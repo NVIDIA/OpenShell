@@ -3060,9 +3060,9 @@ fn reevaluate_transformed_body(
                 .as_ref()
                 .and_then(|info| info.mcp_revision)
             {
-                // Middleware may replace only the body. Reuse the revision
-                // already selected from the immutable request headers so the
-                // replacement cannot be validated against a different profile.
+                // Inspect the replacement under the revision authorized on entry.
+                // The final forwarding check validates the resulting header-selected
+                // profile and body/header mirrors after any header mutations.
                 inspection_options = inspection_options.with_mcp_revision(revision);
             }
             let info =
@@ -4761,7 +4761,12 @@ network_policies:
     fn mcp_relay_context_from_data(
         data: &str,
     ) -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
-        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        mcp_relay_context_from_engine(OpaEngine::from_strings(TEST_POLICY, data).unwrap())
+    }
+
+    fn mcp_relay_context_from_engine(
+        engine: OpaEngine,
+    ) -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
         let input = NetworkInput {
             host: "mcp.example.test".into(),
             port: 8000,
@@ -9607,7 +9612,42 @@ network_policies:
         body: &str,
         upstream_response: &str,
     ) -> (String, Vec<u8>) {
-        let (config, tunnel_engine, ctx) = mcp_sessionless_test_relay_context();
+        run_mcp_relay_case(
+            mcp_sessionless_test_relay_context(),
+            route_selected,
+            headers,
+            body,
+            upstream_response,
+        )
+        .await
+    }
+
+    async fn run_mcp_relay_case(
+        context: (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext),
+        route_selected: bool,
+        headers: &str,
+        body: &str,
+        upstream_response: &str,
+    ) -> (String, Vec<u8>) {
+        run_mcp_method_relay_case(
+            context,
+            route_selected,
+            "POST",
+            headers,
+            body,
+            upstream_response,
+        )
+        .await
+    }
+
+    async fn run_mcp_method_relay_case(
+        (config, tunnel_engine, ctx): (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext),
+        route_selected: bool,
+        method: &str,
+        headers: &str,
+        body: &str,
+        upstream_response: &str,
+    ) -> (String, Vec<u8>) {
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
@@ -9631,7 +9671,6 @@ network_policies:
                 .await
             }
         });
-        let body_len = body.len();
         let upstream_response = upstream_response.to_string();
         let server = tokio::spawn(async move {
             let mut forwarded = Vec::new();
@@ -9645,8 +9684,21 @@ network_policies:
                 if let Some(header_end) = forwarded
                     .windows(4)
                     .position(|window| window == b"\r\n\r\n")
-                    && forwarded.len() >= header_end + 4 + body_len
                 {
+                    // Middleware can change the body length. Wait for the
+                    // complete forwarded representation, not the input size.
+                    let header = std::str::from_utf8(&forwarded[..header_end]).unwrap();
+                    let body_len = header
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .expect("MCP fixture requests include Content-Length");
+                    if forwarded.len() < header_end + 4 + body_len {
+                        continue;
+                    }
                     upstream
                         .write_all(upstream_response.as_bytes())
                         .await
@@ -9656,7 +9708,7 @@ network_policies:
             }
         });
         let request = format!(
-            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "{method} /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         app.write_all(request.as_bytes()).await.unwrap();
@@ -9696,6 +9748,374 @@ network_policies:
         drop(app);
         relay.await.unwrap().unwrap();
         (String::from_utf8(response).unwrap(), server.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn mcp_legacy_receive_stream_get_does_not_admit_tool_bodies_or_delete() {
+        let data = r#"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          versions: ["2025-11-25"]
+        rules:
+          - allow:
+              method: tools/call
+              tool: read_status
+        deny_rules:
+          - method: tools/call
+            tool: delete_resource
+    binaries:
+      - { path: /usr/bin/python3 }
+"#;
+        let tool_body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_resource","arguments":{}}}"#;
+        let allowed_tool_body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_status","arguments":{}}}"#;
+        let event = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n";
+        let upstream_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{event}",
+            event.len()
+        );
+        for route_selected in [false, true] {
+            for (method, body, status) in [
+                ("GET", "", "200 OK"),
+                ("GET", tool_body, "403 Forbidden"),
+                ("GET", allowed_tool_body, "403 Forbidden"),
+                ("DELETE", "", "400 Bad Request"),
+            ] {
+                let (response, forwarded) = run_mcp_method_relay_case(
+                    mcp_relay_context_from_data(data),
+                    route_selected,
+                    method,
+                    "MCP-Protocol-Version: 2025-11-25\r\n",
+                    body,
+                    &upstream_response,
+                )
+                .await;
+                assert!(
+                    response.starts_with(&format!("HTTP/1.1 {status}")),
+                    "{method}, body={body}, route_selected={route_selected}: {response}"
+                );
+                if status == "200 OK" {
+                    // The GET receive-stream exception applies only without a
+                    // client operation body. Preserve its complete SSE response.
+                    let forwarded = String::from_utf8(forwarded).unwrap();
+                    let (headers, forwarded_body) = forwarded.split_once("\r\n\r\n").unwrap();
+                    assert!(headers.starts_with("GET /mcp HTTP/1.1\r\n"));
+                    assert!(forwarded_body.is_empty());
+                    assert!(
+                        response.ends_with(event),
+                        "receive-stream event changed: {response}"
+                    );
+                } else {
+                    assert!(
+                        forwarded.is_empty(),
+                        "{method}: rejected request reached upstream"
+                    );
+                    if method == "DELETE" {
+                        // Legacy cleanup is unsupported: an empty DELETE is
+                        // rejected as an invalid MCP body, not as sessionless 405.
+                        assert!(response.contains("invalid_mcp_request"), "{response}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Replaces a tool call and its sessionless name mirror in one real stage.
+    struct McpToolReplacingService {
+        replacement: Vec<u8>,
+        tool_name: &'static str,
+        sessionless: bool,
+        invocations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl openshell_core::middleware::InProcessMiddleware for McpToolReplacingService {
+        async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+            openshell_core::middleware::InProcessMiddleware::describe(&BodyReplacingService {
+                replacement: b"",
+            })
+            .await
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            request: openshell_core::middleware::HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            use openshell_core::proto::{
+                Decision, ExistingHeaderAction, HeaderMutation, HttpRequestResult, WriteHeader,
+                header_mutation,
+            };
+            let original: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+            assert_eq!(original["params"]["name"], "read_status");
+            self.invocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let header_mutations = if self.sessionless {
+                vec![HeaderMutation {
+                    operation: Some(header_mutation::Operation::Write(WriteHeader {
+                        name: "Mcp-Name".into(),
+                        value: self.tool_name.into(),
+                        on_existing: ExistingHeaderAction::Overwrite as i32,
+                    })),
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(HttpRequestResult {
+                decision: Decision::Allow as i32,
+                body: self.replacement.clone(),
+                has_body: true,
+                header_mutations,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for route_selected in [false, true] {
+            for version in ["2025-11-25", "2026-07-28"] {
+                let sessionless = version == "2026-07-28";
+                let body_for = |name, arguments| {
+                    let params = serde_json::json!({"name": name, "arguments": arguments});
+                    if sessionless {
+                        sessionless_mcp_body("tools/call", params)
+                    } else {
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params
+                        })
+                        .to_string()
+                    }
+                };
+                let original = body_for("read_status", serde_json::json!({}));
+                let mut headers = format!("MCP-Protocol-Version: {version}\r\n");
+                if sessionless {
+                    headers.push_str("Mcp-Method: tools/call\r\nMcp-Name: read_status\r\n");
+                }
+                for enforcement in ["enforce", "audit"] {
+                    for tool_name in ["read_status", "delete_resource"] {
+                        // A changed argument marker makes the allowed control
+                        // prove that the replacement, not the original, arrived.
+                        let replacement =
+                            body_for(tool_name, serde_json::json!({"rewritten": true}));
+                        assert_ne!(original.len(), replacement.len());
+                        let invocations = Arc::new(AtomicUsize::new(0));
+                        let data = format!(
+                            r#"
+network_middlewares:
+  rewriter:
+    middleware: test/rewriter
+    on_error: fail_closed
+    endpoints:
+      include: ["mcp.example.test"]
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: {enforcement}
+        mcp:
+          versions: ["{version}"]
+        rules:
+          - allow:
+              method: tools/call
+              tool: read_status
+        deny_rules:
+          - method: tools/call
+            tool: delete_resource
+    binaries:
+      - {{ path: /usr/bin/python3 }}
+"#
+                        );
+                        let engine = OpaEngine::from_strings(TEST_POLICY, &data).unwrap();
+                        engine.set_middleware_runner_for_tests(
+                            openshell_supervisor_middleware::ChainRunner::new(Arc::new(
+                                McpToolReplacingService {
+                                    replacement: replacement.as_bytes().to_vec(),
+                                    tool_name,
+                                    sessionless,
+                                    invocations: Arc::clone(&invocations),
+                                },
+                            )),
+                        );
+                        let (response, forwarded) = run_mcp_relay_case(
+                            mcp_relay_context_from_engine(engine),
+                            route_selected,
+                            &headers,
+                            &original,
+                            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+                        if tool_name == "delete_resource" && enforcement == "enforce" {
+                            assert_middleware_failure_response(&response, "mcp_api");
+                            assert!(
+                                forwarded.is_empty(),
+                                "rewritten denied tool reached upstream"
+                            );
+                            continue;
+                        }
+                        // Audit permits policy denials, while final revision and
+                        // metadata checks still apply to the rewritten request.
+                        assert!(
+                            response.starts_with("HTTP/1.1 204 No Content"),
+                            "{response}"
+                        );
+                        let forwarded = String::from_utf8(forwarded).unwrap();
+                        let (header, body) = forwarded.split_once("\r\n\r\n").unwrap();
+                        assert_eq!(body, replacement);
+                        let content_length = header
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .expect("rewritten request includes Content-Length");
+                        assert_eq!(content_length, replacement.len());
+                        if sessionless {
+                            let names = header
+                                .lines()
+                                .filter_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("mcp-name").then(|| value.trim())
+                                })
+                                .collect::<Vec<_>>();
+                            assert_eq!(names, [tool_name]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_march_batches_authorize_every_member_before_forwarding() {
+        let call = |id, name| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": name, "arguments": {}}
+            })
+        };
+        let allowed = call(1, "read_status");
+        let denied = call(2, "delete_resource");
+        let malformed = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": 7, "arguments": {}}
+        });
+        let cases = [
+            (
+                "allowed",
+                serde_json::json!([allowed, call(2, "read_status")]),
+                false,
+                false,
+            ),
+            (
+                "deny last",
+                serde_json::json!([allowed, denied]),
+                true,
+                false,
+            ),
+            (
+                "deny first",
+                serde_json::json!([denied, allowed]),
+                true,
+                false,
+            ),
+            (
+                "malformed last",
+                serde_json::json!([allowed, malformed]),
+                false,
+                true,
+            ),
+        ];
+        for route_selected in [false, true] {
+            for enforcement in ["enforce", "audit"] {
+                let data = format!(
+                    r#"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: {enforcement}
+        mcp:
+          versions: ["2025-03-26"]
+        rules:
+          - allow:
+              method: tools/call
+              tool: read_status
+        deny_rules:
+          - method: tools/call
+            tool: delete_resource
+    binaries:
+      - {{ path: /usr/bin/python3 }}
+"#
+                );
+                for (case, members, policy_denied, malformed) in &cases {
+                    let body = members.to_string();
+                    let (response, forwarded) = run_mcp_relay_case(
+                        mcp_relay_context_from_data(&data),
+                        route_selected,
+                        "MCP-Protocol-Version: 2025-03-26\r\n",
+                        &body,
+                        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                    // Audit forwards policy denials, but never malformed MCP.
+                    // Capturing the whole upstream exchange also catches partial
+                    // forwarding of an allowed prefix before a later denial.
+                    let should_forward = !*malformed && (!*policy_denied || enforcement == "audit");
+                    let status = if *malformed {
+                        "400 Bad Request"
+                    } else if should_forward {
+                        "204 No Content"
+                    } else {
+                        "403 Forbidden"
+                    };
+                    assert!(
+                        response.starts_with(&format!("HTTP/1.1 {status}")),
+                        "{case}, route_selected={route_selected}, {enforcement}: {response}"
+                    );
+                    if should_forward {
+                        assert!(
+                            forwarded.ends_with(body.as_bytes()),
+                            "{case}: batch changed"
+                        );
+                    } else {
+                        assert!(
+                            forwarded.is_empty(),
+                            "{case}: rejected batch reached upstream"
+                        );
+                    }
+                    if *malformed {
+                        assert!(response.contains("invalid_mcp_request"), "{response}");
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
