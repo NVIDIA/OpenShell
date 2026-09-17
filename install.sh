@@ -57,10 +57,18 @@ ENVIRONMENT VARIABLES:
 
 NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
-    from ${GITHUB_URL}/releases/latest.
+    from ${GITHUB_URL}/releases/latest for the DEB/RPM, and the release from
+	the latest/stable channel for the OpenShell snap.
 
-    Linux installs the Debian package on amd64/arm64 or the RPM packages on
-    x86_64/aarch64, depending on the host package manager.
+    Linux installs the snap, the DEB package, or the RPM package depending on
+    the host package manager. The snap is preferred when snapd is available,
+    except on RPM-based systems where Docker is not installed, where instead
+    the RPM package and the Podman runtime are used. On other systems with
+    snapd but no Docker preinstalled, it installs the Docker snap before the
+    OpenShell snap. If OPENSHELL_VERSION is set to "dev", then the snap from
+	the latest/edge channel is installed, and if set to an explicit version,
+	the matching DEB or RPM release artifact is installed instead of the snap.
+
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF
@@ -74,6 +82,10 @@ require_cmd() {
   if ! has_cmd "$1"; then
     error "'$1' is required"
   fi
+}
+
+has_snapd() {
+  has_cmd snap && systemctl is-active --quiet snapd.socket 2>/dev/null
 }
 
 download() {
@@ -218,6 +230,10 @@ Please use a newer distribution or container environment."
 }
 
 target_uses_breaking_gateway_model() {
+  if [ "${PLATFORM:-}" = "linux" ] && [ "$(linux_package_method)" = "snap" ]; then
+    return 0
+  fi
+
   case "$RELEASE_TAG" in
     dev)
       return 0
@@ -237,6 +253,14 @@ installed_version_needs_breaking_upgrade_notice() {
   ! semver_at_least "$_version" "$BREAKING_RELEASE_VERSION"
 }
 
+breaking_upgrade_target() {
+  if [ "${PLATFORM:-}" = "linux" ] && [ "$(linux_package_method)" = "snap" ]; then
+    printf 'the OpenShell snap from %s\n' "$(openshell_snap_channel)"
+  else
+    printf 'OpenShell %s\n' "$RELEASE_TAG"
+  fi
+}
+
 find_existing_openshell_bin() {
   _path="$(command -v openshell 2>/dev/null || true)"
   if [ -n "$_path" ] && [ -x "$_path" ]; then
@@ -246,6 +270,7 @@ find_existing_openshell_bin() {
 
   for _candidate in \
     "${TARGET_HOME:-}/.local/bin/openshell" \
+    /snap/bin/openshell \
     /usr/local/bin/openshell \
     /usr/bin/openshell \
     /opt/homebrew/bin/openshell; do
@@ -276,6 +301,7 @@ existing_openshell_version() {
 print_breaking_upgrade_notice() {
   _bin="$1"
   _version="$2"
+  _target="$(breaking_upgrade_target)"
 
   if [ -n "$_version" ]; then
     warn "detected existing OpenShell ${_version} at ${_bin}"
@@ -286,7 +312,7 @@ print_breaking_upgrade_notice() {
   cat >&2 <<EOF
 
 OpenShell ${BREAKING_RELEASE_VERSION} and later are incompatible with gateway
-state created by earlier releases. Before installing ${RELEASE_TAG}, back up
+state created by earlier releases. Before installing ${_target}, back up
 any files, artifacts, and configuration you need from existing sandboxes.
 
 Then clean up the old runtime with the currently installed CLI:
@@ -479,12 +505,33 @@ local_gateway_endpoint() {
 }
 
 linux_package_method() {
-  if has_cmd dpkg; then
+  if [ -n "${OPENSHELL_VERSION:-}" ] && [ "$OPENSHELL_VERSION" != "dev" ]; then
+    linux_native_package_method
+    return
+  fi
+
+  if has_snapd; then
+    if has_cmd docker || ! has_cmd rpm; then
+      echo "snap"
+    else
+      echo "rpm"
+    fi
+  else
+    linux_native_package_method
+  fi
+}
+
+linux_native_package_method() {
+  if has_cmd apt-get || has_cmd apt; then
+    echo "deb"
+  elif has_cmd dnf || has_cmd yum || has_cmd zypper; then
+    echo "rpm"
+  elif has_cmd dpkg; then
     echo "deb"
   elif has_cmd rpm; then
     echo "rpm"
   else
-    error "Linux installs require either dpkg or rpm"
+    error "Linux installs require snapd or a supported DEB/RPM package manager"
   fi
 }
 
@@ -824,12 +871,12 @@ wait_for_local_gateway_status() {
   error "openshell status did not report connected within ${_timeout}s"
 }
 
-remove_local_gateway_registration() {
+remove_local_gateway_registration_from() {
+  _config_dir="$1"
   [ -n "$TARGET_HOME" ] || error "cannot resolve home directory for ${TARGET_USER}"
-  _config_dir="${TARGET_HOME}/.config/openshell"
 
-  # The install-dev gateway is a user service. Replace the CLI registration
-  # directly instead of asking `gateway destroy` to tear down Docker resources.
+  # Replace the CLI registration directly instead of asking `gateway destroy`
+  # to tear down package-managed resources.
   # shellcheck disable=SC2016
   as_target_user sh -c '
     config_dir=$1
@@ -846,6 +893,15 @@ remove_local_gateway_registration() {
       rm -f "$active"
     fi
   ' sh "$_config_dir"
+}
+
+remove_local_gateway_registration() {
+  remove_local_gateway_registration_from "${TARGET_HOME}/.config/openshell"
+}
+
+remove_local_gateway_registration_snap() {
+  remove_local_gateway_registration_from \
+    "${TARGET_HOME}/snap/openshell/common/.config/openshell"
 }
 
 register_local_gateway() {
@@ -978,6 +1034,106 @@ install_linux_rpm() {
   start_user_gateway
 }
 
+install_linux_snap() {
+  require_cmd snap
+  set_linux_target_runtime_dir
+
+  if ! has_cmd docker; then
+    info "Docker not found, installing the docker snap..."
+    as_root snap install docker
+  else
+    info "using existing Docker installation"
+  fi
+
+  wait_for_docker_daemon
+
+  _channel="$(openshell_snap_channel)"
+  if snap list openshell >/dev/null 2>&1; then
+    info "refreshing openshell snap from ${_channel}..."
+    as_root snap refresh openshell --channel="$_channel"
+  else
+    info "installing openshell snap from ${_channel}..."
+    as_root snap install openshell --channel="$_channel"
+  fi
+
+  info "installed openshell snap from Snap Store channel ${_channel}"
+  info "registering local gateway as ${TARGET_USER}..."
+  register_local_gateway_snap
+  wait_for_local_gateway_listener_snap
+  wait_for_local_gateway_status
+}
+
+openshell_snap_channel() {
+  if [ "${OPENSHELL_VERSION:-}" = "dev" ]; then
+    printf '%s\n' "latest/edge"
+  else
+    printf '%s\n' "latest/stable"
+  fi
+}
+
+wait_for_docker_daemon() {
+  _timeout="${OPENSHELL_INSTALL_DOCKER_TIMEOUT:-30}"
+  _elapsed=0
+  _last_output=""
+
+  info "waiting for Docker daemon to become reachable..."
+  while [ "$_elapsed" -lt "$_timeout" ]; do
+    if _last_output="$(docker info 2>&1)"; then
+      info "Docker daemon is reachable"
+      return 0
+    fi
+    sleep 1
+    _elapsed=$((_elapsed + 1))
+  done
+
+  [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
+  error "Docker daemon did not become reachable within ${_timeout}s"
+}
+
+register_local_gateway_snap() {
+  _register_bin="${OPENSHELL_REGISTER_BIN:-openshell}"
+
+  if _add_output="$(as_target_user "$_register_bin" gateway add "http://127.0.0.1:${LOCAL_GATEWAY_PORT}" --local --name openshell 2>&1)"; then
+    [ -z "$_add_output" ] || print_gateway_add_output "$_add_output"
+    return 0
+  else
+    _add_status=$?
+  fi
+
+  case "$_add_output" in
+    *"already exists"*)
+      info "local gateway already exists; removing and re-adding it..."
+      remove_local_gateway_registration_snap
+      as_target_user "$_register_bin" gateway add "http://127.0.0.1:${LOCAL_GATEWAY_PORT}" --local --name openshell
+      ;;
+    *)
+      printf '%s\n' "$_add_output" >&2
+      return "$_add_status"
+      ;;
+  esac
+}
+
+wait_for_local_gateway_listener_snap() {
+  _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT_SNAP:-90}"
+  _elapsed=0
+  _last_output=""
+  _probe_url="http://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+
+  info "waiting for local gateway listener to become reachable..."
+  while [ "$_elapsed" -lt "$_timeout" ]; do
+    if _last_output="$(curl -sS --max-time 2 "$_probe_url" 2>&1)"; then
+      info "local gateway listener is reachable"
+      return 0
+    fi
+    sleep 1
+    _elapsed=$((_elapsed + 1))
+  done
+
+  [ -z "$_last_output" ] || printf '%s
+' "$_last_output" >&2
+  error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
+}
+
 install_macos_homebrew() {
   check_macos_platform
 
@@ -1046,7 +1202,6 @@ main() {
   fi
 
   require_cmd curl
-  RELEASE_TAG="$(resolve_release_tag)"
   PLATFORM="$(detect_platform)"
 
   TARGET_USER="$(target_user)"
@@ -1054,16 +1209,23 @@ main() {
   [ -n "$TARGET_UID" ] || error "cannot resolve uid for ${TARGET_USER}"
   TARGET_HOME="$(user_home "$TARGET_USER")"
 
-  guard_breaking_upgrade
-
   case "$PLATFORM" in
     linux)
-      require_linux_package_glibc
-      case "$(linux_package_method)" in
+      _linux_method="$(linux_package_method)"
+      if [ "$_linux_method" != "snap" ]; then
+        RELEASE_TAG="$(resolve_release_tag)"
+      fi
+      guard_breaking_upgrade
+      case "$_linux_method" in
+        snap)
+          install_linux_snap
+          ;;
         deb)
+          require_linux_package_glibc
           install_linux_deb
           ;;
         rpm)
+          require_linux_package_glibc
           install_linux_rpm
           ;;
         *)
@@ -1072,6 +1234,8 @@ main() {
       esac
       ;;
     darwin)
+      RELEASE_TAG="$(resolve_release_tag)"
+      guard_breaking_upgrade
       install_macos_homebrew
       ;;
     *)

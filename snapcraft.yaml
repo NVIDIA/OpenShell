@@ -16,19 +16,21 @@ description: |
 
   **Setup instructions**
 
-    1. Install the Docker snap:
+    1. Install and start Docker using your preferred package source. The
+       OpenShell snap works with the system Docker interface regardless of how
+       Docker was installed. If Docker is not installed, one option is:
 
          sudo snap install docker
 
-       Support for system-installed Docker is coming in snapd 2.76.
+       If the OpenShell snap was installed before Docker, the gateway service
+       may have repeatedly tried to start and failed to connect. In this case,
+       it may be necessary to reset the systemd start limit and restart the
+       gateway:
 
-    2. Connect the required interfaces:
+         sudo systemctl reset-failed snap.openshell.gateway.service
+         sudo snap restart openshell.gateway
 
-         sudo snap connect openshell:docker docker:docker-daemon
-         sudo snap connect openshell:log-observe
-         sudo snap connect openshell:system-observe
-
-    3. Verify the gateway and register it locally:
+    2. Verify the gateway and register it locally:
 
          snap services openshell.gateway
          openshell status
@@ -95,8 +97,6 @@ apps:
       XDG_RUNTIME_DIR: "$SNAP_COMMON"
     plugs:
       - docker
-      # Docker snap is required because the snap uses the docker:docker-daemon
-      # interface slot. It does not work with system-installed Docker.
       - log-observe
       - network
       - network-bind

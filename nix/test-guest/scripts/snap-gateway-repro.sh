@@ -82,7 +82,7 @@ for attempt in $(seq 1 "${attempts}"); do
 	rm -rf /home/openshell/snap/openshell
 
 	if ! snap install "${snap_file}" --dangerous ||
-		! snap connect openshell:docker docker:docker-daemon ||
+		! snap connect openshell:docker :docker ||
 		! snap connect openshell:log-observe ||
 		! snap connect openshell:system-observe; then
 		echo "OpenShell installation or interface connection failed" >&2
