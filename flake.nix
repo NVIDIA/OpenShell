@@ -138,7 +138,7 @@
           };
           build-artifacts-test-archives = {
             type = "app";
-            program = "${artifacts.conformanceCliArchive}/bin/build-openshell-conformance-test-archive";
+            program = "${artifacts.testArchives}/bin/build-artifacts-test-archives";
           };
           build-artifacts-helm = {
             type = "app";

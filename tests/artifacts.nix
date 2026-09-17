@@ -84,9 +84,17 @@ let
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/openshell-conformance-tests.tar";
   };
+  providerRefreshKeycloakArchive = mkTestArchive {
+    name = "provider-refresh-keycloak";
+    workspacePath = "tests/suites/features";
+    manifestPath = "tests/suites/features/Cargo.toml";
+    package = "openshell-test-feature-provider-refresh-keycloak";
+    target = muslToolchain.target;
+    output = "artifacts/test-archives/${muslToolchain.target}/provider-refresh-keycloak-tests.tar";
+  };
 in
 rec {
-  inherit conformanceCliArchive;
+  inherit conformanceCliArchive providerRefreshKeycloakArchive;
 
   binaries = pkgs.writeShellApplication {
     name = "build-artifacts-binaries";
@@ -123,6 +131,18 @@ rec {
       install -D -m 0755 \
         target/${gnuToolchain.target}/debug/openshell-supervisor \
         artifacts/binaries/${gnuToolchain.target}/openshell-supervisor
+    '';
+  };
+
+  testArchives = pkgs.writeShellApplication {
+    name = "build-artifacts-test-archives";
+    runtimeInputs = [
+      conformanceCliArchive
+      providerRefreshKeycloakArchive
+    ];
+    text = ''
+      build-openshell-conformance-test-archive
+      build-provider-refresh-keycloak-test-archive
     '';
   };
 
@@ -204,13 +224,13 @@ rec {
     name = "build-artifacts";
     runtimeInputs = [
       binaries
-      conformanceCliArchive
+      testArchives
       images
       helm
     ];
     text = ''
       build-artifacts-binaries
-      build-openshell-conformance-test-archive
+      build-artifacts-test-archives
       build-artifacts-images
       build-artifacts-helm
     '';

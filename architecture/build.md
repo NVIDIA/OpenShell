@@ -258,6 +258,10 @@ for explicit publication.
 CLI conformance runs after target provisioning and operates only through the
 configured OpenShell CLI. The smoke scenario verifies the black-box sandbox
 lifecycle by creating, inspecting, executing in, and deleting a sandbox.
+Feature suites use the same disposable guest but may provision isolated
+dependencies after installation. The Keycloak provider-refresh suite starts a
+guest-local Keycloak realm and verifies a successful OAuth refresh followed by
+revocation and the gateway's reauthorization-required recovery state.
 
 The `tests/tmachine` setup and installation caches include a digest of the
 entire directory containing `ANSIBLE_CONFIG`, including local roles, task

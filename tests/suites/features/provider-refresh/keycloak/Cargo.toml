@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-test-feature-provider-refresh-keycloak"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+openshell-conformance = { path = "../../../../../crates/openshell-conformance" }
+openshell-e2e = { path = "../../../../../e2e/rust" }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1.43", features = ["macros", "process", "io-util", "rt"] }

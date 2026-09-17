@@ -248,6 +248,8 @@ pub struct OpenShellRunner {
     run_id: String,
     scenario: String,
     known_sandboxes: BTreeSet<String>,
+    known_providers: BTreeSet<String>,
+    known_provider_profiles: BTreeSet<String>,
     finished: bool,
 }
 
@@ -311,6 +313,8 @@ impl OpenShellRunner {
             run_id: generate_run_id(),
             scenario: scenario.to_string(),
             known_sandboxes: BTreeSet::new(),
+            known_providers: BTreeSet::new(),
+            known_provider_profiles: BTreeSet::new(),
             finished: false,
         }
     }
@@ -393,6 +397,16 @@ impl OpenShellRunner {
         self.known_sandboxes.remove(name);
     }
 
+    /// Register a provider name for cleanup.
+    pub fn track_provider(&mut self, name: &str) {
+        self.known_providers.insert(name.to_string());
+    }
+
+    /// Register a provider profile ID for cleanup.
+    pub fn track_provider_profile(&mut self, id: &str) {
+        self.known_provider_profiles.insert(id.to_string());
+    }
+
     pub async fn poll_until<T, F>(
         &mut self,
         step: &str,
@@ -440,6 +454,7 @@ impl OpenShellRunner {
         step: &str,
         expectation: &str,
         args: Vec<String>,
+        environment: Vec<(String, String)>,
         command_timeout: Duration,
     ) -> Result<CommandResult, RunnerError> {
         let context = self.context(step);
@@ -447,22 +462,22 @@ impl OpenShellRunner {
         eprintln!("{context} running: {command}");
 
         let started = Instant::now();
-        let output =
-            self.cli
-                .execute(args, command_timeout)
-                .await
-                .map_err(|error| match error {
-                    CliExecutionError::Timeout => RunnerError::Timeout {
-                        context: context.clone(),
-                        command: command.clone(),
-                        timeout: command_timeout,
-                    },
-                    CliExecutionError::Spawn(source) => RunnerError::Spawn {
-                        context: context.clone(),
-                        command: command.clone(),
-                        source,
-                    },
-                })?;
+        let output = self
+            .cli
+            .execute(args, environment, command_timeout)
+            .await
+            .map_err(|error| match error {
+                CliExecutionError::Timeout => RunnerError::Timeout {
+                    context: context.clone(),
+                    command: command.clone(),
+                    timeout: command_timeout,
+                },
+                CliExecutionError::Spawn(source) => RunnerError::Spawn {
+                    context: context.clone(),
+                    command: command.clone(),
+                    source,
+                },
+            })?;
         let elapsed = started.elapsed();
         eprintln!(
             "{context} completed in {:.1?}: exit {}",
@@ -484,7 +499,10 @@ impl OpenShellRunner {
     }
 
     async fn cleanup(&self) -> Result<(), String> {
-        if self.known_sandboxes.is_empty() {
+        if self.known_sandboxes.is_empty()
+            && self.known_providers.is_empty()
+            && self.known_provider_profiles.is_empty()
+        {
             return Ok(());
         }
 
@@ -512,6 +530,56 @@ impl OpenShellRunner {
                         "sandbox '{name}' is deleted or already absent"
                     )));
                 }
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+
+        for name in self.known_providers.clone() {
+            let remaining = remaining_cleanup_time(cleanup_started);
+            if remaining.is_zero() {
+                failures.push(format!(
+                    "{} cleanup budget expired before deleting provider '{name}'",
+                    self.context("cleanup/delete-provider")
+                ));
+                break;
+            }
+            match self
+                .step("cleanup/delete-provider")
+                .description(format!("provider '{name}' is deleted or already absent"))
+                .with_timeout(remaining)
+                .run(&["provider", "delete", &name])
+                .await
+            {
+                Ok(result) if result.success() || output_reports_not_found(&result) => {}
+                Ok(result) => failures.push(result.failure_diagnostic(&format!(
+                    "provider '{name}' is deleted or already absent"
+                ))),
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+
+        for id in self.known_provider_profiles.clone() {
+            let remaining = remaining_cleanup_time(cleanup_started);
+            if remaining.is_zero() {
+                failures.push(format!(
+                    "{} cleanup budget expired before deleting provider profile '{id}'",
+                    self.context("cleanup/delete-provider-profile")
+                ));
+                break;
+            }
+            match self
+                .step("cleanup/delete-provider-profile")
+                .description(format!(
+                    "provider profile '{id}' is deleted or already absent"
+                ))
+                .with_timeout(remaining)
+                .run(&["provider", "profile", "delete", &id])
+                .await
+            {
+                Ok(result) if result.success() || output_reports_not_found(&result) => {}
+                Ok(result) => failures.push(result.failure_diagnostic(&format!(
+                    "provider profile '{id}' is deleted or already absent"
+                ))),
                 Err(error) => failures.push(error.to_string()),
             }
         }
@@ -550,11 +618,24 @@ impl<'a> CommandStep<'a> {
 
 impl OpenShellCommand<'_> {
     pub async fn run(&self, args: &[&str]) -> Result<CommandResult, RunnerError> {
+        self.run_with_env(args, &[]).await
+    }
+
+    /// Run a command with environment values that are excluded from diagnostics.
+    pub async fn run_with_env(
+        &self,
+        args: &[&str],
+        environment: &[(&str, &str)],
+    ) -> Result<CommandResult, RunnerError> {
         self.runner
             .run_strings(
                 &self.step,
                 &self.description,
                 args.iter().map(|arg| (*arg).to_string()).collect(),
+                environment
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect(),
                 self.timeout,
             )
             .await
@@ -724,7 +805,12 @@ mod tests {
     }
 
     impl CliExecutor for MockCli {
-        fn execute(&self, args: Vec<String>, _command_timeout: Duration) -> CliExecution<'_> {
+        fn execute(
+            &self,
+            args: Vec<String>,
+            _environment: Vec<(String, String)>,
+            _command_timeout: Duration,
+        ) -> CliExecution<'_> {
             let response = {
                 let mut state = self.state.lock().expect("lock mock CLI state");
                 state.invocations.push(args);

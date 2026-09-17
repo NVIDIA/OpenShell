@@ -3,7 +3,7 @@
 
 #![cfg(target_os = "linux")]
 
-//! End-to-end coverage for provider OAuth refresh recovery against Keycloak.
+//! Provider OAuth refresh recovery against Keycloak.
 //!
 //! OpenShell itself uses the local gateway's mTLS authentication. Keycloak is
 //! only the provider token issuer: the test refreshes a valid grant, revokes
