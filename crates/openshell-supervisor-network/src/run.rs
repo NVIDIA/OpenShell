@@ -274,7 +274,7 @@ pub async fn run_networking(
                             "Container filesystem accessible, resolving policy binary symlinks"
                         );
                         match resolve_engine.reload_from_proto_with_pid(&resolve_proto, pid) {
-                            Ok(()) => {
+                            Ok(_) => {
                                 info!(
                                     pid = pid,
                                     "Policy binary symlink resolution complete \

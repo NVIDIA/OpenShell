@@ -110,6 +110,13 @@ creates a new generation with new Secrets and a replacement supervisor Pod
 while preserving the workspace PVC. The namespace-wide workload fence remains
 in place across sandbox generations.
 
+If provisioning is interrupted, recovery first confirms that the old workload
+Pod is gone. It then lists generation Secrets by sandbox and component labels,
+deletes each stale Secret with a UID precondition, and clears the rollback state
+so the next generation can be created. The Helm chart grants the gateway
+`create`, `list`, and `delete` access to Secrets for this lifecycle. Listing is
+required even when no generation Secrets remain.
+
 ## Check Cluster Requirements
 
 This architecture requires the following cluster behavior:

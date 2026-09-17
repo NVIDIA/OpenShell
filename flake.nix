@@ -167,6 +167,7 @@
             // {
               packages = commonDevShell.packages ++ [
                 pkgs.ansible
+                pkgs.skopeo
                 pkgs.sshpass
                 testMachines.package
               ];

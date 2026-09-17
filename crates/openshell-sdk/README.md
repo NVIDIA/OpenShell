@@ -130,6 +130,40 @@ let _sandbox = client
 # }
 ```
 
+## Wait for a provider change
+
+Provider attach, detach, and update responses include a `ProviderMutationReceipt`: a saved record identifying the exact change requested for one sandbox. Pass that record to `provider_readiness::wait_for_provider` to wait until the current sandbox runtime confirms it applied the change. Detach completes with `Revoked`; attach and update complete with `Ready`.
+
+```rust
+use std::time::Duration;
+use openshell_sdk::{OpenShellClient, raw::ProviderMutationReceipt};
+use openshell_sdk::provider_readiness::{
+    ProviderWaitOutcome, wait_for_provider,
+};
+
+async fn wait_for_change(
+    client: &OpenShellClient,
+    change: &ProviderMutationReceipt,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut grpc = client.raw_grpc_fresh().await?;
+    let result = wait_for_provider(&mut grpc, change, Duration::from_secs(30)).await?;
+    match result.outcome {
+        ProviderWaitOutcome::Complete => println!("The sandbox applied the change."),
+        ProviderWaitOutcome::TimedOut => println!("Still waiting; check the same change again."),
+        ProviderWaitOutcome::Terminal => println!("The change failed, was withheld, or was replaced."),
+    }
+    Ok(())
+}
+```
+
+The result preserves the last known status when the deadline expires. A later change cannot satisfy a wait for the original request. `provider_status` queries once, and `wait_for_provider_until` accepts a shared deadline for waiting on the sandboxes selected by one provider update. Status responses contain configuration identities and safe reason categories, without credentials or raw installation errors.
+
+For ordinary static credentials, launch a new client after update readiness to receive the updated reference. Existing processes keep their revision-scoped references; a successful wait does not retarget them or prove that the old upstream key can be retired. After detach completes, retained references cannot resolve and new processes do not receive them.
+
+The status's `operation` field is the common operation's historical outcome, keyed by the receipt ID. These helpers complete from the live provider state and its matching evidence; a historical applied operation cannot override a disconnected, expired, or superseded live result.
+
+These helpers use the raw client's authentication slot. They do not perform OIDC refresh themselves. Follow the raw-client refresh guidance above if a request returns `Unauthenticated`, then resume waiting for the same change ID.
+
 ## Modules
 
 | Module | Purpose |
@@ -145,6 +179,7 @@ let _sandbox = client
 | `pagination` | Lazy `Pager<T>` and response `Page<T>`. |
 | `types` | Curated request/response types and proto conversions. |
 | `raw` | Escape hatch re-exporting the generated tonic clients. |
+| `provider_readiness` | Check and wait for an exact provider change to take effect. |
 
 ## Notes
 

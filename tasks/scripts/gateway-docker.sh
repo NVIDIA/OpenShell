@@ -194,7 +194,7 @@ if [[ "${HOST_OS}" == "Linux" && "${HOST_ARCH}" == "${DAEMON_ARCH}" ]]; then
     "${ROOT}/target/${SUPERVISOR_TARGET}/debug/openshell-sandbox"
 else
   # Cross-compile through the prebuilt-binary staging helper, then use the
-  # supervisor stage to extract just the openshell-sandbox binary.
+  # sandbox stage to extract just the openshell-sandbox binary.
   #
   # This task is gated on a working Docker daemon above, so pin the
   # container-engine helper to docker — otherwise it auto-detects podman
@@ -204,7 +204,7 @@ else
   if ! CONTAINER_ENGINE=docker \
     DOCKER_PLATFORM="linux/${DAEMON_ARCH}" \
     DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_BUILD_DIR}" \
-      bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor-output; then
+      bash "${ROOT}/tasks/scripts/docker-build-image.sh" sandbox; then
     rm -rf -- "${SUPERVISOR_BUILD_DIR}"
     exit 1
   fi

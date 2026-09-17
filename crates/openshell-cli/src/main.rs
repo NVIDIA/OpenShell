@@ -944,6 +944,9 @@ enum ProviderCommands {
         /// Credential expiry (`KEY=TIMESTAMP`). Accepts epoch milliseconds or RFC3339. A zero timestamp clears expiry.
         #[arg(long = "credential-expires-at", value_name = "KEY=TIMESTAMP")]
         credential_expires_at: Vec<String>,
+
+        #[command(flatten)]
+        readiness: ProviderReadinessArgs,
     },
 
     /// Delete providers by name.
@@ -1624,6 +1627,32 @@ enum SandboxCommands {
     Template(SandboxTemplateCommands),
 }
 
+/// Common observation flags; the deadline starts after the mutation is saved.
+#[derive(clap::Args, Debug)]
+struct ProviderReadinessArgs {
+    /// Wait until the sandbox applies the credentials, policy, and environment for new processes.
+    #[arg(long)]
+    wait: bool,
+
+    /// Maximum wait in seconds after saving the change, shared by all selected sandboxes.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    timeout: u64,
+
+    /// Output format; JSON and YAML include change IDs and results for each sandbox.
+    #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+    output: OutputFormat,
+}
+
+impl ProviderReadinessArgs {
+    fn options(&self) -> run::ProviderWaitOptions<'_> {
+        run::ProviderWaitOptions {
+            wait: self.wait,
+            timeout: std::time::Duration::from_secs(self.timeout),
+            output: self.output.as_str(),
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum SandboxProviderCommands {
     /// List providers attached to a sandbox.
@@ -1648,6 +1677,9 @@ enum SandboxProviderCommands {
         /// Provider name to attach.
         #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
         provider: String,
+
+        #[command(flatten)]
+        readiness: ProviderReadinessArgs,
     },
 
     /// Detach a provider from a sandbox.
@@ -1660,6 +1692,28 @@ enum SandboxProviderCommands {
         /// Provider name to detach.
         #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
         provider: String,
+
+        #[command(flatten)]
+        readiness: ProviderReadinessArgs,
+    },
+
+    /// Check whether a sandbox has applied a provider change.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Status {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+
+        /// Provider whose attachment or revocation is being inspected.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        provider: String,
+
+        /// Change ID returned by attach, detach, or update; omitted means the latest saved state.
+        #[arg(long = "receipt")]
+        receipt: Option<String>,
+
+        #[command(flatten)]
+        readiness: ProviderReadinessArgs,
     },
 }
 
@@ -3373,23 +3427,50 @@ async fn run_async() -> Result<()> {
                                 )
                                 .await?;
                             }
-                            SandboxProviderCommands::Attach { name, provider } => {
+                            SandboxProviderCommands::Attach {
+                                name,
+                                provider,
+                                readiness,
+                            } => {
                                 run::sandbox_provider_attach(
                                     endpoint,
                                     &name,
                                     &provider,
                                     &cli.workspace,
                                     &tls,
+                                    readiness.options(),
                                 )
                                 .await?;
                             }
-                            SandboxProviderCommands::Detach { name, provider } => {
+                            SandboxProviderCommands::Detach {
+                                name,
+                                provider,
+                                readiness,
+                            } => {
                                 run::sandbox_provider_detach(
                                     endpoint,
                                     &name,
                                     &provider,
                                     &cli.workspace,
                                     &tls,
+                                    readiness.options(),
+                                )
+                                .await?;
+                            }
+                            SandboxProviderCommands::Status {
+                                name,
+                                provider,
+                                receipt,
+                                readiness,
+                            } => {
+                                run::sandbox_provider_status(
+                                    endpoint,
+                                    &name,
+                                    &provider,
+                                    receipt.as_deref().unwrap_or_default(),
+                                    &cli.workspace,
+                                    &tls,
+                                    readiness.options(),
                                 )
                                 .await?;
                             }
@@ -3750,6 +3831,7 @@ async fn run_async() -> Result<()> {
                     credentials,
                     config,
                     credential_expires_at,
+                    readiness,
                 } => {
                     run::provider_update(run::ProviderUpdateOptions {
                         server: endpoint,
@@ -3761,6 +3843,7 @@ async fn run_async() -> Result<()> {
                         credential_expires_at: &credential_expires_at,
                         workspace: &cli.workspace,
                         tls: &tls,
+                        readiness: readiness.options(),
                     })
                     .await?;
                 }
@@ -4139,7 +4222,9 @@ mod tests {
 
         let Some(Commands::Sandbox {
             command:
-                Some(SandboxCommands::Provider(SandboxProviderCommands::Attach { name, provider })),
+                Some(SandboxCommands::Provider(SandboxProviderCommands::Attach {
+                    name, provider, ..
+                })),
         }) = cli.command
         else {
             panic!("expected sandbox provider attach command");
@@ -4147,6 +4232,68 @@ mod tests {
 
         assert_eq!(name, "work-sandbox");
         assert_eq!(provider, "work-github");
+    }
+
+    #[test]
+    fn provider_readiness_commands_have_bounded_waits_and_structured_output() {
+        for action in ["attach", "detach", "status"] {
+            let cli = Cli::try_parse_from([
+                "openshell",
+                "sandbox",
+                "provider",
+                action,
+                "sandbox",
+                "provider",
+                "--wait",
+                "--timeout",
+                "45",
+                "--output",
+                "json",
+            ])
+            .expect("readiness flags should parse");
+            let Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Provider(command)),
+            }) = cli.command
+            else {
+                panic!("expected provider command")
+            };
+            let (SandboxProviderCommands::Attach { readiness, .. }
+            | SandboxProviderCommands::Detach { readiness, .. }
+            | SandboxProviderCommands::Status { readiness, .. }) = command
+            else {
+                panic!("expected readiness command");
+            };
+            assert!(readiness.wait);
+            assert_eq!(readiness.timeout, 45);
+            assert_eq!(readiness.output.as_str(), "json");
+        }
+        for timeout in ["0", "3601"] {
+            assert!(
+                Cli::try_parse_from([
+                    "openshell",
+                    "provider",
+                    "update",
+                    "provider",
+                    "--wait",
+                    "--timeout",
+                    timeout,
+                ])
+                .is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "sandbox",
+                "provider",
+                "status",
+                "sandbox",
+                "provider",
+                "--receipt",
+                "receipt-id",
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

@@ -62,21 +62,23 @@ binding error.
 
 ```bash
 openshell sandbox provider list <sandbox>
-openshell sandbox provider attach <sandbox> <provider>
+openshell sandbox provider attach <sandbox> <provider> --wait --timeout 30
 ```
 
-Launch a new process after attaching a provider so it inherits newly available
-credential placeholders:
+Save the change's `receipt_id` and use `openshell sandbox provider status <sandbox> <provider> --receipt <receipt-id> --wait --timeout 30` to check when it takes effect. Success confirms that the sandbox applied the credentials, policy, and environment for new processes. If the result is pending, failed, withheld, or superseded, inspect its reason before launching the client.
+
+Launch the client after the attachment wait succeeds so it receives the updated environment:
 
 ```bash
-openshell sandbox exec <sandbox> -- env
+openshell sandbox exec <sandbox> -- <client-command>
 ```
 
-Do not print or copy credential values into diagnostic output. Detaching a
-provider revokes its policy and credential access:
+After updating an ordinary static provider, wait for that change and launch a new client. An existing process keeps its revision-scoped reference; readiness does not make the old reference resolve the replacement value. Diagnose managed-refresh credentials according to their own lifecycle.
+
+Keep credentials and issued references out of diagnostic output. Acknowledged detach revokes future credential resolution and removes the reference from future process environments. Requests already forwarded may still finish:
 
 ```bash
-openshell sandbox provider detach <sandbox> <provider>
+openshell sandbox provider detach <sandbox> <provider> --wait --timeout 30
 ```
 
 ### 4. Verify Native Client Configuration

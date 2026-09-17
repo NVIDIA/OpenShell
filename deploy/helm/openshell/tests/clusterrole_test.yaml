@@ -69,7 +69,7 @@ tests:
             resourceNames: ["custom-client-tls"]
             verbs: ["get", "patch"]
 
-  - it: limits operator bootstrap secret access to create when TLS and credential storage are disabled
+  - it: grants operator bootstrap secret lifecycle permissions when TLS and credential storage are disabled
     set:
       server.drivers.kubernetes.workspaceMode: operator
       server.disableTls: true
@@ -79,7 +79,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create"]
+            verbs: ["create", "list", "delete"]
       - notContains:
           path: rules
           content:
@@ -107,7 +107,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create"]
+            verbs: ["create", "list", "delete"]
 
   - it: restricts managed copies to image-pull secrets when TLS is disabled
     set:
@@ -128,7 +128,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create"]
+            verbs: ["create", "list", "delete"]
 
   - it: omits secrets rule entirely in shared mode
     set:
@@ -162,7 +162,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create"]
+            verbs: ["create", "list", "delete"]
 
   - it: grants operator sandbox-runtime companion permissions
     set:
@@ -185,4 +185,4 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create"]
+            verbs: ["create", "list", "delete"]

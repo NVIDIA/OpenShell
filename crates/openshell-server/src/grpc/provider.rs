@@ -50,7 +50,7 @@ const GATEWAY_SPIFFE_WORKLOAD_API_SOCKET: &str = "OPENSHELL_GATEWAY_SPIFFE_WORKL
 /// response.  Key names are preserved so callers can display credential counts
 /// and key listings. Internal server paths (sandbox env
 /// injection) read credentials from the store directly and are unaffected.
-fn redact_provider_credentials(mut provider: Provider) -> Provider {
+pub(super) fn redact_provider_credentials(mut provider: Provider) -> Provider {
     for value in provider.credentials.values_mut() {
         *value = "REDACTED".to_string();
     }
@@ -66,6 +66,9 @@ fn redact_provider_credentials(mut provider: Provider) -> Provider {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct ProviderEnvironment {
+    /// A closed reason for omitted injectable material. An empty environment
+    /// alone cannot distinguish successful revocation from withheld authority.
+    pub readiness_reason: openshell_core::proto::ProviderReadinessReason,
     pub environment: HashMap<String, String>,
     pub credential_expiration_times: HashMap<String, i64>,
     pub dynamic_credentials: HashMap<String, ProviderProfileCredential>,
@@ -455,16 +458,12 @@ async fn update_provider_record_validating(
         candidate.object_name(),
         candidate.object_workspace(),
         candidate.object_id(),
-        &removed_credential_handles,
         &updated_credential_values,
         &existing_handles,
     )
     .await?;
     for key in credential_update.pre_stored_handles.keys() {
         candidate.credential_handles.remove(key);
-        candidate.credentials.remove(key);
-    }
-    for key in credential_update.deferred_store_values.keys() {
         candidate.credentials.remove(key);
     }
     if credentials.is_some_and(crate::credentials::CredentialRuntime::stores_provider_credentials) {
@@ -533,16 +532,25 @@ async fn update_provider_record_validating(
         }
     };
 
-    finish_provider_credential_update(
+    // The provider CAS already excludes these handles. Keep the committed
+    // result and its receipts available if retirement fails; the unused
+    // backend objects still require cleanup.
+    if let Err(err) = finish_provider_credential_update(
         credentials,
         candidate.object_name(),
         candidate.object_workspace(),
         candidate.object_id(),
         credential_update,
         &removed_credential_handles,
-        &existing_handles,
     )
-    .await?;
+    .await
+    {
+        warn!(
+            provider_name = %candidate.object_name(),
+            code = ?err.code(),
+            "failed to retire unused provider credentials after publication"
+        );
+    }
 
     // Update resource_version from successful write
     if let Some(metadata) = candidate.metadata.as_mut() {
@@ -784,16 +792,17 @@ fn credential_handles_removed_by_update(
 #[derive(Debug, Clone, Default)]
 struct ProviderCredentialUpdate {
     pre_stored_handles: HashMap<String, CredentialHandle>,
-    deferred_store_values: HashMap<String, String>,
     replaced_handles: HashMap<String, CredentialHandle>,
 }
 
+// Each candidate owns distinct backend objects before its provider CAS. A
+// published resource version therefore identifies fully stored credentials,
+// and a concurrent loser cannot overwrite the winner's credential values.
 async fn prepare_provider_credential_update(
     credentials: Option<&crate::credentials::CredentialRuntime>,
     provider_name: &str,
     workspace: &str,
     provider_id: &str,
-    _removed_handles: &HashMap<String, CredentialHandle>,
     updated_values: &HashMap<String, String>,
     existing_handles: &HashMap<String, CredentialHandle>,
 ) -> Result<ProviderCredentialUpdate, Status> {
@@ -804,42 +813,41 @@ async fn prepare_provider_credential_update(
         return Ok(ProviderCredentialUpdate::default());
     }
 
-    let mut update = ProviderCredentialUpdate::default();
-    let mut values_requiring_new_handles = HashMap::new();
-    for (credential_key, value) in updated_values {
-        match existing_handles.get(credential_key) {
-            Some(existing_handle) if credentials.storage_owns_handle(existing_handle) => {
-                update
-                    .deferred_store_values
-                    .insert(credential_key.clone(), value.clone());
-            }
-            Some(replaced_handle) => {
-                values_requiring_new_handles.insert(credential_key.clone(), value.clone());
-                update
-                    .replaced_handles
-                    .insert(credential_key.clone(), replaced_handle.clone());
-            }
-            None => {
-                values_requiring_new_handles.insert(credential_key.clone(), value.clone());
-            }
-        }
-    }
-
-    if !values_requiring_new_handles.is_empty() {
-        update.pre_stored_handles = credentials
-            .store_provider_credentials(
-                provider_name,
-                workspace,
-                provider_id,
-                &values_requiring_new_handles,
-                &HashMap::new(),
+    let object_id = uuid::Uuid::new_v4().to_string();
+    let pre_stored_handles = credentials
+        .store_provider_credentials_with_object_id(
+            provider_name,
+            workspace,
+            provider_id,
+            &object_id,
+            updated_values,
+            &HashMap::new(),
+        )
+        .await
+        .map_err(|err| {
+            Status::new(
+                err.code(),
+                "credential storage failed before provider publication",
             )
-            .await?;
-    }
+        })?;
+    let replaced_handles = updated_values
+        .keys()
+        .filter_map(|key| {
+            existing_handles
+                .get(key)
+                .map(|handle| (key.clone(), handle.clone()))
+        })
+        .collect();
 
-    Ok(update)
+    Ok(ProviderCredentialUpdate {
+        pre_stored_handles,
+        replaced_handles,
+    })
 }
 
+// Retire only handles replaced by the successful provider CAS. Readers of an
+// older record can fail resolution after retirement, but cannot resolve its
+// handles to credential values from a different provider resource version.
 async fn finish_provider_credential_update(
     credentials: Option<&crate::credentials::CredentialRuntime>,
     provider_name: &str,
@@ -847,25 +855,12 @@ async fn finish_provider_credential_update(
     provider_id: &str,
     update: ProviderCredentialUpdate,
     removed_handles: &HashMap<String, CredentialHandle>,
-    existing_handles: &HashMap<String, CredentialHandle>,
 ) -> Result<(), Status> {
     let Some(credentials) = credentials else {
         return Ok(());
     };
     if !credentials.stores_provider_credentials() {
         return Ok(());
-    }
-
-    if !update.deferred_store_values.is_empty() {
-        credentials
-            .store_provider_credentials(
-                provider_name,
-                workspace,
-                provider_id,
-                &update.deferred_store_values,
-                existing_handles,
-            )
-            .await?;
     }
 
     let mut handles_to_delete = removed_handles.clone();
@@ -878,17 +873,21 @@ async fn finish_provider_credential_update(
                 provider_id,
                 &handles_to_delete,
             )
-            .await?;
+            .await
+            .map_err(|err| {
+                Status::new(
+                    err.code(),
+                    "credential retirement failed after provider publication",
+                )
+            })?;
     }
 
     Ok(())
 }
 
-// TODO(credential-drivers): A gateway crash between CAS success and
-// finish_provider_credential_update leaves replaced/removed credential handles
-// orphaned in the backing store. This best-effort cleanup only covers pre-CAS
-// failures. A background reconciliation loop should be added to detect and
-// reclaim orphaned handles.
+// A failed CAS never owns the published handles. Best-effort cleanup removes
+// only this candidate's staged objects; a crash may leave unused backend objects
+// but cannot change the credential data named by the committed provider record.
 async fn cleanup_pre_stored_provider_credentials(
     credentials: Option<&crate::credentials::CredentialRuntime>,
     provider_name: &str,
@@ -908,7 +907,7 @@ async fn cleanup_pre_stored_provider_credentials(
     {
         warn!(
             provider_name = %provider_name,
-            error = %err,
+            code = ?err.code(),
             "failed to clean up staged provider credentials after provider update failure"
         );
     }
@@ -1128,6 +1127,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
     let mut expires = HashMap::new();
     let mut static_credential_bindings = HashMap::new();
     let mut static_credential_keys = HashSet::new();
+    let mut readiness_reason = openshell_core::proto::ProviderReadinessReason::Unspecified;
     let now_ms = crate::persistence::current_time_ms();
     validate_provider_environment_records_unique_at(store, catalog, records, now_ms).await?;
     let registry = openshell_providers::ProviderRegistry::new();
@@ -1209,6 +1209,8 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                     key = %key,
                     "withholding provider credential not declared by resolved profile"
                 );
+                readiness_reason =
+                    openshell_core::proto::ProviderReadinessReason::CredentialsWithheld;
                 continue;
             }
             if is_non_injectable_provider_credential(provider, key)
@@ -1232,6 +1234,8 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                         key = %key,
                         "withholding static provider credential from endpointless profile"
                     );
+                    readiness_reason =
+                        openshell_core::proto::ProviderReadinessReason::CredentialsWithheld;
                     continue;
                 }
                 let expires_at_ms = provider
@@ -1248,6 +1252,8 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                             expires_at_ms,
                             "skipping expired provider credential"
                         );
+                        readiness_reason =
+                            openshell_core::proto::ProviderReadinessReason::CredentialExpired;
                         continue;
                     }
                     expires.entry(key.clone()).or_insert(expires_at_ms);
@@ -1283,6 +1289,15 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         let resolved_refs = credentials
             .resolve_provider_handles(provider, now_ms)
             .await?;
+        // Expired handles are removed by the credential runtime before values
+        // reach this loop. Preserve omission evidence without exposing handles.
+        if provider.credential_handles.keys().any(|key| {
+            !is_non_injectable_provider_credential(provider, key)
+                && !broker_only_credential_keys.contains(key)
+                && !resolved_refs.values.contains_key(key)
+        }) {
+            readiness_reason = openshell_core::proto::ProviderReadinessReason::CredentialExpired;
+        }
         for (key, value) in resolved_refs.values {
             if accepted_stored_credential_keys
                 .as_ref()
@@ -1293,6 +1308,8 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                     key = %key,
                     "withholding provider credential handle not declared by resolved profile"
                 );
+                readiness_reason =
+                    openshell_core::proto::ProviderReadinessReason::CredentialsWithheld;
                 continue;
             }
             if is_non_injectable_provider_credential(provider, &key)
@@ -1312,6 +1329,8 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                         key = %key,
                         "withholding static provider credential handle from endpointless profile"
                     );
+                    readiness_reason =
+                        openshell_core::proto::ProviderReadinessReason::CredentialsWithheld;
                     continue;
                 }
                 if let Some(expires_at_ms) = resolved_refs.expires_at_ms.get(&key).copied() {
@@ -1356,6 +1375,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
     }
 
     Ok(ProviderEnvironment {
+        readiness_reason,
         environment: env,
         credential_expiration_times: expires,
         dynamic_credentials: resolve_dynamic_credentials_from_records(catalog, records),
@@ -2503,6 +2523,7 @@ pub(super) async fn handle_create_provider(
             );
             Ok(Response::new(ProviderResponse {
                 provider: Some(provider),
+                ..Default::default()
             }))
         }
         Err(err) => {
@@ -2537,6 +2558,7 @@ pub(super) async fn handle_get_provider(
 
     Ok(Response::new(ProviderResponse {
         provider: Some(provider),
+        ..Default::default()
     }))
 }
 
@@ -2689,6 +2711,7 @@ pub(super) async fn handle_import_provider_profiles(
     request: Request<ImportProviderProfilesRequest>,
 ) -> Result<Response<ImportProviderProfilesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let request = request.into_inner();
     let workspace = authorize_and_resolve_profile_workspace(
         state,
@@ -2758,6 +2781,7 @@ pub(super) async fn handle_import_provider_profiles(
         if let Some(metadata) = stored.metadata.as_mut() {
             metadata.resource_version = result.resource_version;
         }
+        replay_facts.resource(&stored)?;
         let resource_version = stored_profile_resource_version(&stored);
         imported.push(profile_response_payload(
             stored.profile.unwrap_or_default(),
@@ -2777,6 +2801,7 @@ pub(super) async fn handle_update_provider_profiles(
     request: Request<UpdateProviderProfilesRequest>,
 ) -> Result<Response<UpdateProviderProfilesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let request = request.into_inner();
     let workspace = authorize_and_resolve_profile_workspace(
         state,
@@ -2891,6 +2916,7 @@ pub(super) async fn handle_update_provider_profiles(
     if let Some(metadata) = stored.metadata.as_mut() {
         metadata.resource_version = result.resource_version;
     }
+    replay_facts.resource(&stored)?;
     let resource_version = stored_profile_resource_version(&stored);
     let profile = profile_response_payload(stored.profile.unwrap_or_default(), resource_version);
 
@@ -3751,6 +3777,13 @@ pub(super) async fn handle_update_provider(
     if state.credentials.stores_provider_credentials() && !provider.credentials.is_empty() {
         state.compute.ensure_workspace(&workspace).await?;
     }
+    // Freeze this operation's target identities before updating authority.
+    // Attachments made later are separate operations; frozen attachment epochs
+    // prevent an intervening detach/reattach from satisfying an older receipt.
+    let targets =
+        sandboxes_using_provider_records(state.store.as_ref(), &workspace, provider.object_name())
+            .await?;
+    let mutation_id = uuid::Uuid::new_v4().to_string();
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -3766,6 +3799,24 @@ pub(super) async fn handle_update_provider(
     .await;
     match result {
         Ok(provider) => {
+            let provider_version = provider
+                .metadata
+                .as_ref()
+                .map_or(0, |metadata| metadata.resource_version);
+            let mut target_receipts = Vec::with_capacity(targets.len());
+            for sandbox in &targets {
+                target_receipts.push(
+                    super::provider_readiness::record_provider_mutation(
+                        state,
+                        sandbox,
+                        provider.object_name(),
+                        openshell_core::proto::ProviderMutationKind::Update,
+                        Some((provider.object_id(), provider_version)),
+                        &mutation_id,
+                    )
+                    .await?,
+                );
+            }
             emit_provider_lifecycle(
                 &provider.r#type,
                 LifecycleOperation::Update,
@@ -3773,6 +3824,8 @@ pub(super) async fn handle_update_provider(
             );
             Ok(Response::new(ProviderResponse {
                 provider: Some(provider),
+                target_receipts,
+                mutation_id,
             }))
         }
         Err(err) => {
@@ -4331,6 +4384,7 @@ pub(super) async fn handle_configure_provider_refresh(
     request: Request<ConfigureProviderRefreshRequest>,
 ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let request = request.into_inner();
     let authz = authorize_workspace_selector(
         &state.store,
@@ -4729,6 +4783,7 @@ pub(super) async fn handle_configure_provider_refresh(
             .await?;
     }
 
+    replay_facts.refresh(&state_record)?;
     Ok(Response::new(ConfigureProviderRefreshResponse {
         status: Some(crate::provider_refresh::refresh_status_from_state(
             &state_record,
@@ -4741,6 +4796,7 @@ pub(super) async fn handle_rotate_provider_credential(
     request: Request<RotateProviderCredentialRequest>,
 ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let request = request.into_inner();
     let authz = authorize_workspace_selector(
         &state.store,
@@ -4771,6 +4827,7 @@ pub(super) async fn handle_rotate_provider_credential(
     )
     .await?;
 
+    replay_facts.refresh(&refresh_state)?;
     Ok(Response::new(RotateProviderCredentialResponse {
         status: Some(crate::provider_refresh::refresh_status_from_state(
             &refresh_state,
@@ -5220,6 +5277,7 @@ mod tests {
         handle_import_provider_profiles(
             state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(profile),
                     source: format!("{id}.yaml"),
@@ -5360,6 +5418,7 @@ mod tests {
         let response = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(profile),
                     source: "grant-new.yaml".to_string(),
@@ -5388,6 +5447,7 @@ mod tests {
             handle_import_provider_profiles(
                 &task_state,
                 authed_request(ImportProviderProfilesRequest {
+                    request_id: String::new(),
                     profiles: vec![ProviderProfileImportItem {
                         profile: Some(custom_profile("guarded-import")),
                         source: "guarded-import.yaml".to_string(),
@@ -5441,6 +5501,7 @@ mod tests {
         let response = handle_update_provider_profiles(
             &state,
             authed_request(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
                     profile: Some(updated_profile.clone()),
                     source: "custom-api.yaml".to_string(),
@@ -5486,6 +5547,7 @@ mod tests {
         let built_in = handle_update_provider_profiles(
             &state,
             authed_request(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
                     profile: Some(custom_profile("github")),
                     source: "github.yaml".to_string(),
@@ -5508,6 +5570,7 @@ mod tests {
         let missing = handle_update_provider_profiles(
             &state,
             authed_request(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
                     profile: Some(custom_profile("missing-custom")),
                     source: "missing-custom.yaml".to_string(),
@@ -5540,6 +5603,7 @@ mod tests {
         let missing_version = handle_update_provider_profiles(
             &state,
             authed_request(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
                     profile: Some(custom_profile("custom-api")),
                     source: "custom-api.yaml".to_string(),
@@ -5563,6 +5627,7 @@ mod tests {
         let stale_error = handle_update_provider_profiles(
             &state,
             authed_request(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
                     profile: Some(stale_profile),
                     source: "custom-api.yaml".to_string(),
@@ -5612,6 +5677,7 @@ mod tests {
         let response = handle_update_provider_profiles(
             &state,
             authed_request(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
                     profile: Some(edited_payload),
                     source: "profile-a.yaml".to_string(),
@@ -5696,6 +5762,7 @@ mod tests {
         let response = handle_update_provider_profiles(
             &state,
             authed_request(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
                     profile: Some(profile),
                     source: "grant-updated.yaml".to_string(),
@@ -5880,6 +5947,7 @@ mod tests {
         handle_import_provider_profiles(
             state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(profile),
                     source: format!("{id}.yaml"),
@@ -6108,6 +6176,7 @@ mod tests {
         let response = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("custom-api")),
                     source: "custom-api.yaml".to_string(),
@@ -6179,6 +6248,7 @@ mod tests {
                     source: "duration-api.proto".to_string(),
                 }],
                 workspace: "default".to_string(),
+                request_id: String::new(),
             }),
         )
         .await
@@ -6234,6 +6304,7 @@ mod tests {
                     source: "invalid-duration-api.proto".to_string(),
                 }],
                 workspace: "default".to_string(),
+                request_id: String::new(),
             }),
         )
         .await
@@ -6260,6 +6331,7 @@ mod tests {
         let imported = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(initial_profile),
                     source: "fanout.yaml".to_string(),
@@ -6328,6 +6400,7 @@ mod tests {
         let response = handle_update_provider_profiles(
             &state,
             authed_request(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
                     profile: Some(conflicting_profile),
                     source: "fanout.yaml".to_string(),
@@ -6368,6 +6441,7 @@ mod tests {
         let response = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("github")),
                     source: "github.yaml".to_string(),
@@ -6396,6 +6470,7 @@ mod tests {
         let response = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("custom-llm")),
                     source: "custom-llm.yaml".to_string(),
@@ -6431,6 +6506,7 @@ mod tests {
         let response = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![
                     ProviderProfileImportItem {
                         profile: Some(custom_profile(" alex-api ")),
@@ -6469,6 +6545,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("alex-api")),
                     source: "alex-api.yaml".to_string(),
@@ -6496,6 +6573,7 @@ mod tests {
         let deleted = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 id: " Alex-API ".to_string(),
                 workspace: "default".to_string(),
@@ -6517,6 +6595,7 @@ mod tests {
         let response = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![
                     ProviderProfileImportItem {
                         profile: Some(custom_profile("bulk-one")),
@@ -6566,6 +6645,7 @@ mod tests {
         let response = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(ProviderProfile {
                         id: "advanced-api".to_string(),
@@ -6693,6 +6773,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("scoped-lint")),
                     source: "scoped-lint.yaml".to_string(),
@@ -6730,6 +6811,7 @@ mod tests {
         crate::grpc::workspace::handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "alpha".to_string(),
                 labels: HashMap::new(),
             }),
@@ -6765,6 +6847,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("custom-api")),
                     source: "custom-api.yaml".to_string(),
@@ -6778,6 +6861,7 @@ mod tests {
         let builtin_err = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 id: "github".to_string(),
                 workspace: "default".to_string(),
@@ -6819,6 +6903,7 @@ mod tests {
         let in_use_err = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 id: "custom-api".to_string(),
                 workspace: "default".to_string(),
@@ -6832,6 +6917,7 @@ mod tests {
         let attached = super::super::sandbox::handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "sandbox-custom".to_string(),
                 provider_name: "custom-provider".to_string(),
                 expected_resource_version: 0,
@@ -6871,6 +6957,7 @@ mod tests {
         let err = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 id: "global-custom".to_string(),
                 workspace: String::new(),
@@ -6920,6 +7007,7 @@ mod tests {
         let response = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
@@ -7015,6 +7103,7 @@ mod tests {
         handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
@@ -7087,6 +7176,7 @@ mod tests {
         let deleted = handle_delete_provider_refresh(
             &state,
             authed_request(DeleteProviderRefreshRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -7153,6 +7243,7 @@ mod tests {
         .await
         .unwrap();
         let request = |client_secret: &str| ConfigureProviderRefreshRequest {
+            request_id: String::new(),
             provider: "configure-conflict".to_string(),
             credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
             strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
@@ -7275,6 +7366,7 @@ mod tests {
             first_state.credentials.clone(),
         ));
         let request = |client_secret: &str| ConfigureProviderRefreshRequest {
+            request_id: String::new(),
             provider: "configure-create-race".to_string(),
             credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
             strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
@@ -7406,6 +7498,7 @@ mod tests {
         handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "provider-a".to_string(),
                 credential_key: "REFRESH_TOKEN".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
@@ -7490,6 +7583,7 @@ mod tests {
         handle_delete_provider_refresh(
             &state,
             authed_request(DeleteProviderRefreshRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 provider: "provider-a".to_string(),
                 credential_key: "REFRESH_TOKEN".to_string(),
@@ -7549,6 +7643,7 @@ mod tests {
         let response = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "vertex-sa".to_string(),
                 credential_key: "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt as i32,
@@ -7622,6 +7717,7 @@ mod tests {
         handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
@@ -7673,6 +7769,7 @@ mod tests {
         let deleted = handle_delete_provider_refresh(
             &state,
             authed_request(DeleteProviderRefreshRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -7735,6 +7832,7 @@ mod tests {
         handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "aws-delete".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
@@ -7794,6 +7892,7 @@ mod tests {
         handle_delete_provider_refresh(
             &state,
             authed_request(DeleteProviderRefreshRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 provider: "aws-delete".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
@@ -7985,6 +8084,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "refreshing-graph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
@@ -8067,6 +8167,7 @@ mod tests {
         handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "first-graph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
@@ -8088,6 +8189,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "second-graph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
@@ -8149,6 +8251,7 @@ mod tests {
         let endpoint_override = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
@@ -8176,6 +8279,7 @@ mod tests {
         let missing_material = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
@@ -8232,6 +8336,7 @@ mod tests {
             let err = handle_configure_provider_refresh(
                 &state,
                 authed_request(ConfigureProviderRefreshRequest {
+                    request_id: String::new(),
                     provider: "msgraph".to_string(),
                     credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                     strategy: strategy as i32,
@@ -8265,6 +8370,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("custom-api")),
                     source: "custom-api.yaml".to_string(),
@@ -8278,6 +8384,7 @@ mod tests {
         let deleted = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 id: "custom-api".to_string(),
                 workspace: "default".to_string(),
@@ -8318,6 +8425,7 @@ mod tests {
             handle_delete_provider_profile(
                 &task_state,
                 authed_request(DeleteProviderProfileRequest {
+                    request_id: String::new(),
                     allow_missing: false,
                     id: "guarded-delete".to_string(),
                     workspace: "default".to_string(),
@@ -8351,6 +8459,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("guarded-create")),
                     source: "guarded-create.yaml".to_string(),
@@ -8370,6 +8479,7 @@ mod tests {
             handle_create_provider(
                 &task_state,
                 authed_request(CreateProviderRequest {
+                    request_id: String::new(),
                     provider: Some(provider),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
@@ -8575,7 +8685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_provider_record_overwrites_credentials_with_runtime() {
+    async fn update_provider_credential_publication_waits_for_staged_storage() {
         let store = test_store().await;
         let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
         let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
@@ -8605,16 +8715,40 @@ mod tests {
             .handle
             .clone();
 
-        let updated = update_provider_record_validating(
+        let (store_hit, release_store) = credentials.gate_next_store();
+        let update = update_provider_record_validating(
             &store,
             "default",
             &catalog,
             provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-second"),
             &[],
             Some(&credentials),
-        )
-        .await
-        .unwrap();
+        );
+        let inspect_while_storage_pending = async {
+            store_hit.await.unwrap();
+            let published = store
+                .get_message_by_name::<Provider>("default", "openai-local")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(published, stored_first);
+            let resolved = resolve_provider_environment_with_credentials(
+                &store,
+                &catalog,
+                "default",
+                &["openai-local".to_string()],
+                &credentials,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                resolved.get("OPENAI_API_KEY").map(String::as_str),
+                Some("sk-first")
+            );
+            release_store.send(()).unwrap();
+        };
+        let (updated, ()) = tokio::join!(update, inspect_while_storage_pending);
+        let updated = updated.unwrap();
         assert_eq!(
             updated
                 .credentials
@@ -8630,13 +8764,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(stored_second.credentials.is_empty());
-        assert_eq!(
+        assert_ne!(
             stored_second
                 .credential_handles
                 .get("OPENAI_API_KEY")
                 .map(|handle| handle.handle.as_str()),
             Some(first_handle.as_str())
         );
+        assert_eq!(
+            stored_second.metadata.as_ref().unwrap().resource_version,
+            stored_first.metadata.as_ref().unwrap().resource_version + 1
+        );
+        assert_eq!(credentials.stored_credential_count(), Some(1));
 
         let result = resolve_provider_environment_with_credentials(
             &store,
@@ -8648,6 +8787,376 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.get("OPENAI_API_KEY"), Some(&"sk-second".to_string()));
+    }
+
+    #[tokio::test]
+    async fn update_provider_credential_store_failure_preserves_published_revision() {
+        let store = test_store().await;
+        let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap();
+        create_provider_record_validating(
+            &store,
+            "default",
+            &catalog,
+            provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-first"),
+            Some(&credentials),
+        )
+        .await
+        .unwrap();
+        let before = store
+            .get_message_by_name::<Provider>("default", "openai-local")
+            .await
+            .unwrap()
+            .unwrap();
+        credentials.fail_next_store();
+
+        let error = update_provider_record_validating(
+            &store,
+            "default",
+            &catalog,
+            provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-failed"),
+            &[],
+            Some(&credentials),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::Unavailable);
+        assert_eq!(
+            error.message(),
+            "credential storage failed before provider publication"
+        );
+        let after = store
+            .get_message_by_name::<Provider>("default", "openai-local")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, before);
+        assert_eq!(credentials.stored_credential_count(), Some(1));
+        let resolved = resolve_provider_environment_with_credentials(
+            &store,
+            &catalog,
+            "default",
+            &["openai-local".to_string()],
+            &credentials,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-first")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_provider_credential_publication_cas_loser_preserves_winner() {
+        let store = test_store().await;
+        let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap();
+        create_provider_record_validating(
+            &store,
+            "default",
+            &catalog,
+            provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-first"),
+            Some(&credentials),
+        )
+        .await
+        .unwrap();
+        let initial = store
+            .get_message_by_name::<Provider>("default", "openai-local")
+            .await
+            .unwrap()
+            .unwrap();
+        let (store_hit, release_store) = credentials.gate_next_store();
+
+        // Pause one writer after it reads the provider version. A second writer
+        // publishes while it waits, so only a database CAS can reject the loser.
+        let loser = update_provider_record_validating(
+            &store,
+            "default",
+            &catalog,
+            provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-loser"),
+            &[],
+            Some(&credentials),
+        );
+        let winner = async {
+            store_hit.await.unwrap();
+            let result = update_provider_record_validating(
+                &store,
+                "default",
+                &catalog,
+                provider_with_credential_value(
+                    "openai-local",
+                    "openai",
+                    "OPENAI_API_KEY",
+                    "sk-winner",
+                ),
+                &[],
+                Some(&credentials),
+            )
+            .await;
+            release_store.send(()).unwrap();
+            result
+        };
+        let (loser_result, winner_result) = tokio::join!(loser, winner);
+
+        assert_eq!(loser_result.unwrap_err().code(), Code::Aborted);
+        winner_result.unwrap();
+        let published = store
+            .get_message_by_name::<Provider>("default", "openai-local")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            published.metadata.as_ref().unwrap().resource_version,
+            initial.metadata.as_ref().unwrap().resource_version + 1
+        );
+        assert_eq!(credentials.stored_credential_count(), Some(1));
+        let resolved = resolve_provider_environment_with_credentials(
+            &store,
+            &catalog,
+            "default",
+            &["openai-local".to_string()],
+            &credentials,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-winner")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_provider_receipts_freeze_targets_before_credential_publication() {
+        let state = test_server_state().await;
+        handle_create_provider(
+            &state,
+            authed_request(CreateProviderRequest {
+                request_id: String::new(),
+                provider: Some(provider_with_credential_value(
+                    "openai-local",
+                    "openai",
+                    "OPENAI_API_KEY",
+                    "sk-first",
+                )),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        )
+        .await
+        .unwrap();
+        for name in ["first", "second", "late"] {
+            state
+                .store
+                .put_message(&Sandbox {
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: name.to_string(),
+                        name: name.to_string(),
+                        workspace: "default".to_string(),
+                        ..Default::default()
+                    }),
+                    spec: Some(SandboxSpec {
+                        providers: if name == "late" {
+                            Vec::new()
+                        } else {
+                            vec!["openai-local".to_string()]
+                        },
+                        provider_attachment_epoch: format!("epoch-{name}"),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let (store_hit, release_store) = state.credentials.gate_next_store();
+        let update = handle_update_provider(
+            &state,
+            authed_request(UpdateProviderRequest {
+                request_id: String::new(),
+                provider: Some(provider_with_credential_value(
+                    "openai-local",
+                    "openai",
+                    "OPENAI_API_KEY",
+                    "sk-second",
+                )),
+                credential_expiration_times: HashMap::new(),
+                clear_credential_expiration_keys: Vec::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        );
+        let attach_from_another_replica = async {
+            store_hit.await.unwrap();
+            // Another gateway's attachment is outside the captured target set,
+            // even when its write reaches the database before provider publish.
+            state
+                .store
+                .update_message_cas::<Sandbox, _>("late", 0, |sandbox| {
+                    let spec = sandbox.spec.as_mut().unwrap();
+                    spec.providers.push("openai-local".to_string());
+                    spec.provider_attachment_epoch = "epoch-late-attached".to_string();
+                })
+                .await
+                .unwrap();
+            release_store.send(()).unwrap();
+        };
+        let (response, ()) = tokio::join!(update, attach_from_another_replica);
+        let response = response.unwrap().into_inner();
+        let provider = response.provider.as_ref().unwrap();
+        let targets: HashSet<_> = response
+            .target_receipts
+            .iter()
+            .map(|receipt| receipt.desired.as_ref().unwrap().sandbox_name.as_str())
+            .collect();
+        assert_eq!(targets, HashSet::from(["first", "second"]));
+        assert!(!response.mutation_id.is_empty());
+        for receipt in &response.target_receipts {
+            assert_eq!(receipt.mutation_id, response.mutation_id);
+            assert_eq!(
+                receipt.kind,
+                openshell_core::proto::ProviderMutationKind::Update as i32
+            );
+            let desired = receipt.desired.as_ref().unwrap();
+            assert_eq!(desired.provider_id, provider.object_id());
+            assert_eq!(
+                desired.provider_resource_version,
+                provider.metadata.as_ref().unwrap().resource_version
+            );
+            assert_eq!(
+                desired.attachment_epoch,
+                format!("epoch-{}", desired.sandbox_name)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_provider_retirement_failure_preserves_publication_and_receipts() {
+        let state = test_server_state().await;
+        handle_create_provider(
+            &state,
+            authed_request(CreateProviderRequest {
+                request_id: String::new(),
+                provider: Some(provider_with_credential_value(
+                    "openai-local",
+                    "openai",
+                    "OPENAI_API_KEY",
+                    "sk-first",
+                )),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        )
+        .await
+        .unwrap();
+        let initial = state
+            .store
+            .get_message_by_name::<Provider>("default", "openai-local")
+            .await
+            .unwrap()
+            .unwrap();
+        let initial_version = initial.metadata.as_ref().unwrap().resource_version;
+        let mut target_epochs = HashMap::new();
+        for name in ["s1", "s2"] {
+            let attachment_epoch = uuid::Uuid::new_v4().to_string();
+            state
+                .store
+                .put_message(&Sandbox {
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: name.to_string(),
+                        workspace: "default".to_string(),
+                        ..Default::default()
+                    }),
+                    spec: Some(SandboxSpec {
+                        providers: vec!["openai-local".to_string()],
+                        provider_attachment_epoch: attachment_epoch.clone(),
+                        policy: Some(openshell_policy::restrictive_default_policy()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            target_epochs.insert(name, attachment_epoch);
+        }
+
+        // Only old-object retirement fails: staging and the provider CAS must
+        // still publish the replacement and preserve every selected receipt.
+        state.credentials.fail_next_delete();
+        let result = handle_update_provider(
+            &state,
+            authed_request(UpdateProviderRequest {
+                request_id: String::new(),
+                provider: Some(provider_with_credential_value(
+                    "openai-local",
+                    "openai",
+                    "OPENAI_API_KEY",
+                    "sk-second",
+                )),
+                credential_expiration_times: HashMap::new(),
+                clear_credential_expiration_keys: Vec::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        )
+        .await;
+
+        let published = state
+            .store
+            .get_message_by_name::<Provider>("default", "openai-local")
+            .await
+            .unwrap()
+            .unwrap();
+        let published_version = published.metadata.as_ref().unwrap().resource_version;
+        assert_eq!(published_version, initial_version + 1);
+        assert_ne!(published.credential_handles, initial.credential_handles);
+        let resolved = state
+            .credentials
+            .resolve_provider_handles(&published, crate::persistence::current_time_ms())
+            .await
+            .unwrap();
+        assert_eq!(resolved.values["OPENAI_API_KEY"], "sk-second");
+        assert_eq!(state.credentials.stored_credential_count(), Some(2));
+
+        let response = result
+            .expect("published credential rotation must return its mutation receipts")
+            .into_inner();
+        let provider = response.provider.as_ref().unwrap();
+        assert_eq!(provider.object_id(), published.object_id());
+        assert_eq!(
+            provider.metadata.as_ref().unwrap().resource_version,
+            published_version
+        );
+        assert!(!response.mutation_id.is_empty());
+        let targets: HashSet<_> = response
+            .target_receipts
+            .iter()
+            .map(|receipt| receipt.desired.as_ref().unwrap().sandbox_name.as_str())
+            .collect();
+        assert_eq!(targets, HashSet::from(["s1", "s2"]));
+        assert_eq!(response.target_receipts.len(), target_epochs.len());
+        for receipt in &response.target_receipts {
+            assert!(!receipt.receipt_id.is_empty());
+            assert_eq!(receipt.mutation_id, response.mutation_id);
+            assert_eq!(
+                receipt.kind,
+                openshell_core::proto::ProviderMutationKind::Update as i32
+            );
+            let desired = receipt.desired.as_ref().unwrap();
+            assert_eq!(desired.provider_id, published.object_id());
+            assert_eq!(desired.provider_resource_version, published_version);
+            assert_eq!(
+                desired.attachment_epoch,
+                target_epochs[desired.sandbox_name.as_str()]
+            );
+            assert!(!desired.policy_hash.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -8845,6 +9354,7 @@ mod tests {
         let err = handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(provider_with_credential_handle(
                     "openai-ref",
                     "openai",
@@ -8868,6 +9378,7 @@ mod tests {
         let err = handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(provider_with_values("legacy-gitlab", "gitlab")),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -8890,6 +9401,7 @@ mod tests {
         let response = handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(Provider {
                     metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                         name: "pypi".to_string(),
@@ -8921,6 +9433,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("gitlab")),
                     source: "custom-gitlab.yaml".to_string(),
@@ -8934,6 +9447,7 @@ mod tests {
         let response = handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(Provider {
                     metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                         name: "private-gitlab".to_string(),
@@ -8981,6 +9495,7 @@ mod tests {
         let imported = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(profile),
                     source: "enterprise-github.yaml".to_string(),
@@ -8996,6 +9511,7 @@ mod tests {
         let provider = handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(provider_with_credential_value(
                     "enterprise-github",
                     "gh",
@@ -9044,6 +9560,7 @@ mod tests {
         let response = handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(provider_with_credential_value(
                     "openai-local",
                     "openai",
@@ -9146,6 +9663,7 @@ mod tests {
         let imported = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(profile),
                     source: "provider-profile.yaml".to_string(),
@@ -9161,6 +9679,7 @@ mod tests {
         handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(provider_with_credential_value(
                     "exchange",
                     "spiffe-token-exchange-demo",
@@ -9199,6 +9718,7 @@ mod tests {
         let err = handle_update_provider(
             &state,
             authed_request(UpdateProviderRequest {
+                request_id: String::new(),
                 provider: Some(provider_with_credential_handle(
                     "openai-local",
                     "openai",
@@ -9466,6 +9986,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(ProviderProfile {
                         id: "delegated-refresh-api".to_string(),
@@ -9562,6 +10083,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(mixed_required_profile),
                     source: "mixed-required-api.yaml".to_string(),
@@ -9605,6 +10127,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(optional_static_profile),
                     source: "optional-static-api.yaml".to_string(),
@@ -10149,6 +10672,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(profile),
                     source: "stable-refresh-provider.yaml".to_string(),
@@ -10176,6 +10700,7 @@ mod tests {
         .await
         .unwrap();
         let configure = || ConfigureProviderRefreshRequest {
+            request_id: String::new(),
             provider: "stable-refresh".to_string(),
             credential_key: "ACCESS_TOKEN".to_string(),
             strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
@@ -10240,6 +10765,7 @@ mod tests {
             let err = handle_update_provider(
                 &state,
                 authed_request(UpdateProviderRequest {
+                    request_id: String::new(),
                     provider: Some(Provider {
                         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                             name: "stable-refresh".to_string(),
@@ -10946,6 +11472,10 @@ mod tests {
         assert_eq!(result.get("FRESH_TOKEN"), Some(&"fresh".to_string()));
         assert!(!result.contains_key("STALE_TOKEN"));
         assert!(!result.contains_key("EPOCH_TOKEN"));
+        assert_eq!(
+            result.readiness_reason,
+            openshell_core::proto::ProviderReadinessReason::CredentialExpired
+        );
         assert_eq!(
             result.credential_expiration_times.get("FRESH_TOKEN"),
             Some(&(now_ms + 60_000))
@@ -12066,6 +12596,7 @@ mod tests {
         handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(provider_with_credential_value(
                     "profile-backed-openai",
                     "openai",
@@ -12096,6 +12627,7 @@ mod tests {
         let error = handle_update_provider(
             &state,
             authed_request(UpdateProviderRequest {
+                request_id: String::new(),
                 provider: Some(update),
                 credential_expiration_times: HashMap::new(),
                 clear_credential_expiration_keys: Vec::new(),
@@ -12117,6 +12649,7 @@ mod tests {
         handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(provider_with_credential_value(
                     "required-openai",
                     "openai",
@@ -12146,6 +12679,7 @@ mod tests {
         let error = handle_update_provider(
             &state,
             authed_request(UpdateProviderRequest {
+                request_id: String::new(),
                 provider: Some(update),
                 credential_expiration_times: HashMap::new(),
                 clear_credential_expiration_keys: Vec::new(),
@@ -12172,6 +12706,7 @@ mod tests {
         handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(provider.clone()),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -12202,6 +12737,7 @@ mod tests {
         let response = handle_update_provider(
             &state,
             authed_request(UpdateProviderRequest {
+                request_id: String::new(),
                 provider: Some(updated_provider.clone()),
                 credential_expiration_times: HashMap::new(),
                 clear_credential_expiration_keys: Vec::new(),
@@ -12243,6 +12779,7 @@ mod tests {
         handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(provider.clone()),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -12273,6 +12810,7 @@ mod tests {
         let err = handle_update_provider(
             &state,
             authed_request(UpdateProviderRequest {
+                request_id: String::new(),
                 provider: Some(stale_provider),
                 credential_expiration_times: HashMap::new(),
                 clear_credential_expiration_keys: Vec::new(),
@@ -12321,6 +12859,7 @@ mod tests {
         handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(provider_with_credential_value(
                     "openai-local",
                     "openai",
@@ -12351,6 +12890,7 @@ mod tests {
         let err = handle_update_provider(
             &state,
             authed_request(UpdateProviderRequest {
+                request_id: String::new(),
                 provider: Some(stale_provider),
                 credential_expiration_times: HashMap::new(),
                 clear_credential_expiration_keys: Vec::new(),
@@ -12395,6 +12935,7 @@ mod tests {
         handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(provider.clone()),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -12428,6 +12969,7 @@ mod tests {
                 handle_update_provider(
                     &state_clone,
                     authed_request(UpdateProviderRequest {
+                        request_id: String::new(),
                         provider: Some(updated),
                         credential_expiration_times: HashMap::new(),
                         clear_credential_expiration_keys: Vec::new(),
@@ -12518,6 +13060,7 @@ mod tests {
         let response = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "my-aws-v2".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
@@ -12576,6 +13119,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "aws-endpoint-override".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
@@ -12655,6 +13199,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "aws-partial-source".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
@@ -12710,6 +13255,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "aws-lone-session".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
@@ -12768,6 +13314,7 @@ mod tests {
         handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "aws-outputs".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
@@ -12848,6 +13395,7 @@ mod tests {
         handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "aws-update-guard".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
@@ -12874,6 +13422,7 @@ mod tests {
                 let err = handle_update_provider(
                     &state,
                     authed_request(UpdateProviderRequest {
+                        request_id: String::new(),
                         provider: Some(Provider {
                             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                                 name: "aws-update-guard".to_string(),
@@ -12943,6 +13492,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "generic-no-profile".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
@@ -12997,6 +13547,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "aws-wrong-key".to_string(),
                 credential_key: "AWS_SECRET_ACCESS_KEY".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
@@ -13177,6 +13728,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: "new-aws-provider".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
@@ -13254,6 +13806,7 @@ mod tests {
 
         let configure = |provider: &str| {
             authed_request(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: provider.to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
                 strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
@@ -13438,6 +13991,7 @@ mod tests {
         crate::grpc::workspace::handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "beta".to_string(),
                 labels: HashMap::new(),
             }),
@@ -13459,6 +14013,7 @@ mod tests {
         let created_default = handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some({
                     let mut p = make_provider();
                     p.metadata = Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -13491,6 +14046,7 @@ mod tests {
         let created_beta = handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some({
                     let mut p = make_provider();
                     p.metadata = Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -13588,6 +14144,7 @@ mod tests {
         let deleted = handle_delete_provider(
             &state,
             authed_request(DeleteProviderRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: "shared-name".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -13637,6 +14194,7 @@ mod tests {
         handle_create_provider(
             &state,
             authed_request(CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some({
                     let mut p = make_provider();
                     p.metadata = Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -13709,6 +14267,7 @@ mod tests {
         let import_error = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 workspace: String::new(),
                 profiles: Vec::new(),
             }),
@@ -13725,6 +14284,7 @@ mod tests {
         let update_error = handle_update_provider_profiles(
             &state,
             authed_request(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 id: "nonexistent".to_string(),
                 workspace: String::new(),
                 ..UpdateProviderProfilesRequest::default()
@@ -13758,6 +14318,7 @@ mod tests {
         let delete_error = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 id: "nonexistent".to_string(),
                 workspace: String::new(),
@@ -13950,6 +14511,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("ws-custom")),
                     source: "ws-custom.yaml".to_string(),
@@ -14003,6 +14565,7 @@ mod tests {
                 handle_import_provider_profiles(
                     &state,
                     authed_request(ImportProviderProfilesRequest {
+                        request_id: String::new(),
                         profiles: vec![ProviderProfileImportItem {
                             profile: Some(custom_profile(&id)),
                             source: format!("{id}.yaml"),
@@ -14080,6 +14643,7 @@ mod tests {
                 handle_delete_provider_profile(
                     &state,
                     authed_request(DeleteProviderProfileRequest {
+                        request_id: String::new(),
                         allow_missing: false,
                         id,
                         workspace,
@@ -14113,6 +14677,7 @@ mod tests {
                 handle_import_provider_profiles(
                     &state,
                     authed_request(ImportProviderProfilesRequest {
+                        request_id: String::new(),
                         profiles: vec![ProviderProfileImportItem {
                             profile: Some(custom_profile(&id)),
                             source: format!("{id}.yaml"),
@@ -14150,6 +14715,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("scoped-api")),
                     source: "scoped-api.yaml".to_string(),
@@ -14195,6 +14761,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("platform-only")),
                     source: "platform-only.yaml".to_string(),
@@ -14232,6 +14799,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("shadow-target")),
                     source: "shadow-target.yaml".to_string(),
@@ -14247,6 +14815,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(ws_profile),
                     source: "shadow-target.yaml".to_string(),
@@ -14280,6 +14849,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("shadow-warn")),
                     source: "shadow-warn.yaml".to_string(),
@@ -14293,6 +14863,7 @@ mod tests {
         let resp = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("shadow-warn")),
                     source: "shadow-warn.yaml".to_string(),
@@ -14322,6 +14893,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("global-only")),
                     source: "global-only.yaml".to_string(),
@@ -14335,6 +14907,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(custom_profile("ws-only")),
                     source: "ws-only.yaml".to_string(),
@@ -14376,6 +14949,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(platform_profile),
                     source: "scope-test.yaml".to_string(),
@@ -14391,6 +14965,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(ws_profile),
                     source: "scope-test.yaml".to_string(),
@@ -14425,6 +15000,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(platform_profile),
                     source: "scope-test-ws.yaml".to_string(),
@@ -14440,6 +15016,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(ws_profile),
                     source: "scope-test-ws.yaml".to_string(),

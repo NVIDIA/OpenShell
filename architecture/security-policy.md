@@ -33,8 +33,9 @@ path normalization.
 
 Consumers project that syntax into purpose-specific models. `openshell-policy`
 owns protobuf conversion, composition, merge behavior, raw-protobuf checks, and
-validation that depends on runtime components. The existing prover retains its
-risk model but uses the same fail-closed parser as the runtime. The parser
+validation that depends on runtime components. Both the proposal-risk prover and
+standalone containment checker project the shared schema into their own models
+using the same fail-closed parser as the runtime. The parser
 requires `version: 1` and rejects managed annotations and every unknown field
 before any consumer-specific projection runs. There is no permissive parsing
 profile: unsupported policy fields always invalidate the document. Middleware `config`, query and persisted-query names, and recursive MCP
@@ -218,6 +219,10 @@ same effective configuration path.
 
 The OPA loader checks the object and list shapes of raw policy data before injecting runtime fields, normalizing values, or expanding access presets. It rejects the first malformed container with a fixed structural error that excludes authored keys and values. This check preserves valid versionless OPA data and runtime-only fields. A rejected OPA engine reload leaves that engine's installed policy, generation, and decisions unchanged; the supervisor separately applies its configured runtime rejection mode.
 
+After validating L7 rules, the OPA loader converts nonempty string query and MCP parameter matchers into explicit `glob` objects, including MCP `tool` aliases and deny rules. Matchers representable in both YAML and protobuf therefore expose the same representation to endpoint configuration consumers. Already lowered `glob` and `any` matchers retain their values across reloads; normalization preserves runtime endpoint provenance. Empty scalar query matchers remain an OPA-only form because Rego gives them different behavior from empty `glob` objects.
+
+An explicitly supplied MCP rule `params` value must be a map in both allow and deny rules. Omit the field when using only the `tool` alias; `params: null` is rejected before alias lowering. A rejected raw policy reload preserves the active evaluator and its generation.
+
 The supervisor validates complete effective policy generations before
 activation. Overlapping endpoint selectors may contribute request allow and
 deny rules only when their connection and request-processing metadata agree;
@@ -366,7 +371,38 @@ may store such a draft, but existing merge validation rejects it when an
 approval attempts to add it to policy; runtime SSRF protections remain the
 final enforcement boundary.
 
-## What the prover decides
+## Standalone boundary checks
+
+The standalone `openshell-prover check` command compares a fully composed local
+candidate policy with an operator-supplied local boundary. It establishes
+`Allowed(candidate) ⊆ Allowed(boundary)` for the model scope reported in its
+result. It does not fetch gateway state, compose provider rules, apply policy,
+or decide whether an in-boundary change is eligible for automatic approval.
+
+The initial model covers filesystem paths, L4 network authority, and enforced
+REST method and path authority. It returns explicit unsupported or inconclusive
+results when a sound decision depends on authority or runtime context outside
+the model. The result records the model version and covered domains so callers
+can bind a successful check to those semantics.
+
+Before semantic validation, the checker observes cancellation and applies
+aggregate limits across both inputs. Oversized checks therefore return
+`resource_limit` without building validation indexes. Cross-protocol ambiguity
+validation indexes host and port authority rather than comparing every endpoint
+pair, and it checks cancellation while scanning admitted policies.
+
+The Rust containment API has an explicit extensibility contract: options and
+modeled-domain evidence permit additive growth, while the four `CheckResult`
+states remain exhaustive and authorization accepts only `Within`. This Rust
+source-compatibility boundary is separate from the CLI JSON schema and the
+reported containment model version. See the `openshell-prover` crate README for
+the supported construction and matching patterns.
+
+This containment operation is separate from the proposal-risk queries below.
+See the [standalone policy prover documentation](../docs/reference/policy-prover.mdx)
+for installation, command behavior, model limitations, evidence, and exit codes.
+
+## What the proposal prover decides
 
 The prover answers four formal questions about each proposed policy
 change. Each "yes" answer becomes its own categorical finding — there is
