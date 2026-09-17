@@ -31,17 +31,25 @@ docker build --pull --no-cache --tag openshell/codex-app-server:local --file Doc
 
 ## 2. Create the provider
 
-This single command reads the existing host login and stores it in an
-OpenShell provider named `codex`. Skip it if that provider already exists on
-the gateway.
+This single command creates a provider from the current host login, moves the
+refresh token into gateway-only refresh material, and rotates the access token
+once. The sandbox receives opaque handles for only the access token and account
+ID; it never receives the refresh token. Run this command once per gateway.
 
 ```shell
 openshell provider create \
   --name codex \
   --type codex \
   --credential "CODEX_AUTH_ACCESS_TOKEN=$(jq -er '.tokens.access_token' "$HOME/.codex/auth.json")" \
-  --credential "CODEX_AUTH_REFRESH_TOKEN=$(jq -er '.tokens.refresh_token' "$HOME/.codex/auth.json")" \
-  --credential "CODEX_AUTH_ACCOUNT_ID=$(jq -er '.tokens.account_id' "$HOME/.codex/auth.json")"
+  --credential "CODEX_AUTH_ACCOUNT_ID=$(jq -er '.tokens.account_id' "$HOME/.codex/auth.json")" && \
+env "CODEX_REFRESH_TOKEN=$(jq -er '.tokens.refresh_token' "$HOME/.codex/auth.json")" \
+  openshell provider refresh configure codex \
+    --credential-key CODEX_AUTH_ACCESS_TOKEN \
+    --strategy oauth2-refresh-token \
+    --material client_id=app_EMoamEEZ73f0CkXaXp7hrann \
+    --secret-material-env refresh_token=CODEX_REFRESH_TOKEN && \
+openshell provider refresh rotate codex \
+  --credential-key CODEX_AUTH_ACCESS_TOKEN
 ```
 
 ## 3. Launch the sandbox
@@ -79,5 +87,6 @@ codex --remote ws://default--codex-app-server.openshell.localhost:<gateway-port>
 
 ```shell
 openshell sandbox delete codex-app-server
+openshell provider delete codex
 docker image rm openshell/codex-app-server:local
 ```
