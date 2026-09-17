@@ -133,8 +133,8 @@ jobs:
       test-matrix: >-
         [
           {
-            "scenario":"fedora-podman-rootful",
-            "testsuite":"conformance"
+            "scenario":"fedora-podman-rootless",
+            "testsuite":"provider-refresh"
           },
           {
             "scenario":"fedora-podman-rootful",
