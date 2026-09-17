@@ -103,15 +103,30 @@ openshell-prover check candidate.yaml \
 The JSON object includes the result, exit code, input paths, prover version,
 model version, checked policy version, and modeled domains. The documented
 semantics and environmental conditions for that scope are tied to its model
-version. An exceeding result also includes a filesystem or network
-counterexample. Automation should use `result` and `reason_code` instead of
-parsing the human-readable explanation.
+version. An exceeding result also includes a typed counterexample. Automation
+should use `result` and `reason_code` instead of parsing the human-readable
+explanation.
 
 | Field | When populated |
 |---|---|
 | `counterexample` | An object for `exceeds_boundary`; otherwise `null`. |
 | `reason_code` | A stable identifier for an emitted `error`, `unsupported`, or `inconclusive` result; otherwise `null`. |
 | `reason` | A human-readable explanation paired with `reason_code`; otherwise `null`. |
+
+The `counterexample.domain` field selects one of these objects:
+
+| Domain | Fields |
+|---|---|
+| `filesystem` | `access` (`read` or `write`) and `path`. |
+| `process` | `field` (`run_as_user` or `run_as_group`), `boundary`, and `candidate`. |
+| `landlock` | `boundary` and `candidate` compatibility modes. |
+| `network` | `binary`, `ancestor_binary`, `binary_identity_required`, `host`, `destination_ip`, `trusted_gateway`, `port`, `protocol`, `method`, and `path`. |
+
+Network `binary` and `ancestor_binary` values are `null` when binary identity
+enforcement is disabled. `method` and `path` are `null` for L4 witnesses.
+`trusted_gateway: true` means the witness uses a recognized host-gateway alias
+with a runtime-provided trusted gateway binding; `false` uses ordinary
+destination validation.
 
 The stable reason codes are `invalid_input`, `unsupported_policy_shape`,
 `unresolved_workdir`, `unresolved_binary_path`,
@@ -158,12 +173,13 @@ containment model return `unsupported` and exit `3`.
 
 The prover applies aggregate limits across the candidate and boundary before
 semantic shape validation: 1,024 network rules, 4,096 endpoints, 4,096 binary
-selectors, 65,536 authored port entries, 16,384 REST rules, 4 KiB per modeled
-pattern, and 1 MiB of modeled pattern text. Exceeding any limit returns
-`inconclusive` with `reason_code: resource_limit`. A cancellation already
-requested at preflight takes precedence over that result; otherwise a resource
-limit takes precedence over unsupported policy-shape diagnostics. This ordering
-keeps validation work bounded for checked-in CI inputs.
+selectors, 65,536 authored port entries, 4,096 `allowed_ips` entries, 16,384
+REST rules, 4 KiB per modeled pattern, and 1 MiB of modeled pattern text.
+Exceeding any limit returns `inconclusive` with `reason_code: resource_limit`.
+A cancellation already requested at preflight takes precedence over that
+result; otherwise a resource limit takes precedence over unsupported
+policy-shape diagnostics. This ordering keeps validation work bounded for
+checked-in CI inputs.
 
 ### Process and Landlock settings
 
@@ -188,11 +204,13 @@ restrictions; network counterexamples include `destination_ip`. An empty IP
 list follows the runtime's destination rules and is not a universal allowlist.
 The check does not resolve DNS on the host running the CLI.
 
-Policies whose overlapping endpoints select different destination restrictions
-remain unsupported because the runtime uses the selected endpoint's address
-filter. CIDR unions within a supported endpoint are checked by the solver.
-Unsupported IP-literal wildcard selectors and ranges rejected by the runtime
-also cannot produce a successful proof.
+Policies whose potentially overlapping endpoints select different destination
+restrictions remain unsupported because the runtime uses the selected
+endpoint's address filter. The prover conservatively treats wildcard host
+selectors on a shared port as potentially overlapping, including when their
+literal suffixes differ. CIDR unions within a supported endpoint are checked by
+the solver. Unsupported IP-literal wildcard selectors and ranges rejected by
+the runtime also cannot produce a successful proof.
 
 Consumers must explicitly accept model `boundary-v2` and its additional
 `process` and `landlock` domains. Do not treat a v1 result as covering these
