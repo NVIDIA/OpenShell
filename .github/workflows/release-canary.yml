@@ -208,6 +208,11 @@ jobs:
           openshell --version
           sudo snap services openshell
           openshell status
+          gateway_pid=$(systemctl show -p MainPID --value snap.openshell.gateway.service)
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          refreshed_pid=$(systemctl show -p MainPID --value snap.openshell.gateway.service)
+          test "$gateway_pid" = "$refreshed_pid"
+          openshell status
           sandbox="release-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           openshell sandbox create --name "$sandbox" --detach
           openshell sandbox exec --name "$sandbox" --no-tty -- true

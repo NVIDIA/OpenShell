@@ -57,14 +57,17 @@ ENVIRONMENT VARIABLES:
 
 NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
-    from ${GITHUB_URL}/releases/latest.
+    from ${GITHUB_URL}/releases/latest for the DEB/RPM, and the release from
+	the latest/stable channel for the OpenShell snap.
 
     Linux installs the snap, the DEB package, or the RPM package depending on
     the host package manager. The snap is preferred when snapd is available,
     except on RPM-based systems where Docker is not installed, where instead
     the RPM package and the Podman runtime are used. On other systems with
     snapd but no Docker preinstalled, it installs the Docker snap before the
-    OpenShell snap.
+    OpenShell snap. If OPENSHELL_VERSION is set to "dev", then the snap from
+	the latest/edge channel is installed, and if set to an explicit version,
+	the matching DEB or RPM release artifact is installed instead of the snap.
 
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
@@ -227,6 +230,10 @@ Please use a newer distribution or container environment."
 }
 
 target_uses_breaking_gateway_model() {
+  if [ "${PLATFORM:-}" = "linux" ] && [ "$(linux_package_method)" = "snap" ]; then
+    return 0
+  fi
+
   case "$RELEASE_TAG" in
     dev)
       return 0
@@ -246,6 +253,14 @@ installed_version_needs_breaking_upgrade_notice() {
   ! semver_at_least "$_version" "$BREAKING_RELEASE_VERSION"
 }
 
+breaking_upgrade_target() {
+  if [ "${PLATFORM:-}" = "linux" ] && [ "$(linux_package_method)" = "snap" ]; then
+    printf 'the OpenShell snap from %s\n' "$(openshell_snap_channel)"
+  else
+    printf 'OpenShell %s\n' "$RELEASE_TAG"
+  fi
+}
+
 find_existing_openshell_bin() {
   _path="$(command -v openshell 2>/dev/null || true)"
   if [ -n "$_path" ] && [ -x "$_path" ]; then
@@ -255,6 +270,7 @@ find_existing_openshell_bin() {
 
   for _candidate in \
     "${TARGET_HOME:-}/.local/bin/openshell" \
+    /snap/bin/openshell \
     /usr/local/bin/openshell \
     /usr/bin/openshell \
     /opt/homebrew/bin/openshell; do
@@ -285,6 +301,7 @@ existing_openshell_version() {
 print_breaking_upgrade_notice() {
   _bin="$1"
   _version="$2"
+  _target="$(breaking_upgrade_target)"
 
   if [ -n "$_version" ]; then
     warn "detected existing OpenShell ${_version} at ${_bin}"
@@ -295,7 +312,7 @@ print_breaking_upgrade_notice() {
   cat >&2 <<EOF
 
 OpenShell ${BREAKING_RELEASE_VERSION} and later are incompatible with gateway
-state created by earlier releases. Before installing ${RELEASE_TAG}, back up
+state created by earlier releases. Before installing ${_target}, back up
 any files, artifacts, and configuration you need from existing sandboxes.
 
 Then clean up the old runtime with the currently installed CLI:
@@ -488,18 +505,33 @@ local_gateway_endpoint() {
 }
 
 linux_package_method() {
+  if [ -n "${OPENSHELL_VERSION:-}" ] && [ "$OPENSHELL_VERSION" != "dev" ]; then
+    linux_native_package_method
+    return
+  fi
+
   if has_snapd; then
     if has_cmd docker || ! has_cmd rpm; then
       echo "snap"
     else
       echo "rpm"
     fi
+  else
+    linux_native_package_method
+  fi
+}
+
+linux_native_package_method() {
+  if has_cmd apt-get || has_cmd apt; then
+    echo "deb"
+  elif has_cmd dnf || has_cmd yum || has_cmd zypper; then
+    echo "rpm"
   elif has_cmd dpkg; then
     echo "deb"
   elif has_cmd rpm; then
     echo "rpm"
   else
-    error "Linux installs require either snapd, dpkg, or rpm"
+    error "Linux installs require snapd or a supported DEB/RPM package manager"
   fi
 }
 
@@ -1006,14 +1038,28 @@ install_linux_snap() {
 
   wait_for_docker_daemon
 
-  info "installing openshell snap..."
-  as_root snap install openshell
+  _channel="$(openshell_snap_channel)"
+  if snap list openshell >/dev/null 2>&1; then
+    info "refreshing openshell snap from ${_channel}..."
+    as_root snap refresh openshell --channel="$_channel"
+  else
+    info "installing openshell snap from ${_channel}..."
+    as_root snap install openshell --channel="$_channel"
+  fi
 
-  info "installed openshell snap from Snap Store"
+  info "installed openshell snap from Snap Store channel ${_channel}"
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway_snap
   wait_for_local_gateway_listener_snap
   wait_for_local_gateway_status
+}
+
+openshell_snap_channel() {
+  if [ "${OPENSHELL_VERSION:-}" = "dev" ]; then
+    printf '%s\n' "latest/edge"
+  else
+    printf '%s\n' "latest/stable"
+  fi
 }
 
 wait_for_docker_daemon() {
@@ -1147,7 +1193,6 @@ main() {
   fi
 
   require_cmd curl
-  RELEASE_TAG="$(resolve_release_tag)"
   PLATFORM="$(detect_platform)"
 
   TARGET_USER="$(target_user)"
@@ -1155,11 +1200,14 @@ main() {
   [ -n "$TARGET_UID" ] || error "cannot resolve uid for ${TARGET_USER}"
   TARGET_HOME="$(user_home "$TARGET_USER")"
 
-  guard_breaking_upgrade
-
   case "$PLATFORM" in
     linux)
-      case "$(linux_package_method)" in
+      _linux_method="$(linux_package_method)"
+      if [ "$_linux_method" != "snap" ]; then
+        RELEASE_TAG="$(resolve_release_tag)"
+      fi
+      guard_breaking_upgrade
+      case "$_linux_method" in
         snap)
           install_linux_snap
           ;;
@@ -1177,6 +1225,8 @@ main() {
       esac
       ;;
     darwin)
+      RELEASE_TAG="$(resolve_release_tag)"
+      guard_breaking_upgrade
       install_macos_homebrew
       ;;
     *)

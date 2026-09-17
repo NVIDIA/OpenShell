@@ -15,9 +15,9 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 |---|---|---|
 | `macos` | `macos-latest-xlarge` | Installs the dev Homebrew artifacts, reaches the VM gateway, and creates, executes in, and deletes a sandbox. |
 | `ubuntu-deb` | `ubuntu-latest` | Installs the dev Debian package (since snapd is not installed), reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
-| `ubuntu-snap` | `ubuntu-latest` | Installs the Release Dev Snap, connects its interfaces, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
-| `ubuntu-snap-existing-docker` | `ubuntu-latest` | Installs the OpenShell snap from the Snap Store with native Docker preinstalled, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
-| `ubuntu-snap-provision-docker` | `ubuntu-latest` | Installs the Docker and Openshell snap packages from the Snap Store, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
+| `ubuntu-snap` | `ubuntu-latest` | Installs the exact Release Dev `.snap` artifact with `--dangerous`, manually connects its interfaces to the system slots, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
+| `ubuntu-snap-existing-docker` | `ubuntu-latest` | Installs OpenShell from the Snap Store `latest/edge` channel with apt-installed Docker, verifies that the Docker snap was not installed and `openshell:docker` auto-connected to `:docker`, then exercises a sandbox. |
+| `ubuntu-snap-provision-docker` | `ubuntu-latest` | Installs the Docker snap and OpenShell from the Snap Store `latest/edge` channel, verifies Docker readiness and the automatic `openshell:docker` to `:docker` connection, then exercises a sandbox. |
 | `fedora` | `fedora:latest` container | Installs the dev RPM packages, reaches the Podman gateway, and creates, executes in, and deletes a sandbox. |
 | `kubernetes` | `ubuntu-latest` + kind | Installs the dev Helm chart, reaches the in-cluster gateway, and creates, executes in, and deletes a sandbox using the published runtime images. |
 
@@ -27,8 +27,10 @@ Kubernetes job installs with `server.telemetryEnabled=false`, so smoke traffic
 does not contribute to product usage metrics.
 
 The workflow sets `OPENSHELL_VERSION=dev`, so every `install.sh` job consumes the
-rolling dev release produced by the triggering workflow. Kubernetes pins the
-matching `0.0.0-dev` chart and `:dev` images.
+rolling dev release produced by the triggering workflow. Store Snap jobs track
+`latest/edge`, while the artifact Snap job installs the exact `.snap` from the
+triggering Release Dev run. Kubernetes pins the matching `0.0.0-dev` chart and
+`:dev` images.
 
 The host-package jobs exercise fresh installs, not upgrades from a persisted
 schema-v1 gateway config. Validate Homebrew and RPM exact-default migration with

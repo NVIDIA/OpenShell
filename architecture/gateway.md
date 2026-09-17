@@ -913,6 +913,11 @@ infrastructure:
   the RPM installation provisions Podman. If RPM is unavailable, it installs
   the Docker Snap, waits for `docker info` to succeed, and then installs the
   OpenShell Snap.
+- An explicit `OPENSHELL_VERSION` release tag bypasses Snap Store channels and
+  selects the matching DEB or RPM artifact. The `dev` value maps Snap installs
+  to `latest/edge`; the default Snap path tracks `latest/stable`. Repeated Snap
+  installs refresh the selected channel without restarting the enduring gateway
+  daemon.
 
 Store-installed OpenShell Snaps auto-connect `openshell:docker` to the system
 `:docker` slot. This interface does not depend on how Docker was packaged.

@@ -18,6 +18,12 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 
 The script detects your operating system and installs the OpenShell CLI, standalone policy prover, and gateway with your native package manager. On Linux, it prefers the Snap path when `snapd` and Docker are available. On RPM-based systems without Docker, it installs the RPM packages and their Podman runtime. On other systems with `snapd` but no Docker, it installs the Docker snap before OpenShell. When `snapd` is unavailable, it uses the native DEB or RPM package. It then starts the local gateway so you can begin creating sandboxes.
 
+By default, the installer uses the latest stable release. Set
+`OPENSHELL_VERSION=dev` to use the rolling development release; Snap installs
+track `latest/edge` for this mode. Set `OPENSHELL_VERSION` to a release tag such
+as `v0.0.116` to install that exact Homebrew, DEB, or RPM release artifact.
+Explicit release tags do not use the floating Snap Store channels.
+
 You can also download release artifacts directly from the [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
 
 The `openshell` package on PyPI provides the Python SDK only. It does not install the `openshell` CLI. Add the SDK to a Python project with:
@@ -119,6 +125,10 @@ Docker Snap, a distribution package, Docker's package repository, or another
 supported installation method. The install script reuses an existing Docker
 installation. If Docker is absent and no RPM package path is available, it
 installs the Docker snap and waits for the daemon before installing OpenShell.
+The installer installs OpenShell from `latest/stable` by default and from
+`latest/edge` when `OPENSHELL_VERSION=dev`. Rerunning the installer refreshes an
+existing OpenShell snap onto the selected channel without restarting the
+gateway automatically.
 
 ### Snap store installs
 
