@@ -1971,7 +1971,7 @@ async fn provider_readiness_mutations_reject_unbound_receipts_before_output_or_p
         ("kind", |receipt| {
             receipt.kind = ProviderMutationKind::Observe.into();
         }),
-        ("sandbox_name", |receipt| {
+        ("sandbox", |receipt| {
             receipt.desired.as_mut().expect("desired identity").sandbox = "other".to_string();
         }),
         ("sandbox_id", |receipt| {
