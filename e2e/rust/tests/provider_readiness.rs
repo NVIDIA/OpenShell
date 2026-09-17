@@ -1369,14 +1369,15 @@ async fn acknowledged_provider_changes_apply_to_fresh_clients_and_revoke_retaine
             "FROM {base}\nUSER root\nCOPY client.py /opt/provider-readiness-client.py\nUSER sandbox\n"
         )).map_err(|_| "could not write fixture Dockerfile")?;
         let supervisor_dockerfile = context.join("Dockerfile.supervisor");
-        // Outbound TLS belongs to the separate supervisor. Replace the system
-        // bundle in this test-only image with the fixture CA without invoking a
-        // shell: the production supervisor image is deliberately distroless.
-        // The supervisor retains its compiled Mozilla roots and delivers this
-        // fixture CA together with the generated sandbox CA to the workload.
+        // Outbound TLS belongs to the separate supervisor. Assemble its combined
+        // public trust bundle in the shell-capable workload image because the
+        // final supervisor image is intentionally distroless. Preserve the final
+        // image's user setting: Docker's archive upload applies an explicit image
+        // user to the supervisor's private bootstrap files.
         std::fs::write(&supervisor_dockerfile, format!(
-            "FROM {}\nCOPY fixture-ca.crt /etc/ssl/certs/ca-certificates.crt\n",
-            gateway_config.supervisor_image
+            "FROM {} AS supervisor\nFROM {base} AS trust-bundle\nUSER 0\nCOPY --from=supervisor /etc/ssl/certs/ca-certificates.crt /tmp/ca-certificates.crt\nCOPY fixture-ca.crt /tmp/readiness-fixture-ca.crt\nRUN [\"/usr/bin/python3\", \"-c\", \"from pathlib import Path; bundle = Path('/tmp/ca-certificates.crt'); bundle.write_bytes(bundle.read_bytes() + Path('/tmp/readiness-fixture-ca.crt').read_bytes())\"]\nFROM {}\nCOPY --from=trust-bundle /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt\n",
+            gateway_config.supervisor_image,
+            gateway_config.supervisor_image,
         )).map_err(|_| "could not write fixture supervisor Dockerfile")?;
         image
             .build(&dockerfile, &context, "build workload fixture image")
