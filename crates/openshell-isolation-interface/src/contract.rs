@@ -562,7 +562,11 @@ impl SandboxConfirmEvidence {
             && self.seccomp.proc_fd_identity
             && self.seccomp.task_memory_read
             && self.seccomp.task_memory_write
-            && self.seccomp.cancellation
+            // `cancellation` (seccomp WAIT_KILLABLE_RECV, Linux 5.19+) is a
+            // robustness property, not a containment prerequisite: on older
+            // kernels (e.g. RHEL 9.x / 5.14) the sandbox falls back to a plain
+            // listener and reports cancellation=false. Containment still holds
+            // via the listener itself, so launch is not gated on cancellation.
             && self.landlock_abi >= 3
             && self.landlock_allow_deny
             && self.udp_dns_round_trip

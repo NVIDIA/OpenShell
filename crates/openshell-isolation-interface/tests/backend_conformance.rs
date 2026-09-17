@@ -538,7 +538,11 @@ async fn one_driver_runs_both_backends() {
 #[test]
 fn confirmation_constructor_rejects_incomplete_evidence() {
     let mut evidence = confirmation_evidence();
-    evidence.seccomp.cancellation = false;
+    // A missing containment-critical primitive (the notification listener
+    // itself) must be rejected. `cancellation` is intentionally NOT in this set:
+    // it reflects WAIT_KILLABLE_RECV (Linux 5.19+) and is unavailable on older
+    // kernels, where the sandbox degrades to a plain listener.
+    evidence.seccomp.new_listener = false;
     let result = ConfirmedBoundary::try_new(
         Box::new(MockReady::<Primary> { _k: PhantomData }),
         evidence,
