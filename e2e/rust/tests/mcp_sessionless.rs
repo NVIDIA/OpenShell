@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Sessionless MCP requests through the sandbox's transparent network interception.
+//! MCP request profiles through the sandbox's transparent network interception.
 //!
-//! A local fixture serves discovery, named tools, and a bounded subscription
-//! stream. The client starts with discovery and sends the protocol metadata on
-//! every POST; no initialization handshake or session ID is involved.
+//! A shared fixture serves legacy initialization, sessionless discovery, named
+//! tools, and a bounded subscription stream. Upstream receipts distinguish a
+//! policy denial from a tool request accepted by the fixture.
 
 #![cfg(feature = "e2e-host-gateway")]
 
@@ -21,7 +21,8 @@ const SERVER_SCRIPT: &str = r#"
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-VERSION = "2026-07-28"
+SESSIONLESS_VERSION = "2026-07-28"
+received = []
 
 class Handler(BaseHTTPRequestHandler):
     def reply(self, status, payload, content_type="application/json"):
@@ -51,21 +52,38 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         message = json.loads(self.read_body())
         method = message["method"]
-        params = message["params"]
-        meta = params["_meta"]
-        if (self.path != "/mcp"
-            or self.headers.get("MCP-Protocol-Version") != VERSION
-            or self.headers.get("Mcp-Method") != method
-            or meta.get("io.modelcontextprotocol/protocolVersion") != VERSION
-            or meta.get("io.modelcontextprotocol/clientCapabilities") != {}
-            or (method == "tools/call"
-                and self.headers.get("Mcp-Name") != params["name"])):
-            self.reply(400, b"request metadata did not reach the fixture intact")
+        params = message.get("params", {})
+        version = (params.get("protocolVersion") if method == "initialize"
+                   else self.headers.get("MCP-Protocol-Version"))
+        # Record parsed requests before fixture admission so rejected revisions
+        # and tool attempts stay visible. HTTPServer handles requests serially.
+        received.append([version, method, params.get("name")])
+        if self.path != "/mcp" or version not in SUPPORTED_VERSIONS:
+            self.reply(400, b"request revision did not reach the fixture intact")
             return
+        if version == SESSIONLESS_VERSION:
+            meta = params.get("_meta", {})
+            if (self.headers.get("MCP-Protocol-Version") != version
+                or self.headers.get("Mcp-Method") != method
+                or meta.get("io.modelcontextprotocol/protocolVersion") != version
+                or meta.get("io.modelcontextprotocol/clientCapabilities") != {}
+                or (method == "tools/call"
+                    and self.headers.get("Mcp-Name") != params["name"])):
+                self.reply(400, b"request metadata did not reach the fixture intact")
+                return
 
-        if method == "server/discover":
+        if method == "initialize" and version != SESSIONLESS_VERSION:
             result = {
-                "supportedVersions": [VERSION],
+                "protocolVersion": version,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "openshell-profile-fixture", "version": "1"},
+            }
+        elif method == "notifications/initialized" and version != SESSIONLESS_VERSION:
+            self.reply(202, b"")
+            return
+        elif method == "server/discover" and version == SESSIONLESS_VERSION:
+            result = {
+                "supportedVersions": [version],
                 "capabilities": {"tools": {"listChanged": True}},
                 "ttlMs": 0,
                 "cacheScope": "private",
@@ -78,11 +96,13 @@ class Handler(BaseHTTPRequestHandler):
         elif method == "tools/call":
             # Both tool names work upstream; OpenShell owns the policy denial.
             result = {
-                "resultType": "complete",
                 "content": [{"type": "text", "text": params["name"]}],
                 "isError": False,
+                "_meta": {"fixtureRequests": list(received)},
             }
-        elif method == "subscriptions/listen":
+            if version == SESSIONLESS_VERSION:
+                result["resultType"] = "complete"
+        elif method == "subscriptions/listen" and version == SESSIONLESS_VERSION:
             subscription_meta = {"io.modelcontextprotocol/subscriptionId": message["id"]}
             events = [
                 {
@@ -105,7 +125,7 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(200, body.encode(), "text/event-stream")
             return
         else:
-            self.reply(400, b"unexpected method; this fixture has no initialization handshake")
+            self.reply(400, b"unexpected method for the selected fixture revision")
             return
 
         self.reply(200, json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}).encode())
@@ -116,33 +136,36 @@ class Handler(BaseHTTPRequestHandler):
 HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
 "#;
 
-const CLIENT_SCRIPT: &str = r#"
+const CLIENT_HELPERS: &str = r#"
 import json
 import urllib.error
 import urllib.request
-
-VERSION = "2026-07-28"
 # Direct client connections pass through the sandbox's transparent interception.
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-def post(request_id, method, params):
+def post(request_id, method, params, version):
     params = dict(params)
-    params["_meta"] = {
-        "io.modelcontextprotocol/protocolVersion": VERSION,
-        "io.modelcontextprotocol/clientCapabilities": {},
-        "io.modelcontextprotocol/clientInfo": {"name": "openshell-e2e", "version": "1"},
-    }
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
-        "MCP-Protocol-Version": VERSION,
-        "Mcp-Method": method,
     }
-    if method == "tools/call":
-        headers["Mcp-Name"] = params["name"]
+    if method != "initialize":
+        headers["MCP-Protocol-Version"] = version
+    if version == "2026-07-28":
+        params["_meta"] = {
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": {"name": "openshell-e2e", "version": "1"},
+        }
+        headers["Mcp-Method"] = method
+        if method == "tools/call":
+            headers["Mcp-Name"] = params["name"]
+    message = {"jsonrpc": "2.0", "method": method, "params": params}
+    if request_id is not None:
+        message["id"] = request_id
     request = urllib.request.Request(
         f"http://{HOST}:{PORT}/mcp",
-        data=json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}).encode(),
+        data=json.dumps(message).encode(),
         headers=headers,
         method="POST",
     )
@@ -151,24 +174,28 @@ def post(request_id, method, params):
             return response.status, response.headers.get_content_type(), response.read()
     except urllib.error.HTTPError as error:
         return error.code, error.headers.get_content_type(), error.read()
+"#;
 
-status, content_type, body = post(1, "server/discover", {})
+const CLIENT_SCRIPT: &str = r#"
+VERSION = "2026-07-28"
+
+status, content_type, body = post(1, "server/discover", {}, VERSION)
 assert status == 200, ("discovery", status, body)
 assert content_type == "application/json", content_type
 discovery = json.loads(body)
 assert discovery["id"] == 1, discovery
 assert discovery["result"]["supportedVersions"] == [VERSION], discovery
 
-status, _, body = post(2, "tools/call", {"name": "read_status", "arguments": {}})
+status, _, body = post(2, "tools/call", {"name": "read_status", "arguments": {}}, VERSION)
 assert status == 200, ("allowed tool", status, body)
 tool = json.loads(body)
 assert tool["id"] == 2, tool
 assert tool["result"]["content"] == [{"type": "text", "text": "read_status"}], tool
 
-status, _, body = post(3, "tools/call", {"name": "read_details", "arguments": {}})
+status, _, body = post(3, "tools/call", {"name": "read_details", "arguments": {}}, VERSION)
 assert status == 403, ("denied tool", status, body)
 
-status, content_type, body = post(4, "subscriptions/listen", {"notifications": {"toolsListChanged": True}})
+status, content_type, body = post(4, "subscriptions/listen", {"notifications": {"toolsListChanged": True}}, VERSION)
 assert status == 200, ("subscription", status, body)
 assert content_type == "text/event-stream", (content_type, body)
 events = [json.loads(line[6:]) for line in body.decode().splitlines() if line.startswith("data: ")]
@@ -182,8 +209,63 @@ assert events[2]["id"] == 4 and events[2]["result"]["resultType"] == "complete",
 print("MCP_SESSIONLESS_OK discovery=200 allowed_tool=200 denied_tool=403 subscription=200")
 "#;
 
-fn write_policy(host: &str, port: u16) -> Result<NamedTempFile, String> {
+const PROFILE_CLIENT_SCRIPT: &str = r#"
+expected_receipts = []
+for version in SELECTED_VERSIONS:
+    if version == "2026-07-28":
+        status, _, body = post(1, "server/discover", {}, version)
+        assert status == 200, (version, "discovery", status, body)
+        assert json.loads(body)["result"]["supportedVersions"] == [version], body
+        expected_receipts.append([version, "server/discover", None])
+    else:
+        status, _, body = post(1, "initialize", {
+            "protocolVersion": version,
+            "capabilities": {},
+            "clientInfo": {"name": "openshell-e2e", "version": "1"},
+        }, version)
+        assert status == 200, (version, "initialize", status, body)
+        assert json.loads(body)["result"]["protocolVersion"] == version, body
+        expected_receipts.append([version, "initialize", None])
+        status, _, body = post(None, "notifications/initialized", {}, version)
+        assert status == 202, (version, "initialized", status, body)
+        expected_receipts.append([version, "notifications/initialized", None])
+
+    status, _, body = post(2, "tools/call", {"name": "read_status", "arguments": {}}, version)
+    assert status == 200, (version, "allowed tool", status, body)
+    tool = json.loads(body)
+    assert tool["id"] == 2, tool
+    assert tool["result"]["content"] == [{"type": "text", "text": "read_status"}], tool
+    expected_receipts.append([version, "tools/call", "read_status"])
+    assert tool["result"]["_meta"]["fixtureRequests"] == expected_receipts, tool
+
+    status, _, body = post(3, "tools/call", {"name": "read_details", "arguments": {}}, version)
+    assert status == 403, (version, "denied tool", status, body)
+
+    # The fixture accepts both tools. A later allowed call proves the denial
+    # came from the proxy and no denied operation reached the upstream.
+    status, _, body = post(4, "tools/call", {"name": "read_status", "arguments": {}}, version)
+    assert status == 200, (version, "receipt tool", status, body)
+    receipt = json.loads(body)
+    assert receipt["id"] == 4, receipt
+    expected_receipts.append([version, "tools/call", "read_status"])
+    assert receipt["result"]["_meta"]["fixtureRequests"] == expected_receipts, receipt
+    print(f"MCP_PROFILE_OK version={version} allowed_tool=200 denied_tool=403 receipts=verified")
+"#;
+
+async fn start_server(alias: &str, versions: &[&str]) -> Result<ContainerHttpServer, String> {
+    let versions = serde_json::to_string(versions).map_err(|err| err.to_string())?;
+    let script = format!("SUPPORTED_VERSIONS = {versions}\n{SERVER_SCRIPT}");
+    ContainerHttpServer::start_python(alias, &script).await
+}
+
+fn write_policy(host: &str, port: u16, versions: &[&str]) -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|err| format!("create temp policy: {err}"))?;
+    let legacy_rules = if versions.iter().any(|version| *version != "2026-07-28") {
+        "          - allow:\n              method: initialize\n          - allow:\n              method: notifications/initialized\n"
+    } else {
+        ""
+    };
+    let versions = serde_json::to_string(versions).map_err(|err| err.to_string())?;
     let policy = format!(
         r#"version: 1
 filesystem_policy:
@@ -206,10 +288,10 @@ network_policies:
         enforcement: enforce
         allowed_ips: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]
         mcp:
-          versions: ["2026-07-28"]
+          versions: {versions}
           max_body_bytes: 65536
         rules:
-          - allow:
+{legacy_rules}          - allow:
               method: server/discover
           - allow:
               method: tools/call
@@ -232,18 +314,31 @@ network_policies:
     Ok(file)
 }
 
-#[tokio::test]
-async fn sessionless_discovery_tools_and_subscription_use_request_metadata() {
-    let server = ContainerHttpServer::start_python(SERVER_ALIAS, SERVER_SCRIPT)
-        .await
-        .expect("start sessionless MCP fixture");
-    let policy = write_policy(&server.host, server.port).expect("write sessionless MCP policy");
-    let policy_path = policy.path().to_str().expect("temp policy path is UTF-8");
+async fn run_client(
+    server: &ContainerHttpServer,
+    versions: &[&str],
+    client: &str,
+) -> Result<SandboxGuard, String> {
+    let policy = write_policy(&server.host, server.port, versions)?;
+    let policy_path = policy
+        .path()
+        .to_str()
+        .ok_or("temp policy path is not UTF-8")?;
+    let selected_versions = serde_json::to_string(versions).map_err(|err| err.to_string())?;
     let script = format!(
-        "HOST = {:?}\nPORT = {}\n{CLIENT_SCRIPT}",
+        "HOST = {:?}\nPORT = {}\nSELECTED_VERSIONS = {selected_versions}\n{CLIENT_HELPERS}\n{client}",
         server.host, server.port
     );
-    let sandbox = SandboxGuard::create(&["--policy", policy_path, "--", "python3", "-c", &script])
+    SandboxGuard::create(&["--policy", policy_path, "--", "python3", "-c", &script]).await
+}
+
+#[tokio::test]
+async fn sessionless_discovery_tools_and_subscription_use_request_metadata() {
+    let versions = ["2026-07-28"];
+    let server = start_server(SERVER_ALIAS, &versions)
+        .await
+        .expect("start sessionless MCP fixture");
+    let sandbox = run_client(&server, &versions, CLIENT_SCRIPT)
         .await
         .expect("run sessionless MCP client in sandbox");
 
@@ -254,4 +349,33 @@ async fn sessionless_discovery_tools_and_subscription_use_request_metadata() {
         "expected completed sessionless MCP assertions, got:\n{}",
         sandbox.create_output
     );
+}
+
+#[tokio::test]
+async fn legacy_and_multi_version_profiles_authorize_tools_through_sandbox() {
+    for versions in [
+        &["2025-03-26"][..],
+        &["2025-06-18"][..],
+        &["2025-11-25", "2026-07-28"][..],
+    ] {
+        // Each scenario starts with fresh upstream receipts. Its distinct alias
+        // avoids the sessionless test's fixture, and cleanup precedes alias reuse.
+        let server = start_server("mcp-profiles.openshell.test", versions)
+            .await
+            .unwrap_or_else(|err| panic!("{versions:?}: start MCP fixture: {err}"));
+        let mut sandbox = run_client(&server, versions, PROFILE_CLIENT_SCRIPT)
+            .await
+            .unwrap_or_else(|err| panic!("{versions:?}: run MCP sandbox client: {err}"));
+        for version in versions {
+            let marker = format!(
+                "MCP_PROFILE_OK version={version} allowed_tool=200 denied_tool=403 receipts=verified"
+            );
+            assert!(
+                sandbox.create_output.contains(&marker),
+                "{versions:?}: expected completed {version} assertions, got:\n{}",
+                sandbox.create_output
+            );
+        }
+        sandbox.cleanup().await;
+    }
 }
