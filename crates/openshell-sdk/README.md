@@ -59,6 +59,22 @@ Curated calls without a workspace argument explicitly select the `default`
 workspace. Cross-workspace listing uses the separate `*_all_workspaces`
 methods and requires Platform Admin access.
 
+For an accepted sandbox deletion, pass its original ID to `wait_deleted` so a
+same-name replacement does not extend the wait. Both the default and
+workspace-scoped clients accept the optional third argument; pass `None` to wait
+for name absence instead.
+
+```rust
+let deletion = client.delete_sandbox(name, openshell_sdk::DeleteOptions::default()).await?;
+if deletion.outcome == openshell_sdk::DeletionOutcome::Accepted {
+    client.wait_deleted(
+        name,
+        std::time::Duration::from_secs(60),
+        deletion.sandbox_id.as_deref(),
+    ).await?;
+}
+```
+
 Curated `list_*` methods return a lazy `Pager<T>`. Each `next_page()` call
 issues at most one RPC and returns a `Page<T>` with its opaque continuation
 token. The explicit `list_all_*` conveniences exhaust that pager; `page_size`

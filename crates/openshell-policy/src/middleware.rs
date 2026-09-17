@@ -13,63 +13,39 @@ use openshell_core::proto::{
 use openshell_core::proto_struct::{
     ProtoStructError, json_object_to_struct, struct_to_json_object,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use super::PolicyViolation;
 
 pub use openshell_core::host_pattern::host_matches as middleware_host_matches;
 use openshell_core::host_pattern::{HostPattern, HostSelector};
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NetworkMiddlewareConfigDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    name: String,
-    middleware: String,
-    #[serde(default, skip_serializing_if = "is_default")]
-    order: i32,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    config: BTreeMap<String, serde_json::Value>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    on_error: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    endpoints: Option<MiddlewareEndpointSelectorDef>,
-}
-
-fn is_default<T: Default + PartialEq>(value: &T) -> bool {
-    value == &T::default()
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MiddlewareEndpointSelectorDef {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    include: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    exclude: Vec<String>,
-}
+use openshell_policy_schema::{
+    MiddlewareEndpointSelector as MiddlewareEndpointSelectorDef,
+    NetworkMiddleware as NetworkMiddlewareConfigDef,
+};
 
 /// Middleware-relevant projection of the runtime policy JSON accepted by the
 /// supervisor's local-file mode. Unrelated network and L7 fields are ignored;
 /// middleware entries retain their strict canonical schema.
 #[derive(Debug, Default, Deserialize)]
-struct MiddlewareValidationPolicyDef {
+struct SupervisorRuntimePolicyJson {
     #[serde(default)]
     network_middlewares: BTreeMap<String, NetworkMiddlewareConfigDef>,
     #[serde(default)]
-    network_policies: BTreeMap<String, MiddlewareValidationNetworkPolicyDef>,
+    network_policies: BTreeMap<String, SupervisorRuntimeNetworkPolicyJson>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct MiddlewareValidationNetworkPolicyDef {
+struct SupervisorRuntimeNetworkPolicyJson {
     #[serde(default)]
     name: String,
     #[serde(default)]
-    endpoints: Vec<MiddlewareValidationEndpointDef>,
+    endpoints: Vec<SupervisorRuntimeEndpointJson>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct MiddlewareValidationEndpointDef {
+struct SupervisorRuntimeEndpointJson {
     #[serde(default)]
     host: String,
     #[serde(default)]
@@ -155,7 +131,7 @@ pub fn validate_json_with_config<F>(
 where
     F: Fn(&str, &prost_types::Struct) -> Result<(), String>,
 {
-    let definition: MiddlewareValidationPolicyDef = serde_json::from_value(data.clone())
+    let definition: SupervisorRuntimePolicyJson = serde_json::from_value(data.clone())
         .map_err(|error| format!("failed to parse network middleware policy: {error}"))?;
     let network_middlewares = into_proto(definition.network_middlewares)
         .map_err(|error| format!("failed to convert network middleware config: {error}"))?;

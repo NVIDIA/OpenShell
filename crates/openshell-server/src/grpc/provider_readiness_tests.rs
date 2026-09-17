@@ -789,7 +789,8 @@ async fn attach_waiting_for_update_captures_published_revision_and_becomes_ready
             &update_state,
             authed_request(UpdateProviderRequest {
                 provider: Some(replacement),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
+                clear_credential_expiration_keys: Vec::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             }),
         )

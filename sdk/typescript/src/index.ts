@@ -5,6 +5,9 @@
 //
 export type {
   ConnectOptions,
+  DeleteOptions,
+  DeletionOutcome,
+  DeletionResult,
   EffectiveSettingView,
   ExecExitEvent,
   ExecInteractiveOptions,
@@ -43,6 +46,7 @@ export type {
   SettingValue,
   SshSession,
   UpdateConfigResult,
+  WaitDeletedOptions,
   WaitOptions,
   WorkspaceListScope,
 } from './client.js';

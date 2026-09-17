@@ -8,6 +8,7 @@ syntax = "proto3";
 package openshell.storage.v1;
 
 import "datamodel.proto";
+import "google/protobuf/duration.proto";
 import "openshell.proto";
 import "options.proto";
 import "sandbox.proto";
@@ -59,6 +60,39 @@ message StoredProviderCredentialRefreshState {
   string failure_code = 22;
   string provider_error_subtype = 23;
   int64 last_error_at_ms = 24;
+}
+
+// Current durable refresh state. V1 remains frozen so pre-upgrade records can
+// be decoded and transactionally rewritten into this representation.
+message StoredProviderCredentialRefreshStateV2 {
+  reserved 15, 16;
+  reserved "refresh_before_seconds", "max_lifetime_seconds";
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  string provider_id = 2;
+  string provider_name = 3;
+  string credential_key = 4;
+  openshell.v1.ProviderCredentialRefreshStrategy strategy = 5;
+  map<string, string> material = 6 [(openshell.options.v1.secret) = true];
+  repeated string secret_material_keys = 7;
+  int64 expires_at_ms = 8;
+  int64 next_refresh_at_ms = 9;
+  int64 last_refresh_at_ms = 10;
+  string status = 11;
+  string last_error = 12;
+  string token_url = 13;
+  repeated string scopes = 14;
+  map<string, string> additional_output_keys = 17;
+  string authorization_epoch = 18;
+  map<string, openshell.datamodel.v1.CredentialHandle> secret_material_handles = 19;
+  repeated StoredRefreshMaterialDeletion pending_secret_deletions = 20;
+  openshell.v1.ProviderCredentialRefreshRecoveryAction recovery_action = 21;
+  string failure_code = 22;
+  string provider_error_subtype = 23;
+  int64 last_error_at_ms = 24;
+  // Absence selects the profile defaults. Explicit zero refresh_before means
+  // refresh at expiry. max_lifetime must be positive when present.
+  google.protobuf.Duration refresh_before = 115;
+  google.protobuf.Duration max_lifetime = 116;
 }
 
 message StoredRefreshMaterialDeletion {

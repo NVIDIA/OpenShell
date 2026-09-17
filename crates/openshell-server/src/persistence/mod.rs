@@ -3,6 +3,7 @@
 
 //! Persistence layer for `OpenShell` Server.
 
+mod legacy_time_wire;
 mod postgres;
 mod sqlite;
 
@@ -201,6 +202,10 @@ pub trait ObjectType {
     fn object_type() -> &'static str;
 }
 
+pub fn migrate_legacy_time_fields(object_type: &str, payload: &[u8]) -> PersistenceResult<Vec<u8>> {
+    legacy_time_wire::migrate(object_type, payload)
+}
+
 // Import object metadata accessor traits from openshell-core. Implementations
 // for public resource types live there; private storage types implement them
 // in crate::storage_proto.
@@ -227,10 +232,11 @@ pub fn generate_name() -> String {
 /// Extracted to avoid repeating the identical decode-and-hydrate block across
 /// `get_message`, `get_message_by_name`, `list_messages`, and
 /// `list_messages_with_selector`.
-fn decode_record<T: Message + Default + SetResourceVersion>(
+fn decode_record<T: Message + Default + SetResourceVersion + ObjectType>(
     record: ObjectRecord,
 ) -> PersistenceResult<T> {
-    let mut message = T::decode(record.payload.as_slice())
+    let payload = legacy_time_wire::migrate(T::object_type(), &record.payload)?;
+    let mut message = T::decode(payload.as_slice())
         .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))?;
     message.set_resource_version(record.resource_version);
     Ok(message)

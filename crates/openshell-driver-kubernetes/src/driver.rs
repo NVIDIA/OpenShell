@@ -4989,7 +4989,7 @@ fn mark_sandbox_runtime_bootstrapping(sandbox: &mut Sandbox) {
             status: "True".to_string(),
             reason: "SandboxRuntimeGenerationStarting".to_string(),
             message: "replacement sandbox-runtime generation is starting".to_string(),
-            last_transition_time: String::new(),
+            transition_time: None,
         });
     }
     mark_sandbox_runtime_control_unavailable(sandbox);
@@ -5015,7 +5015,7 @@ fn mark_sandbox_runtime_control_unavailable(sandbox: &mut Sandbox) {
             status: "False".to_string(),
             reason: REASON.to_string(),
             message: MESSAGE.to_string(),
-            last_transition_time: String::new(),
+            transition_time: None,
         });
     }
 }
@@ -5103,7 +5103,7 @@ fn map_kube_event_to_platform(
     Some((
         sandbox_id,
         PlatformEvent {
-            timestamp_ms: ts,
+            event_time: openshell_core::time::timestamp_from_millis(ts).ok(),
             source: "kubernetes".to_string(),
             r#type: obj.type_.clone().unwrap_or_default(),
             reason: obj.reason.clone().unwrap_or_default(),
@@ -6549,11 +6549,10 @@ fn condition_from_value(value: &serde_json::Value) -> Option<SandboxCondition> {
             .and_then(|val| val.as_str())
             .unwrap_or_default()
             .to_string(),
-        last_transition_time: obj
+        transition_time: obj
             .get("lastTransitionTime")
             .and_then(|val| val.as_str())
-            .unwrap_or_default()
-            .to_string(),
+            .and_then(|value| value.parse().ok()),
     })
 }
 

@@ -44,7 +44,7 @@ Remove an exposed service. The underlying sandbox port remains accessible
 internally but is no longer reachable through the service endpoint.
 
 ```go
-err := client.Services().Delete(ctx, "default", "my-sandbox", "web")
+deletion, err := client.Services().Delete(ctx, "default", "my-sandbox", "web")
 if err != nil {
     log.Fatal(err)
 }

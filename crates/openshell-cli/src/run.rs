@@ -47,15 +47,16 @@ use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, BeginRootfsTarStagingRequest,
     ClearDraftChunksRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
     CreateSshSessionRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
-    DeleteServiceRequest, EndpointResult, EndpointStatus, ExecSandboxRequest, ExposeServiceRequest,
-    GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
-    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetSandboxTemplateRequest, GetServiceRequest,
-    GpuResourceRequirements, ListSandboxPoliciesRequest, ListSandboxTemplatesRequest,
-    ListSandboxesRequest, ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest,
-    ResourceRequirements, RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase,
-    SandboxPolicy, SandboxResources, SandboxServiceLevel, SandboxSpec, SandboxStartup,
-    SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
+    DeleteServiceRequest, DeletionOutcome, EndpointResult, EndpointStatus, ExecSandboxRequest,
+    ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
+    GetGatewayConfigRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
+    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
+    GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
+    ListSandboxPoliciesRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
+    ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
+    RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
+    SandboxResources, SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate,
+    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
     ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, WatchSandboxRequest,
     exec_sandbox_event, tcp_forward_init,
@@ -71,6 +72,21 @@ use std::time::{Duration, Instant};
 use tonic::{Code, Status};
 
 const PROVISIONAL_CONTAINER_EXIT_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn proto_timestamp_ms(timestamp: Option<&prost_types::Timestamp>) -> i64 {
+    timestamp
+        .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+        .unwrap_or_default()
+}
+
+fn proto_execution_timeout(timeout_seconds: u32) -> Result<Option<prost_types::Duration>> {
+    if timeout_seconds == 0 {
+        return Ok(None);
+    }
+    openshell_core::time::duration_from_std(Duration::from_secs(timeout_seconds.into()))
+        .map(Some)
+        .into_diagnostic()
+}
 
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::{Editor, print_ssh_config};
@@ -760,7 +776,7 @@ pub async fn sandbox_create(
             log_tail_lines: 200,
             event_tail: 50,
             stop_on_terminal: false,
-            log_since_ms: 0,
+            since_time: None,
             log_sources: vec!["gateway".to_string()],
             log_min_level: String::new(),
         })
@@ -1478,11 +1494,6 @@ pub async fn sandbox_sync_command(
     Ok(())
 }
 
-/// Fetch a sandbox by name.
-///
-/// Policy always comes from [`GetSandboxConfig`] (effective active policy, sandbox
-/// or global). With `policy_only`, prints only that YAML to stdout; otherwise
-/// prints sandbox metadata and the same policy with formatted YAML.
 pub async fn sandbox_get(
     server: &str,
     name: &str,
@@ -1491,6 +1502,44 @@ pub async fn sandbox_get(
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
+    let mut stdout = Vec::new();
+    sandbox_get_to_writer(
+        server,
+        name,
+        policy_only,
+        output,
+        workspace,
+        tls,
+        &mut stdout,
+    )
+    .await?;
+    if !stdout.is_empty() {
+        std::io::stdout()
+            .lock()
+            .write_all(&stdout)
+            .into_diagnostic()?;
+    }
+    Ok(())
+}
+
+/// Fetch a sandbox by name.
+///
+/// Policy always comes from [`GetSandboxConfig`] (effective active policy, sandbox
+/// or global). With `policy_only`, prints only that YAML to stdout; otherwise
+/// prints sandbox metadata and the same policy with formatted YAML.
+#[doc(hidden)]
+pub async fn sandbox_get_to_writer<W>(
+    server: &str,
+    name: &str,
+    policy_only: bool,
+    output: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+    stdout: &mut W,
+) -> Result<()>
+where
+    W: Write + Send,
+{
     let mut client = grpc_client(server, tls).await?;
 
     let response = client
@@ -1525,7 +1574,7 @@ pub async fn sandbox_get(
         };
         let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
             .wrap_err("failed to serialize policy to YAML")?;
-        print!("{yaml_str}");
+        stdout.write_all(yaml_str.as_bytes()).into_diagnostic()?;
         return Ok(());
     }
 
@@ -1760,7 +1809,7 @@ pub async fn sandbox_exec_grpc(
             command: command.to_vec(),
             workdir: workdir.unwrap_or_default().to_string(),
             environment: environment.clone(),
-            timeout_seconds,
+            execution_timeout: proto_execution_timeout(timeout_seconds)?,
             stdin: stdin_payload,
             tty,
             cols,
@@ -1893,7 +1942,7 @@ pub async fn service_forward_tcp(
                         }
                     }
                     let _ = client
-                        .revoke_ssh_session(RevokeSshSessionRequest { token })
+                        .revoke_ssh_session(RevokeSshSessionRequest { allow_missing: true, token })
                         .await;
                 });
             }
@@ -2145,7 +2194,7 @@ async fn sandbox_exec_interactive_grpc(
                 workdir: workdir.unwrap_or_default().to_string(),
                 environment: environment.clone(),
                 no_login_shell,
-                timeout_seconds,
+                execution_timeout: proto_execution_timeout(timeout_seconds)?,
                 stdin: Vec::new(),
                 tty: true,
                 cols,
@@ -2384,7 +2433,12 @@ pub async fn sandbox_list(
             Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
             _ => phase.to_string(),
         };
-        let created = format_epoch_ms(sandbox.metadata.as_ref().map_or(0, |m| m.created_at_ms));
+        let created = format_epoch_ms(
+            sandbox
+                .metadata
+                .as_ref()
+                .map_or(0, |m| proto_timestamp_ms(m.created_time.as_ref())),
+        );
         if all_workspaces {
             println!(
                 "{:<ws_width$}  {:<name_width$}  {:<created_width$}  {}",
@@ -2441,7 +2495,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
                     "ports": endpoint.ports,
                     "path": endpoint.path,
                     "last_result": endpoint_result_name(endpoint.last_result()),
-                    "last_reported_at": endpoint.last_reported_at,
+                    "last_reported_at": endpoint.last_reported_time.as_ref().map(ToString::to_string).unwrap_or_default(),
                 })
             })
             .collect::<Vec<_>>()
@@ -2453,7 +2507,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "labels": labels,
         "annotations": annotations,
         "resource_version": meta.map_or(0, |m| m.resource_version),
-        "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
+        "created_at": format_epoch_ms(meta.map_or(0, |m| proto_timestamp_ms(m.created_time.as_ref()))),
         "phase": phase_name(sandbox.phase()),
         "current_policy_version": sandbox.current_policy_version(),
         "exit_code": sandbox.status.as_ref().and_then(|status| status.exit_code),
@@ -2464,12 +2518,17 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
 }
 
 fn sandbox_condition_to_json(condition: &SandboxCondition) -> serde_json::Value {
+    let transition_time = condition
+        .transition_time
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
     serde_json::json!({
         "type": condition.r#type,
         "status": condition.status,
         "reason": condition.reason,
         "message": condition.message,
-        "last_transition_time": condition.last_transition_time,
+        "last_transition_time": transition_time,
     })
 }
 
@@ -2488,11 +2547,8 @@ fn sandbox_condition_display_lines(condition: &SandboxCondition) -> Vec<String> 
         "{}: {}{reason}{message}",
         condition.r#type, condition.status
     )];
-    if !condition.last_transition_time.is_empty() {
-        lines.push(format!(
-            "Last transition: {}",
-            condition.last_transition_time
-        ));
+    if let Some(transition_time) = &condition.transition_time {
+        lines.push(format!("Last transition: {transition_time}"));
     }
     lines
 }
@@ -2532,8 +2588,11 @@ fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
         EndpointResult::UpstreamRejected => "Server rejected the request (HTTP 400 or higher).",
     };
     // The gateway supplies acceptance time, which can follow the actual
-    // exchange. An empty timestamp means there is no accepted observation.
-    let reported_at = non_empty_or(&endpoint.last_reported_at, "no report yet");
+    // exchange. An absent timestamp means there is no accepted observation.
+    let reported_at = endpoint
+        .last_reported_time
+        .as_ref()
+        .map_or_else(|| "no report yet".to_string(), ToString::to_string);
     vec![
         format!(
             "{} (ports: {ports}; path: {})",
@@ -2631,12 +2690,12 @@ pub async fn sandbox_template_create(
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: name.to_string(),
-                    created_at_ms: 0,
+                    created_time: openshell_core::time::timestamp_from_millis(0).ok(),
                     labels,
                     resource_version: 0,
                     annotations,
                     workspace: workspace.to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxWorkloadTemplateSpec {
                     workload: Some(SandboxWorkloadConfig {
@@ -2793,6 +2852,17 @@ pub async fn sandbox_template_list(
     Ok(())
 }
 
+pub(crate) fn deletion_completed(outcome: i32) -> Result<bool> {
+    use openshell_core::proto::DeletionOutcome;
+    match DeletionOutcome::try_from(outcome) {
+        Ok(DeletionOutcome::Completed) => Ok(true),
+        Ok(DeletionOutcome::AlreadyAbsent) => Ok(false),
+        _ => Err(miette!(
+            "gateway returned an unsupported deletion outcome: {outcome}"
+        )),
+    }
+}
+
 pub async fn sandbox_template_delete(
     server: &str,
     names: &[String],
@@ -2803,12 +2873,13 @@ pub async fn sandbox_template_delete(
     for name in names {
         let response = client
             .delete_sandbox_template(DeleteSandboxTemplateRequest {
+                allow_missing: true,
                 name: name.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
             .into_diagnostic()?;
-        if response.into_inner().deleted {
+        if deletion_completed(response.into_inner().outcome)? {
             println!("{} Deleted sandbox template {name}", "✓".green().bold());
         } else {
             println!("Sandbox template {name} not found.");
@@ -2836,10 +2907,12 @@ fn sandbox_template_to_json(template: &SandboxWorkloadTemplate) -> serde_json::V
                 serde_json::json!(metadata.resource_version),
             );
         }
-        if metadata.created_at_ms != 0 {
+        if metadata.created_time.is_some() {
             obj.insert(
                 "created_at".to_string(),
-                serde_json::json!(format_epoch_ms(metadata.created_at_ms)),
+                serde_json::json!(format_epoch_ms(proto_timestamp_ms(
+                    metadata.created_time.as_ref()
+                ))),
             );
         }
         if !metadata.labels.is_empty() {
@@ -2935,11 +3008,11 @@ fn print_sandbox_template_detail(template: &SandboxWorkloadTemplate) {
             "Resource version:".dimmed(),
             metadata.resource_version
         );
-        if metadata.created_at_ms != 0 {
+        if metadata.created_time.is_some() {
             println!(
                 "  {} {}",
                 "Created:".dimmed(),
-                format_epoch_ms(metadata.created_at_ms)
+                format_epoch_ms(proto_timestamp_ms(metadata.created_time.as_ref()))
             );
         }
         let labels = labels_display(&metadata.labels);
@@ -3228,17 +3301,13 @@ pub async fn sandbox_delete(
 
         let response = match client
             .delete_sandbox(DeleteSandboxRequest {
+                allow_missing: true,
                 name: name.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             })
             .await
         {
             Ok(response) => response,
-            Err(status) if status.code() == Code::NotFound => {
-                clear_last_sandbox_if_matches(gateway, workspace, name);
-                println!("{} Sandbox {name} already deleted", "✓".green().bold());
-                continue;
-            }
             Err(status) => {
                 eprintln!(
                     "{} Failed to delete sandbox {name}: {status}",
@@ -3249,13 +3318,25 @@ pub async fn sandbox_delete(
             }
         };
 
-        let deleted = response.into_inner().deleted;
-        if deleted {
-            clear_last_sandbox_if_matches(gateway, workspace, name);
-            println!("{} Deleted sandbox {name}", "✓".green().bold());
-        } else {
-            println!("{} Sandbox {name} not found", "!".yellow());
+        match response.into_inner().outcome() {
+            DeletionOutcome::Completed => println!("{} Deleted sandbox {name}", "✓".green().bold()),
+            DeletionOutcome::Accepted => println!(
+                "{} Sandbox {name} deletion accepted; cleanup is pending",
+                "✓".green().bold()
+            ),
+            DeletionOutcome::AlreadyAbsent => {
+                println!("{} Sandbox {name} already deleted", "✓".green().bold());
+            }
+            DeletionOutcome::Unspecified => {
+                eprintln!(
+                    "{} Unsupported deletion outcome for sandbox {name}",
+                    "!".red().bold()
+                );
+                failures.push(name.clone());
+                continue;
+            }
         }
+        clear_last_sandbox_if_matches(gateway, workspace, name);
     }
 
     aggregate_delete_failures("sandbox", &failures)
@@ -3347,7 +3428,7 @@ async fn wait_for_lifecycle_phase(
             log_tail_lines: 0,
             event_tail: 0,
             stop_on_terminal: false,
-            log_since_ms: 0,
+            since_time: None,
             log_sources: Vec::new(),
             log_min_level: String::new(),
         })
@@ -3527,6 +3608,7 @@ pub async fn service_delete(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .delete_service(DeleteServiceRequest {
+            allow_missing: false,
             sandbox: sandbox.to_string(),
             service: service.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -3535,7 +3617,7 @@ pub async fn service_delete(
         .map_err(|status| service_status_error("delete service", "sandbox:write", status))?
         .into_inner();
 
-    if !response.deleted {
+    if !deletion_completed(response.outcome)? {
         return Err(miette!("delete service failed: service endpoint not found"));
     }
 
@@ -3792,11 +3874,11 @@ pub async fn workspace_get(server: &str, name: &str, tls: &TlsOptions) -> Result
             "Resource version:".dimmed(),
             meta.resource_version
         );
-        if meta.created_at_ms != 0 {
+        if meta.created_time.is_some() {
             println!(
                 "  {} {}",
                 "Created:".dimmed(),
-                format_epoch_ms(meta.created_at_ms)
+                format_epoch_ms(proto_timestamp_ms(meta.created_time.as_ref()))
             );
         }
         if !meta.labels.is_empty() {
@@ -3871,10 +3953,9 @@ pub async fn workspace_list(
 
     for workspace in &workspaces {
         let status = workspace_phase_display(workspace);
-        let created = workspace
-            .metadata
-            .as_ref()
-            .map_or_else(String::new, |m| format_epoch_ms(m.created_at_ms));
+        let created = workspace.metadata.as_ref().map_or_else(String::new, |m| {
+            format_epoch_ms(proto_timestamp_ms(m.created_time.as_ref()))
+        });
         let labels = workspace.metadata.as_ref().map_or_else(String::new, |m| {
             m.labels
                 .iter()
@@ -3900,10 +3981,13 @@ pub async fn workspace_delete(server: &str, names: &[String], tls: &TlsOptions) 
     let mut client = grpc_client(server, tls).await?;
     for name in names {
         let response = client
-            .delete_workspace(DeleteWorkspaceRequest { name: name.clone() })
+            .delete_workspace(DeleteWorkspaceRequest {
+                allow_missing: false,
+                name: name.clone(),
+            })
             .await
             .into_diagnostic()?;
-        if response.into_inner().deleted {
+        if deletion_completed(response.into_inner().outcome)? {
             println!("{} Deleted workspace {name}", "✓".green().bold());
         } else {
             println!("{} Workspace {name} not found", "!".yellow());
@@ -3969,13 +4053,14 @@ pub async fn workspace_member_remove(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .remove_workspace_member(RemoveWorkspaceMemberRequest {
+            allow_missing: true,
             workspace: workspace.to_string(),
             principal_subject: subject.to_string(),
         })
         .await
         .into_diagnostic()?;
 
-    if response.into_inner().removed {
+    if deletion_completed(response.into_inner().outcome)? {
         println!(
             "{} Removed {} from workspace {}",
             "✓".green().bold(),
@@ -4098,10 +4183,12 @@ fn workspace_to_json(workspace: &openshell_core::proto::Workspace) -> serde_json
             "resource_version".to_string(),
             serde_json::json!(meta.resource_version),
         );
-        if meta.created_at_ms != 0 {
+        if meta.created_time.is_some() {
             obj.insert(
                 "created_at".to_string(),
-                serde_json::json!(format_epoch_ms(meta.created_at_ms)),
+                serde_json::json!(format_epoch_ms(proto_timestamp_ms(
+                    meta.created_time.as_ref()
+                ))),
             );
         }
         if !meta.labels.is_empty() {
@@ -5064,11 +5151,21 @@ where
         writeln!(stdout, "Hash:         {}", rev.policy_hash).into_diagnostic()?;
         writeln!(stdout, "Status:       {status:?}").into_diagnostic()?;
         writeln!(stdout, "Active:       {}", inner.active_version).into_diagnostic()?;
-        if rev.created_at_ms > 0 {
-            writeln!(stdout, "Created:      {} ms", rev.created_at_ms).into_diagnostic()?;
+        if let Some(created_time) = rev.created_time.as_ref() {
+            writeln!(
+                stdout,
+                "Created:      {} ms",
+                proto_timestamp_ms(Some(created_time))
+            )
+            .into_diagnostic()?;
         }
-        if rev.loaded_at_ms > 0 {
-            writeln!(stdout, "Loaded:       {} ms", rev.loaded_at_ms).into_diagnostic()?;
+        if let Some(loaded_time) = rev.loaded_time.as_ref() {
+            writeln!(
+                stdout,
+                "Loaded:       {} ms",
+                proto_timestamp_ms(Some(loaded_time))
+            )
+            .into_diagnostic()?;
         }
         if !rev.load_error.is_empty() {
             writeln!(stdout, "Error:        {}", rev.load_error).into_diagnostic()?;
@@ -5246,11 +5343,14 @@ pub async fn sandbox_policy_get_global(
         println!("Version:      {}", rev.version);
         println!("Hash:         {}", rev.policy_hash);
         println!("Status:       {status:?}");
-        if rev.created_at_ms > 0 {
-            println!("Created:      {} ms", rev.created_at_ms);
+        if let Some(created_time) = rev.created_time.as_ref() {
+            println!(
+                "Created:      {} ms",
+                proto_timestamp_ms(Some(created_time))
+            );
         }
-        if rev.loaded_at_ms > 0 {
-            println!("Loaded:       {} ms", rev.loaded_at_ms);
+        if let Some(loaded_time) = rev.loaded_time.as_ref() {
+            println!("Loaded:       {} ms", proto_timestamp_ms(Some(loaded_time)));
         }
 
         if view.includes_policy() {
@@ -5306,16 +5406,16 @@ fn policy_revision_to_json(
             serde_json::json!(active_version),
         );
     }
-    if rev.created_at_ms > 0 {
+    if rev.created_time.is_some() {
         obj.insert(
             "created_at_ms".to_string(),
-            serde_json::json!(rev.created_at_ms),
+            serde_json::json!(proto_timestamp_ms(rev.created_time.as_ref())),
         );
     }
-    if rev.loaded_at_ms > 0 {
+    if rev.loaded_time.is_some() {
         obj.insert(
             "loaded_at_ms".to_string(),
-            serde_json::json!(rev.loaded_at_ms),
+            serde_json::json!(proto_timestamp_ms(rev.loaded_time.as_ref())),
         );
     }
     if !rev.load_error.is_empty() {
@@ -5484,7 +5584,7 @@ fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicy
             rev.version,
             hash_short,
             format!("{status:?}"),
-            rev.created_at_ms,
+            proto_timestamp_ms(rev.created_time.as_ref()),
             error_short,
         );
     }
@@ -5552,7 +5652,8 @@ pub async fn sandbox_logs(
                 log_tail_lines: lines,
                 event_tail: 0,
                 stop_on_terminal: false,
-                log_since_ms: since_ms,
+                since_time: openshell_core::time::optional_timestamp_from_legacy_millis(since_ms)
+                    .into_diagnostic()?,
                 log_sources: source_filter,
                 log_min_level: level.to_uppercase(),
             })
@@ -5574,7 +5675,8 @@ pub async fn sandbox_logs(
             .get_sandbox_logs(GetSandboxLogsRequest {
                 sandbox_id: sandbox.object_id().to_string(),
                 lines,
-                since_ms,
+                since_time: openshell_core::time::optional_timestamp_from_legacy_millis(since_ms)
+                    .into_diagnostic()?,
                 sources: source_filter,
                 min_level: level.to_uppercase(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -5609,8 +5711,9 @@ fn format_log_line(log: &openshell_core::proto::SandboxLogLine) -> String {
     } else {
         &log.source
     };
-    let secs = log.timestamp_ms / 1000;
-    let millis = log.timestamp_ms % 1000;
+    let timestamp_ms = proto_timestamp_ms(log.event_time.as_ref());
+    let secs = timestamp_ms / 1000;
+    let millis = timestamp_ms % 1000;
     if log.fields.is_empty() {
         format!(
             "[{secs}.{millis:03}] [{source:<7}] [{:<5}] [{}] {}",
@@ -5738,8 +5841,8 @@ pub async fn sandbox_draft_get(
                 "  {} {} (first seen {}, last seen {})",
                 "Hits:".dimmed(),
                 chunk.hit_count,
-                format_epoch_ms(chunk.first_seen_ms),
-                format_epoch_ms(chunk.last_seen_ms),
+                format_epoch_ms(proto_timestamp_ms(chunk.first_seen_time.as_ref())),
+                format_epoch_ms(proto_timestamp_ms(chunk.last_seen_time.as_ref())),
             );
         }
         println!();
@@ -5931,7 +6034,7 @@ pub async fn sandbox_draft_history(
 
         println!(
             "  {} {} [{}] {}",
-            format_timestamp_ms(entry.timestamp_ms).dimmed(),
+            format_timestamp_ms(proto_timestamp_ms(entry.event_time.as_ref())).dimmed(),
             event_colored,
             entry.chunk_id.get(..8).unwrap_or(&entry.chunk_id),
             entry.description,
@@ -5999,11 +6102,23 @@ mod tests {
         format_log_line, git_sync_files, has_main_process_result, parse_cli_setting_value,
         parse_credential_expiry_cli_value, parse_driver_config_json,
         parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
-        provisioning_timeout_message, ready_false_condition_message, resolve_from,
-        rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
-        service_endpoint_to_json, service_expose_status_error, service_url_for_gateway,
-        workspace_member_to_json,
+        proto_execution_timeout, provisioning_timeout_message, ready_false_condition_message,
+        resolve_from, rootfs_tar_sources_supported_for_gateway, sandbox_should_persist,
+        sandbox_upload_plan, service_endpoint_to_json, service_expose_status_error,
+        service_url_for_gateway, workspace_member_to_json,
     };
+
+    #[test]
+    fn zero_exec_timeout_is_omitted() {
+        assert!(proto_execution_timeout(0).unwrap().is_none());
+        assert_eq!(
+            proto_execution_timeout(30).unwrap().unwrap(),
+            prost_types::Duration {
+                seconds: 30,
+                nanos: 0,
+            }
+        );
+    }
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::{
         parse_credential_expiry_pairs, parse_credential_pairs, progress_step_from_metadata,
@@ -6064,8 +6179,8 @@ mod tests {
             policy_hash: "0123456789abcdef".to_string(),
             status: PolicyStatus::Failed as i32,
             load_error: load_error.to_string(),
-            created_at_ms: 100,
-            loaded_at_ms: 200,
+            created_time: openshell_core::time::timestamp_from_millis(100).ok(),
+            loaded_time: openshell_core::time::timestamp_from_millis(200).ok(),
             policy: Some(SandboxPolicy::default()),
             provenance: std::collections::HashMap::from([(
                 "source".to_string(),
@@ -6888,7 +7003,7 @@ mod tests {
                 status: "False".to_string(),
                 reason: "Unschedulable".to_string(),
                 message: "Another GPU sandbox may already be using the available GPU.".to_string(),
-                last_transition_time: String::new(),
+                transition_time: None,
             }],
             ..Default::default()
         };
@@ -6909,7 +7024,7 @@ mod tests {
                 status: "True".to_string(),
                 reason: "Scheduled".to_string(),
                 message: "Sandbox scheduled".to_string(),
-                last_transition_time: String::new(),
+                transition_time: None,
             }],
             ..Default::default()
         };
@@ -7225,7 +7340,7 @@ mod tests {
                 id: "sb-123".to_string(),
                 name: "test-sb".to_string(),
                 resource_version: 5,
-                created_at_ms: 1_609_459_200_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_609_459_200_000).ok(),
                 ..Default::default()
             }),
             created_from_workload_template: Some(SandboxWorkloadTemplateProvenance {
@@ -7292,14 +7407,14 @@ mod tests {
                     ports: vec![443, 8443],
                     path: "/mcp".to_string(),
                     last_result: EndpointResult::TransportFailed as i32,
-                    last_reported_at: "2026-09-05T10:01:00Z".to_string(),
+                    last_reported_time: Some("2026-09-05T10:01:00Z".parse().unwrap()),
                 }],
                 conditions: vec![SandboxCondition {
                     r#type: "Ready".to_string(),
                     status: "True".to_string(),
                     reason: "DependenciesReady".to_string(),
                     message: "Supervisor session connected".to_string(),
-                    last_transition_time: "2026-09-05T10:00:00Z".to_string(),
+                    transition_time: "2026-09-05T10:00:00Z".parse().ok(),
                 }],
                 ..Default::default()
             }),
@@ -7353,7 +7468,7 @@ mod tests {
             ports: vec![443, 8443],
             path: "/mcp".to_string(),
             last_result: EndpointResult::TransportFailed as i32,
-            last_reported_at: "2026-09-05T11:01:00Z".to_string(),
+            last_reported_time: Some("2026-09-05T11:01:00Z".parse().unwrap()),
         };
 
         assert_eq!(
@@ -7374,7 +7489,7 @@ mod tests {
             ports: vec![443],
             path: "/**".to_string(),
             last_result: EndpointResult::NoObservedExchange as i32,
-            last_reported_at: String::new(),
+            last_reported_time: None,
         };
 
         assert_eq!(
@@ -7414,7 +7529,7 @@ mod tests {
             ports: vec![443],
             path: "/mcp".to_string(),
             last_result: EndpointResult::HttpResponseReceived as i32,
-            last_reported_at: "2026-09-05T11:01:00Z".to_string(),
+            last_reported_time: Some("2026-09-05T11:01:00Z".parse().unwrap()),
             ..Default::default()
         };
         assert_eq!(
@@ -7462,7 +7577,7 @@ mod tests {
             status: "True".to_string(),
             reason: "DependenciesReady".to_string(),
             message: "Supervisor session connected".to_string(),
-            last_transition_time: String::new(),
+            transition_time: None,
         };
         assert_eq!(
             super::sandbox_condition_display_lines(&ordinary),
@@ -7479,7 +7594,7 @@ mod tests {
     ) -> openshell_core::proto::SandboxLogLine {
         openshell_core::proto::SandboxLogLine {
             sandbox_id: "sb-1".to_string(),
-            timestamp_ms: 1_234_567,
+            event_time: openshell_core::time::timestamp_from_millis(1_234_567).ok(),
             level: level.to_string(),
             target: target.to_string(),
             message: message.to_string(),
@@ -7557,10 +7672,10 @@ mod tests {
     #[test]
     fn format_log_line_zero_pads_millis() {
         let mut log = log_line("INFO", "t", "m", "sandbox", &[]);
-        log.timestamp_ms = 1_000_007;
+        log.event_time = openshell_core::time::timestamp_from_millis(1_000_007).ok();
         assert_eq!(format_log_line(&log), "[1000.007] [sandbox] [INFO ] [t] m");
 
-        log.timestamp_ms = 0;
+        log.event_time = None;
         assert_eq!(format_log_line(&log), "[0.000] [sandbox] [INFO ] [t] m");
     }
 

@@ -329,7 +329,7 @@ impl KubernetesSecretsCredentialDriver {
             Ok::<_, Status>(ResolvedCredential {
                 request_id: request.request_id,
                 value,
-                expires_at_ms: 0,
+                expiration_time: None,
             })
         });
         futures::future::try_join_all(futures).await

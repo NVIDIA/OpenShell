@@ -28,7 +28,8 @@ from ._proto import (
     openshell_pb2,
     openshell_pb2_grpc,
 )
-from .errors import GatewayError, _error_mapping_channel
+from .errors import _error_mapping_channel
+from .mutations import DeletionOutcome, DeletionResult
 
 _ClientCallDetailsBase = namedtuple(
     "_ClientCallDetailsBase",
@@ -534,8 +535,10 @@ class SandboxSession:
             timeout_seconds=timeout_seconds,
         )
 
-    def delete(self) -> bool:
-        return self._client.delete(self.sandbox.name, workspace=self._workspace)
+    def delete(self, *, allow_missing: bool = False) -> DeletionResult:
+        return self._client.delete(
+            self.sandbox.name, workspace=self._workspace, allow_missing=allow_missing
+        )
 
     def stop(self) -> SandboxRef:
         self.sandbox = self._client.stop(self.sandbox.name, workspace=self._workspace)
@@ -956,14 +959,20 @@ class SandboxClient:
             )
         ]
 
-    def delete(self, sandbox_name: str, *, workspace: str) -> bool:
+    def delete(
+        self, sandbox_name: str, *, workspace: str, allow_missing: bool = False
+    ) -> DeletionResult:
         response = self._stub.DeleteSandbox(
             openshell_pb2.DeleteSandboxRequest(
-                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+                name=sandbox_name,
+                workspace_scope=_workspace_scope(workspace),
+                allow_missing=allow_missing,
             ),
             timeout=self._timeout,
         )
-        return bool(response.deleted)
+        return DeletionResult(
+            DeletionOutcome(response.outcome), response.sandbox_id or None
+        )
 
     def stop(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StopSandbox(
@@ -984,18 +993,24 @@ class SandboxClient:
         return _sandbox_ref(response.sandbox)
 
     def wait_deleted(
-        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 60.0
+        self,
+        sandbox_name: str,
+        *,
+        workspace: str,
+        timeout_seconds: float = 60.0,
+        expected_sandbox_id: str | None = None,
     ) -> None:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             try:
-                self.get(sandbox_name, workspace=workspace)
-            except grpc.RpcError as exc:
-                call = exc.raw_error if isinstance(exc, GatewayError) else exc
+                current = self.get(sandbox_name, workspace=workspace)
                 if (
-                    isinstance(call, grpc.Call)
-                    and call.code() == grpc.StatusCode.NOT_FOUND
+                    expected_sandbox_id is not None
+                    and current.id != expected_sandbox_id
                 ):
+                    return
+            except grpc.RpcError as exc:
+                if getattr(exc, "code", lambda: None)() == grpc.StatusCode.NOT_FOUND:
                     return
                 raise
             time.sleep(1)
@@ -1075,10 +1090,11 @@ class SandboxClient:
             command=list(command),
             workdir=workdir or "",
             environment=dict(env or {}),
-            timeout_seconds=timeout_seconds or 0,
             stdin=stdin or b"",
             no_login_shell=no_login_shell,
         )
+        if timeout_seconds:
+            request.execution_timeout.seconds = timeout_seconds
         # Use whichever is larger: the default client timeout or the command
         # timeout plus headroom for SSH setup / teardown overhead.
         grpc_deadline = self._timeout
@@ -1329,14 +1345,18 @@ class SandboxTemplateClient:
             label_selector=label_selector,
         ).all()
 
-    def delete(self, name: str, *, workspace: str) -> bool:
+    def delete(
+        self, name: str, *, workspace: str, allow_missing: bool = False
+    ) -> DeletionResult:
         response = self._stub.DeleteSandboxTemplate(
             openshell_pb2.DeleteSandboxTemplateRequest(
-                name=name, workspace_scope=_workspace_scope(workspace)
+                name=name,
+                workspace_scope=_workspace_scope(workspace),
+                allow_missing=allow_missing,
             ),
             timeout=self._timeout,
         )
-        return bool(response.deleted)
+        return DeletionResult(DeletionOutcome(response.outcome))
 
 
 @dataclass(frozen=True)
@@ -1424,12 +1444,14 @@ class WorkspaceClient:
             label_selector=label_selector,
         ).all()
 
-    def delete(self, name: str) -> bool:
+    def delete(self, name: str, *, allow_missing: bool = False) -> DeletionResult:
         response = self._stub.DeleteWorkspace(
-            openshell_pb2.DeleteWorkspaceRequest(name=name),
+            openshell_pb2.DeleteWorkspaceRequest(
+                name=name, allow_missing=allow_missing
+            ),
             timeout=self._timeout,
         )
-        return response.deleted
+        return DeletionResult(DeletionOutcome(response.outcome))
 
 
 class Sandbox:
@@ -1555,20 +1577,20 @@ class Sandbox:
                 and self._session is not None
                 and self._client is not None
             ):
-                try:
-                    deleted = self._session.delete()
-                    if deleted:
-                        self._client.wait_deleted(
-                            self._session.sandbox.name,
-                            workspace=self._workspace,
-                        )
-                except grpc.RpcError as exc:
-                    call = exc.raw_error if isinstance(exc, GatewayError) else exc
-                    if (
-                        not isinstance(call, grpc.Call)
-                        or call.code() != grpc.StatusCode.NOT_FOUND
-                    ):
-                        raise
+                result = self._session.delete(allow_missing=True)
+                if result.outcome == DeletionOutcome.ACCEPTED:
+                    self._client.wait_deleted(
+                        self._session.sandbox.name,
+                        workspace=self._workspace,
+                        expected_sandbox_id=result.sandbox_id,
+                    )
+                elif result.outcome not in (
+                    DeletionOutcome.COMPLETED,
+                    DeletionOutcome.ALREADY_ABSENT,
+                ):
+                    raise SandboxError(
+                        f"unsupported deletion outcome: {result.outcome}"
+                    )
         finally:
             if self._client is not None:
                 self._client.close()

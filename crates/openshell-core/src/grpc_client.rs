@@ -34,6 +34,7 @@ use crate::proto::{
     open_shell_client::OpenShellClient, workspace_selector,
 };
 use crate::sandbox_env;
+use crate::time::{duration_to_std, timestamp_to_millis};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_extension_core::{BearerTokenSlot, ExtensionCredentialStore};
 use tonic::Status;
@@ -123,7 +124,13 @@ fn validate_sandbox_refresh(
 ) -> std::result::Result<ValidatedSandboxRefresh, crate::jwt::SessionJwtError> {
     let token = crate::jwt::SecretJwt::parse(response.sandbox_token.clone())?;
     let credential_epoch = crate::jwt::CredentialEpoch::new(response.credential_epoch)?;
-    let expires_at = response.sandbox_expires_at_ms / 1000;
+    let expiration_time = response
+        .sandbox_expiration_time
+        .as_ref()
+        .ok_or(crate::jwt::SessionJwtError::InvalidLifetime)?;
+    crate::time::validate_timestamp(expiration_time)
+        .map_err(|_| crate::jwt::SessionJwtError::InvalidLifetime)?;
+    let expires_at = expiration_time.seconds;
     crate::jwt::SessionBearerTokenSlot::new(token.clone(), expires_at, credential_epoch)?;
     Ok(ValidatedSandboxRefresh {
         token,
@@ -579,10 +586,11 @@ async fn refresh_extension_credentials_with_client(
                 "gateway returned an unexpected or duplicate extension credential"
             ));
         }
-        validated.insert(
-            credential.service_name,
-            (credential.token, credential.expires_at_ms),
-        );
+        let expiration_time = credential.expiration_time.as_ref().ok_or_else(|| {
+            miette::miette!("gateway returned an extension credential without an expiration time")
+        })?;
+        let expires_at_ms = timestamp_to_millis(expiration_time).into_diagnostic()?;
+        validated.insert(credential.service_name, (credential.token, expires_at_ms));
     }
     if validated.len() != expected.len() {
         return Err(miette::miette!(
@@ -678,10 +686,13 @@ mod auth_tests {
 
     #[cfg(feature = "jwt")]
     #[test]
-    fn sandbox_refresh_validation_rejects_invalid_lifetime_before_installation() {
+    fn sandbox_refresh_validation_rejects_epoch_expiration() {
         let response = crate::proto::RefreshSandboxTokenResponse {
             sandbox_token: "sandbox-token".to_string(),
-            sandbox_expires_at_ms: 999,
+            sandbox_expiration_time: Some(prost_types::Timestamp {
+                seconds: 0,
+                nanos: 0,
+            }),
             credential_epoch: 2,
             ..Default::default()
         };
@@ -690,6 +701,57 @@ mod auth_tests {
             validate_sandbox_refresh(&response).err(),
             Some(crate::jwt::SessionJwtError::InvalidLifetime)
         );
+    }
+
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn sandbox_refresh_validation_rejects_missing_expiration() {
+        let response = crate::proto::RefreshSandboxTokenResponse {
+            sandbox_token: "sandbox-token".to_string(),
+            credential_epoch: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            validate_sandbox_refresh(&response).err(),
+            Some(crate::jwt::SessionJwtError::InvalidLifetime)
+        );
+    }
+
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn sandbox_refresh_validation_rejects_malformed_expiration() {
+        let response = crate::proto::RefreshSandboxTokenResponse {
+            sandbox_token: "sandbox-token".to_string(),
+            sandbox_expiration_time: Some(prost_types::Timestamp {
+                seconds: 1,
+                nanos: -1,
+            }),
+            credential_epoch: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            validate_sandbox_refresh(&response).err(),
+            Some(crate::jwt::SessionJwtError::InvalidLifetime)
+        );
+    }
+
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn sandbox_refresh_validation_accepts_canonical_fractional_expiration() {
+        let response = crate::proto::RefreshSandboxTokenResponse {
+            sandbox_token: "sandbox-token".to_string(),
+            sandbox_expiration_time: Some(prost_types::Timestamp {
+                seconds: 1_900_000_000,
+                nanos: 500_000_000,
+            }),
+            credential_epoch: 2,
+            ..Default::default()
+        };
+
+        let refresh = validate_sandbox_refresh(&response).expect("valid refresh");
+        assert_eq!(refresh.expires_at, 1_900_000_000);
     }
 
     #[test]
@@ -981,25 +1043,35 @@ pub async fn fetch_provider_environment(
         .await
         .into_diagnostic()?;
 
-    Ok(provider_environment_result(response.into_inner()))
+    provider_environment_result(response.into_inner())
 }
 
-/// Preserve snapshot authority and fail closed on unknown delivery reasons.
+/// Preserve snapshot authority and reject invalid credential expiration times.
+/// Unknown delivery reasons withhold credentials rather than implying readiness.
 fn provider_environment_result(
     inner: GetSandboxProviderEnvironmentResponse,
-) -> ProviderEnvironmentResult {
-    ProviderEnvironmentResult {
+) -> Result<ProviderEnvironmentResult> {
+    let credential_expires_at_ms = inner
+        .credential_expiration_times
+        .iter()
+        .map(|(name, expiration_time)| {
+            timestamp_to_millis(expiration_time)
+                .map(|value| (name.clone(), value))
+                .into_diagnostic()
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+    Ok(ProviderEnvironmentResult {
         environment: inner.environment,
         provider_env_revision: inner.provider_env_revision,
         provider_attachment_epoch: inner.provider_attachment_epoch,
         policy_hash: inner.policy_hash,
         readiness_reason: crate::proto::ProviderReadinessReason::try_from(inner.readiness_reason)
             .unwrap_or(crate::proto::ProviderReadinessReason::CredentialsWithheld),
-        credential_expires_at_ms: inner.credential_expires_at_ms,
+        credential_expires_at_ms,
         dynamic_credentials: inner.dynamic_credentials,
         static_credential_bindings: inner.static_credential_bindings,
         non_secret_environment_keys: inner.non_secret_environment_keys,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1014,8 +1086,16 @@ mod provider_environment_tests {
             provider_attachment_epoch: "attachment-epoch".to_string(),
             policy_hash: "binding-policy".to_string(),
             readiness_reason: crate::proto::ProviderReadinessReason::CredentialsWithheld.into(),
+            credential_expiration_times: HashMap::from([(
+                "TOKEN".to_string(),
+                prost_types::Timestamp {
+                    seconds: 1_900_000_000,
+                    nanos: 123_000_000,
+                },
+            )]),
             ..Default::default()
-        });
+        })
+        .expect("valid provider environment");
         assert_eq!(result.provider_env_revision, 42);
         assert_eq!(result.provider_attachment_epoch, "attachment-epoch");
         assert_eq!(result.policy_hash, "binding-policy");
@@ -1027,6 +1107,10 @@ mod provider_environment_tests {
             result.environment.get("TOKEN").map(String::as_str),
             Some("synthetic")
         );
+        assert_eq!(
+            result.credential_expires_at_ms.get("TOKEN"),
+            Some(&1_900_000_000_123)
+        );
     }
 
     #[test]
@@ -1035,11 +1119,27 @@ mod provider_environment_tests {
             policy_hash: "binding-policy".to_string(),
             readiness_reason: i32::MAX,
             ..Default::default()
-        });
+        })
+        .expect("valid provider environment");
         assert_eq!(
             result.readiness_reason,
             crate::proto::ProviderReadinessReason::CredentialsWithheld
         );
+    }
+
+    #[test]
+    fn provider_environment_rejects_invalid_credential_expiration() {
+        let result = provider_environment_result(GetSandboxProviderEnvironmentResponse {
+            credential_expiration_times: HashMap::from([(
+                "TOKEN".to_string(),
+                prost_types::Timestamp {
+                    seconds: 1_900_000_000,
+                    nanos: -1,
+                },
+            )]),
+            ..Default::default()
+        });
+        assert!(result.is_err());
     }
 }
 
@@ -1069,9 +1169,18 @@ pub async fn exchange_provider_subject_token(
         .await
         .map_err(provider_subject_token_exchange_status)?;
     let inner = response.into_inner();
+    let expires_in = inner
+        .expires_after
+        .as_ref()
+        .map(duration_to_std)
+        .transpose()
+        .into_diagnostic()?
+        .map_or(0, |value| {
+            i64::try_from(value.as_secs()).unwrap_or(i64::MAX)
+        });
     Ok(ProviderSubjectTokenExchangeResult {
         access_token: inner.access_token,
-        expires_in: inner.expires_in,
+        expires_in,
         token_type: inner.token_type,
     })
 }

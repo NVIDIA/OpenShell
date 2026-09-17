@@ -18,6 +18,7 @@ import pytest
 
 import openshell.sandbox as sandbox_module
 from openshell._proto import openshell_pb2
+from openshell.mutations import DeletionOutcome
 from openshell.sandbox import (
     _OIDC_TOKEN_EXPIRY_GRACE_SECONDS,
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
@@ -2013,7 +2014,7 @@ class _FakeSandboxStub:
     ) -> Any:
         self.delete_request = request
         _ = timeout
-        return SimpleNamespace(deleted=True)
+        return SimpleNamespace(outcome=1, sandbox_id="sb-1")
 
     def StopSandbox(
         self,
@@ -2122,7 +2123,7 @@ class _FakeSandboxStub:
     ) -> Any:
         self.delete_template_request = request
         _ = timeout
-        return SimpleNamespace(deleted=True)
+        return SimpleNamespace(outcome=1, sandbox_id="sb-1")
 
 
 class _RecordingHighLevelClient:
@@ -2421,7 +2422,7 @@ def test_sandbox_template_client_crud_forwards_requests() -> None:
     assert stub.list_template_request.label_selector == "team=runtime"
     assert not _request_selects_all_workspaces(stub.list_template_request)
 
-    assert client.delete("gpu-kata", workspace="default") is True
+    assert client.delete("gpu-kata", workspace="default").outcome == 1
     assert stub.delete_template_request is not None
     assert stub.delete_template_request.name == "gpu-kata"
     assert _request_workspace(stub.delete_template_request) == "default"
@@ -2835,9 +2836,32 @@ def test_delete_passes_workspace_to_proto() -> None:
 
     result = client.delete("job-1", workspace="staging")
 
-    assert result is True
+    assert result.outcome == 1
     assert stub.delete_request is not None
     assert _request_workspace(stub.delete_request) == "staging"
+    assert not stub.delete_request.allow_missing
+
+
+@pytest.mark.parametrize("outcome", [0, 1, 2, 3, 99])
+def test_delete_preserves_outcome_and_identity(outcome: int) -> None:
+    class Stub:
+        def DeleteSandbox(self, request: Any, **_kwargs: Any) -> Any:
+            assert request.allow_missing
+            return openshell_pb2.DeleteSandboxResponse(
+                outcome=cast("openshell_pb2.DeletionOutcome", outcome),
+                sandbox_id="original-id",
+            )
+
+    result = _client_with_fake_stub(Stub()).delete(
+        "job", workspace="default", allow_missing=True
+    )
+    assert int(result.outcome) == outcome
+    assert result.sandbox_id == "original-id"
+    if outcome == 99:
+        assert result.outcome not in (
+            DeletionOutcome.COMPLETED,
+            DeletionOutcome.ALREADY_ABSENT,
+        )
 
 
 def test_list_for_all_workspaces_sets_flag() -> None:

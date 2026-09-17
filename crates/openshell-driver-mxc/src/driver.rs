@@ -179,7 +179,7 @@ fn platform_event(sandbox_id: String, reason: &str, message: String) -> WatchSan
             WatchSandboxesPlatformEvent {
                 sandbox_id,
                 event: Some(DriverPlatformEvent {
-                    timestamp_ms: 0,
+                    event_time: None,
                     source: "mxc-driver".into(),
                     r#type: "Warning".into(),
                     reason: reason.to_string(),
@@ -582,7 +582,7 @@ impl MxcComputeBackend {
                     status: "False".into(),
                     reason: "Starting".into(),
                     message: "MXC lifecycle starting".into(),
-                    last_transition_time: String::new(),
+                    transition_time: None,
                 },
                 false,
             );
@@ -682,7 +682,7 @@ impl MxcComputeBackend {
                     status: "False".into(),
                     reason: "Stopped".into(),
                     message: "MXC sandbox stopped".into(),
-                    last_transition_time: String::new(),
+                    transition_time: None,
                 },
                 false,
             );
@@ -1000,7 +1000,7 @@ async fn run_lifecycle(
             status: "True".into(),
             reason: "AgentRunning".into(),
             message: format!("Agent exec launched: {command_line}"),
-            last_transition_time: String::new(),
+            transition_time: None,
         },
         false,
     );
@@ -1109,7 +1109,7 @@ async fn monitor_exec(
                     status: "True".into(),
                     reason: "AgentCompleted".into(),
                     message: "Agent exec finished successfully (exit code 0)".into(),
-                    last_transition_time: String::new(),
+                    transition_time: None,
                 },
                 false,
             );
@@ -1137,7 +1137,7 @@ async fn monitor_exec(
                     status: "False".into(),
                     reason: "ExecFailed".into(),
                     message: format!("Agent exec exited {code}"),
-                    last_transition_time: String::new(),
+                    transition_time: None,
                 },
                 false,
             );
@@ -1170,7 +1170,7 @@ async fn set_failed(
             status: "False".into(),
             reason: "ProvisionFailed".into(),
             message: message.to_string(),
-            last_transition_time: String::new(),
+            transition_time: None,
         },
         false,
     );

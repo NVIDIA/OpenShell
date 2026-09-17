@@ -163,7 +163,9 @@ pub async fn record_provider_operation(
             id: receipt.receipt_id.clone(),
             name: receipt.receipt_id.clone(),
             workspace: receipt.workspace.clone(),
-            created_at_ms: receipt.persisted_at_ms,
+            created_time: openshell_core::time::timestamp_from_millis(receipt.persisted_at_ms)
+                .map(Some)
+                .map_err(|_| invalid_record())?,
             ..Default::default()
         }),
         operation: Some(operation),

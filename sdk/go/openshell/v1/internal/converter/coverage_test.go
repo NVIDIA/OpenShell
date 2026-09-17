@@ -137,11 +137,11 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxCondition(t *testing.T) {
 	handled := fieldSet{
-		"type":                 true,
-		"status":               true,
-		"reason":               true,
-		"message":              true,
-		"last_transition_time": true,
+		"type":            true,
+		"status":          true,
+		"reason":          true,
+		"message":         true,
+		"transition_time": true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxCondition{}).ProtoReflect().Descriptor(), handled, nil)
@@ -149,12 +149,12 @@ func TestConverterCoversAllProtoFields_SandboxCondition(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_EndpointStatus(t *testing.T) {
 	handled := fieldSet{
-		"endpoint_id":      true,
-		"host":             true,
-		"ports":            true,
-		"path":             true,
-		"last_result":      true,
-		"last_reported_at": true,
+		"endpoint_id":        true,
+		"host":               true,
+		"ports":              true,
+		"path":               true,
+		"last_result":        true,
+		"last_reported_time": true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.EndpointStatus{}).ProtoReflect().Descriptor(), handled, nil)
@@ -260,13 +260,13 @@ func TestConverterCoversAllProtoFields_L7DenyRule(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_Provider(t *testing.T) {
 	handled := fieldSet{
-		"metadata":                 true,
-		"type":                     true,
-		"credentials":              true,
-		"config":                   true,
-		"credential_expires_at_ms": true,
-		"profile_workspace":        true,
-		"credential_handles":       true,
+		"metadata":                    true,
+		"type":                        true,
+		"credentials":                 true,
+		"config":                      true,
+		"credential_expiration_times": true,
+		"profile_workspace":           true,
+		"credential_handles":          true,
 	}
 
 	assertAllFieldsCovered(t, (&dm.Provider{}).ProtoReflect().Descriptor(), handled, nil)
@@ -284,14 +284,14 @@ func TestConverterCoversAllProtoFields_CredentialHandle(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxPolicyRevision(t *testing.T) {
 	handled := fieldSet{
-		"version":       true,
-		"policy_hash":   true,
-		"status":        true,
-		"load_error":    true,
-		"created_at_ms": true,
-		"loaded_at_ms":  true,
-		"policy":        true,
-		"provenance":    true,
+		"version":      true,
+		"policy_hash":  true,
+		"status":       true,
+		"load_error":   true,
+		"created_time": true,
+		"loaded_time":  true,
+		"policy":       true,
+		"provenance":   true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxPolicyRevision{}).ProtoReflect().Descriptor(), handled, nil)
@@ -340,7 +340,7 @@ func TestConverterCoversAllProtoFields_ProviderCredentialTokenGrant(t *testing.T
 		"audience":              true,
 		"jwt_svid_audience":     true,
 		"scopes":                true,
-		"cache_ttl_seconds":     true,
+		"cache_ttl":             true,
 		"audience_overrides":    true,
 		"client_assertion_type": true,
 		"grant_type":            true,
