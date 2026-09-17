@@ -10,7 +10,6 @@ use crate::watcher::{
     self, LifecycleEventFences, WatchStream, driver_sandbox_from_inspect,
     driver_sandbox_from_list_entry,
 };
-use openshell_core::ComputeDriverError;
 use openshell_core::config::CDI_GPU_DEVICE_ALL;
 use openshell_core::driver_utils::{
     SANDBOX_RUNTIME_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
@@ -20,10 +19,14 @@ use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
     effective_driver_gpu_count, validate_specific_gpu_device_request,
 };
+use openshell_core::network_trust::{
+    NETWORK_SUPERVISOR_TRUST_GENERATION_KEY, NETWORK_SUPERVISOR_TRUST_GENERATION_NONE,
+};
 use openshell_core::proto::compute::v1::{
     CpuResourceCapabilities, DriverSandbox, GetCapabilitiesResponse, GpuResourceCapabilities,
     GpuResourceRequirements, MemoryResourceCapabilities, ResourceCapabilities,
 };
+use openshell_core::{ComputeDriverError, NetworkSupervisorTrustBundle};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -115,6 +118,9 @@ pub struct PodmanComputeDriver {
     gpu_selector: Arc<CdiGpuDefaultSelector>,
     gpu_inventory_refresh: Arc<dyn Fn() -> (CdiGpuInventory, bool) + Send + Sync>,
     lifecycle_event_fences: LifecycleEventFences,
+    /// Gateway-normalized destination trust held outside untrusted sandbox
+    /// specs. Standalone external drivers always construct this as `None`.
+    network_trust: Option<NetworkSupervisorTrustBundle>,
 }
 
 impl std::fmt::Debug for PodmanComputeDriver {
@@ -415,7 +421,10 @@ fn resolve_socket_path(
 
 impl PodmanComputeDriver {
     /// Create a new driver, verifying the Podman socket is reachable.
-    pub async fn new(mut config: PodmanComputeConfig) -> Result<Self, PodmanApiError> {
+    pub async fn new(
+        mut config: PodmanComputeConfig,
+        network_trust: Option<NetworkSupervisorTrustBundle>,
+    ) -> Result<Self, PodmanApiError> {
         const MAX_PING_RETRIES: u32 = 5;
         const PING_RETRY_DELAY: Duration = Duration::from_secs(2);
 
@@ -540,6 +549,7 @@ impl PodmanComputeDriver {
             )),
             gpu_inventory_refresh: Arc::new(local_podman_gpu_selector_state),
             lifecycle_event_fences: LifecycleEventFences::default(),
+            network_trust,
         };
         let reconciler = driver.clone();
         tokio::spawn(async move {
@@ -866,6 +876,24 @@ impl PodmanComputeDriver {
         }
     }
 
+    fn verify_network_trust(&self) -> Result<(), ComputeDriverError> {
+        if let Some(bundle) = self.network_trust.as_ref() {
+            bundle.verify_artifact().map_err(|error| {
+                ComputeDriverError::Precondition(format!(
+                    "verify gateway-owned network additional CA artifact: {error}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn expected_network_trust_generation(&self) -> &str {
+        self.network_trust.as_ref().map_or(
+            NETWORK_SUPERVISOR_TRUST_GENERATION_NONE,
+            NetworkSupervisorTrustBundle::digest,
+        )
+    }
+
     /// Create a sandbox container.
     #[tracing::instrument(
         name = "podman.provision",
@@ -878,7 +906,27 @@ impl PodmanComputeDriver {
         )
     )]
     pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), ComputeDriverError> {
+        self.create_sandbox_with_existing_token(sandbox, None, None)
+            .await
+    }
+
+    /// Provision a replacement while retaining the existing token secret.
+    /// Only stopped-pair reconciliation uses this; ordinary creates always
+    /// generate their own secret from the gateway's create credential.
+    async fn create_sandbox_with_existing_token(
+        &self,
+        sandbox: &DriverSandbox,
+        existing_token_secret: Option<&str>,
+        restart_generation: Option<&str>,
+    ) -> Result<(), ComputeDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        let reuse_existing_resources = restart_generation.is_some();
+        let restart_generation =
+            restart_generation.map_or_else(|| uuid::Uuid::new_v4().to_string(), ToOwned::to_owned);
+        // The same immutable gateway snapshot is verified immediately before
+        // any workload/supervisor pair is admitted. Do not turn a tampered
+        // artifact into a runtime-only supervisor failure.
+        self.verify_network_trust()?;
         if sandbox.name.is_empty() {
             return Err(ComputeDriverError::Precondition(
                 "sandbox name is required".into(),
@@ -1031,30 +1079,61 @@ impl PodmanComputeDriver {
             ));
         }
 
-        // Create the workspace volume and per-sandbox runtime files.
-        let (resolver_secret_name, token_secret_name, proxy_auth_secret_name) = async {
+        // Create the workspace volume and per-sandbox runtime files. During a
+        // stopped trust replacement, retain the named resources belonging to
+        // the old pair and reuse its resolver/token secrets.
+        let (
+            resolver_secret_name,
+            resolver_secret_owned,
+            token_secret_name,
+            proxy_auth_secret_name,
+        ) = async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
-                self.client
-                    .create_owned_volume(&vol_name, &sandbox.id, &sandbox.workspace)
-                    .await
-                    .map_err(ComputeDriverError::from)?;
-                let resolver_secret_name =
-                    match create_sandbox_resolver_secret(&self.client, &sandbox.id).await {
+                if !reuse_existing_resources {
+                    self.client
+                        .create_owned_volume(&vol_name, &sandbox.id, &sandbox.workspace)
+                        .await
+                        .map_err(ComputeDriverError::from)?;
+                }
+                let resolver_secret_name = container::resolver_secret_name(&sandbox.id);
+                let resolver_secret_owned = if reuse_existing_resources {
+                    if !self
+                        .client
+                        .secret_exists(&resolver_secret_name)
+                        .await
+                        .map_err(ComputeDriverError::from)?
+                    {
+                        return Err(ComputeDriverError::Precondition(
+                            "Podman trust replacement requires the existing resolver secret".into(),
+                        ));
+                    }
+                    false
+                } else {
+                    create_sandbox_resolver_secret(&self.client, &sandbox.id).await?;
+                    true
+                };
+                let token_secret_name = if let Some(secret) = existing_token_secret {
+                    // The durable gateway Sandbox intentionally does not
+                    // contain the bearer token. Reuse its per-sandbox
+                    // secret after the old stopped workload is renamed.
+                    Some(secret.to_string())
+                } else {
+                    match create_sandbox_token_secret(&self.client, sandbox).await {
                         Ok(name) => name,
                         Err(e) => {
-                            let _ = self.client.remove_volume(&vol_name).await;
+                            if !reuse_existing_resources {
+                                let _ = self.client.remove_volume(&vol_name).await;
+                                if resolver_secret_owned {
+                                    cleanup_sandbox_resolver_secret(
+                                        &self.client,
+                                        &resolver_secret_name,
+                                    )
+                                    .await;
+                                }
+                            }
                             return Err(e);
                         }
-                    };
-                let token_secret_name = match create_sandbox_token_secret(&self.client, sandbox)
-                    .await
-                {
-                    Ok(name) => name,
-                    Err(e) => {
-                        let _ = self.client.remove_volume(&vol_name).await;
-                        cleanup_sandbox_resolver_secret(&self.client, &resolver_secret_name).await;
-                        return Err(e);
                     }
                 };
                 let proxy_auth_secret_name =
@@ -1063,17 +1142,27 @@ impl PodmanComputeDriver {
                     {
                         Ok(name) => name,
                         Err(e) => {
-                            let _ = self.client.remove_volume(&vol_name).await;
-                            if let Some(secret) = token_secret_name.as_deref() {
+                            if !reuse_existing_resources {
+                                let _ = self.client.remove_volume(&vol_name).await;
+                            }
+                            if existing_token_secret.is_none()
+                                && let Some(secret) = token_secret_name.as_deref()
+                            {
                                 cleanup_sandbox_token_secret(&self.client, secret).await;
                             }
-                            cleanup_sandbox_resolver_secret(&self.client, &resolver_secret_name)
+                            if resolver_secret_owned {
+                                cleanup_sandbox_resolver_secret(
+                                    &self.client,
+                                    &resolver_secret_name,
+                                )
                                 .await;
+                            }
                             return Err(e);
                         }
                     };
                 Ok((
                     resolver_secret_name,
+                    resolver_secret_owned,
                     token_secret_name,
                     proxy_auth_secret_name,
                 ))
@@ -1090,15 +1179,23 @@ impl PodmanComputeDriver {
         .await?;
 
         // Clean up the volume and per-sandbox secrets on any failure past this
-        // point.
+        // point. Resources retained for a stopped trust replacement are left
+        // intact so the rollback path can restore the old pair.
         let channel_owned = std::sync::atomic::AtomicBool::new(false);
         let cleanup_created = || async {
-            if channel_owned.load(std::sync::atomic::Ordering::Relaxed) {
+            if !reuse_existing_resources && channel_owned.load(std::sync::atomic::Ordering::Relaxed)
+            {
                 let _ = self.client.remove_volume(&channel_volume).await;
             }
-            let _ = self.client.remove_volume(&vol_name).await;
-            cleanup_sandbox_resolver_secret(&self.client, &resolver_secret_name).await;
-            if let Some(secret) = token_secret_name.as_deref() {
+            if !reuse_existing_resources {
+                let _ = self.client.remove_volume(&vol_name).await;
+            }
+            if resolver_secret_owned {
+                cleanup_sandbox_resolver_secret(&self.client, &resolver_secret_name).await;
+            }
+            if existing_token_secret.is_none()
+                && let Some(secret) = token_secret_name.as_deref()
+            {
                 cleanup_sandbox_token_secret(&self.client, secret).await;
             }
             if let Some(secret) = proxy_auth_secret_name.as_deref() {
@@ -1163,6 +1260,7 @@ impl PodmanComputeDriver {
                     image_env: &image_env,
                     supervisor_bin: supervisor_bin_path.as_deref(),
                     tls_secrets: tls_secret_names.as_ref(),
+                    network_trust: self.network_trust.as_ref(),
                     identity: &identity,
                     rootless: self.rootless,
                 });
@@ -1178,10 +1276,12 @@ impl PodmanComputeDriver {
                 let create_result = async {
                     let identities = self.validate_user_volume_mounts_available(sandbox).await?;
                     specs.record_resource_identities(&identities)?;
-                    self.client
-                        .create_owned_volume(&channel_volume, &sandbox.id, &sandbox.workspace)
-                        .await?;
-                    channel_owned.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if !reuse_existing_resources {
+                        self.client
+                            .create_owned_volume(&channel_volume, &sandbox.id, &sandbox.workspace)
+                            .await?;
+                        channel_owned.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let workload_id = self.client.create_typed_container(&specs.workload).await?;
                     created_workload = Some(workload_id.clone());
                     self.client.verify_isolation_fence(&workload_id).await?;
@@ -1199,12 +1299,11 @@ impl PodmanComputeDriver {
                         .and_then(|spec| {
                             decode_launch_authentication(&spec.launch_authentication)
                         })?;
-                    let generation = uuid::Uuid::new_v4().to_string();
                     let archives = crate::isolation::bootstrap_archives(
                         crate::isolation::BootstrapArchivesInput {
                             sandbox_id: &sandbox.id,
                             container_id: &workload_id,
-                            generation: &generation,
+                            generation: &restart_generation,
                             host_gateway_ip,
                             identity: &identity,
                             allow_extra_supplementary_groups:
@@ -1457,6 +1556,148 @@ impl PodmanComputeDriver {
         span_status.finish(result)
     }
 
+    fn network_trust_generation_matches(&self, container: &ContainerListEntry) -> bool {
+        // Reconcile an unmarked stopped legacy pair once instead of treating
+        // absence as disabled trust. New workloads must durably record the
+        // explicit `none` generation too.
+        container
+            .labels
+            .get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY)
+            .map(String::as_str)
+            .is_some_and(|generation| generation == self.expected_network_trust_generation())
+    }
+
+    async fn replace_stopped_pair_for_network_trust(
+        &self,
+        old_workload: &ContainerListEntry,
+        durable_sandbox: &DriverSandbox,
+        generation: &openshell_core::sandbox_generation::SandboxGenerationId,
+        encoded_authentication: &[u8],
+    ) -> Result<(), ComputeDriverError> {
+        if durable_sandbox.id
+            != old_workload
+                .labels
+                .get(LABEL_SANDBOX_ID)
+                .map_or("", String::as_str)
+        {
+            return Err(ComputeDriverError::Precondition(
+                "durable sandbox id did not match stopped Podman workload".into(),
+            ));
+        }
+        if durable_sandbox.name.is_empty() || durable_sandbox.spec.is_none() {
+            return Err(ComputeDriverError::Precondition(
+                "a durable sandbox provisioning snapshot is required for stopped Podman trust reconciliation".into(),
+            ));
+        }
+        if encoded_authentication.is_empty() {
+            return Err(ComputeDriverError::Precondition(
+                "fresh launch authentication is required for stopped Podman trust reconciliation"
+                    .into(),
+            ));
+        }
+        // Validate all untrusted fields before changing the old pair. Image
+        // selection below is driven exclusively by this durable snapshot.
+        self.validated_sandbox_create(durable_sandbox).await?;
+
+        let canonical_supervisor = crate::isolation::supervisor_name(&durable_sandbox.id);
+        let previous_supervisor = match self.client.inspect_container(&canonical_supervisor).await {
+            Ok(inspect) if inspect.state.running => {
+                return Err(ComputeDriverError::Precondition(
+                    "refusing to replace a running Podman supervisor during trust reconciliation"
+                        .into(),
+                ));
+            }
+            Ok(inspect) => Some(inspect.id),
+            Err(PodmanApiError::NotFound(_)) => None,
+            Err(error) => return Err(error.into()),
+        };
+
+        let workload_rollback_name = format!("openshell-rollback-{}", uuid::Uuid::new_v4());
+        let supervisor_rollback_name =
+            format!("openshell-supervisor-rollback-{}", uuid::Uuid::new_v4());
+        self.client
+            .rename_container(&old_workload.id, &workload_rollback_name)
+            .await
+            .map_err(ComputeDriverError::from)?;
+        if previous_supervisor.is_some()
+            && let Err(error) = self
+                .client
+                .rename_container(&canonical_supervisor, &supervisor_rollback_name)
+                .await
+        {
+            let _ = self
+                .client
+                .rename_container(
+                    &workload_rollback_name,
+                    &container::container_name(
+                        &durable_sandbox.workspace,
+                        &durable_sandbox.name,
+                        &durable_sandbox.id,
+                    ),
+                )
+                .await;
+            return Err(error.into());
+        }
+
+        let existing_token_name = container::token_secret_name(&durable_sandbox.id);
+        let existing_token = self
+            .client
+            .secret_exists(&existing_token_name)
+            .await
+            .map_err(ComputeDriverError::from)?
+            .then_some(existing_token_name.as_str());
+        let mut replacement = durable_sandbox.clone();
+        replacement
+            .spec
+            .as_mut()
+            .expect("validated durable snapshot has a spec")
+            .launch_authentication = encoded_authentication.to_vec();
+        let provisioned = self
+            .create_sandbox_with_existing_token(
+                &replacement,
+                existing_token,
+                Some(generation.as_str()),
+            )
+            .await;
+        if let Err(error) = provisioned {
+            // The old pair retained both named volumes. Restore the canonical
+            // names so a failed replacement has no externally observable
+            // provisioning change.
+            let canonical_workload = container::container_name(
+                &durable_sandbox.workspace,
+                &durable_sandbox.name,
+                &durable_sandbox.id,
+            );
+            let _ = self
+                .client
+                .rename_container(&workload_rollback_name, &canonical_workload)
+                .await;
+            if previous_supervisor.is_some() {
+                let _ = self
+                    .client
+                    .rename_container(&supervisor_rollback_name, &canonical_supervisor)
+                    .await;
+            }
+            return Err(error);
+        }
+
+        // Delayed remove events from the rollback containers must never
+        // delete the gateway's newly-created workload snapshot.
+        self.lifecycle_event_fences
+            .record_intentional_removal(&old_workload.id);
+        self.client
+            .remove_container_preserving_volumes(&workload_rollback_name)
+            .await
+            .map_err(ComputeDriverError::from)?;
+        if previous_supervisor.is_some() {
+            self.client
+                .remove_container_preserving_volumes(&supervisor_rollback_name)
+                .await
+                .map_err(ComputeDriverError::from)?;
+        }
+        Ok(())
+    }
+
     /// Start a previously stopped sandbox container.
     #[tracing::instrument(
         name = "podman.start_sandbox",
@@ -1472,18 +1713,53 @@ impl PodmanComputeDriver {
         sandbox_id: &str,
         generation_id: &str,
         encoded_authentication: &[u8],
+        durable_sandbox: Option<&DriverSandbox>,
     ) -> Result<(), ComputeDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
+        // Verify before inspecting or modifying either member of the pair.
+        // The durable snapshot is used only if a stopped generation must be
+        // reconciled; it never comes from Podman's mutable inspect response.
+        self.verify_network_trust()?;
         let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
             generation_id.to_string(),
         )
         .map_err(|error| ComputeDriverError::InvalidArgument(error.to_string()))?;
-        let launch_authentication = decode_launch_authentication(encoded_authentication)?;
+        let launch_authentication = (!encoded_authentication.is_empty())
+            .then(|| decode_launch_authentication(encoded_authentication))
+            .transpose()?;
         let container = self
             .find_container(sandbox_id)
             .await?
             .ok_or(ComputeDriverError::NotFound)?;
         self.admit_container_resources(&container.id).await?;
+        if !self.network_trust_generation_matches(&container) {
+            if container.state == "running" {
+                return span_status.finish(Err(ComputeDriverError::Precondition(
+                    "refusing to replace a running Podman workload during trust reconciliation"
+                        .into(),
+                )));
+            }
+            if !matches!(container.state.as_str(), "exited" | "stopped") {
+                return span_status.finish(Err(ComputeDriverError::Precondition(
+                    "Podman trust reconciliation requires a stopped workload; transitional resources are never replaced"
+                        .into(),
+                )));
+            }
+            let durable_sandbox = durable_sandbox.ok_or_else(|| {
+                ComputeDriverError::Precondition(
+                    "a durable sandbox provisioning snapshot is required for stopped Podman trust reconciliation".into(),
+                )
+            })?;
+            let result = self
+                .replace_stopped_pair_for_network_trust(
+                    &container,
+                    durable_sandbox,
+                    &generation,
+                    encoded_authentication,
+                )
+                .await;
+            return span_status.finish(result);
+        }
         if container.state == "running" {
             let supervisor = self
                 .client
@@ -1549,6 +1825,25 @@ impl PodmanComputeDriver {
             let bundle =
                 extract_first_tar_entry(&archive).map_err(ComputeDriverError::Precondition)?;
             let restart_metadata = crate::isolation::restart_metadata_from_slice(&bundle)?;
+            if launch_authentication.is_none() {
+                if restart_metadata.generation != generation.as_str() {
+                    return Err(ComputeDriverError::Precondition(format!(
+                        "Podman sandbox is already provisioned for generation {}",
+                        restart_metadata.generation
+                    )));
+                }
+                // A gateway crash can recover a persisted Starting transition
+                // without a newly minted credential. Its stopped pair already
+                // contains the authenticated channel and supervisor state, so
+                // restart it as-is rather than fabricating provisioning input.
+                self.client.verify_isolation_fence(&container_id).await?;
+                self.client.start_container(&container_id).await?;
+                if let Err(error) = self.client.start_container(&supervisor).await {
+                    let _ = self.client.stop_container(&container_id, 0).await;
+                    return Err(error.into());
+                }
+                return Ok(());
+            }
             let archives =
                 crate::isolation::bootstrap_archives(crate::isolation::BootstrapArchivesInput {
                     sandbox_id,
@@ -1564,7 +1859,7 @@ impl PodmanComputeDriver {
                             self.config.userns.as_deref(),
                         ),
                     child_env: restart_metadata.child_env,
-                    launch_authentication: &launch_authentication,
+                    launch_authentication: launch_authentication.as_ref().expect("checked above"),
                 })?;
             self.client
                 .copy_to_container(
@@ -1819,6 +2114,7 @@ impl PodmanComputeDriver {
                 (refresh_inventory.clone(), allow_all_default_gpu)
             }),
             lifecycle_event_fences: LifecycleEventFences::default(),
+            network_trust: None,
         }
     }
 }
@@ -2206,7 +2502,10 @@ mod tests {
         let (start_socket, start_requests, start_handle) = spawn_podman_stub(
             "lifecycle-start",
             vec![
-                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"stopped"}]"#),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"[{"Id":"ctr-1","State":"stopped","Labels":{"openshell.ai/network-additional-ca-generation":"none"}}]"#,
+                ),
                 StubResponse::new(
                     StatusCode::OK,
                     r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
@@ -2215,7 +2514,7 @@ mod tests {
         );
         let authentication = encoded_launch_authentication();
         test_driver(start_socket.clone())
-            .start_sandbox("sandbox-1", "generation-1", &authentication)
+            .start_sandbox("sandbox-1", "generation-1", &authentication, None)
             .await
             .expect("start should succeed");
         start_handle.await.expect("start stub should finish");
@@ -2403,6 +2702,7 @@ mod tests {
                 "sandbox-1",
                 "invalid-generation",
                 b"secret-launch-authentication",
+                None,
             )
             .with_subscriber(subscriber)
             .await
@@ -2556,7 +2856,10 @@ mod tests {
         let (start_socket, _requests, start_handle) = spawn_podman_stub(
             "trace-start",
             vec![
-                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"stopped"}]"#),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"[{"Id":"ctr-1","State":"stopped","Labels":{"openshell.ai/network-additional-ca-generation":"none"}}]"#,
+                ),
                 StubResponse::new(
                     StatusCode::OK,
                     r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
@@ -2565,7 +2868,7 @@ mod tests {
         );
         let authentication = encoded_launch_authentication();
         test_driver(start_socket.clone())
-            .start_sandbox("sandbox-1", "generation-1", &authentication)
+            .start_sandbox("sandbox-1", "generation-1", &authentication, None)
             .with_subscriber(subscriber)
             .await
             .expect("start should succeed");
@@ -2754,6 +3057,7 @@ mod tests {
     }
 
     #[test]
+
     fn local_podman_cdi_gpu_inventory_maps_nvidia_device_nodes() {
         let root = std::env::temp_dir().join(format!(
             "openshell-podman-gpu-test-{}-{}",

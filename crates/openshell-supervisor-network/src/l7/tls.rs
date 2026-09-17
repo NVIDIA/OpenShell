@@ -8,12 +8,14 @@
 //! store, terminates TLS from the client (presenting dynamic certs per hostname),
 //! inspects the plaintext HTTP, then re-encrypts to upstream using real root CAs.
 
+use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ServerConfig};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::{BufReader, Write as _};
+use std::io::{BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -279,15 +281,33 @@ pub async fn tls_connect_upstream(
 /// `system_ca_bundle` is ignored because the native store already reflects all
 /// operator-installed trust anchors.
 pub fn build_upstream_client_config(system_ca_bundle: &str) -> Result<Arc<ClientConfig>> {
+    build_upstream_client_config_with_additional(system_ca_bundle, None)
+}
+
+/// Build upstream TLS configuration with optional additive destination roots.
+///
+/// The additional roots are installed after the feature-selected default roots
+/// (Mozilla plus the system overlay, or native roots). They authenticate only
+/// destination TLS connections and never feed the child/interception CA files.
+pub fn build_upstream_client_config_with_additional(
+    system_ca_bundle: &str,
+    additional_ca_bundle: Option<&str>,
+) -> Result<Arc<ClientConfig>> {
     let mut config = ClientConfig::builder()
-        .with_root_certificates(build_upstream_root_store(system_ca_bundle)?)
+        .with_root_certificates(build_upstream_root_store(
+            system_ca_bundle,
+            additional_ca_bundle,
+        )?)
         .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
 }
 
-fn build_upstream_root_store(system_ca_bundle: &str) -> Result<rustls::RootCertStore> {
+fn build_upstream_root_store(
+    system_ca_bundle: &str,
+    additional_ca_bundle: Option<&str>,
+) -> Result<rustls::RootCertStore> {
     let mut root_store = rustls::RootCertStore::empty();
 
     #[cfg(feature = "bundled-ca-roots")]
@@ -311,6 +331,21 @@ fn build_upstream_root_store(system_ca_bundle: &str) -> Result<rustls::RootCertS
     {
         let _ = system_ca_bundle; // native store already includes operator-installed CAs
         add_native_roots(&mut root_store)?;
+    }
+
+    if let Some(additional_ca_bundle) = additional_ca_bundle {
+        let certificates = strict_pem_certificates(
+            additional_ca_bundle.as_bytes(),
+            "additional destination CA bundle",
+        )?;
+        let expected = certificates.len();
+        let (added, ignored) = root_store.add_parsable_certificates(certificates);
+        if added != expected || ignored != 0 {
+            return Err(miette!(
+                "additional destination CA bundle contains an unusable X.509 certificate"
+            ));
+        }
+        tracing::debug!(added, "loaded additional destination CA certificates");
     }
 
     if root_store.is_empty() {
@@ -415,6 +450,251 @@ fn write_tls_output(path: &Path, contents: &[u8]) -> Result<()> {
         )
     })?;
     Ok(())
+}
+
+/// Validate the canonical SHA-256 syntax used by the protected destination
+/// trust argument. The gateway emits exactly this lower-case representation.
+pub fn validate_additional_ca_digest(digest: &str) -> Result<()> {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return Err(miette!(
+            "--network-additional-ca-digest must use sha256:<64 lowercase hexadecimal characters> format"
+        ));
+    };
+    if hex.len() != Sha256::output_size() * 2
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(miette!(
+            "--network-additional-ca-digest must use sha256:<64 lowercase hexadecimal characters> format"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the protected all-or-nothing destination-trust argument pair.
+///
+/// This is separate from file verification so both supervisor roles can
+/// reject incoherent or malformed command lines before any role-specific
+/// setup begins.
+pub fn validate_network_additional_ca_args(
+    bundle: Option<&Path>,
+    digest: Option<&str>,
+) -> Result<()> {
+    match (bundle, digest) {
+        (None, None) => Ok(()),
+        (Some(_), Some(digest)) => validate_additional_ca_digest(digest),
+        _ => Err(miette!(
+            "--network-additional-ca-bundle and --network-additional-ca-digest must be set together"
+        )),
+    }
+}
+
+/// Read, strictly canonicalize, and authenticate a staged destination trust
+/// bundle before network setup uses it.
+///
+/// The digest covers canonical certificate-only PEM rather than the mounted
+/// bytes, matching gateway normalization. The bounded, no-follow read closes
+/// the path substitution and unbounded-read hazards at this trust boundary.
+/// Diagnostics intentionally identify only the path and expected digest.
+pub fn read_and_verify_additional_ca_bundle(path: &Path, expected_digest: &str) -> Result<String> {
+    validate_additional_ca_digest(expected_digest)?;
+    let source = read_additional_ca_bundle_file(path)?;
+    let certificates = strict_pem_certificates(&source, "--network-additional-ca-bundle")
+        .wrap_err_with(|| format!("invalid staged destination CA bundle at {}", path.display()))?;
+
+    let expected_certificate_count = certificates.len();
+    let mut roots = rustls::RootCertStore::empty();
+    let (added, ignored) = roots.add_parsable_certificates(certificates.clone());
+    if added != expected_certificate_count || ignored != 0 {
+        return Err(miette!(
+            "invalid staged destination CA bundle at {}: contains an unusable X.509 certificate",
+            path.display()
+        ));
+    }
+
+    let canonical = canonical_pem(&certificates);
+    let limit = openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES;
+    if canonical.len() > limit {
+        return Err(miette!(
+            "--network-additional-ca-bundle at {} exceeds the shared {limit}-byte limit",
+            path.display()
+        ));
+    }
+    let actual_digest = format!("sha256:{:x}", Sha256::digest(canonical.as_bytes()));
+    if actual_digest != expected_digest {
+        return Err(miette!(
+            "network additional CA digest mismatch at {}: expected {expected_digest}; mounted bundle does not match",
+            path.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Read the gateway-owned artifact with the shared normalized-bundle limit.
+///
+/// `NetworkSupervisorTrustBundle::verify_artifact` offers the corresponding
+/// public-core check when the expected canonical bytes are available. The
+/// supervisor receives only their digest on argv, so it must canonicalize the
+/// opened file first before it can compare that protected generation.
+fn read_additional_ca_bundle_file(path: &Path) -> Result<Vec<u8>> {
+    use std::fs::{self, OpenOptions};
+
+    let limit = openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES;
+    let metadata = fs::symlink_metadata(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("read --network-additional-ca-bundle at {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(miette!(
+            "--network-additional-ca-bundle at {} is not a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() > limit as u64 {
+        return Err(miette!(
+            "--network-additional-ca-bundle at {} exceeds the shared {limit}-byte limit",
+            path.display()
+        ));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Do not follow a symlink introduced after the metadata check, and do
+        // not block if a regular file is swapped for a FIFO before open.
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options
+        .open(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("read --network-additional-ca-bundle at {}", path.display()))?;
+    let opened_metadata = file
+        .metadata()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("read --network-additional-ca-bundle at {}", path.display()))?;
+    if !opened_metadata.file_type().is_file() {
+        return Err(miette!(
+            "--network-additional-ca-bundle at {} is not a regular file",
+            path.display()
+        ));
+    }
+    if opened_metadata.len() > limit as u64 {
+        return Err(miette!(
+            "--network-additional-ca-bundle at {} exceeds the shared {limit}-byte limit",
+            path.display()
+        ));
+    }
+
+    let capacity = usize::try_from(opened_metadata.len()).map_err(|_| {
+        miette!(
+            "--network-additional-ca-bundle at {} exceeds the platform allocation limit",
+            path.display()
+        )
+    })?;
+    let mut source = Vec::with_capacity(capacity);
+    std::io::Read::by_ref(&mut file)
+        .take((limit + 1) as u64)
+        .read_to_end(&mut source)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("read --network-additional-ca-bundle at {}", path.display()))?;
+    if source.len() > limit {
+        return Err(miette!(
+            "--network-additional-ca-bundle at {} exceeds the shared {limit}-byte limit",
+            path.display()
+        ));
+    }
+    Ok(source)
+}
+
+/// Parse a certificate-only PEM bundle and reject every non-certificate or
+/// malformed item instead of accepting a valid subset.
+fn strict_pem_certificates(
+    source: &[u8],
+    description: &str,
+) -> Result<Vec<CertificateDer<'static>>> {
+    let text = std::str::from_utf8(source)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("{description} is not UTF-8 PEM text"))?;
+    validate_pem_envelope(text, description)?;
+
+    let mut certificates = Vec::new();
+    for item in rustls_pemfile::read_all(&mut std::io::Cursor::new(source)) {
+        let item = item
+            .into_diagnostic()
+            .wrap_err_with(|| format!("{description} contains malformed PEM data"))?;
+        let rustls_pemfile::Item::X509Certificate(certificate) = item else {
+            return Err(miette!(
+                "{description} contains a non-certificate PEM block"
+            ));
+        };
+        certificates.push(certificate);
+    }
+    if certificates.is_empty() {
+        return Err(miette!("{description} contains no PEM certificate blocks"));
+    }
+    Ok(certificates)
+}
+
+/// Apply the gateway's strict PEM framing rules before canonicalization.
+fn validate_pem_envelope(text: &str, description: &str) -> Result<()> {
+    let mut begin_label = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(expected_label) = begin_label {
+            if let Some(end_label) = pem_label(line, "-----END ") {
+                if end_label != expected_label {
+                    return Err(miette!(
+                        "{description} contains malformed PEM data: END label does not match BEGIN label"
+                    ));
+                }
+                begin_label = None;
+            } else if pem_label(line, "-----BEGIN ").is_some()
+                || !line
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+            {
+                return Err(miette!("{description} contains malformed PEM data"));
+            }
+        } else if let Some(label) = pem_label(line, "-----BEGIN ") {
+            begin_label = Some(label);
+        } else {
+            return Err(miette!(
+                "{description} contains non-PEM content outside certificate blocks"
+            ));
+        }
+    }
+    if begin_label.is_some() {
+        return Err(miette!("{description} contains an unterminated PEM block"));
+    }
+    Ok(())
+}
+
+fn pem_label<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let label = line.strip_prefix(prefix)?.strip_suffix("-----")?;
+    (!label.is_empty()
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b' '))
+    .then_some(label)
+}
+
+fn canonical_pem(certificates: &[CertificateDer<'static>]) -> String {
+    let mut normalized = String::new();
+    for certificate in certificates {
+        normalized.push_str("-----BEGIN CERTIFICATE-----\n");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.as_ref());
+        for line in encoded.as_bytes().chunks(64) {
+            normalized.push_str(std::str::from_utf8(line).expect("base64 is UTF-8"));
+            normalized.push('\n');
+        }
+        normalized.push_str("-----END CERTIFICATE-----\n");
+    }
+    normalized
 }
 
 /// Load PEM-encoded certificates from a string into a root certificate store.
@@ -583,6 +863,168 @@ mod tests {
     fn upstream_config_alpn() {
         let config = build_upstream_client_config("").unwrap();
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn additional_roots_augment_feature_selected_default_store() {
+        let baseline = build_upstream_root_store("", None).unwrap();
+        let additional = generate_ca_pem();
+        let augmented = build_upstream_root_store("", Some(&additional)).unwrap();
+        assert!(augmented.len() > baseline.len());
+    }
+
+    #[tokio::test]
+    async fn additional_destination_root_authenticates_an_upstream_tls_connection() {
+        const HOSTNAME: &str = "private.destination.test";
+
+        let destination_ca = SandboxCa::generate().unwrap();
+        let additional = destination_ca.cert_pem().to_string();
+        let server_state = Arc::new(ProxyTlsState::new(
+            CertCache::new(destination_ca),
+            build_upstream_client_config("").unwrap(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_hostname = HOSTNAME.to_string();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tls_terminate_client(stream, &server_state, &server_hostname)
+                .await
+                .unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let client_config = build_upstream_client_config_with_additional("", Some(&additional))
+            .expect("additional destination root should be accepted");
+        tls_connect_upstream(stream, HOSTNAME, &client_config)
+            .await
+            .expect("additional destination root should authenticate the server");
+    }
+
+    #[test]
+    fn destination_ca_digest_requires_canonical_sha256_syntax() {
+        let valid = format!("sha256:{}", "a".repeat(64));
+        validate_additional_ca_digest(&valid).unwrap();
+        for invalid in [
+            "sha256:abc",
+            "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let error = validate_additional_ca_digest(invalid).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("sha256:<64 lowercase hexadecimal characters>"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn destination_ca_file_is_canonicalized_and_authenticated() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("additional.pem");
+        let certificate = generate_ca_pem();
+        std::fs::write(&path, format!("\n{certificate}\n")).unwrap();
+        let expected_digest = format!("sha256:{:x}", Sha256::digest(certificate.as_bytes()));
+
+        assert_eq!(
+            read_and_verify_additional_ca_bundle(&path, &expected_digest).unwrap(),
+            certificate
+        );
+    }
+
+    #[test]
+    fn destination_ca_file_rejects_private_key_or_mixed_pem_without_leaking_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = SandboxCa::generate().unwrap();
+        let private_key = certificate.private_key_pem();
+        let private_key_payload = private_key
+            .lines()
+            .find(|line| !line.starts_with("-----") && !line.is_empty())
+            .unwrap();
+        let expected_digest = format!("sha256:{}", "a".repeat(64));
+
+        for (name, contents) in [
+            ("empty.pem", String::new()),
+            ("malformed.pem", "not PEM material".to_string()),
+            ("private-key.pem", private_key.clone()),
+            (
+                "mixed.pem",
+                format!("{}{}", certificate.cert_pem(), private_key),
+            ),
+        ] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, contents).unwrap();
+            let error = read_and_verify_additional_ca_bundle(&path, &expected_digest)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("destination CA bundle"), "{error}");
+            assert!(error.contains(&path.display().to_string()), "{error}");
+            assert!(!error.contains(private_key_payload), "{error}");
+            assert!(!error.contains("BEGIN PRIVATE KEY"), "{error}");
+        }
+    }
+
+    #[test]
+    fn destination_ca_file_rejects_valid_wrong_generation_without_leaking_pem() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected_path = directory.path().join("expected.pem");
+        let mounted_path = directory.path().join("mounted.pem");
+        let expected = generate_ca_pem();
+        std::fs::write(&expected_path, &expected).unwrap();
+        let expected_digest = format!("sha256:{:x}", Sha256::digest(expected.as_bytes()));
+
+        let replacement = generate_ca_pem();
+        let replacement_payload = replacement
+            .lines()
+            .find(|line| !line.starts_with("-----") && !line.is_empty())
+            .unwrap();
+        std::fs::write(&mounted_path, &replacement).unwrap();
+
+        let error = read_and_verify_additional_ca_bundle(&mounted_path, &expected_digest)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("network additional CA digest mismatch"),
+            "{error}"
+        );
+        assert!(error.contains(&expected_digest), "{error}");
+        assert!(!error.contains(replacement_payload), "{error}");
+        assert!(!error.contains("BEGIN CERTIFICATE"), "{error}");
+    }
+
+    #[test]
+    fn destination_ca_file_enforces_shared_size_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized-additional.pem");
+        let limit = openshell_core::network_trust::MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES;
+        std::fs::write(&path, vec![b'x'; limit + 1]).unwrap();
+
+        let error =
+            read_and_verify_additional_ca_bundle(&path, &format!("sha256:{}", "a".repeat(64)))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("--network-additional-ca-bundle"), "{error}");
+        assert!(error.contains(&format!("{limit}-byte limit")), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_ca_file_rejects_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.pem");
+        let link = directory.path().join("additional.pem");
+        std::fs::write(&target, generate_ca_pem()).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error =
+            read_and_verify_additional_ca_bundle(&link, &format!("sha256:{}", "a".repeat(64)))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("not a regular file"), "{error}");
     }
 
     /// Helper: generate a self-signed CA and return its PEM string.
