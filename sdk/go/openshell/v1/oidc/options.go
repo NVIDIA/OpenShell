@@ -11,9 +11,13 @@ import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/gateway"
 )
 
+// scopeOpenID is the scope that turns an OAuth2 authorization request into
+// an OpenID Connect one. Interactive flows always request it.
+const scopeOpenID = "openid"
+
 // defaultScopes are the OIDC scopes requested when no custom scopes
 // are specified via [WithScopes].
-var defaultScopes = []string{"openid", "profile", "email"}
+var defaultScopes = []string{scopeOpenID, "profile", "email"}
 
 // defaultTimeout is the maximum duration for interactive login flows
 // (browser, keyboard, device code) when no custom timeout is set.
@@ -33,6 +37,7 @@ type loginConfig struct {
 	scopesSet      bool
 	callbackPort   int
 	timeout        time.Duration
+	timeoutSet     bool
 	keyboardFlow   bool
 	inMemory       bool
 	displayFunc    func(verificationURL, userCode string)
@@ -48,14 +53,37 @@ type loginConfig struct {
 // applyDefaults fills in default values for fields that were not set
 // by any option function.
 func (c *loginConfig) applyDefaults() {
-	if len(c.scopes) == 0 {
+	// Check set-ness, not the zero value, so an explicitly-set empty scope
+	// list or zero timeout is honored instead of being replaced by defaults.
+	if !c.scopesSet {
 		// Deep copy to avoid callers mutating the package-level slice.
 		c.scopes = make([]string, len(defaultScopes))
 		copy(c.scopes, defaultScopes)
 	}
-	if c.timeout == 0 {
+	if !c.timeoutSet {
 		c.timeout = defaultTimeout
 	}
+}
+
+// requireOpenIDScope normalizes the scopes for an interactive flow so the
+// request is always an OpenID Connect one. "openid" is placed first and any
+// caller-supplied duplicate is dropped; the remaining scopes keep their order.
+//
+// Interactive flows authenticate a user, and the gateway requires a "sub"
+// claim on the resulting token, so "openid" is not optional there. Callers
+// remain free to request application scopes such as "sandbox:read". The
+// client credentials grant has no user and is left untouched.
+//
+// This mirrors build_scopes in crates/openshell-cli/src/oidc_auth.rs.
+func (c *loginConfig) requireOpenIDScope() {
+	normalized := make([]string, 0, len(c.scopes)+1)
+	normalized = append(normalized, scopeOpenID)
+	for _, scope := range c.scopes {
+		if scope != scopeOpenID {
+			normalized = append(normalized, scope)
+		}
+	}
+	c.scopes = normalized
 }
 
 // LoginOption configures a login attempt. Use the With* functions to
@@ -104,6 +132,12 @@ func WithAudience(audience string) LoginOption {
 
 // WithScopes overrides the default scopes (openid, profile, email).
 // The provided scopes replace the defaults entirely.
+//
+// [Login] and [DeviceLogin] always request "openid" in addition to the
+// provided scopes, so WithScopes("sandbox:read") sends "openid sandbox:read".
+// [ClientCredentials] and [NewClientCredentialsAuth] send exactly what is
+// provided, since that grant has no user and no ID token; calling
+// WithScopes with no arguments there sends no scope parameter at all.
 func WithScopes(scopes ...string) LoginOption {
 	return func(c *loginConfig) {
 		c.scopes = make([]string, len(scopes))
@@ -120,11 +154,16 @@ func WithCallbackPort(port int) LoginOption {
 	}
 }
 
-// WithTimeout sets the maximum duration for interactive login flows.
+// WithTimeout sets the maximum duration for a login flow.
 // The default is 2 minutes.
+//
+// A non-positive duration (d <= 0) means "no deadline": the flow runs until
+// it completes or the caller's context is cancelled. A caller-supplied
+// context that already carries a deadline always takes precedence.
 func WithTimeout(d time.Duration) LoginOption {
 	return func(c *loginConfig) {
 		c.timeout = d
+		c.timeoutSet = true
 	}
 }
 
@@ -176,6 +215,13 @@ func withTokenDir(dir string) LoginOption {
 func withInput(r io.Reader) LoginOption {
 	return func(c *loginConfig) {
 		c.input = r
+	}
+}
+
+// withOutput overrides the output writer for keyboard flow testing.
+func withOutput(w io.Writer) LoginOption {
+	return func(c *loginConfig) {
+		c.output = w
 	}
 }
 
