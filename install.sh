@@ -583,6 +583,10 @@ find_rpm_asset() {
       _dev_name="openshell-gateway-dev-${_arch}.rpm"
       _fallback_re="^openshell-gateway-[0-9].*\\.${_arch}\\.rpm$"
       ;;
+    openshell-prover)
+      _dev_name="openshell-prover-dev-${_arch}.rpm"
+      _fallback_re="^openshell-prover-[0-9].*\\.${_arch}\\.rpm$"
+      ;;
     *)
       error "unknown RPM package selector: ${_package}"
       ;;
@@ -944,9 +948,14 @@ install_linux_rpm() {
     error "no openshell-gateway RPM package found for architecture: ${_arch}"
   fi
 
-  info "selected ${_rpm_file} and ${_gateway_rpm_file}"
+  _prover_rpm_file="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" openshell-prover)"
+  if [ -z "$_prover_rpm_file" ]; then
+    error "no openshell-prover RPM package found for architecture: ${_arch}"
+  fi
 
-  for _package_file in "$_rpm_file" "$_gateway_rpm_file"; do
+  info "selected ${_rpm_file}, ${_gateway_rpm_file}, and ${_prover_rpm_file}"
+
+  for _package_file in "$_rpm_file" "$_gateway_rpm_file" "$_prover_rpm_file"; do
     _package_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${_package_file}"
     _package_path="${_tmpdir}/${_package_file}"
 
@@ -960,8 +969,11 @@ install_linux_rpm() {
     verify_checksum "$_package_path" "${_tmpdir}/${CHECKSUMS_NAME}" "$_package_file"
   done
 
-  info "installing ${_rpm_file} and ${_gateway_rpm_file}..."
-  install_rpm_packages "${_tmpdir}/${_rpm_file}" "${_tmpdir}/${_gateway_rpm_file}"
+  info "installing ${_rpm_file}, ${_gateway_rpm_file}, and ${_prover_rpm_file}..."
+  install_rpm_packages \
+    "${_tmpdir}/${_rpm_file}" \
+    "${_tmpdir}/${_gateway_rpm_file}" \
+    "${_tmpdir}/${_prover_rpm_file}"
   info "installed ${APP_NAME} RPM packages from ${RELEASE_TAG}"
   start_user_gateway
 }

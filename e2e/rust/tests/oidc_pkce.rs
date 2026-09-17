@@ -808,6 +808,7 @@ async fn workspace_admin_cannot_manage_another_workspace_members() {
 async fn workspace_admin_cannot_manage_another_workspace_providers() {
     const WORKSPACE_A: &str = "oidc-wsa-xprov-a";
     const WORKSPACE_B: &str = "oidc-wsa-xprov-b";
+    const PROVIDER: &str = "oidc-wsa-xprovider";
     let (admin, workspace_admin, _user_b) =
         prepare_isolated_workspaces_with_admin(WORKSPACE_A, WORKSPACE_B).await;
 
@@ -818,7 +819,7 @@ async fn workspace_admin_cannot_manage_another_workspace_providers() {
             "provider",
             "create",
             "--name",
-            "oidc-wsa-xprovider",
+            PROVIDER,
             "--type",
             "openai",
             "--credential",
@@ -826,9 +827,50 @@ async fn workspace_admin_cannot_manage_another_workspace_providers() {
         ],
     )
     .await;
-    assert_non_member_denial(
-        &denied,
-        "manage another workspace's providers as workspace admin",
+    let diagnostic = combined_output(&denied);
+    let compact: String = diagnostic
+        .chars()
+        .filter(|character| !character.is_whitespace() && *character != '│')
+        .collect();
+    // Profile lookup redacts backend diagnostics. Check the permission code and
+    // safe recovery guidance without requiring the server's membership details.
+    assert!(
+        !denied.status.success()
+            && compact.contains("PERMISSION_DENIED")
+            && compact.contains("verifyworkspacemembershipandrequiredpermissions"),
+        "cross-workspace provider creation did not report a safe permission denial:\n{diagnostic}"
+    );
+    assert!(!diagnostic.contains("e2e-test-value"));
+
+    // Query with an independent authorized identity so a failed command alone
+    // cannot hide a provider created before the denial was returned.
+    let listed = assert_workspace_allowed(
+        &admin,
+        WORKSPACE_B,
+        &["provider", "list", "--output", "json"],
+        "verify denied creation left the target workspace empty",
+    )
+    .await;
+    // CLI startup diagnostics may precede the JSON object on stdout.
+    let stdout = String::from_utf8(listed.stdout).expect("provider list output should be UTF-8");
+    let json_start = stdout
+        .find('{')
+        .expect("provider list output should contain JSON");
+    let json_end = stdout
+        .rfind('}')
+        .expect("provider list output should contain a complete JSON object");
+    let listing: Value = serde_json::from_str(&stdout[json_start..=json_end])
+        .expect("provider list --output json should return JSON on stdout");
+    assert_eq!(
+        listing["next_page_token"], "",
+        "provider listing is incomplete"
+    );
+    assert!(
+        listing["providers"]
+            .as_array()
+            .expect("provider collection")
+            .is_empty(),
+        "denied creation added a provider to the isolated target workspace"
     );
 
     delete_workspace(&admin, WORKSPACE_B).await;

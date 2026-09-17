@@ -65,8 +65,15 @@ pub(super) fn hash_inputs(hasher: &mut Hasher, inputs: &BTreeMap<String, PathBuf
     for (name, file) in inputs {
         hasher.update(&(name.len() as u64).to_le_bytes());
         hasher.update(name.as_bytes());
-        hash_file(hasher, file)
-            .with_context(|| format!("failed to hash input {name:?} from {}", file.display()))?;
+        if file.exists() {
+            hash_file(hasher, file).with_context(|| {
+                format!("failed to hash input {name:?} from {}", file.display())
+            })?;
+        } else {
+            let value = file.as_os_str().as_encoded_bytes();
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
     }
     Ok(())
 }

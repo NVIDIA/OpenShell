@@ -215,6 +215,24 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(GetGatewayConfigResponse::default()))
     }
 
+    async fn get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider readiness is not exercised by this mock",
+        ))
+    }
+
+    async fn report_provider_readiness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider installation reports are not exercised by this mock",
+        ))
+    }
+
     async fn get_sandbox_provider_environment(
         &self,
         _request: tonic::Request<GetSandboxProviderEnvironmentRequest>,
@@ -296,6 +314,7 @@ impl OpenShell for TestOpenShell {
         providers.insert(provider_name, provider.clone());
         Ok(Response::new(ProviderResponse {
             provider: Some(provider),
+            ..Default::default()
         }))
     }
 
@@ -311,6 +330,7 @@ impl OpenShell for TestOpenShell {
             .ok_or_else(|| Status::not_found("provider not found"))?;
         Ok(Response::new(ProviderResponse {
             provider: Some(provider),
+            ..Default::default()
         }))
     }
 
@@ -463,6 +483,7 @@ impl OpenShell for TestOpenShell {
         providers.insert(updated_name, updated.clone());
         Ok(Response::new(ProviderResponse {
             provider: Some(updated),
+            ..Default::default()
         }))
     }
     async fn get_provider_refresh_status(

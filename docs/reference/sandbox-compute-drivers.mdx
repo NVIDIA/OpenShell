@@ -162,6 +162,11 @@ HTTP requests. A `PermissionDenied` response from an additional callback-only
 listener is expected for those requests. Do not broaden the primary listener
 to `0.0.0.0` solely to make sandbox callbacks reachable.
 
+The published supervisor container uses a shell-free distroless Debian 13 image.
+Inspect its container logs and health status with your runtime tools; it does not
+provide a shell or package manager for interactive debugging. This does not
+change the tools available inside your workload image.
+
 ## Docker Driver
 
 [Docker](https://www.docker.com/get-started/)-backed sandboxes run as containers on the gateway host. Use Docker for local development, single-machine gateways, and hosts that already use Docker Desktop or Docker Engine.

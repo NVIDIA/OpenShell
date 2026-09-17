@@ -27,10 +27,11 @@ use crate::proto::{
     DenialSummary, EndpointObservation as ProtoEndpointObservation,
     EndpointResult as ProtoEndpointResult, ExchangeProviderSubjectTokenRequest,
     GetDraftPolicyRequest, GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest,
-    IssueSandboxTokenRequest, NetworkActivitySummary, PolicyChunk, PolicySource, PolicyStatus,
-    RefreshSandboxTokenRequest, ReportEndpointStatusRequest, ReportPolicyStatusRequest,
-    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    UpdateConfigRequest, open_shell_client::OpenShellClient, workspace_selector,
+    GetSandboxProviderEnvironmentResponse, IssueSandboxTokenRequest, NetworkActivitySummary,
+    PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
+    ReportEndpointStatusRequest, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
+    open_shell_client::OpenShellClient, workspace_selector,
 };
 use crate::sandbox_env;
 use crate::time::{duration_to_std, timestamp_to_millis};
@@ -395,6 +396,26 @@ async fn acquire_k8s_sandbox_token(
 /// long-lived `supervisor_session` control stream).
 pub async fn connect_channel_pub(endpoint: &str) -> Result<AuthedChannel> {
     connect_channel(endpoint).await
+}
+
+/// Report installed provider state for the current authenticated supervisor session.
+///
+/// The observation must carry the session ID returned by `ConnectSupervisor`.
+/// Reconnects start a new report sequence; retries preserve the complete report.
+pub async fn report_provider_readiness(
+    endpoint: &str,
+    sandbox_id: &str,
+    observation: crate::proto::ProviderReadinessObservation,
+) -> Result<crate::proto::ReportProviderReadinessResponse> {
+    let mut client = connect(endpoint).await?;
+    client
+        .report_provider_readiness(crate::proto::ReportProviderReadinessRequest {
+            sandbox_id: sandbox_id.to_string(),
+            observation: Some(observation),
+        })
+        .await
+        .map(tonic::Response::into_inner)
+        .into_diagnostic()
 }
 
 /// Background task that renews the sandbox JWT at ~80% of its remaining
@@ -1003,9 +1024,9 @@ pub async fn sync_policy_and_fetch_snapshot(
 
 /// Fetch provider environment variables for a sandbox from `OpenShell` server via gRPC.
 ///
-/// Returns a map of environment variable names to values derived from provider
-/// credentials configured on the sandbox. Returns an empty map if the sandbox
-/// has no providers or the call fails.
+/// Returns the credential snapshot and its exact readiness identity. An empty
+/// environment represents a sandbox without provider credentials. Transport
+/// failure returns an error so callers can revoke credentials and retry.
 pub async fn fetch_provider_environment(
     endpoint: &str,
     sandbox_id: &str,
@@ -1022,7 +1043,14 @@ pub async fn fetch_provider_environment(
         .await
         .into_diagnostic()?;
 
-    let inner = response.into_inner();
+    provider_environment_result(response.into_inner())
+}
+
+/// Preserve snapshot authority and reject invalid credential expiration times.
+/// Unknown delivery reasons withhold credentials rather than implying readiness.
+fn provider_environment_result(
+    inner: GetSandboxProviderEnvironmentResponse,
+) -> Result<ProviderEnvironmentResult> {
     let credential_expires_at_ms = inner
         .credential_expiration_times
         .iter()
@@ -1035,11 +1063,84 @@ pub async fn fetch_provider_environment(
     Ok(ProviderEnvironmentResult {
         environment: inner.environment,
         provider_env_revision: inner.provider_env_revision,
+        provider_attachment_epoch: inner.provider_attachment_epoch,
+        policy_hash: inner.policy_hash,
+        readiness_reason: crate::proto::ProviderReadinessReason::try_from(inner.readiness_reason)
+            .unwrap_or(crate::proto::ProviderReadinessReason::CredentialsWithheld),
         credential_expires_at_ms,
         dynamic_credentials: inner.dynamic_credentials,
         static_credential_bindings: inner.static_credential_bindings,
         non_secret_environment_keys: inner.non_secret_environment_keys,
     })
+}
+
+#[cfg(test)]
+mod provider_environment_tests {
+    use super::*;
+
+    #[test]
+    fn provider_environment_preserves_readiness_identity() {
+        let result = provider_environment_result(GetSandboxProviderEnvironmentResponse {
+            environment: HashMap::from([("TOKEN".to_string(), "synthetic".to_string())]),
+            provider_env_revision: 42,
+            provider_attachment_epoch: "attachment-epoch".to_string(),
+            policy_hash: "binding-policy".to_string(),
+            readiness_reason: crate::proto::ProviderReadinessReason::CredentialsWithheld.into(),
+            credential_expiration_times: HashMap::from([(
+                "TOKEN".to_string(),
+                prost_types::Timestamp {
+                    seconds: 1_900_000_000,
+                    nanos: 123_000_000,
+                },
+            )]),
+            ..Default::default()
+        })
+        .expect("valid provider environment");
+        assert_eq!(result.provider_env_revision, 42);
+        assert_eq!(result.provider_attachment_epoch, "attachment-epoch");
+        assert_eq!(result.policy_hash, "binding-policy");
+        assert_eq!(
+            result.readiness_reason,
+            crate::proto::ProviderReadinessReason::CredentialsWithheld
+        );
+        assert_eq!(
+            result.environment.get("TOKEN").map(String::as_str),
+            Some("synthetic")
+        );
+        assert_eq!(
+            result.credential_expires_at_ms.get("TOKEN"),
+            Some(&1_900_000_000_123)
+        );
+    }
+
+    #[test]
+    fn provider_readiness_unknown_delivery_reason_is_withheld() {
+        let result = provider_environment_result(GetSandboxProviderEnvironmentResponse {
+            policy_hash: "binding-policy".to_string(),
+            readiness_reason: i32::MAX,
+            ..Default::default()
+        })
+        .expect("valid provider environment");
+        assert_eq!(
+            result.readiness_reason,
+            crate::proto::ProviderReadinessReason::CredentialsWithheld
+        );
+    }
+
+    #[test]
+    fn provider_environment_rejects_invalid_credential_expiration() {
+        let result = provider_environment_result(GetSandboxProviderEnvironmentResponse {
+            credential_expiration_times: HashMap::from([(
+                "TOKEN".to_string(),
+                prost_types::Timestamp {
+                    seconds: 1_900_000_000,
+                    nanos: -1,
+                },
+            )]),
+            ..Default::default()
+        });
+        assert!(result.is_err());
+    }
 }
 
 pub async fn exchange_provider_subject_token(
@@ -1127,6 +1228,8 @@ pub struct SettingsPollResult {
     /// When `policy_source` is `Global`, the version of the global policy revision.
     pub global_policy_version: u32,
     pub provider_env_revision: u64,
+    /// Attachment identity captured with this effective configuration.
+    pub provider_attachment_epoch: String,
     pub supervisor_middleware_services: Vec<crate::proto::SupervisorMiddlewareService>,
     /// Workspace the sandbox belongs to.
     pub workspace: String,
@@ -1147,6 +1250,7 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
         settings: inner.settings,
         global_policy_version: inner.global_policy_version,
         provider_env_revision: inner.provider_env_revision,
+        provider_attachment_epoch: inner.provider_attachment_epoch,
         supervisor_middleware_services: inner.supervisor_middleware_services,
         workspace: inner.workspace,
         policy_validation_failure_mode: inner
@@ -1200,9 +1304,16 @@ mod settings_poll_tests {
     }
 }
 
+/// Credential material and the authority snapshot that produced its bindings.
 pub struct ProviderEnvironmentResult {
     pub environment: HashMap<String, String>,
     pub provider_env_revision: u64,
+    /// Attachment identity captured with the delivered credential records.
+    pub provider_attachment_epoch: String,
+    /// Effective policy used to derive the delivered endpoint bindings.
+    pub policy_hash: String,
+    /// Closed failure category; withheld material cannot establish readiness.
+    pub readiness_reason: crate::proto::ProviderReadinessReason,
     pub credential_expires_at_ms: HashMap<String, i64>,
     pub dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
     pub static_credential_bindings: HashMap<String, crate::proto::StaticCredentialBinding>,

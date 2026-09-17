@@ -33,7 +33,12 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 		"tty":                   true,
 	}
 
-	assertAllFieldsCovered(t, (&pb.SandboxSpec{}).ProtoReflect().Descriptor(), handled, nil)
+	// The gateway owns this identity. Provider status exposes it through the
+	// raw API; callers must not supply it when constructing a sandbox spec.
+	skipped := fieldSet{
+		"provider_attachment_epoch": true,
+	}
+	assertAllFieldsCovered(t, (&pb.SandboxSpec{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
 func TestConverterCoversAllProtoFields_SandboxTemplate(t *testing.T) {

@@ -37,6 +37,7 @@ const (
 	OpenShell_ListSandboxProviders_FullMethodName          = "/openshell.v1.OpenShell/ListSandboxProviders"
 	OpenShell_AttachSandboxProvider_FullMethodName         = "/openshell.v1.OpenShell/AttachSandboxProvider"
 	OpenShell_DetachSandboxProvider_FullMethodName         = "/openshell.v1.OpenShell/DetachSandboxProvider"
+	OpenShell_GetSandboxProviderStatus_FullMethodName      = "/openshell.v1.OpenShell/GetSandboxProviderStatus"
 	OpenShell_DeleteSandbox_FullMethodName                 = "/openshell.v1.OpenShell/DeleteSandbox"
 	OpenShell_StopSandbox_FullMethodName                   = "/openshell.v1.OpenShell/StopSandbox"
 	OpenShell_StartSandbox_FullMethodName                  = "/openshell.v1.OpenShell/StartSandbox"
@@ -71,6 +72,7 @@ const (
 	OpenShell_ListSandboxPolicies_FullMethodName           = "/openshell.v1.OpenShell/ListSandboxPolicies"
 	OpenShell_ReportPolicyStatus_FullMethodName            = "/openshell.v1.OpenShell/ReportPolicyStatus"
 	OpenShell_ReportEndpointStatus_FullMethodName          = "/openshell.v1.OpenShell/ReportEndpointStatus"
+	OpenShell_ReportProviderReadiness_FullMethodName       = "/openshell.v1.OpenShell/ReportProviderReadiness"
 	OpenShell_GetSandboxProviderEnvironment_FullMethodName = "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
 	OpenShell_ExchangeProviderSubjectToken_FullMethodName  = "/openshell.v1.OpenShell/ExchangeProviderSubjectToken"
 	OpenShell_GetSandboxLogs_FullMethodName                = "/openshell.v1.OpenShell/GetSandboxLogs"
@@ -148,6 +150,8 @@ type OpenShellClient interface {
 	AttachSandboxProvider(ctx context.Context, in *AttachSandboxProviderRequest, opts ...grpc.CallOption) (*AttachSandboxProviderResponse, error)
 	// Detach a provider record from an existing sandbox.
 	DetachSandboxProvider(ctx context.Context, in *DetachSandboxProviderRequest, opts ...grpc.CallOption) (*DetachSandboxProviderResponse, error)
+	// Inspect the installed authority for one sandbox provider mutation.
+	GetSandboxProviderStatus(ctx context.Context, in *GetSandboxProviderStatusRequest, opts ...grpc.CallOption) (*GetSandboxProviderStatusResponse, error)
 	// Delete a sandbox by name.
 	DeleteSandbox(ctx context.Context, in *DeleteSandboxRequest, opts ...grpc.CallOption) (*DeleteSandboxResponse, error)
 	// Stop a sandbox while retaining its persistent state.
@@ -224,6 +228,9 @@ type OpenShellClient interface {
 	ReportPolicyStatus(ctx context.Context, in *ReportPolicyStatusRequest, opts ...grpc.CallOption) (*ReportPolicyStatusResponse, error)
 	// Replace the gateway's observed tool server endpoint status for one sandbox.
 	ReportEndpointStatus(ctx context.Context, in *ReportEndpointStatusRequest, opts ...grpc.CallOption) (*ReportEndpointStatusResponse, error)
+	// Report installed provider state for the current ConnectSupervisor session.
+	// Replacing or losing that session invalidates its observations.
+	ReportProviderReadiness(ctx context.Context, in *ReportProviderReadinessRequest, opts ...grpc.CallOption) (*ReportProviderReadinessResponse, error)
 	// Get provider environment for a sandbox (called by sandbox supervisor at startup).
 	GetSandboxProviderEnvironment(ctx context.Context, in *GetSandboxProviderEnvironmentRequest, opts ...grpc.CallOption) (*GetSandboxProviderEnvironmentResponse, error)
 	// Exchange a stored provider subject token for an intermediate token scoped
@@ -453,6 +460,16 @@ func (c *openShellClient) DetachSandboxProvider(ctx context.Context, in *DetachS
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(DetachSandboxProviderResponse)
 	err := c.cc.Invoke(ctx, OpenShell_DetachSandboxProvider_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) GetSandboxProviderStatus(ctx context.Context, in *GetSandboxProviderStatusRequest, opts ...grpc.CallOption) (*GetSandboxProviderStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSandboxProviderStatusResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetSandboxProviderStatus_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -814,6 +831,16 @@ func (c *openShellClient) ReportEndpointStatus(ctx context.Context, in *ReportEn
 	return out, nil
 }
 
+func (c *openShellClient) ReportProviderReadiness(ctx context.Context, in *ReportProviderReadinessRequest, opts ...grpc.CallOption) (*ReportProviderReadinessResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportProviderReadinessResponse)
+	err := c.cc.Invoke(ctx, OpenShell_ReportProviderReadiness_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *openShellClient) GetSandboxProviderEnvironment(ctx context.Context, in *GetSandboxProviderEnvironmentRequest, opts ...grpc.CallOption) (*GetSandboxProviderEnvironmentResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetSandboxProviderEnvironmentResponse)
@@ -1150,6 +1177,8 @@ type OpenShellServer interface {
 	AttachSandboxProvider(context.Context, *AttachSandboxProviderRequest) (*AttachSandboxProviderResponse, error)
 	// Detach a provider record from an existing sandbox.
 	DetachSandboxProvider(context.Context, *DetachSandboxProviderRequest) (*DetachSandboxProviderResponse, error)
+	// Inspect the installed authority for one sandbox provider mutation.
+	GetSandboxProviderStatus(context.Context, *GetSandboxProviderStatusRequest) (*GetSandboxProviderStatusResponse, error)
 	// Delete a sandbox by name.
 	DeleteSandbox(context.Context, *DeleteSandboxRequest) (*DeleteSandboxResponse, error)
 	// Stop a sandbox while retaining its persistent state.
@@ -1226,6 +1255,9 @@ type OpenShellServer interface {
 	ReportPolicyStatus(context.Context, *ReportPolicyStatusRequest) (*ReportPolicyStatusResponse, error)
 	// Replace the gateway's observed tool server endpoint status for one sandbox.
 	ReportEndpointStatus(context.Context, *ReportEndpointStatusRequest) (*ReportEndpointStatusResponse, error)
+	// Report installed provider state for the current ConnectSupervisor session.
+	// Replacing or losing that session invalidates its observations.
+	ReportProviderReadiness(context.Context, *ReportProviderReadinessRequest) (*ReportProviderReadinessResponse, error)
 	// Get provider environment for a sandbox (called by sandbox supervisor at startup).
 	GetSandboxProviderEnvironment(context.Context, *GetSandboxProviderEnvironmentRequest) (*GetSandboxProviderEnvironmentResponse, error)
 	// Exchange a stored provider subject token for an intermediate token scoped
@@ -1363,6 +1395,9 @@ func (UnimplementedOpenShellServer) AttachSandboxProvider(context.Context, *Atta
 func (UnimplementedOpenShellServer) DetachSandboxProvider(context.Context, *DetachSandboxProviderRequest) (*DetachSandboxProviderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DetachSandboxProvider not implemented")
 }
+func (UnimplementedOpenShellServer) GetSandboxProviderStatus(context.Context, *GetSandboxProviderStatusRequest) (*GetSandboxProviderStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSandboxProviderStatus not implemented")
+}
 func (UnimplementedOpenShellServer) DeleteSandbox(context.Context, *DeleteSandboxRequest) (*DeleteSandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteSandbox not implemented")
 }
@@ -1464,6 +1499,9 @@ func (UnimplementedOpenShellServer) ReportPolicyStatus(context.Context, *ReportP
 }
 func (UnimplementedOpenShellServer) ReportEndpointStatus(context.Context, *ReportEndpointStatusRequest) (*ReportEndpointStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReportEndpointStatus not implemented")
+}
+func (UnimplementedOpenShellServer) ReportProviderReadiness(context.Context, *ReportProviderReadinessRequest) (*ReportProviderReadinessResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportProviderReadiness not implemented")
 }
 func (UnimplementedOpenShellServer) GetSandboxProviderEnvironment(context.Context, *GetSandboxProviderEnvironmentRequest) (*GetSandboxProviderEnvironmentResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSandboxProviderEnvironment not implemented")
@@ -1815,6 +1853,24 @@ func _OpenShell_DetachSandboxProvider_Handler(srv interface{}, ctx context.Conte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).DetachSandboxProvider(ctx, req.(*DetachSandboxProviderRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_GetSandboxProviderStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSandboxProviderStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetSandboxProviderStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetSandboxProviderStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetSandboxProviderStatus(ctx, req.(*GetSandboxProviderStatusRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2402,6 +2458,24 @@ func _OpenShell_ReportEndpointStatus_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_ReportProviderReadiness_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportProviderReadinessRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).ReportProviderReadiness(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_ReportProviderReadiness_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).ReportProviderReadiness(ctx, req.(*ReportProviderReadinessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OpenShell_GetSandboxProviderEnvironment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetSandboxProviderEnvironmentRequest)
 	if err := dec(in); err != nil {
@@ -2912,6 +2986,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _OpenShell_DetachSandboxProvider_Handler,
 		},
 		{
+			MethodName: "GetSandboxProviderStatus",
+			Handler:    _OpenShell_GetSandboxProviderStatus_Handler,
+		},
+		{
 			MethodName: "DeleteSandbox",
 			Handler:    _OpenShell_DeleteSandbox_Handler,
 		},
@@ -3034,6 +3112,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReportEndpointStatus",
 			Handler:    _OpenShell_ReportEndpointStatus_Handler,
+		},
+		{
+			MethodName: "ReportProviderReadiness",
+			Handler:    _OpenShell_ReportProviderReadiness_Handler,
 		},
 		{
 			MethodName: "GetSandboxProviderEnvironment",

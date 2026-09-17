@@ -166,6 +166,101 @@ fn direct_child_pids() -> io::Result<HashSet<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
+    use nix::unistd::Pid;
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn fast_child_remains_waitable_after_orphan_reap_attempt() {
+        let mut registry = lock();
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 11"])
+            .spawn()
+            .expect("spawn fast child");
+        let child_pid = child.id();
+        let managed_child = registry.register(child_pid).expect("register fast child");
+        drop(registry);
+        let pid = Pid::from_raw(i32::try_from(child_pid).unwrap());
+
+        // Observe the completed child without consuming its status, exactly
+        // as the orphan reaper does before its managed-PID check.
+        loop {
+            match waitid(
+                Id::Pid(pid),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+            ) {
+                Ok(WaitStatus::StillAlive) => std::thread::yield_now(),
+                Ok(_) => break,
+                Err(error) => panic!("observe fast child: {error}"),
+            }
+        }
+
+        let registry = lock();
+        let reaped = if registry.contains(pid.as_raw()) {
+            None
+        } else {
+            Some(waitpid(pid, Some(WaitPidFlag::WNOHANG)))
+        };
+        drop(registry);
+        assert!(
+            reaped.is_none(),
+            "the orphan reaper must leave a registered child to its explicit waiter"
+        );
+
+        let wait = child.wait();
+        unregister(managed_child);
+        assert!(
+            wait.is_ok(),
+            "the explicit child waiter must retain the exit status"
+        );
+    }
+
+    #[test]
+    fn reaper_cannot_steal_child_while_registration_is_in_progress() {
+        // Keep the logical spawn paused before its PID is registered. This is
+        // the exact window that previously let the orphan reaper consume a
+        // fast child's status.
+        let pid = 1_000_002_u32;
+        let (spawn_entered_tx, spawn_entered_rx) = mpsc::channel();
+        let (complete_spawn_tx, complete_spawn_rx) = mpsc::channel();
+        let (registered_tx, registered_rx) = mpsc::channel();
+        let (reap_attempted_tx, reap_attempted_rx) = mpsc::channel();
+        let (reap_result_tx, reap_result_rx) = mpsc::channel();
+
+        let spawn = std::thread::spawn(move || {
+            let mut registry = lock();
+            spawn_entered_tx.send(()).unwrap();
+            complete_spawn_rx.recv().unwrap();
+            let managed_child = registry.register(pid).expect("register child");
+            assert!(registered_tx.send(managed_child).is_ok());
+        });
+        spawn_entered_rx.recv().unwrap();
+
+        let reaper = std::thread::spawn(move || {
+            reap_attempted_tx.send(()).unwrap();
+            let registry = lock();
+            reap_result_tx
+                .send(registry.contains(i32::try_from(pid).unwrap()))
+                .unwrap();
+        });
+        reap_attempted_rx.recv().unwrap();
+
+        assert!(
+            reap_result_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "the reaper must wait until the child is registered"
+        );
+
+        complete_spawn_tx.send(()).unwrap();
+        let managed_child = registered_rx.recv().unwrap();
+        spawn.join().unwrap();
+        assert!(reap_result_rx.recv().unwrap());
+        reaper.join().unwrap();
+        unregister(managed_child);
+    }
 
     #[test]
     fn stale_unregister_preserves_reused_pid_registration() {
@@ -182,7 +277,7 @@ mod tests {
 
     #[test]
     fn child_pid_parser_observes_a_live_child() {
-        let mut child = std::process::Command::new("sleep")
+        let mut child = Command::new("sleep")
             .arg("30")
             .spawn()
             .expect("spawn child");

@@ -1494,6 +1494,13 @@ pub fn build_isolation_specs(
         openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND.into(),
         openshell_sandbox_backend::BACKEND_NAME.into(),
     );
+    // The supervisor runs as the resolved non-root workload identity. Keep
+    // generated interception CA material under its writable /run tmpfs rather
+    // than the root-owned default at /etc/openshell-tls.
+    supervisor.env.insert(
+        openshell_core::sandbox_env::PROXY_TLS_DIR.into(),
+        "/run/openshell/proxy-tls".into(),
+    );
     supervisor.user = user;
     supervisor.groups = input
         .identity
@@ -1801,6 +1808,14 @@ mod tests {
                 .contains(&"nocopy".into())
         );
         assert_eq!(specs.supervisor.entrypoint, vec!["/openshell-supervisor"]);
+        assert_eq!(
+            specs
+                .supervisor
+                .env
+                .get(openshell_core::sandbox_env::PROXY_TLS_DIR)
+                .map(String::as_str),
+            Some("/run/openshell/proxy-tls")
+        );
     }
 
     fn json_struct(value: Value) -> prost_types::Struct {

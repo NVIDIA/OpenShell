@@ -308,6 +308,7 @@ mod tests {
         let codec =
             ProtoJsonCodec::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
         let request = CreateSandboxRequest {
+            request_id: String::new(),
             spec: Some(SandboxSpec {
                 providers: vec!["github".to_string()],
                 ..SandboxSpec::default()
@@ -336,6 +337,7 @@ mod tests {
     fn interceptor_view_omits_nested_secrets_but_keeps_non_secret_fields() {
         let codec = ProtoJsonCodec::openshell().unwrap();
         let request = CreateProviderRequest {
+            request_id: String::new(),
             provider: Some(Provider {
                 r#type: "github".to_string(),
                 credentials: HashMap::from([(
@@ -396,6 +398,7 @@ mod tests {
     fn generic_sandbox_environment_remains_visible() {
         let codec = ProtoJsonCodec::openshell().unwrap();
         let request = CreateSandboxRequest {
+            request_id: String::new(),
             spec: Some(SandboxSpec {
                 environment: HashMap::from([("FEATURE_FLAG".to_string(), "on".to_string())]),
                 ..SandboxSpec::default()

@@ -536,7 +536,8 @@ pub enum Request {
         provider_env: std::collections::HashMap<String, String>,
     },
     UpdateProviderEnvironment {
-        expected_revision: u64,
+        /// Ordered publication within this authenticated boundary session.
+        generation: u64,
         revision: u64,
         provider_env: std::collections::HashMap<String, String>,
     },
@@ -634,12 +635,12 @@ impl fmt::Debug for Request {
                 )
                 .finish(),
             Self::UpdateProviderEnvironment {
-                expected_revision,
+                generation,
                 revision,
                 provider_env,
             } => formatter
                 .debug_struct("UpdateProviderEnvironment")
-                .field("expected_revision", expected_revision)
+                .field("generation", generation)
                 .field("revision", revision)
                 .field(
                     "provider_env_keys",
@@ -710,9 +711,13 @@ pub enum Response {
     Started {
         process_id: String,
         provider_env_revision: u64,
+        provider_env_generation: u64,
     },
     ProviderEnvironmentUpdated {
         revision: u64,
+        generation: u64,
+        /// True only for this installed request or its exact idempotent replay.
+        applied: bool,
     },
     ProcessAttached {
         terminal: bool,
@@ -1298,7 +1303,7 @@ mod tests {
         second.insert("A".to_string(), "1".to_string());
         second.insert("B".to_string(), "2".to_string());
         let build = |provider_env| Request::UpdateProviderEnvironment {
-            expected_revision: 1,
+            generation: 1,
             revision: 2,
             provider_env,
         };

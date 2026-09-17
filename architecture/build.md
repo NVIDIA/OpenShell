@@ -13,6 +13,7 @@ OpenShell builds these main artifacts:
 | Gateway binary | `crates/openshell-gateway` |
 | CLI binaries and system packages | `crates/openshell-cli` plus release packaging |
 | E2E conformance CLI | `crates/openshell-conformance-cli` |
+| Standalone policy prover | `crates/openshell-prover-cli` |
 | Python SDK wheel | `python/openshell` |
 | TypeScript SDK package | `sdk/typescript` |
 | Gateway container image | `deploy/docker/Dockerfile.gateway` |
@@ -75,6 +76,14 @@ HTTP/TLS support behind explicit build features, so default system-Z3 builds do
 not reintroduce bundled Mozilla roots. Release builds that need bundled Z3
 continue to opt in with `bundled-z3`.
 
+Release workflows build the standalone `openshell-prover` executable for Linux
+musl x86_64 and aarch64 and macOS Apple Silicon. The standard Debian, RPM, and
+Homebrew installations include it. Releases also publish one standalone archive
+per target plus a dedicated SHA-256 manifest. Before publication, target-native
+jobs extract each archive, reject host Z3 or Nix store linkage, and run a real
+local containment check. The standalone artifact therefore requires neither an
+OpenShell installation nor a separately installed Z3 runtime.
+
 ## Linux Runtime Environments
 
 OpenShell uses different Linux libc environments for different host artifacts.
@@ -88,9 +97,8 @@ SONAMEs.
 
 The workload-side `openshell-sandbox` binary is statically linked with musl so
 drivers can stage it into an arbitrary agent image without depending on that
-image's libc. The supervisor is also statically linked: release images use the
-default musl build, while distribution-specific builds may select the
-`glibc-static` variant.
+image's libc. The separate `openshell-supervisor` binary is dynamically linked
+with GNU libc and uses the same glibc 2.28 compatibility floor as the gateway.
 
 ## Container Builds
 
@@ -115,11 +123,8 @@ package-managed VM support does not raise the package runtime requirement.
 Gateway staging and release workflows set up the Zig C/C++ wrapper before
 bundled Z3 builds and verify the maximum referenced `GLIBC_*` symbol version
 before publishing or copying artifacts.
-Supervisor binaries are static in every configuration. The default `musl`
-variant uses `cargo zigbuild` when available, including native CPU
-architectures, so C dependencies are compiled for the musl target instead of the
-host GNU libc target. The `glibc-static` variant uses plain `cargo build` with
-`+crt-static` and requires a native per-architecture build. Local Docker image tasks infer the
+Supervisor staging uses the GNU build path and verifies the glibc 2.28 floor.
+Sandbox staging uses the static musl build path. Local Docker image tasks infer the
 target architecture from `DOCKER_PLATFORM` when set. Otherwise, they require
 valid container engine host metadata and fail when the engine query is
 unavailable or reports an unsupported architecture, avoiding host-kernel
@@ -139,6 +144,9 @@ is a different artifact from the source SBOM produced by `syft dir:.` in
 attestation below, which describes a published image.
 
 The shared binary build action compiles release artifacts with `cargo auditable`.
+The standalone prover uses this same action, while its package workflow adds
+target-native extracted-archive linkage and containment smoke checks before
+producing its checksum manifest.
 Branch E2E, Release Dev, and Release Tag image jobs stage those same artifacts
 instead of rebuilding binaries in Docker. Each binary build scans its output with
 Syft and requires at least one decoded Cargo package before uploading the
@@ -184,9 +192,16 @@ Runtime layout:
 - **Sandbox**: Alpine-based `openshell/sandbox` image containing the static
   musl `/openshell-sandbox` binary and its static VM guest-init helper.
   Drivers stage this binary into the workload trust domain.
-- **Supervisor**: Debian-based `openshell/supervisor` image containing only the
-  dynamically linked GNU `/openshell-supervisor` binary. GNU supervisor builds
-  must not reference `GLIBC_*` symbols newer than `GLIBC_2.28`.
+- **Supervisor**: digest-pinned `gcr.io/distroless/base-nossl-debian13` base
+  with the dynamically linked GNU `/openshell-supervisor` binary. The base
+  supplies glibc and CA roots without a shell, package manager, OpenSSL or zlib.
+  GNU supervisor builds must not reference `GLIBC_*` symbols newer than
+  `GLIBC_2.28`. Image defaults remain UID 0 and working directory `/`; compute
+  drivers set the runtime identity and writable mounts. Docker stages private
+  files with the same numeric identity as the supervisor so archive uploads
+  preserve access regardless of the base image's default user. Health probes execute
+  the supervisor binary directly. Base updates require refreshing the
+  multi-architecture digest and rebuilding the image.
 
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.
@@ -258,8 +273,10 @@ the required roles and their dependencies before running playbooks.
 The `tests/artifacts.nix` helpers build the CLI, conformance CLI, and sandbox
 with musl, and the gateway and supervisor with GNU. Image assembly stages
 the gateway, sandbox, and supervisor as separate binaries for their respective
-Dockerfiles. The Ubuntu Docker and Fedora Podman scenarios import both local
-runtime images and configure the gateway to use them.
+Dockerfiles. The helpers stage binaries under `artifacts/binaries` so local and
+CI builds expose the same inputs to tmachine and image assembly. The Ubuntu
+Docker and Fedora Podman scenarios import both local runtime images and
+configure the gateway to use them.
 
 ## Python Wheel Packaging
 

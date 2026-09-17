@@ -39,6 +39,9 @@ credentials to claim the existing runtime generation. Confirmation resumes the
 workload; expiration terminates it. A credential replacement does not displace
 the active connection until the new connection is confirmed. Idle healthy
 connections remain usable.
+
+A renewed Sandbox Protocol bearer is authenticated even when its credential epoch is unchanged. The supervisor confirms that bearer on the active physical connection and records its fingerprint only after confirmation succeeds, preserving pending streams and the mediation session. Changing the credential epoch still requires an authenticated replacement connection.
+
 Unauthenticated TLS handshakes have a separate bounded asynchronous pool and
 five-second deadline, never consuming authenticated control slots or threads.
 The socket broker reserves the TCP control-listener port against workload
@@ -301,6 +304,23 @@ middleware registry validates implementation-owned config. The generic
 registry and chain runner live in `openshell-supervisor-middleware`; first-party
 implementations live in `openshell-supervisor-middleware-builtins`.
 
+The selected middleware chain can also inspect the final HTTP response before
+it returns to the workload. Stages select header-only, whole-body, or streaming
+inspection independently. The relay owns response framing when body bytes can
+change. Preflight exposes upstream `Content-Length`, `Content-Encoding`, and
+`Content-Range` as read-only metadata, while the relay emits final framing
+separately from middleware-visible headers. Stage failures follow policy-local
+`on_error`; explicit denials always block delivery. Once delivery has started,
+blocking aborts the response.
+
+The network supervisor represents the destination-selected request and response
+pair as one `HttpMiddlewareExchange`. It retains the full chain, runner, request
+identity, and policy generation while request and response bindings are selected
+independently. The HTTP response adapter owns wire parsing, downstream commit
+state, generation fences, framing, and transport error classification. The
+generic middleware crate owns stage selection, remote stream lifecycle, ordered
+body processing, limits, and result validation.
+
 The supervisor installs policy and middleware registry changes as one runtime
 generation and preserves the last-known-good generation if preparation fails.
 Policy-only updates reuse the connected registry, so an external middleware
@@ -381,6 +401,8 @@ enhancement and out of scope.) Workload proxy variables are removed from the
 protected launch environment; transparent socket mediation does not depend on
 them.
 
+The canonical main process receives the declared workload environment before
+supervisor-only values are stripped and provider placeholders are injected.
 Template environment is treated like user-provided sandbox environment. It can
 shape the workload child, but it cannot override driver-controlled identity,
 gateway callback, TLS, relay socket, proxy, provider, or supervisor coordination

@@ -762,6 +762,30 @@ pub struct ExecSpec {
 pub trait BoundaryExec: Send + Sync {
     /// Spawn `spec` inside the boundary, returning an owned session.
     async fn exec(&self, spec: ExecSpec) -> Result<ExecSession, BackendError>;
+
+    /// Install the current provider environment for future process launches.
+    ///
+    /// Success requires an authenticated acknowledgment from the running
+    /// boundary. Implementations serialize this operation with exec so an
+    /// older publication cannot replace the acknowledged environment.
+    async fn synchronize_provider_environment(
+        &self,
+    ) -> Result<ProviderEnvironmentInstallation, BackendError> {
+        Err(BackendError::Unsupported(
+            "provider environment installation acknowledgment is unavailable".to_string(),
+        ))
+    }
+}
+
+/// Evidence that the running workload boundary installed one provider snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderEnvironmentInstallation {
+    /// Local supervisor snapshot that produced the acknowledged environment.
+    pub installation_id: String,
+    /// Opaque provider content fingerprint.
+    pub revision: u64,
+    /// Authenticated and confirmed workload boundary session.
+    pub session_id: SandboxSessionId,
 }
 
 // ============================================================================

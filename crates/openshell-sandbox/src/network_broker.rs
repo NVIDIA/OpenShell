@@ -41,6 +41,10 @@ const DNS_RELAY_ADDRESS: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const NETWORK_DECISION_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn retry_notification_receive(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::ENOENT)
+}
+
 #[derive(Debug)]
 struct PendingOpenSlot(Arc<AtomicUsize>);
 
@@ -271,7 +275,12 @@ impl NetworkBroker {
                 while broker_healthy.load(Ordering::Acquire) {
                     let notification = match listener.receive() {
                         Ok(notification) => notification,
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        // ENOENT is a documented seccomp user-notification
+                        // race: the target thread exited or its blocked
+                        // syscall was interrupted while the kernel was
+                        // preparing the notification. It does not mean the
+                        // listener itself is unhealthy.
+                        Err(error) if retry_notification_receive(&error) => continue,
                         Err(error) => {
                             tracing::error!(%error, "sandbox network broker listener failed");
                             broker_healthy.store(false, Ordering::Release);
@@ -1753,6 +1762,19 @@ mod tests {
     use super::*;
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::{UnixListener, UnixStream};
+
+    #[test]
+    fn notification_receive_retries_interrupted_and_disappeared_targets() {
+        assert!(retry_notification_receive(&io::Error::from(
+            io::ErrorKind::Interrupted
+        )));
+        assert!(retry_notification_receive(&io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
+        assert!(!retry_notification_receive(&io::Error::from_raw_os_error(
+            libc::EBADF
+        )));
+    }
 
     #[test]
     fn relay_rejects_descriptor_replaced_after_policy_decision() {

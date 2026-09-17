@@ -51,11 +51,11 @@ use openshell_core::proto::{
     GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
     ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, PolicyChunk, PolicyMergeOperation,
-    PolicySource, PolicyStatus, PushSandboxLogsRequest, PushSandboxLogsResponse,
-    RejectDraftChunkRequest, RejectDraftChunkResponse, ReportPolicyStatusRequest,
-    ReportPolicyStatusResponse, SandboxLogLine, SandboxPolicyRevision, SettingScope, SettingValue,
-    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    PolicySource, PolicyStatus, ProviderReadinessReason, PushSandboxLogsRequest,
+    PushSandboxLogsResponse, RejectDraftChunkRequest, RejectDraftChunkResponse,
+    ReportPolicyStatusRequest, ReportPolicyStatusResponse, SandboxLogLine, SandboxPolicyRevision,
+    SettingScope, SettingValue, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
 };
 use openshell_core::proto::{
     L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
@@ -2499,6 +2499,16 @@ pub(super) async fn handle_get_sandbox_config(
 
     let sandbox =
         super::sandbox::fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
+    Ok(Response::new(load_sandbox_config(state, &sandbox).await?))
+}
+
+/// Resolve the same effective configuration for authenticated RPCs and trusted
+/// readiness snapshots. Callers must authorize external access before entering.
+pub(super) async fn load_sandbox_config(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+) -> Result<GetSandboxConfigResponse, Status> {
+    let sandbox_id = sandbox.object_id().to_string();
     let workspace = sandbox.object_workspace().to_string();
     let sandbox_provider_names = sandbox
         .spec
@@ -2710,7 +2720,7 @@ pub(super) async fn handle_get_sandbox_config(
     )
     .await?;
 
-    Ok(Response::new(GetSandboxConfigResponse {
+    Ok(GetSandboxConfigResponse {
         policy,
         version,
         policy_hash,
@@ -2727,7 +2737,12 @@ pub(super) async fn handle_get_sandbox_config(
             .as_str()
             .to_string(),
         extension_authentication_enabled: state.sandbox_jwt_issuer.is_some(),
-    }))
+        provider_attachment_epoch: sandbox
+            .spec
+            .as_ref()
+            .map(|spec| spec.provider_attachment_epoch.clone())
+            .unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -3245,6 +3260,20 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    Ok(Response::new(
+        load_sandbox_provider_environment(state, &sandbox, supports_static_credential_bindings)
+            .await?,
+    ))
+}
+
+/// Materialize a privileged provider snapshot after the caller has authorized
+/// access. Omission reasons remain separate from a legitimately empty snapshot.
+pub(super) async fn load_sandbox_provider_environment(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+    supports_static_credential_bindings: bool,
+) -> Result<GetSandboxProviderEnvironmentResponse, Status> {
+    let sandbox_id = sandbox.object_id().to_string();
     let workspace = sandbox.object_workspace().to_string();
 
     let spec = sandbox
@@ -3267,7 +3296,7 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         state.as_ref(),
         &provider_profile_catalog,
         &workspace,
-        &sandbox,
+        sandbox,
         &sandbox_id,
     )
     .await?;
@@ -3295,6 +3324,8 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         )
         .await?;
 
+    let mut readiness_reason = provider_environment.readiness_reason;
+
     if supports_static_credential_bindings {
         let unbound_static_keys = provider_environment
             .static_credential_keys
@@ -3306,6 +3337,9 @@ pub(super) async fn handle_get_sandbox_provider_environment(
             })
             .cloned()
             .collect::<Vec<_>>();
+        if !unbound_static_keys.is_empty() {
+            readiness_reason = ProviderReadinessReason::CredentialsWithheld;
+        }
         for key in unbound_static_keys {
             warn!(
                 sandbox_id = %sandbox_id,
@@ -3319,6 +3353,9 @@ pub(super) async fn handle_get_sandbox_provider_environment(
             provider_environment.static_credential_keys.remove(&key);
         }
     } else {
+        if !provider_environment.static_credential_keys.is_empty() {
+            readiness_reason = ProviderReadinessReason::UnsupportedSupervisor;
+        }
         for key in &provider_environment.static_credential_keys {
             provider_environment.environment.remove(key);
             provider_environment.credential_expiration_times.remove(key);
@@ -3351,14 +3388,17 @@ pub(super) async fn handle_get_sandbox_provider_environment(
                 .map(|timestamp| (key, timestamp))
         })
         .collect();
-    Ok(Response::new(GetSandboxProviderEnvironmentResponse {
+    Ok(GetSandboxProviderEnvironmentResponse {
         environment: provider_environment.environment,
         provider_env_revision,
         credential_expiration_times,
         dynamic_credentials: provider_environment.dynamic_credentials,
         static_credential_bindings: provider_environment.static_credential_bindings,
         non_secret_environment_keys,
-    }))
+        provider_attachment_epoch: spec.provider_attachment_epoch.clone(),
+        policy_hash: deterministic_policy_hash(&effective_policy),
+        readiness_reason: readiness_reason.into(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3393,6 +3433,7 @@ async fn handle_update_config_inner(
     principal: &Principal,
     sandbox_caller: bool,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     validate_annotations(&req.annotations, "annotations")?;
     let workspace = if req.global {
@@ -3402,6 +3443,7 @@ async fn handle_update_config_inner(
             ));
         }
         require_platform_admin(&state.admin_role, principal)?;
+        replay_facts.global()?;
         String::new()
     } else {
         let min_role = if sandbox_caller {
@@ -3659,6 +3701,7 @@ async fn handle_update_config_inner(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
     let mut response_annotations = sandbox_metadata_annotations(&sandbox);
 
     if has_setting {
@@ -5040,6 +5083,7 @@ async fn handle_approve_draft_chunk_inner(
     request: Request<ApproveDraftChunkRequest>,
 ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     let authz = authorize_workspace_selector(
         &state.store,
@@ -5068,6 +5112,7 @@ async fn handle_approve_draft_chunk_inner(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let chunk = state
         .store
@@ -5195,6 +5240,7 @@ async fn handle_reject_draft_chunk_inner(
     request: Request<RejectDraftChunkRequest>,
 ) -> Result<Response<RejectDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     let authz = authorize_workspace_selector(
         &state.store,
@@ -5221,6 +5267,7 @@ async fn handle_reject_draft_chunk_inner(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let chunk = state
         .store
@@ -5305,6 +5352,7 @@ async fn handle_approve_all_draft_chunks_inner(
     request: Request<ApproveAllDraftChunksRequest>,
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     let authz = authorize_workspace_selector(
         &state.store,
@@ -5330,6 +5378,7 @@ async fn handle_approve_all_draft_chunks_inner(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let pending_chunks = state
         .store
@@ -5613,6 +5662,7 @@ pub(super) async fn handle_edit_draft_chunk(
     request: Request<EditDraftChunkRequest>,
 ) -> Result<Response<EditDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     let authz = authorize_workspace_selector(
         &state.store,
@@ -5642,6 +5692,7 @@ pub(super) async fn handle_edit_draft_chunk(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let chunk = state
         .store
@@ -5694,6 +5745,7 @@ async fn handle_undo_draft_chunk_inner(
     request: Request<UndoDraftChunkRequest>,
 ) -> Result<Response<UndoDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     let authz = authorize_workspace_selector(
         &state.store,
@@ -5720,6 +5772,7 @@ async fn handle_undo_draft_chunk_inner(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let chunk = state
         .store
@@ -5791,6 +5844,7 @@ pub(super) async fn handle_clear_draft_chunks(
     request: Request<ClearDraftChunksRequest>,
 ) -> Result<Response<ClearDraftChunksResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     let authz = authorize_workspace_selector(
         &state.store,
@@ -5814,6 +5868,7 @@ pub(super) async fn handle_clear_draft_chunks(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let deleted = state
         .store
@@ -9184,6 +9239,7 @@ mod tests {
         let error = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
+                request_id: String::new(),
                 global: true,
                 setting_key: "log_level".to_string(),
                 delete_setting: true,
@@ -9278,6 +9334,7 @@ mod tests {
         let error = handle_update_config(
             &state,
             Request::new(UpdateConfigRequest {
+                request_id: String::new(),
                 global: true,
                 setting_key: "log_level".to_string(),
                 delete_setting: true,
@@ -11225,6 +11282,7 @@ mod tests {
         let error = super::super::sandbox::handle_attach_sandbox_provider(
             &state,
             authed_request(openshell_core::proto::AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "provider-ambiguity".to_string(),
                 provider_name: "candidate-provider".to_string(),
                 expected_resource_version: 0,
@@ -11490,6 +11548,7 @@ mod tests {
         let response = handle_update_provider_profiles(
             &state,
             with_user(Request::new(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
                     profile: Some(updated_profile),
                     source: "custom-policy.yaml".to_string(),
@@ -11649,6 +11708,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_readiness_snapshot_uses_baseline_static_binding_contract() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-static-ready",
+            "static-ready",
+            test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+            vec!["work-github".to_string()],
+        );
+        let attachment_epoch = uuid::Uuid::new_v4().to_string();
+        sandbox.spec.as_mut().unwrap().provider_attachment_epoch = attachment_epoch.clone();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // Static binding support is sufficient to install this snapshot. The
+        // environment and policy must describe the same attachment authority.
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-static-ready".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let config = load_sandbox_config(&state, &sandbox).await.unwrap();
+
+        assert_eq!(
+            response.readiness_reason,
+            ProviderReadinessReason::Unspecified as i32
+        );
+        assert_eq!(response.provider_attachment_epoch, attachment_epoch);
+        assert_eq!(
+            response.provider_attachment_epoch,
+            config.provider_attachment_epoch
+        );
+        assert_eq!(response.provider_env_revision, config.provider_env_revision);
+        assert_eq!(response.policy_hash, config.policy_hash);
+        assert!(response.environment.contains_key("GITHUB_TOKEN"));
+        assert!(
+            response
+                .static_credential_bindings
+                .contains_key("GITHUB_TOKEN")
+        );
+        assert!(
+            !response
+                .non_secret_environment_keys
+                .iter()
+                .any(|key| key == "GITHUB_TOKEN")
+        );
+    }
+
+    #[tokio::test]
     async fn provider_environment_withholds_static_credentials_from_legacy_supervisors() {
         use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
 
@@ -11682,6 +11798,10 @@ mod tests {
 
         assert!(!response.environment.contains_key("GITHUB_TOKEN"));
         assert!(response.static_credential_bindings.is_empty());
+        assert_eq!(
+            response.readiness_reason,
+            ProviderReadinessReason::UnsupportedSupervisor as i32
+        );
     }
 
     #[tokio::test]
@@ -11721,6 +11841,10 @@ mod tests {
         .into_inner();
 
         assert!(!response.environment.contains_key("OPENAI_API_KEY"));
+        assert_eq!(
+            response.readiness_reason,
+            ProviderReadinessReason::CredentialsWithheld as i32
+        );
         assert!(
             !response
                 .static_credential_bindings
@@ -12542,6 +12666,7 @@ mod tests {
         handle_update_provider_profiles(
             &state,
             with_user(Request::new(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
                     profile: Some(rotated_profile),
                     source: "custom-token.yaml".to_string(),
@@ -12701,6 +12826,7 @@ mod tests {
         handle_attach_sandbox_provider(
             &state,
             with_user(Request::new(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -12741,6 +12867,7 @@ mod tests {
         handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -12793,6 +12920,7 @@ mod tests {
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     source: "custom-api.yaml".to_string(),
                     profile: Some(ProviderProfile {
@@ -12873,6 +13001,7 @@ mod tests {
         handle_attach_sandbox_provider(
             &state,
             with_user(Request::new(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-custom".to_string(),
                 expected_resource_version: 0,
@@ -12916,6 +13045,7 @@ mod tests {
         handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-custom".to_string(),
                 expected_resource_version: 0,
@@ -13564,6 +13694,7 @@ mod tests {
         let skipped = handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
+                request_id: String::new(),
                 name: sandbox_name.to_string(),
                 include_security_flagged: false,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -13594,6 +13725,7 @@ mod tests {
         let approved = handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
+                request_id: String::new(),
                 name: sandbox_name.to_string(),
                 include_security_flagged: true,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -13672,6 +13804,7 @@ mod tests {
         handle_edit_draft_chunk(
             &state,
             with_user(Request::new(EditDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.to_string(),
                 chunk_id: chunk_id.clone(),
                 proposed_rule: Some(private_rule),
@@ -13965,6 +14098,7 @@ mod tests {
         handle_edit_draft_chunk(
             &state,
             with_user(Request::new(EditDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.to_string(),
                 chunk_id: chunk_id.clone(),
                 proposed_rule: Some(finding_rule),
@@ -14122,6 +14256,7 @@ mod tests {
         let approve = handle_approve_draft_chunk(
             &state,
             authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -14174,6 +14309,7 @@ mod tests {
         let undo = handle_undo_draft_chunk(
             &state,
             authed_request(UndoDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -14240,6 +14376,7 @@ mod tests {
         let cleared = handle_clear_draft_chunks(
             &state,
             authed_request(ClearDraftChunksRequest {
+                request_id: String::new(),
                 name: sandbox_name.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -14345,6 +14482,7 @@ mod tests {
         handle_reject_draft_chunk(
             &state,
             authed_request(RejectDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 reason: guidance.to_string(),
@@ -15144,6 +15282,7 @@ mod tests {
         let error = handle_approve_draft_chunk(
             &state,
             with_user(Request::new(ApproveDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name,
                 chunk_id: chunk_id.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -16551,6 +16690,7 @@ mod tests {
         handle_approve_draft_chunk(
             &state,
             authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name,
                 chunk_id,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -16914,6 +17054,7 @@ mod tests {
         handle_reject_draft_chunk(
             &state,
             authed_request(RejectDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name,
                 chunk_id: second.accepted_chunk_ids[0].clone(),
                 reason: "redraft test".to_string(),
@@ -17383,6 +17524,7 @@ mod tests {
         handle_reject_draft_chunk(
             &state,
             authed_request(RejectDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 reason: "scope too broad".to_string(),
@@ -17397,6 +17539,7 @@ mod tests {
         handle_approve_draft_chunk(
             &state,
             authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -17411,6 +17554,7 @@ mod tests {
         handle_undo_draft_chunk(
             &state,
             authed_request(UndoDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -17554,6 +17698,7 @@ mod tests {
         let approve_err = handle_approve_draft_chunk(
             &state,
             authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
                 name: other_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -17569,6 +17714,7 @@ mod tests {
         let reject_err = handle_reject_draft_chunk(
             &state,
             authed_request(RejectDraftChunkRequest {
+                request_id: String::new(),
                 name: other_name.clone(),
                 chunk_id: chunk_id.clone(),
                 reason: "wrong sandbox".to_string(),
@@ -17584,6 +17730,7 @@ mod tests {
         let edit_err = handle_edit_draft_chunk(
             &state,
             authed_request(EditDraftChunkRequest {
+                request_id: String::new(),
                 name: other_name.clone(),
                 chunk_id: chunk_id.clone(),
                 proposed_rule: Some(proposed_rule.clone()),
@@ -17599,6 +17746,7 @@ mod tests {
         handle_approve_draft_chunk(
             &state,
             authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
                 name: sandbox_a.object_name().to_string(),
                 chunk_id: chunk_id.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -17613,6 +17761,7 @@ mod tests {
         let undo_err = handle_undo_draft_chunk(
             &state,
             authed_request(UndoDraftChunkRequest {
+                request_id: String::new(),
                 name: other_name,
                 chunk_id,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -19705,6 +19854,7 @@ mod tests {
         let response = handle_update_config(
             &state,
             authed_request(UpdateConfigRequest {
+                request_id: String::new(),
                 name: "test-sandbox".to_string(),
                 policy: Some(new_policy),
                 setting_key: String::new(),
@@ -19803,6 +19953,7 @@ mod tests {
         let response = handle_update_config(
             &state,
             authed_request(UpdateConfigRequest {
+                request_id: String::new(),
                 name: "annotated-backfill".to_string(),
                 policy: Some(ProtoSandboxPolicy::default()),
                 setting_key: String::new(),
@@ -20835,6 +20986,7 @@ mod tests {
         let err = handle_update_config(
             &state,
             authed_request(UpdateConfigRequest {
+                request_id: String::new(),
                 name: "test-sandbox".to_string(),
                 policy: Some(new_policy),
                 setting_key: String::new(),
@@ -20936,6 +21088,7 @@ mod tests {
                 handle_update_config(
                     &state_clone,
                     authed_request(UpdateConfigRequest {
+                        request_id: String::new(),
                         name: "test-sandbox".to_string(),
                         policy: Some(new_policy),
                         setting_key: String::new(),

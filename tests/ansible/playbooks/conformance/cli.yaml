@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ---
-- name: Run OpenShell smoke tests
+- name: Run OpenShell conformance tests
   hosts: all
   gather_facts: false
   tasks:
@@ -18,7 +18,7 @@
         group: tmachine
         mode: "0700"
 
-    - name: Install OpenShell conformance test bundle
+    - name: Extract OpenShell conformance test bundle
       become: true
       ansible.builtin.unarchive:
         src: "{{ openshell_conformance_test_bundle }}"
@@ -26,24 +26,20 @@
         owner: tmachine
         group: tmachine
 
-    - name: Wait for OpenShell gateway
-      ansible.builtin.wait_for:
-        host: 127.0.0.1
-        port: 17670
-        timeout: 60
+    # Report a malformed outer bundle directly instead of failing later with
+    # an opaque cargo-nextest missing-archive error.
+    - name: Check OpenShell conformance nextest archive
+      ansible.builtin.stat:
+        path: /var/lib/openshell-conformance/tests/tests.tar.zst
+      register: conformance_archive
 
-    - name: Register OpenShell gateway
-      ansible.builtin.command:
-        argv:
-          - /usr/local/bin/openshell
-          - gateway
-          - add
-          - http://127.0.0.1:17670
-          - --local
-          - --name
-          - tmachine
+    - name: Require OpenShell conformance nextest archive
+      ansible.builtin.assert:
+        that:
+          - conformance_archive.stat.isreg | default(false)
+        fail_msg: OpenShell conformance test bundle did not contain tests.tar.zst
 
-    - name: Run OpenShell smoke conformance archive
+    - name: Run OpenShell conformance archive
       ansible.builtin.command:
         argv:
           - cargo-nextest
@@ -60,13 +56,12 @@
       changed_when: false
       failed_when: false
 
-    - name: Show OpenShell smoke conformance diagnostics
+    # Preserve both streams for failures without adding passing-test output to
+    # every tmachine run.
+    - name: Show OpenShell conformance diagnostics
       ansible.builtin.debug:
-        var: conformance_result.stderr_lines
-
-    - name: Show OpenShell smoke conformance result
-      ansible.builtin.debug:
-        var: conformance_result.stdout_lines
+        var: conformance_result
+      when: conformance_result.rc != 0
 
     - name: Read OpenShell gateway logs
       become: true
@@ -88,8 +83,8 @@
         var: openshell_gateway_logs.stdout_lines
       when: conformance_result.rc != 0
 
-    - name: Require OpenShell smoke conformance success
+    - name: Require OpenShell conformance success
       ansible.builtin.assert:
         that:
           - conformance_result.rc == 0
-        fail_msg: OpenShell smoke conformance test failed
+        fail_msg: OpenShell conformance test failed

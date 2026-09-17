@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::provider_readiness::{
+    ProviderMutationExpectation, ProviderWaitOptions, finish_provider_mutation,
+};
 use crate::color::Colorize;
 use crate::commands::common::{
     format_epoch_ms, format_optional_epoch_ms, parse_credential_expiry_pairs,
@@ -19,10 +22,11 @@ use openshell_core::proto::{
     LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
     ListSandboxProvidersRequest, Provider, ProviderCredentialRefreshRecoveryAction,
     ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-    ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileImportItem, RotateProviderCredentialRequest, UpdateProviderProfilesRequest,
-    UpdateProviderRequest,
+    ProviderCredentialTokenGrantType, ProviderMutationKind, ProviderProfile,
+    ProviderProfileDiagnostic, ProviderProfileImportItem, RotateProviderCredentialRequest,
+    UpdateProviderProfilesRequest, UpdateProviderRequest,
 };
+use openshell_core::rpc_error::{ERROR_DOMAIN, decode_details};
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use openshell_providers::{
     ProviderTypeProfile, RealDiscoveryContext, detect_provider_from_command, discover_from_profile,
@@ -33,6 +37,30 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use tonic::{Code, Status};
+
+fn provider_mutation_is_uncertain(status: &Status) -> bool {
+    // Only a validated gateway ErrorInfo identifies a possibly saved mutation.
+    // Message text, metadata, foreign domains, and malformed details are untrusted.
+    decode_details(status).is_some_and(|details| {
+        details.error_info().is_some_and(|info| {
+            info.domain == ERROR_DOMAIN && info.reason == "CONFIG_OPERATION_STORAGE_UNCERTAIN"
+        })
+    })
+}
+
+fn provider_mutation_error(status: &Status, operation: &str) -> miette::Report {
+    if provider_mutation_is_uncertain(status) {
+        // Emit fixed guidance without chaining the server's potentially sensitive
+        // message or metadata. An error does not establish that the write rolled back.
+        miette!(
+            "provider change may already be saved (CONFIG_OPERATION_STORAGE_UNCERTAIN); \
+             readiness receipt could not be recorded. Do not blindly retry the mutation; \
+             check provider and sandbox status and reconcile the saved change first."
+        )
+    } else {
+        miette!("provider {operation} failed ({})", status.code())
+    }
+}
 
 fn proto_timestamp_ms(timestamp: Option<&prost_types::Timestamp>) -> i64 {
     timestamp
@@ -84,13 +112,16 @@ pub async fn sandbox_provider_list(
     Ok(())
 }
 
+/// Save a provider attachment and optionally wait for its installed authority.
 pub async fn sandbox_provider_attach(
     server: &str,
     name: &str,
     provider: &str,
     workspace: &str,
     tls: &TlsOptions,
+    readiness: ProviderWaitOptions<'_>,
 ) -> Result<()> {
+    readiness.validate()?;
     let mut client = grpc_client(server, tls).await?;
 
     // Fetch current sandbox to get resource_version for CAS
@@ -100,7 +131,7 @@ pub async fn sandbox_provider_attach(
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
-        .into_diagnostic()?
+        .map_err(|status| miette!("provider attachment lookup failed ({})", status.code()))?
         .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
@@ -109,6 +140,7 @@ pub async fn sandbox_provider_attach(
 
     let response = match client
         .attach_sandbox_provider(AttachSandboxProviderRequest {
+            request_id: String::new(),
             sandbox_name: name.to_string(),
             provider_name: provider.to_string(),
             expected_resource_version: resource_version,
@@ -117,36 +149,50 @@ pub async fn sandbox_provider_attach(
         .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) if status.code() == Code::Aborted => {
+        // Explicit post-save uncertainty takes precedence over a generic retry hint.
+        Err(status)
+            if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+        {
             return Err(miette::miette!(
                 "Failed to attach provider: sandbox was modified by another operation.\n\
                  Please retry the command."
-            )
-            .with_source_code(status.message().to_string()));
+            ));
         }
-        Err(e) => return Err(e).into_diagnostic(),
+        Err(error) => return Err(provider_mutation_error(&error, "attachment")),
     };
 
-    if response.attached {
-        println!(
-            "{} Attached provider {} to sandbox {}",
-            "✓".green().bold(),
-            provider,
-            name
-        );
-    } else {
-        println!("Provider {provider} is already attached to sandbox {name}.");
-    }
-    Ok(())
+    let receipt = response.receipt.ok_or_else(|| {
+        miette!(
+            "gateway did not return a provider receipt; saved attachment cannot establish readiness"
+        )
+    })?;
+    let mutation_id = receipt.mutation_id.clone();
+    finish_provider_mutation(
+        &client,
+        &mutation_id,
+        vec![receipt],
+        ProviderMutationExpectation {
+            workspace,
+            provider_name: provider,
+            kind: ProviderMutationKind::Attach,
+            sandbox: Some((name, sandbox.object_id())),
+            provider: None,
+        },
+        readiness,
+    )
+    .await
 }
 
+/// Save a provider detachment and optionally wait for future authority revocation.
 pub async fn sandbox_provider_detach(
     server: &str,
     name: &str,
     provider: &str,
     workspace: &str,
     tls: &TlsOptions,
+    readiness: ProviderWaitOptions<'_>,
 ) -> Result<()> {
+    readiness.validate()?;
     let mut client = grpc_client(server, tls).await?;
 
     // Fetch current sandbox to get resource_version for CAS
@@ -156,7 +202,7 @@ pub async fn sandbox_provider_detach(
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
-        .into_diagnostic()?
+        .map_err(|status| miette!("provider detachment lookup failed ({})", status.code()))?
         .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
@@ -165,6 +211,7 @@ pub async fn sandbox_provider_detach(
 
     let response = match client
         .detach_sandbox_provider(DetachSandboxProviderRequest {
+            request_id: String::new(),
             sandbox_name: name.to_string(),
             provider_name: provider.to_string(),
             expected_resource_version: resource_version,
@@ -173,27 +220,34 @@ pub async fn sandbox_provider_detach(
         .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) if status.code() == Code::Aborted => {
+        // Explicit post-save uncertainty takes precedence over a generic retry hint.
+        Err(status)
+            if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+        {
             return Err(miette::miette!(
                 "Failed to detach provider: sandbox was modified by another operation.\n\
                  Please retry the command."
-            )
-            .with_source_code(status.message().to_string()));
+            ));
         }
-        Err(e) => return Err(e).into_diagnostic(),
+        Err(error) => return Err(provider_mutation_error(&error, "detachment")),
     };
 
-    if response.detached {
-        println!(
-            "{} Detached provider {} from sandbox {}",
-            "✓".green().bold(),
-            provider,
-            name
-        );
-    } else {
-        println!("Provider {provider} was not attached to sandbox {name}.");
-    }
-    Ok(())
+    let receipt = response.receipt.ok_or_else(|| miette!("gateway did not return a provider receipt; saved detachment cannot establish revocation"))?;
+    let mutation_id = receipt.mutation_id.clone();
+    finish_provider_mutation(
+        &client,
+        &mutation_id,
+        vec![receipt],
+        ProviderMutationExpectation {
+            workspace,
+            provider_name: provider,
+            kind: ProviderMutationKind::Detach,
+            sandbox: Some((name, sandbox.object_id())),
+            provider: None,
+        },
+        readiness,
+    )
+    .await
 }
 
 fn print_provider_attachment_table(providers: &[Provider]) {
@@ -477,6 +531,7 @@ async fn auto_create_provider(
     if let Some(exact_name) = preferred_name {
         // Explicit name: create with exactly that name, no retries.
         let request = CreateProviderRequest {
+            request_id: String::new(),
             provider: Some(Provider {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
@@ -525,6 +580,7 @@ async fn auto_create_provider(
             };
 
             let request = CreateProviderRequest {
+                request_id: String::new(),
                 provider: Some(Provider {
                     metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                         id: String::new(),
@@ -676,6 +732,7 @@ async fn rollback_provider_create_after_gcloud_adc_failure(
 ) -> Result<()> {
     match client
         .delete_provider(DeleteProviderRequest {
+            request_id: String::new(),
             allow_missing: true,
             name: provider_name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -705,6 +762,19 @@ async fn rollback_provider_create_after_gcloud_adc_failure(
     }
 }
 
+fn provider_profile_lookup_error(status: &Status) -> miette::Report {
+    // A permission code supports recovery guidance, but cannot distinguish a
+    // missing membership from an insufficient role. Never expose backend text.
+    if status.code() == Code::PermissionDenied {
+        miette!(
+            "provider profile lookup denied (PERMISSION_DENIED): \
+             verify workspace membership and required permissions"
+        )
+    } else {
+        miette!("provider profile lookup failed ({})", status.code())
+    }
+}
+
 async fn fetch_provider_profile(
     client: &mut crate::tls::GrpcClient,
     provider_type: &str,
@@ -729,11 +799,11 @@ async fn fetch_provider_profile(
                             "provider profile '{requested}' not found; import a matching profile before using this provider type"
                         )
                     } else {
-                        miette::miette!(fallback_status.to_string())
+                        provider_profile_lookup_error(&fallback_status)
                     }
                 })?
         }
-        Err(status) => return Err(miette::miette!(status.to_string())),
+        Err(status) => return Err(provider_profile_lookup_error(&status)),
     };
 
     Ok(response)
@@ -1020,11 +1090,10 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
     if profile_id.is_empty() {
         return Err(miette::miette!("provider type is required"));
     }
-    let provider_profile = fetch_provider_profile(&mut client, profile_id, profile_workspace)
-        .await
-        .map_err(|err| {
-            miette::miette!("unsupported provider type or profile: {profile_id} ({err})")
-        })?;
+    // Lookup already distinguishes absent profiles from permission and transport
+    // failures; those failures do not establish that the profile is unsupported.
+    let provider_profile =
+        fetch_provider_profile(&mut client, profile_id, profile_workspace).await?;
     let provider_type = provider_profile.id.clone();
 
     let adc_credential_key = if from_gcloud_adc {
@@ -1107,6 +1176,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
 
     let response = client
         .create_provider(CreateProviderRequest {
+            request_id: String::new(),
             provider: Some(Provider {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
@@ -1153,6 +1223,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
 
         if let Err(configure_err) = client
             .configure_provider_refresh(ConfigureProviderRefreshRequest {
+                request_id: String::new(),
                 provider: provider_name.clone(),
                 credential_key: adc_credential_key.clone(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
@@ -1178,6 +1249,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
 
         if let Err(rotate_err) = client
             .rotate_provider_credential(RotateProviderCredentialRequest {
+                request_id: String::new(),
                 provider: provider_name.clone(),
                 credential_key: adc_credential_key,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -1601,6 +1673,7 @@ pub async fn provider_profile_import(
     if !items.is_empty() {
         let response = client
             .import_provider_profiles(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: items,
                 workspace: workspace.to_string(),
             })
@@ -1650,6 +1723,7 @@ pub async fn provider_profile_update(
             .map_or(0, |profile| profile.resource_version);
         let response = client
             .update_provider_profiles(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(item),
                 expected_resource_version,
                 id: id.to_string(),
@@ -1714,6 +1788,7 @@ pub async fn provider_profile_delete(
     for id in ids {
         let response = match client
             .delete_provider_profile(DeleteProviderProfileRequest {
+                request_id: String::new(),
                 allow_missing: true,
                 id: id.clone(),
                 workspace: workspace.to_string(),
@@ -1826,6 +1901,7 @@ pub async fn provider_refresh_config(
     let mut client = grpc_client(server, tls).await?;
     let status = client
         .configure_provider_refresh(ConfigureProviderRefreshRequest {
+            request_id: String::new(),
             provider: input.name.to_string(),
             credential_key: input.credential_key.to_string(),
             strategy: strategy as i32,
@@ -1863,6 +1939,7 @@ pub async fn provider_rotate(
     let mut client = grpc_client(server, tls).await?;
     let status = client
         .rotate_provider_credential(RotateProviderCredentialRequest {
+            request_id: String::new(),
             provider: name.to_string(),
             credential_key: credential_key.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -1900,6 +1977,7 @@ pub async fn provider_refresh_delete(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .delete_provider_refresh(DeleteProviderRefreshRequest {
+            request_id: String::new(),
             allow_missing: true,
             provider: name.to_string(),
             credential_key: credential_key.to_string(),
@@ -2223,6 +2301,7 @@ fn print_provider_type_row(
     );
 }
 
+/// Credential update inputs and observation choices for all attached sandboxes.
 pub struct ProviderUpdateOptions<'a> {
     pub server: &'a str,
     pub name: &'a str,
@@ -2233,8 +2312,11 @@ pub struct ProviderUpdateOptions<'a> {
     pub credential_expires_at: &'a [String],
     pub workspace: &'a str,
     pub tls: &'a TlsOptions,
+    /// Bound observation of the sandbox target set selected by the update.
+    pub readiness: ProviderWaitOptions<'a>,
 }
 
+/// Update provider credentials and report each selected sandbox independently.
 pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     let ProviderUpdateOptions {
         server,
@@ -2246,7 +2328,9 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
         credential_expires_at,
         workspace,
         tls,
+        readiness,
     } = options;
+    readiness.validate()?;
 
     if from_existing && !credentials.is_empty() {
         return Err(miette::miette!(
@@ -2284,7 +2368,7 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
         {
             None
         }
-        Err(status) => return Err(status).into_diagnostic(),
+        Err(status) => return Err(miette!("provider update lookup failed ({})", status.code())),
     };
 
     if existing.is_none() && (from_existing || from_oidc_token) {
@@ -2337,6 +2421,7 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
 
     let response = client
         .update_provider(UpdateProviderRequest {
+            request_id: String::new(),
             provider: Some(Provider {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
@@ -2373,19 +2458,28 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
             clear_credential_expiration_keys,
         })
         .await
-        .into_diagnostic()?;
+        .map_err(|error| provider_mutation_error(&error, "update"))?;
 
-    let provider = response
-        .into_inner()
-        .provider
-        .ok_or_else(|| miette::miette!("provider missing from response"))?;
-
-    println!(
-        "{} Updated provider {}",
-        "✓".green().bold(),
-        provider.object_name()
-    );
-    Ok(())
+    let response = response.into_inner();
+    if response.mutation_id.is_empty() {
+        return Err(miette!(
+            "gateway did not return a provider mutation receipt; saved credentials cannot establish readiness"
+        ));
+    }
+    finish_provider_mutation(
+        &client,
+        &response.mutation_id,
+        response.target_receipts,
+        ProviderMutationExpectation {
+            workspace,
+            provider_name: name,
+            kind: ProviderMutationKind::Update,
+            sandbox: None,
+            provider: response.provider.as_ref(),
+        },
+        readiness,
+    )
+    .await
 }
 
 pub async fn provider_delete(
@@ -2399,6 +2493,7 @@ pub async fn provider_delete(
     for name in names {
         let response = match client
             .delete_provider(DeleteProviderRequest {
+                request_id: String::new(),
                 allow_missing: true,
                 name: name.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),

@@ -26,7 +26,7 @@ inputs:
       as 0.0.0-dev.<sha> with appVersion set to the same SHA, enabling exact
       version pinning alongside the floating 0.0.0-dev tag. Both chart version
       and appVersion use the full SHA so the chart tag matches the image tag
-      pushed by docker-build.yml.
+      pushed by build-images.yml.
     required: false
     default: ""
 

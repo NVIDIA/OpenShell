@@ -95,7 +95,9 @@ rules:
     verbs: ["create", "get"]
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create"]
+    # Bootstrap Secrets are generation-scoped. Recovery lists them by label and
+    # deletes stale generations with UID preconditions before retrying creation.
+    verbs: ["create", "list", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get"]

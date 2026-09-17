@@ -178,6 +178,18 @@ Update a provider's credentials:
 openshell provider update my-claude --from-existing
 ```
 
+To wait until attached sandboxes apply the updated credentials, add `--wait`:
+
+```shell
+openshell provider update my-claude --from-existing --wait --timeout 30 --output json
+```
+
+The update records which sandboxes are attached before saving the new credentials. Its result includes a change ID and outcome for each of those sandboxes. Sandboxes attached later are outside this wait. The timeout applies to the whole group; if any selected sandbox fails or times out, the command exits with an error and still reports each sandbox's outcome. When no sandboxes are attached, it reports the saved change and an empty target list.
+
+Credential refresh status tells you whether OpenShell obtained credentials. [Provider readiness](/providers/profiles#inspect-provider-readiness) tells you whether the sandbox applied the credentials, policy, and environment for new processes. It does not test access to a backend model or cancel requests already sent upstream.
+
+After a static credential update completes, launch a new client process to use the updated reference. An existing process keeps its revision-scoped reference; readiness does not make that old reference resolve the new value. Acknowledged detach revokes retained references and removes them from environments for future launches.
+
 Set or clear a credential expiry timestamp:
 
 ```shell

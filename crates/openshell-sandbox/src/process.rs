@@ -247,6 +247,7 @@ fn apply_canonical_process_environment(
     interactive: bool,
     user_environment: &HashMap<String, String>,
 ) {
+    cmd.envs(user_environment);
     let (session_user, session_home) = session_user_and_home(policy, workspace.home());
     // Resolve a shell present in the sandbox image (minimal images such as
     // Alpine ship only `/bin/sh`, not bash). Runs in the supervisor.
@@ -562,9 +563,6 @@ impl ProcessHandle {
         // inherited environment. The entrypoint drops to the sandbox user
         // before `exec`; without this strip, sandbox code could recover
         // supervisor credentials from its inherited environment.
-        strip_supervisor_only_env(&mut cmd);
-
-        inject_provider_env(&mut cmd, provider_env);
         apply_canonical_process_environment(
             &mut cmd,
             policy,
@@ -572,6 +570,9 @@ impl ProcessHandle {
             interactive,
             &configured_user_environment(),
         );
+        strip_supervisor_only_env(&mut cmd);
+
+        inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
@@ -727,9 +728,6 @@ impl ProcessHandle {
 
         // Strip supervisor-only identity material from the entrypoint's
         // inherited environment.
-        strip_supervisor_only_env(&mut cmd);
-
-        inject_provider_env(&mut cmd, provider_env);
         apply_canonical_process_environment(
             &mut cmd,
             policy,
@@ -737,6 +735,9 @@ impl ProcessHandle {
             interactive,
             &configured_user_environment(),
         );
+        strip_supervisor_only_env(&mut cmd);
+
+        inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
@@ -2239,6 +2240,58 @@ mod tests {
         let expected_shell = openshell_core::shell::detect_login_shell();
         assert_eq!(variables.get("SHELL"), Some(&expected_shell.as_str()));
         assert_eq!(variables.get("TERM"), Some(&"xterm-256color"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_process_receives_declared_environment_and_home() {
+        let current_user = User::from_uid(nix::unistd::geteuid()).unwrap().unwrap();
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_user.name),
+            run_as_group: None,
+        });
+        for interactive in [false, true] {
+            let mut cmd = Command::new("/usr/bin/env");
+            cmd.env_clear().stdout(StdStdio::piped());
+            let declared = HashMap::from([
+                ("APPLICATION_AGENT".into(), "researcher".into()),
+                (
+                    openshell_core::sandbox_env::SANDBOX_TOKEN.into(),
+                    "must-not-reach-child".into(),
+                ),
+                ("ANTHROPIC_API_KEY".into(), "caller-value".into()),
+                ("HOME".into(), "/sandbox".into()),
+            ]);
+            apply_canonical_process_environment(
+                &mut cmd,
+                &policy,
+                &ResolvedWorkspace::default(),
+                interactive,
+                &declared,
+            );
+            strip_supervisor_only_env(&mut cmd);
+            inject_provider_env(
+                &mut cmd,
+                &HashMap::from([(
+                    "ANTHROPIC_API_KEY".into(),
+                    "openshell:resolve:env:ANTHROPIC_API_KEY".into(),
+                )]),
+            );
+            let output = cmd.output().await.expect("run environment probe");
+            assert!(output.status.success());
+            let environment = String::from_utf8(output.stdout).unwrap();
+            let variables: HashMap<_, _> = environment
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .collect();
+            assert_eq!(variables.get("APPLICATION_AGENT"), Some(&"researcher"));
+            assert!(!variables.contains_key(openshell_core::sandbox_env::SANDBOX_TOKEN));
+            assert_eq!(
+                variables.get("ANTHROPIC_API_KEY"),
+                Some(&"openshell:resolve:env:ANTHROPIC_API_KEY")
+            );
+            assert_eq!(variables.get("HOME"), Some(&"/sandbox"));
+        }
     }
 
     /// Unknown names may yield `Ok(None)` (`… not found …`) or `Err` when NSS fails first

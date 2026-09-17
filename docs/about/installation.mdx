@@ -16,7 +16,7 @@ Install OpenShell with a single command:
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
-The script detects your operating system and installs the OpenShell CLI and gateway with your native package manager. It then starts the local gateway server so you can begin creating sandboxes.
+The script detects your operating system and installs the OpenShell CLI, standalone policy prover, and gateway with your native package manager. It then starts the local gateway server so you can begin creating sandboxes.
 
 You can also download release artifacts directly from the [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
 
@@ -42,7 +42,7 @@ For detailed driver behavior, refer to [Sandbox Compute Drivers](/reference/sand
 
 ## macOS
 
-On macOS, the install script uses Homebrew. The Homebrew package installs the `openshell` CLI, the gateway binary, and a Homebrew-managed gateway service.
+On macOS, the install script uses Homebrew. The Homebrew package installs the `openshell` CLI, `openshell-prover`, the gateway binary, and a Homebrew-managed gateway service.
 
 The Homebrew service uses the gateway's built-in `127.0.0.1:17670` listener and generates a local mTLS bundle on install. The installer registers `https://localhost:17670` with the CLI so TLS uses a DNS name covered by the generated certificate. The formula creates a Homebrew prefix config, such as `/opt/homebrew/var/openshell/gateway.toml`, without overriding `bind_address`. Docker Desktop and Podman Machine reuse the primary listener for sandbox callbacks when they can reach it. The gateway reads `~/.config/openshell/gateway.toml` instead when that file exists. Homebrew upgrades migrate exact package-generated schema-v1 prefix configs, including the affected IPv6 variant. They preserve edited prefix configs and all user configs. Follow the [schema version 2 migration steps](/reference/gateway-config#migrate-to-schema-version-2) for an edited v1 file.
 
@@ -57,9 +57,9 @@ brew services restart openshell
 
 ## Linux
 
-On Fedora and RHEL, the install script uses RPM packages. The RPM installs the `openshell` CLI, the `openshell-gateway` daemon, and a systemd user service.
+On Fedora and RHEL, the install script uses RPM packages. The RPMs install the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, and a systemd user service.
 
-On Debian and Ubuntu, the install script uses a Debian package. The Debian package installs the `openshell` CLI, the `openshell-gateway` daemon, VM sandbox support, and a systemd user service.
+On Debian and Ubuntu, the install script uses a Debian package. The Debian package installs the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, VM sandbox support, and a systemd user service.
 
 Linux packages require glibc 2.28 or newer. The installer checks libc before downloading packages and exits with an error on older glibc versions, Alpine, musl-based distributions, or unknown libc environments.
 

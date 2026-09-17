@@ -164,6 +164,10 @@ openshell provider profile import --file ./my-profile.yaml
 
 ### List, inspect, update, delete
 
+Use `openshell sandbox provider status --help` and the attach, detach, and update help to find the installed version's wait options. Add `--wait` when the next step depends on a provider change taking effect. Without it, a successful command only confirms that the gateway saved the change. Save the returned `receipt_id` to check that same change later, and inspect the result for every selected sandbox. Credential refresh status confirms that OpenShell obtained credentials; provider status confirms that the sandbox applied them, activated the policy, and updated the environment for new processes. If the status is `superseded`, explain that a later change replaced the request and inspect that change separately.
+
+If attach, detach, or update reports `CONFIG_OPERATION_STORAGE_UNCERTAIN`, explain that the change may already be saved and its readiness receipt may be unavailable. Do not blindly retry the mutation. Inspect the provider and sandbox state and reconcile the saved change before deciding on another mutation; the error proves neither rollback nor readiness.
+
 ```bash
 openshell provider list
 openshell provider list --output json
@@ -378,8 +382,9 @@ provider instead of passing API keys, tokens, or other secrets to `sandbox exec`
 ```bash
 openshell sandbox provider list my-sandbox
 openshell sandbox provider list my-sandbox --output json
-openshell sandbox provider attach my-sandbox my-github
-openshell sandbox provider detach my-sandbox my-github
+openshell sandbox provider attach my-sandbox my-github --wait --timeout 30
+openshell sandbox provider status my-sandbox my-github --output json
+openshell sandbox provider detach my-sandbox my-github --wait --timeout 30
 ```
 
 Structured attachment output contains provider names, types, and sorted
@@ -507,11 +512,15 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
 - Binary matching patterns
-- Ordered `network_middlewares`, host selection, HTTP and WebSocket bindings, and `fail_open` or `fail_closed` behavior
+- Ordered `network_middlewares`, host selection, HTTP request/response and WebSocket bindings, and `fail_open` or `fail_closed` behavior
 
 `network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
-Middleware can inspect parsed HTTP request bodies and complete client-to-upstream WebSocket text messages over both `ws://` and `wss://` when the implementation advertises the matching binding. The built-in `openshell/regex` advertises both bindings and applies its fixed patterns to UTF-8 text. A host-matched HTTP-only attachment can inspect the upgrade GET but does not join the WebSocket chain; look for `binding_not_selected` coverage. Binary messages pass under both `on_error` modes and active stages emit `unsupported_message_type` coverage; upstream-to-client messages remain uninspected. A broken fail-open WebSocket stage is disabled for the rest of that connection; inspect sandbox OCSF logs for `openshell.middleware.websocket_stage_disabled`.
+Middleware can inspect HTTP requests, HTTP responses, or client WebSocket text
+messages when the implementation advertises the matching binding. The built-in
+`openshell/regex` supports request bodies and client WebSocket text messages.
+Use the `generate-sandbox-policy` skill to choose attachments and failure policy,
+and `debug-openshell-cluster` to investigate middleware failures.
 
 ### Step 5: Push the updated policy
 
@@ -719,14 +728,14 @@ endpoint, create the provider, and attach it only to sandboxes that need it:
 ```bash
 openshell provider profile import -f ./inference-provider.yaml
 openshell provider create --name model-provider --type <profile-id> --credential <KEY>
-openshell sandbox provider attach work-session model-provider
+openshell sandbox provider attach work-session model-provider --wait --timeout 30
 openshell sandbox exec work-session -- <client-command>
 ```
 
 The application owns the native base URL, model, request shape, and timeout.
-Launch a new process after attaching a provider so it inherits the provider
-credential placeholder. Use the `debug-inference` skill for endpoint, policy,
-credential-binding, or migration failures.
+Launch a new process after attachment readiness so it inherits the installed provider environment. Use the `debug-inference` skill for endpoint, policy, credential-binding, or migration failures.
+
+For an ordinary static provider update, wait for the update and launch a new client process to obtain the new reference. Do not claim that readiness updates the environment of an existing process or retargets its old reference. Acknowledged detach revokes retained references and removes them from future process environments.
 
 ## Workflow 8: Gateway Management
 

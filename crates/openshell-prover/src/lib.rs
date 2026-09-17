@@ -8,6 +8,7 @@
 //! paths and write-bypass violations.
 
 pub mod accepted_risks;
+pub mod containment;
 pub mod credentials;
 pub mod finding;
 pub mod model;

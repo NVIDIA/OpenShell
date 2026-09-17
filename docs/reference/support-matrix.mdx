@@ -10,7 +10,7 @@ This page lists the host platform, compute driver, software, runtime, and kernel
 
 ## Supported Platforms
 
-OpenShell publishes multi-architecture gateway images for `linux/amd64` and `linux/arm64`. The CLI, package-managed gateway, and standalone gateway binary are supported on the following host platforms:
+OpenShell publishes multi-architecture gateway images for `linux/amd64` and `linux/arm64`. The CLI, policy prover, package-managed gateway, and standalone gateway binary are supported on the following host platforms:
 
 | Platform                         | Architecture          | Status    |
 | -------------------------------- | --------------------- | --------- |
@@ -34,6 +34,18 @@ OpenShell publishes standalone `openshell-gateway` release assets for manual dow
 These artifacts are attached to GitHub releases. Kubernetes deployments should use the Helm chart and the published gateway image.
 
 On Linux, `openshell-gateway` requires glibc 2.28 or newer. Compatible systems include, for example, Ubuntu 20.04+, RHEL 8+, Rocky Linux 8+, Amazon Linux 2023+, and Fedora 32+.
+
+## Standalone Policy Prover
+
+OpenShell publishes standalone `openshell-prover` release assets for manual download on these platforms:
+
+| Platform              | Artifact pattern                                      |
+| --------------------- | ----------------------------------------------------- |
+| Linux x86_64 (amd64)  | `openshell-prover-x86_64-unknown-linux-musl.tar.gz`   |
+| Linux aarch64 (arm64) | `openshell-prover-aarch64-unknown-linux-musl.tar.gz`  |
+| macOS Apple Silicon   | `openshell-prover-aarch64-apple-darwin.tar.gz`        |
+
+These artifacts are attached to GitHub releases. The Linux binaries are static and do not require glibc. All prover archives include the required solver linkage.
 
 ## Compute Drivers
 

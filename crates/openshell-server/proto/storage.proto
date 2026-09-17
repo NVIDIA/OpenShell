@@ -9,6 +9,7 @@ package openshell.storage.v1;
 
 import "datamodel.proto";
 import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
 import "openshell.proto";
 import "options.proto";
 import "sandbox.proto";
@@ -106,6 +107,31 @@ message StoredRefreshMaterialDeletion {
 message StoredProviderProfile {
   openshell.datamodel.v1.ObjectMeta metadata = 1;
   openshell.v1.ProviderProfile profile = 2;
+}
+
+// Durable, non-secret progress for a sandbox-scoped desired-state mutation.
+// The target_* fields let a recovery worker bind the exact effective snapshot
+// revision after the desired-state transaction commits.
+message StoredConfigUpdateOperation {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  openshell.v1.ConfigUpdateOperation operation = 2;
+  uint32 target_policy_version = 3;
+  uint64 target_settings_revision = 4;
+  openshell.v1.SandboxPhase initial_phase = 5;
+  string idempotency_key = 6;
+  uint32 attempt_count = 7;
+  reserved 8;
+  reserved "next_attempt_at_ms";
+  google.protobuf.Timestamp next_attempt_time = 108;
+  uint32 response_policy_version = 9;
+  string response_policy_hash = 10;
+  uint64 response_settings_revision = 11;
+  bool response_deleted = 12;
+  map<string, string> response_annotations = 13;
+  // Immutable provider mutation intent associated with this operation.
+  openshell.v1.ProviderMutationReceipt provider_receipt = 14;
+  // Closed reason captured when resolving the operation's provider snapshot.
+  openshell.v1.ProviderReadinessReason provider_snapshot_reason = 15;
 }
 
 // Stored payload for a policy revision row in the generic objects table.

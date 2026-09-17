@@ -1019,9 +1019,11 @@ fn validate_mcp_params_field(
     has_tool: bool,
     mcp_strict_tool_names: bool,
 ) {
-    let Some(params) = rule.get("params").filter(|v| !v.is_null()) else {
+    let Some(params) = rule.get("params") else {
         return;
     };
+    // Explicit params must be a map: tool alias lowering inserts params.name
+    // into it, so accepting null would discard the tool selector.
     let Some(params_obj) = params.as_object() else {
         errors.push(format!("{loc}.params: expected map of matchers"));
         return;

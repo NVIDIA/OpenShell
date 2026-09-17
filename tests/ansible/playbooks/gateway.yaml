@@ -7,3 +7,4 @@
   gather_facts: false
   roles:
     - openshell_gateway
+    - openshell_client
