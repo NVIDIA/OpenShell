@@ -116,11 +116,11 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
-        "6c31e100348f9880a1f8a26f44afa6c583bddcb6cfb7915766c172e517472611";
+        "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "6b7970718a68b2641adaf54917c063754692012e8c26db04ee9d6f022556ddb7";
+        "40d1aba0dbe3e0e5bb3c30bb94cc49b338e1b9cc23a0032f988e69012ecdbbc6";
     const DURABLE_SCHEMA_SHA256: &str =
-        "8231d551f29bc671e200ea5b0b2d2f5887f5bc13a26ec7cb6a427c27fbd06acc";
+        "557ca283c55fd46b213d5573b950ba8604cc3f4b31bad3e433eb9c5f9975138d";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "f541c25bb3e1e5806865bc61470c66d10c16cca7399bf5909c77dc384d469171";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;

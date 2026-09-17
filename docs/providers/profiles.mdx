@@ -1011,6 +1011,8 @@ An unavailable supervisor, an expired report, a failed installation, or a missin
 
 JSON and YAML output include change IDs, requested and installed revisions, timestamps, reason categories, and a result for each sandbox. Revision strings identify configurations; compare them for equality rather than numerical order. Status output excludes credential values, credential references, authorization headers, and raw installation errors.
 
+The `persisted_time`, `observed_time`, and `evaluated_time` fields use RFC 3339 timestamp strings. An absent `observed_time` means the current supervisor session has not supplied accepted evidence. API operation timestamps use protobuf `Timestamp`, and report intervals and observation lifetimes use protobuf `Duration`, following the [protobuf time representation](/reference/protobuf-time-types).
+
 The API's `operation` field records the common operation's historical outcome; its `operation_id` equals the receipt ID. Use the provider `state` and the wait result for current readiness. A disconnected supervisor can make the live state pending even after the operation previously applied, and a newer change can supersede the live result. Historical completion does not override those checks.
 
 ### Runtime Limitations

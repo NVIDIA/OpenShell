@@ -1047,12 +1047,7 @@ impl MutationReceipt {
         } else {
             nonempty_string(desired, "provider_id")?;
         }
-        if receipt["persisted_at_ms"]
-            .as_i64()
-            .is_none_or(|time| time <= 0)
-        {
-            return Err("provider mutation receipt persistence time was absent".to_string());
-        }
+        nonempty_string(receipt, "persisted_time")?;
         Ok(Self {
             mutation_id: mutation_id.to_string(),
             receipt: receipt.clone(),
@@ -1160,14 +1155,9 @@ impl MutationReceipt {
             nonempty_string(observed, field)?;
         }
         nonempty_string(status, "network_instance_id")?;
-        if observed["reason"] != "unspecified"
-            || status["observed_at_ms"]
-                .as_i64()
-                .is_none_or(|time| time <= 0)
-            || status["evaluated_at_ms"]
-                .as_i64()
-                .is_none_or(|time| time <= 0)
-        {
+        nonempty_string(status, "observed_time")?;
+        nonempty_string(status, "evaluated_time")?;
+        if observed["reason"] != "unspecified" {
             return Err(
                 "provider installation observation lacked a successful timestamped acknowledgment"
                     .to_string(),

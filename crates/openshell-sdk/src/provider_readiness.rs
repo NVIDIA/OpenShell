@@ -220,6 +220,15 @@ fn validate_status(status: &ProviderReadinessStatus) -> Result<(), ProviderReadi
     {
         return Err(ProviderReadinessError::InvalidStatus);
     }
+    // Absent observation times are expected before a report arrives. Present
+    // times must be canonical so output cannot normalize malformed timestamps.
+    for timestamp in [&status.observed_time, &status.evaluated_time]
+        .into_iter()
+        .flatten()
+    {
+        openshell_core::time::validate_timestamp(timestamp)
+            .map_err(|_| ProviderReadinessError::InvalidStatus)?;
+    }
     let receipt = status
         .receipt
         .as_ref()
@@ -269,7 +278,8 @@ fn completion_state(
 /// the mutation kind must still agree with the presence of a provider identity.
 ///
 /// # Errors
-/// Rejects incomplete receipts and inconsistent mutation/provider identities.
+/// Rejects incomplete receipts, invalid persistence timestamps, and inconsistent
+/// mutation/provider identities.
 pub fn validate_provider_receipt(
     receipt: &ProviderMutationReceipt,
 ) -> Result<(), ProviderReadinessError> {
@@ -277,9 +287,14 @@ pub fn validate_provider_receipt(
         .desired
         .as_ref()
         .ok_or(ProviderReadinessError::InvalidReceipt)?;
+    let persisted_time = receipt
+        .persisted_time
+        .as_ref()
+        .ok_or(ProviderReadinessError::InvalidReceipt)?;
+    openshell_core::time::validate_timestamp(persisted_time)
+        .map_err(|_| ProviderReadinessError::InvalidReceipt)?;
     if receipt.receipt_id.is_empty()
         || receipt.mutation_id.is_empty()
-        || receipt.persisted_at_ms <= 0
         || desired.sandbox_id.is_empty()
         || desired.sandbox_name.is_empty()
         || receipt.provider_name.is_empty()
@@ -331,7 +346,7 @@ fn disposition(
             && (observed_receipt.receipt_id != receipt.receipt_id
                 || observed_receipt.mutation_id != receipt.mutation_id
                 || observed_receipt.kind != receipt.kind
-                || observed_receipt.persisted_at_ms != receipt.persisted_at_ms))
+                || observed_receipt.persisted_time != receipt.persisted_time))
     {
         status.receipt = Some(receipt.clone());
         status.state = ProviderReadinessState::Superseded.into();
@@ -466,7 +481,7 @@ mod tests {
             mutation_id: "mutation".into(),
             provider_name: "provider".into(),
             workspace: "default".into(),
-            persisted_at_ms: 1,
+            persisted_time: Some(openshell_core::time::timestamp_from_millis(1).unwrap()),
             kind: kind.into(),
             desired: Some(ProviderDesiredIdentity {
                 sandbox_id: "sandbox-id".into(),
@@ -506,6 +521,67 @@ mod tests {
                 ..Default::default()
             }),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn receipt_requires_a_present_canonical_persistence_time() {
+        let mut receipt = receipt(ProviderMutationKind::Attach);
+        for (seconds, nanos, valid) in [
+            (0, 1, true),
+            (0, 0, true),
+            (-1, 999_999_999, true),
+            (1, -1, false),
+            (1, 1_000_000_000, false),
+            (253_402_300_800, 0, false),
+            (-62_135_596_801, 0, false),
+        ] {
+            let timestamp = receipt.persisted_time.as_mut().unwrap();
+            timestamp.seconds = seconds;
+            timestamp.nanos = nanos;
+            assert_eq!(
+                validate_provider_receipt(&receipt).is_ok(),
+                valid,
+                "seconds={seconds}, nanos={nanos}"
+            );
+        }
+        receipt.persisted_time = None;
+        assert!(matches!(
+            validate_provider_receipt(&receipt),
+            Err(ProviderReadinessError::InvalidReceipt)
+        ));
+    }
+
+    #[test]
+    fn changed_persistence_nanoseconds_supersede_the_original_receipt() {
+        let receipt = receipt(ProviderMutationKind::Attach);
+        let mut changed = receipt.clone();
+        changed.persisted_time.as_mut().unwrap().nanos += 1;
+        let mut status = completed_status(&changed, ProviderReadinessState::Ready);
+        assert_eq!(
+            disposition(&receipt, &mut status).unwrap(),
+            Some(ProviderWaitOutcome::Terminal)
+        );
+        assert_eq!(status.state, i32::from(ProviderReadinessState::Superseded));
+        assert_eq!(status.receipt.as_ref(), Some(&receipt));
+    }
+
+    #[test]
+    fn status_rejects_malformed_observation_and_evaluation_times() {
+        let receipt = receipt(ProviderMutationKind::Attach);
+        let mut malformed = openshell_core::time::timestamp_from_millis(1).unwrap();
+        malformed.nanos = -1;
+        for observation in [true, false] {
+            let mut status = completed_status(&receipt, ProviderReadinessState::Ready);
+            if observation {
+                status.observed_time = Some(malformed);
+            } else {
+                status.evaluated_time = Some(malformed);
+            }
+            assert!(matches!(
+                validate_status(&status),
+                Err(ProviderReadinessError::InvalidStatus)
+            ));
         }
     }
 

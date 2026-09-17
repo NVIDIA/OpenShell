@@ -9,6 +9,7 @@ package openshell.storage.v1;
 
 import "datamodel.proto";
 import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
 import "openshell.proto";
 import "options.proto";
 import "sandbox.proto";
@@ -119,7 +120,9 @@ message StoredConfigUpdateOperation {
   openshell.v1.SandboxPhase initial_phase = 5;
   string idempotency_key = 6;
   uint32 attempt_count = 7;
-  int64 next_attempt_at_ms = 8;
+  reserved 8;
+  reserved "next_attempt_at_ms";
+  google.protobuf.Timestamp next_attempt_time = 108;
   uint32 response_policy_version = 9;
   string response_policy_hash = 10;
   uint64 response_settings_revision = 11;

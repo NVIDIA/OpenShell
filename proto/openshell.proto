@@ -1532,9 +1532,12 @@ message ConfigUpdateOperation {
   ConfigUpdateOperationState state = 5;
   ConfigApplyOutcome outcome = 6;
   string sanitized_error = 7;
-  int64 created_at_ms = 8;
-  int64 updated_at_ms = 9;
-  int64 completed_at_ms = 10;
+  reserved 8, 9, 10;
+  reserved "created_at_ms", "updated_at_ms", "completed_at_ms";
+  google.protobuf.Timestamp created_time = 108;
+  google.protobuf.Timestamp updated_time = 109;
+  // Absent until the operation reaches a terminal state.
+  google.protobuf.Timestamp completed_time = 110;
 }
 
 // Immutable, secret-free record of one sandbox's intended provider mutation.
@@ -1546,7 +1549,9 @@ message ProviderMutationReceipt {
   string workspace = 4;
   ProviderMutationKind kind = 5;
   ProviderDesiredIdentity desired = 6;
-  int64 persisted_at_ms = 7;
+  reserved 7;
+  reserved "persisted_at_ms";
+  google.protobuf.Timestamp persisted_time = 107;
 }
 
 // Installed state reported by the current supervisor. Process installation is
@@ -1575,8 +1580,11 @@ message ProviderReadinessStatus {
   ProviderReadinessReason reason = 3;
   ProviderReadinessObservation observed = 4;
   string network_instance_id = 5;
-  int64 observed_at_ms = 6;
-  int64 evaluated_at_ms = 7;
+  reserved 6, 7;
+  reserved "observed_at_ms", "evaluated_at_ms";
+  // Absent until the current supervisor session supplies accepted evidence.
+  google.protobuf.Timestamp observed_time = 106;
+  google.protobuf.Timestamp evaluated_time = 107;
   // Durable operation for the receipt, including its terminal apply outcome.
   ConfigUpdateOperation operation = 8;
 }
@@ -1605,8 +1613,10 @@ message ReportProviderReadinessRequest {
 // Identical retries do not extend the evidence's original acceptance time.
 message ReportProviderReadinessResponse {
   uint64 accepted_sequence = 1;
-  uint32 report_interval_seconds = 2;
-  uint32 observation_ttl_seconds = 3;
+  reserved 2, 3;
+  reserved "report_interval_seconds", "observation_ttl_seconds";
+  google.protobuf.Duration report_interval = 102;
+  google.protobuf.Duration observation_ttl = 103;
 }
 
 // Delete sandbox response.

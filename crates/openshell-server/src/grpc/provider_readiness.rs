@@ -6,7 +6,7 @@
 #![allow(clippy::result_large_err)] // The RPC boundary returns tonic status values.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use openshell_core::proto::{
     GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse, Provider,
@@ -23,7 +23,7 @@ use crate::ServerState;
 use crate::auth::guard::{enforce_sandbox_scope, ensure_sandbox_principal_scope};
 use crate::auth::workspace_authz::{MinWorkspaceRole, authorize_workspace_selector};
 use crate::config_update_operation;
-use crate::persistence::{ObjectType, current_time_ms};
+use crate::persistence::ObjectType;
 
 const REPORT_INTERVAL_SECONDS: u32 = 5;
 const OBSERVATION_TTL_SECONDS: u32 = 15;
@@ -37,7 +37,7 @@ pub struct ProviderReadinessEvidence {
     process_instance_id: Option<String>,
     last_seen: Instant,
     observation: Option<ProviderReadinessObservation>,
-    observed_at_ms: i64,
+    observed_time: Option<prost_types::Timestamp>,
 }
 
 impl ProviderReadinessEvidence {
@@ -59,7 +59,7 @@ impl ProviderReadinessEvidence {
             process_instance_id: None,
             last_seen: Instant::now(),
             observation: None,
-            observed_at_ms: 0,
+            observed_time: None,
         })
     }
 
@@ -116,6 +116,7 @@ impl ProviderReadinessEvidence {
                 "process instance identity is required",
             ));
         }
+        let observed_time = now_timestamp()?;
         if !observation.process_instance_id.is_empty() {
             canonical_uuid(&observation.process_instance_id)?;
             if self
@@ -130,7 +131,7 @@ impl ProviderReadinessEvidence {
             self.process_instance_id = Some(observation.process_instance_id.clone());
         }
         self.last_seen = Instant::now();
-        self.observed_at_ms = current_time_ms();
+        self.observed_time = Some(observed_time);
         self.observation = Some(observation);
         Ok(())
     }
@@ -138,6 +139,11 @@ impl ProviderReadinessEvidence {
 
 fn registry_unavailable() -> Status {
     Status::unavailable("provider readiness state is unavailable")
+}
+
+fn now_timestamp() -> Result<prost_types::Timestamp, Status> {
+    openshell_core::time::timestamp_from_system_time(SystemTime::now())
+        .map_err(|error| Status::internal(format!("create provider readiness timestamp: {error}")))
 }
 
 fn canonical_uuid(value: &str) -> Result<(), Status> {
@@ -178,7 +184,7 @@ pub(super) async fn record_provider_mutation(
         workspace: sandbox.object_workspace().to_string(),
         kind: kind.into(),
         desired: Some(desired),
-        persisted_at_ms: current_time_ms(),
+        persisted_time: Some(now_timestamp()?),
     };
     config_update_operation::record_provider_operation(
         state.store.as_ref(),
@@ -407,7 +413,7 @@ pub(super) async fn handle_get_sandbox_provider_status(
         active_sandbox.phase() == SandboxPhase::Ready as i32,
         active_instance_id,
         session.as_ref(),
-    );
+    )?;
     config_update_operation::observe_provider_status(state.store.as_ref(), &mut status).await?;
     Ok(Response::new(GetSandboxProviderStatusResponse {
         status: Some(status),
@@ -445,7 +451,7 @@ fn evaluate_status(
     running: bool,
     active_instance_id: &str,
     session: Option<&ProviderReadinessEvidence>,
-) -> ProviderReadinessStatus {
+) -> Result<ProviderReadinessStatus, Status> {
     let mut status = ProviderReadinessStatus {
         receipt: Some(receipt.clone()),
         state: ProviderReadinessState::Persisted.into(),
@@ -454,8 +460,8 @@ fn evaluate_status(
         network_instance_id: session
             .map(|session| session.network_instance_id.clone())
             .unwrap_or_default(),
-        observed_at_ms: session.map_or(0, |session| session.observed_at_ms),
-        evaluated_at_ms: current_time_ms(),
+        observed_time: session.and_then(|session| session.observed_time),
+        evaluated_time: Some(now_timestamp()?),
         operation: None,
     };
     let set = |status: &mut ProviderReadinessStatus,
@@ -470,7 +476,7 @@ fn evaluate_status(
             ProviderReadinessState::Failed,
             ProviderReadinessReason::SnapshotMismatch,
         );
-        return status;
+        return Ok(status);
     };
     if !same_authority(desired, current)
         || (snapshot_reason == ProviderReadinessReason::Unspecified && desired != current)
@@ -554,7 +560,7 @@ fn evaluate_status(
             }
         }
     }
-    status
+    Ok(status)
 }
 
 fn authorize_provider_readiness<T>(
@@ -602,8 +608,18 @@ pub(super) async fn handle_report_provider_readiness(
     )?;
     Ok(Response::new(ReportProviderReadinessResponse {
         accepted_sequence,
-        report_interval_seconds: REPORT_INTERVAL_SECONDS,
-        observation_ttl_seconds: OBSERVATION_TTL_SECONDS,
+        report_interval: Some(
+            openshell_core::time::duration_from_std(Duration::from_secs(u64::from(
+                REPORT_INTERVAL_SECONDS,
+            )))
+            .map_err(|error| Status::internal(format!("create report interval: {error}")))?,
+        ),
+        observation_ttl: Some(
+            openshell_core::time::duration_from_std(Duration::from_secs(u64::from(
+                OBSERVATION_TTL_SECONDS,
+            )))
+            .map_err(|error| Status::internal(format!("create observation TTL: {error}")))?,
+        ),
     }))
 }
 

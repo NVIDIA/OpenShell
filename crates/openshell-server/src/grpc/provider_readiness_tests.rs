@@ -91,7 +91,10 @@ fn receipt(hello: &SupervisorHello) -> ProviderMutationReceipt {
             config_revision: u64::MAX,
             policy_hash: "abcd".to_string(),
         }),
-        persisted_at_ms: 1,
+        persisted_time: Some(prost_types::Timestamp {
+            seconds: 0,
+            nanos: 1,
+        }),
     }
 }
 
@@ -129,6 +132,34 @@ fn evaluate(
         session.map_or("", |evidence| evidence.network_instance_id.as_str()),
         session,
     )
+    .unwrap()
+}
+
+#[test]
+fn readiness_timestamps_distinguish_missing_observations_and_preserve_nanos() {
+    let hello = hello();
+    let receipt = receipt(&hello);
+    let disconnected = evaluate(&receipt, None);
+    assert!(disconnected.observed_time.is_none());
+    assert!(disconnected.evaluated_time.is_some());
+
+    let mut evidence = ProviderReadinessEvidence::from_hello(&hello).unwrap();
+    assert!(evaluate(&receipt, Some(&evidence)).observed_time.is_none());
+    let observation = installed(&hello, &Uuid::new_v4().to_string(), &receipt);
+    evidence.accept(observation.clone()).unwrap();
+    assert!(evidence.observed_time.is_some());
+
+    // A captured timestamp must survive status projection and report retries
+    // without millisecond truncation or a fabricated new observation time.
+    let captured = prost_types::Timestamp {
+        seconds: 0,
+        nanos: 1,
+    };
+    evidence.observed_time = Some(captured);
+    evidence.accept(observation).unwrap();
+    let status = evaluate(&receipt, Some(&evidence));
+    assert_eq!(status.observed_time, Some(captured));
+    openshell_core::time::validate_timestamp(status.evaluated_time.as_ref().unwrap()).unwrap();
 }
 
 #[test]
@@ -233,7 +264,14 @@ async fn report_rpc_requires_the_authenticated_sandboxes_current_session() {
             .unwrap()
             .into_inner();
     assert_eq!(response.accepted_sequence, 1);
-    assert_eq!(response.observation_ttl_seconds, OBSERVATION_TTL_SECONDS);
+    assert_eq!(
+        openshell_core::time::duration_to_std(response.observation_ttl.as_ref().unwrap()).unwrap(),
+        Duration::from_secs(u64::from(OBSERVATION_TTL_SECONDS))
+    );
+    assert_eq!(
+        openshell_core::time::duration_to_std(response.report_interval.as_ref().unwrap()).unwrap(),
+        Duration::from_secs(u64::from(REPORT_INTERVAL_SECONDS))
+    );
     // Another gateway replica can replace the persisted instance without
     // touching this process's session registry. The old report must fail.
     let mut sandbox = state
@@ -297,7 +335,7 @@ fn report_retries_preserve_evidence_and_reject_reordering_or_changed_content() {
     let retried = registry.snapshot(&hello.sandbox_id).unwrap().unwrap();
     assert_eq!(retried.observation, Some(observation));
     assert_eq!(retried.last_seen, accepted.last_seen);
-    assert_eq!(retried.observed_at_ms, accepted.observed_at_ms);
+    assert_eq!(retried.observed_time, accepted.observed_time);
 }
 
 #[test]
@@ -430,7 +468,7 @@ fn replacement_disconnect_and_replayed_reports_cannot_restore_readiness() {
         .unwrap();
     let after_retry = registry.snapshot(&hello.sandbox_id).unwrap().unwrap();
     assert_eq!(before_retry.last_seen, after_retry.last_seen);
-    assert_eq!(before_retry.observed_at_ms, after_retry.observed_at_ms);
+    assert_eq!(before_retry.observed_time, after_retry.observed_time);
 
     let second = registry.register(&hello).unwrap();
     assert_ne!(first, second);
@@ -557,7 +595,8 @@ fn partial_failed_incompatible_stopped_and_expired_installations_are_not_ready()
         false,
         &hello.instance_id,
         Some(&complete),
-    );
+    )
+    .unwrap();
     assert_eq!(
         stopped.reason,
         ProviderReadinessReason::SupervisorDisconnected as i32
@@ -654,7 +693,8 @@ fn superseded_authority_cannot_complete_an_older_receipt() {
             true,
             &hello.instance_id,
             session.as_ref(),
-        );
+        )
+        .unwrap();
         assert_eq!(status.state, ProviderReadinessState::Superseded as i32);
     }
     let failed_snapshot = evaluate_status(
@@ -665,7 +705,8 @@ fn superseded_authority_cannot_complete_an_older_receipt() {
         true,
         &hello.instance_id,
         session.as_ref(),
-    );
+    )
+    .unwrap();
     assert_eq!(failed_snapshot.state, ProviderReadinessState::Failed as i32);
 }
 

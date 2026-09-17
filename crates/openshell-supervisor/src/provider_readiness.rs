@@ -366,7 +366,7 @@ impl Tracker {
                 response = report => response,
             };
             if let Ok(Ok(response)) = response
-                && (response.accepted_sequence != sequence || response.observation_ttl_seconds == 0)
+                && !report_acknowledged(&response, sequence)
             {
                 // A gateway rejection does not invalidate the boundary's
                 // installation. Retry on the normal cadence or a real state
@@ -375,6 +375,16 @@ impl Tracker {
             }
         }
     }
+}
+
+/// An acknowledgment must bind this report and a valid positive evidence lease.
+fn report_acknowledged(response: &ReportProviderReadinessResponse, sequence: u64) -> bool {
+    response.accepted_sequence == sequence
+        && response
+            .observation_ttl
+            .as_ref()
+            .and_then(|ttl| openshell_core::time::duration_to_std(ttl).ok())
+            .is_some_and(|ttl| !ttl.is_zero())
 }
 
 #[tonic::async_trait]
@@ -419,6 +429,37 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn acknowledgment_requires_matching_sequence_and_valid_positive_ttl() {
+        let mut response = ReportProviderReadinessResponse {
+            accepted_sequence: 7,
+            ..Default::default()
+        };
+        assert!(!report_acknowledged(&response, 7));
+        for (seconds, nanos, valid) in [
+            (15, 0, true),
+            (0, 1, true),
+            (0, 0, false),
+            (-1, 0, false),
+            (0, -1, false),
+            (1, -1, false),
+            (0, 1_000_000_000, false),
+            (315_576_000_001, 0, false),
+        ] {
+            response.observation_ttl = Some(prost_types::Duration { seconds, nanos });
+            assert_eq!(
+                report_acknowledged(&response, 7),
+                valid,
+                "seconds={seconds}, nanos={nanos}"
+            );
+        }
+        response.observation_ttl = Some(prost_types::Duration {
+            seconds: 15,
+            nanos: 0,
+        });
+        assert!(!report_acknowledged(&response, 8));
+    }
+
     struct CapturingReporter(tokio::sync::mpsc::UnboundedSender<ProviderReadinessObservation>);
 
     #[tonic::async_trait]
@@ -431,8 +472,12 @@ mod tests {
             self.0.send(observation).unwrap();
             Ok(ReportProviderReadinessResponse {
                 accepted_sequence: sequence,
-                report_interval_seconds: 5,
-                observation_ttl_seconds: 15,
+                report_interval: Some(
+                    openshell_core::time::duration_from_std(Duration::from_secs(5)).unwrap(),
+                ),
+                observation_ttl: Some(
+                    openshell_core::time::duration_from_std(Duration::from_secs(15)).unwrap(),
+                ),
             })
         }
     }

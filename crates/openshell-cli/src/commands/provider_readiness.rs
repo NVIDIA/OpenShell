@@ -364,7 +364,7 @@ fn receipt_json(receipt: &ProviderMutationReceipt) -> serde_json::Value {
         "workspace": receipt.workspace,
         "kind": receipt.kind().as_str_name().trim_start_matches("PROVIDER_MUTATION_KIND_").to_ascii_lowercase(),
         "desired": desired,
-        "persisted_at_ms": receipt.persisted_at_ms,
+        "persisted_time": receipt.persisted_time.as_ref().map(ToString::to_string),
     })
 }
 
@@ -390,8 +390,8 @@ fn status_json(result: &DisplayStatus) -> serde_json::Value {
         "reason": reason_label(result.status.reason),
         "observed": observed,
         "network_instance_id": result.status.network_instance_id,
-        "observed_at_ms": result.status.observed_at_ms,
-        "evaluated_at_ms": result.status.evaluated_at_ms,
+        "observed_time": result.status.observed_time.as_ref().map(ToString::to_string),
+        "evaluated_time": result.status.evaluated_time.as_ref().map(ToString::to_string),
         "wait_outcome": result.outcome,
     })
 }
@@ -433,7 +433,10 @@ fn print_statuses(mutation_id: &str, results: &[DisplayStatus], output: &str) ->
         );
         println!(
             "  Persisted: {}",
-            crate::commands::common::format_epoch_ms(receipt.persisted_at_ms)
+            receipt
+                .persisted_time
+                .as_ref()
+                .map_or_else(|| "-".to_string(), ToString::to_string)
         );
         if let Some(observed) = result.status.observed.as_ref() {
             println!(
@@ -480,7 +483,7 @@ mod tests {
             provider_name: "provider".to_string(),
             workspace: "default".to_string(),
             kind: ProviderMutationKind::Update.into(),
-            persisted_at_ms: 1,
+            persisted_time: Some(openshell_core::time::timestamp_from_millis(1).unwrap()),
             desired: Some(ProviderDesiredIdentity {
                 sandbox_id: "sandbox-id".to_string(),
                 sandbox_name: "sandbox".to_string(),
@@ -517,6 +520,42 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn structured_status_renders_rfc3339_timestamps_without_losing_nanos() {
+        let timestamp = prost_types::Timestamp {
+            seconds: 1_000,
+            nanos: 123_456_789,
+        };
+        let receipt = ProviderMutationReceipt {
+            persisted_time: Some(timestamp),
+            ..Default::default()
+        };
+        let mut status = persisted_status(receipt);
+        status.observed_time = Some(timestamp);
+        status.evaluated_time = Some(timestamp);
+        let value = status_json(&DisplayStatus {
+            status,
+            outcome: "not_requested",
+            complete: false,
+        });
+        let expected = "1970-01-01T00:16:40.123456789Z";
+        assert_eq!(value["receipt"]["persisted_time"], expected);
+        assert_eq!(value["observed_time"], expected);
+        assert_eq!(value["evaluated_time"], expected);
+        assert!(value["receipt"].get("persisted_at_ms").is_none());
+        assert!(value.get("observed_at_ms").is_none());
+        assert!(value.get("evaluated_at_ms").is_none());
+
+        let value = status_json(&DisplayStatus {
+            status: persisted_status(ProviderMutationReceipt::default()),
+            outcome: "not_requested",
+            complete: false,
+        });
+        assert!(value["receipt"]["persisted_time"].is_null());
+        assert!(value["observed_time"].is_null());
+        assert!(value["evaluated_time"].is_null());
     }
 
     #[test]

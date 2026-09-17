@@ -4722,7 +4722,7 @@ mod linux {
             // fingerprint. Distinct publications must still replace the map,
             // while a delayed older clear must never undo the repair.
             assert_eq!(
-                boundary.update_provider_environment(2, 7, HashMap::default()),
+                boundary.update_provider_environment(2, 7, std::collections::HashMap::default()),
                 Response::ProviderEnvironmentUpdated {
                     revision: 7,
                     generation: 2,
@@ -4745,7 +4745,7 @@ mod linux {
                 }
             );
             assert_eq!(
-                boundary.update_provider_environment(2, 7, HashMap::default()),
+                boundary.update_provider_environment(2, 7, std::collections::HashMap::default()),
                 Response::ProviderEnvironmentUpdated {
                     revision: 7,
                     generation: 3,

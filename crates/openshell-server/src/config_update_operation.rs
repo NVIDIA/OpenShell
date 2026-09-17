@@ -22,9 +22,7 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 use tonic::{Code, Status};
 
-use crate::persistence::{
-    ObjectRecord, ObjectType, PersistenceError, Store, WriteCondition, current_time_ms,
-};
+use crate::persistence::{ObjectRecord, ObjectType, PersistenceError, Store, WriteCondition};
 use crate::storage_proto::StoredConfigUpdateOperation;
 
 /// Object-store namespace shared by configuration completion resources.
@@ -72,6 +70,14 @@ fn invalid_record() -> Status {
             HashMap::new(),
         ),
     )
+}
+
+fn persisted_time(receipt: &ProviderMutationReceipt) -> Result<prost_types::Timestamp, Status> {
+    // Receipt identity includes the full canonical timestamp. Absence is not
+    // the Unix epoch, and reducing nanos to milliseconds would merge identities.
+    let timestamp = receipt.persisted_time.ok_or_else(invalid_record)?;
+    openshell_core::time::validate_timestamp(&timestamp).map_err(|_| invalid_record())?;
+    Ok(timestamp)
 }
 
 fn observation_id(
@@ -129,6 +135,7 @@ pub async fn record_provider_operation(
     {
         return Err(invalid_record());
     }
+    let persisted_time = persisted_time(&receipt)?;
     let failed = snapshot_reason != ProviderReadinessReason::Unspecified;
     let operation = ConfigUpdateOperation {
         operation_id: receipt.receipt_id.clone(),
@@ -154,18 +161,16 @@ pub async fn record_provider_operation(
         } else {
             String::new()
         },
-        created_at_ms: receipt.persisted_at_ms,
-        updated_at_ms: receipt.persisted_at_ms,
-        completed_at_ms: if failed { receipt.persisted_at_ms } else { 0 },
+        created_time: Some(persisted_time),
+        updated_time: Some(persisted_time),
+        completed_time: failed.then_some(persisted_time),
     };
     let stored = StoredConfigUpdateOperation {
         metadata: Some(ObjectMeta {
             id: receipt.receipt_id.clone(),
             name: receipt.receipt_id.clone(),
             workspace: receipt.workspace.clone(),
-            created_time: openshell_core::time::timestamp_from_millis(receipt.persisted_at_ms)
-                .map(Some)
-                .map_err(|_| invalid_record())?,
+            created_time: Some(persisted_time),
             ..Default::default()
         }),
         operation: Some(operation),
@@ -220,6 +225,7 @@ fn decode_provider_operation(
     let operation = stored.operation.as_ref().ok_or_else(invalid_record)?;
     let metadata = stored.metadata.as_ref().ok_or_else(invalid_record)?;
     let desired = receipt.desired.as_ref().ok_or_else(invalid_record)?;
+    let persisted_time = persisted_time(receipt)?;
     let snapshot_reason = ProviderReadinessReason::try_from(stored.provider_snapshot_reason)
         .map_err(|_| invalid_record())?;
     if record.id != receipt.receipt_id
@@ -228,6 +234,8 @@ fn decode_provider_operation(
         || metadata.workspace != record.workspace
         || operation.operation_id != record.id
         || operation.sandbox_id != desired.sandbox_id
+        || operation.created_time != Some(persisted_time)
+        || metadata.created_time != Some(persisted_time)
         || operation.component != ConfigComponent::ProviderEnvironment as i32
         || operation
             .target_revision
@@ -372,8 +380,13 @@ pub async fn observe_provider_status(
         } else {
             String::new()
         };
-        operation.updated_at_ms = current_time_ms();
-        operation.completed_at_ms = operation.updated_at_ms;
+        let completed_time =
+            openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+                .map_err(|error| {
+                    Status::internal(format!("create operation completion timestamp: {error}"))
+                })?;
+        operation.updated_time = Some(completed_time);
+        operation.completed_time = Some(completed_time);
         let result = store
             .put_if(
                 CONFIG_UPDATE_OPERATION_OBJECT_TYPE,
@@ -427,7 +440,10 @@ mod tests {
                 config_revision: 7,
                 policy_hash: "policy".to_string(),
             }),
-            persisted_at_ms: current_time_ms(),
+            persisted_time: Some(prost_types::Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 123_456_789,
+            }),
         }
     }
 
@@ -470,6 +486,9 @@ mod tests {
             .unwrap();
         assert_eq!(operation.receipt, receipt);
         assert_eq!(operation.operation.operation_id, receipt.receipt_id);
+        assert_eq!(operation.operation.created_time, receipt.persisted_time);
+        assert_eq!(operation.operation.updated_time, receipt.persisted_time);
+        assert!(operation.operation.completed_time.is_none());
         assert_eq!(
             operation.operation.state,
             ConfigUpdateOperationState::Pending as i32
@@ -503,10 +522,103 @@ mod tests {
         .unwrap();
         let mut status = ready(&receipt);
         observe_provider_status(&store, &mut status).await.unwrap();
+        let operation = status.operation.unwrap();
+        assert_eq!(operation.state, ConfigUpdateOperationState::Failed as i32);
+        assert_eq!(operation.completed_time, receipt.persisted_time);
+    }
+
+    #[tokio::test]
+    async fn receipt_timestamp_requires_presence_and_canonical_nanos() {
+        let store = crate::persistence::test_store().await;
+        for invalid_time in [
+            None,
+            Some(prost_types::Timestamp {
+                seconds: 0,
+                nanos: -1,
+            }),
+            Some(prost_types::Timestamp {
+                seconds: openshell_core::time::MAX_TIMESTAMP_SECONDS + 1,
+                nanos: 0,
+            }),
+        ] {
+            let mut receipt = receipt();
+            receipt.persisted_time = invalid_time;
+            let error =
+                record_provider_operation(&store, receipt, ProviderReadinessReason::Unspecified)
+                    .await
+                    .unwrap_err();
+            assert_eq!(error.code(), Code::Internal);
+        }
         assert_eq!(
-            status.operation.unwrap().state,
-            ConfigUpdateOperationState::Failed as i32
+            store
+                .count_in_workspace(CONFIG_UPDATE_OPERATION_OBJECT_TYPE, "default")
+                .await
+                .unwrap(),
+            0
         );
+
+        // The Unix epoch is a valid explicit timestamp, not missing data.
+        let mut epoch = receipt();
+        epoch.persisted_time = Some(prost_types::Timestamp::default());
+        let recorded =
+            record_provider_operation(&store, epoch.clone(), ProviderReadinessReason::Unspecified)
+                .await
+                .unwrap();
+        assert_eq!(recorded, epoch);
+        assert_eq!(
+            get_provider_operation(&store, &epoch.receipt_id, "default")
+                .await
+                .unwrap()
+                .receipt,
+            epoch
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_timestamp_nanos_are_part_of_exact_completion_identity() {
+        let store = crate::persistence::test_store().await;
+        let receipt = receipt();
+        record_provider_operation(
+            &store,
+            receipt.clone(),
+            ProviderReadinessReason::Unspecified,
+        )
+        .await
+        .unwrap();
+        let mut changed = ready(&receipt);
+        changed
+            .receipt
+            .as_mut()
+            .unwrap()
+            .persisted_time
+            .as_mut()
+            .unwrap()
+            .nanos += 1;
+        assert_eq!(
+            observe_provider_status(&store, &mut changed)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Internal
+        );
+        let stored = get_provider_operation(&store, &receipt.receipt_id, "default")
+            .await
+            .unwrap();
+        assert_eq!(stored.receipt, receipt);
+        assert_eq!(
+            stored.operation.state,
+            ConfigUpdateOperationState::Pending as i32
+        );
+        assert!(stored.operation.completed_time.is_none());
+
+        let mut exact = ready(&receipt);
+        observe_provider_status(&store, &mut exact).await.unwrap();
+        let completed = exact.operation.unwrap();
+        assert_eq!(completed.created_time, receipt.persisted_time);
+        assert!(completed.completed_time.is_some());
+        assert_eq!(completed.updated_time, completed.completed_time);
+        openshell_core::time::validate_timestamp(completed.completed_time.as_ref().unwrap())
+            .unwrap();
     }
 
     #[tokio::test]
@@ -618,7 +730,7 @@ mod tests {
         .await
         .unwrap();
         observed.mutation_id = Uuid::new_v4().to_string();
-        observed.persisted_at_ms += 1;
+        observed.persisted_time.as_mut().unwrap().nanos += 1;
         let repeated = record_provider_operation(
             &store,
             observed.clone(),

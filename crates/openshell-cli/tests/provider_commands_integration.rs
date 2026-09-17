@@ -191,7 +191,10 @@ impl TestOpenShell {
                 config_revision: 17,
                 policy_hash: "effective-policy".to_string(),
             }),
-            persisted_at_ms: i64::try_from(sequence).unwrap(),
+            persisted_time: Some(
+                openshell_core::time::timestamp_from_millis(i64::try_from(sequence).unwrap())
+                    .unwrap(),
+            ),
         };
         let corrupt = *self.state.corrupt_mutation_receipt.lock().await;
         if let Some(corrupt) = corrupt {
@@ -525,7 +528,12 @@ impl OpenShell for TestOpenShell {
                             .as_ref()
                             .is_some_and(|desired| desired.sandbox_name == request.sandbox_name)
                 })
-                .max_by_key(|receipt| receipt.persisted_at_ms)
+                .max_by_key(|receipt| {
+                    receipt
+                        .persisted_time
+                        .as_ref()
+                        .map(|time| (time.seconds, time.nanos))
+                })
         } else {
             receipts
                 .get(&request.receipt_id)
@@ -1568,8 +1576,8 @@ fn readiness_status(
             ..Default::default()
         }),
         network_instance_id: "network-instance".to_string(),
-        observed_at_ms: 1000,
-        evaluated_at_ms: 1000,
+        observed_time: Some(openshell_core::time::timestamp_from_millis(1000).unwrap()),
+        evaluated_time: Some(openshell_core::time::timestamp_from_millis(1000).unwrap()),
         ..Default::default()
     }
 }
@@ -1634,7 +1642,12 @@ async fn latest_readiness_receipt(
                 .as_ref()
                 .is_some_and(|desired| desired.sandbox_name == sandbox_name)
         })
-        .max_by_key(|receipt| receipt.persisted_at_ms)
+        .max_by_key(|receipt| {
+            receipt
+                .persisted_time
+                .as_ref()
+                .map(|time| (time.seconds, time.nanos))
+        })
         .cloned()
         .expect("sandbox mutation receipt")
 }
@@ -1727,7 +1740,7 @@ async fn provider_readiness_mutations_reject_unbound_receipts_before_output_or_p
                 .sandbox_id = "other-id".to_string();
         }),
         ("desired", |receipt| receipt.desired = None),
-        ("timestamp", |receipt| receipt.persisted_at_ms = 0),
+        ("timestamp", |receipt| receipt.persisted_time = None),
         ("provider_presence", |receipt| {
             let detached = receipt.kind == i32::from(ProviderMutationKind::Detach);
             receipt

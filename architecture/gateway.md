@@ -710,6 +710,8 @@ Each receipt projects a common configuration operation in the `config_update_ope
 
 Provider mutation and operation-result writes are separate. A result-storage failure can follow a saved mutation and returns structured uncertainty without a rollback or safe-retry claim. A failed initial snapshot remains failed rather than acquiring a different target during a later lookup. Operations contain only identities, revisions, timestamps, and closed reason categories.
 
+Provider receipts, installation status, and common operations represent absolute times with protobuf `Timestamp`; report intervals and evidence lifetimes use protobuf `Duration`. Receipt identity compares the full canonical timestamp without truncating nanoseconds. An absent observation or completion time represents missing evidence or an unfinished operation, independently of the Unix epoch.
+
 Provider installation reports belong to the existing `ConnectSupervisor` session. Each report names that session, has an increasing sequence, and expires unless the supervisor reports again. Reconnection or disconnect invalidates prior observations; stored change records survive a gateway restart, but runtime evidence does not. Replaying an identical report cannot extend its lifetime.
 
 Reports and status also compare the supervisor instance with the sandbox's persisted current instance. A different supervisor becoming current invalidates an older connection, including one retained by another gateway replica. Observations stay local to the gateway holding the supervisor session; a status request reaching a replica without that session returns pending. Multi-replica deployments therefore retain the existing supervisor-session routing requirement.
