@@ -191,48 +191,16 @@ jobs:
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-  build-gateway-image:
-    needs: [pr_metadata, build-binaries]
-    if: >-
-      needs.pr_metadata.outputs.should_run == 'true' &&
-      (needs.pr_metadata.outputs.run_core_e2e == 'true' ||
-      needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true' ||
-      needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true')
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: gateway
-      binary: openshell-gateway
-      target-suffix: unknown-linux-gnu
-
-  build-sandbox-image:
+  build-images:
     needs: [pr_metadata, build-binaries]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: sandbox
-      binary: openshell-sandbox
-      target-suffix: unknown-linux-musl
-
-  build-supervisor-image:
-    needs: [pr_metadata, build-binaries]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: supervisor
-      binary: openshell-supervisor
-      target-suffix: unknown-linux-gnu
+    uses: ./.github/workflows/build-images.yml
 
   docker-e2e:
-    needs: [pr_metadata, build-binaries, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -245,7 +213,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   podman-e2e:
-    needs: [pr_metadata, build-binaries, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -268,7 +236,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   docker-external-driver-e2e:
-    needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -285,7 +253,7 @@ jobs:
         [{"suite":"external-driver","cmd":"mise run --no-deps --skip-deps e2e:docker:external-driver","apt_packages":"openssh-client","python_proto":false,"mcp":false}]
 
   podman-external-driver-e2e:
-    needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -315,7 +283,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   gpu-e2e:
-    needs: [pr_metadata, build-binaries, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_gpu_e2e == 'true'
     permissions:
       actions: read
@@ -327,7 +295,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-e2e:
-    needs: [pr_metadata, build-binaries, build-gateway-image, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     strategy:
       fail-fast: false
@@ -349,7 +317,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-workspace-managed-e2e:
-    needs: [pr_metadata, build-binaries, build-gateway-image, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -363,7 +331,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-external-driver-e2e:
-    needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -380,7 +348,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-workspace-operator-e2e:
-    needs: [pr_metadata, build-binaries, build-gateway-image, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -394,7 +362,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-ha-e2e:
-    needs: [pr_metadata, build-binaries, build-gateway-image, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
     permissions:
       actions: read
@@ -409,7 +377,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-credential-drivers-e2e:
-    needs: [pr_metadata, build-binaries, build-gateway-image, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
     permissions:
       actions: read

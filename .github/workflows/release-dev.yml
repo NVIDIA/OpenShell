@@ -90,44 +90,17 @@ jobs:
       contents: read
     uses: ./.github/workflows/package-release-binaries.yml
 
-  build-gateway-image:
+  build-images:
     needs: build-binaries
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/docker-build.yml
+    uses: ./.github/workflows/build-images.yml
     with:
-      component: gateway
-      binary: openshell-gateway
-      target-suffix: unknown-linux-gnu
-      checkout-ref: ${{ github.sha }}
-
-  build-sandbox-image:
-    needs: build-binaries
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: sandbox
-      binary: openshell-sandbox
-      target-suffix: unknown-linux-musl
-      checkout-ref: ${{ github.sha }}
-
-  build-supervisor-image:
-    needs: build-binaries
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: supervisor
-      binary: openshell-supervisor
-      target-suffix: unknown-linux-gnu
       checkout-ref: ${{ github.sha }}
 
   docker-e2e:
-    needs: [build-binaries, build-sandbox-image, build-supervisor-image]
+    needs: [build-binaries, build-images]
     permissions:
       actions: read
       contents: read
@@ -140,7 +113,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   podman-e2e:
-    needs: [build-binaries, build-sandbox-image, build-supervisor-image]
+    needs: [build-binaries, build-images]
     permissions:
       actions: read
       contents: read
@@ -164,7 +137,7 @@ jobs:
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
-    needs: [build-gateway-image, build-sandbox-image, build-supervisor-image, release-dev]
+    needs: [build-images, release-dev]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:

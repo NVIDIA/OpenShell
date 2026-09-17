@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build Images
+
+on:
+  workflow_call:
+    inputs:
+      checkout-ref:
+        required: false
+        type: string
+        default: ""
+      image-tag:
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  gateway:
+    env:
+      COMPONENT: gateway
+      BINARY: openshell-gateway
+      TARGET_SUFFIX: unknown-linux-gnu
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 20
+    steps: &build_steps
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout-ref || github.sha }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/build-docker-image
+        with:
+          component: ${{ env.COMPONENT }}
+          binary: ${{ env.BINARY }}
+          target-suffix: ${{ env.TARGET_SUFFIX }}
+          image-tag: ${{ inputs.image-tag || github.sha }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  sandbox:
+    env:
+      COMPONENT: sandbox
+      BINARY: openshell-sandbox
+      TARGET_SUFFIX: unknown-linux-musl
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 20
+    steps: *build_steps
+
+  supervisor:
+    env:
+      COMPONENT: supervisor
+      BINARY: openshell-supervisor
+      TARGET_SUFFIX: unknown-linux-gnu
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 20
+    steps: *build_steps

@@ -117,47 +117,18 @@ jobs:
       contents: read
     uses: ./.github/workflows/package-release-binaries.yml
 
-  build-gateway-image:
+  build-images:
     needs: [compute-versions, build-binaries]
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/docker-build.yml
+    uses: ./.github/workflows/build-images.yml
     with:
-      component: gateway
-      binary: openshell-gateway
-      target-suffix: unknown-linux-gnu
-      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
-      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
-
-  build-sandbox-image:
-    needs: [compute-versions, build-binaries]
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: sandbox
-      binary: openshell-sandbox
-      target-suffix: unknown-linux-musl
-      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
-      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
-
-  build-supervisor-image:
-    needs: [compute-versions, build-binaries]
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: supervisor
-      binary: openshell-supervisor
-      target-suffix: unknown-linux-gnu
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
 
   docker-e2e:
-    needs: [compute-versions, build-binaries, build-sandbox-image, build-supervisor-image]
+    needs: [compute-versions, build-binaries, build-images]
     permissions:
       actions: read
       contents: read
@@ -170,7 +141,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   podman-e2e:
-    needs: [compute-versions, build-binaries, build-sandbox-image, build-supervisor-image]
+    needs: [compute-versions, build-binaries, build-images]
     permissions:
       actions: read
       contents: read
@@ -194,7 +165,7 @@ jobs:
 
   tag-ghcr-release:
     name: Tag GHCR Images
-    needs: [compute-versions, build-gateway-image, build-sandbox-image, build-supervisor-image, release]
+    needs: [compute-versions, build-images, release]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:
