@@ -31,6 +31,7 @@ use openshell_core::proto::{
     RotateProviderCredentialResponse, Sandbox, SandboxResponse, SandboxStreamEvent, ServiceStatus,
     SettingValue, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
 };
+use openshell_core::rpc_error::{ERROR_DOMAIN, ErrorDetails, StatusExt};
 use openshell_core::{ObjectId, ObjectName};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -58,6 +59,8 @@ const READINESS_PROVIDER: &str = "readiness-provider";
 const SYNTHETIC_READINESS_CREDENTIAL: &str = "fixture-provider-credential";
 const SYNTHETIC_READINESS_BACKEND_ERROR: &str = "fixture-backend-authorization-details";
 const SYNTHETIC_PROFILE_BACKEND_ERROR: &str = "TESTLEAK";
+const SYNTHETIC_MUTATION_ERROR_METADATA: &str = "fixture-mutation-error-metadata";
+const STORAGE_UNCERTAIN_REASON: &str = "CONFIG_OPERATION_STORAGE_UNCERTAIN";
 
 fn selected_workspace(
     scope: &Option<openshell_core::proto::datamodel::v1::WorkspaceSelector>,
@@ -98,6 +101,7 @@ struct ProviderState {
     readiness_requests: Arc<Mutex<Vec<GetSandboxProviderStatusRequest>>>,
     readiness_sequence: Arc<AtomicU64>,
     corrupt_mutation_receipt: Arc<Mutex<Option<ReceiptCorruption>>>,
+    fail_mutation_after_save: Arc<Mutex<Option<Status>>>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
 }
 
@@ -145,6 +149,13 @@ struct TestOpenShell {
 }
 
 impl TestOpenShell {
+    // A durable mutation can fail before its receipt is stored. Keep the failure
+    // active for every call so a client replay remains visible in request logs.
+    async fn check_mutation_receipt_storage(&self) -> Result<(), Status> {
+        let failure = self.state.fail_mutation_after_save.lock().await.clone();
+        failure.map_or(Ok(()), Err)
+    }
+
     async fn provider_receipt(
         &self,
         sandbox_name: &str,
@@ -388,6 +399,7 @@ impl OpenShell for TestOpenShell {
         };
         let provider_names = providers.clone();
         drop(sandbox_providers);
+        self.check_mutation_receipt_storage().await?;
         let receipt = self
             .provider_receipt(
                 &request.sandbox_name,
@@ -440,6 +452,7 @@ impl OpenShell for TestOpenShell {
         let detached = providers.len() != before_len;
         let provider_names = providers.clone();
         drop(sandbox_providers);
+        self.check_mutation_receipt_storage().await?;
         let receipt = self
             .provider_receipt(
                 &request.sandbox_name,
@@ -999,6 +1012,7 @@ impl OpenShell for TestOpenShell {
         let updated_name = updated.object_name().to_string();
         providers.insert(updated_name.clone(), updated.clone());
         drop(providers);
+        self.check_mutation_receipt_storage().await?;
         let mutation_id = format!(
             "update-{}",
             self.state.readiness_sequence.fetch_add(1, Ordering::SeqCst) + 1
@@ -1703,6 +1717,248 @@ fn assert_readiness_output_redacted(output: &std::process::Output) {
         assert!(!text.contains(SYNTHETIC_READINESS_CREDENTIAL));
         assert!(!text.contains(SYNTHETIC_READINESS_BACKEND_ERROR));
         assert!(!text.contains(SYNTHETIC_PROFILE_BACKEND_ERROR));
+        assert!(!text.contains(SYNTHETIC_MUTATION_ERROR_METADATA));
+    }
+}
+
+fn mutation_error_status(code: Code, reason: &str, domain: &str) -> Status {
+    Status::with_error_details(
+        code,
+        SYNTHETIC_READINESS_BACKEND_ERROR,
+        ErrorDetails::with_error_info(
+            reason,
+            domain,
+            HashMap::from([(
+                "backend".to_string(),
+                SYNTHETIC_MUTATION_ERROR_METADATA.to_string(),
+            )]),
+        ),
+    )
+}
+
+// Exercise the actual CLI process and establish that the mock saved exactly one
+// mutation before returning the error, without producing or polling a receipt.
+async fn run_saved_provider_mutation_error(
+    server: &TestServer,
+    action: &str,
+    status: Status,
+    wait: bool,
+) -> String {
+    let sandbox_name = "storage-uncertain";
+    seed_readiness_provider(server).await;
+    server.state.sandbox_providers.lock().await.insert(
+        sandbox_name.to_string(),
+        if action == "attach" {
+            Vec::new()
+        } else {
+            vec![READINESS_PROVIDER.to_string()]
+        },
+    );
+    server.state.sandbox_provider_requests.lock().await.clear();
+    server.state.provider_update_requests.lock().await.clear();
+    *server.state.fail_mutation_after_save.lock().await = Some(status);
+    let mut args = if action == "update" {
+        vec![
+            "provider",
+            "update",
+            READINESS_PROVIDER,
+            "--config",
+            "region=changed",
+        ]
+    } else {
+        vec![
+            "sandbox",
+            "provider",
+            action,
+            sandbox_name,
+            READINESS_PROVIDER,
+        ]
+    };
+    args.extend(["--output", "json"]);
+    if wait {
+        args.extend(["--wait", "--timeout", "1"]);
+    }
+    let output = run_readiness_cli(server, &args).await;
+    assert!(!output.status.success(), "{action}, wait={wait}");
+    assert!(output.stdout.is_empty(), "failed mutation printed a result");
+    assert_readiness_output_redacted(&output);
+    assert!(server.state.readiness_receipts.lock().await.is_empty());
+    assert!(server.state.readiness_requests.lock().await.is_empty());
+
+    let attachment_requests = server.state.sandbox_provider_requests.lock().await;
+    let update_requests = server.state.provider_update_requests.lock().await;
+    if action == "update" {
+        assert!(attachment_requests.is_empty());
+        assert_eq!(update_requests.len(), 1, "update was replayed");
+        let providers = server.state.providers.lock().await;
+        let provider = providers.get(READINESS_PROVIDER).unwrap();
+        assert_eq!(
+            provider.config.get("region").map(String::as_str),
+            Some("changed")
+        );
+        assert_eq!(provider.metadata.as_ref().unwrap().resource_version, 2);
+    } else {
+        assert!(update_requests.is_empty());
+        let expected_request = if action == "attach" {
+            SandboxProviderRequestLog::Attach {
+                sandbox_name: sandbox_name.to_string(),
+                provider_name: READINESS_PROVIDER.to_string(),
+            }
+        } else {
+            SandboxProviderRequestLog::Detach {
+                sandbox_name: sandbox_name.to_string(),
+                provider_name: READINESS_PROVIDER.to_string(),
+            }
+        };
+        assert_eq!(
+            *attachment_requests,
+            vec![expected_request],
+            "mutation was replayed"
+        );
+        let attachments = server.state.sandbox_providers.lock().await;
+        assert_eq!(
+            attachments
+                .get(sandbox_name)
+                .unwrap()
+                .contains(&READINESS_PROVIDER.to_string()),
+            action == "attach",
+            "attachment mutation was not saved"
+        );
+    }
+    String::from_utf8(output.stderr).unwrap()
+}
+
+#[tokio::test]
+async fn provider_readiness_storage_uncertainty_preserves_safe_recovery_guidance() {
+    let server = run_server().await;
+    for action in ["attach", "detach", "update"] {
+        for wait in [false, true] {
+            // Structured uncertainty takes precedence over the ordinary Aborted
+            // conflict hint: this saved mutation must not invite a blind retry.
+            for code in [Code::Unavailable, Code::Aborted] {
+                let stderr = run_saved_provider_mutation_error(
+                    &server,
+                    action,
+                    mutation_error_status(code, STORAGE_UNCERTAIN_REASON, ERROR_DOMAIN),
+                    wait,
+                )
+                .await;
+                for expected in [
+                    STORAGE_UNCERTAIN_REASON,
+                    "may already be saved",
+                    "Do not blindly retry",
+                    "reconcile",
+                ] {
+                    assert!(
+                        stderr.contains(expected),
+                        "{action}, wait={wait}, {code:?}: {stderr}"
+                    );
+                }
+                assert!(!stderr.contains("Please retry the command"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_readiness_storage_uncertainty_requires_trusted_error_info() {
+    let server = run_server().await;
+    let valid = mutation_error_status(Code::Unavailable, STORAGE_UNCERTAIN_REASON, ERROR_DOMAIN);
+    let mut malformed_error_info = valid.details().to_vec();
+    let reason_offset = malformed_error_info
+        .windows(STORAGE_UNCERTAIN_REASON.len())
+        .position(|bytes| bytes == STORAGE_UNCERTAIN_REASON.as_bytes())
+        .unwrap();
+    // Invalid UTF-8 breaks only the nested ErrorInfo reason; its outer status
+    // envelope remains valid and cannot authorize the special recovery hint.
+    malformed_error_info[reason_offset] = 0xff;
+    let cases = [
+        (
+            "unrelated",
+            mutation_error_status(Code::Unavailable, "OTHER_REASON", ERROR_DOMAIN),
+        ),
+        (
+            "wrong domain",
+            mutation_error_status(Code::Unavailable, STORAGE_UNCERTAIN_REASON, "other.example"),
+        ),
+        (
+            "reason case",
+            mutation_error_status(
+                Code::Unavailable,
+                "config_operation_storage_uncertain",
+                ERROR_DOMAIN,
+            ),
+        ),
+        (
+            "domain case",
+            mutation_error_status(
+                Code::Unavailable,
+                STORAGE_UNCERTAIN_REASON,
+                "OPENSHELL.NVIDIA.COM",
+            ),
+        ),
+        (
+            "missing ErrorInfo",
+            Status::with_error_details(
+                Code::Unavailable,
+                SYNTHETIC_READINESS_BACKEND_ERROR,
+                ErrorDetails::new(),
+            ),
+        ),
+        (
+            "message only",
+            Status::unavailable(format!(
+                "{STORAGE_UNCERTAIN_REASON}: {SYNTHETIC_READINESS_BACKEND_ERROR}"
+            )),
+        ),
+        (
+            "malformed ErrorInfo",
+            Status::with_details(
+                Code::Unavailable,
+                SYNTHETIC_READINESS_BACKEND_ERROR,
+                malformed_error_info.into(),
+            ),
+        ),
+        (
+            "malformed envelope",
+            Status::with_details(
+                Code::Unavailable,
+                SYNTHETIC_READINESS_BACKEND_ERROR,
+                vec![0xff].into(),
+            ),
+        ),
+        (
+            "mismatched envelope message",
+            Status::with_details(
+                Code::Unavailable,
+                "different message",
+                valid.details().to_vec().into(),
+            ),
+        ),
+    ];
+    for action in ["attach", "detach", "update"] {
+        let error_prefix = match action {
+            "attach" => "provider attachment failed",
+            "detach" => "provider detachment failed",
+            _ => "provider update failed",
+        };
+        for (case, status) in &cases {
+            let stderr =
+                run_saved_provider_mutation_error(&server, action, status.clone(), true).await;
+            assert!(stderr.contains(error_prefix), "{action}, {case}: {stderr}");
+            assert!(
+                stderr.contains(&Code::Unavailable.to_string()),
+                "{action}, {case}: {stderr}"
+            );
+            assert!(
+                !stderr.contains(STORAGE_UNCERTAIN_REASON),
+                "{action}, {case}: {stderr}"
+            );
+            assert!(
+                !stderr.contains("may already be saved"),
+                "{action}, {case}: {stderr}"
+            );
+        }
     }
 }
 

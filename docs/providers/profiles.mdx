@@ -995,6 +995,8 @@ openshell sandbox provider status provider-demo work-github --receipt RECEIPT_ID
 
 Replace `RECEIPT_ID` with the `receipt_id` returned by attach, detach, or update. The ID always refers to the original change. If a later change replaces it, the status is `superseded` and the wait ends without reporting success.
 
+If attach, detach, or update reports `CONFIG_OPERATION_STORAGE_UNCERTAIN`, the change may already be saved even though the gateway could not record its readiness receipt. Do not blindly retry the mutation: inspect the provider and sandbox state and reconcile the saved change first. A receipt may be unavailable, so an error does not establish that the mutation was rolled back or that the sandbox is ready.
+
 Readiness states have these meanings:
 
 - `persisted`: the gateway saved the change; the command has not checked the sandbox yet.

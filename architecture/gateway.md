@@ -710,6 +710,8 @@ Each receipt projects a common configuration operation in the `config_update_ope
 
 Provider mutation and operation-result writes are separate. A result-storage failure can follow a saved mutation and returns structured uncertainty without a rollback or safe-retry claim. A failed initial snapshot remains failed rather than acquiring a different target during a later lookup. Operations contain only identities, revisions, timestamps, and closed reason categories.
 
+The CLI recognizes the gateway's `CONFIG_OPERATION_STORAGE_UNCERTAIN` error reason and domain for attach, detach, and update. It reports fixed guidance to inspect and reconcile the saved change before retrying, while withholding arbitrary server messages and error metadata. An uncertain mutation never starts a readiness wait or automatic replay.
+
 Provider receipts, installation status, and common operations represent absolute times with protobuf `Timestamp`; report intervals and evidence lifetimes use protobuf `Duration`. Receipt identity compares the full canonical timestamp without truncating nanoseconds. An absent observation or completion time represents missing evidence or an unfinished operation, independently of the Unix epoch.
 
 Provider installation reports belong to the existing `ConnectSupervisor` session. Each report names that session, has an increasing sequence, and expires unless the supervisor reports again. Reconnection or disconnect invalidates prior observations; stored change records survive a gateway restart, but runtime evidence does not. Replaying an identical report cannot extend its lifetime.

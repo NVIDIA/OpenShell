@@ -26,6 +26,7 @@ use openshell_core::proto::{
     ProviderProfileDiagnostic, ProviderProfileImportItem, RotateProviderCredentialRequest,
     UpdateProviderProfilesRequest, UpdateProviderRequest,
 };
+use openshell_core::rpc_error::{ERROR_DOMAIN, decode_details};
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use openshell_providers::{
     ProviderTypeProfile, RealDiscoveryContext, detect_provider_from_command, discover_from_profile,
@@ -36,6 +37,30 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use tonic::{Code, Status};
+
+fn provider_mutation_is_uncertain(status: &Status) -> bool {
+    // Only a validated gateway ErrorInfo identifies a possibly saved mutation.
+    // Message text, metadata, foreign domains, and malformed details are untrusted.
+    decode_details(status).is_some_and(|details| {
+        details.error_info().is_some_and(|info| {
+            info.domain == ERROR_DOMAIN && info.reason == "CONFIG_OPERATION_STORAGE_UNCERTAIN"
+        })
+    })
+}
+
+fn provider_mutation_error(status: &Status, operation: &str) -> miette::Report {
+    if provider_mutation_is_uncertain(status) {
+        // Emit fixed guidance without chaining the server's potentially sensitive
+        // message or metadata. An error does not establish that the write rolled back.
+        miette!(
+            "provider change may already be saved (CONFIG_OPERATION_STORAGE_UNCERTAIN); \
+             readiness receipt could not be recorded. Do not blindly retry the mutation; \
+             check provider and sandbox status and reconcile the saved change first."
+        )
+    } else {
+        miette!("provider {operation} failed ({})", status.code())
+    }
+}
 
 fn proto_timestamp_ms(timestamp: Option<&prost_types::Timestamp>) -> i64 {
     timestamp
@@ -123,13 +148,16 @@ pub async fn sandbox_provider_attach(
         .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) if status.code() == Code::Aborted => {
+        // Explicit post-save uncertainty takes precedence over a generic retry hint.
+        Err(status)
+            if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+        {
             return Err(miette::miette!(
                 "Failed to attach provider: sandbox was modified by another operation.\n\
                  Please retry the command."
             ));
         }
-        Err(error) => return Err(miette!("provider attachment failed ({})", error.code())),
+        Err(error) => return Err(provider_mutation_error(&error, "attachment")),
     };
 
     let receipt = response.receipt.ok_or_else(|| {
@@ -190,13 +218,16 @@ pub async fn sandbox_provider_detach(
         .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) if status.code() == Code::Aborted => {
+        // Explicit post-save uncertainty takes precedence over a generic retry hint.
+        Err(status)
+            if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+        {
             return Err(miette::miette!(
                 "Failed to detach provider: sandbox was modified by another operation.\n\
                  Please retry the command."
             ));
         }
-        Err(error) => return Err(miette!("provider detachment failed ({})", error.code())),
+        Err(error) => return Err(provider_mutation_error(&error, "detachment")),
     };
 
     let receipt = response.receipt.ok_or_else(|| miette!("gateway did not return a provider receipt; saved detachment cannot establish revocation"))?;
@@ -2405,7 +2436,7 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
             clear_credential_expiration_keys,
         })
         .await
-        .map_err(|error| miette!("provider update failed ({})", error.code()))?;
+        .map_err(|error| provider_mutation_error(&error, "update"))?;
 
     let response = response.into_inner();
     if response.mutation_id.is_empty() {
