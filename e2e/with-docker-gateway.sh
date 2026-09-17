@@ -718,7 +718,9 @@ if [ "${OIDC_MODE}" = "1" ]; then
     "${HOST_PORT}" \
     "${OIDC_ISSUER}" \
     "${OPENSHELL_E2E_OIDC_USERNAME:-admin@test}" \
-    "${OPENSHELL_E2E_OIDC_PASSWORD:-admin}" || exit 1
+    "${OPENSHELL_E2E_OIDC_PASSWORD:-admin}" \
+    "${PKI_DIR}" \
+    "${CLI_BIN}" || exit 1
 fi
 e2e_import_example_provider_profiles "${CLI_BIN}" "${ROOT}" || exit 1
 

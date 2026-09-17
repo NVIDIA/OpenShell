@@ -177,7 +177,9 @@ e2e_register_oidc_admin_session() {
   local issuer=$5
   local username=$6
   local password=$7
-  local client_id="${8:-openshell-cli}"
+  local pki_dir=$8
+  local cli_bin=$9
+  local client_id="${10:-openshell-cli}"
   local gateway_config_dir="${config_home}/openshell/gateways/${name}"
 
   local token
@@ -194,13 +196,27 @@ e2e_register_oidc_admin_session() {
   fi
 
   mkdir -p "${gateway_config_dir}"
+
+  # Trust the gateway's self-signed serving certificate. Only the CA is
+  # installed: these lanes start the gateway without --tls-client-ca, and with
+  # no client cert/key on disk the CLI falls back to CA-only server
+  # verification and authenticates with the bearer token instead of an mTLS
+  # identity.
+  mkdir -p "${gateway_config_dir}/mtls"
+  cp "${pki_dir}/ca.crt" "${gateway_config_dir}/mtls/ca.crt"
+
+  # auth_mode must be "oidc": the CLI dispatches on this field alone when
+  # deciding to load a stored bearer token, so omitting it leaves
+  # oidc_token.json on disk and unread, and the request goes unauthenticated.
   cat >"${gateway_config_dir}/metadata.json" <<EOF
 {
   "name": "${name}",
   "gateway_endpoint": "${endpoint}",
   "is_remote": false,
   "gateway_port": ${port},
-  "oidc_issuer": "${issuer}"
+  "auth_mode": "oidc",
+  "oidc_issuer": "${issuer}",
+  "oidc_client_id": "${client_id}"
 }
 EOF
   cat >"${gateway_config_dir}/oidc_token.json" <<EOF
@@ -212,6 +228,21 @@ EOF
 EOF
   chmod 600 "${gateway_config_dir}/oidc_token.json"
   printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
+
+  # Assert the CLI reaches the gateway as an authenticated administrator before
+  # anything depends on it. ListProviderProfiles is annotated
+  # auth_mode: "bearer", so it cannot succeed unless the stored token was
+  # loaded and accepted -- this fails here, with the cause named, rather than
+  # surfacing later as an opaque profile import error.
+  if ! "${cli_bin}" provider list-profiles --global --output json >/dev/null 2>&1; then
+    echo "ERROR: the CLI could not make an authenticated call as the OIDC administrator" >&2
+    echo "       gateway config: ${gateway_config_dir}" >&2
+    echo "       CLI output follows:" >&2
+    "${cli_bin}" provider list-profiles --global --output json >&2 || true
+    return 1
+  fi
+
+  echo "Established an authenticated OIDC administrator session for '${name}'."
 }
 
 e2e_toml_string() {
