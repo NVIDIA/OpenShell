@@ -388,11 +388,15 @@ export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
 e2e_run_openshell_conformance "VM"
 
+# Seed the catalog once for the whole lane. The profiles live in the gateway
+# for as long as it runs, and the import is create-only: a second import of
+# the same directory fails with "custom provider profile '<id>' already
+# exists", so this cannot move inside the per-target helper below.
+e2e_import_example_provider_profiles "${CLI_BIN}" "${ROOT}" || exit 1
+
 run_e2e_test() {
   local test_target="$1"
   shift
-
-  e2e_import_example_provider_profiles "${CLI_BIN}" "${ROOT}" || exit 1
 
   echo "==> Running e2e ${test_target} test (features: ${E2E_FEATURES}, endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})"
   cargo test \
