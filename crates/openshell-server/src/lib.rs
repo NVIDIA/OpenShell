@@ -26,6 +26,7 @@ mod grpc;
 mod http;
 mod middleware;
 mod multiplex;
+pub(crate) mod otel_relay;
 mod otel_tracing;
 mod pagination;
 mod persistence;
@@ -347,6 +348,10 @@ pub struct ServerState {
     /// Empty when OIDC is not configured — `authorize_workspace()` treats
     /// every authenticated user as Platform Admin in that case.
     pub admin_role: String,
+
+    /// Dedicated OTLP exporter for relayed telemetry from supervisors.
+    /// `None` when the gateway has no OTLP endpoint configured.
+    pub otel_relay_exporter: Option<Arc<otel_relay::OtelRelayExporter>>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -435,6 +440,7 @@ impl ServerState {
             provider_profile_sources:
                 provider_profile_sources::ProviderProfileSources::with_default_sources(),
             admin_role,
+            otel_relay_exporter: None,
         }
     }
 }
@@ -683,6 +689,7 @@ pub(crate) async fn run_server(
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
+    state.otel_relay_exporter = otel_relay::try_create_exporter(config_file.as_ref()).await;
     state.sandbox_jwt_issuer = sandbox_jwt_issuer.clone();
     state.sandbox_jwt_authenticator = sandbox_jwt_authenticator;
     state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;

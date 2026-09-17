@@ -394,6 +394,9 @@ async fn run_single_session(
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
             sandbox_id: config.sandbox_id.clone(),
             instance_id: config.instance_id.clone(),
+            // Advertised once the supervisor-side relay lands; the gateway
+            // confirms only capabilities it can serve.
+            capabilities: Vec::new(),
             supports_provider_readiness: true,
         })),
     })

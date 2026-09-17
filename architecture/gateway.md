@@ -392,6 +392,8 @@ Allow and deny append requests carry `L7RuleTarget` to declare the rule, endpoin
 
 `GetSandboxProviderStatus` and `ReportProviderReadiness` are unary public gateway RPCs. The first lets authorized users inspect a provider change; the second accepts installation reports only from the sandbox's current authenticated supervisor session.
 
+The `ConnectSupervisor` stream negotiates optional capabilities. `SupervisorHello.capabilities` advertises what a supervisor can do and `SessionAccepted.capabilities` echoes the subset the gateway will serve; both are new repeated fields that older peers leave empty. `OtelExportData` is a new `SupervisorMessage` payload case carrying relayed OTLP trace bytes and OCSF events, and the gateway only acts on it after confirming `otel_export`. All three belong only to the public closure; nothing on this stream is persisted.
+
 The removed `NetworkBinary.harness` field remains reserved by number and name,
 so protobuf implementations cannot reuse its wire slot or source identifier.
 The durable-policy compatibility decoder reads the former boolean before Prost
