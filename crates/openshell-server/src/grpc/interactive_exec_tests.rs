@@ -9,7 +9,8 @@ use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Session};
 use std::time::Duration;
 
 struct ExecPeer {
-    echo: bool,
+    channel: Option<russh::Channel<Msg>>,
+    echo_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     input: Arc<std::sync::Mutex<Vec<u8>>>,
     eof: Arc<AtomicBool>,
     release_output: Arc<tokio::sync::Notify>,
@@ -33,11 +34,12 @@ impl Handler for ExecPeer {
 
     async fn channel_open_session(
         &mut self,
-        _channel: russh::Channel<Msg>,
+        channel: russh::Channel<Msg>,
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         reply.accept().await;
+        self.channel = Some(channel);
         Ok(())
     }
 
@@ -48,7 +50,27 @@ impl Handler for ExecPeer {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         session.channel_success(channel)?;
-        self.echo = data == b"duplex";
+        if data == b"duplex" {
+            let channel = self.channel.take().unwrap();
+            let release = self.release_output.clone();
+            let (echo_tx, mut echo_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            self.echo_tx = Some(echo_tx);
+            self.output_task = Some(tokio::spawn(async move {
+                let (reader, writer) = channel.split();
+                // The handler receives stdin independently of output flow
+                // control, as a real process with separate I/O pumps would.
+                drop(reader);
+                while let Some(data) = echo_rx.recv().await {
+                    writer.data_bytes(data.clone()).await.unwrap();
+                    writer.extended_data_bytes(1, data).await.unwrap();
+                }
+                release.notified().await;
+                writer.exit_status(7).await.unwrap();
+                writer.close().await.unwrap();
+            }));
+        } else {
+            self.channel.take();
+        }
         if data == b"early" {
             session.exit_status_request(channel, 0)?;
             session.close(channel)?;
@@ -61,14 +83,13 @@ impl Handler for ExecPeer {
 
     async fn data(
         &mut self,
-        channel: russh::ChannelId,
+        _channel: russh::ChannelId,
         data: &[u8],
-        session: &mut Session,
+        _session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.input.lock().unwrap().extend_from_slice(data);
-        if self.echo {
-            session.data(channel, data.to_vec())?;
-            session.extended_data(channel, 1, data.to_vec())?;
+        if let Some(tx) = &self.echo_tx {
+            tx.send(data.to_vec()).unwrap();
         }
         Ok(())
     }
@@ -79,6 +100,10 @@ impl Handler for ExecPeer {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.eof.store(true, Ordering::SeqCst);
+        self.echo_tx.take();
+        if self.output_task.is_some() {
+            return Ok(());
+        }
         let release = self.release_output.clone();
         let handle = session.handle();
         self.output_task = Some(tokio::spawn(async move {
@@ -135,7 +160,8 @@ impl Fixture {
         let eof = Arc::new(AtomicBool::new(false));
         let release_output = Arc::new(tokio::sync::Notify::new());
         let handler = ExecPeer {
-            echo: false,
+            channel: None,
+            echo_tx: None,
             input: input.clone(),
             eof: eof.clone(),
             release_output: release_output.clone(),
@@ -228,10 +254,12 @@ async fn interactive_exec_drains_stdout_and_stderr_after_input_eof() {
 async fn interactive_exec_makes_progress_in_both_directions_before_eof() {
     const CHUNKS: usize = 128;
     const CHUNK_SIZE: usize = 64 * 1024;
+    const BATCH: usize = 4;
     let fixture = Fixture::new().await;
     let (input_tx, input_rx) = mpsc::channel(16);
     let (output_tx, mut output_rx) = mpsc::channel(2);
     let drained = tokio::sync::Notify::new();
+    let progress = std::cell::Cell::new((0, 0));
     let exec = run_interactive_exec_with_russh(
         fixture.port,
         "duplex",
@@ -243,24 +271,27 @@ async fn interactive_exec_makes_progress_in_both_directions_before_eof() {
         output_tx,
     );
     let writer = async {
-        for _ in 0..CHUNKS {
+        for chunk in 1..=CHUNKS {
             input_tx
                 .send(Ok(ExecSandboxInput {
                     payload: Some(exec_sandbox_input::Payload::Stdin(vec![b'x'; CHUNK_SIZE])),
                 }))
                 .await
                 .unwrap();
+            if chunk % BATCH == 0 {
+                drained.notified().await;
+            }
         }
         // Keep the request stream open until BOTH output streams have drained.
-        // The payload exceeds SSH windows and all bridge queues, so buffering
-        // the entire exchange cannot masquerade as concurrent progress.
-        drained.notified().await;
+        // Bound in-flight data to exercise sustained interactive traffic without
+        // saturating both ends of the fixture's SSH transport simultaneously.
         drop(input_tx);
     };
     let reader = async {
         ready(&mut output_rx).await;
         let mut stdout = 0;
         let mut stderr = 0;
+        let mut acknowledged = 0;
         while stdout < CHUNKS * CHUNK_SIZE || stderr < CHUNKS * CHUNK_SIZE {
             let bytes = match output_rx.recv().await.unwrap().unwrap().payload.unwrap() {
                 exec_sandbox_event::Payload::Stdout(s) => {
@@ -271,14 +302,20 @@ async fn interactive_exec_makes_progress_in_both_directions_before_eof() {
                     stderr += s.data.len();
                     s.data
                 }
-                event => panic!("unexpected event: {event:?}"),
+                event @ exec_sandbox_event::Payload::Exit(_) => {
+                    panic!("unexpected event: {event:?}")
+                }
             };
             assert!(bytes.iter().all(|b| *b == b'x'));
+            progress.set((stdout, stderr));
             assert!(!fixture.eof.load(Ordering::SeqCst));
+            if stdout.min(stderr) >= acknowledged + BATCH * CHUNK_SIZE {
+                acknowledged += BATCH * CHUNK_SIZE;
+                drained.notify_one();
+            }
         }
         assert_eq!(stdout, CHUNKS * CHUNK_SIZE);
         assert_eq!(stderr, CHUNKS * CHUNK_SIZE);
-        drained.notify_one();
         fixture.release_output.notify_one();
         while output_rx.recv().await.is_some() {}
     };
@@ -286,9 +323,53 @@ async fn interactive_exec_makes_progress_in_both_directions_before_eof() {
         tokio::join!(exec, writer, reader)
     })
     .await
-    .expect("stdin and stdout/stderr must make progress without request EOF");
+    .unwrap_or_else(|_| {
+        panic!(
+            "duplex stalled: input={}, output={:?}, eof={}",
+            fixture.input.lock().unwrap().len(),
+            progress.get(),
+            fixture.eof.load(Ordering::SeqCst)
+        )
+    });
     assert_eq!(result.unwrap(), 7);
     assert_eq!(fixture.input.lock().unwrap().len(), CHUNKS * CHUNK_SIZE);
+}
+
+#[tokio::test]
+async fn interactive_exec_ready_resize_stream_does_not_starve_output() {
+    use futures::StreamExt;
+    use std::sync::atomic::AtomicUsize;
+
+    // Finite to make a regression fail rather than wedge the runtime forever.
+    // These frames have no SSH write await because this session has no PTY.
+    const FRAMES: usize = 100_000;
+    let fixture = Fixture::new().await;
+    let consumed = AtomicUsize::new(0);
+    let input = futures::stream::repeat_with(|| {
+        consumed.fetch_add(1, Ordering::SeqCst);
+        Ok(ExecSandboxInput {
+            payload: Some(exec_sandbox_input::Payload::Resize(
+                openshell_core::proto::ExecSandboxWindowResize::default(),
+            )),
+        })
+    })
+    .take(FRAMES);
+    let (output_tx, mut output_rx) = mpsc::channel(2);
+    let exec =
+        run_interactive_exec_with_russh(fixture.port, "test", input, false, false, 0, 0, output_tx);
+    let reader = async {
+        ready(&mut output_rx).await;
+        assert!(
+            consumed.load(Ordering::SeqCst) < FRAMES,
+            "output must be delivered before the continuously ready input ends"
+        );
+        drop(output_rx);
+    };
+    let (result, ()) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(exec, reader) })
+            .await
+            .unwrap();
+    assert_eq!(result.unwrap_err().code(), tonic::Code::Cancelled);
 }
 
 #[tokio::test]
