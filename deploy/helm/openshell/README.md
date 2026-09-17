@@ -211,6 +211,77 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
 - [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
 
+### Additional destination CAs
+
+Create an operator-owned ConfigMap with a `ca.crt` key when sandboxes must reach
+TLS destinations signed by a private CA:
+
+```shell
+kubectl create configmap private-destination-ca -n openshell \
+  --from-file=ca.crt=/path/to/ca.crt
+```
+
+Then set the source ConfigMap name:
+
+```yaml
+supervisor:
+  network:
+    additionalCaConfigMapName: private-destination-ca
+```
+
+The chart mounts the source into the gateway and renders
+`[openshell.supervisor.network].additional_ca_cert_paths`. The gateway validates
+and normalizes certificate-only PEM at startup. The Kubernetes driver creates a
+separate managed ConfigMap in each target sandbox namespace and mounts it only
+in the dedicated supervisor Pod. That supervisor receives the expected generation
+as protected startup arguments and rejects mounted PEM whose canonical digest
+differs before network setup. The configured roots augment default destination
+trust. They do not configure the corporate proxy, OIDC, or gateway callback mTLS
+trust.
+
+Changing only the source ConfigMap does not roll or reload the gateway. Restart
+the gateway, then recreate or restart affected sandboxes to use the new roots.
+Removing `additionalCaConfigMapName` removes the global TOML setting; newly
+created or recreated sandbox pods then have no additional-CA volume or mount.
+Existing running sandbox supervisors retain their startup trust until they are
+restarted or recreated.
+
+The driver creates one immutable, content-addressed ConfigMap generation in
+each target namespace. Names begin with
+`openshell-network-additional-ca-` and include DNS-safe hashes of the effective
+gateway ID and normalized bundle generation. Existing objects are accepted only
+when their ownership labels, generation annotation, immutability, and exact
+`ca.crt` data match; the driver never patches or updates them.
+
+Kubernetes cannot restrict `create` by `resourceNames`, and `resourceNames`
+cannot express the digest-bearing name prefix needed for `get`. Enabling this
+feature therefore gives the gateway/driver service account namespace-wide
+ConfigMap `get` and `create` permissions in shared mode. In managed/operator
+modes, the chart's ClusterRoleBinding makes those permissions cluster-wide for
+the bound service account. The chart does not grant ConfigMap `list`, `watch`,
+`patch`, `update`, or `delete`. Use a dedicated gateway service account and
+namespace-scoped bindings when this boundary matters. If you render the TOML
+setting outside this Helm value, grant `get` and `create` in every target
+sandbox namespace.
+
+Disabling the setting intentionally does not delete driver-managed generations:
+the gateway has no ConfigMap list/delete permissions, and an older object may
+still be referenced by a running or stopped sandbox. An operator with separate
+list/delete authority can inventory the gateway's generations by label:
+
+```shell
+kubectl -n <sandbox-namespace> get configmap \
+  -l 'openshell.ai/managed-by=openshell,openshell.ai/gateway-id=<effective-gateway-id>'
+```
+
+Before deleting a named generation, verify that no Sandbox resource or pod
+volume in that namespace references it. Delete only the confirmed unreferenced
+name; removing a referenced generation can make a later pod start or reschedule
+fail closed.
+
+A configured CA can authenticate every policy-permitted TLS endpoint with a
+matching certificate chain and hostname. Scope private CAs accordingly.
+
 ### Database backend
 
 By default, OpenShell uses SQLite and runs the gateway as a StatefulSet so the
@@ -631,6 +702,7 @@ discovery endpoint or its TLS CA.
 | supervisor.podSecurityContext.runAsNonRoot | bool | `true` | Require the shared supervisor to run as a non-root user. |
 | supervisor.podSecurityContext.runAsUser | int | `65534` | UID assigned to the shared supervisor pod. |
 | supervisor.podSecurityContext.seccompProfile.type | string | `"RuntimeDefault"` | Seccomp profile applied to the shared supervisor pod. |
+| supervisor.network.additionalCaConfigMapName | string | `""` | Name of an operator-owned ConfigMap with a `ca.crt` key containing additional destination CA certificates for sandbox supervisors. Empty disables additional destination trust. |
 | supervisor.recoveryTimeoutSeconds | int | `60` | Seconds a sandbox workload stays frozen after losing its pool member's supervision before the sandbox runtime terminates it, rendered as [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an integer from 10 to 300. Null leaves the gateway's pool default of 60 seconds. |
 | supervisor.replicas | int | `1` | Shared supervisor pool members, used only when gatewayConfig selects supervisor_topology = "gateway". The gateway always coordinates the shared supervisor as a high-availability pool: when a member fails or leaves, another member takes over its sandboxes without restarting their workloads. 1 has no failover; use 2 or more to survive losing a member. Only the supervisor Deployment's replica count depends on this value, so changing it neither restarts the gateway nor replaces running members. Ignored when supervisor.autoscaling.enabled is true. |
 | supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |

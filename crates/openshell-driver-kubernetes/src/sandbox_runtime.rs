@@ -8,8 +8,8 @@ use std::path::Path;
 
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{
-    CSIVolumeSource, Capabilities, Container, EmptyDirVolumeSource, EnvVar, KeyToPath,
-    LocalObjectReference, Pod, PodSchedulingGate, PodSecurityContext, PodSpec, Probe,
+    CSIVolumeSource, Capabilities, ConfigMapVolumeSource, Container, EmptyDirVolumeSource, EnvVar,
+    KeyToPath, LocalObjectReference, Pod, PodSchedulingGate, PodSecurityContext, PodSpec, Probe,
     ProjectedVolumeSource, Secret, SecretVolumeSource, SecurityContext, Service,
     ServiceAccountTokenProjection, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
     VolumeProjection,
@@ -65,6 +65,13 @@ pub const CONTROL_HEALTH_SOCKET_PATH: &str = "/run/openshell/health.sock";
 /// Kubelet `tcpSocket` readiness port. An exec probe would start a supervisor
 /// process in every sandbox on every period.
 pub const CONTROL_HEALTH_PORT: u16 = 5501;
+
+/// `ConfigMap` volume name reserved for gateway-normalized destination trust.
+pub const NETWORK_ADDITIONAL_CA_VOLUME_NAME: &str = "openshell-network-additional-ca";
+/// The only destination-trust path exposed to the dedicated supervisor Pod.
+pub const NETWORK_ADDITIONAL_CA_BUNDLE_PATH: &str =
+    openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH;
+const NETWORK_ADDITIONAL_CA_KEY: &str = "ca.crt";
 pub const NAMESPACE_WORKLOAD_POLICY_NAME: &str = "openshell-sandbox-workloads";
 pub const NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME: &str = "openshell-sandbox-supervisors";
 pub const SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS: i64 = 30;
@@ -337,6 +344,10 @@ pub fn supervisor_pod(
     proxy_connect_by_hostname: bool,
     upstream_proxy_ca_bundle_staged: bool,
     provider_spiffe_socket_path: Option<&str>,
+    // Name and expected full digest of a gateway-normalized destination trust
+    // generation. The ConfigMap is mounted only in this dedicated control Pod;
+    // it is deliberately absent from the workload Pod and its bootstrap Secret.
+    network_additional_ca: Option<(&str, &str)>,
     owner: OwnerReference,
     tracing_environment: &[(&str, String)],
 ) -> Result<Pod, String> {
@@ -476,6 +487,28 @@ pub fn supervisor_pod(
             "--upstream-proxy-ca-bundle".to_string(),
             UPSTREAM_PROXY_CA_BUNDLE_PATH.to_string(),
         ]);
+    }
+    if let Some((config_map_name, digest)) = network_additional_ca {
+        command.extend([
+            "--network-additional-ca-bundle".to_string(),
+            NETWORK_ADDITIONAL_CA_BUNDLE_PATH.to_string(),
+            "--network-additional-ca-digest".to_string(),
+            digest.to_string(),
+        ]);
+        let mut mount = volume_mount(
+            NETWORK_ADDITIONAL_CA_VOLUME_NAME,
+            NETWORK_ADDITIONAL_CA_BUNDLE_PATH,
+            true,
+        );
+        // A subPath exposes `ca.crt` at the exact protected file path rather
+        // than mounting a ConfigMap directory over the supervisor's filesystem.
+        mount.sub_path = Some(NETWORK_ADDITIONAL_CA_KEY.to_string());
+        volume_mounts.push(mount);
+        volumes.push(config_map_volume(
+            NETWORK_ADDITIONAL_CA_VOLUME_NAME,
+            config_map_name,
+            NETWORK_ADDITIONAL_CA_KEY,
+        ));
     }
     if let Some((secret_name, secret_key)) = proxy_auth_secret {
         let auth_path = Path::new(openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH);
@@ -822,6 +855,23 @@ fn volume_mount(name: &str, mount_path: &str, read_only: bool) -> VolumeMount {
     }
 }
 
+fn config_map_volume(name: &str, config_map_name: &str, key: &str) -> Volume {
+    Volume {
+        name: name.to_string(),
+        config_map: Some(ConfigMapVolumeSource {
+            name: config_map_name.to_string(),
+            default_mode: Some(0o444),
+            items: Some(vec![KeyToPath {
+                key: key.to_string(),
+                path: key.to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 fn secret_volume(name: &str, secret_name: &str, item: Option<KeyToPath>) -> Volume {
     Volume {
         name: name.to_string(),
@@ -992,6 +1042,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             None,
             owner(),
             &[],
@@ -1178,6 +1229,7 @@ mod tests {
             false,
             false,
             None,
+            None,
             owner(),
             &[],
         )
@@ -1318,6 +1370,92 @@ mod tests {
     }
 
     #[test]
+    fn destination_trust_is_mounted_only_into_the_dedicated_supervisor_pod() {
+        let names = SandboxRuntimeNames::new("pair");
+        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let pod = supervisor_pod(
+            "sandbox",
+            &names,
+            "pair",
+            "demo",
+            "gateway",
+            "supervisor:latest",
+            None,
+            "sandbox-sa",
+            1000,
+            1000,
+            &[],
+            "https://gateway:8080",
+            SupervisorClientTls::Disabled,
+            "{}",
+            "info",
+            600,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            Some(("openshell-network-additional-ca-gateway-generation", digest)),
+            owner(),
+        )
+        .expect("render supervisor Pod with destination trust");
+        let spec = pod.spec.expect("Pod spec");
+        let container = &spec.containers[0];
+        assert!(container.command.as_deref().is_some_and(|command| {
+            command.windows(2).any(|args| {
+                args == [
+                    "--network-additional-ca-bundle",
+                    NETWORK_ADDITIONAL_CA_BUNDLE_PATH,
+                ]
+            }) && command
+                .windows(2)
+                .any(|args| args == ["--network-additional-ca-digest", digest])
+        }));
+        assert_eq!(
+            container
+                .volume_mounts
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter(|mount| mount.name == NETWORK_ADDITIONAL_CA_VOLUME_NAME)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            &[&VolumeMount {
+                name: NETWORK_ADDITIONAL_CA_VOLUME_NAME.to_string(),
+                mount_path: NETWORK_ADDITIONAL_CA_BUNDLE_PATH.to_string(),
+                read_only: Some(true),
+                sub_path: Some(NETWORK_ADDITIONAL_CA_KEY.to_string()),
+                ..Default::default()
+            }]
+        );
+        let volume = spec
+            .volumes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|volume| volume.name == NETWORK_ADDITIONAL_CA_VOLUME_NAME)
+            .expect("destination trust ConfigMap volume");
+        assert_eq!(
+            volume
+                .config_map
+                .as_ref()
+                .map(|source| source.name.as_str()),
+            Some("openshell-network-additional-ca-gateway-generation")
+        );
+        assert_eq!(
+            volume
+                .config_map
+                .as_ref()
+                .and_then(|source| source.items.as_deref())
+                .and_then(|items| items.first())
+                .map(|item| (item.key.as_str(), item.path.as_str())),
+            Some((NETWORK_ADDITIONAL_CA_KEY, NETWORK_ADDITIONAL_CA_KEY))
+        );
+    }
+
+    #[test]
     fn bootstrap_secrets_are_immutable_and_split_by_trust_domain() {
         let names = SandboxRuntimeNames::new("pair");
         let sandbox = sandbox_bootstrap_secret(
@@ -1435,6 +1573,7 @@ mod tests {
             false,
             false,
             staged,
+            None,
             None,
             owner(),
             &[],

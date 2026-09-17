@@ -231,104 +231,115 @@ fn inspect_kubernetes_pod() -> Result<String, String> {
     let namespace = std::env::var("OPENSHELL_E2E_SANDBOX_NAMESPACE")
         .map_err(|error| format!("sandbox namespace missing: {error}"))?;
     let pods = kubectl_json(&["-n", &namespace, "get", "pods", "-o", "json"])?;
-    let pod = pods["items"]
+    let items = pods["items"]
         .as_array()
-        .and_then(|items| {
-            items.iter().find(|pod| {
-                pod["spec"]["volumes"].as_array().is_some_and(|volumes| {
+        .ok_or("Kubernetes Pod list missing items")?;
+    let supervisor = items
+        .iter()
+        .find(|pod| {
+            pod["metadata"]["labels"]["openshell.ai/boundary-role"] == "supervisor"
+                && pod["spec"]["volumes"].as_array().is_some_and(|volumes| {
                     volumes
                         .iter()
                         .any(|volume| volume["name"] == NETWORK_CA_VOLUME)
                 })
-            })
         })
-        .ok_or("sandbox pod with destination CA volume not found")?;
-    let pod_name = pod["metadata"]["name"]
+        .ok_or("dedicated supervisor Pod with destination CA volume not found")?;
+    let supervisor_name = supervisor["metadata"]["name"]
         .as_str()
-        .ok_or("sandbox pod name missing")?;
-    let containers = pod["spec"]["containers"]
+        .ok_or("dedicated supervisor Pod name missing")?;
+    let containers = supervisor["spec"]["containers"]
         .as_array()
-        .ok_or("pod containers missing")?;
-    let mounted = containers
-        .iter()
-        .filter(|container| {
-            container["volumeMounts"].as_array().is_some_and(|mounts| {
-                mounts.iter().any(|mount| {
-                    mount["name"] == NETWORK_CA_VOLUME
-                        && mount["mountPath"] == NETWORK_CA_PATH
-                        && mount["readOnly"] == true
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-    if mounted.len() != 1 {
+        .ok_or("dedicated supervisor Pod containers missing")?;
+    let [supervisor_container] = containers.as_slice() else {
         return Err(format!(
-            "expected one destination CA container mount: {containers:#?}"
+            "destination CA must be mounted only in the one-container dedicated supervisor Pod: {containers:#?}"
+        ));
+    };
+    if supervisor_container["name"] != "supervisor" {
+        return Err(format!(
+            "destination CA mounted in non-supervisor control container: {supervisor_container:#?}"
         ));
     }
-    let expected_container = if containers
+    let mounts = supervisor_container["volumeMounts"]
+        .as_array()
+        .ok_or("dedicated supervisor Pod volume mounts missing")?;
+    let destination_mounts = mounts
         .iter()
-        .any(|container| container["name"] == "openshell-network")
-    {
-        "openshell-network"
-    } else {
-        "agent"
-    };
-    if mounted[0]["name"] != expected_container {
+        .filter(|mount| mount["name"] == NETWORK_CA_VOLUME)
+        .collect::<Vec<_>>();
+    let [destination_mount] = destination_mounts.as_slice() else {
         return Err(format!(
-            "destination CA mounted in {}, expected {expected_container}",
-            mounted[0]["name"]
+            "expected exactly one destination CA mount in dedicated supervisor Pod: {mounts:#?}"
+        ));
+    };
+    if destination_mount["mountPath"] != NETWORK_CA_PATH
+        || destination_mount["subPath"] != "ca.crt"
+        || destination_mount["readOnly"] != true
+    {
+        return Err(format!(
+            "dedicated supervisor destination CA mount must be a read-only ca.crt file: {destination_mount:#?}"
         ));
     }
     let supervisor_digest = network_ca_command_digest(
-        mounted[0]["command"]
+        supervisor_container["command"]
             .as_array()
-            .ok_or("supervisor command missing")?,
+            .ok_or("dedicated supervisor command missing")?,
     )?;
-    let trust_init_containers = pod["spec"]["initContainers"]
+    let volume = supervisor["spec"]["volumes"]
         .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|init| {
-            init["volumeMounts"].as_array().is_some_and(|mounts| {
-                mounts
-                    .iter()
-                    .any(|mount| mount["name"] == NETWORK_CA_VOLUME)
-            })
-        })
-        .collect::<Vec<_>>();
-    if expected_container == "openshell-network" {
-        let [network_init] = trust_init_containers.as_slice() else {
-            return Err(format!(
-                "expected trust only at the network-init boundary: {trust_init_containers:#?}"
-            ));
-        };
-        if network_init["name"] != "openshell-network-init" {
-            return Err(format!(
-                "destination CA mounted in unexpected init container: {network_init:#?}"
-            ));
-        }
-        let init_digest = network_ca_command_digest(
-            network_init["command"]
-                .as_array()
-                .ok_or("network-init command missing")?,
-        )?;
-        if init_digest != supervisor_digest {
-            return Err("network-init and supervisor trust digests differ".to_string());
-        }
-    } else if !trust_init_containers.is_empty() {
-        return Err("destination CA leaked outside the network supervisor boundary".to_string());
-    }
-
-    let volume = pod["spec"]["volumes"]
-        .as_array()
-        .unwrap()
+        .ok_or("dedicated supervisor Pod volumes missing")?
         .iter()
         .find(|volume| volume["name"] == NETWORK_CA_VOLUME)
-        .unwrap();
+        .ok_or("dedicated supervisor destination CA volume missing")?;
     let managed_name = volume["configMap"]["name"]
         .as_str()
         .ok_or("managed destination CA ConfigMap name missing")?;
+    if !managed_name.starts_with("openshell-network-additional-ca-")
+        || volume["configMap"]["items"].as_array().is_none_or(|items| {
+            items != &vec![serde_json::json!({"key": "ca.crt", "path": "ca.crt"})]
+        })
+    {
+        return Err(format!(
+            "dedicated supervisor has an unexpected destination CA ConfigMap volume: {volume:#?}"
+        ));
+    }
+
+    let workload = items
+        .iter()
+        .find(|pod| pod["metadata"]["labels"]["openshell.ai/boundary-role"] == "workload")
+        .ok_or("paired workload Pod not found")?;
+    let workload_volumes = workload["spec"]["volumes"]
+        .as_array()
+        .ok_or("workload Pod volumes missing")?;
+    if workload_volumes
+        .iter()
+        .any(|volume| volume["name"] == NETWORK_CA_VOLUME)
+    {
+        return Err("destination CA ConfigMap leaked into workload Pod volumes".to_string());
+    }
+    for container in workload["spec"]["containers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            workload["spec"]["initContainers"]
+                .as_array()
+                .into_iter()
+                .flatten(),
+        )
+    {
+        if container["volumeMounts"].as_array().is_some_and(|mounts| {
+            mounts.iter().any(|mount| {
+                mount["name"] == NETWORK_CA_VOLUME || mount["mountPath"] == NETWORK_CA_PATH
+            })
+        }) {
+            return Err(format!(
+                "destination CA leaked into workload container or bootstrap init container: {container:#?}"
+            ));
+        }
+    }
+
     let config_map = kubectl_json(&[
         "-n",
         &namespace,
@@ -338,10 +349,18 @@ fn inspect_kubernetes_pod() -> Result<String, String> {
         "-o",
         "json",
     ])?;
+    let supervisor_gateway = supervisor["metadata"]["labels"]["openshell.ai/gateway-id"]
+        .as_str()
+        .ok_or("dedicated supervisor gateway ownership label missing")?;
     if config_map["metadata"]["labels"]["openshell.ai/managed-by"] != "openshell"
+        || config_map["metadata"]["labels"]["openshell.ai/gateway-id"] != supervisor_gateway
+        || config_map["metadata"]["ownerReferences"].is_array()
+        || config_map["immutable"] != true
+        || config_map["data"] != serde_json::json!({"ca.crt": config_map["data"]["ca.crt"].clone()})
         || config_map["data"]["ca.crt"].as_str().is_none()
+        || !config_map["binaryData"].is_null()
     {
-        return Err("managed destination CA ConfigMap metadata/data is incomplete".to_string());
+        return Err("managed destination CA ConfigMap ownership/data is incomplete".to_string());
     }
     let config_map_digest =
         config_map["metadata"]["annotations"]["openshell.ai/network-additional-ca-generation"]
@@ -350,7 +369,7 @@ fn inspect_kubernetes_pod() -> Result<String, String> {
     if supervisor_digest != config_map_digest {
         return Err("supervisor digest does not match managed ConfigMap generation".to_string());
     }
-    Ok(format!("{namespace}/{managed_name}/{pod_name}"))
+    Ok(format!("{namespace}/{managed_name}/{supervisor_name}"))
 }
 
 #[cfg(feature = "e2e-vm")]

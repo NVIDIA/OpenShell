@@ -480,6 +480,12 @@ message StartSandboxRequest {
   bool resume = 7;
   // Forwarded to ResumeBoundaryRequest.restart_if_restore_fails.
   bool restart_if_restore_fails = 8;
+  // Durable provisioning snapshot recovered by the gateway from its persisted
+  // Sandbox record. Local drivers use this only to reconcile a stopped
+  // workload/supervisor pair without trusting mutable runtime inspection
+  // output. Older gateways omit the field, preserving the original start
+  // contract on the wire.
+  optional DriverSandbox sandbox = 9;
 }
 
 message SuspendSandboxRequest {

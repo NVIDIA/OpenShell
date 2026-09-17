@@ -27,6 +27,9 @@ RUN_WITH_GATEWAY_COMMAND="__openshell_run_kubernetes_e2e"
 source "${ROOT}/e2e/support/conformance.sh"
 
 # Unset or empty selects Rust defaults; e2e-conformance-only skips Rust tests.
+# Reusable-workflow inputs are exported as an explicitly empty environment
+# variable when the caller uses their default. Treat that the same as unset so
+# the focused additional-CA row retains the upstream Kubernetes feature set.
 E2E_FEATURES="${OPENSHELL_E2E_KUBERNETES_FEATURES:-e2e,e2e-host-gateway,e2e-kubernetes}"
 
 if [ "${OPENSHELL_E2E_KUBE_TEST:-}" = "additional_ca" ]; then
