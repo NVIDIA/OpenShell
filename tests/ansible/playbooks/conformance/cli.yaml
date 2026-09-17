@@ -39,19 +39,6 @@
           - conformance_archive.stat.isreg | default(false)
         fail_msg: OpenShell conformance test bundle did not contain tests.tar.zst
 
-    # The archived candidate CLI runs in a fresh guest and needs an explicit
-    # local gateway selection for its status and sandbox lifecycle commands.
-    - name: Register OpenShell gateway
-      ansible.builtin.command:
-        argv:
-          - /usr/local/bin/openshell
-          - gateway
-          - add
-          - http://127.0.0.1:17670
-          - --local
-          - --name
-          - tmachine
-
     - name: Run OpenShell conformance archive
       ansible.builtin.command:
         argv:
