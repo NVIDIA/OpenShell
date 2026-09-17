@@ -572,6 +572,7 @@ pub async fn run_network_proxy(
         #[cfg(target_os = "linux")]
         None,
         None,
+        None,
     )
     .await?;
 
@@ -957,6 +958,7 @@ pub async fn run_sandbox(
             #[cfg(target_os = "linux")]
             None,
             Some(remote_network_source),
+            None,
         )
         .await?,
     );
