@@ -148,11 +148,15 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-podman-test.yml
+    uses: ./.github/workflows/tmachine-test.yml
     with:
-      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
-      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
-      conformance-artifact-prefix: openshell-conformance
+      test-matrix: >-
+        [
+          {
+            "scenario":"fedora-podman-rootful",
+            "testsuite":"provider-refresh"
+          }
+        ]
 
   vm-e2e:
     needs: [compute-versions, build-binaries, build-vm-driver]

@@ -130,11 +130,15 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-podman-test.yml
+    uses: ./.github/workflows/tmachine-test.yml
     with:
-      image-tag: ${{ github.sha }}
-      checkout-ref: ${{ github.sha }}
-      conformance-artifact-prefix: openshell-conformance
+      test-matrix: >-
+        [
+          {
+            "scenario":"fedora-podman-rootful",
+            "testsuite":"provider-refresh"
+          }
+        ]
 
   vm-e2e:
     needs: [build-binaries, build-vm-driver]
@@ -146,6 +150,14 @@ jobs:
     with:
       checkout-ref: ${{ github.sha }}
       conformance-artifact-prefix: openshell-conformance
+
+  conformance:
+    needs: [build-binaries, build-sandbox-image, build-supervisor-image]
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/tmachine-test.yml
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
