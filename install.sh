@@ -371,11 +371,29 @@ resolve_latest_prerelease_tag() {
 
   info "resolving latest prerelease..."
   _artifact_platform="$(prerelease_artifact_platform)"
-  _artifact_names="$(gh api --paginate \
+  _successful_run_ids="$(gh api --paginate \
+    "repos/${REPO}/actions/workflows/release-tag.yml/runs?status=success&per_page=100" \
+    --jq '.workflow_runs[] | select(.status == "completed" and .conclusion == "success") | .id')" || {
+    error "failed to list successful Release Tag workflow runs"
+  }
+  _artifact_records="$(gh api --paginate \
     "repos/${REPO}/actions/artifacts?per_page=100" \
-    --jq '.artifacts[] | select(.expired == false) | .name')" || {
+    --jq '.artifacts[] | select(.expired == false) | [.workflow_run.id, .name] | @tsv')" || {
     error "failed to list prerelease artifacts"
   }
+  _artifact_names="$(printf '%s\n--ARTIFACTS--\n%s\n' "$_successful_run_ids" "$_artifact_records" | awk -F '\t' '
+    $0 == "--ARTIFACTS--" {
+      reading_artifacts = 1
+      next
+    }
+    !reading_artifacts {
+      if ($1 ~ /^[0-9]+$/) successful_runs[$1] = 1
+      next
+    }
+    $1 in successful_runs {
+      print $2
+    }
+  ')"
   _release_tags="$(printf '%s\n' "$_artifact_names" | sed -n "s/^openshell-\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*-pre\.[1-9][0-9]*\)-${_artifact_platform}$/\1/p" | sort -u)"
 
   _latest_prerelease="$(printf '%s\n' "$_release_tags" | awk '

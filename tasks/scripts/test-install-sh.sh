@@ -141,13 +141,17 @@ gh() {
     api:*)
       case "$*" in
         *"?name="*) printf '123456\n' ;;
+        *"actions/workflows/release-tag.yml/runs?status=success"*)
+          printf '%s\n' 100 101
+          ;;
         *)
           if [ "${MOCK_NO_PRERELEASE:-0}" != "1" ]; then
-            printf '%s\n' \
-              openshell-v0.1.0-pre.9-linux-amd64-deb \
-              openshell-v1.0.0-pre.2-linux-amd64-deb \
-              openshell-v1.0.0-pre.1-macos-arm64 \
-              openshell-v0.2.0-pre.10-linux-aarch64-rpm
+            printf '%b\n' \
+              '100\topenshell-v0.1.0-pre.9-linux-amd64-deb' \
+              '101\topenshell-v1.0.0-pre.2-linux-amd64-deb' \
+              '101\topenshell-v1.0.0-pre.1-macos-arm64' \
+              '101\topenshell-v0.2.0-pre.10-linux-aarch64-rpm' \
+              '999\topenshell-v2.0.0-pre.1-linux-amd64-deb'
           fi
           ;;
       esac
@@ -171,6 +175,16 @@ gh() {
 resolved_prerelease="$(OPENSHELL_VERSION=pre resolve_release_tag)"
 if [ "$resolved_prerelease" != "v1.0.0-pre.2" ]; then
   echo "FAIL: pre alias resolved to ${resolved_prerelease}, expected v1.0.0-pre.2" >&2
+  exit 1
+fi
+if ! grep -Fq 'actions/workflows/release-tag.yml/runs?status=success' "$mock_gh_log"; then
+  echo "FAIL: pre alias did not query successful Release Tag workflow runs" >&2
+  cat "$mock_gh_log" >&2
+  exit 1
+fi
+if ! grep -Fq 'select(.status == "completed" and .conclusion == "success")' "$mock_gh_log"; then
+  echo "FAIL: pre alias did not require completed successful workflow runs" >&2
+  cat "$mock_gh_log" >&2
   exit 1
 fi
 
