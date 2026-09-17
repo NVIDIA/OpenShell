@@ -110,7 +110,7 @@ enum SandboxRuntimeBootstrapPhase {
     Preparing,
     Released,
     Releasing,
-    RollingBack,
+    Suspending,
 }
 
 impl SandboxRuntimeBootstrapPhase {
@@ -119,7 +119,7 @@ impl SandboxRuntimeBootstrapPhase {
             Self::Preparing => "preparing",
             Self::Released => "released",
             Self::Releasing => "releasing",
-            Self::RollingBack => "rolling-back",
+            Self::Suspending => "suspending",
         }
     }
 
@@ -128,7 +128,7 @@ impl SandboxRuntimeBootstrapPhase {
             "preparing" => Some(Self::Preparing),
             "released" => Some(Self::Released),
             "releasing" => Some(Self::Releasing),
-            "rolling-back" => Some(Self::RollingBack),
+            "suspending" => Some(Self::Suspending),
             _ => None,
         }
     }
@@ -2711,14 +2711,14 @@ impl KubernetesComputeDriver {
     async fn stop_sandbox_inner(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
         let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout, phase) =
             self.prepare_sandbox_stop(sandbox_id).await?;
-        if phase != Some(SandboxRuntimeBootstrapPhase::RollingBack) {
+        if phase != Some(SandboxRuntimeBootstrapPhase::Suspending) {
             self.delete_sandbox_runtime_supervisor_pod(sandbox_id, &namespace)
                 .await?;
             patch_dynamic_object_with_resource_version_retry(
                 &agent_sandbox_api.api,
                 &kube_name,
                 |version| {
-                    sandbox_runtime_rollback_patch(&agent_sandbox_api.resource.version, version)
+                    sandbox_runtime_suspension_patch(&agent_sandbox_api.resource.version, version)
                 },
             )
             .await?;
@@ -2765,7 +2765,7 @@ impl KubernetesComputeDriver {
                 patch_dynamic_object_with_resource_version_retry(
                     &agent_sandbox_api.api,
                     &kube_name,
-                    sandbox_runtime_rollback_completion_patch,
+                    sandbox_runtime_suspension_completion_patch,
                 )
                 .await?;
                 return Ok(());
@@ -2833,7 +2833,7 @@ impl KubernetesComputeDriver {
         let mut object = objects.pop().ok_or(KubernetesDriverError::NotFound)?;
         if sandbox_runtime_bootstrap_in_progress(&object) {
             let phase = sandbox_runtime_bootstrap_phase(&object);
-            if phase != Some(SandboxRuntimeBootstrapPhase::RollingBack)
+            if phase != Some(SandboxRuntimeBootstrapPhase::Suspending)
                 && sandbox_runtime_bootstrap_operation(&object) != Some("restart")
             {
                 return Err(KubernetesDriverError::Precondition(
@@ -3115,7 +3115,7 @@ impl KubernetesComputeDriver {
         if !matches!(
             phase,
             Some(
-                SandboxRuntimeBootstrapPhase::Releasing | SandboxRuntimeBootstrapPhase::RollingBack
+                SandboxRuntimeBootstrapPhase::Releasing | SandboxRuntimeBootstrapPhase::Suspending
             )
         ) {
             patch_dynamic_object_with_resource_version_retry(
@@ -3467,9 +3467,9 @@ impl KubernetesComputeDriver {
                 continue;
             }
             if sandbox_runtime_bootstrap_phase(&object)
-                == Some(SandboxRuntimeBootstrapPhase::RollingBack)
+                == Some(SandboxRuntimeBootstrapPhase::Suspending)
             {
-                self.reconcile_sandbox_runtime_rollback(
+                self.reconcile_sandbox_runtime_suspending(
                     &lookup_api,
                     &object,
                     &sandbox_id,
@@ -3600,7 +3600,7 @@ impl KubernetesComputeDriver {
         }
     }
 
-    async fn reconcile_sandbox_runtime_rollback(
+    async fn reconcile_sandbox_runtime_suspending(
         &self,
         lookup_api: &AgentSandboxApi,
         object: &DynamicObject,
@@ -3620,7 +3620,7 @@ impl KubernetesComputeDriver {
             Ok(true) => {}
             Ok(false) => return,
             Err(error) => {
-                debug!(sandbox_id, %error, "could not verify sandbox-runtime rollback; reconciliation will retry");
+                debug!(sandbox_id, %error, "could not verify sandbox-runtime suspension; reconciliation will retry");
                 return;
             }
         }
@@ -3628,7 +3628,7 @@ impl KubernetesComputeDriver {
             .delete_sandbox_runtime_supervisor(sandbox_id, namespace)
             .await
         {
-            warn!(sandbox_id, %error, "could not finish sandbox-runtime rollback cleanup");
+            warn!(sandbox_id, %error, "could not finish sandbox-runtime suspension cleanup");
             return;
         }
         let Some(resource_version) = object.metadata.resource_version.as_deref() else {
@@ -3636,7 +3636,7 @@ impl KubernetesComputeDriver {
         };
         let api =
             Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
-        let patch = sandbox_runtime_rollback_completion_patch(resource_version);
+        let patch = sandbox_runtime_suspension_completion_patch(resource_version);
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             api.api
@@ -3646,10 +3646,13 @@ impl KubernetesComputeDriver {
         {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
-                debug!(sandbox_id, %error, "sandbox-runtime rollback completion raced; reconciliation will retry");
+                debug!(sandbox_id, %error, "sandbox-runtime suspension completion raced; reconciliation will retry");
             }
             Err(_) => {
-                warn!(sandbox_id, "timed out completing sandbox-runtime rollback");
+                warn!(
+                    sandbox_id,
+                    "timed out completing sandbox-runtime suspension"
+                );
             }
         }
     }
@@ -3674,7 +3677,8 @@ impl KubernetesComputeDriver {
         };
         let api =
             Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
-        let patch = sandbox_runtime_rollback_patch(&lookup_api.resource.version, resource_version);
+        let patch =
+            sandbox_runtime_suspension_patch(&lookup_api.resource.version, resource_version);
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             api.api
@@ -3764,7 +3768,7 @@ impl KubernetesComputeDriver {
             .unwrap_or(&self.config.namespace);
         let api =
             Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
-        let patch = sandbox_runtime_rollback_patch(
+        let patch = sandbox_runtime_suspension_patch(
             &lookup_api.resource.version,
             object
                 .metadata
@@ -6603,7 +6607,7 @@ fn sandbox_operating_state_patch(
                 "spec": {"operatingMode": "Running"}
             })
         } else {
-            sandbox_runtime_rollback_patch(api_version, resource_version)
+            sandbox_runtime_suspension_patch(api_version, resource_version)
         }
     } else {
         if running {
@@ -6612,7 +6616,7 @@ fn sandbox_operating_state_patch(
                 "spec": {"replicas": 1}
             })
         } else {
-            sandbox_runtime_rollback_patch(api_version, resource_version)
+            sandbox_runtime_suspension_patch(api_version, resource_version)
         }
     }
 }
@@ -6632,7 +6636,10 @@ fn sandbox_runtime_stop_begin_patch(resource_version: &str) -> serde_json::Value
     })
 }
 
-fn sandbox_runtime_rollback_patch(api_version: &str, resource_version: &str) -> serde_json::Value {
+fn sandbox_runtime_suspension_patch(
+    api_version: &str,
+    resource_version: &str,
+) -> serde_json::Value {
     let desired_state = if api_version == SANDBOX_VERSION_V1BETA1 {
         serde_json::json!({"operatingMode": "Suspended"})
     } else {
@@ -6645,7 +6652,7 @@ fn sandbox_runtime_rollback_patch(api_version: &str, resource_version: &str) -> 
                 ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true",
                 ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: openshell_core::time::now_ms().to_string(),
                 ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "stop",
-                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: SandboxRuntimeBootstrapPhase::RollingBack.as_str(),
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: SandboxRuntimeBootstrapPhase::Suspending.as_str(),
                 ANNOTATION_SANDBOX_RUNTIME_READINESS: "unavailable",
             },
         },
@@ -6653,7 +6660,7 @@ fn sandbox_runtime_rollback_patch(api_version: &str, resource_version: &str) -> 
     })
 }
 
-fn sandbox_runtime_rollback_completion_patch(resource_version: &str) -> serde_json::Value {
+fn sandbox_runtime_suspension_completion_patch(resource_version: &str) -> serde_json::Value {
     serde_json::json!({
         "metadata": {
             "resourceVersion": resource_version,
@@ -7584,11 +7591,11 @@ mod tests {
         );
         assert!(stop_begin.get("spec").is_none());
 
-        let beta_stop = sandbox_runtime_rollback_patch(SANDBOX_VERSION_V1BETA1, "43");
+        let beta_stop = sandbox_runtime_suspension_patch(SANDBOX_VERSION_V1BETA1, "43");
         assert_eq!(beta_stop["spec"]["operatingMode"], "Suspended");
         assert!(beta_stop["spec"].get("replicas").is_none());
 
-        let alpha_stop = sandbox_runtime_rollback_patch(SANDBOX_VERSION_V1ALPHA1, "44");
+        let alpha_stop = sandbox_runtime_suspension_patch(SANDBOX_VERSION_V1ALPHA1, "44");
         assert_eq!(alpha_stop["spec"]["replicas"], 0);
         assert!(alpha_stop["spec"].get("operatingMode").is_none());
 
@@ -7600,7 +7607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_resumed_from_rolling_back_removes_the_complete_runtime() {
+    async fn stop_resumed_from_suspending_removes_the_complete_runtime() {
         let sandbox = serde_json::json!({
             "apiVersion": "agents.x-k8s.io/v1beta1",
             "kind": "Sandbox",
@@ -7611,7 +7618,7 @@ mod tests {
                 "annotations": {
                     SANDBOX_POD_NAME_ANNOTATION: "workload-pod",
                     ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE:
-                        SandboxRuntimeBootstrapPhase::RollingBack.as_str()
+                        SandboxRuntimeBootstrapPhase::Suspending.as_str()
                 }
             },
             "status": {"conditions": [{"type": "Suspended", "status": "True"}]}
@@ -7724,7 +7731,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), driver.stop_sandbox("sandbox-1"))
             .await
             .expect("stop timed out")
-            .expect("resume stop from RollingBack");
+            .expect("resume stop from Suspending");
         assert!(steps.lock().unwrap().is_empty());
     }
 
@@ -10382,24 +10389,24 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_runtime_rollback_is_durable_until_cleanup_completes() {
-        let rollback = sandbox_runtime_rollback_patch(SANDBOX_VERSION_V1BETA1, "42");
-        assert_eq!(rollback["metadata"]["resourceVersion"], "42");
+    fn sandbox_runtime_suspension_is_durable_until_cleanup_completes() {
+        let suspension = sandbox_runtime_suspension_patch(SANDBOX_VERSION_V1BETA1, "42");
+        assert_eq!(suspension["metadata"]["resourceVersion"], "42");
         assert_eq!(
-            rollback["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING],
+            suspension["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING],
             "true"
         );
         assert_eq!(
-            rollback["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION],
+            suspension["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION],
             "stop"
         );
         assert_eq!(
-            rollback["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE],
-            SandboxRuntimeBootstrapPhase::RollingBack.as_str()
+            suspension["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE],
+            SandboxRuntimeBootstrapPhase::Suspending.as_str()
         );
-        assert_eq!(rollback["spec"]["operatingMode"], "Suspended");
+        assert_eq!(suspension["spec"]["operatingMode"], "Suspended");
 
-        let complete = sandbox_runtime_rollback_completion_patch("43");
+        let complete = sandbox_runtime_suspension_completion_patch("43");
         assert_eq!(complete["metadata"]["resourceVersion"], "43");
         for annotation in [
             ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING,
@@ -10502,7 +10509,7 @@ mod tests {
 
         sandbox.metadata.annotations.as_mut().unwrap().insert(
             ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE.to_string(),
-            SandboxRuntimeBootstrapPhase::RollingBack
+            SandboxRuntimeBootstrapPhase::Suspending
                 .as_str()
                 .to_string(),
         );

@@ -663,14 +663,14 @@ kubectl auth can-i delete pods \
 ```
 
 Do not suspend or delete the workload Pod manually. The driver advances to
-`rolling-back` only after runtime control has been released, and then suspends
-the workload.
+`suspending` only after runtime control has been released, and then suspends the
+workload.
 
-If a Sandbox remains in the `rolling-back` bootstrap phase, verify that the
+If a Sandbox remains in the `suspending` bootstrap phase, verify that the
 gateway ServiceAccount can create, list, and delete Secrets in the sandbox
 namespace. Recovery lists generation Secrets by sandbox and component labels
 even when none remain, then deletes stale entries with UID preconditions before
-clearing the rollback annotations:
+clearing the suspension annotations:
 
 ```bash
 for verb in create list delete; do
