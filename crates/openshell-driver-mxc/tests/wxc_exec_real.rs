@@ -40,6 +40,126 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+mod token_probe {
+    #![allow(unsafe_code)]
+
+    use std::ffi::c_void;
+    use std::ptr;
+
+    #[repr(C)]
+    struct SidIdentifierAuthority {
+        value: [u8; 6],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
+        fn GetTokenInformation(
+            token: isize,
+            class: i32,
+            info: *mut c_void,
+            len: u32,
+            return_len: *mut u32,
+        ) -> i32;
+        fn AllocateAndInitializeSid(
+            authority: *const SidIdentifierAuthority,
+            count: u8,
+            sub0: u32,
+            sub1: u32,
+            sub2: u32,
+            sub3: u32,
+            sub4: u32,
+            sub5: u32,
+            sub6: u32,
+            sub7: u32,
+            sid: *mut *mut c_void,
+        ) -> i32;
+        fn FreeSid(sid: *mut c_void) -> *mut c_void;
+        fn CheckTokenMembership(token: isize, sid: *const c_void, is_member: *mut i32) -> i32;
+    }
+
+    fn token_u32(token: isize, class: i32) -> Option<u32> {
+        let mut value = 0u32;
+        let mut returned = 0u32;
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                class,
+                (&raw mut value).cast(),
+                u32::try_from(size_of::<u32>()).expect("u32 size fits Win32 length"),
+                &raw mut returned,
+            )
+        };
+        (ok != 0).then_some(value)
+    }
+
+    fn has_appcontainer_sid(token: isize) -> bool {
+        let mut buf = [0u8; 256];
+        let mut returned = 0u32;
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                31, // TokenAppContainerSid
+                buf.as_mut_ptr().cast(),
+                u32::try_from(buf.len()).expect("token buffer length fits u32"),
+                &raw mut returned,
+            )
+        };
+        ok != 0 && !unsafe { ptr::read_unaligned(buf.as_ptr().cast::<*const c_void>()) }.is_null()
+    }
+
+    fn effective_administrator() -> Option<bool> {
+        let authority = SidIdentifierAuthority {
+            value: [0, 0, 0, 0, 0, 5],
+        };
+        let mut sid = ptr::null_mut();
+        let allocated = unsafe {
+            AllocateAndInitializeSid(
+                &raw const authority,
+                2,
+                32,  // SECURITY_BUILTIN_DOMAIN_RID
+                544, // DOMAIN_ALIAS_RID_ADMINS
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &raw mut sid,
+            )
+        };
+        if allocated == 0 {
+            return None;
+        }
+        let mut member = 0;
+        let checked = unsafe { CheckTokenMembership(0, sid, &raw mut member) };
+        unsafe { FreeSid(sid) };
+        (checked != 0).then_some(member != 0)
+    }
+
+    pub fn snapshot() -> serde_json::Value {
+        let mut token = 0isize;
+        let opened = unsafe { OpenProcessToken(GetCurrentProcess(), 0x0008, &raw mut token) };
+        assert_ne!(opened, 0, "OpenProcessToken failed");
+
+        let snapshot = serde_json::json!({
+            "is_appcontainer": token_u32(token, 29), // TokenIsAppContainer
+            "has_appcontainer_sid": has_appcontainer_sid(token),
+            "effective_administrator": effective_administrator(),
+        });
+        unsafe { CloseHandle(token) };
+        snapshot
+    }
+}
+
+const TOKEN_PROBE_MARKER: &str = "OPENSHELL_MXC_TOKEN_PROBE=";
+
 // ── Path resolution ──────────────────────────────────────────────────────────
 
 /// Resolve the path to `wxc-exec.exe`.
@@ -477,6 +597,17 @@ fn dryrun_accepts_split_policy_output() {
 // These skip on this box (processcontainer velocity keys not enabled;
 // isolation_session backend absent). They PASS where backends are live.
 
+/// Entrypoint used by `pc_oneshot_token_is_appcontainer_without_effective_admin`.
+/// The parent test relaunches this integration-test binary inside MXC so the
+/// probe observes the workload token rather than the host test runner's token.
+#[test]
+fn child_token_probe_entry() {
+    if std::env::var("OPENSHELL_MXC_CHILD_TOKEN_PROBE").as_deref() != Ok("1") {
+        return;
+    }
+    println!("{TOKEN_PROBE_MARKER}{}", token_probe::snapshot());
+}
+
 /// Probe the processcontainer backend.
 ///
 /// Runs a trivial one-shot (`cmd /c exit 0`, user-owned temp grant). Returns
@@ -799,6 +930,93 @@ fn pc_oneshot_in_policy_write_succeeds() {
         target.exists(),
         "in-policy write: file should exist at {target_str}\nstdout={stdout}\nstderr={stderr}"
     );
+}
+
+/// Verify the default `ProcessContainer` token through the token APIs Windows
+/// uses for access checks. `whoami /all` is not sufficient for this assertion:
+/// the package SID is exposed through `TokenAppContainerSid`, and a group SID
+/// listed in the token is not an effective membership unless it is enabled.
+#[test]
+#[ignore = "requires real wxc-exec"]
+fn pc_oneshot_token_is_appcontainer_without_effective_admin() {
+    let Some(wxc) = wxc_path() else {
+        eprintln!("SKIP: wxc-exec not found");
+        return;
+    };
+    if let Err(reason) = probe_processcontainer(&wxc) {
+        eprintln!("SKIP: processcontainer not live: {reason}");
+        return;
+    }
+
+    let (tempdir, temp_path) = temp_fixture();
+    let test_exe = std::env::current_exe().expect("resolve integration-test executable");
+    let test_exe_parent = test_exe
+        .parent()
+        .expect("integration-test executable has a parent")
+        .to_string_lossy()
+        .into_owned();
+    let command_line = format!(
+        "\"{}\" --exact child_token_probe_entry --nocapture",
+        test_exe.display()
+    );
+    let mut child_env = vec!["OPENSHELL_MXC_CHILD_TOKEN_PROBE=1".to_string()];
+    child_env.extend(
+        ["SYSTEMROOT", "WINDIR", "PATH", "COMSPEC", "LOCALAPPDATA"]
+            .into_iter()
+            .filter_map(|key| {
+                std::env::var(key)
+                    .ok()
+                    .map(|value| format!("{key}={value}"))
+            }),
+    );
+    let config = serde_json::json!({
+        "version": "0.8.0-alpha",
+        "containerId": "pc-token-identity",
+        "containment": "processcontainer",
+        "process": {
+            "commandLine": command_line,
+            "cwd": temp_path,
+            "env": child_env,
+            "timeout": 30_000,
+        },
+        "filesystem": {
+            "readwritePaths": [temp_path],
+            "readonlyPaths": [test_exe_parent],
+        },
+        "processContainer": {
+            "leastPrivilege": false,
+        },
+        "ui": {
+            "disable": false,
+            "clipboard": "none",
+            "injection": false,
+        },
+    });
+    let json = serde_json::to_string(&config).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+    let out = Command::new(&wxc)
+        .arg("--config-base64")
+        .arg(&b64)
+        .output()
+        .expect("wxc-exec token probe spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "token probe should exit successfully\nstdout={stdout}\nstderr={stderr}"
+    );
+    let snapshot: serde_json::Value = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(TOKEN_PROBE_MARKER))
+        .map_or_else(
+            || panic!("token probe marker missing\nstdout={stdout}\nstderr={stderr}"),
+            |value| serde_json::from_str(value).expect("parse token probe JSON"),
+        );
+
+    assert_eq!(snapshot["is_appcontainer"], 1);
+    assert_eq!(snapshot["has_appcontainer_sid"], true);
+    assert_eq!(snapshot["effective_administrator"], false);
+    drop(tempdir);
 }
 
 /// Run an HTTPS request through the real driver and `ProcessContainer`. The
