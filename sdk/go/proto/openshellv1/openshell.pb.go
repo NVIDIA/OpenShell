@@ -2802,8 +2802,6 @@ func (x *SandboxWorkloadTemplateProvenance) GetResourceVersion() string {
 // Public status does not embed driver-only flags such as `deleting`.
 type SandboxStatus struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Compute-platform sandbox object name.
-	SandboxName string `protobuf:"bytes,1,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"`
 	// Name of the agent pod or equivalent runtime instance.
 	AgentPod string `protobuf:"bytes,2,opt,name=agent_pod,json=agentPod,proto3" json:"agent_pod,omitempty"`
 	// File descriptor or endpoint for reaching the agent service, when available.
@@ -2865,13 +2863,6 @@ func (x *SandboxStatus) ProtoReflect() protoreflect.Message {
 // Deprecated: Use SandboxStatus.ProtoReflect.Descriptor instead.
 func (*SandboxStatus) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{28}
-}
-
-func (x *SandboxStatus) GetSandboxName() string {
-	if x != nil {
-		return x.SandboxName
-	}
-	return ""
 }
 
 func (x *SandboxStatus) GetAgentPod() string {
@@ -3144,14 +3135,14 @@ type CreateSandboxRequest struct {
 	// One-shot launch hint indicating that the creating client will attach to
 	// the canonical main process. The supervisor keeps the terminal transport
 	// alive until that attachment connects and closes naturally.
-	AwaitMainProcessAttachment bool `protobuf:"varint,6,opt,name=await_main_process_attachment,json=awaitMainProcessAttachment,proto3" json:"await_main_process_attachment,omitempty"`
+	AwaitMainProcessAttachment bool `protobuf:"varint,5,opt,name=await_main_process_attachment,json=awaitMainProcessAttachment,proto3" json:"await_main_process_attachment,omitempty"`
 	// Workspace-scoped SandboxWorkloadTemplate name to resolve at creation time.
-	WorkloadTemplateName string `protobuf:"bytes,7,opt,name=workload_template_name,json=workloadTemplateName,proto3" json:"workload_template_name,omitempty"`
+	WorkloadTemplateName string `protobuf:"bytes,6,opt,name=workload_template_name,json=workloadTemplateName,proto3" json:"workload_template_name,omitempty"`
 	// Explicit workspace for the sandbox. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,8,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	Workspace string `protobuf:"bytes,7,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,9,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,8,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3228,11 +3219,11 @@ func (x *CreateSandboxRequest) GetWorkloadTemplateName() string {
 	return ""
 }
 
-func (x *CreateSandboxRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *CreateSandboxRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 func (x *CreateSandboxRequest) GetRequestId() string {
@@ -3246,10 +3237,10 @@ type CreateSandboxTemplateRequest struct {
 	state    protoimpl.MessageState   `protogen:"open.v1"`
 	Template *SandboxWorkloadTemplate `protobuf:"bytes,1,opt,name=template,proto3" json:"template,omitempty"`
 	// Explicit workspace for the template. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	Workspace string `protobuf:"bytes,2,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,3,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3291,11 +3282,11 @@ func (x *CreateSandboxTemplateRequest) GetTemplate() *SandboxWorkloadTemplate {
 	return nil
 }
 
-func (x *CreateSandboxTemplateRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *CreateSandboxTemplateRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 func (x *CreateSandboxTemplateRequest) GetRequestId() string {
@@ -3308,10 +3299,10 @@ func (x *CreateSandboxTemplateRequest) GetRequestId() string {
 type GetSandboxTemplateRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Canonical workspace name.
+	Workspace     string `protobuf:"bytes,2,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetSandboxTemplateRequest) Reset() {
@@ -3351,11 +3342,11 @@ func (x *GetSandboxTemplateRequest) GetName() string {
 	return ""
 }
 
-func (x *GetSandboxTemplateRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *GetSandboxTemplateRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 type ListSandboxTemplatesRequest struct {
@@ -3367,9 +3358,9 @@ type ListSandboxTemplatesRequest struct {
 	// parameters except page_size must match the request that produced it.
 	PageToken string `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	// Optional label selector in key=value comma-separated form.
-	LabelSelector string `protobuf:"bytes,5,opt,name=label_selector,json=labelSelector,proto3" json:"label_selector,omitempty"`
+	LabelSelector string `protobuf:"bytes,3,opt,name=label_selector,json=labelSelector,proto3" json:"label_selector,omitempty"`
 	// Explicit named or all-workspaces scope.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,6,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,4,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -3435,13 +3426,13 @@ func (x *ListSandboxTemplatesRequest) GetWorkspaceScope() *datamodelv1.Workspace
 type DeleteSandboxTemplateRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	// Canonical workspace name.
+	Workspace string `protobuf:"bytes,2,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Succeed with ALREADY_ABSENT if the target is missing. Authorization and
 	// parent-workspace checks still apply.
-	AllowMissing bool `protobuf:"varint,4,opt,name=allow_missing,json=allowMissing,proto3" json:"allow_missing,omitempty"`
+	AllowMissing bool `protobuf:"varint,3,opt,name=allow_missing,json=allowMissing,proto3" json:"allow_missing,omitempty"`
 	// Optional nonzero UUID. Same ID and payload replay success for 24 hours.
-	RequestId     string `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3483,11 +3474,11 @@ func (x *DeleteSandboxTemplateRequest) GetName() string {
 	return ""
 }
 
-func (x *DeleteSandboxTemplateRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *DeleteSandboxTemplateRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 func (x *DeleteSandboxTemplateRequest) GetAllowMissing() bool {
@@ -3650,15 +3641,15 @@ type BeginRootfsTarStagingRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Base file name of the local archive. The gateway uses it only to name the
 	// staged file; path separators and traversal components are rejected.
-	FileName string `protobuf:"bytes,2,opt,name=file_name,json=fileName,proto3" json:"file_name,omitempty"`
+	FileName string `protobuf:"bytes,1,opt,name=file_name,json=fileName,proto3" json:"file_name,omitempty"`
 	// Size of the local archive in bytes, checked against the driver limit
 	// before the gateway allocates a slot.
-	SizeBytes uint64 `protobuf:"varint,3,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
+	SizeBytes uint64 `protobuf:"varint,2,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
 	// Explicit workspace that will own the sandbox created from this archive.
 	// The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,4,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	Workspace     string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *BeginRootfsTarStagingRequest) Reset() {
@@ -3705,11 +3696,11 @@ func (x *BeginRootfsTarStagingRequest) GetSizeBytes() uint64 {
 	return 0
 }
 
-func (x *BeginRootfsTarStagingRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *BeginRootfsTarStagingRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 // Gateway-issued staging slot.
@@ -3789,13 +3780,11 @@ func (x *BeginRootfsTarStagingResponse) GetExpirationTime() *timestamppb.Timesta
 
 // Get sandbox request.
 type GetSandboxRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name (canonical lookup key).
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Sandbox       string                 `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace     string                 `protobuf:"bytes,2,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetSandboxRequest) Reset() {
@@ -3828,18 +3817,18 @@ func (*GetSandboxRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{41}
 }
 
-func (x *GetSandboxRequest) GetName() string {
+func (x *GetSandboxRequest) GetSandbox() string {
 	if x != nil {
-		return x.Name
+		return x.Sandbox
 	}
 	return ""
 }
 
-func (x *GetSandboxRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *GetSandboxRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 // List sandboxes request.
@@ -3854,7 +3843,7 @@ type ListSandboxesRequest struct {
 	// Optional label selector for filtering (format: "key1=value1,key2=value2").
 	LabelSelector string `protobuf:"bytes,3,opt,name=label_selector,json=labelSelector,proto3" json:"label_selector,omitempty"`
 	// Explicit named or all-workspaces scope.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,6,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,4,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -3919,13 +3908,11 @@ func (x *ListSandboxesRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelecto
 
 // List providers attached to a sandbox request.
 type ListSandboxProvidersRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name (canonical lookup key).
-	SandboxName string `protobuf:"bytes,1,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Sandbox       string                 `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace     string                 `protobuf:"bytes,2,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ListSandboxProvidersRequest) Reset() {
@@ -3958,25 +3945,24 @@ func (*ListSandboxProvidersRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{43}
 }
 
-func (x *ListSandboxProvidersRequest) GetSandboxName() string {
+func (x *ListSandboxProvidersRequest) GetSandbox() string {
 	if x != nil {
-		return x.SandboxName
+		return x.Sandbox
 	}
 	return ""
 }
 
-func (x *ListSandboxProvidersRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *ListSandboxProvidersRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 // Attach provider to sandbox request.
 type AttachSandboxProviderRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name (canonical lookup key).
-	SandboxName string `protobuf:"bytes,1,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Sandbox string                 `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// Provider name to attach.
 	ProviderName string `protobuf:"bytes,2,opt,name=provider_name,json=providerName,proto3" json:"provider_name,omitempty"`
 	// Expected resource version for optimistic concurrency control.
@@ -3984,11 +3970,10 @@ type AttachSandboxProviderRequest struct {
 	// If non-zero, the server validates that the sandbox's current resource_version
 	// matches this value before applying the mutation, returning ABORTED on mismatch.
 	ExpectedResourceVersion uint64 `protobuf:"varint,3,opt,name=expected_resource_version,json=expectedResourceVersion,proto3" json:"expected_resource_version,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,5,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	Workspace               string `protobuf:"bytes,4,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4023,9 +4008,9 @@ func (*AttachSandboxProviderRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{44}
 }
 
-func (x *AttachSandboxProviderRequest) GetSandboxName() string {
+func (x *AttachSandboxProviderRequest) GetSandbox() string {
 	if x != nil {
-		return x.SandboxName
+		return x.Sandbox
 	}
 	return ""
 }
@@ -4044,11 +4029,11 @@ func (x *AttachSandboxProviderRequest) GetExpectedResourceVersion() uint64 {
 	return 0
 }
 
-func (x *AttachSandboxProviderRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *AttachSandboxProviderRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 func (x *AttachSandboxProviderRequest) GetRequestId() string {
@@ -4060,9 +4045,8 @@ func (x *AttachSandboxProviderRequest) GetRequestId() string {
 
 // Detach provider from sandbox request.
 type DetachSandboxProviderRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name (canonical lookup key).
-	SandboxName string `protobuf:"bytes,1,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Sandbox string                 `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// Provider name to detach.
 	ProviderName string `protobuf:"bytes,2,opt,name=provider_name,json=providerName,proto3" json:"provider_name,omitempty"`
 	// Expected resource version for optimistic concurrency control.
@@ -4070,11 +4054,10 @@ type DetachSandboxProviderRequest struct {
 	// If non-zero, the server validates that the sandbox's current resource_version
 	// matches this value before applying the mutation, returning ABORTED on mismatch.
 	ExpectedResourceVersion uint64 `protobuf:"varint,3,opt,name=expected_resource_version,json=expectedResourceVersion,proto3" json:"expected_resource_version,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,5,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	Workspace               string `protobuf:"bytes,4,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4109,9 +4092,9 @@ func (*DetachSandboxProviderRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{45}
 }
 
-func (x *DetachSandboxProviderRequest) GetSandboxName() string {
+func (x *DetachSandboxProviderRequest) GetSandbox() string {
 	if x != nil {
-		return x.SandboxName
+		return x.Sandbox
 	}
 	return ""
 }
@@ -4130,11 +4113,11 @@ func (x *DetachSandboxProviderRequest) GetExpectedResourceVersion() uint64 {
 	return 0
 }
 
-func (x *DetachSandboxProviderRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *DetachSandboxProviderRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 func (x *DetachSandboxProviderRequest) GetRequestId() string {
@@ -4147,16 +4130,15 @@ func (x *DetachSandboxProviderRequest) GetRequestId() string {
 // Delete sandbox request.
 type DeleteSandboxRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name (canonical lookup key).
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	// Canonical sandbox name.
+	Sandbox   string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace string `protobuf:"bytes,2,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Succeed with ALREADY_ABSENT if the target is missing. Does not wait for
 	// asynchronous cleanup and does not suppress authorization or parent errors.
-	AllowMissing bool `protobuf:"varint,4,opt,name=allow_missing,json=allowMissing,proto3" json:"allow_missing,omitempty"`
+	AllowMissing bool `protobuf:"varint,3,opt,name=allow_missing,json=allowMissing,proto3" json:"allow_missing,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4191,18 +4173,18 @@ func (*DeleteSandboxRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{46}
 }
 
-func (x *DeleteSandboxRequest) GetName() string {
+func (x *DeleteSandboxRequest) GetSandbox() string {
 	if x != nil {
-		return x.Name
+		return x.Sandbox
 	}
 	return ""
 }
 
-func (x *DeleteSandboxRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *DeleteSandboxRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 func (x *DeleteSandboxRequest) GetAllowMissing() bool {
@@ -4221,14 +4203,12 @@ func (x *DeleteSandboxRequest) GetRequestId() string {
 
 // Stop sandbox request.
 type StopSandboxRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name (canonical lookup key).
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Sandbox   string                 `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace string                 `protobuf:"bytes,2,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,3,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4263,18 +4243,18 @@ func (*StopSandboxRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{47}
 }
 
-func (x *StopSandboxRequest) GetName() string {
+func (x *StopSandboxRequest) GetSandbox() string {
 	if x != nil {
-		return x.Name
+		return x.Sandbox
 	}
 	return ""
 }
 
-func (x *StopSandboxRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *StopSandboxRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 func (x *StopSandboxRequest) GetRequestId() string {
@@ -4286,14 +4266,12 @@ func (x *StopSandboxRequest) GetRequestId() string {
 
 // Start sandbox request.
 type StartSandboxRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name (canonical lookup key).
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Sandbox   string                 `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace string                 `protobuf:"bytes,2,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,3,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4328,18 +4306,18 @@ func (*StartSandboxRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{48}
 }
 
-func (x *StartSandboxRequest) GetName() string {
+func (x *StartSandboxRequest) GetSandbox() string {
 	if x != nil {
-		return x.Name
+		return x.Sandbox
 	}
 	return ""
 }
 
-func (x *StartSandboxRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *StartSandboxRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 func (x *StartSandboxRequest) GetRequestId() string {
@@ -4623,7 +4601,7 @@ func (x *DetachSandboxProviderResponse) GetReceipt() *ProviderMutationReceipt {
 type ProviderDesiredIdentity struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	SandboxId       string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
-	SandboxName     string                 `protobuf:"bytes,2,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"`
+	Sandbox         string                 `protobuf:"bytes,2,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	AttachmentEpoch string                 `protobuf:"bytes,3,opt,name=attachment_epoch,json=attachmentEpoch,proto3" json:"attachment_epoch,omitempty"`
 	// Empty for a detached provider.
 	ProviderId              string `protobuf:"bytes,4,opt,name=provider_id,json=providerId,proto3" json:"provider_id,omitempty"`
@@ -4672,9 +4650,9 @@ func (x *ProviderDesiredIdentity) GetSandboxId() string {
 	return ""
 }
 
-func (x *ProviderDesiredIdentity) GetSandboxName() string {
+func (x *ProviderDesiredIdentity) GetSandbox() string {
 	if x != nil {
-		return x.SandboxName
+		return x.Sandbox
 	}
 	return ""
 }
@@ -5350,13 +5328,13 @@ func (x *ProviderReadinessStatus) GetOperation() *ConfigUpdateOperation {
 // Query an immutable receipt, or reconstruct the current desired state when
 // receipt_id is empty. The sandbox identity must match the receipt.
 type GetSandboxProviderStatusRequest struct {
-	state          protoimpl.MessageState         `protogen:"open.v1"`
-	SandboxName    string                         `protobuf:"bytes,1,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"`
-	ProviderName   string                         `protobuf:"bytes,2,opt,name=provider_name,json=providerName,proto3" json:"provider_name,omitempty"`
-	ReceiptId      string                         `protobuf:"bytes,3,opt,name=receipt_id,json=receiptId,proto3" json:"receipt_id,omitempty"`
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,4,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Sandbox       string                 `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	ProviderName  string                 `protobuf:"bytes,2,opt,name=provider_name,json=providerName,proto3" json:"provider_name,omitempty"`
+	ReceiptId     string                 `protobuf:"bytes,3,opt,name=receipt_id,json=receiptId,proto3" json:"receipt_id,omitempty"`
+	Workspace     string                 `protobuf:"bytes,4,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetSandboxProviderStatusRequest) Reset() {
@@ -5389,9 +5367,9 @@ func (*GetSandboxProviderStatusRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{61}
 }
 
-func (x *GetSandboxProviderStatusRequest) GetSandboxName() string {
+func (x *GetSandboxProviderStatusRequest) GetSandbox() string {
 	if x != nil {
-		return x.SandboxName
+		return x.Sandbox
 	}
 	return ""
 }
@@ -5410,11 +5388,11 @@ func (x *GetSandboxProviderStatusRequest) GetReceiptId() string {
 	return ""
 }
 
-func (x *GetSandboxProviderStatusRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *GetSandboxProviderStatusRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 type GetSandboxProviderStatusResponse struct {
@@ -5634,9 +5612,9 @@ func (x *DeleteSandboxResponse) GetSandboxId() string {
 
 // Create SSH session request.
 type CreateSshSessionRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox id.
-	SandboxId     string `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Sandbox       string                 `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace     string                 `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -5671,9 +5649,16 @@ func (*CreateSshSessionRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{66}
 }
 
-func (x *CreateSshSessionRequest) GetSandboxId() string {
+func (x *CreateSshSessionRequest) GetSandbox() string {
 	if x != nil {
-		return x.SandboxId
+		return x.Sandbox
+	}
+	return ""
+}
+
+func (x *CreateSshSessionRequest) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
 	}
 	return ""
 }
@@ -5791,19 +5776,17 @@ func (x *CreateSshSessionResponse) GetExpirationTime() *timestamppb.Timestamp {
 // Request to expose an HTTP service running inside a sandbox.
 type ExposeServiceRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name.
-	Sandbox string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// Service name within the sandbox.
 	Service string `protobuf:"bytes,2,opt,name=service,proto3" json:"service,omitempty"`
 	// Loopback TCP port inside the sandbox.
 	TargetPort uint32 `protobuf:"varint,3,opt,name=target_port,json=targetPort,proto3" json:"target_port,omitempty"`
 	// Whether to print/use the browser-facing service URL.
-	Domain bool `protobuf:"varint,4,opt,name=domain,proto3" json:"domain,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,6,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	Domain    bool   `protobuf:"varint,4,opt,name=domain,proto3" json:"domain,omitempty"`
+	Sandbox   string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace string `protobuf:"bytes,5,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,7,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -5838,13 +5821,6 @@ func (*ExposeServiceRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{68}
 }
 
-func (x *ExposeServiceRequest) GetSandbox() string {
-	if x != nil {
-		return x.Sandbox
-	}
-	return ""
-}
-
 func (x *ExposeServiceRequest) GetService() string {
 	if x != nil {
 		return x.Service
@@ -5866,11 +5842,18 @@ func (x *ExposeServiceRequest) GetDomain() bool {
 	return false
 }
 
-func (x *ExposeServiceRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *ExposeServiceRequest) GetSandbox() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Sandbox
 	}
-	return nil
+	return ""
+}
+
+func (x *ExposeServiceRequest) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
+	}
+	return ""
 }
 
 func (x *ExposeServiceRequest) GetRequestId() string {
@@ -5883,14 +5866,12 @@ func (x *ExposeServiceRequest) GetRequestId() string {
 // Request to fetch an exposed sandbox service endpoint.
 type GetServiceRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name.
-	Sandbox string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// Service name within the sandbox. Empty selects the unnamed endpoint.
-	Service string `protobuf:"bytes,2,opt,name=service,proto3" json:"service,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,4,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	Service       string `protobuf:"bytes,2,opt,name=service,proto3" json:"service,omitempty"`
+	Sandbox       string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace     string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetServiceRequest) Reset() {
@@ -5923,13 +5904,6 @@ func (*GetServiceRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{69}
 }
 
-func (x *GetServiceRequest) GetSandbox() string {
-	if x != nil {
-		return x.Sandbox
-	}
-	return ""
-}
-
 func (x *GetServiceRequest) GetService() string {
 	if x != nil {
 		return x.Service
@@ -5937,18 +5911,23 @@ func (x *GetServiceRequest) GetService() string {
 	return ""
 }
 
-func (x *GetServiceRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *GetServiceRequest) GetSandbox() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Sandbox
 	}
-	return nil
+	return ""
+}
+
+func (x *GetServiceRequest) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
+	}
+	return ""
 }
 
 // Request to list exposed sandbox service endpoints.
 type ListServicesRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Optional sandbox name. Empty lists endpoints for all sandboxes.
-	Sandbox string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// The maximum number of services to return. Zero uses 100. Values above
 	// 1000 are coerced to 1000; negative values are invalid.
 	PageSize int32 `protobuf:"varint,2,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
@@ -5956,9 +5935,11 @@ type ListServicesRequest struct {
 	// except page_size must match the request that produced it.
 	PageToken string `protobuf:"bytes,3,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	// Explicit named or all-workspaces scope.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,6,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,4,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	// Optional sandbox name. Empty lists endpoints for all sandboxes.
+	Sandbox       string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ListServicesRequest) Reset() {
@@ -5991,13 +5972,6 @@ func (*ListServicesRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{70}
 }
 
-func (x *ListServicesRequest) GetSandbox() string {
-	if x != nil {
-		return x.Sandbox
-	}
-	return ""
-}
-
 func (x *ListServicesRequest) GetPageSize() int32 {
 	if x != nil {
 		return x.PageSize
@@ -6017,6 +5991,13 @@ func (x *ListServicesRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector
 		return x.WorkspaceScope
 	}
 	return nil
+}
+
+func (x *ListServicesRequest) GetSandbox() string {
+	if x != nil {
+		return x.Sandbox
+	}
+	return ""
 }
 
 // Response containing exposed sandbox service endpoints.
@@ -6076,16 +6057,15 @@ func (x *ListServicesResponse) GetNextPageToken() string {
 // Request to delete an exposed sandbox service endpoint.
 type DeleteServiceRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name.
-	Sandbox string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// Service name within the sandbox. Empty selects the unnamed endpoint.
 	Service string `protobuf:"bytes,2,opt,name=service,proto3" json:"service,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,4,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	AllowMissing   bool                           `protobuf:"varint,5,opt,name=allow_missing,json=allowMissing,proto3" json:"allow_missing,omitempty"`
+	Sandbox string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	// Canonical workspace name.
+	Workspace    string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	AllowMissing bool   `protobuf:"varint,4,opt,name=allow_missing,json=allowMissing,proto3" json:"allow_missing,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6120,13 +6100,6 @@ func (*DeleteServiceRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{72}
 }
 
-func (x *DeleteServiceRequest) GetSandbox() string {
-	if x != nil {
-		return x.Sandbox
-	}
-	return ""
-}
-
 func (x *DeleteServiceRequest) GetService() string {
 	if x != nil {
 		return x.Service
@@ -6134,11 +6107,18 @@ func (x *DeleteServiceRequest) GetService() string {
 	return ""
 }
 
-func (x *DeleteServiceRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *DeleteServiceRequest) GetSandbox() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Sandbox
 	}
-	return nil
+	return ""
+}
+
+func (x *DeleteServiceRequest) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
+	}
+	return ""
 }
 
 func (x *DeleteServiceRequest) GetAllowMissing() bool {
@@ -6208,7 +6188,7 @@ type ServiceEndpoint struct {
 	// Sandbox object ID.
 	SandboxId string `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
 	// Sandbox name.
-	SandboxName string `protobuf:"bytes,3,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"`
+	Sandbox string `protobuf:"bytes,3,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// Service name within the sandbox.
 	ServiceName string `protobuf:"bytes,4,opt,name=service_name,json=serviceName,proto3" json:"service_name,omitempty"`
 	// Loopback TCP port inside the sandbox.
@@ -6263,9 +6243,9 @@ func (x *ServiceEndpoint) GetSandboxId() string {
 	return ""
 }
 
-func (x *ServiceEndpoint) GetSandboxName() string {
+func (x *ServiceEndpoint) GetSandbox() string {
 	if x != nil {
-		return x.SandboxName
+		return x.Sandbox
 	}
 	return ""
 }
@@ -6448,8 +6428,8 @@ func (x *RevokeSshSessionResponse) GetOutcome() DeletionOutcome {
 // Execute command request.
 type ExecSandboxRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox id.
-	SandboxId string `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	// Canonical sandbox name.
+	Sandbox string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// Command and arguments.
 	Command []string `protobuf:"bytes,2,rep,name=command,proto3" json:"command,omitempty"`
 	// Optional working directory.
@@ -6471,7 +6451,8 @@ type ExecSandboxRequest struct {
 	// (`bash -lc`) so user startup files (.bash_profile/.profile, and .bashrc if
 	// sourced by them) are applied. When true, the command runs without those
 	// files (`bash -c`), for automation that needs predictable startup behavior.
-	NoLoginShell  bool `protobuf:"varint,10,opt,name=no_login_shell,json=noLoginShell,proto3" json:"no_login_shell,omitempty"`
+	NoLoginShell  bool   `protobuf:"varint,10,opt,name=no_login_shell,json=noLoginShell,proto3" json:"no_login_shell,omitempty"`
+	Workspace     string `protobuf:"bytes,12,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6506,9 +6487,9 @@ func (*ExecSandboxRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{78}
 }
 
-func (x *ExecSandboxRequest) GetSandboxId() string {
+func (x *ExecSandboxRequest) GetSandbox() string {
 	if x != nil {
-		return x.SandboxId
+		return x.Sandbox
 	}
 	return ""
 }
@@ -6574,6 +6555,13 @@ func (x *ExecSandboxRequest) GetNoLoginShell() bool {
 		return x.NoLoginShell
 	}
 	return false
+}
+
+func (x *ExecSandboxRequest) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
+	}
+	return ""
 }
 
 // One stdout chunk from a sandbox exec.
@@ -6812,9 +6800,9 @@ func (*ExecSandboxEvent_Exit) isExecSandboxEvent_Payload() {}
 
 // Initial frame for one TCP forward stream.
 type TcpForwardInit struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox id.
-	SandboxId string `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Sandbox   string                 `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace string                 `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional service identifier for audit/correlation.
 	ServiceId string `protobuf:"bytes,4,opt,name=service_id,json=serviceId,proto3" json:"service_id,omitempty"`
 	// Target the gateway should request from the supervisor.
@@ -6861,9 +6849,16 @@ func (*TcpForwardInit) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{83}
 }
 
-func (x *TcpForwardInit) GetSandboxId() string {
+func (x *TcpForwardInit) GetSandbox() string {
 	if x != nil {
-		return x.SandboxId
+		return x.Sandbox
+	}
+	return ""
+}
+
+func (x *TcpForwardInit) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
 	}
 	return ""
 }
@@ -7246,8 +7241,8 @@ func (x *SshSession) GetRevoked() bool {
 // Watch sandbox request.
 type WatchSandboxRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox id.
-	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Canonical sandbox name.
+	Sandbox string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// Stream sandbox status snapshots.
 	FollowStatus bool `protobuf:"varint,2,opt,name=follow_status,json=followStatus,proto3" json:"follow_status,omitempty"`
 	// Stream openshell-server process logs correlated to this sandbox.
@@ -7268,6 +7263,7 @@ type WatchSandboxRequest struct {
 	LogSources []string `protobuf:"bytes,9,rep,name=log_sources,json=logSources,proto3" json:"log_sources,omitempty"`
 	// Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
 	LogMinLevel   string `protobuf:"bytes,10,opt,name=log_min_level,json=logMinLevel,proto3" json:"log_min_level,omitempty"`
+	Workspace     string `protobuf:"bytes,11,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -7302,9 +7298,9 @@ func (*WatchSandboxRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{88}
 }
 
-func (x *WatchSandboxRequest) GetId() string {
+func (x *WatchSandboxRequest) GetSandbox() string {
 	if x != nil {
-		return x.Id
+		return x.Sandbox
 	}
 	return ""
 }
@@ -7368,6 +7364,13 @@ func (x *WatchSandboxRequest) GetLogSources() []string {
 func (x *WatchSandboxRequest) GetLogMinLevel() string {
 	if x != nil {
 		return x.LogMinLevel
+	}
+	return ""
+}
+
+func (x *WatchSandboxRequest) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
 	}
 	return ""
 }
@@ -7653,10 +7656,10 @@ type CreateProviderRequest struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	Provider *datamodelv1.Provider  `protobuf:"bytes,1,opt,name=provider,proto3" json:"provider,omitempty"`
 	// Explicit workspace for the provider. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	Workspace string `protobuf:"bytes,2,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,3,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -7698,11 +7701,11 @@ func (x *CreateProviderRequest) GetProvider() *datamodelv1.Provider {
 	return nil
 }
 
-func (x *CreateProviderRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *CreateProviderRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 func (x *CreateProviderRequest) GetRequestId() string {
@@ -7716,10 +7719,10 @@ func (x *CreateProviderRequest) GetRequestId() string {
 type GetProviderRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Canonical workspace name.
+	Workspace     string `protobuf:"bytes,2,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetProviderRequest) Reset() {
@@ -7759,11 +7762,11 @@ func (x *GetProviderRequest) GetName() string {
 	return ""
 }
 
-func (x *GetProviderRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *GetProviderRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 // List providers request.
@@ -7776,7 +7779,7 @@ type ListProvidersRequest struct {
 	// except page_size must match the request that produced it.
 	PageToken string `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	// Explicit named or all-workspaces scope.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,5,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -7842,11 +7845,11 @@ type UpdateProviderRequest struct {
 	CredentialExpirationTimes map[string]*timestamppb.Timestamp `protobuf:"bytes,102,rep,name=credential_expiration_times,json=credentialExpirationTimes,proto3" json:"credential_expiration_times,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Credential keys whose existing expiry should be removed.
 	ClearCredentialExpirationKeys []string `protobuf:"bytes,103,rep,name=clear_credential_expiration_keys,json=clearCredentialExpirationKeys,proto3" json:"clear_credential_expiration_keys,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,4,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	// Canonical workspace name.
+	Workspace string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -7902,11 +7905,11 @@ func (x *UpdateProviderRequest) GetClearCredentialExpirationKeys() []string {
 	return nil
 }
 
-func (x *UpdateProviderRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *UpdateProviderRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 func (x *UpdateProviderRequest) GetRequestId() string {
@@ -7920,9 +7923,9 @@ func (x *UpdateProviderRequest) GetRequestId() string {
 type DeleteProviderRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	AllowMissing   bool                           `protobuf:"varint,4,opt,name=allow_missing,json=allowMissing,proto3" json:"allow_missing,omitempty"`
+	// Canonical workspace name.
+	Workspace    string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	AllowMissing bool   `protobuf:"varint,4,opt,name=allow_missing,json=allowMissing,proto3" json:"allow_missing,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
 	RequestId     string `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
@@ -7967,11 +7970,11 @@ func (x *DeleteProviderRequest) GetName() string {
 	return ""
 }
 
-func (x *DeleteProviderRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *DeleteProviderRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 func (x *DeleteProviderRequest) GetAllowMissing() bool {
@@ -9167,10 +9170,10 @@ type GetProviderRefreshStatusRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Provider      string                 `protobuf:"bytes,1,opt,name=provider,proto3" json:"provider,omitempty"`
 	CredentialKey string                 `protobuf:"bytes,2,opt,name=credential_key,json=credentialKey,proto3" json:"credential_key,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,4,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Canonical workspace name.
+	Workspace     string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetProviderRefreshStatusRequest) Reset() {
@@ -9217,11 +9220,11 @@ func (x *GetProviderRefreshStatusRequest) GetCredentialKey() string {
 	return ""
 }
 
-func (x *GetProviderRefreshStatusRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *GetProviderRefreshStatusRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 type GetProviderRefreshStatusResponse struct {
@@ -9279,11 +9282,11 @@ type ConfigureProviderRefreshRequest struct {
 	// the authoritative provider profile and refresh strategy.
 	SecretMaterialKeys []string               `protobuf:"bytes,5,rep,name=secret_material_keys,json=secretMaterialKeys,proto3" json:"secret_material_keys,omitempty"`
 	ExpirationTime     *timestamppb.Timestamp `protobuf:"bytes,106,opt,name=expiration_time,json=expirationTime,proto3" json:"expiration_time,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,8,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	// Canonical workspace name.
+	Workspace string `protobuf:"bytes,7,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,9,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,8,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -9360,11 +9363,11 @@ func (x *ConfigureProviderRefreshRequest) GetExpirationTime() *timestamppb.Times
 	return nil
 }
 
-func (x *ConfigureProviderRefreshRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *ConfigureProviderRefreshRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 func (x *ConfigureProviderRefreshRequest) GetRequestId() string {
@@ -9422,11 +9425,11 @@ type RotateProviderCredentialRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Provider      string                 `protobuf:"bytes,1,opt,name=provider,proto3" json:"provider,omitempty"`
 	CredentialKey string                 `protobuf:"bytes,2,opt,name=credential_key,json=credentialKey,proto3" json:"credential_key,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,4,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	// Canonical workspace name.
+	Workspace string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -9475,11 +9478,11 @@ func (x *RotateProviderCredentialRequest) GetCredentialKey() string {
 	return ""
 }
 
-func (x *RotateProviderCredentialRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *RotateProviderCredentialRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 func (x *RotateProviderCredentialRequest) GetRequestId() string {
@@ -9537,9 +9540,9 @@ type DeleteProviderRefreshRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Provider      string                 `protobuf:"bytes,1,opt,name=provider,proto3" json:"provider,omitempty"`
 	CredentialKey string                 `protobuf:"bytes,2,opt,name=credential_key,json=credentialKey,proto3" json:"credential_key,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,4,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	AllowMissing   bool                           `protobuf:"varint,5,opt,name=allow_missing,json=allowMissing,proto3" json:"allow_missing,omitempty"`
+	// Canonical workspace name.
+	Workspace    string `protobuf:"bytes,4,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	AllowMissing bool   `protobuf:"varint,5,opt,name=allow_missing,json=allowMissing,proto3" json:"allow_missing,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
 	RequestId     string `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
@@ -9591,11 +9594,11 @@ func (x *DeleteProviderRefreshRequest) GetCredentialKey() string {
 	return ""
 }
 
-func (x *DeleteProviderRefreshRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *DeleteProviderRefreshRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 func (x *DeleteProviderRefreshRequest) GetAllowMissing() bool {
@@ -10895,9 +10898,6 @@ func (x *ExchangeProviderSubjectTokenResponse) GetTokenType() string {
 // Update sandbox policy request.
 type UpdateConfigRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name (canonical lookup key). Required for sandbox-scoped updates.
-	// Not required when `global=true`.
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// The new policy to apply.
 	//
 	// Sandbox scope (`global=false`):
@@ -10931,12 +10931,12 @@ type UpdateConfigRequest struct {
 	// sandbox metadata as a convenience projection. For setting-only updates, it
 	// only merges them into sandbox metadata.
 	Annotations map[string]string `protobuf:"bytes,9,rep,name=annotations,proto3" json:"annotations,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Explicit workspace scope for sandbox-scoped updates. Omit only when
-	// `global` is true; the all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,11,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	// Required for sandbox-scoped updates and empty for global updates.
+	Sandbox   string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace string `protobuf:"bytes,10,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,12,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,11,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -10969,13 +10969,6 @@ func (x *UpdateConfigRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use UpdateConfigRequest.ProtoReflect.Descriptor instead.
 func (*UpdateConfigRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{138}
-}
-
-func (x *UpdateConfigRequest) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
 }
 
 func (x *UpdateConfigRequest) GetPolicy() *sandboxv1.SandboxPolicy {
@@ -11034,11 +11027,18 @@ func (x *UpdateConfigRequest) GetAnnotations() map[string]string {
 	return nil
 }
 
-func (x *UpdateConfigRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *UpdateConfigRequest) GetSandbox() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Sandbox
 	}
-	return nil
+	return ""
+}
+
+func (x *UpdateConfigRequest) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
+	}
+	return ""
 }
 
 func (x *UpdateConfigRequest) GetRequestId() string {
@@ -11680,17 +11680,14 @@ func (x *UpdateConfigResponse) GetAnnotations() map[string]string {
 // Get sandbox policy status request.
 type GetSandboxPolicyStatusRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name (canonical lookup key). Ignored when global is true.
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// The specific policy version to query. 0 means latest.
 	Version uint32 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"`
 	// Query global policy revisions instead of a sandbox-scoped one.
-	Global bool `protobuf:"varint,3,opt,name=global,proto3" json:"global,omitempty"`
-	// Explicit workspace scope for sandbox-scoped queries. Omit only when
-	// `global` is true; the all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,5,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	Global        bool   `protobuf:"varint,3,opt,name=global,proto3" json:"global,omitempty"`
+	Sandbox       string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace     string `protobuf:"bytes,4,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetSandboxPolicyStatusRequest) Reset() {
@@ -11723,13 +11720,6 @@ func (*GetSandboxPolicyStatusRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{148}
 }
 
-func (x *GetSandboxPolicyStatusRequest) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
 func (x *GetSandboxPolicyStatusRequest) GetVersion() uint32 {
 	if x != nil {
 		return x.Version
@@ -11744,11 +11734,18 @@ func (x *GetSandboxPolicyStatusRequest) GetGlobal() bool {
 	return false
 }
 
-func (x *GetSandboxPolicyStatusRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *GetSandboxPolicyStatusRequest) GetSandbox() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Sandbox
 	}
-	return nil
+	return ""
+}
+
+func (x *GetSandboxPolicyStatusRequest) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
+	}
+	return ""
 }
 
 // Get sandbox policy status response.
@@ -11809,8 +11806,6 @@ func (x *GetSandboxPolicyStatusResponse) GetActiveVersion() uint32 {
 // List sandbox policies request.
 type ListSandboxPoliciesRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name (canonical lookup key). Ignored when global is true.
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// The maximum number of revisions to return. Zero uses 100. Values above
 	// 1000 are coerced to 1000; negative values are invalid.
 	PageSize int32 `protobuf:"varint,2,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
@@ -11818,12 +11813,11 @@ type ListSandboxPoliciesRequest struct {
 	// parameters except page_size must match the request that produced it.
 	PageToken string `protobuf:"bytes,3,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	// List global policy revisions instead of sandbox-scoped ones.
-	Global bool `protobuf:"varint,4,opt,name=global,proto3" json:"global,omitempty"`
-	// Explicit workspace scope for sandbox-scoped queries. Omit only when
-	// `global` is true; the all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,6,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	Global        bool   `protobuf:"varint,4,opt,name=global,proto3" json:"global,omitempty"`
+	Sandbox       string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace     string `protobuf:"bytes,5,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ListSandboxPoliciesRequest) Reset() {
@@ -11856,13 +11850,6 @@ func (*ListSandboxPoliciesRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{150}
 }
 
-func (x *ListSandboxPoliciesRequest) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
 func (x *ListSandboxPoliciesRequest) GetPageSize() int32 {
 	if x != nil {
 		return x.PageSize
@@ -11884,11 +11871,18 @@ func (x *ListSandboxPoliciesRequest) GetGlobal() bool {
 	return false
 }
 
-func (x *ListSandboxPoliciesRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *ListSandboxPoliciesRequest) GetSandbox() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Sandbox
 	}
-	return nil
+	return ""
+}
+
+func (x *ListSandboxPoliciesRequest) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
+	}
+	return ""
 }
 
 // List sandbox policies response.
@@ -12363,8 +12357,8 @@ func (x *SandboxPolicyRevision) GetProvenance() map[string]string {
 // Get sandbox logs request (one-shot fetch).
 type GetSandboxLogsRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox id.
-	SandboxId string `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	// Canonical sandbox name.
+	Sandbox string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// Maximum number of log lines to return. 0 means use default (2000).
 	Lines uint32 `protobuf:"varint,2,opt,name=lines,proto3" json:"lines,omitempty"`
 	// Only include logs at or after this time. Absence means no filter.
@@ -12372,11 +12366,10 @@ type GetSandboxLogsRequest struct {
 	// Filter by log source (e.g. "gateway", "sandbox"). Empty means all sources.
 	Sources []string `protobuf:"bytes,4,rep,name=sources,proto3" json:"sources,omitempty"`
 	// Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
-	MinLevel string `protobuf:"bytes,5,opt,name=min_level,json=minLevel,proto3" json:"min_level,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,7,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	MinLevel      string `protobuf:"bytes,5,opt,name=min_level,json=minLevel,proto3" json:"min_level,omitempty"`
+	Workspace     string `protobuf:"bytes,6,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetSandboxLogsRequest) Reset() {
@@ -12409,9 +12402,9 @@ func (*GetSandboxLogsRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{158}
 }
 
-func (x *GetSandboxLogsRequest) GetSandboxId() string {
+func (x *GetSandboxLogsRequest) GetSandbox() string {
 	if x != nil {
-		return x.SandboxId
+		return x.Sandbox
 	}
 	return ""
 }
@@ -12444,11 +12437,11 @@ func (x *GetSandboxLogsRequest) GetMinLevel() string {
 	return ""
 }
 
-func (x *GetSandboxLogsRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *GetSandboxLogsRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 // Batch of log lines pushed from sandbox to server.
@@ -14455,11 +14448,13 @@ type SubmitPolicyAnalysisRequest struct {
 	// to watch. Other values are treated as agent-style (no dedup) so a new
 	// mode does not silently collapse proposals.
 	AnalysisMode string `protobuf:"bytes,3,opt,name=analysis_mode,json=analysisMode,proto3" json:"analysis_mode,omitempty"`
-	// Sandbox name.
+	// Sandbox name. The authenticated sandbox principal remains authoritative
+	// for this internal callback.
 	Name string `protobuf:"bytes,4,opt,name=name,proto3" json:"name,omitempty"`
 	// Anonymous network activity counters.
 	NetworkActivitySummaries []*NetworkActivitySummary `protobuf:"bytes,5,rep,name=network_activity_summaries,json=networkActivitySummaries,proto3" json:"network_activity_summaries,omitempty"`
-	// Workspace scope. Empty defaults to "default".
+	// Internal callback workspace. The gateway validates it against the
+	// authenticated sandbox principal.
 	Workspace     string `protobuf:"bytes,6,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -14614,14 +14609,12 @@ func (x *SubmitPolicyAnalysisResponse) GetAcceptedChunkIds() []string {
 // Get draft policy for a sandbox.
 type GetDraftPolicyRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name.
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// Optional status filter: "pending", "approved", "rejected", or "" for all.
-	StatusFilter string `protobuf:"bytes,2,opt,name=status_filter,json=statusFilter,proto3" json:"status_filter,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,4,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	StatusFilter  string `protobuf:"bytes,2,opt,name=status_filter,json=statusFilter,proto3" json:"status_filter,omitempty"`
+	Sandbox       string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace     string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetDraftPolicyRequest) Reset() {
@@ -14654,13 +14647,6 @@ func (*GetDraftPolicyRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{188}
 }
 
-func (x *GetDraftPolicyRequest) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
 func (x *GetDraftPolicyRequest) GetStatusFilter() string {
 	if x != nil {
 		return x.StatusFilter
@@ -14668,11 +14654,18 @@ func (x *GetDraftPolicyRequest) GetStatusFilter() string {
 	return ""
 }
 
-func (x *GetDraftPolicyRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *GetDraftPolicyRequest) GetSandbox() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Sandbox
 	}
-	return nil
+	return ""
+}
+
+func (x *GetDraftPolicyRequest) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
+	}
+	return ""
 }
 
 type GetDraftPolicyResponse struct {
@@ -14750,18 +14743,16 @@ func (x *GetDraftPolicyResponse) GetLastAnalyzedTime() *timestamppb.Timestamp {
 // Approve a single draft chunk.
 type ApproveDraftChunkRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name.
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// Chunk ID to approve.
 	ChunkId string `protobuf:"bytes,2,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
 	// Token returned with the reviewed PolicyChunk. Approval fails with
 	// FAILED_PRECONDITION if live decision inputs no longer match it.
 	ReviewToken string `protobuf:"bytes,4,opt,name=review_token,json=reviewToken,proto3" json:"review_token,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,5,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	Sandbox     string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace   string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -14796,13 +14787,6 @@ func (*ApproveDraftChunkRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{190}
 }
 
-func (x *ApproveDraftChunkRequest) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
 func (x *ApproveDraftChunkRequest) GetChunkId() string {
 	if x != nil {
 		return x.ChunkId
@@ -14817,11 +14801,18 @@ func (x *ApproveDraftChunkRequest) GetReviewToken() string {
 	return ""
 }
 
-func (x *ApproveDraftChunkRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *ApproveDraftChunkRequest) GetSandbox() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Sandbox
 	}
-	return nil
+	return ""
+}
+
+func (x *ApproveDraftChunkRequest) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
+	}
+	return ""
 }
 
 func (x *ApproveDraftChunkRequest) GetRequestId() string {
@@ -14888,17 +14879,15 @@ func (x *ApproveDraftChunkResponse) GetPolicyHash() string {
 // Reject a single draft chunk.
 type RejectDraftChunkRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name.
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// Chunk ID to reject.
 	ChunkId string `protobuf:"bytes,2,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
 	// Optional reason for rejection (fed to LLM context in future analysis).
-	Reason string `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,5,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	Reason    string `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	Sandbox   string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace string `protobuf:"bytes,4,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -14933,13 +14922,6 @@ func (*RejectDraftChunkRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{192}
 }
 
-func (x *RejectDraftChunkRequest) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
 func (x *RejectDraftChunkRequest) GetChunkId() string {
 	if x != nil {
 		return x.ChunkId
@@ -14954,11 +14936,18 @@ func (x *RejectDraftChunkRequest) GetReason() string {
 	return ""
 }
 
-func (x *RejectDraftChunkRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *RejectDraftChunkRequest) GetSandbox() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Sandbox
 	}
-	return nil
+	return ""
+}
+
+func (x *RejectDraftChunkRequest) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
+	}
+	return ""
 }
 
 func (x *RejectDraftChunkRequest) GetRequestId() string {
@@ -15059,18 +15048,16 @@ func (x *DraftChunkApproval) GetReviewToken() string {
 
 type ApproveAllDraftChunksRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name.
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// Include chunks with security_notes (default false: skips them).
 	IncludeSecurityFlagged bool `protobuf:"varint,2,opt,name=include_security_flagged,json=includeSecurityFlagged,proto3" json:"include_security_flagged,omitempty"`
 	// Exact reviewed chunks and tokens. The server validates them against one
 	// live snapshot, stages compatible operations in order, and writes once.
-	Approvals []*DraftChunkApproval `protobuf:"bytes,4,rep,name=approvals,proto3" json:"approvals,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,5,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	Approvals []*DraftChunkApproval `protobuf:"bytes,3,rep,name=approvals,proto3" json:"approvals,omitempty"`
+	Sandbox   string                `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace string                `protobuf:"bytes,4,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -15105,13 +15092,6 @@ func (*ApproveAllDraftChunksRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{195}
 }
 
-func (x *ApproveAllDraftChunksRequest) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
 func (x *ApproveAllDraftChunksRequest) GetIncludeSecurityFlagged() bool {
 	if x != nil {
 		return x.IncludeSecurityFlagged
@@ -15126,11 +15106,18 @@ func (x *ApproveAllDraftChunksRequest) GetApprovals() []*DraftChunkApproval {
 	return nil
 }
 
-func (x *ApproveAllDraftChunksRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *ApproveAllDraftChunksRequest) GetSandbox() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Sandbox
 	}
-	return nil
+	return ""
+}
+
+func (x *ApproveAllDraftChunksRequest) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
+	}
+	return ""
 }
 
 func (x *ApproveAllDraftChunksRequest) GetRequestId() string {
@@ -15216,17 +15203,15 @@ func (x *ApproveAllDraftChunksResponse) GetChunksSkipped() uint32 {
 // Edit a pending chunk in-place.
 type EditDraftChunkRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name.
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// Chunk ID to edit.
 	ChunkId string `protobuf:"bytes,2,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
 	// The modified rule (replaces existing proposed_rule).
 	ProposedRule *sandboxv1.NetworkPolicyRule `protobuf:"bytes,3,opt,name=proposed_rule,json=proposedRule,proto3" json:"proposed_rule,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,5,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	Sandbox      string                       `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace    string                       `protobuf:"bytes,4,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,6,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -15261,13 +15246,6 @@ func (*EditDraftChunkRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{197}
 }
 
-func (x *EditDraftChunkRequest) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
 func (x *EditDraftChunkRequest) GetChunkId() string {
 	if x != nil {
 		return x.ChunkId
@@ -15282,11 +15260,18 @@ func (x *EditDraftChunkRequest) GetProposedRule() *sandboxv1.NetworkPolicyRule {
 	return nil
 }
 
-func (x *EditDraftChunkRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *EditDraftChunkRequest) GetSandbox() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Sandbox
 	}
-	return nil
+	return ""
+}
+
+func (x *EditDraftChunkRequest) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
+	}
+	return ""
 }
 
 func (x *EditDraftChunkRequest) GetRequestId() string {
@@ -15335,15 +15320,13 @@ func (*EditDraftChunkResponse) Descriptor() ([]byte, []int) {
 // Reverse an approval (remove merged rule from active policy).
 type UndoDraftChunkRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name.
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// Chunk ID to undo.
-	ChunkId string `protobuf:"bytes,2,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,4,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	ChunkId   string `protobuf:"bytes,2,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
+	Sandbox   string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,5,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -15378,13 +15361,6 @@ func (*UndoDraftChunkRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{199}
 }
 
-func (x *UndoDraftChunkRequest) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
 func (x *UndoDraftChunkRequest) GetChunkId() string {
 	if x != nil {
 		return x.ChunkId
@@ -15392,11 +15368,18 @@ func (x *UndoDraftChunkRequest) GetChunkId() string {
 	return ""
 }
 
-func (x *UndoDraftChunkRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *UndoDraftChunkRequest) GetSandbox() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Sandbox
 	}
-	return nil
+	return ""
+}
+
+func (x *UndoDraftChunkRequest) GetWorkspace() string {
+	if x != nil {
+		return x.Workspace
+	}
+	return ""
 }
 
 func (x *UndoDraftChunkRequest) GetRequestId() string {
@@ -15462,14 +15445,12 @@ func (x *UndoDraftChunkResponse) GetPolicyHash() string {
 
 // Clear all pending draft chunks for a sandbox.
 type ClearDraftChunksRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name.
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Sandbox   string                 `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace string                 `protobuf:"bytes,2,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
-	RequestId     string `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId     string `protobuf:"bytes,3,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -15504,18 +15485,18 @@ func (*ClearDraftChunksRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{201}
 }
 
-func (x *ClearDraftChunksRequest) GetName() string {
+func (x *ClearDraftChunksRequest) GetSandbox() string {
 	if x != nil {
-		return x.Name
+		return x.Sandbox
 	}
 	return ""
 }
 
-func (x *ClearDraftChunksRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *ClearDraftChunksRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 func (x *ClearDraftChunksRequest) GetRequestId() string {
@@ -15572,13 +15553,11 @@ func (x *ClearDraftChunksResponse) GetChunksCleared() uint32 {
 
 // Get decision history for a sandbox's draft policy.
 type GetDraftHistoryRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Sandbox name.
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	// Explicit workspace scope. The all-workspaces selection is invalid.
-	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Sandbox       string                 `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
+	Workspace     string                 `protobuf:"bytes,2,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetDraftHistoryRequest) Reset() {
@@ -15611,18 +15590,18 @@ func (*GetDraftHistoryRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{203}
 }
 
-func (x *GetDraftHistoryRequest) GetName() string {
+func (x *GetDraftHistoryRequest) GetSandbox() string {
 	if x != nil {
-		return x.Name
+		return x.Sandbox
 	}
 	return ""
 }
 
-func (x *GetDraftHistoryRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
+func (x *GetDraftHistoryRequest) GetWorkspace() string {
 	if x != nil {
-		return x.WorkspaceScope
+		return x.Workspace
 	}
-	return nil
+	return ""
 }
 
 type DraftHistoryEntry struct {
@@ -17204,9 +17183,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\tmax_burst\x18\x02 \x01(\rR\bmaxBurst\"b\n" +
 	"!SandboxWorkloadTemplateProvenance\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12)\n" +
-	"\x10resource_version\x18\x02 \x01(\tR\x0fresourceVersion\"\xec\x05\n" +
-	"\rSandboxStatus\x12!\n" +
-	"\fsandbox_name\x18\x01 \x01(\tR\vsandboxName\x12\x1b\n" +
+	"\x10resource_version\x18\x02 \x01(\tR\x0fresourceVersion\"\xc9\x05\n" +
+	"\rSandboxStatus\x12\x1b\n" +
 	"\tagent_pod\x18\x02 \x01(\tR\bagentPod\x12\x19\n" +
 	"\bagent_fd\x18\x03 \x01(\tR\aagentFd\x12\x1d\n" +
 	"\n" +
@@ -17242,103 +17220,103 @@ const file_openshell_proto_rawDesc = "" +
 	"\bmetadata\x18\x06 \x03(\v2).openshell.v1.PlatformEvent.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x01\x10\x02R\ftimestamp_ms\"\xf0\x04\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x01\x10\x02R\ftimestamp_ms\"\xa9\x04\n" +
 	"\x14CreateSandboxRequest\x12-\n" +
 	"\x04spec\x18\x01 \x01(\v2\x19.openshell.v1.SandboxSpecR\x04spec\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12F\n" +
 	"\x06labels\x18\x03 \x03(\v2..openshell.v1.CreateSandboxRequest.LabelsEntryR\x06labels\x12U\n" +
 	"\vannotations\x18\x04 \x03(\v23.openshell.v1.CreateSandboxRequest.AnnotationsEntryR\vannotations\x12A\n" +
-	"\x1dawait_main_process_attachment\x18\x06 \x01(\bR\x1aawaitMainProcessAttachment\x124\n" +
-	"\x16workload_template_name\x18\a \x01(\tR\x14workloadTemplateName\x12R\n" +
-	"\x0fworkspace_scope\x18\b \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"\x1dawait_main_process_attachment\x18\x05 \x01(\bR\x1aawaitMainProcessAttachment\x124\n" +
+	"\x16workload_template_name\x18\x06 \x01(\tR\x14workloadTemplateName\x12\x1c\n" +
+	"\tworkspace\x18\a \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\t \x01(\tR\trequestId\x1a9\n" +
+	"request_id\x18\b \x01(\tR\trequestId\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a>\n" +
 	"\x10AnnotationsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x05\x10\x06R\tworkspace\"\xe5\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x9e\x01\n" +
 	"\x1cCreateSandboxTemplateRequest\x12A\n" +
-	"\btemplate\x18\x01 \x01(\v2%.openshell.v1.SandboxWorkloadTemplateR\btemplate\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"\btemplate\x18\x01 \x01(\v2%.openshell.v1.SandboxWorkloadTemplateR\btemplate\x12\x1c\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x04 \x01(\tR\trequestIdJ\x04\b\x02\x10\x03R\tworkspace\"\x94\x01\n" +
+	"request_id\x18\x03 \x01(\tR\trequestId\"M\n" +
 	"\x19GetSandboxTemplateRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\xfb\x01\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1c\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"\xd4\x01\n" +
 	"\x1bListSandboxTemplatesRequest\x12\x1b\n" +
 	"\tpage_size\x18\x01 \x01(\x05R\bpageSize\x12\x1d\n" +
 	"\n" +
 	"page_token\x18\x02 \x01(\tR\tpageToken\x12%\n" +
-	"\x0elabel_selector\x18\x05 \x01(\tR\rlabelSelector\x12R\n" +
-	"\x0fworkspace_scope\x18\x06 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05R\tworkspaceR\x0eall_workspaces\"\xdb\x01\n" +
+	"\x0elabel_selector\x18\x03 \x01(\tR\rlabelSelector\x12R\n" +
+	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\"\x94\x01\n" +
 	"\x1cDeleteSandboxTemplateRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12#\n" +
-	"\rallow_missing\x18\x04 \x01(\bR\fallowMissing\x12\x1d\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1c\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\x12#\n" +
+	"\rallow_missing\x18\x03 \x01(\bR\fallowMissing\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x05 \x01(\tR\trequestIdJ\x04\b\x02\x10\x03R\tworkspace\"\\\n" +
+	"request_id\x18\x04 \x01(\tR\trequestId\"\\\n" +
 	"\x17SandboxTemplateResponse\x12A\n" +
 	"\btemplate\x18\x01 \x01(\v2%.openshell.v1.SandboxWorkloadTemplateR\btemplate\"\x8b\x01\n" +
 	"\x1cListSandboxTemplatesResponse\x12C\n" +
 	"\ttemplates\x18\x01 \x03(\v2%.openshell.v1.SandboxWorkloadTemplateR\ttemplates\x12&\n" +
 	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"g\n" +
 	"\x1dDeleteSandboxTemplateResponse\x127\n" +
-	"\aoutcome\x18\x02 \x01(\x0e2\x1d.openshell.v1.DeletionOutcomeR\aoutcomeJ\x04\b\x01\x10\x02R\adeleted\"\xbf\x01\n" +
+	"\aoutcome\x18\x02 \x01(\x0e2\x1d.openshell.v1.DeletionOutcomeR\aoutcomeJ\x04\b\x01\x10\x02R\adeleted\"x\n" +
 	"\x1cBeginRootfsTarStagingRequest\x12\x1b\n" +
-	"\tfile_name\x18\x02 \x01(\tR\bfileName\x12\x1d\n" +
+	"\tfile_name\x18\x01 \x01(\tR\bfileName\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\x03 \x01(\x04R\tsizeBytes\x12R\n" +
-	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x01\x10\x02R\tworkspace\"\xdc\x01\n" +
+	"size_bytes\x18\x02 \x01(\x04R\tsizeBytes\x12\x1c\n" +
+	"\tworkspace\x18\x03 \x01(\tR\tworkspace\"\xdc\x01\n" +
 	"\x1dBeginRootfsTarStagingResponse\x12#\n" +
 	"\rstaging_token\x18\x01 \x01(\tR\fstagingToken\x12\x1f\n" +
 	"\vupload_path\x18\x02 \x01(\tR\n" +
 	"uploadPath\x12\x1b\n" +
 	"\tmax_bytes\x18\x03 \x01(\x04R\bmaxBytes\x12C\n" +
-	"\x0fexpiration_time\x18h \x01(\v2\x1a.google.protobuf.TimestampR\x0eexpirationTimeJ\x04\b\x04\x10\x05R\rexpires_at_ms\"\x8c\x01\n" +
-	"\x11GetSandboxRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\xf4\x01\n" +
+	"\x0fexpiration_time\x18h \x01(\v2\x1a.google.protobuf.TimestampR\x0eexpirationTimeJ\x04\b\x04\x10\x05R\rexpires_at_ms\"K\n" +
+	"\x11GetSandboxRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"\xcd\x01\n" +
 	"\x14ListSandboxesRequest\x12\x1b\n" +
 	"\tpage_size\x18\x01 \x01(\x05R\bpageSize\x12\x1d\n" +
 	"\n" +
 	"page_token\x18\x02 \x01(\tR\tpageToken\x12%\n" +
 	"\x0elabel_selector\x18\x03 \x01(\tR\rlabelSelector\x12R\n" +
-	"\x0fworkspace_scope\x18\x06 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06R\tworkspaceR\x0eall_workspaces\"\xa5\x01\n" +
-	"\x1bListSandboxProvidersRequest\x12!\n" +
-	"\fsandbox_name\x18\x01 \x01(\tR\vsandboxName\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\xa6\x02\n" +
-	"\x1cAttachSandboxProviderRequest\x12!\n" +
-	"\fsandbox_name\x18\x01 \x01(\tR\vsandboxName\x12#\n" +
+	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\"U\n" +
+	"\x1bListSandboxProvidersRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"\xd6\x01\n" +
+	"\x1cAttachSandboxProviderRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12#\n" +
 	"\rprovider_name\x18\x02 \x01(\tR\fproviderName\x12:\n" +
-	"\x19expected_resource_version\x18\x03 \x01(\x04R\x17expectedResourceVersion\x12R\n" +
-	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"\x19expected_resource_version\x18\x03 \x01(\x04R\x17expectedResourceVersion\x12\x1c\n" +
+	"\tworkspace\x18\x04 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x06 \x01(\tR\trequestIdJ\x04\b\x04\x10\x05R\tworkspace\"\xa6\x02\n" +
-	"\x1cDetachSandboxProviderRequest\x12!\n" +
-	"\fsandbox_name\x18\x01 \x01(\tR\vsandboxName\x12#\n" +
+	"request_id\x18\x05 \x01(\tR\trequestId\"\xd6\x01\n" +
+	"\x1cDetachSandboxProviderRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12#\n" +
 	"\rprovider_name\x18\x02 \x01(\tR\fproviderName\x12:\n" +
-	"\x19expected_resource_version\x18\x03 \x01(\x04R\x17expectedResourceVersion\x12R\n" +
-	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"\x19expected_resource_version\x18\x03 \x01(\x04R\x17expectedResourceVersion\x12\x1c\n" +
+	"\tworkspace\x18\x04 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x06 \x01(\tR\trequestIdJ\x04\b\x04\x10\x05R\tworkspace\"\xd3\x01\n" +
-	"\x14DeleteSandboxRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12#\n" +
-	"\rallow_missing\x18\x04 \x01(\bR\fallowMissing\x12\x1d\n" +
+	"request_id\x18\x05 \x01(\tR\trequestId\"\x92\x01\n" +
+	"\x14DeleteSandboxRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\x12#\n" +
+	"\rallow_missing\x18\x03 \x01(\bR\fallowMissing\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x05 \x01(\tR\trequestIdJ\x04\b\x02\x10\x03R\tworkspace\"\xac\x01\n" +
-	"\x12StopSandboxRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"request_id\x18\x04 \x01(\tR\trequestId\"k\n" +
+	"\x12StopSandboxRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x04 \x01(\tR\trequestIdJ\x04\b\x02\x10\x03R\tworkspace\"\xad\x01\n" +
-	"\x13StartSandboxRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"request_id\x18\x03 \x01(\tR\trequestId\"l\n" +
+	"\x13StartSandboxRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x04 \x01(\tR\trequestIdJ\x04\b\x02\x10\x03R\tworkspace\"B\n" +
+	"request_id\x18\x03 \x01(\tR\trequestId\"B\n" +
 	"\x0fSandboxResponse\x12/\n" +
 	"\asandbox\x18\x01 \x01(\v2\x15.openshell.v1.SandboxR\asandbox\"t\n" +
 	"\x15ListSandboxesResponse\x123\n" +
@@ -17353,11 +17331,11 @@ const file_openshell_proto_rawDesc = "" +
 	"\x1dDetachSandboxProviderResponse\x12/\n" +
 	"\asandbox\x18\x01 \x01(\v2\x15.openshell.v1.SandboxR\asandbox\x12\x1a\n" +
 	"\bdetached\x18\x02 \x01(\bR\bdetached\x12?\n" +
-	"\areceipt\x18\x03 \x01(\v2%.openshell.v1.ProviderMutationReceiptR\areceipt\"\xe1\x02\n" +
+	"\areceipt\x18\x03 \x01(\v2%.openshell.v1.ProviderMutationReceiptR\areceipt\"\xd8\x02\n" +
 	"\x17ProviderDesiredIdentity\x12\x1d\n" +
 	"\n" +
-	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12!\n" +
-	"\fsandbox_name\x18\x02 \x01(\tR\vsandboxName\x12)\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x18\n" +
+	"\asandbox\x18\x02 \x01(\tR\asandbox\x12)\n" +
 	"\x10attachment_epoch\x18\x03 \x01(\tR\x0fattachmentEpoch\x12\x1f\n" +
 	"\vprovider_id\x18\x04 \x01(\tR\n" +
 	"providerId\x12:\n" +
@@ -17424,13 +17402,13 @@ const file_openshell_proto_rawDesc = "" +
 	"\x13network_instance_id\x18\x05 \x01(\tR\x11networkInstanceId\x12?\n" +
 	"\robserved_time\x18j \x01(\v2\x1a.google.protobuf.TimestampR\fobservedTime\x12A\n" +
 	"\x0eevaluated_time\x18k \x01(\v2\x1a.google.protobuf.TimestampR\revaluatedTime\x12A\n" +
-	"\toperation\x18\b \x01(\v2#.openshell.v1.ConfigUpdateOperationR\toperationJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\x0eobserved_at_msR\x0fevaluated_at_ms\"\xdc\x01\n" +
-	"\x1fGetSandboxProviderStatusRequest\x12!\n" +
-	"\fsandbox_name\x18\x01 \x01(\tR\vsandboxName\x12#\n" +
+	"\toperation\x18\b \x01(\v2#.openshell.v1.ConfigUpdateOperationR\toperationJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\x0eobserved_at_msR\x0fevaluated_at_ms\"\x9d\x01\n" +
+	"\x1fGetSandboxProviderStatusRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12#\n" +
 	"\rprovider_name\x18\x02 \x01(\tR\fproviderName\x12\x1d\n" +
 	"\n" +
-	"receipt_id\x18\x03 \x01(\tR\treceiptId\x12R\n" +
-	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\"a\n" +
+	"receipt_id\x18\x03 \x01(\tR\treceiptId\x12\x1c\n" +
+	"\tworkspace\x18\x04 \x01(\tR\tworkspace\"a\n" +
 	" GetSandboxProviderStatusResponse\x12=\n" +
 	"\x06status\x18\x01 \x01(\v2%.openshell.v1.ProviderReadinessStatusR\x06status\"\x8d\x01\n" +
 	"\x1eReportProviderReadinessRequest\x12\x1d\n" +
@@ -17444,10 +17422,10 @@ const file_openshell_proto_rawDesc = "" +
 	"\x15DeleteSandboxResponse\x127\n" +
 	"\aoutcome\x18\x02 \x01(\x0e2\x1d.openshell.v1.DeletionOutcomeR\aoutcome\x12\x1d\n" +
 	"\n" +
-	"sandbox_id\x18\x03 \x01(\tR\tsandboxIdJ\x04\b\x01\x10\x02R\adeleted\"8\n" +
-	"\x17CreateSshSessionRequest\x12\x1d\n" +
-	"\n" +
-	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\"\xce\x02\n" +
+	"sandbox_id\x18\x03 \x01(\tR\tsandboxIdJ\x04\b\x01\x10\x02R\adeleted\"Q\n" +
+	"\x17CreateSshSessionRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x03 \x01(\tR\tworkspace\"\xce\x02\n" +
 	"\x18CreateSshSessionResponse\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1a\n" +
@@ -17456,43 +17434,43 @@ const file_openshell_proto_rawDesc = "" +
 	"\fgateway_port\x18\x04 \x01(\rR\vgatewayPort\x12%\n" +
 	"\x0egateway_scheme\x18\x05 \x01(\tR\rgatewayScheme\x120\n" +
 	"\x14host_key_fingerprint\x18\a \x01(\tR\x12hostKeyFingerprint\x12C\n" +
-	"\x0fexpiration_time\x18l \x01(\v2\x1a.google.protobuf.TimestampR\x0eexpirationTimeJ\x04\b\b\x10\tR\rexpires_at_ms\"\x87\x02\n" +
+	"\x0fexpiration_time\x18l \x01(\v2\x1a.google.protobuf.TimestampR\x0eexpirationTimeJ\x04\b\b\x10\tR\rexpires_at_ms\"\xc0\x01\n" +
 	"\x14ExposeServiceRequest\x12\x18\n" +
-	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x18\n" +
 	"\aservice\x18\x02 \x01(\tR\aservice\x12\x1f\n" +
 	"\vtarget_port\x18\x03 \x01(\rR\n" +
 	"targetPort\x12\x16\n" +
-	"\x06domain\x18\x04 \x01(\bR\x06domain\x12R\n" +
-	"\x0fworkspace_scope\x18\x06 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"\x06domain\x18\x04 \x01(\bR\x06domain\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x05 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\a \x01(\tR\trequestIdJ\x04\b\x05\x10\x06R\tworkspace\"\xac\x01\n" +
+	"request_id\x18\x06 \x01(\tR\trequestId\"e\n" +
 	"\x11GetServiceRequest\x12\x18\n" +
-	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x18\n" +
-	"\aservice\x18\x02 \x01(\tR\aservice\x12R\n" +
-	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x03\x10\x04R\tworkspace\"\xe6\x01\n" +
-	"\x13ListServicesRequest\x12\x18\n" +
-	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1b\n" +
+	"\aservice\x18\x02 \x01(\tR\aservice\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x03 \x01(\tR\tworkspace\"\xbf\x01\n" +
+	"\x13ListServicesRequest\x12\x1b\n" +
 	"\tpage_size\x18\x02 \x01(\x05R\bpageSize\x12\x1d\n" +
 	"\n" +
 	"page_token\x18\x03 \x01(\tR\tpageToken\x12R\n" +
-	"\x0fworkspace_scope\x18\x06 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06R\tworkspaceR\x0eall_workspaces\"\x81\x01\n" +
+	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\"\x81\x01\n" +
 	"\x14ListServicesResponse\x12A\n" +
 	"\bservices\x18\x01 \x03(\v2%.openshell.v1.ServiceEndpointResponseR\bservices\x12&\n" +
-	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xf3\x01\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xac\x01\n" +
 	"\x14DeleteServiceRequest\x12\x18\n" +
-	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x18\n" +
-	"\aservice\x18\x02 \x01(\tR\aservice\x12R\n" +
-	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12#\n" +
-	"\rallow_missing\x18\x05 \x01(\bR\fallowMissing\x12\x1d\n" +
+	"\aservice\x18\x02 \x01(\tR\aservice\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x03 \x01(\tR\tworkspace\x12#\n" +
+	"\rallow_missing\x18\x04 \x01(\bR\fallowMissing\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x06 \x01(\tR\trequestIdJ\x04\b\x03\x10\x04R\tworkspace\"_\n" +
+	"request_id\x18\x05 \x01(\tR\trequestId\"_\n" +
 	"\x15DeleteServiceResponse\x127\n" +
-	"\aoutcome\x18\x02 \x01(\x0e2\x1d.openshell.v1.DeletionOutcomeR\aoutcomeJ\x04\b\x01\x10\x02R\adeleted\"\xef\x01\n" +
+	"\aoutcome\x18\x02 \x01(\x0e2\x1d.openshell.v1.DeletionOutcomeR\aoutcomeJ\x04\b\x01\x10\x02R\adeleted\"\xe6\x01\n" +
 	"\x0fServiceEndpoint\x12>\n" +
 	"\bmetadata\x18\x01 \x01(\v2\".openshell.datamodel.v1.ObjectMetaR\bmetadata\x12\x1d\n" +
 	"\n" +
-	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12!\n" +
-	"\fsandbox_name\x18\x03 \x01(\tR\vsandboxName\x12!\n" +
+	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12\x18\n" +
+	"\asandbox\x18\x03 \x01(\tR\asandbox\x12!\n" +
 	"\fservice_name\x18\x04 \x01(\tR\vserviceName\x12\x1f\n" +
 	"\vtarget_port\x18\x05 \x01(\rR\n" +
 	"targetPort\x12\x16\n" +
@@ -17504,10 +17482,9 @@ const file_openshell_proto_rawDesc = "" +
 	"\x05token\x18\x01 \x01(\tB\x04\x88\xb5\x18\x01R\x05token\x12#\n" +
 	"\rallow_missing\x18\x02 \x01(\bR\fallowMissing\"b\n" +
 	"\x18RevokeSshSessionResponse\x127\n" +
-	"\aoutcome\x18\x02 \x01(\x0e2\x1d.openshell.v1.DeletionOutcomeR\aoutcomeJ\x04\b\x01\x10\x02R\arevoked\"\xd1\x03\n" +
-	"\x12ExecSandboxRequest\x12\x1d\n" +
-	"\n" +
-	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x18\n" +
+	"\aoutcome\x18\x02 \x01(\x0e2\x1d.openshell.v1.DeletionOutcomeR\aoutcomeJ\x04\b\x01\x10\x02R\arevoked\"\xea\x03\n" +
+	"\x12ExecSandboxRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x18\n" +
 	"\acommand\x18\x02 \x03(\tR\acommand\x12\x18\n" +
 	"\aworkdir\x18\x03 \x01(\tR\aworkdir\x12S\n" +
 	"\venvironment\x18\x04 \x03(\v21.openshell.v1.ExecSandboxRequest.EnvironmentEntryR\venvironment\x12F\n" +
@@ -17517,7 +17494,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\x04cols\x18\b \x01(\rR\x04cols\x12\x12\n" +
 	"\x04rows\x18\t \x01(\rR\x04rows\x12$\n" +
 	"\x0eno_login_shell\x18\n" +
-	" \x01(\bR\fnoLoginShell\x1a>\n" +
+	" \x01(\bR\fnoLoginShell\x12\x1c\n" +
+	"\tworkspace\x18\f \x01(\tR\tworkspace\x1a>\n" +
 	"\x10EnvironmentEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x05\x10\x06R\x0ftimeout_seconds\"'\n" +
@@ -17531,10 +17509,10 @@ const file_openshell_proto_rawDesc = "" +
 	"\x06stdout\x18\x01 \x01(\v2\x1f.openshell.v1.ExecSandboxStdoutH\x00R\x06stdout\x129\n" +
 	"\x06stderr\x18\x02 \x01(\v2\x1f.openshell.v1.ExecSandboxStderrH\x00R\x06stderr\x123\n" +
 	"\x04exit\x18\x03 \x01(\v2\x1d.openshell.v1.ExecSandboxExitH\x00R\x04exitB\t\n" +
-	"\apayload\"\xf3\x01\n" +
-	"\x0eTcpForwardInit\x12\x1d\n" +
-	"\n" +
-	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1d\n" +
+	"\apayload\"\x8c\x02\n" +
+	"\x0eTcpForwardInit\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x03 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
 	"service_id\x18\x04 \x01(\tR\tserviceId\x120\n" +
 	"\x03ssh\x18\x05 \x01(\v2\x1c.openshell.v1.SshRelayTargetH\x00R\x03ssh\x120\n" +
@@ -17560,9 +17538,9 @@ const file_openshell_proto_rawDesc = "" +
 	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12\x1a\n" +
 	"\x05token\x18\x03 \x01(\tB\x04\x88\xb5\x18\x01R\x05token\x12C\n" +
 	"\x0fexpiration_time\x18h \x01(\v2\x1a.google.protobuf.TimestampR\x0eexpirationTime\x12\x18\n" +
-	"\arevoked\x18\x05 \x01(\bR\arevokedJ\x04\b\x04\x10\x05R\rexpires_at_ms\"\x93\x03\n" +
-	"\x13WatchSandboxRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\x12#\n" +
+	"\arevoked\x18\x05 \x01(\bR\arevokedJ\x04\b\x04\x10\x05R\rexpires_at_ms\"\xbb\x03\n" +
+	"\x13WatchSandboxRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12#\n" +
 	"\rfollow_status\x18\x02 \x01(\bR\ffollowStatus\x12\x1f\n" +
 	"\vfollow_logs\x18\x03 \x01(\bR\n" +
 	"followLogs\x12#\n" +
@@ -17576,7 +17554,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\vlog_sources\x18\t \x03(\tR\n" +
 	"logSources\x12\"\n" +
 	"\rlog_min_level\x18\n" +
-	" \x01(\tR\vlogMinLevelJ\x04\b\b\x10\tR\flog_since_ms\"\xcc\x02\n" +
+	" \x01(\tR\vlogMinLevel\x12\x1c\n" +
+	"\tworkspace\x18\v \x01(\tR\tworkspaceJ\x04\b\b\x10\tR\flog_since_ms\"\xcc\x02\n" +
 	"\x12SandboxStreamEvent\x121\n" +
 	"\asandbox\x18\x01 \x01(\v2\x15.openshell.v1.SandboxH\x00R\asandbox\x120\n" +
 	"\x03log\x18\x02 \x01(\v2\x1c.openshell.v1.SandboxLogLineH\x00R\x03log\x123\n" +
@@ -17598,36 +17577,36 @@ const file_openshell_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x02\x10\x03R\ftimestamp_ms\"0\n" +
 	"\x14SandboxStreamWarning\x12\x18\n" +
-	"\amessage\x18\x01 \x01(\tR\amessage\"\xd9\x01\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage\"\x92\x01\n" +
 	"\x15CreateProviderRequest\x12<\n" +
-	"\bprovider\x18\x01 \x01(\v2 .openshell.datamodel.v1.ProviderR\bprovider\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"\bprovider\x18\x01 \x01(\v2 .openshell.datamodel.v1.ProviderR\bprovider\x12\x1c\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x04 \x01(\tR\trequestIdJ\x04\b\x02\x10\x03R\tworkspace\"\x8d\x01\n" +
+	"request_id\x18\x03 \x01(\tR\trequestId\"F\n" +
 	"\x12GetProviderRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\xcd\x01\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1c\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"\xa6\x01\n" +
 	"\x14ListProvidersRequest\x12\x1b\n" +
 	"\tpage_size\x18\x01 \x01(\x05R\bpageSize\x12\x1d\n" +
 	"\n" +
 	"page_token\x18\x02 \x01(\tR\tpageToken\x12R\n" +
-	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05R\tworkspaceR\x0eall_workspaces\"\xb1\x04\n" +
+	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\"\xea\x03\n" +
 	"\x15UpdateProviderRequest\x12<\n" +
 	"\bprovider\x18\x01 \x01(\v2 .openshell.datamodel.v1.ProviderR\bprovider\x12\x82\x01\n" +
 	"\x1bcredential_expiration_times\x18f \x03(\v2B.openshell.v1.UpdateProviderRequest.CredentialExpirationTimesEntryR\x19credentialExpirationTimes\x12G\n" +
-	" clear_credential_expiration_keys\x18g \x03(\tR\x1dclearCredentialExpirationKeys\x12R\n" +
-	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	" clear_credential_expiration_keys\x18g \x03(\tR\x1dclearCredentialExpirationKeys\x12\x1c\n" +
+	"\tworkspace\x18\x03 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x05 \x01(\tR\trequestId\x1ah\n" +
+	"request_id\x18\x04 \x01(\tR\trequestId\x1ah\n" +
 	"\x1eCredentialExpirationTimesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x120\n" +
-	"\x05value\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\x05value:\x028\x01J\x04\b\x03\x10\x04J\x04\b\x02\x10\x03R\tworkspaceR\x18credential_expires_at_ms\"\xd4\x01\n" +
+	"\x05value\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\x05value:\x028\x01J\x04\b\x02\x10\x03R\x18credential_expires_at_ms\"\x8d\x01\n" +
 	"\x15DeleteProviderRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12#\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1c\n" +
+	"\tworkspace\x18\x03 \x01(\tR\tworkspace\x12#\n" +
 	"\rallow_missing\x18\x04 \x01(\bR\fallowMissing\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x05 \x01(\tR\trequestIdJ\x04\b\x02\x10\x03R\tworkspace\"\xc1\x01\n" +
+	"request_id\x18\x05 \x01(\tR\trequestId\"\xc1\x01\n" +
 	"\x10ProviderResponse\x12<\n" +
 	"\bprovider\x18\x01 \x01(\v2 .openshell.datamodel.v1.ProviderR\bprovider\x12N\n" +
 	"\x0ftarget_receipts\x18\x02 \x03(\v2%.openshell.v1.ProviderMutationReceiptR\x0etargetReceipts\x12\x1f\n" +
@@ -17731,43 +17710,43 @@ const file_openshell_proto_rawDesc = "" +
 	"\x16provider_error_subtype\x18\f \x01(\tR\x14providerErrorSubtype\x12B\n" +
 	"\x0flast_error_time\x18q \x01(\v2\x1a.google.protobuf.TimestampR\rlastErrorTimeJ\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\b\x10\tJ\x04\b\r\x10\x0eR\rexpires_at_msR\x12next_refresh_at_msR\x12last_refresh_at_msR\x10last_error_at_ms\"<\n" +
 	"\x18ProviderProfileDiscovery\x12 \n" +
-	"\vcredentials\x18\x01 \x03(\tR\vcredentials\"\xc9\x01\n" +
+	"\vcredentials\x18\x01 \x03(\tR\vcredentials\"\x82\x01\n" +
 	"\x1fGetProviderRefreshStatusRequest\x12\x1a\n" +
 	"\bprovider\x18\x01 \x01(\tR\bprovider\x12%\n" +
-	"\x0ecredential_key\x18\x02 \x01(\tR\rcredentialKey\x12R\n" +
-	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x03\x10\x04R\tworkspace\"s\n" +
+	"\x0ecredential_key\x18\x02 \x01(\tR\rcredentialKey\x12\x1c\n" +
+	"\tworkspace\x18\x03 \x01(\tR\tworkspace\"s\n" +
 	" GetProviderRefreshStatusResponse\x12O\n" +
-	"\vcredentials\x18\x01 \x03(\v2-.openshell.v1.ProviderCredentialRefreshStatusR\vcredentials\"\xdd\x04\n" +
+	"\vcredentials\x18\x01 \x03(\v2-.openshell.v1.ProviderCredentialRefreshStatusR\vcredentials\"\x96\x04\n" +
 	"\x1fConfigureProviderRefreshRequest\x12\x1a\n" +
 	"\bprovider\x18\x01 \x01(\tR\bprovider\x12%\n" +
 	"\x0ecredential_key\x18\x02 \x01(\tR\rcredentialKey\x12K\n" +
 	"\bstrategy\x18\x03 \x01(\x0e2/.openshell.v1.ProviderCredentialRefreshStrategyR\bstrategy\x12]\n" +
 	"\bmaterial\x18\x04 \x03(\v2;.openshell.v1.ConfigureProviderRefreshRequest.MaterialEntryB\x04\x88\xb5\x18\x01R\bmaterial\x120\n" +
 	"\x14secret_material_keys\x18\x05 \x03(\tR\x12secretMaterialKeys\x12C\n" +
-	"\x0fexpiration_time\x18j \x01(\v2\x1a.google.protobuf.TimestampR\x0eexpirationTime\x12R\n" +
-	"\x0fworkspace_scope\x18\b \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"\x0fexpiration_time\x18j \x01(\v2\x1a.google.protobuf.TimestampR\x0eexpirationTime\x12\x1c\n" +
+	"\tworkspace\x18\a \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\t \x01(\tR\trequestId\x1a;\n" +
+	"request_id\x18\b \x01(\tR\trequestId\x1a;\n" +
 	"\rMaterialEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\a\x10\bJ\x04\b\x06\x10\aR\tworkspaceR\rexpires_at_ms\"i\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x06\x10\aR\rexpires_at_ms\"i\n" +
 	" ConfigureProviderRefreshResponse\x12E\n" +
-	"\x06status\x18\x01 \x01(\v2-.openshell.v1.ProviderCredentialRefreshStatusR\x06status\"\xe8\x01\n" +
+	"\x06status\x18\x01 \x01(\v2-.openshell.v1.ProviderCredentialRefreshStatusR\x06status\"\xa1\x01\n" +
 	"\x1fRotateProviderCredentialRequest\x12\x1a\n" +
 	"\bprovider\x18\x01 \x01(\tR\bprovider\x12%\n" +
-	"\x0ecredential_key\x18\x02 \x01(\tR\rcredentialKey\x12R\n" +
-	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"\x0ecredential_key\x18\x02 \x01(\tR\rcredentialKey\x12\x1c\n" +
+	"\tworkspace\x18\x03 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x05 \x01(\tR\trequestIdJ\x04\b\x03\x10\x04R\tworkspace\"i\n" +
+	"request_id\x18\x04 \x01(\tR\trequestId\"i\n" +
 	" RotateProviderCredentialResponse\x12E\n" +
-	"\x06status\x18\x01 \x01(\v2-.openshell.v1.ProviderCredentialRefreshStatusR\x06status\"\x8a\x02\n" +
+	"\x06status\x18\x01 \x01(\v2-.openshell.v1.ProviderCredentialRefreshStatusR\x06status\"\xc3\x01\n" +
 	"\x1cDeleteProviderRefreshRequest\x12\x1a\n" +
 	"\bprovider\x18\x01 \x01(\tR\bprovider\x12%\n" +
-	"\x0ecredential_key\x18\x02 \x01(\tR\rcredentialKey\x12R\n" +
-	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12#\n" +
+	"\x0ecredential_key\x18\x02 \x01(\tR\rcredentialKey\x12\x1c\n" +
+	"\tworkspace\x18\x04 \x01(\tR\tworkspace\x12#\n" +
 	"\rallow_missing\x18\x05 \x01(\bR\fallowMissing\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x06 \x01(\tR\trequestIdJ\x04\b\x03\x10\x04R\tworkspace\"g\n" +
+	"request_id\x18\x06 \x01(\tR\trequestId\"g\n" +
 	"\x1dDeleteProviderRefreshResponse\x127\n" +
 	"\aoutcome\x18\x02 \x01(\x0e2\x1d.openshell.v1.DeletionOutcomeR\aoutcomeJ\x04\b\x01\x10\x02R\adeleted\"\xd8\x05\n" +
 	"\x0fProviderProfile\x12\x0e\n" +
@@ -17876,9 +17855,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\rexpires_after\x18f \x01(\v2\x19.google.protobuf.DurationR\fexpiresAfter\x12\x1d\n" +
 	"\n" +
 	"token_type\x18\x03 \x01(\tR\ttokenTypeJ\x04\b\x02\x10\x03R\n" +
-	"expires_in\"\xb4\x05\n" +
-	"\x13UpdateConfigRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12;\n" +
+	"expires_in\"\xf3\x04\n" +
+	"\x13UpdateConfigRequest\x12;\n" +
 	"\x06policy\x18\x02 \x01(\v2#.openshell.sandbox.v1.SandboxPolicyR\x06policy\x12\x1f\n" +
 	"\vsetting_key\x18\x03 \x01(\tR\n" +
 	"settingKey\x12G\n" +
@@ -17887,14 +17865,15 @@ const file_openshell_proto_rawDesc = "" +
 	"\x06global\x18\x06 \x01(\bR\x06global\x12M\n" +
 	"\x10merge_operations\x18\a \x03(\v2\".openshell.v1.PolicyMergeOperationR\x0fmergeOperations\x12:\n" +
 	"\x19expected_resource_version\x18\b \x01(\x04R\x17expectedResourceVersion\x12T\n" +
-	"\vannotations\x18\t \x03(\v22.openshell.v1.UpdateConfigRequest.AnnotationsEntryR\vannotations\x12R\n" +
-	"\x0fworkspace_scope\x18\v \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"\vannotations\x18\t \x03(\v22.openshell.v1.UpdateConfigRequest.AnnotationsEntryR\vannotations\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\n" +
+	" \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\f \x01(\tR\trequestId\x1a>\n" +
+	"request_id\x18\v \x01(\tR\trequestId\x1a>\n" +
 	"\x10AnnotationsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\n" +
-	"\x10\vR\tworkspace\"\xc7\x03\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xc7\x03\n" +
 	"\x14PolicyMergeOperation\x129\n" +
 	"\badd_rule\x18\x01 \x01(\v2\x1c.openshell.v1.AddNetworkRuleH\x00R\aaddRule\x12N\n" +
 	"\x0fremove_endpoint\x18\x02 \x01(\v2#.openshell.v1.RemoveNetworkEndpointH\x00R\x0eremoveEndpoint\x12B\n" +
@@ -17942,22 +17921,22 @@ const file_openshell_proto_rawDesc = "" +
 	"\vannotations\x18\x05 \x03(\v23.openshell.v1.UpdateConfigResponse.AnnotationsEntryR\vannotations\x1a>\n" +
 	"\x10AnnotationsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xca\x01\n" +
-	"\x1dGetSandboxPolicyStatusRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x89\x01\n" +
+	"\x1dGetSandboxPolicyStatusRequest\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x16\n" +
-	"\x06global\x18\x03 \x01(\bR\x06global\x12R\n" +
-	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x04\x10\x05R\tworkspace\"\x88\x01\n" +
+	"\x06global\x18\x03 \x01(\bR\x06global\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x04 \x01(\tR\tworkspace\"\x88\x01\n" +
 	"\x1eGetSandboxPolicyStatusResponse\x12?\n" +
 	"\brevision\x18\x01 \x01(\v2#.openshell.v1.SandboxPolicyRevisionR\brevision\x12%\n" +
-	"\x0eactive_version\x18\x02 \x01(\rR\ractiveVersion\"\xe9\x01\n" +
-	"\x1aListSandboxPoliciesRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1b\n" +
+	"\x0eactive_version\x18\x02 \x01(\rR\ractiveVersion\"\xa8\x01\n" +
+	"\x1aListSandboxPoliciesRequest\x12\x1b\n" +
 	"\tpage_size\x18\x02 \x01(\x05R\bpageSize\x12\x1d\n" +
 	"\n" +
 	"page_token\x18\x03 \x01(\tR\tpageToken\x12\x16\n" +
-	"\x06global\x18\x04 \x01(\bR\x06global\x12R\n" +
-	"\x0fworkspace_scope\x18\x06 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x05\x10\x06R\tworkspace\"\x88\x01\n" +
+	"\x06global\x18\x04 \x01(\bR\x06global\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x05 \x01(\tR\tworkspace\"\x88\x01\n" +
 	"\x1bListSandboxPoliciesResponse\x12A\n" +
 	"\trevisions\x18\x01 \x03(\v2#.openshell.v1.SandboxPolicyRevisionR\trevisions\x12&\n" +
 	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xa7\x01\n" +
@@ -18001,16 +17980,15 @@ const file_openshell_proto_rawDesc = "" +
 	"provenance\x1a=\n" +
 	"\x0fProvenanceEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x05\x10\x06J\x04\b\x06\x10\aR\rcreated_at_msR\floaded_at_ms\"\xb3\x02\n" +
-	"\x15GetSandboxLogsRequest\x12\x1d\n" +
-	"\n" +
-	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x05\x10\x06J\x04\b\x06\x10\aR\rcreated_at_msR\floaded_at_ms\"\xe7\x01\n" +
+	"\x15GetSandboxLogsRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x14\n" +
 	"\x05lines\x18\x02 \x01(\rR\x05lines\x129\n" +
 	"\n" +
 	"since_time\x18g \x01(\v2\x1a.google.protobuf.TimestampR\tsinceTime\x12\x18\n" +
 	"\asources\x18\x04 \x03(\tR\asources\x12\x1b\n" +
-	"\tmin_level\x18\x05 \x01(\tR\bminLevel\x12R\n" +
-	"\x0fworkspace_scope\x18\a \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x06\x10\aJ\x04\b\x03\x10\x04R\tworkspaceR\bsince_ms\"i\n" +
+	"\tmin_level\x18\x05 \x01(\tR\bminLevel\x12\x1c\n" +
+	"\tworkspace\x18\x06 \x01(\tR\tworkspaceJ\x04\b\x03\x10\x04R\bsince_ms\"i\n" +
 	"\x16PushSandboxLogsRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x120\n" +
@@ -18175,79 +18153,79 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0faccepted_chunks\x18\x01 \x01(\rR\x0eacceptedChunks\x12'\n" +
 	"\x0frejected_chunks\x18\x02 \x01(\rR\x0erejectedChunks\x12+\n" +
 	"\x11rejection_reasons\x18\x03 \x03(\tR\x10rejectionReasons\x12,\n" +
-	"\x12accepted_chunk_ids\x18\x04 \x03(\tR\x10acceptedChunkIds\"\xb5\x01\n" +
-	"\x15GetDraftPolicyRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12#\n" +
-	"\rstatus_filter\x18\x02 \x01(\tR\fstatusFilter\x12R\n" +
-	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x03\x10\x04R\tworkspace\"\xfe\x01\n" +
+	"\x12accepted_chunk_ids\x18\x04 \x03(\tR\x10acceptedChunkIds\"t\n" +
+	"\x15GetDraftPolicyRequest\x12#\n" +
+	"\rstatus_filter\x18\x02 \x01(\tR\fstatusFilter\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x03 \x01(\tR\tworkspace\"\xfe\x01\n" +
 	"\x16GetDraftPolicyResponse\x121\n" +
 	"\x06chunks\x18\x01 \x03(\v2\x19.openshell.v1.PolicyChunkR\x06chunks\x12'\n" +
 	"\x0frolling_summary\x18\x02 \x01(\tR\x0erollingSummary\x12#\n" +
 	"\rdraft_version\x18\x03 \x01(\x04R\fdraftVersion\x12H\n" +
-	"\x12last_analyzed_time\x18h \x01(\v2\x1a.google.protobuf.TimestampR\x10lastAnalyzedTimeJ\x04\b\x04\x10\x05R\x13last_analyzed_at_ms\"\xf0\x01\n" +
-	"\x18ApproveDraftChunkRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12\x19\n" +
+	"\x12last_analyzed_time\x18h \x01(\v2\x1a.google.protobuf.TimestampR\x10lastAnalyzedTimeJ\x04\b\x04\x10\x05R\x13last_analyzed_at_ms\"\xaf\x01\n" +
+	"\x18ApproveDraftChunkRequest\x12\x19\n" +
 	"\bchunk_id\x18\x02 \x01(\tR\achunkId\x12!\n" +
-	"\freview_token\x18\x04 \x01(\tR\vreviewToken\x12R\n" +
-	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"\freview_token\x18\x04 \x01(\tR\vreviewToken\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x03 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x06 \x01(\tR\trequestIdJ\x04\b\x03\x10\x04R\tworkspace\"c\n" +
+	"request_id\x18\x05 \x01(\tR\trequestId\"c\n" +
 	"\x19ApproveDraftChunkResponse\x12%\n" +
 	"\x0epolicy_version\x18\x01 \x01(\rR\rpolicyVersion\x12\x1f\n" +
 	"\vpolicy_hash\x18\x02 \x01(\tR\n" +
-	"policyHash\"\xe4\x01\n" +
-	"\x17RejectDraftChunkRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12\x19\n" +
+	"policyHash\"\xa3\x01\n" +
+	"\x17RejectDraftChunkRequest\x12\x19\n" +
 	"\bchunk_id\x18\x02 \x01(\tR\achunkId\x12\x16\n" +
-	"\x06reason\x18\x03 \x01(\tR\x06reason\x12R\n" +
-	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x04 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x06 \x01(\tR\trequestIdJ\x04\b\x04\x10\x05R\tworkspace\"\x1a\n" +
+	"request_id\x18\x05 \x01(\tR\trequestId\"\x1a\n" +
 	"\x18RejectDraftChunkResponse\"R\n" +
 	"\x12DraftChunkApproval\x12\x19\n" +
 	"\bchunk_id\x18\x01 \x01(\tR\achunkId\x12!\n" +
-	"\freview_token\x18\x02 \x01(\tR\vreviewToken\"\xb0\x02\n" +
-	"\x1cApproveAllDraftChunksRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x128\n" +
+	"\freview_token\x18\x02 \x01(\tR\vreviewToken\"\xef\x01\n" +
+	"\x1cApproveAllDraftChunksRequest\x128\n" +
 	"\x18include_security_flagged\x18\x02 \x01(\bR\x16includeSecurityFlagged\x12>\n" +
-	"\tapprovals\x18\x04 \x03(\v2 .openshell.v1.DraftChunkApprovalR\tapprovals\x12R\n" +
-	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"\tapprovals\x18\x03 \x03(\v2 .openshell.v1.DraftChunkApprovalR\tapprovals\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x04 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x06 \x01(\tR\trequestIdJ\x04\b\x03\x10\x04R\tworkspace\"\xb7\x01\n" +
+	"request_id\x18\x05 \x01(\tR\trequestId\"\xb7\x01\n" +
 	"\x1dApproveAllDraftChunksResponse\x12%\n" +
 	"\x0epolicy_version\x18\x01 \x01(\rR\rpolicyVersion\x12\x1f\n" +
 	"\vpolicy_hash\x18\x02 \x01(\tR\n" +
 	"policyHash\x12'\n" +
 	"\x0fchunks_approved\x18\x03 \x01(\rR\x0echunksApproved\x12%\n" +
-	"\x0echunks_skipped\x18\x04 \x01(\rR\rchunksSkipped\"\x98\x02\n" +
-	"\x15EditDraftChunkRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12\x19\n" +
+	"\x0echunks_skipped\x18\x04 \x01(\rR\rchunksSkipped\"\xd7\x01\n" +
+	"\x15EditDraftChunkRequest\x12\x19\n" +
 	"\bchunk_id\x18\x02 \x01(\tR\achunkId\x12L\n" +
-	"\rproposed_rule\x18\x03 \x01(\v2'.openshell.sandbox.v1.NetworkPolicyRuleR\fproposedRule\x12R\n" +
-	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"\rproposed_rule\x18\x03 \x01(\v2'.openshell.sandbox.v1.NetworkPolicyRuleR\fproposedRule\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x04 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x06 \x01(\tR\trequestIdJ\x04\b\x04\x10\x05R\tworkspace\"\x18\n" +
-	"\x16EditDraftChunkResponse\"\xca\x01\n" +
-	"\x15UndoDraftChunkRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12\x19\n" +
-	"\bchunk_id\x18\x02 \x01(\tR\achunkId\x12R\n" +
-	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"request_id\x18\x05 \x01(\tR\trequestId\"\x18\n" +
+	"\x16EditDraftChunkResponse\"\x89\x01\n" +
+	"\x15UndoDraftChunkRequest\x12\x19\n" +
+	"\bchunk_id\x18\x02 \x01(\tR\achunkId\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x03 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x05 \x01(\tR\trequestIdJ\x04\b\x03\x10\x04R\tworkspace\"`\n" +
+	"request_id\x18\x04 \x01(\tR\trequestId\"`\n" +
 	"\x16UndoDraftChunkResponse\x12%\n" +
 	"\x0epolicy_version\x18\x01 \x01(\rR\rpolicyVersion\x12\x1f\n" +
 	"\vpolicy_hash\x18\x02 \x01(\tR\n" +
-	"policyHash\"\xb1\x01\n" +
-	"\x17ClearDraftChunksRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x1d\n" +
+	"policyHash\"p\n" +
+	"\x17ClearDraftChunksRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x04 \x01(\tR\trequestIdJ\x04\b\x02\x10\x03R\tworkspace\"A\n" +
+	"request_id\x18\x03 \x01(\tR\trequestId\"A\n" +
 	"\x18ClearDraftChunksResponse\x12%\n" +
-	"\x0echunks_cleared\x18\x01 \x01(\rR\rchunksCleared\"\x91\x01\n" +
-	"\x16GetDraftHistoryRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\xbe\x01\n" +
+	"\x0echunks_cleared\x18\x01 \x01(\rR\rchunksCleared\"P\n" +
+	"\x16GetDraftHistoryRequest\x12\x18\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1c\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"\xbe\x01\n" +
 	"\x11DraftHistoryEntry\x129\n" +
 	"\n" +
 	"event_time\x18e \x01(\v2\x1a.google.protobuf.TimestampR\teventTime\x12\x1d\n" +
@@ -18994,417 +18972,381 @@ var file_openshell_proto_depIdxs = []int32{
 	34,  // 44: openshell.v1.CreateSandboxRequest.spec:type_name -> openshell.v1.SandboxSpec
 	250, // 45: openshell.v1.CreateSandboxRequest.labels:type_name -> openshell.v1.CreateSandboxRequest.LabelsEntry
 	251, // 46: openshell.v1.CreateSandboxRequest.annotations:type_name -> openshell.v1.CreateSandboxRequest.AnnotationsEntry
-	270, // 47: openshell.v1.CreateSandboxRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	38,  // 48: openshell.v1.CreateSandboxTemplateRequest.template:type_name -> openshell.v1.SandboxWorkloadTemplate
-	270, // 49: openshell.v1.CreateSandboxTemplateRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 50: openshell.v1.GetSandboxTemplateRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 51: openshell.v1.ListSandboxTemplatesRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 52: openshell.v1.DeleteSandboxTemplateRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	38,  // 53: openshell.v1.SandboxTemplateResponse.template:type_name -> openshell.v1.SandboxWorkloadTemplate
-	38,  // 54: openshell.v1.ListSandboxTemplatesResponse.templates:type_name -> openshell.v1.SandboxWorkloadTemplate
-	15,  // 55: openshell.v1.DeleteSandboxTemplateResponse.outcome:type_name -> openshell.v1.DeletionOutcome
-	270, // 56: openshell.v1.BeginRootfsTarStagingRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	265, // 57: openshell.v1.BeginRootfsTarStagingResponse.expiration_time:type_name -> google.protobuf.Timestamp
-	270, // 58: openshell.v1.GetSandboxRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 59: openshell.v1.ListSandboxesRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 60: openshell.v1.ListSandboxProvidersRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 61: openshell.v1.AttachSandboxProviderRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 62: openshell.v1.DetachSandboxProviderRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 63: openshell.v1.DeleteSandboxRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 64: openshell.v1.StopSandboxRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 65: openshell.v1.StartSandboxRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	33,  // 66: openshell.v1.SandboxResponse.sandbox:type_name -> openshell.v1.Sandbox
-	33,  // 67: openshell.v1.ListSandboxesResponse.sandboxes:type_name -> openshell.v1.Sandbox
-	271, // 68: openshell.v1.ListSandboxProvidersResponse.providers:type_name -> openshell.datamodel.v1.Provider
-	33,  // 69: openshell.v1.AttachSandboxProviderResponse.sandbox:type_name -> openshell.v1.Sandbox
-	75,  // 70: openshell.v1.AttachSandboxProviderResponse.receipt:type_name -> openshell.v1.ProviderMutationReceipt
-	33,  // 71: openshell.v1.DetachSandboxProviderResponse.sandbox:type_name -> openshell.v1.Sandbox
-	75,  // 72: openshell.v1.DetachSandboxProviderResponse.receipt:type_name -> openshell.v1.ProviderMutationReceipt
-	73,  // 73: openshell.v1.ConfigSnapshotRevision.sandbox_config:type_name -> openshell.v1.SandboxConfigRevision
-	71,  // 74: openshell.v1.ConfigSnapshotRevision.provider_target:type_name -> openshell.v1.ProviderDesiredIdentity
-	272, // 75: openshell.v1.SandboxConfigRevision.policy_source:type_name -> openshell.sandbox.v1.PolicySource
-	4,   // 76: openshell.v1.ConfigUpdateOperation.component:type_name -> openshell.v1.ConfigComponent
-	72,  // 77: openshell.v1.ConfigUpdateOperation.target_revision:type_name -> openshell.v1.ConfigSnapshotRevision
-	6,   // 78: openshell.v1.ConfigUpdateOperation.state:type_name -> openshell.v1.ConfigUpdateOperationState
-	5,   // 79: openshell.v1.ConfigUpdateOperation.outcome:type_name -> openshell.v1.ConfigApplyOutcome
-	265, // 80: openshell.v1.ConfigUpdateOperation.created_time:type_name -> google.protobuf.Timestamp
-	265, // 81: openshell.v1.ConfigUpdateOperation.updated_time:type_name -> google.protobuf.Timestamp
-	265, // 82: openshell.v1.ConfigUpdateOperation.completed_time:type_name -> google.protobuf.Timestamp
-	1,   // 83: openshell.v1.ProviderMutationReceipt.kind:type_name -> openshell.v1.ProviderMutationKind
-	71,  // 84: openshell.v1.ProviderMutationReceipt.desired:type_name -> openshell.v1.ProviderDesiredIdentity
-	265, // 85: openshell.v1.ProviderMutationReceipt.persisted_time:type_name -> google.protobuf.Timestamp
-	3,   // 86: openshell.v1.ProviderReadinessObservation.reason:type_name -> openshell.v1.ProviderReadinessReason
-	75,  // 87: openshell.v1.ProviderReadinessStatus.receipt:type_name -> openshell.v1.ProviderMutationReceipt
-	2,   // 88: openshell.v1.ProviderReadinessStatus.state:type_name -> openshell.v1.ProviderReadinessState
-	3,   // 89: openshell.v1.ProviderReadinessStatus.reason:type_name -> openshell.v1.ProviderReadinessReason
-	76,  // 90: openshell.v1.ProviderReadinessStatus.observed:type_name -> openshell.v1.ProviderReadinessObservation
-	265, // 91: openshell.v1.ProviderReadinessStatus.observed_time:type_name -> google.protobuf.Timestamp
-	265, // 92: openshell.v1.ProviderReadinessStatus.evaluated_time:type_name -> google.protobuf.Timestamp
-	74,  // 93: openshell.v1.ProviderReadinessStatus.operation:type_name -> openshell.v1.ConfigUpdateOperation
-	270, // 94: openshell.v1.GetSandboxProviderStatusRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	77,  // 95: openshell.v1.GetSandboxProviderStatusResponse.status:type_name -> openshell.v1.ProviderReadinessStatus
-	76,  // 96: openshell.v1.ReportProviderReadinessRequest.observation:type_name -> openshell.v1.ProviderReadinessObservation
-	269, // 97: openshell.v1.ReportProviderReadinessResponse.report_interval:type_name -> google.protobuf.Duration
-	269, // 98: openshell.v1.ReportProviderReadinessResponse.observation_ttl:type_name -> google.protobuf.Duration
-	15,  // 99: openshell.v1.DeleteSandboxResponse.outcome:type_name -> openshell.v1.DeletionOutcome
-	265, // 100: openshell.v1.CreateSshSessionResponse.expiration_time:type_name -> google.protobuf.Timestamp
-	270, // 101: openshell.v1.ExposeServiceRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 102: openshell.v1.GetServiceRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 103: openshell.v1.ListServicesRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	92,  // 104: openshell.v1.ListServicesResponse.services:type_name -> openshell.v1.ServiceEndpointResponse
-	270, // 105: openshell.v1.DeleteServiceRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	15,  // 106: openshell.v1.DeleteServiceResponse.outcome:type_name -> openshell.v1.DeletionOutcome
-	266, // 107: openshell.v1.ServiceEndpoint.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
-	91,  // 108: openshell.v1.ServiceEndpointResponse.endpoint:type_name -> openshell.v1.ServiceEndpoint
-	15,  // 109: openshell.v1.RevokeSshSessionResponse.outcome:type_name -> openshell.v1.DeletionOutcome
-	252, // 110: openshell.v1.ExecSandboxRequest.environment:type_name -> openshell.v1.ExecSandboxRequest.EnvironmentEntry
-	269, // 111: openshell.v1.ExecSandboxRequest.execution_timeout:type_name -> google.protobuf.Duration
-	96,  // 112: openshell.v1.ExecSandboxEvent.stdout:type_name -> openshell.v1.ExecSandboxStdout
-	97,  // 113: openshell.v1.ExecSandboxEvent.stderr:type_name -> openshell.v1.ExecSandboxStderr
-	98,  // 114: openshell.v1.ExecSandboxEvent.exit:type_name -> openshell.v1.ExecSandboxExit
-	191, // 115: openshell.v1.TcpForwardInit.ssh:type_name -> openshell.v1.SshRelayTarget
-	192, // 116: openshell.v1.TcpForwardInit.tcp:type_name -> openshell.v1.TcpRelayTarget
-	100, // 117: openshell.v1.TcpForwardFrame.init:type_name -> openshell.v1.TcpForwardInit
-	95,  // 118: openshell.v1.ExecSandboxInput.start:type_name -> openshell.v1.ExecSandboxRequest
-	103, // 119: openshell.v1.ExecSandboxInput.resize:type_name -> openshell.v1.ExecSandboxWindowResize
-	266, // 120: openshell.v1.SshSession.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
-	265, // 121: openshell.v1.SshSession.expiration_time:type_name -> google.protobuf.Timestamp
-	265, // 122: openshell.v1.WatchSandboxRequest.since_time:type_name -> google.protobuf.Timestamp
-	33,  // 123: openshell.v1.SandboxStreamEvent.sandbox:type_name -> openshell.v1.Sandbox
-	107, // 124: openshell.v1.SandboxStreamEvent.log:type_name -> openshell.v1.SandboxLogLine
-	47,  // 125: openshell.v1.SandboxStreamEvent.event:type_name -> openshell.v1.PlatformEvent
-	108, // 126: openshell.v1.SandboxStreamEvent.warning:type_name -> openshell.v1.SandboxStreamWarning
-	202, // 127: openshell.v1.SandboxStreamEvent.draft_policy_update:type_name -> openshell.v1.DraftPolicyUpdate
-	265, // 128: openshell.v1.SandboxLogLine.event_time:type_name -> google.protobuf.Timestamp
-	253, // 129: openshell.v1.SandboxLogLine.fields:type_name -> openshell.v1.SandboxLogLine.FieldsEntry
-	271, // 130: openshell.v1.CreateProviderRequest.provider:type_name -> openshell.datamodel.v1.Provider
-	270, // 131: openshell.v1.CreateProviderRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 132: openshell.v1.GetProviderRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 133: openshell.v1.ListProvidersRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	271, // 134: openshell.v1.UpdateProviderRequest.provider:type_name -> openshell.datamodel.v1.Provider
-	254, // 135: openshell.v1.UpdateProviderRequest.credential_expiration_times:type_name -> openshell.v1.UpdateProviderRequest.CredentialExpirationTimesEntry
-	270, // 136: openshell.v1.UpdateProviderRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 137: openshell.v1.DeleteProviderRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	271, // 138: openshell.v1.ProviderResponse.provider:type_name -> openshell.datamodel.v1.Provider
-	75,  // 139: openshell.v1.ProviderResponse.target_receipts:type_name -> openshell.v1.ProviderMutationReceipt
-	271, // 140: openshell.v1.ListProvidersResponse.providers:type_name -> openshell.datamodel.v1.Provider
-	137, // 141: openshell.v1.ProviderProfileImportItem.profile:type_name -> openshell.v1.ProviderProfile
-	269, // 142: openshell.v1.ProviderCredentialTokenGrant.cache_ttl:type_name -> google.protobuf.Duration
-	120, // 143: openshell.v1.ProviderCredentialTokenGrant.audience_overrides:type_name -> openshell.v1.ProviderCredentialTokenGrantAudienceOverride
-	7,   // 144: openshell.v1.ProviderCredentialTokenGrant.grant_type:type_name -> openshell.v1.ProviderCredentialTokenGrantType
-	121, // 145: openshell.v1.ProviderCredentialTokenGrant.subject_token:type_name -> openshell.v1.ProviderCredentialTokenGrantSubjectToken
-	126, // 146: openshell.v1.ProviderProfileCredential.refresh:type_name -> openshell.v1.ProviderCredentialRefresh
-	122, // 147: openshell.v1.ProviderProfileCredential.token_grant:type_name -> openshell.v1.ProviderCredentialTokenGrant
-	8,   // 148: openshell.v1.ProviderCredentialRefresh.strategy:type_name -> openshell.v1.ProviderCredentialRefreshStrategy
-	269, // 149: openshell.v1.ProviderCredentialRefresh.refresh_before:type_name -> google.protobuf.Duration
-	269, // 150: openshell.v1.ProviderCredentialRefresh.max_lifetime:type_name -> google.protobuf.Duration
-	124, // 151: openshell.v1.ProviderCredentialRefresh.material:type_name -> openshell.v1.ProviderCredentialRefreshMaterial
-	125, // 152: openshell.v1.ProviderCredentialRefresh.additional_outputs:type_name -> openshell.v1.ProviderCredentialRefreshOutput
-	8,   // 153: openshell.v1.ProviderCredentialRefreshStatus.strategy:type_name -> openshell.v1.ProviderCredentialRefreshStrategy
-	265, // 154: openshell.v1.ProviderCredentialRefreshStatus.expiration_time:type_name -> google.protobuf.Timestamp
-	265, // 155: openshell.v1.ProviderCredentialRefreshStatus.next_refresh_time:type_name -> google.protobuf.Timestamp
-	265, // 156: openshell.v1.ProviderCredentialRefreshStatus.last_refresh_time:type_name -> google.protobuf.Timestamp
-	14,  // 157: openshell.v1.ProviderCredentialRefreshStatus.recovery_action:type_name -> openshell.v1.ProviderCredentialRefreshRecoveryAction
-	265, // 158: openshell.v1.ProviderCredentialRefreshStatus.last_error_time:type_name -> google.protobuf.Timestamp
-	270, // 159: openshell.v1.GetProviderRefreshStatusRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	127, // 160: openshell.v1.GetProviderRefreshStatusResponse.credentials:type_name -> openshell.v1.ProviderCredentialRefreshStatus
-	8,   // 161: openshell.v1.ConfigureProviderRefreshRequest.strategy:type_name -> openshell.v1.ProviderCredentialRefreshStrategy
-	255, // 162: openshell.v1.ConfigureProviderRefreshRequest.material:type_name -> openshell.v1.ConfigureProviderRefreshRequest.MaterialEntry
-	265, // 163: openshell.v1.ConfigureProviderRefreshRequest.expiration_time:type_name -> google.protobuf.Timestamp
-	270, // 164: openshell.v1.ConfigureProviderRefreshRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	127, // 165: openshell.v1.ConfigureProviderRefreshResponse.status:type_name -> openshell.v1.ProviderCredentialRefreshStatus
-	270, // 166: openshell.v1.RotateProviderCredentialRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	127, // 167: openshell.v1.RotateProviderCredentialResponse.status:type_name -> openshell.v1.ProviderCredentialRefreshStatus
-	270, // 168: openshell.v1.DeleteProviderRefreshRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	15,  // 169: openshell.v1.DeleteProviderRefreshResponse.outcome:type_name -> openshell.v1.DeletionOutcome
-	9,   // 170: openshell.v1.ProviderProfile.category:type_name -> openshell.v1.ProviderProfileCategory
-	123, // 171: openshell.v1.ProviderProfile.credentials:type_name -> openshell.v1.ProviderProfileCredential
-	273, // 172: openshell.v1.ProviderProfile.endpoints:type_name -> openshell.sandbox.v1.NetworkEndpoint
-	274, // 173: openshell.v1.ProviderProfile.binaries:type_name -> openshell.sandbox.v1.NetworkBinary
-	128, // 174: openshell.v1.ProviderProfile.discovery:type_name -> openshell.v1.ProviderProfileDiscovery
-	256, // 175: openshell.v1.ProviderProfile.annotations:type_name -> openshell.v1.ProviderProfile.AnnotationsEntry
-	137, // 176: openshell.v1.ProviderProfileResponse.profile:type_name -> openshell.v1.ProviderProfile
-	137, // 177: openshell.v1.ListProviderProfilesResponse.profiles:type_name -> openshell.v1.ProviderProfile
-	118, // 178: openshell.v1.ImportProviderProfilesRequest.profiles:type_name -> openshell.v1.ProviderProfileImportItem
-	119, // 179: openshell.v1.ImportProviderProfilesResponse.diagnostics:type_name -> openshell.v1.ProviderProfileDiagnostic
-	137, // 180: openshell.v1.ImportProviderProfilesResponse.profiles:type_name -> openshell.v1.ProviderProfile
-	118, // 181: openshell.v1.UpdateProviderProfilesRequest.profile:type_name -> openshell.v1.ProviderProfileImportItem
-	119, // 182: openshell.v1.UpdateProviderProfilesResponse.diagnostics:type_name -> openshell.v1.ProviderProfileDiagnostic
-	137, // 183: openshell.v1.UpdateProviderProfilesResponse.profile:type_name -> openshell.v1.ProviderProfile
-	118, // 184: openshell.v1.LintProviderProfilesRequest.profiles:type_name -> openshell.v1.ProviderProfileImportItem
-	119, // 185: openshell.v1.LintProviderProfilesResponse.diagnostics:type_name -> openshell.v1.ProviderProfileDiagnostic
-	15,  // 186: openshell.v1.DeleteProviderResponse.outcome:type_name -> openshell.v1.DeletionOutcome
-	15,  // 187: openshell.v1.DeleteProviderProfileResponse.outcome:type_name -> openshell.v1.DeletionOutcome
-	150, // 188: openshell.v1.StaticCredentialBinding.endpoints:type_name -> openshell.v1.StaticCredentialEndpointBinding
-	257, // 189: openshell.v1.GetSandboxProviderEnvironmentResponse.environment:type_name -> openshell.v1.GetSandboxProviderEnvironmentResponse.EnvironmentEntry
-	258, // 190: openshell.v1.GetSandboxProviderEnvironmentResponse.credential_expiration_times:type_name -> openshell.v1.GetSandboxProviderEnvironmentResponse.CredentialExpirationTimesEntry
-	259, // 191: openshell.v1.GetSandboxProviderEnvironmentResponse.dynamic_credentials:type_name -> openshell.v1.GetSandboxProviderEnvironmentResponse.DynamicCredentialsEntry
-	260, // 192: openshell.v1.GetSandboxProviderEnvironmentResponse.static_credential_bindings:type_name -> openshell.v1.GetSandboxProviderEnvironmentResponse.StaticCredentialBindingsEntry
-	3,   // 193: openshell.v1.GetSandboxProviderEnvironmentResponse.readiness_reason:type_name -> openshell.v1.ProviderReadinessReason
-	269, // 194: openshell.v1.ExchangeProviderSubjectTokenResponse.expires_after:type_name -> google.protobuf.Duration
-	267, // 195: openshell.v1.UpdateConfigRequest.policy:type_name -> openshell.sandbox.v1.SandboxPolicy
-	275, // 196: openshell.v1.UpdateConfigRequest.setting_value:type_name -> openshell.sandbox.v1.SettingValue
-	156, // 197: openshell.v1.UpdateConfigRequest.merge_operations:type_name -> openshell.v1.PolicyMergeOperation
-	261, // 198: openshell.v1.UpdateConfigRequest.annotations:type_name -> openshell.v1.UpdateConfigRequest.AnnotationsEntry
-	270, // 199: openshell.v1.UpdateConfigRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	157, // 200: openshell.v1.PolicyMergeOperation.add_rule:type_name -> openshell.v1.AddNetworkRule
-	158, // 201: openshell.v1.PolicyMergeOperation.remove_endpoint:type_name -> openshell.v1.RemoveNetworkEndpoint
-	159, // 202: openshell.v1.PolicyMergeOperation.remove_rule:type_name -> openshell.v1.RemoveNetworkRule
-	161, // 203: openshell.v1.PolicyMergeOperation.add_deny_rules:type_name -> openshell.v1.AddDenyRules
-	162, // 204: openshell.v1.PolicyMergeOperation.add_allow_rules:type_name -> openshell.v1.AddAllowRules
-	163, // 205: openshell.v1.PolicyMergeOperation.remove_binary:type_name -> openshell.v1.RemoveNetworkBinary
-	276, // 206: openshell.v1.AddNetworkRule.rule:type_name -> openshell.sandbox.v1.NetworkPolicyRule
-	274, // 207: openshell.v1.L7RuleTarget.binaries:type_name -> openshell.sandbox.v1.NetworkBinary
-	277, // 208: openshell.v1.AddDenyRules.deny_rules:type_name -> openshell.sandbox.v1.L7DenyRule
-	160, // 209: openshell.v1.AddDenyRules.target:type_name -> openshell.v1.L7RuleTarget
-	278, // 210: openshell.v1.AddAllowRules.rules:type_name -> openshell.sandbox.v1.L7Rule
-	160, // 211: openshell.v1.AddAllowRules.target:type_name -> openshell.v1.L7RuleTarget
-	262, // 212: openshell.v1.UpdateConfigResponse.annotations:type_name -> openshell.v1.UpdateConfigResponse.AnnotationsEntry
-	270, // 213: openshell.v1.GetSandboxPolicyStatusRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	174, // 214: openshell.v1.GetSandboxPolicyStatusResponse.revision:type_name -> openshell.v1.SandboxPolicyRevision
-	270, // 215: openshell.v1.ListSandboxPoliciesRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	174, // 216: openshell.v1.ListSandboxPoliciesResponse.revisions:type_name -> openshell.v1.SandboxPolicyRevision
-	11,  // 217: openshell.v1.ReportPolicyStatusRequest.status:type_name -> openshell.v1.PolicyStatus
-	10,  // 218: openshell.v1.SandboxConfigurationAdmission.state:type_name -> openshell.v1.ConfigurationAdmissionState
-	171, // 219: openshell.v1.ReportSandboxConfigurationRequest.admission:type_name -> openshell.v1.SandboxConfigurationAdmission
-	11,  // 220: openshell.v1.SandboxPolicyRevision.status:type_name -> openshell.v1.PolicyStatus
-	265, // 221: openshell.v1.SandboxPolicyRevision.created_time:type_name -> google.protobuf.Timestamp
-	265, // 222: openshell.v1.SandboxPolicyRevision.loaded_time:type_name -> google.protobuf.Timestamp
-	267, // 223: openshell.v1.SandboxPolicyRevision.policy:type_name -> openshell.sandbox.v1.SandboxPolicy
-	263, // 224: openshell.v1.SandboxPolicyRevision.provenance:type_name -> openshell.v1.SandboxPolicyRevision.ProvenanceEntry
-	265, // 225: openshell.v1.GetSandboxLogsRequest.since_time:type_name -> google.protobuf.Timestamp
-	270, // 226: openshell.v1.GetSandboxLogsRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	107, // 227: openshell.v1.PushSandboxLogsRequest.logs:type_name -> openshell.v1.SandboxLogLine
-	107, // 228: openshell.v1.GetSandboxLogsResponse.logs:type_name -> openshell.v1.SandboxLogLine
-	181, // 229: openshell.v1.SupervisorMessage.hello:type_name -> openshell.v1.SupervisorHello
-	184, // 230: openshell.v1.SupervisorMessage.heartbeat:type_name -> openshell.v1.SupervisorHeartbeat
-	195, // 231: openshell.v1.SupervisorMessage.relay_open_result:type_name -> openshell.v1.RelayOpenResult
-	196, // 232: openshell.v1.SupervisorMessage.relay_close:type_name -> openshell.v1.RelayClose
-	182, // 233: openshell.v1.GatewayMessage.session_accepted:type_name -> openshell.v1.SessionAccepted
-	183, // 234: openshell.v1.GatewayMessage.session_rejected:type_name -> openshell.v1.SessionRejected
-	185, // 235: openshell.v1.GatewayMessage.heartbeat:type_name -> openshell.v1.GatewayHeartbeat
-	190, // 236: openshell.v1.GatewayMessage.relay_open:type_name -> openshell.v1.RelayOpen
-	196, // 237: openshell.v1.GatewayMessage.relay_close:type_name -> openshell.v1.RelayClose
-	269, // 238: openshell.v1.SessionAccepted.heartbeat_interval:type_name -> google.protobuf.Duration
-	191, // 239: openshell.v1.RelayOpen.ssh:type_name -> openshell.v1.SshRelayTarget
-	192, // 240: openshell.v1.RelayOpen.tcp:type_name -> openshell.v1.TcpRelayTarget
-	193, // 241: openshell.v1.RelayFrame.init:type_name -> openshell.v1.RelayInit
-	265, // 242: openshell.v1.DenialSummary.first_seen_time:type_name -> google.protobuf.Timestamp
-	265, // 243: openshell.v1.DenialSummary.last_seen_time:type_name -> google.protobuf.Timestamp
-	197, // 244: openshell.v1.DenialSummary.l7_request_samples:type_name -> openshell.v1.L7RequestSample
-	199, // 245: openshell.v1.NetworkActivitySummary.denials_by_group:type_name -> openshell.v1.DenialGroupCount
-	276, // 246: openshell.v1.PolicyChunk.proposed_rule:type_name -> openshell.sandbox.v1.NetworkPolicyRule
-	265, // 247: openshell.v1.PolicyChunk.created_time:type_name -> google.protobuf.Timestamp
-	265, // 248: openshell.v1.PolicyChunk.decided_time:type_name -> google.protobuf.Timestamp
-	265, // 249: openshell.v1.PolicyChunk.first_seen_time:type_name -> google.protobuf.Timestamp
-	265, // 250: openshell.v1.PolicyChunk.last_seen_time:type_name -> google.protobuf.Timestamp
-	267, // 251: openshell.v1.PolicyChunk.current_effective_policy:type_name -> openshell.sandbox.v1.SandboxPolicy
-	267, // 252: openshell.v1.PolicyChunk.candidate_effective_policy:type_name -> openshell.sandbox.v1.SandboxPolicy
-	198, // 253: openshell.v1.SubmitPolicyAnalysisRequest.summaries:type_name -> openshell.v1.DenialSummary
-	201, // 254: openshell.v1.SubmitPolicyAnalysisRequest.proposed_chunks:type_name -> openshell.v1.PolicyChunk
-	200, // 255: openshell.v1.SubmitPolicyAnalysisRequest.network_activity_summaries:type_name -> openshell.v1.NetworkActivitySummary
-	270, // 256: openshell.v1.GetDraftPolicyRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	201, // 257: openshell.v1.GetDraftPolicyResponse.chunks:type_name -> openshell.v1.PolicyChunk
-	265, // 258: openshell.v1.GetDraftPolicyResponse.last_analyzed_time:type_name -> google.protobuf.Timestamp
-	270, // 259: openshell.v1.ApproveDraftChunkRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 260: openshell.v1.RejectDraftChunkRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	211, // 261: openshell.v1.ApproveAllDraftChunksRequest.approvals:type_name -> openshell.v1.DraftChunkApproval
-	270, // 262: openshell.v1.ApproveAllDraftChunksRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	276, // 263: openshell.v1.EditDraftChunkRequest.proposed_rule:type_name -> openshell.sandbox.v1.NetworkPolicyRule
-	270, // 264: openshell.v1.EditDraftChunkRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 265: openshell.v1.UndoDraftChunkRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 266: openshell.v1.ClearDraftChunksRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	270, // 267: openshell.v1.GetDraftHistoryRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
-	265, // 268: openshell.v1.DraftHistoryEntry.event_time:type_name -> google.protobuf.Timestamp
-	221, // 269: openshell.v1.GetDraftHistoryResponse.entries:type_name -> openshell.v1.DraftHistoryEntry
-	264, // 270: openshell.v1.CreateWorkspaceRequest.labels:type_name -> openshell.v1.CreateWorkspaceRequest.LabelsEntry
-	279, // 271: openshell.v1.CreateWorkspaceResponse.workspace:type_name -> openshell.datamodel.v1.Workspace
-	279, // 272: openshell.v1.GetWorkspaceResponse.workspace:type_name -> openshell.datamodel.v1.Workspace
-	279, // 273: openshell.v1.ListWorkspacesResponse.workspaces:type_name -> openshell.datamodel.v1.Workspace
-	15,  // 274: openshell.v1.DeleteWorkspaceResponse.outcome:type_name -> openshell.v1.DeletionOutcome
-	266, // 275: openshell.v1.WorkspaceMember.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
-	13,  // 276: openshell.v1.WorkspaceMember.role:type_name -> openshell.v1.WorkspaceRole
-	13,  // 277: openshell.v1.AddWorkspaceMemberRequest.role:type_name -> openshell.v1.WorkspaceRole
-	231, // 278: openshell.v1.AddWorkspaceMemberResponse.member:type_name -> openshell.v1.WorkspaceMember
-	15,  // 279: openshell.v1.RemoveWorkspaceMemberResponse.outcome:type_name -> openshell.v1.DeletionOutcome
-	231, // 280: openshell.v1.ListWorkspaceMembersResponse.members:type_name -> openshell.v1.WorkspaceMember
-	265, // 281: openshell.v1.ExtensionServiceCredential.expiration_time:type_name -> google.protobuf.Timestamp
-	16,  // 282: openshell.v1.EndpointObservation.result:type_name -> openshell.v1.EndpointResult
-	239, // 283: openshell.v1.ReportEndpointStatusRequest.observations:type_name -> openshell.v1.EndpointObservation
-	16,  // 284: openshell.v1.EndpointStatus.last_result:type_name -> openshell.v1.EndpointResult
-	265, // 285: openshell.v1.EndpointStatus.last_reported_time:type_name -> google.protobuf.Timestamp
-	265, // 286: openshell.v1.SandboxProvisioning.configuration_change_time:type_name -> google.protobuf.Timestamp
-	265, // 287: openshell.v1.SandboxProvisioning.first_rejection_time:type_name -> google.protobuf.Timestamp
-	265, // 288: openshell.v1.SandboxProvisioning.deadline:type_name -> google.protobuf.Timestamp
-	265, // 289: openshell.v1.SandboxProvisioning.timeout_time:type_name -> google.protobuf.Timestamp
-	265, // 290: openshell.v1.SandboxProvisioning.cleanup_completed_time:type_name -> google.protobuf.Timestamp
-	265, // 291: openshell.v1.SandboxProvisioning.cleanup_retry_time:type_name -> google.protobuf.Timestamp
-	265, // 292: openshell.v1.SandboxProvisioning.attachment_change_time:type_name -> google.protobuf.Timestamp
-	265, // 293: openshell.v1.UpdateProviderRequest.CredentialExpirationTimesEntry.value:type_name -> google.protobuf.Timestamp
-	265, // 294: openshell.v1.GetSandboxProviderEnvironmentResponse.CredentialExpirationTimesEntry.value:type_name -> google.protobuf.Timestamp
-	123, // 295: openshell.v1.GetSandboxProviderEnvironmentResponse.DynamicCredentialsEntry.value:type_name -> openshell.v1.ProviderProfileCredential
-	151, // 296: openshell.v1.GetSandboxProviderEnvironmentResponse.StaticCredentialBindingsEntry.value:type_name -> openshell.v1.StaticCredentialBinding
-	21,  // 297: openshell.v1.OpenShell.Health:input_type -> openshell.v1.HealthRequest
-	23,  // 298: openshell.v1.OpenShell.GetCurrentUser:input_type -> openshell.v1.GetCurrentUserRequest
-	25,  // 299: openshell.v1.OpenShell.GetGatewayInfo:input_type -> openshell.v1.GetGatewayInfoRequest
-	48,  // 300: openshell.v1.OpenShell.CreateSandbox:input_type -> openshell.v1.CreateSandboxRequest
-	56,  // 301: openshell.v1.OpenShell.BeginRootfsTarStaging:input_type -> openshell.v1.BeginRootfsTarStagingRequest
-	58,  // 302: openshell.v1.OpenShell.GetSandbox:input_type -> openshell.v1.GetSandboxRequest
-	59,  // 303: openshell.v1.OpenShell.ListSandboxes:input_type -> openshell.v1.ListSandboxesRequest
-	49,  // 304: openshell.v1.OpenShell.CreateSandboxTemplate:input_type -> openshell.v1.CreateSandboxTemplateRequest
-	50,  // 305: openshell.v1.OpenShell.GetSandboxTemplate:input_type -> openshell.v1.GetSandboxTemplateRequest
-	51,  // 306: openshell.v1.OpenShell.ListSandboxTemplates:input_type -> openshell.v1.ListSandboxTemplatesRequest
-	52,  // 307: openshell.v1.OpenShell.DeleteSandboxTemplate:input_type -> openshell.v1.DeleteSandboxTemplateRequest
-	60,  // 308: openshell.v1.OpenShell.ListSandboxProviders:input_type -> openshell.v1.ListSandboxProvidersRequest
-	61,  // 309: openshell.v1.OpenShell.AttachSandboxProvider:input_type -> openshell.v1.AttachSandboxProviderRequest
-	62,  // 310: openshell.v1.OpenShell.DetachSandboxProvider:input_type -> openshell.v1.DetachSandboxProviderRequest
-	78,  // 311: openshell.v1.OpenShell.GetSandboxProviderStatus:input_type -> openshell.v1.GetSandboxProviderStatusRequest
-	63,  // 312: openshell.v1.OpenShell.DeleteSandbox:input_type -> openshell.v1.DeleteSandboxRequest
-	64,  // 313: openshell.v1.OpenShell.StopSandbox:input_type -> openshell.v1.StopSandboxRequest
-	65,  // 314: openshell.v1.OpenShell.StartSandbox:input_type -> openshell.v1.StartSandboxRequest
-	83,  // 315: openshell.v1.OpenShell.CreateSshSession:input_type -> openshell.v1.CreateSshSessionRequest
-	85,  // 316: openshell.v1.OpenShell.ExposeService:input_type -> openshell.v1.ExposeServiceRequest
-	86,  // 317: openshell.v1.OpenShell.GetService:input_type -> openshell.v1.GetServiceRequest
-	87,  // 318: openshell.v1.OpenShell.ListServices:input_type -> openshell.v1.ListServicesRequest
-	89,  // 319: openshell.v1.OpenShell.DeleteService:input_type -> openshell.v1.DeleteServiceRequest
-	93,  // 320: openshell.v1.OpenShell.RevokeSshSession:input_type -> openshell.v1.RevokeSshSessionRequest
-	95,  // 321: openshell.v1.OpenShell.ExecSandbox:input_type -> openshell.v1.ExecSandboxRequest
-	101, // 322: openshell.v1.OpenShell.ForwardTcp:input_type -> openshell.v1.TcpForwardFrame
-	102, // 323: openshell.v1.OpenShell.ExecSandboxInteractive:input_type -> openshell.v1.ExecSandboxInput
-	109, // 324: openshell.v1.OpenShell.CreateProvider:input_type -> openshell.v1.CreateProviderRequest
-	110, // 325: openshell.v1.OpenShell.GetProvider:input_type -> openshell.v1.GetProviderRequest
-	111, // 326: openshell.v1.OpenShell.ListProviders:input_type -> openshell.v1.ListProvidersRequest
-	116, // 327: openshell.v1.OpenShell.ListProviderProfiles:input_type -> openshell.v1.ListProviderProfilesRequest
-	117, // 328: openshell.v1.OpenShell.GetProviderProfile:input_type -> openshell.v1.GetProviderProfileRequest
-	140, // 329: openshell.v1.OpenShell.ImportProviderProfiles:input_type -> openshell.v1.ImportProviderProfilesRequest
-	142, // 330: openshell.v1.OpenShell.UpdateProviderProfiles:input_type -> openshell.v1.UpdateProviderProfilesRequest
-	144, // 331: openshell.v1.OpenShell.LintProviderProfiles:input_type -> openshell.v1.LintProviderProfilesRequest
-	112, // 332: openshell.v1.OpenShell.UpdateProvider:input_type -> openshell.v1.UpdateProviderRequest
-	129, // 333: openshell.v1.OpenShell.GetProviderRefreshStatus:input_type -> openshell.v1.GetProviderRefreshStatusRequest
-	131, // 334: openshell.v1.OpenShell.ConfigureProviderRefresh:input_type -> openshell.v1.ConfigureProviderRefreshRequest
-	133, // 335: openshell.v1.OpenShell.RotateProviderCredential:input_type -> openshell.v1.RotateProviderCredentialRequest
-	135, // 336: openshell.v1.OpenShell.DeleteProviderRefresh:input_type -> openshell.v1.DeleteProviderRefreshRequest
-	113, // 337: openshell.v1.OpenShell.DeleteProvider:input_type -> openshell.v1.DeleteProviderRequest
-	147, // 338: openshell.v1.OpenShell.DeleteProviderProfile:input_type -> openshell.v1.DeleteProviderProfileRequest
-	280, // 339: openshell.v1.OpenShell.GetSandboxConfig:input_type -> openshell.sandbox.v1.GetSandboxConfigRequest
-	281, // 340: openshell.v1.OpenShell.GetGatewayConfig:input_type -> openshell.sandbox.v1.GetGatewayConfigRequest
-	155, // 341: openshell.v1.OpenShell.UpdateConfig:input_type -> openshell.v1.UpdateConfigRequest
-	165, // 342: openshell.v1.OpenShell.GetSandboxPolicyStatus:input_type -> openshell.v1.GetSandboxPolicyStatusRequest
-	167, // 343: openshell.v1.OpenShell.ListSandboxPolicies:input_type -> openshell.v1.ListSandboxPoliciesRequest
-	169, // 344: openshell.v1.OpenShell.ReportPolicyStatus:input_type -> openshell.v1.ReportPolicyStatusRequest
-	240, // 345: openshell.v1.OpenShell.ReportEndpointStatus:input_type -> openshell.v1.ReportEndpointStatusRequest
-	80,  // 346: openshell.v1.OpenShell.ReportProviderReadiness:input_type -> openshell.v1.ReportProviderReadinessRequest
-	172, // 347: openshell.v1.OpenShell.ReportSandboxConfiguration:input_type -> openshell.v1.ReportSandboxConfigurationRequest
-	149, // 348: openshell.v1.OpenShell.GetSandboxProviderEnvironment:input_type -> openshell.v1.GetSandboxProviderEnvironmentRequest
-	153, // 349: openshell.v1.OpenShell.ExchangeProviderSubjectToken:input_type -> openshell.v1.ExchangeProviderSubjectTokenRequest
-	175, // 350: openshell.v1.OpenShell.GetSandboxLogs:input_type -> openshell.v1.GetSandboxLogsRequest
-	176, // 351: openshell.v1.OpenShell.PushSandboxLogs:input_type -> openshell.v1.PushSandboxLogsRequest
-	179, // 352: openshell.v1.OpenShell.ConnectSupervisor:input_type -> openshell.v1.SupervisorMessage
-	186, // 353: openshell.v1.OpenShell.ReportMainProcessExit:input_type -> openshell.v1.ReportMainProcessExitRequest
-	188, // 354: openshell.v1.OpenShell.FinalizeMainProcessExit:input_type -> openshell.v1.FinalizeMainProcessExitRequest
-	194, // 355: openshell.v1.OpenShell.RelayStream:input_type -> openshell.v1.RelayFrame
-	105, // 356: openshell.v1.OpenShell.WatchSandbox:input_type -> openshell.v1.WatchSandboxRequest
-	203, // 357: openshell.v1.OpenShell.SubmitPolicyAnalysis:input_type -> openshell.v1.SubmitPolicyAnalysisRequest
-	205, // 358: openshell.v1.OpenShell.GetDraftPolicy:input_type -> openshell.v1.GetDraftPolicyRequest
-	207, // 359: openshell.v1.OpenShell.ApproveDraftChunk:input_type -> openshell.v1.ApproveDraftChunkRequest
-	209, // 360: openshell.v1.OpenShell.RejectDraftChunk:input_type -> openshell.v1.RejectDraftChunkRequest
-	212, // 361: openshell.v1.OpenShell.ApproveAllDraftChunks:input_type -> openshell.v1.ApproveAllDraftChunksRequest
-	214, // 362: openshell.v1.OpenShell.EditDraftChunk:input_type -> openshell.v1.EditDraftChunkRequest
-	216, // 363: openshell.v1.OpenShell.UndoDraftChunk:input_type -> openshell.v1.UndoDraftChunkRequest
-	218, // 364: openshell.v1.OpenShell.ClearDraftChunks:input_type -> openshell.v1.ClearDraftChunksRequest
-	220, // 365: openshell.v1.OpenShell.GetDraftHistory:input_type -> openshell.v1.GetDraftHistoryRequest
-	17,  // 366: openshell.v1.OpenShell.IssueSandboxToken:input_type -> openshell.v1.IssueSandboxTokenRequest
-	19,  // 367: openshell.v1.OpenShell.RefreshSandboxToken:input_type -> openshell.v1.RefreshSandboxTokenRequest
-	223, // 368: openshell.v1.OpenShell.CreateWorkspace:input_type -> openshell.v1.CreateWorkspaceRequest
-	225, // 369: openshell.v1.OpenShell.GetWorkspace:input_type -> openshell.v1.GetWorkspaceRequest
-	227, // 370: openshell.v1.OpenShell.ListWorkspaces:input_type -> openshell.v1.ListWorkspacesRequest
-	229, // 371: openshell.v1.OpenShell.DeleteWorkspace:input_type -> openshell.v1.DeleteWorkspaceRequest
-	232, // 372: openshell.v1.OpenShell.AddWorkspaceMember:input_type -> openshell.v1.AddWorkspaceMemberRequest
-	234, // 373: openshell.v1.OpenShell.RemoveWorkspaceMember:input_type -> openshell.v1.RemoveWorkspaceMemberRequest
-	236, // 374: openshell.v1.OpenShell.ListWorkspaceMembers:input_type -> openshell.v1.ListWorkspaceMembersRequest
-	22,  // 375: openshell.v1.OpenShell.Health:output_type -> openshell.v1.HealthResponse
-	24,  // 376: openshell.v1.OpenShell.GetCurrentUser:output_type -> openshell.v1.GetCurrentUserResponse
-	26,  // 377: openshell.v1.OpenShell.GetGatewayInfo:output_type -> openshell.v1.GetGatewayInfoResponse
-	66,  // 378: openshell.v1.OpenShell.CreateSandbox:output_type -> openshell.v1.SandboxResponse
-	57,  // 379: openshell.v1.OpenShell.BeginRootfsTarStaging:output_type -> openshell.v1.BeginRootfsTarStagingResponse
-	66,  // 380: openshell.v1.OpenShell.GetSandbox:output_type -> openshell.v1.SandboxResponse
-	67,  // 381: openshell.v1.OpenShell.ListSandboxes:output_type -> openshell.v1.ListSandboxesResponse
-	53,  // 382: openshell.v1.OpenShell.CreateSandboxTemplate:output_type -> openshell.v1.SandboxTemplateResponse
-	53,  // 383: openshell.v1.OpenShell.GetSandboxTemplate:output_type -> openshell.v1.SandboxTemplateResponse
-	54,  // 384: openshell.v1.OpenShell.ListSandboxTemplates:output_type -> openshell.v1.ListSandboxTemplatesResponse
-	55,  // 385: openshell.v1.OpenShell.DeleteSandboxTemplate:output_type -> openshell.v1.DeleteSandboxTemplateResponse
-	68,  // 386: openshell.v1.OpenShell.ListSandboxProviders:output_type -> openshell.v1.ListSandboxProvidersResponse
-	69,  // 387: openshell.v1.OpenShell.AttachSandboxProvider:output_type -> openshell.v1.AttachSandboxProviderResponse
-	70,  // 388: openshell.v1.OpenShell.DetachSandboxProvider:output_type -> openshell.v1.DetachSandboxProviderResponse
-	79,  // 389: openshell.v1.OpenShell.GetSandboxProviderStatus:output_type -> openshell.v1.GetSandboxProviderStatusResponse
-	82,  // 390: openshell.v1.OpenShell.DeleteSandbox:output_type -> openshell.v1.DeleteSandboxResponse
-	66,  // 391: openshell.v1.OpenShell.StopSandbox:output_type -> openshell.v1.SandboxResponse
-	66,  // 392: openshell.v1.OpenShell.StartSandbox:output_type -> openshell.v1.SandboxResponse
-	84,  // 393: openshell.v1.OpenShell.CreateSshSession:output_type -> openshell.v1.CreateSshSessionResponse
-	92,  // 394: openshell.v1.OpenShell.ExposeService:output_type -> openshell.v1.ServiceEndpointResponse
-	92,  // 395: openshell.v1.OpenShell.GetService:output_type -> openshell.v1.ServiceEndpointResponse
-	88,  // 396: openshell.v1.OpenShell.ListServices:output_type -> openshell.v1.ListServicesResponse
-	90,  // 397: openshell.v1.OpenShell.DeleteService:output_type -> openshell.v1.DeleteServiceResponse
-	94,  // 398: openshell.v1.OpenShell.RevokeSshSession:output_type -> openshell.v1.RevokeSshSessionResponse
-	99,  // 399: openshell.v1.OpenShell.ExecSandbox:output_type -> openshell.v1.ExecSandboxEvent
-	101, // 400: openshell.v1.OpenShell.ForwardTcp:output_type -> openshell.v1.TcpForwardFrame
-	99,  // 401: openshell.v1.OpenShell.ExecSandboxInteractive:output_type -> openshell.v1.ExecSandboxEvent
-	114, // 402: openshell.v1.OpenShell.CreateProvider:output_type -> openshell.v1.ProviderResponse
-	114, // 403: openshell.v1.OpenShell.GetProvider:output_type -> openshell.v1.ProviderResponse
-	115, // 404: openshell.v1.OpenShell.ListProviders:output_type -> openshell.v1.ListProvidersResponse
-	139, // 405: openshell.v1.OpenShell.ListProviderProfiles:output_type -> openshell.v1.ListProviderProfilesResponse
-	138, // 406: openshell.v1.OpenShell.GetProviderProfile:output_type -> openshell.v1.ProviderProfileResponse
-	141, // 407: openshell.v1.OpenShell.ImportProviderProfiles:output_type -> openshell.v1.ImportProviderProfilesResponse
-	143, // 408: openshell.v1.OpenShell.UpdateProviderProfiles:output_type -> openshell.v1.UpdateProviderProfilesResponse
-	145, // 409: openshell.v1.OpenShell.LintProviderProfiles:output_type -> openshell.v1.LintProviderProfilesResponse
-	114, // 410: openshell.v1.OpenShell.UpdateProvider:output_type -> openshell.v1.ProviderResponse
-	130, // 411: openshell.v1.OpenShell.GetProviderRefreshStatus:output_type -> openshell.v1.GetProviderRefreshStatusResponse
-	132, // 412: openshell.v1.OpenShell.ConfigureProviderRefresh:output_type -> openshell.v1.ConfigureProviderRefreshResponse
-	134, // 413: openshell.v1.OpenShell.RotateProviderCredential:output_type -> openshell.v1.RotateProviderCredentialResponse
-	136, // 414: openshell.v1.OpenShell.DeleteProviderRefresh:output_type -> openshell.v1.DeleteProviderRefreshResponse
-	146, // 415: openshell.v1.OpenShell.DeleteProvider:output_type -> openshell.v1.DeleteProviderResponse
-	148, // 416: openshell.v1.OpenShell.DeleteProviderProfile:output_type -> openshell.v1.DeleteProviderProfileResponse
-	282, // 417: openshell.v1.OpenShell.GetSandboxConfig:output_type -> openshell.sandbox.v1.GetSandboxConfigResponse
-	283, // 418: openshell.v1.OpenShell.GetGatewayConfig:output_type -> openshell.sandbox.v1.GetGatewayConfigResponse
-	164, // 419: openshell.v1.OpenShell.UpdateConfig:output_type -> openshell.v1.UpdateConfigResponse
-	166, // 420: openshell.v1.OpenShell.GetSandboxPolicyStatus:output_type -> openshell.v1.GetSandboxPolicyStatusResponse
-	168, // 421: openshell.v1.OpenShell.ListSandboxPolicies:output_type -> openshell.v1.ListSandboxPoliciesResponse
-	170, // 422: openshell.v1.OpenShell.ReportPolicyStatus:output_type -> openshell.v1.ReportPolicyStatusResponse
-	241, // 423: openshell.v1.OpenShell.ReportEndpointStatus:output_type -> openshell.v1.ReportEndpointStatusResponse
-	81,  // 424: openshell.v1.OpenShell.ReportProviderReadiness:output_type -> openshell.v1.ReportProviderReadinessResponse
-	173, // 425: openshell.v1.OpenShell.ReportSandboxConfiguration:output_type -> openshell.v1.ReportSandboxConfigurationResponse
-	152, // 426: openshell.v1.OpenShell.GetSandboxProviderEnvironment:output_type -> openshell.v1.GetSandboxProviderEnvironmentResponse
-	154, // 427: openshell.v1.OpenShell.ExchangeProviderSubjectToken:output_type -> openshell.v1.ExchangeProviderSubjectTokenResponse
-	178, // 428: openshell.v1.OpenShell.GetSandboxLogs:output_type -> openshell.v1.GetSandboxLogsResponse
-	177, // 429: openshell.v1.OpenShell.PushSandboxLogs:output_type -> openshell.v1.PushSandboxLogsResponse
-	180, // 430: openshell.v1.OpenShell.ConnectSupervisor:output_type -> openshell.v1.GatewayMessage
-	187, // 431: openshell.v1.OpenShell.ReportMainProcessExit:output_type -> openshell.v1.ReportMainProcessExitResponse
-	189, // 432: openshell.v1.OpenShell.FinalizeMainProcessExit:output_type -> openshell.v1.FinalizeMainProcessExitResponse
-	194, // 433: openshell.v1.OpenShell.RelayStream:output_type -> openshell.v1.RelayFrame
-	106, // 434: openshell.v1.OpenShell.WatchSandbox:output_type -> openshell.v1.SandboxStreamEvent
-	204, // 435: openshell.v1.OpenShell.SubmitPolicyAnalysis:output_type -> openshell.v1.SubmitPolicyAnalysisResponse
-	206, // 436: openshell.v1.OpenShell.GetDraftPolicy:output_type -> openshell.v1.GetDraftPolicyResponse
-	208, // 437: openshell.v1.OpenShell.ApproveDraftChunk:output_type -> openshell.v1.ApproveDraftChunkResponse
-	210, // 438: openshell.v1.OpenShell.RejectDraftChunk:output_type -> openshell.v1.RejectDraftChunkResponse
-	213, // 439: openshell.v1.OpenShell.ApproveAllDraftChunks:output_type -> openshell.v1.ApproveAllDraftChunksResponse
-	215, // 440: openshell.v1.OpenShell.EditDraftChunk:output_type -> openshell.v1.EditDraftChunkResponse
-	217, // 441: openshell.v1.OpenShell.UndoDraftChunk:output_type -> openshell.v1.UndoDraftChunkResponse
-	219, // 442: openshell.v1.OpenShell.ClearDraftChunks:output_type -> openshell.v1.ClearDraftChunksResponse
-	222, // 443: openshell.v1.OpenShell.GetDraftHistory:output_type -> openshell.v1.GetDraftHistoryResponse
-	18,  // 444: openshell.v1.OpenShell.IssueSandboxToken:output_type -> openshell.v1.IssueSandboxTokenResponse
-	20,  // 445: openshell.v1.OpenShell.RefreshSandboxToken:output_type -> openshell.v1.RefreshSandboxTokenResponse
-	224, // 446: openshell.v1.OpenShell.CreateWorkspace:output_type -> openshell.v1.CreateWorkspaceResponse
-	226, // 447: openshell.v1.OpenShell.GetWorkspace:output_type -> openshell.v1.GetWorkspaceResponse
-	228, // 448: openshell.v1.OpenShell.ListWorkspaces:output_type -> openshell.v1.ListWorkspacesResponse
-	230, // 449: openshell.v1.OpenShell.DeleteWorkspace:output_type -> openshell.v1.DeleteWorkspaceResponse
-	233, // 450: openshell.v1.OpenShell.AddWorkspaceMember:output_type -> openshell.v1.AddWorkspaceMemberResponse
-	235, // 451: openshell.v1.OpenShell.RemoveWorkspaceMember:output_type -> openshell.v1.RemoveWorkspaceMemberResponse
-	237, // 452: openshell.v1.OpenShell.ListWorkspaceMembers:output_type -> openshell.v1.ListWorkspaceMembersResponse
-	375, // [375:453] is the sub-list for method output_type
-	297, // [297:375] is the sub-list for method input_type
-	297, // [297:297] is the sub-list for extension type_name
-	297, // [297:297] is the sub-list for extension extendee
-	0,   // [0:297] is the sub-list for field type_name
+	38,  // 47: openshell.v1.CreateSandboxTemplateRequest.template:type_name -> openshell.v1.SandboxWorkloadTemplate
+	270, // 48: openshell.v1.ListSandboxTemplatesRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
+	38,  // 49: openshell.v1.SandboxTemplateResponse.template:type_name -> openshell.v1.SandboxWorkloadTemplate
+	38,  // 50: openshell.v1.ListSandboxTemplatesResponse.templates:type_name -> openshell.v1.SandboxWorkloadTemplate
+	15,  // 51: openshell.v1.DeleteSandboxTemplateResponse.outcome:type_name -> openshell.v1.DeletionOutcome
+	265, // 52: openshell.v1.BeginRootfsTarStagingResponse.expiration_time:type_name -> google.protobuf.Timestamp
+	270, // 53: openshell.v1.ListSandboxesRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
+	33,  // 54: openshell.v1.SandboxResponse.sandbox:type_name -> openshell.v1.Sandbox
+	33,  // 55: openshell.v1.ListSandboxesResponse.sandboxes:type_name -> openshell.v1.Sandbox
+	271, // 56: openshell.v1.ListSandboxProvidersResponse.providers:type_name -> openshell.datamodel.v1.Provider
+	33,  // 57: openshell.v1.AttachSandboxProviderResponse.sandbox:type_name -> openshell.v1.Sandbox
+	75,  // 58: openshell.v1.AttachSandboxProviderResponse.receipt:type_name -> openshell.v1.ProviderMutationReceipt
+	33,  // 59: openshell.v1.DetachSandboxProviderResponse.sandbox:type_name -> openshell.v1.Sandbox
+	75,  // 60: openshell.v1.DetachSandboxProviderResponse.receipt:type_name -> openshell.v1.ProviderMutationReceipt
+	73,  // 61: openshell.v1.ConfigSnapshotRevision.sandbox_config:type_name -> openshell.v1.SandboxConfigRevision
+	71,  // 62: openshell.v1.ConfigSnapshotRevision.provider_target:type_name -> openshell.v1.ProviderDesiredIdentity
+	272, // 63: openshell.v1.SandboxConfigRevision.policy_source:type_name -> openshell.sandbox.v1.PolicySource
+	4,   // 64: openshell.v1.ConfigUpdateOperation.component:type_name -> openshell.v1.ConfigComponent
+	72,  // 65: openshell.v1.ConfigUpdateOperation.target_revision:type_name -> openshell.v1.ConfigSnapshotRevision
+	6,   // 66: openshell.v1.ConfigUpdateOperation.state:type_name -> openshell.v1.ConfigUpdateOperationState
+	5,   // 67: openshell.v1.ConfigUpdateOperation.outcome:type_name -> openshell.v1.ConfigApplyOutcome
+	265, // 68: openshell.v1.ConfigUpdateOperation.created_time:type_name -> google.protobuf.Timestamp
+	265, // 69: openshell.v1.ConfigUpdateOperation.updated_time:type_name -> google.protobuf.Timestamp
+	265, // 70: openshell.v1.ConfigUpdateOperation.completed_time:type_name -> google.protobuf.Timestamp
+	1,   // 71: openshell.v1.ProviderMutationReceipt.kind:type_name -> openshell.v1.ProviderMutationKind
+	71,  // 72: openshell.v1.ProviderMutationReceipt.desired:type_name -> openshell.v1.ProviderDesiredIdentity
+	265, // 73: openshell.v1.ProviderMutationReceipt.persisted_time:type_name -> google.protobuf.Timestamp
+	3,   // 74: openshell.v1.ProviderReadinessObservation.reason:type_name -> openshell.v1.ProviderReadinessReason
+	75,  // 75: openshell.v1.ProviderReadinessStatus.receipt:type_name -> openshell.v1.ProviderMutationReceipt
+	2,   // 76: openshell.v1.ProviderReadinessStatus.state:type_name -> openshell.v1.ProviderReadinessState
+	3,   // 77: openshell.v1.ProviderReadinessStatus.reason:type_name -> openshell.v1.ProviderReadinessReason
+	76,  // 78: openshell.v1.ProviderReadinessStatus.observed:type_name -> openshell.v1.ProviderReadinessObservation
+	265, // 79: openshell.v1.ProviderReadinessStatus.observed_time:type_name -> google.protobuf.Timestamp
+	265, // 80: openshell.v1.ProviderReadinessStatus.evaluated_time:type_name -> google.protobuf.Timestamp
+	74,  // 81: openshell.v1.ProviderReadinessStatus.operation:type_name -> openshell.v1.ConfigUpdateOperation
+	77,  // 82: openshell.v1.GetSandboxProviderStatusResponse.status:type_name -> openshell.v1.ProviderReadinessStatus
+	76,  // 83: openshell.v1.ReportProviderReadinessRequest.observation:type_name -> openshell.v1.ProviderReadinessObservation
+	269, // 84: openshell.v1.ReportProviderReadinessResponse.report_interval:type_name -> google.protobuf.Duration
+	269, // 85: openshell.v1.ReportProviderReadinessResponse.observation_ttl:type_name -> google.protobuf.Duration
+	15,  // 86: openshell.v1.DeleteSandboxResponse.outcome:type_name -> openshell.v1.DeletionOutcome
+	265, // 87: openshell.v1.CreateSshSessionResponse.expiration_time:type_name -> google.protobuf.Timestamp
+	270, // 88: openshell.v1.ListServicesRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
+	92,  // 89: openshell.v1.ListServicesResponse.services:type_name -> openshell.v1.ServiceEndpointResponse
+	15,  // 90: openshell.v1.DeleteServiceResponse.outcome:type_name -> openshell.v1.DeletionOutcome
+	266, // 91: openshell.v1.ServiceEndpoint.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
+	91,  // 92: openshell.v1.ServiceEndpointResponse.endpoint:type_name -> openshell.v1.ServiceEndpoint
+	15,  // 93: openshell.v1.RevokeSshSessionResponse.outcome:type_name -> openshell.v1.DeletionOutcome
+	252, // 94: openshell.v1.ExecSandboxRequest.environment:type_name -> openshell.v1.ExecSandboxRequest.EnvironmentEntry
+	269, // 95: openshell.v1.ExecSandboxRequest.execution_timeout:type_name -> google.protobuf.Duration
+	96,  // 96: openshell.v1.ExecSandboxEvent.stdout:type_name -> openshell.v1.ExecSandboxStdout
+	97,  // 97: openshell.v1.ExecSandboxEvent.stderr:type_name -> openshell.v1.ExecSandboxStderr
+	98,  // 98: openshell.v1.ExecSandboxEvent.exit:type_name -> openshell.v1.ExecSandboxExit
+	191, // 99: openshell.v1.TcpForwardInit.ssh:type_name -> openshell.v1.SshRelayTarget
+	192, // 100: openshell.v1.TcpForwardInit.tcp:type_name -> openshell.v1.TcpRelayTarget
+	100, // 101: openshell.v1.TcpForwardFrame.init:type_name -> openshell.v1.TcpForwardInit
+	95,  // 102: openshell.v1.ExecSandboxInput.start:type_name -> openshell.v1.ExecSandboxRequest
+	103, // 103: openshell.v1.ExecSandboxInput.resize:type_name -> openshell.v1.ExecSandboxWindowResize
+	266, // 104: openshell.v1.SshSession.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
+	265, // 105: openshell.v1.SshSession.expiration_time:type_name -> google.protobuf.Timestamp
+	265, // 106: openshell.v1.WatchSandboxRequest.since_time:type_name -> google.protobuf.Timestamp
+	33,  // 107: openshell.v1.SandboxStreamEvent.sandbox:type_name -> openshell.v1.Sandbox
+	107, // 108: openshell.v1.SandboxStreamEvent.log:type_name -> openshell.v1.SandboxLogLine
+	47,  // 109: openshell.v1.SandboxStreamEvent.event:type_name -> openshell.v1.PlatformEvent
+	108, // 110: openshell.v1.SandboxStreamEvent.warning:type_name -> openshell.v1.SandboxStreamWarning
+	202, // 111: openshell.v1.SandboxStreamEvent.draft_policy_update:type_name -> openshell.v1.DraftPolicyUpdate
+	265, // 112: openshell.v1.SandboxLogLine.event_time:type_name -> google.protobuf.Timestamp
+	253, // 113: openshell.v1.SandboxLogLine.fields:type_name -> openshell.v1.SandboxLogLine.FieldsEntry
+	271, // 114: openshell.v1.CreateProviderRequest.provider:type_name -> openshell.datamodel.v1.Provider
+	270, // 115: openshell.v1.ListProvidersRequest.workspace_scope:type_name -> openshell.datamodel.v1.WorkspaceSelector
+	271, // 116: openshell.v1.UpdateProviderRequest.provider:type_name -> openshell.datamodel.v1.Provider
+	254, // 117: openshell.v1.UpdateProviderRequest.credential_expiration_times:type_name -> openshell.v1.UpdateProviderRequest.CredentialExpirationTimesEntry
+	271, // 118: openshell.v1.ProviderResponse.provider:type_name -> openshell.datamodel.v1.Provider
+	75,  // 119: openshell.v1.ProviderResponse.target_receipts:type_name -> openshell.v1.ProviderMutationReceipt
+	271, // 120: openshell.v1.ListProvidersResponse.providers:type_name -> openshell.datamodel.v1.Provider
+	137, // 121: openshell.v1.ProviderProfileImportItem.profile:type_name -> openshell.v1.ProviderProfile
+	269, // 122: openshell.v1.ProviderCredentialTokenGrant.cache_ttl:type_name -> google.protobuf.Duration
+	120, // 123: openshell.v1.ProviderCredentialTokenGrant.audience_overrides:type_name -> openshell.v1.ProviderCredentialTokenGrantAudienceOverride
+	7,   // 124: openshell.v1.ProviderCredentialTokenGrant.grant_type:type_name -> openshell.v1.ProviderCredentialTokenGrantType
+	121, // 125: openshell.v1.ProviderCredentialTokenGrant.subject_token:type_name -> openshell.v1.ProviderCredentialTokenGrantSubjectToken
+	126, // 126: openshell.v1.ProviderProfileCredential.refresh:type_name -> openshell.v1.ProviderCredentialRefresh
+	122, // 127: openshell.v1.ProviderProfileCredential.token_grant:type_name -> openshell.v1.ProviderCredentialTokenGrant
+	8,   // 128: openshell.v1.ProviderCredentialRefresh.strategy:type_name -> openshell.v1.ProviderCredentialRefreshStrategy
+	269, // 129: openshell.v1.ProviderCredentialRefresh.refresh_before:type_name -> google.protobuf.Duration
+	269, // 130: openshell.v1.ProviderCredentialRefresh.max_lifetime:type_name -> google.protobuf.Duration
+	124, // 131: openshell.v1.ProviderCredentialRefresh.material:type_name -> openshell.v1.ProviderCredentialRefreshMaterial
+	125, // 132: openshell.v1.ProviderCredentialRefresh.additional_outputs:type_name -> openshell.v1.ProviderCredentialRefreshOutput
+	8,   // 133: openshell.v1.ProviderCredentialRefreshStatus.strategy:type_name -> openshell.v1.ProviderCredentialRefreshStrategy
+	265, // 134: openshell.v1.ProviderCredentialRefreshStatus.expiration_time:type_name -> google.protobuf.Timestamp
+	265, // 135: openshell.v1.ProviderCredentialRefreshStatus.next_refresh_time:type_name -> google.protobuf.Timestamp
+	265, // 136: openshell.v1.ProviderCredentialRefreshStatus.last_refresh_time:type_name -> google.protobuf.Timestamp
+	14,  // 137: openshell.v1.ProviderCredentialRefreshStatus.recovery_action:type_name -> openshell.v1.ProviderCredentialRefreshRecoveryAction
+	265, // 138: openshell.v1.ProviderCredentialRefreshStatus.last_error_time:type_name -> google.protobuf.Timestamp
+	127, // 139: openshell.v1.GetProviderRefreshStatusResponse.credentials:type_name -> openshell.v1.ProviderCredentialRefreshStatus
+	8,   // 140: openshell.v1.ConfigureProviderRefreshRequest.strategy:type_name -> openshell.v1.ProviderCredentialRefreshStrategy
+	255, // 141: openshell.v1.ConfigureProviderRefreshRequest.material:type_name -> openshell.v1.ConfigureProviderRefreshRequest.MaterialEntry
+	265, // 142: openshell.v1.ConfigureProviderRefreshRequest.expiration_time:type_name -> google.protobuf.Timestamp
+	127, // 143: openshell.v1.ConfigureProviderRefreshResponse.status:type_name -> openshell.v1.ProviderCredentialRefreshStatus
+	127, // 144: openshell.v1.RotateProviderCredentialResponse.status:type_name -> openshell.v1.ProviderCredentialRefreshStatus
+	15,  // 145: openshell.v1.DeleteProviderRefreshResponse.outcome:type_name -> openshell.v1.DeletionOutcome
+	9,   // 146: openshell.v1.ProviderProfile.category:type_name -> openshell.v1.ProviderProfileCategory
+	123, // 147: openshell.v1.ProviderProfile.credentials:type_name -> openshell.v1.ProviderProfileCredential
+	273, // 148: openshell.v1.ProviderProfile.endpoints:type_name -> openshell.sandbox.v1.NetworkEndpoint
+	274, // 149: openshell.v1.ProviderProfile.binaries:type_name -> openshell.sandbox.v1.NetworkBinary
+	128, // 150: openshell.v1.ProviderProfile.discovery:type_name -> openshell.v1.ProviderProfileDiscovery
+	256, // 151: openshell.v1.ProviderProfile.annotations:type_name -> openshell.v1.ProviderProfile.AnnotationsEntry
+	137, // 152: openshell.v1.ProviderProfileResponse.profile:type_name -> openshell.v1.ProviderProfile
+	137, // 153: openshell.v1.ListProviderProfilesResponse.profiles:type_name -> openshell.v1.ProviderProfile
+	118, // 154: openshell.v1.ImportProviderProfilesRequest.profiles:type_name -> openshell.v1.ProviderProfileImportItem
+	119, // 155: openshell.v1.ImportProviderProfilesResponse.diagnostics:type_name -> openshell.v1.ProviderProfileDiagnostic
+	137, // 156: openshell.v1.ImportProviderProfilesResponse.profiles:type_name -> openshell.v1.ProviderProfile
+	118, // 157: openshell.v1.UpdateProviderProfilesRequest.profile:type_name -> openshell.v1.ProviderProfileImportItem
+	119, // 158: openshell.v1.UpdateProviderProfilesResponse.diagnostics:type_name -> openshell.v1.ProviderProfileDiagnostic
+	137, // 159: openshell.v1.UpdateProviderProfilesResponse.profile:type_name -> openshell.v1.ProviderProfile
+	118, // 160: openshell.v1.LintProviderProfilesRequest.profiles:type_name -> openshell.v1.ProviderProfileImportItem
+	119, // 161: openshell.v1.LintProviderProfilesResponse.diagnostics:type_name -> openshell.v1.ProviderProfileDiagnostic
+	15,  // 162: openshell.v1.DeleteProviderResponse.outcome:type_name -> openshell.v1.DeletionOutcome
+	15,  // 163: openshell.v1.DeleteProviderProfileResponse.outcome:type_name -> openshell.v1.DeletionOutcome
+	150, // 164: openshell.v1.StaticCredentialBinding.endpoints:type_name -> openshell.v1.StaticCredentialEndpointBinding
+	257, // 165: openshell.v1.GetSandboxProviderEnvironmentResponse.environment:type_name -> openshell.v1.GetSandboxProviderEnvironmentResponse.EnvironmentEntry
+	258, // 166: openshell.v1.GetSandboxProviderEnvironmentResponse.credential_expiration_times:type_name -> openshell.v1.GetSandboxProviderEnvironmentResponse.CredentialExpirationTimesEntry
+	259, // 167: openshell.v1.GetSandboxProviderEnvironmentResponse.dynamic_credentials:type_name -> openshell.v1.GetSandboxProviderEnvironmentResponse.DynamicCredentialsEntry
+	260, // 168: openshell.v1.GetSandboxProviderEnvironmentResponse.static_credential_bindings:type_name -> openshell.v1.GetSandboxProviderEnvironmentResponse.StaticCredentialBindingsEntry
+	3,   // 169: openshell.v1.GetSandboxProviderEnvironmentResponse.readiness_reason:type_name -> openshell.v1.ProviderReadinessReason
+	269, // 170: openshell.v1.ExchangeProviderSubjectTokenResponse.expires_after:type_name -> google.protobuf.Duration
+	267, // 171: openshell.v1.UpdateConfigRequest.policy:type_name -> openshell.sandbox.v1.SandboxPolicy
+	275, // 172: openshell.v1.UpdateConfigRequest.setting_value:type_name -> openshell.sandbox.v1.SettingValue
+	156, // 173: openshell.v1.UpdateConfigRequest.merge_operations:type_name -> openshell.v1.PolicyMergeOperation
+	261, // 174: openshell.v1.UpdateConfigRequest.annotations:type_name -> openshell.v1.UpdateConfigRequest.AnnotationsEntry
+	157, // 175: openshell.v1.PolicyMergeOperation.add_rule:type_name -> openshell.v1.AddNetworkRule
+	158, // 176: openshell.v1.PolicyMergeOperation.remove_endpoint:type_name -> openshell.v1.RemoveNetworkEndpoint
+	159, // 177: openshell.v1.PolicyMergeOperation.remove_rule:type_name -> openshell.v1.RemoveNetworkRule
+	161, // 178: openshell.v1.PolicyMergeOperation.add_deny_rules:type_name -> openshell.v1.AddDenyRules
+	162, // 179: openshell.v1.PolicyMergeOperation.add_allow_rules:type_name -> openshell.v1.AddAllowRules
+	163, // 180: openshell.v1.PolicyMergeOperation.remove_binary:type_name -> openshell.v1.RemoveNetworkBinary
+	276, // 181: openshell.v1.AddNetworkRule.rule:type_name -> openshell.sandbox.v1.NetworkPolicyRule
+	274, // 182: openshell.v1.L7RuleTarget.binaries:type_name -> openshell.sandbox.v1.NetworkBinary
+	277, // 183: openshell.v1.AddDenyRules.deny_rules:type_name -> openshell.sandbox.v1.L7DenyRule
+	160, // 184: openshell.v1.AddDenyRules.target:type_name -> openshell.v1.L7RuleTarget
+	278, // 185: openshell.v1.AddAllowRules.rules:type_name -> openshell.sandbox.v1.L7Rule
+	160, // 186: openshell.v1.AddAllowRules.target:type_name -> openshell.v1.L7RuleTarget
+	262, // 187: openshell.v1.UpdateConfigResponse.annotations:type_name -> openshell.v1.UpdateConfigResponse.AnnotationsEntry
+	174, // 188: openshell.v1.GetSandboxPolicyStatusResponse.revision:type_name -> openshell.v1.SandboxPolicyRevision
+	174, // 189: openshell.v1.ListSandboxPoliciesResponse.revisions:type_name -> openshell.v1.SandboxPolicyRevision
+	11,  // 190: openshell.v1.ReportPolicyStatusRequest.status:type_name -> openshell.v1.PolicyStatus
+	10,  // 191: openshell.v1.SandboxConfigurationAdmission.state:type_name -> openshell.v1.ConfigurationAdmissionState
+	171, // 192: openshell.v1.ReportSandboxConfigurationRequest.admission:type_name -> openshell.v1.SandboxConfigurationAdmission
+	11,  // 193: openshell.v1.SandboxPolicyRevision.status:type_name -> openshell.v1.PolicyStatus
+	265, // 194: openshell.v1.SandboxPolicyRevision.created_time:type_name -> google.protobuf.Timestamp
+	265, // 195: openshell.v1.SandboxPolicyRevision.loaded_time:type_name -> google.protobuf.Timestamp
+	267, // 196: openshell.v1.SandboxPolicyRevision.policy:type_name -> openshell.sandbox.v1.SandboxPolicy
+	263, // 197: openshell.v1.SandboxPolicyRevision.provenance:type_name -> openshell.v1.SandboxPolicyRevision.ProvenanceEntry
+	265, // 198: openshell.v1.GetSandboxLogsRequest.since_time:type_name -> google.protobuf.Timestamp
+	107, // 199: openshell.v1.PushSandboxLogsRequest.logs:type_name -> openshell.v1.SandboxLogLine
+	107, // 200: openshell.v1.GetSandboxLogsResponse.logs:type_name -> openshell.v1.SandboxLogLine
+	181, // 201: openshell.v1.SupervisorMessage.hello:type_name -> openshell.v1.SupervisorHello
+	184, // 202: openshell.v1.SupervisorMessage.heartbeat:type_name -> openshell.v1.SupervisorHeartbeat
+	195, // 203: openshell.v1.SupervisorMessage.relay_open_result:type_name -> openshell.v1.RelayOpenResult
+	196, // 204: openshell.v1.SupervisorMessage.relay_close:type_name -> openshell.v1.RelayClose
+	182, // 205: openshell.v1.GatewayMessage.session_accepted:type_name -> openshell.v1.SessionAccepted
+	183, // 206: openshell.v1.GatewayMessage.session_rejected:type_name -> openshell.v1.SessionRejected
+	185, // 207: openshell.v1.GatewayMessage.heartbeat:type_name -> openshell.v1.GatewayHeartbeat
+	190, // 208: openshell.v1.GatewayMessage.relay_open:type_name -> openshell.v1.RelayOpen
+	196, // 209: openshell.v1.GatewayMessage.relay_close:type_name -> openshell.v1.RelayClose
+	269, // 210: openshell.v1.SessionAccepted.heartbeat_interval:type_name -> google.protobuf.Duration
+	191, // 211: openshell.v1.RelayOpen.ssh:type_name -> openshell.v1.SshRelayTarget
+	192, // 212: openshell.v1.RelayOpen.tcp:type_name -> openshell.v1.TcpRelayTarget
+	193, // 213: openshell.v1.RelayFrame.init:type_name -> openshell.v1.RelayInit
+	265, // 214: openshell.v1.DenialSummary.first_seen_time:type_name -> google.protobuf.Timestamp
+	265, // 215: openshell.v1.DenialSummary.last_seen_time:type_name -> google.protobuf.Timestamp
+	197, // 216: openshell.v1.DenialSummary.l7_request_samples:type_name -> openshell.v1.L7RequestSample
+	199, // 217: openshell.v1.NetworkActivitySummary.denials_by_group:type_name -> openshell.v1.DenialGroupCount
+	276, // 218: openshell.v1.PolicyChunk.proposed_rule:type_name -> openshell.sandbox.v1.NetworkPolicyRule
+	265, // 219: openshell.v1.PolicyChunk.created_time:type_name -> google.protobuf.Timestamp
+	265, // 220: openshell.v1.PolicyChunk.decided_time:type_name -> google.protobuf.Timestamp
+	265, // 221: openshell.v1.PolicyChunk.first_seen_time:type_name -> google.protobuf.Timestamp
+	265, // 222: openshell.v1.PolicyChunk.last_seen_time:type_name -> google.protobuf.Timestamp
+	267, // 223: openshell.v1.PolicyChunk.current_effective_policy:type_name -> openshell.sandbox.v1.SandboxPolicy
+	267, // 224: openshell.v1.PolicyChunk.candidate_effective_policy:type_name -> openshell.sandbox.v1.SandboxPolicy
+	198, // 225: openshell.v1.SubmitPolicyAnalysisRequest.summaries:type_name -> openshell.v1.DenialSummary
+	201, // 226: openshell.v1.SubmitPolicyAnalysisRequest.proposed_chunks:type_name -> openshell.v1.PolicyChunk
+	200, // 227: openshell.v1.SubmitPolicyAnalysisRequest.network_activity_summaries:type_name -> openshell.v1.NetworkActivitySummary
+	201, // 228: openshell.v1.GetDraftPolicyResponse.chunks:type_name -> openshell.v1.PolicyChunk
+	265, // 229: openshell.v1.GetDraftPolicyResponse.last_analyzed_time:type_name -> google.protobuf.Timestamp
+	211, // 230: openshell.v1.ApproveAllDraftChunksRequest.approvals:type_name -> openshell.v1.DraftChunkApproval
+	276, // 231: openshell.v1.EditDraftChunkRequest.proposed_rule:type_name -> openshell.sandbox.v1.NetworkPolicyRule
+	265, // 232: openshell.v1.DraftHistoryEntry.event_time:type_name -> google.protobuf.Timestamp
+	221, // 233: openshell.v1.GetDraftHistoryResponse.entries:type_name -> openshell.v1.DraftHistoryEntry
+	264, // 234: openshell.v1.CreateWorkspaceRequest.labels:type_name -> openshell.v1.CreateWorkspaceRequest.LabelsEntry
+	279, // 235: openshell.v1.CreateWorkspaceResponse.workspace:type_name -> openshell.datamodel.v1.Workspace
+	279, // 236: openshell.v1.GetWorkspaceResponse.workspace:type_name -> openshell.datamodel.v1.Workspace
+	279, // 237: openshell.v1.ListWorkspacesResponse.workspaces:type_name -> openshell.datamodel.v1.Workspace
+	15,  // 238: openshell.v1.DeleteWorkspaceResponse.outcome:type_name -> openshell.v1.DeletionOutcome
+	266, // 239: openshell.v1.WorkspaceMember.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
+	13,  // 240: openshell.v1.WorkspaceMember.role:type_name -> openshell.v1.WorkspaceRole
+	13,  // 241: openshell.v1.AddWorkspaceMemberRequest.role:type_name -> openshell.v1.WorkspaceRole
+	231, // 242: openshell.v1.AddWorkspaceMemberResponse.member:type_name -> openshell.v1.WorkspaceMember
+	15,  // 243: openshell.v1.RemoveWorkspaceMemberResponse.outcome:type_name -> openshell.v1.DeletionOutcome
+	231, // 244: openshell.v1.ListWorkspaceMembersResponse.members:type_name -> openshell.v1.WorkspaceMember
+	265, // 245: openshell.v1.ExtensionServiceCredential.expiration_time:type_name -> google.protobuf.Timestamp
+	16,  // 246: openshell.v1.EndpointObservation.result:type_name -> openshell.v1.EndpointResult
+	239, // 247: openshell.v1.ReportEndpointStatusRequest.observations:type_name -> openshell.v1.EndpointObservation
+	16,  // 248: openshell.v1.EndpointStatus.last_result:type_name -> openshell.v1.EndpointResult
+	265, // 249: openshell.v1.EndpointStatus.last_reported_time:type_name -> google.protobuf.Timestamp
+	265, // 250: openshell.v1.SandboxProvisioning.configuration_change_time:type_name -> google.protobuf.Timestamp
+	265, // 251: openshell.v1.SandboxProvisioning.first_rejection_time:type_name -> google.protobuf.Timestamp
+	265, // 252: openshell.v1.SandboxProvisioning.deadline:type_name -> google.protobuf.Timestamp
+	265, // 253: openshell.v1.SandboxProvisioning.timeout_time:type_name -> google.protobuf.Timestamp
+	265, // 254: openshell.v1.SandboxProvisioning.cleanup_completed_time:type_name -> google.protobuf.Timestamp
+	265, // 255: openshell.v1.SandboxProvisioning.cleanup_retry_time:type_name -> google.protobuf.Timestamp
+	265, // 256: openshell.v1.SandboxProvisioning.attachment_change_time:type_name -> google.protobuf.Timestamp
+	265, // 257: openshell.v1.UpdateProviderRequest.CredentialExpirationTimesEntry.value:type_name -> google.protobuf.Timestamp
+	265, // 258: openshell.v1.GetSandboxProviderEnvironmentResponse.CredentialExpirationTimesEntry.value:type_name -> google.protobuf.Timestamp
+	123, // 259: openshell.v1.GetSandboxProviderEnvironmentResponse.DynamicCredentialsEntry.value:type_name -> openshell.v1.ProviderProfileCredential
+	151, // 260: openshell.v1.GetSandboxProviderEnvironmentResponse.StaticCredentialBindingsEntry.value:type_name -> openshell.v1.StaticCredentialBinding
+	21,  // 261: openshell.v1.OpenShell.Health:input_type -> openshell.v1.HealthRequest
+	23,  // 262: openshell.v1.OpenShell.GetCurrentUser:input_type -> openshell.v1.GetCurrentUserRequest
+	25,  // 263: openshell.v1.OpenShell.GetGatewayInfo:input_type -> openshell.v1.GetGatewayInfoRequest
+	48,  // 264: openshell.v1.OpenShell.CreateSandbox:input_type -> openshell.v1.CreateSandboxRequest
+	56,  // 265: openshell.v1.OpenShell.BeginRootfsTarStaging:input_type -> openshell.v1.BeginRootfsTarStagingRequest
+	58,  // 266: openshell.v1.OpenShell.GetSandbox:input_type -> openshell.v1.GetSandboxRequest
+	59,  // 267: openshell.v1.OpenShell.ListSandboxes:input_type -> openshell.v1.ListSandboxesRequest
+	49,  // 268: openshell.v1.OpenShell.CreateSandboxTemplate:input_type -> openshell.v1.CreateSandboxTemplateRequest
+	50,  // 269: openshell.v1.OpenShell.GetSandboxTemplate:input_type -> openshell.v1.GetSandboxTemplateRequest
+	51,  // 270: openshell.v1.OpenShell.ListSandboxTemplates:input_type -> openshell.v1.ListSandboxTemplatesRequest
+	52,  // 271: openshell.v1.OpenShell.DeleteSandboxTemplate:input_type -> openshell.v1.DeleteSandboxTemplateRequest
+	60,  // 272: openshell.v1.OpenShell.ListSandboxProviders:input_type -> openshell.v1.ListSandboxProvidersRequest
+	61,  // 273: openshell.v1.OpenShell.AttachSandboxProvider:input_type -> openshell.v1.AttachSandboxProviderRequest
+	62,  // 274: openshell.v1.OpenShell.DetachSandboxProvider:input_type -> openshell.v1.DetachSandboxProviderRequest
+	78,  // 275: openshell.v1.OpenShell.GetSandboxProviderStatus:input_type -> openshell.v1.GetSandboxProviderStatusRequest
+	63,  // 276: openshell.v1.OpenShell.DeleteSandbox:input_type -> openshell.v1.DeleteSandboxRequest
+	64,  // 277: openshell.v1.OpenShell.StopSandbox:input_type -> openshell.v1.StopSandboxRequest
+	65,  // 278: openshell.v1.OpenShell.StartSandbox:input_type -> openshell.v1.StartSandboxRequest
+	83,  // 279: openshell.v1.OpenShell.CreateSshSession:input_type -> openshell.v1.CreateSshSessionRequest
+	85,  // 280: openshell.v1.OpenShell.ExposeService:input_type -> openshell.v1.ExposeServiceRequest
+	86,  // 281: openshell.v1.OpenShell.GetService:input_type -> openshell.v1.GetServiceRequest
+	87,  // 282: openshell.v1.OpenShell.ListServices:input_type -> openshell.v1.ListServicesRequest
+	89,  // 283: openshell.v1.OpenShell.DeleteService:input_type -> openshell.v1.DeleteServiceRequest
+	93,  // 284: openshell.v1.OpenShell.RevokeSshSession:input_type -> openshell.v1.RevokeSshSessionRequest
+	95,  // 285: openshell.v1.OpenShell.ExecSandbox:input_type -> openshell.v1.ExecSandboxRequest
+	101, // 286: openshell.v1.OpenShell.ForwardTcp:input_type -> openshell.v1.TcpForwardFrame
+	102, // 287: openshell.v1.OpenShell.ExecSandboxInteractive:input_type -> openshell.v1.ExecSandboxInput
+	109, // 288: openshell.v1.OpenShell.CreateProvider:input_type -> openshell.v1.CreateProviderRequest
+	110, // 289: openshell.v1.OpenShell.GetProvider:input_type -> openshell.v1.GetProviderRequest
+	111, // 290: openshell.v1.OpenShell.ListProviders:input_type -> openshell.v1.ListProvidersRequest
+	116, // 291: openshell.v1.OpenShell.ListProviderProfiles:input_type -> openshell.v1.ListProviderProfilesRequest
+	117, // 292: openshell.v1.OpenShell.GetProviderProfile:input_type -> openshell.v1.GetProviderProfileRequest
+	140, // 293: openshell.v1.OpenShell.ImportProviderProfiles:input_type -> openshell.v1.ImportProviderProfilesRequest
+	142, // 294: openshell.v1.OpenShell.UpdateProviderProfiles:input_type -> openshell.v1.UpdateProviderProfilesRequest
+	144, // 295: openshell.v1.OpenShell.LintProviderProfiles:input_type -> openshell.v1.LintProviderProfilesRequest
+	112, // 296: openshell.v1.OpenShell.UpdateProvider:input_type -> openshell.v1.UpdateProviderRequest
+	129, // 297: openshell.v1.OpenShell.GetProviderRefreshStatus:input_type -> openshell.v1.GetProviderRefreshStatusRequest
+	131, // 298: openshell.v1.OpenShell.ConfigureProviderRefresh:input_type -> openshell.v1.ConfigureProviderRefreshRequest
+	133, // 299: openshell.v1.OpenShell.RotateProviderCredential:input_type -> openshell.v1.RotateProviderCredentialRequest
+	135, // 300: openshell.v1.OpenShell.DeleteProviderRefresh:input_type -> openshell.v1.DeleteProviderRefreshRequest
+	113, // 301: openshell.v1.OpenShell.DeleteProvider:input_type -> openshell.v1.DeleteProviderRequest
+	147, // 302: openshell.v1.OpenShell.DeleteProviderProfile:input_type -> openshell.v1.DeleteProviderProfileRequest
+	280, // 303: openshell.v1.OpenShell.GetSandboxConfig:input_type -> openshell.sandbox.v1.GetSandboxConfigRequest
+	281, // 304: openshell.v1.OpenShell.GetGatewayConfig:input_type -> openshell.sandbox.v1.GetGatewayConfigRequest
+	155, // 305: openshell.v1.OpenShell.UpdateConfig:input_type -> openshell.v1.UpdateConfigRequest
+	165, // 306: openshell.v1.OpenShell.GetSandboxPolicyStatus:input_type -> openshell.v1.GetSandboxPolicyStatusRequest
+	167, // 307: openshell.v1.OpenShell.ListSandboxPolicies:input_type -> openshell.v1.ListSandboxPoliciesRequest
+	169, // 308: openshell.v1.OpenShell.ReportPolicyStatus:input_type -> openshell.v1.ReportPolicyStatusRequest
+	240, // 309: openshell.v1.OpenShell.ReportEndpointStatus:input_type -> openshell.v1.ReportEndpointStatusRequest
+	80,  // 310: openshell.v1.OpenShell.ReportProviderReadiness:input_type -> openshell.v1.ReportProviderReadinessRequest
+	172, // 311: openshell.v1.OpenShell.ReportSandboxConfiguration:input_type -> openshell.v1.ReportSandboxConfigurationRequest
+	149, // 312: openshell.v1.OpenShell.GetSandboxProviderEnvironment:input_type -> openshell.v1.GetSandboxProviderEnvironmentRequest
+	153, // 313: openshell.v1.OpenShell.ExchangeProviderSubjectToken:input_type -> openshell.v1.ExchangeProviderSubjectTokenRequest
+	175, // 314: openshell.v1.OpenShell.GetSandboxLogs:input_type -> openshell.v1.GetSandboxLogsRequest
+	176, // 315: openshell.v1.OpenShell.PushSandboxLogs:input_type -> openshell.v1.PushSandboxLogsRequest
+	179, // 316: openshell.v1.OpenShell.ConnectSupervisor:input_type -> openshell.v1.SupervisorMessage
+	186, // 317: openshell.v1.OpenShell.ReportMainProcessExit:input_type -> openshell.v1.ReportMainProcessExitRequest
+	188, // 318: openshell.v1.OpenShell.FinalizeMainProcessExit:input_type -> openshell.v1.FinalizeMainProcessExitRequest
+	194, // 319: openshell.v1.OpenShell.RelayStream:input_type -> openshell.v1.RelayFrame
+	105, // 320: openshell.v1.OpenShell.WatchSandbox:input_type -> openshell.v1.WatchSandboxRequest
+	203, // 321: openshell.v1.OpenShell.SubmitPolicyAnalysis:input_type -> openshell.v1.SubmitPolicyAnalysisRequest
+	205, // 322: openshell.v1.OpenShell.GetDraftPolicy:input_type -> openshell.v1.GetDraftPolicyRequest
+	207, // 323: openshell.v1.OpenShell.ApproveDraftChunk:input_type -> openshell.v1.ApproveDraftChunkRequest
+	209, // 324: openshell.v1.OpenShell.RejectDraftChunk:input_type -> openshell.v1.RejectDraftChunkRequest
+	212, // 325: openshell.v1.OpenShell.ApproveAllDraftChunks:input_type -> openshell.v1.ApproveAllDraftChunksRequest
+	214, // 326: openshell.v1.OpenShell.EditDraftChunk:input_type -> openshell.v1.EditDraftChunkRequest
+	216, // 327: openshell.v1.OpenShell.UndoDraftChunk:input_type -> openshell.v1.UndoDraftChunkRequest
+	218, // 328: openshell.v1.OpenShell.ClearDraftChunks:input_type -> openshell.v1.ClearDraftChunksRequest
+	220, // 329: openshell.v1.OpenShell.GetDraftHistory:input_type -> openshell.v1.GetDraftHistoryRequest
+	17,  // 330: openshell.v1.OpenShell.IssueSandboxToken:input_type -> openshell.v1.IssueSandboxTokenRequest
+	19,  // 331: openshell.v1.OpenShell.RefreshSandboxToken:input_type -> openshell.v1.RefreshSandboxTokenRequest
+	223, // 332: openshell.v1.OpenShell.CreateWorkspace:input_type -> openshell.v1.CreateWorkspaceRequest
+	225, // 333: openshell.v1.OpenShell.GetWorkspace:input_type -> openshell.v1.GetWorkspaceRequest
+	227, // 334: openshell.v1.OpenShell.ListWorkspaces:input_type -> openshell.v1.ListWorkspacesRequest
+	229, // 335: openshell.v1.OpenShell.DeleteWorkspace:input_type -> openshell.v1.DeleteWorkspaceRequest
+	232, // 336: openshell.v1.OpenShell.AddWorkspaceMember:input_type -> openshell.v1.AddWorkspaceMemberRequest
+	234, // 337: openshell.v1.OpenShell.RemoveWorkspaceMember:input_type -> openshell.v1.RemoveWorkspaceMemberRequest
+	236, // 338: openshell.v1.OpenShell.ListWorkspaceMembers:input_type -> openshell.v1.ListWorkspaceMembersRequest
+	22,  // 339: openshell.v1.OpenShell.Health:output_type -> openshell.v1.HealthResponse
+	24,  // 340: openshell.v1.OpenShell.GetCurrentUser:output_type -> openshell.v1.GetCurrentUserResponse
+	26,  // 341: openshell.v1.OpenShell.GetGatewayInfo:output_type -> openshell.v1.GetGatewayInfoResponse
+	66,  // 342: openshell.v1.OpenShell.CreateSandbox:output_type -> openshell.v1.SandboxResponse
+	57,  // 343: openshell.v1.OpenShell.BeginRootfsTarStaging:output_type -> openshell.v1.BeginRootfsTarStagingResponse
+	66,  // 344: openshell.v1.OpenShell.GetSandbox:output_type -> openshell.v1.SandboxResponse
+	67,  // 345: openshell.v1.OpenShell.ListSandboxes:output_type -> openshell.v1.ListSandboxesResponse
+	53,  // 346: openshell.v1.OpenShell.CreateSandboxTemplate:output_type -> openshell.v1.SandboxTemplateResponse
+	53,  // 347: openshell.v1.OpenShell.GetSandboxTemplate:output_type -> openshell.v1.SandboxTemplateResponse
+	54,  // 348: openshell.v1.OpenShell.ListSandboxTemplates:output_type -> openshell.v1.ListSandboxTemplatesResponse
+	55,  // 349: openshell.v1.OpenShell.DeleteSandboxTemplate:output_type -> openshell.v1.DeleteSandboxTemplateResponse
+	68,  // 350: openshell.v1.OpenShell.ListSandboxProviders:output_type -> openshell.v1.ListSandboxProvidersResponse
+	69,  // 351: openshell.v1.OpenShell.AttachSandboxProvider:output_type -> openshell.v1.AttachSandboxProviderResponse
+	70,  // 352: openshell.v1.OpenShell.DetachSandboxProvider:output_type -> openshell.v1.DetachSandboxProviderResponse
+	79,  // 353: openshell.v1.OpenShell.GetSandboxProviderStatus:output_type -> openshell.v1.GetSandboxProviderStatusResponse
+	82,  // 354: openshell.v1.OpenShell.DeleteSandbox:output_type -> openshell.v1.DeleteSandboxResponse
+	66,  // 355: openshell.v1.OpenShell.StopSandbox:output_type -> openshell.v1.SandboxResponse
+	66,  // 356: openshell.v1.OpenShell.StartSandbox:output_type -> openshell.v1.SandboxResponse
+	84,  // 357: openshell.v1.OpenShell.CreateSshSession:output_type -> openshell.v1.CreateSshSessionResponse
+	92,  // 358: openshell.v1.OpenShell.ExposeService:output_type -> openshell.v1.ServiceEndpointResponse
+	92,  // 359: openshell.v1.OpenShell.GetService:output_type -> openshell.v1.ServiceEndpointResponse
+	88,  // 360: openshell.v1.OpenShell.ListServices:output_type -> openshell.v1.ListServicesResponse
+	90,  // 361: openshell.v1.OpenShell.DeleteService:output_type -> openshell.v1.DeleteServiceResponse
+	94,  // 362: openshell.v1.OpenShell.RevokeSshSession:output_type -> openshell.v1.RevokeSshSessionResponse
+	99,  // 363: openshell.v1.OpenShell.ExecSandbox:output_type -> openshell.v1.ExecSandboxEvent
+	101, // 364: openshell.v1.OpenShell.ForwardTcp:output_type -> openshell.v1.TcpForwardFrame
+	99,  // 365: openshell.v1.OpenShell.ExecSandboxInteractive:output_type -> openshell.v1.ExecSandboxEvent
+	114, // 366: openshell.v1.OpenShell.CreateProvider:output_type -> openshell.v1.ProviderResponse
+	114, // 367: openshell.v1.OpenShell.GetProvider:output_type -> openshell.v1.ProviderResponse
+	115, // 368: openshell.v1.OpenShell.ListProviders:output_type -> openshell.v1.ListProvidersResponse
+	139, // 369: openshell.v1.OpenShell.ListProviderProfiles:output_type -> openshell.v1.ListProviderProfilesResponse
+	138, // 370: openshell.v1.OpenShell.GetProviderProfile:output_type -> openshell.v1.ProviderProfileResponse
+	141, // 371: openshell.v1.OpenShell.ImportProviderProfiles:output_type -> openshell.v1.ImportProviderProfilesResponse
+	143, // 372: openshell.v1.OpenShell.UpdateProviderProfiles:output_type -> openshell.v1.UpdateProviderProfilesResponse
+	145, // 373: openshell.v1.OpenShell.LintProviderProfiles:output_type -> openshell.v1.LintProviderProfilesResponse
+	114, // 374: openshell.v1.OpenShell.UpdateProvider:output_type -> openshell.v1.ProviderResponse
+	130, // 375: openshell.v1.OpenShell.GetProviderRefreshStatus:output_type -> openshell.v1.GetProviderRefreshStatusResponse
+	132, // 376: openshell.v1.OpenShell.ConfigureProviderRefresh:output_type -> openshell.v1.ConfigureProviderRefreshResponse
+	134, // 377: openshell.v1.OpenShell.RotateProviderCredential:output_type -> openshell.v1.RotateProviderCredentialResponse
+	136, // 378: openshell.v1.OpenShell.DeleteProviderRefresh:output_type -> openshell.v1.DeleteProviderRefreshResponse
+	146, // 379: openshell.v1.OpenShell.DeleteProvider:output_type -> openshell.v1.DeleteProviderResponse
+	148, // 380: openshell.v1.OpenShell.DeleteProviderProfile:output_type -> openshell.v1.DeleteProviderProfileResponse
+	282, // 381: openshell.v1.OpenShell.GetSandboxConfig:output_type -> openshell.sandbox.v1.GetSandboxConfigResponse
+	283, // 382: openshell.v1.OpenShell.GetGatewayConfig:output_type -> openshell.sandbox.v1.GetGatewayConfigResponse
+	164, // 383: openshell.v1.OpenShell.UpdateConfig:output_type -> openshell.v1.UpdateConfigResponse
+	166, // 384: openshell.v1.OpenShell.GetSandboxPolicyStatus:output_type -> openshell.v1.GetSandboxPolicyStatusResponse
+	168, // 385: openshell.v1.OpenShell.ListSandboxPolicies:output_type -> openshell.v1.ListSandboxPoliciesResponse
+	170, // 386: openshell.v1.OpenShell.ReportPolicyStatus:output_type -> openshell.v1.ReportPolicyStatusResponse
+	241, // 387: openshell.v1.OpenShell.ReportEndpointStatus:output_type -> openshell.v1.ReportEndpointStatusResponse
+	81,  // 388: openshell.v1.OpenShell.ReportProviderReadiness:output_type -> openshell.v1.ReportProviderReadinessResponse
+	173, // 389: openshell.v1.OpenShell.ReportSandboxConfiguration:output_type -> openshell.v1.ReportSandboxConfigurationResponse
+	152, // 390: openshell.v1.OpenShell.GetSandboxProviderEnvironment:output_type -> openshell.v1.GetSandboxProviderEnvironmentResponse
+	154, // 391: openshell.v1.OpenShell.ExchangeProviderSubjectToken:output_type -> openshell.v1.ExchangeProviderSubjectTokenResponse
+	178, // 392: openshell.v1.OpenShell.GetSandboxLogs:output_type -> openshell.v1.GetSandboxLogsResponse
+	177, // 393: openshell.v1.OpenShell.PushSandboxLogs:output_type -> openshell.v1.PushSandboxLogsResponse
+	180, // 394: openshell.v1.OpenShell.ConnectSupervisor:output_type -> openshell.v1.GatewayMessage
+	187, // 395: openshell.v1.OpenShell.ReportMainProcessExit:output_type -> openshell.v1.ReportMainProcessExitResponse
+	189, // 396: openshell.v1.OpenShell.FinalizeMainProcessExit:output_type -> openshell.v1.FinalizeMainProcessExitResponse
+	194, // 397: openshell.v1.OpenShell.RelayStream:output_type -> openshell.v1.RelayFrame
+	106, // 398: openshell.v1.OpenShell.WatchSandbox:output_type -> openshell.v1.SandboxStreamEvent
+	204, // 399: openshell.v1.OpenShell.SubmitPolicyAnalysis:output_type -> openshell.v1.SubmitPolicyAnalysisResponse
+	206, // 400: openshell.v1.OpenShell.GetDraftPolicy:output_type -> openshell.v1.GetDraftPolicyResponse
+	208, // 401: openshell.v1.OpenShell.ApproveDraftChunk:output_type -> openshell.v1.ApproveDraftChunkResponse
+	210, // 402: openshell.v1.OpenShell.RejectDraftChunk:output_type -> openshell.v1.RejectDraftChunkResponse
+	213, // 403: openshell.v1.OpenShell.ApproveAllDraftChunks:output_type -> openshell.v1.ApproveAllDraftChunksResponse
+	215, // 404: openshell.v1.OpenShell.EditDraftChunk:output_type -> openshell.v1.EditDraftChunkResponse
+	217, // 405: openshell.v1.OpenShell.UndoDraftChunk:output_type -> openshell.v1.UndoDraftChunkResponse
+	219, // 406: openshell.v1.OpenShell.ClearDraftChunks:output_type -> openshell.v1.ClearDraftChunksResponse
+	222, // 407: openshell.v1.OpenShell.GetDraftHistory:output_type -> openshell.v1.GetDraftHistoryResponse
+	18,  // 408: openshell.v1.OpenShell.IssueSandboxToken:output_type -> openshell.v1.IssueSandboxTokenResponse
+	20,  // 409: openshell.v1.OpenShell.RefreshSandboxToken:output_type -> openshell.v1.RefreshSandboxTokenResponse
+	224, // 410: openshell.v1.OpenShell.CreateWorkspace:output_type -> openshell.v1.CreateWorkspaceResponse
+	226, // 411: openshell.v1.OpenShell.GetWorkspace:output_type -> openshell.v1.GetWorkspaceResponse
+	228, // 412: openshell.v1.OpenShell.ListWorkspaces:output_type -> openshell.v1.ListWorkspacesResponse
+	230, // 413: openshell.v1.OpenShell.DeleteWorkspace:output_type -> openshell.v1.DeleteWorkspaceResponse
+	233, // 414: openshell.v1.OpenShell.AddWorkspaceMember:output_type -> openshell.v1.AddWorkspaceMemberResponse
+	235, // 415: openshell.v1.OpenShell.RemoveWorkspaceMember:output_type -> openshell.v1.RemoveWorkspaceMemberResponse
+	237, // 416: openshell.v1.OpenShell.ListWorkspaceMembers:output_type -> openshell.v1.ListWorkspaceMembersResponse
+	339, // [339:417] is the sub-list for method output_type
+	261, // [261:339] is the sub-list for method input_type
+	261, // [261:261] is the sub-list for extension type_name
+	261, // [261:261] is the sub-list for extension extendee
+	0,   // [0:261] is the sub-list for field type_name
 }
 
 func init() { file_openshell_proto_init() }

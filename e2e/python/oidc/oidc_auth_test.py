@@ -51,7 +51,7 @@ class TestRbac:
         token = get_token("admin@test", "admin", scopes="openid openshell:all")
         stub, metadata = stub_with_token(token)
         req = openshell_pb2.CreateProviderRequest(
-            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+            workspace="default",
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-admin-test"),
                 type="claude-code",
@@ -69,9 +69,7 @@ class TestRbac:
             with contextlib.suppress(grpc.RpcError):
                 stub.DeleteProvider(
                     openshell_pb2.DeleteProviderRequest(
-                        workspace_scope=datamodel_pb2.WorkspaceSelector(
-                            workspace="default"
-                        ),
+                        workspace="default",
                         name="e2e-oidc-admin-test",
                     ),
                     metadata=metadata,
@@ -81,7 +79,7 @@ class TestRbac:
         token = get_token("user@test", "user", scopes="openid openshell:all")
         stub, metadata = stub_with_token(token)
         req = openshell_pb2.CreateProviderRequest(
-            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+            workspace="default",
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-user-blocked"),
                 type="claude-code",

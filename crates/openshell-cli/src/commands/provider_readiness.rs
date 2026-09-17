@@ -124,7 +124,7 @@ fn validate_mutation_receipts(
             || !sandbox_ids.insert(desired.sandbox_id.as_str())
             || expected
                 .sandbox
-                .is_some_and(|(name, id)| desired.sandbox_name != name || desired.sandbox_id != id)
+                .is_some_and(|(name, id)| desired.sandbox != name || desired.sandbox_id != id)
             || provider.is_some_and(|provider| {
                 desired.provider_id != provider.id
                     || desired.provider_resource_version != provider.resource_version
@@ -274,10 +274,10 @@ pub async fn sandbox_provider_status(
         provider_status(
             &mut client,
             GetSandboxProviderStatusRequest {
-                sandbox_name: name.to_string(),
+                sandbox: name.to_string(),
                 provider_name: provider.to_string(),
                 receipt_id: receipt_id.to_string(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                workspace: workspace.to_string(),
             },
         ),
     )
@@ -348,7 +348,7 @@ fn receipt_json(receipt: &ProviderMutationReceipt) -> serde_json::Value {
     let desired = receipt.desired.as_ref().map(|desired| {
         serde_json::json!({
             "sandbox_id": desired.sandbox_id,
-            "sandbox_name": desired.sandbox_name,
+            "sandbox": desired.sandbox,
             "attachment_epoch": desired.attachment_epoch,
             "provider_id": desired.provider_id,
             "provider_resource_version": desired.provider_resource_version.to_string(),
@@ -415,7 +415,7 @@ fn print_statuses(mutation_id: &str, results: &[DisplayStatus], output: &str) ->
         let sandbox = receipt
             .desired
             .as_ref()
-            .map_or("unknown", |desired| desired.sandbox_name.as_str());
+            .map_or("unknown", |desired| desired.sandbox.as_str());
         println!(
             "{} / {}: {} ({})",
             sandbox,
@@ -486,7 +486,7 @@ mod tests {
             persisted_time: Some(openshell_core::time::timestamp_from_millis(1).unwrap()),
             desired: Some(ProviderDesiredIdentity {
                 sandbox_id: "sandbox-id".to_string(),
-                sandbox_name: "sandbox".to_string(),
+                sandbox: "sandbox".to_string(),
                 provider_id: "provider-id".to_string(),
                 ..Default::default()
             }),

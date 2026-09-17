@@ -91,8 +91,8 @@ pub async fn sandbox_provider_list(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .list_sandbox_providers(ListSandboxProvidersRequest {
-            sandbox_name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            sandbox: (name).to_string(),
+            workspace: (workspace).to_string(),
         })
         .await
         .into_diagnostic()?;
@@ -126,8 +126,8 @@ pub async fn sandbox_provider_attach(
     // Fetch current sandbox to get resource_version for CAS
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            sandbox: (name).to_string(),
+            workspace: (workspace).to_string(),
         })
         .await
         .map_err(|status| miette!("provider attachment lookup failed ({})", status.code()))?
@@ -140,10 +140,10 @@ pub async fn sandbox_provider_attach(
     let response = match client
         .attach_sandbox_provider(AttachSandboxProviderRequest {
             request_id: String::new(),
-            sandbox_name: name.to_string(),
+            sandbox: (name).to_string(),
+            workspace: (workspace).to_string(),
             provider_name: provider.to_string(),
             expected_resource_version: resource_version,
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
     {
@@ -197,8 +197,8 @@ pub async fn sandbox_provider_detach(
     // Fetch current sandbox to get resource_version for CAS
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            sandbox: (name).to_string(),
+            workspace: (workspace).to_string(),
         })
         .await
         .map_err(|status| miette!("provider detachment lookup failed ({})", status.code()))?
@@ -211,10 +211,10 @@ pub async fn sandbox_provider_detach(
     let response = match client
         .detach_sandbox_provider(DetachSandboxProviderRequest {
             request_id: String::new(),
-            sandbox_name: name.to_string(),
+            sandbox: (name).to_string(),
+            workspace: (workspace).to_string(),
             provider_name: provider.to_string(),
             expected_resource_version: resource_version,
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
     {
@@ -517,7 +517,7 @@ async fn auto_create_provider(
                 profile_workspace: workspace.to_string(),
                 credential_handles: HashMap::new(),
             }),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace: (workspace).to_string(),
         };
 
         let response = client.create_provider(request).await.map_err(|status| {
@@ -566,7 +566,7 @@ async fn auto_create_provider(
                     profile_workspace: workspace.to_string(),
                     credential_handles: HashMap::new(),
                 }),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                workspace: (workspace).to_string(),
             };
 
             match client.create_provider(request).await {
@@ -702,7 +702,7 @@ async fn rollback_provider_create_after_gcloud_adc_failure(
             request_id: String::new(),
             allow_missing: true,
             name: provider_name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace: (workspace).to_string(),
         })
         .await
     {
@@ -1191,7 +1191,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
                 profile_workspace: profile_workspace.to_string(),
                 credential_handles: HashMap::new(),
             }),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace: (workspace).to_string(),
         })
         .await
         .into_diagnostic()?;
@@ -1222,7 +1222,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
                     "refresh_token".to_string(),
                 ],
                 expiration_time: None,
-                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                workspace: (workspace).to_string(),
             })
             .await
         {
@@ -1241,7 +1241,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
                 request_id: String::new(),
                 provider: provider_name.clone(),
                 credential_key: adc_credential_key,
-                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                workspace: (workspace).to_string(),
             })
             .await
         {
@@ -1282,7 +1282,7 @@ pub async fn provider_get(
     let response = client
         .get_provider(GetProviderRequest {
             name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace: (workspace).to_string(),
         })
         .await
         .into_diagnostic()?;
@@ -1798,7 +1798,7 @@ pub async fn provider_refresh_status(
         .get_provider_refresh_status(GetProviderRefreshStatusRequest {
             provider: name.to_string(),
             credential_key: credential_key.unwrap_or_default().to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace: (workspace).to_string(),
         })
         .await
         .into_diagnostic()?
@@ -1884,7 +1884,7 @@ pub async fn provider_refresh_config(
                 .map(openshell_core::time::timestamp_from_millis)
                 .transpose()
                 .into_diagnostic()?,
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace: (workspace).to_string(),
         })
         .await
         .into_diagnostic()?
@@ -1914,7 +1914,7 @@ pub async fn provider_rotate(
             request_id: String::new(),
             provider: name.to_string(),
             credential_key: credential_key.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace: (workspace).to_string(),
         })
         .await
         .into_diagnostic()?
@@ -1953,7 +1953,7 @@ pub async fn provider_refresh_delete(
             allow_missing: true,
             provider: name.to_string(),
             credential_key: credential_key.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace: (workspace).to_string(),
         })
         .await
         .into_diagnostic()?
@@ -2330,7 +2330,7 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     let existing = match client
         .get_provider(GetProviderRequest {
             name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace: (workspace).to_string(),
         })
         .await
     {
@@ -2426,7 +2426,7 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
                 })
                 .collect::<Result<HashMap<_, _>, _>>()
                 .into_diagnostic()?,
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            workspace: (workspace).to_string(),
             clear_credential_expiration_keys,
         })
         .await
@@ -2468,7 +2468,7 @@ pub async fn provider_delete(
                 request_id: String::new(),
                 allow_missing: true,
                 name: name.clone(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                workspace: (workspace).to_string(),
             })
             .await
         {

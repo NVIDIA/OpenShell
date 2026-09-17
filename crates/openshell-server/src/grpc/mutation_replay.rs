@@ -16,7 +16,7 @@ use openshell_core::proto::{
     CreateWorkspaceRequest, CreateWorkspaceResponse, DeleteSandboxTemplateRequest,
     DeleteSandboxTemplateResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
     RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, SandboxTemplateResponse,
-    Workspace, WorkspaceSelector,
+    Workspace,
 };
 use openshell_core::{GetResourceVersion, ObjectId, rpc_error};
 use prost::Message;
@@ -30,9 +30,7 @@ use super::{sandbox, workspace};
 use crate::ServerState;
 use crate::auth::identity::IdentityProvider;
 use crate::auth::principal::Principal;
-use crate::auth::workspace_authz::{
-    MinWorkspaceRole, authorize_workspace, authorize_workspace_selector, require_platform_admin,
-};
+use crate::auth::workspace_authz::{MinWorkspaceRole, authorize_workspace, require_platform_admin};
 use crate::persistence::{
     ObjectType, PersistenceError, SetResourceVersion, Store, WriteCondition, current_time_ms,
 };
@@ -506,13 +504,13 @@ fn global_scope(state: &ServerState, principal: &Principal) -> Result<Scope, Sta
 async fn template_scope(
     state: &ServerState,
     principal: &Principal,
-    selector: Option<&WorkspaceSelector>,
+    workspace: &str,
 ) -> Result<Scope, Status> {
-    let authz = authorize_workspace_selector(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         principal,
-        selector,
+        workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
@@ -670,7 +668,7 @@ resource_mutation!(
     sandbox::handle_create_sandbox_template,
     template,
     async |req: &CreateSandboxTemplateRequest, state: &ServerState, principal: &Principal| {
-        template_scope(state, principal, req.workspace_scope.as_ref()).await
+        template_scope(state, principal, &req.workspace).await
     }
 );
 deletion_mutation!(
@@ -679,7 +677,7 @@ deletion_mutation!(
     "DeleteSandboxTemplate",
     sandbox::handle_delete_sandbox_template,
     async |req: &DeleteSandboxTemplateRequest, state: &ServerState, principal: &Principal| {
-        template_scope(state, principal, req.workspace_scope.as_ref()).await
+        template_scope(state, principal, &req.workspace).await
     }
 );
 resource_mutation!(

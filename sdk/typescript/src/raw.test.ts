@@ -25,11 +25,11 @@ describe('raw sandbox endpoint status', () => {
           (router) => {
             router.service(OpenShell, {
               getSandbox: (request) => {
-                expect(request.name).toBe('tool-sandbox');
-                expect(request.workspaceScope?.selection).toEqual({ case: 'workspace', value: 'tool-workspace' });
+                expect(request.sandbox).toBe('tool-sandbox');
+                expect(request.workspace).toBe('tool-workspace');
                 return {
                   sandbox: {
-                    metadata: { id: 'sandbox-id', name: request.name, workspace: 'tool-workspace' },
+                    metadata: { id: 'sandbox-id', name: request.sandbox, workspace: 'tool-workspace' },
                     status: {
                       phase: SandboxPhase.READY,
                       endpointStatuses: endpoints.map((endpoint) => ({
@@ -57,8 +57,8 @@ describe('raw sandbox endpoint status', () => {
       ]) {
         lastResult = result;
         const response = await sandbox.raw.getSandbox({
-          name: 'tool-sandbox',
-          workspaceScope: { selection: { case: 'workspace', value: 'tool-workspace' } },
+          sandbox: 'tool-sandbox',
+          workspace: 'tool-workspace',
         });
         const status = response.sandbox?.status;
         expect(status?.phase).toBe(SandboxPhase.READY);

@@ -9,7 +9,7 @@ use openshell_core::endpoint_status::endpoint_id;
 use openshell_core::proto::{
     EndpointObservation, GetSandboxConfigRequest, GetSandboxRequest, NetworkEndpoint,
     NetworkPolicyRule, PolicyStatus, ReportPolicyStatusRequest, SandboxCondition, SandboxPhase,
-    UpdateConfigRequest, workspace_selector,
+    UpdateConfigRequest,
 };
 use tonic::Code;
 
@@ -61,8 +61,8 @@ async fn public_status(state: &Arc<ServerState>, sandbox_id: &str) -> SandboxSta
     crate::grpc::sandbox::handle_get_sandbox(
         state,
         authed_request(GetSandboxRequest {
-            name: sandbox_id.to_string(),
-            workspace_scope: Some(workspace_selector("default")),
+            sandbox: sandbox_id.to_string(),
+            workspace: "default".to_string(),
         }),
     )
     .await
@@ -106,7 +106,6 @@ async fn sandbox_with_accepted_endpoint_result(
     endpoint.path = "/mcp".to_string();
     let mut sandbox = test_sandbox(sandbox_id, sandbox_id, policy.clone(), Vec::new());
     sandbox.status = Some(SandboxStatus {
-        sandbox_name: sandbox_id.to_string(),
         phase: SandboxPhase::Ready as i32,
         conditions: vec![ready_condition()],
         ..Default::default()
@@ -230,10 +229,10 @@ async fn unchanged_policy_revision_preserves_endpoint_evidence() {
     let revision = handle_update_config(
         &state,
         authed_request(UpdateConfigRequest {
-            name: sandbox_id.to_string(),
+            sandbox: sandbox_id.to_string(),
             policy: sandbox.spec.expect("sandbox spec").policy,
             annotations: HashMap::from([("audit".to_string(), "v2".to_string())]),
-            workspace_scope: Some(workspace_selector("default")),
+            workspace: "default".to_string(),
             ..Default::default()
         }),
     )
@@ -343,9 +342,9 @@ async fn loaded_policy_hash_cycle_resets_endpoint_evidence() {
         let revision = handle_update_config(
             &state,
             authed_request(UpdateConfigRequest {
-                name: sandbox_id.to_string(),
+                sandbox: sandbox_id.to_string(),
                 policy: Some(policy),
-                workspace_scope: Some(workspace_selector("default")),
+                workspace: "default".to_string(),
                 ..Default::default()
             }),
         )
@@ -517,7 +516,8 @@ async fn report_endpoint_status_rejects_stale_configuration_epoch() {
         &state,
         with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                sandbox_id: sandbox_id.to_string(),
+                sandbox: sandbox_id.to_string(),
+                workspace: String::new(),
             }),
             sandbox_id,
         ),
@@ -625,7 +625,6 @@ fn endpoint_results_preserve_address_and_lifecycle_through_failure_recovery_and_
         Vec::new(),
     );
     sandbox.status = Some(SandboxStatus {
-        sandbox_name: "sandbox-name".to_string(),
         phase: SandboxPhase::Ready as i32,
         conditions: vec![ready_condition()],
         endpoint_statuses: vec![test_initial_endpoint_status(
@@ -790,7 +789,6 @@ fn endpoint_reconciliation_initializes_status_name_and_unknown_result() {
     );
     let status = sandbox.status.expect("status initialized");
     assert_eq!(status.endpoint_statuses, vec![endpoint]);
-    assert_eq!(status.sandbox_name, "sandbox-name");
     assert_eq!(status.phase, expected_phase);
     assert_eq!(status.current_policy_version, expected_policy_version);
     assert!(status.conditions.is_empty());
@@ -808,7 +806,6 @@ async fn startup_reconciliation_invalidates_status_from_previous_sessions() {
     );
     let initial = test_initial_endpoint_status("old-session", "api.example.com", "/mcp");
     sandbox.status = Some(SandboxStatus {
-        sandbox_name: sandbox_id.to_string(),
         endpoint_statuses: vec![EndpointStatus {
             last_result: EndpointResult::HttpResponseReceived as i32,
             last_reported_time: Some(timestamp("2026-09-05T01:01:00.000Z")),
@@ -849,7 +846,6 @@ async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
     endpoints.push(unobserved);
     let mut sandbox = test_sandbox(sandbox_id, sandbox_id, policy, Vec::new());
     sandbox.status = Some(SandboxStatus {
-        sandbox_name: sandbox_id.to_string(),
         phase: SandboxPhase::Ready as i32,
         conditions: vec![ready_condition()],
         ..Default::default()
@@ -863,7 +859,8 @@ async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
         &state,
         with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                sandbox_id: sandbox_id.to_string(),
+                sandbox: sandbox_id.to_string(),
+                workspace: String::new(),
             }),
             sandbox_id,
         ),
@@ -1036,7 +1033,6 @@ async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
     let initial_old = initial_endpoint_status(&old_policy.network_policies["mcp"].endpoints[0]);
     let mut sandbox = test_sandbox(sandbox_id, sandbox_id, old_policy, Vec::new());
     sandbox.status = Some(SandboxStatus {
-        sandbox_name: sandbox_id.to_string(),
         current_policy_version: 0,
         endpoint_statuses: vec![EndpointStatus {
             last_result: EndpointResult::HttpResponseReceived as i32,

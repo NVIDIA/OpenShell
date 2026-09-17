@@ -30,21 +30,21 @@ def cleanup_client():
 
     def get(request, context):
         state.calls.append("GetSandbox")
-        assert request.name == "cleanup-test"
-        assert request.workspace_scope.workspace == "default"
+        assert request.sandbox == "cleanup-test"
+        assert request.workspace == "default"
         if not state.exists:
             fail(context)
         response = openshell_pb2.SandboxResponse()
         response.sandbox.metadata.id = "sandbox-1"
-        response.sandbox.metadata.name = request.name
+        response.sandbox.metadata.name = request.sandbox
         response.sandbox.metadata.workspace = "default"
         response.sandbox.status.phase = openshell_pb2.SANDBOX_PHASE_READY
         return response
 
     def delete(request, context):
         state.calls.append("DeleteSandbox")
-        assert request.name == "cleanup-test"
-        assert request.workspace_scope.workspace == "default"
+        assert request.sandbox == "cleanup-test"
+        assert request.workspace == "default"
         assert request.allow_missing
         if state.code == grpc.StatusCode.NOT_FOUND:
             return openshell_pb2.DeleteSandboxResponse(

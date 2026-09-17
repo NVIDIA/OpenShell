@@ -503,8 +503,9 @@ class SandboxSession:
         no_login_shell: bool = False,
     ) -> ExecResult:
         return self._client.exec(
-            self.sandbox.id,
+            self.sandbox.name,
             command,
+            workspace=self._workspace,
             stream_output=stream_output,
             workdir=workdir,
             env=env,
@@ -525,8 +526,9 @@ class SandboxSession:
         timeout_seconds: int | None = None,
     ) -> ExecResult:
         return self._client.exec_python(
-            self.sandbox.id,
+            self.sandbox.name,
             function,
+            workspace=self._workspace,
             args=args,
             kwargs=kwargs,
             stream_output=stream_output,
@@ -769,7 +771,7 @@ class SandboxClient:
                 spec=request_spec,
                 name=name or "",
                 labels=dict(labels) if labels else {},
-                workspace_scope=_workspace_scope(workspace),
+                workspace=workspace,
             ),
             timeout=self._timeout,
         )
@@ -795,7 +797,7 @@ class SandboxClient:
                 spec=request_spec,
                 name=name or "",
                 labels=dict(labels) if labels else {},
-                workspace_scope=_workspace_scope(workspace),
+                workspace=workspace,
                 workload_template_name=template_name,
             ),
             timeout=self._timeout,
@@ -843,7 +845,8 @@ class SandboxClient:
     def get(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(
             openshell_pb2.GetSandboxRequest(
-                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+                sandbox=sandbox_name,
+                workspace=workspace,
             ),
             timeout=self._timeout,
         )
@@ -964,8 +967,8 @@ class SandboxClient:
     ) -> DeletionResult:
         response = self._stub.DeleteSandbox(
             openshell_pb2.DeleteSandboxRequest(
-                name=sandbox_name,
-                workspace_scope=_workspace_scope(workspace),
+                sandbox=sandbox_name,
+                workspace=workspace,
                 allow_missing=allow_missing,
             ),
             timeout=self._timeout,
@@ -977,7 +980,8 @@ class SandboxClient:
     def stop(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StopSandbox(
             openshell_pb2.StopSandboxRequest(
-                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+                sandbox=sandbox_name,
+                workspace=workspace,
             ),
             timeout=self._timeout,
         )
@@ -986,7 +990,8 @@ class SandboxClient:
     def start(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StartSandbox(
             openshell_pb2.StartSandboxRequest(
-                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+                sandbox=sandbox_name,
+                workspace=workspace,
             ),
             timeout=self._timeout,
         )
@@ -1073,9 +1078,10 @@ class SandboxClient:
 
     def exec_stream(
         self,
-        sandbox_id: str,
+        sandbox_name: str,
         command: Sequence[str],
         *,
+        workspace: str,
         workdir: str | None = None,
         env: Mapping[str, str] | None = None,
         stdin: bytes | None = None,
@@ -1086,7 +1092,8 @@ class SandboxClient:
             raise SandboxError("command must not be empty")
 
         request = openshell_pb2.ExecSandboxRequest(
-            sandbox_id=sandbox_id,
+            sandbox=sandbox_name,
+            workspace=workspace,
             command=list(command),
             workdir=workdir or "",
             environment=dict(env or {}),
@@ -1130,9 +1137,10 @@ class SandboxClient:
 
     def exec(
         self,
-        sandbox_id: str,
+        sandbox_name: str,
         command: Sequence[str],
         *,
+        workspace: str,
         stream_output: bool = False,
         workdir: str | None = None,
         env: Mapping[str, str] | None = None,
@@ -1142,8 +1150,9 @@ class SandboxClient:
     ) -> ExecResult:
         result: ExecResult | None = None
         for item in self.exec_stream(
-            sandbox_id,
+            sandbox_name,
             command,
+            workspace=workspace,
             workdir=workdir,
             env=env,
             stdin=stdin,
@@ -1165,9 +1174,10 @@ class SandboxClient:
 
     def exec_python(
         self,
-        sandbox_id: str,
+        sandbox_name: str,
         function: Callable[..., object],
         *,
+        workspace: str,
         args: Sequence[object] = (),
         kwargs: Mapping[str, object] | None = None,
         stream_output: bool = False,
@@ -1182,8 +1192,9 @@ class SandboxClient:
             kwargs=kwargs,
         )
         return self.exec(
-            sandbox_id,
+            sandbox_name,
             [_SANDBOX_PYTHON_BIN, "-c", _PYTHON_CLOUDPICKLE_BOOTSTRAP],
+            workspace=workspace,
             stream_output=stream_output,
             workdir=workdir,
             env=exec_env,
@@ -1247,7 +1258,7 @@ class SandboxTemplateClient:
 
         response = self._stub.CreateSandboxTemplate(
             openshell_pb2.CreateSandboxTemplateRequest(
-                workspace_scope=_workspace_scope(workspace),
+                workspace=workspace,
                 template=template,
             ),
             timeout=self._timeout,
@@ -1261,9 +1272,7 @@ class SandboxTemplateClient:
         workspace: str,
     ) -> openshell_pb2.SandboxWorkloadTemplate:
         response = self._stub.GetSandboxTemplate(
-            openshell_pb2.GetSandboxTemplateRequest(
-                name=name, workspace_scope=_workspace_scope(workspace)
-            ),
+            openshell_pb2.GetSandboxTemplateRequest(name=name, workspace=workspace),
             timeout=self._timeout,
         )
         return response.template
@@ -1351,7 +1360,7 @@ class SandboxTemplateClient:
         response = self._stub.DeleteSandboxTemplate(
             openshell_pb2.DeleteSandboxTemplateRequest(
                 name=name,
-                workspace_scope=_workspace_scope(workspace),
+                workspace=workspace,
                 allow_missing=allow_missing,
             ),
             timeout=self._timeout,

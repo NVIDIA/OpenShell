@@ -68,19 +68,6 @@ pub enum AuthorizedWorkspaceScope {
     AllWorkspaces,
 }
 
-/// Authorize the required named selector on a single-workspace request.
-#[allow(clippy::result_large_err)]
-pub async fn authorize_workspace_selector(
-    store: &Store,
-    admin_role: &str,
-    principal: &Principal,
-    selector: Option<&WorkspaceSelector>,
-    min_role: MinWorkspaceRole,
-) -> Result<AuthorizedWorkspace, Status> {
-    let workspace = selected_workspace_name(selector)?;
-    authorize_workspace(store, admin_role, principal, workspace, min_role).await
-}
-
 /// Authorize a selector on a request that explicitly supports all workspaces.
 #[allow(clippy::result_large_err)]
 pub async fn authorize_list_workspace_selector(
@@ -150,6 +137,7 @@ pub async fn authorize_workspace(
     workspace: &str,
     min_role: MinWorkspaceRole,
 ) -> Result<AuthorizedWorkspace, Status> {
+    crate::grpc::workspace::validate_workspace_name(workspace)?;
     let workspace = workspace.to_string();
 
     match principal {
@@ -206,12 +194,10 @@ pub async fn authorize_workspace(
     }
 }
 
-/// Authorize a data-plane operation where the workspace is resolved from the
-/// sandbox record rather than the request message.
-///
 /// Used by `ExecSandbox`, `ForwardTcp`, `WatchSandbox`, `CreateSshSession` — these
-/// RPCs identify a sandbox by name/ID and the handler resolves the workspace
-/// from the sandbox record.
+/// RPCs identify a sandbox by its canonical name within an explicit workspace.
+/// User requests authorize that workspace before lookup; sandbox principals
+/// remain bound to the immutable ID from their authenticated identity.
 #[allow(clippy::result_large_err)]
 pub async fn authorize_sandbox_workspace(
     store: &Store,
@@ -471,15 +457,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_named_selector_is_rejected() {
+    async fn empty_workspace_is_rejected() {
         let store = test_store().await;
         add_member(&store, "default", "user-d", ProtoWorkspaceRole::User).await;
         let principal = user_principal("user-d", &["openshell-user"]);
-        let result = authorize_workspace_selector(
+        let result = authorize_workspace(
             &store,
             "openshell-admin",
             &principal,
-            Some(&openshell_core::proto::workspace_selector("")),
+            "",
             MinWorkspaceRole::User,
         )
         .await;

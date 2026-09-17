@@ -636,10 +636,11 @@ openshell forward list --output json
 openshell forward list --output yaml
 ```
 
-Structured output includes `sandbox`, `bind_address`, `port`, `pid`, and
-`alive`. The `alive` boolean reports whether the tracked PID still matches the
-expected OpenShell SSH forward; it does not probe the forwarded socket. When no
-forwards are tracked, structured output returns an empty collection.
+Structured output includes `workspace`, `sandbox`, `bind_address`, `port`,
+`pid`, and `alive`. The `alive` boolean reports whether the tracked PID still
+matches the expected workspace-scoped OpenShell SSH forward and immutable
+sandbox identity; it does not probe the forwarded socket. When no forwards are
+tracked, structured output returns an empty collection.
 
 The default table colorizes the `STATUS` column only when both standard output and standard error are capable ANSI terminals; piping or redirecting either stream, or running under `TERM=dumb`, gives a plain-text table. Other styled output—including `-v` log lines, progress spinners, prompts, and error messages—is decided per stream, so redirecting one stream leaves the other styled. Prefer `--output json` for automation rather than matching on the table. Set `NO_COLOR` to any non-empty value or pass `--color never` to suppress ANSI formatting, and `--color always` to force it when piping into a pager. `--color` applies to every `openshell` command.
 

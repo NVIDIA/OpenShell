@@ -110,6 +110,7 @@ impl ObjectWorkspace for StoredProviderCredentialRefreshStateV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::proto::{SandboxPhase, SandboxStatus};
     use prost::Message;
     use prost_types::{DescriptorProto, EnumDescriptorProto, FileDescriptorSet};
     use sha2::{Digest, Sha256};
@@ -118,9 +119,9 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "f30e23cffedb97d9db96ab1efff5e0ec9dcf174cf113533c0378e7ac63ec6883";
+        "ca7ee759cff27e2f57822856830431dab03df9b3d8f82bb33671053977474e91";
     const DURABLE_SCHEMA_SHA256: &str =
-        "55e4d8f70de4ffe004e45f230b7fe9425c4e635848164a1b94232201745f8d51";
+        "c6dea38c62b6f85d16c03b9783be2a20234d6cce5ed049ff2eb7bf66e0863ee3";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "a6e97fdde30c439ffaa03c2952a43033f8ea338fed6b1456ebe2d7d8af14e834";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
@@ -138,6 +139,10 @@ mod tests {
         "0a0472756c651a07666978747572652d0000403f3a0b6578616d706c652e636f6d40bb035002";
     const V0_0_116_POLICY_RECORD: &str = "0a09706f6c6963792d6964120a73616e64626f782d6964180222030102032a0673686132353632066c6f616465643a046e6f6e6540fa0148ac0252110a06736f75726365120766697874757265";
     const V0_0_116_DRAFT_RECORD: &str = "0a086368756e6b2d6964120a73616e64626f782d69641802220770656e64696e672a0472756c65320204053a076669787475726549000000000000e83f50de02589003620b6578616d706c652e636f6d68bb037801";
+    // SandboxStatus encoded before its redundant parent sandbox name was removed.
+    // Field 1 is ignored while the remaining durable status fields retain their tags.
+    const PRE_CANONICAL_SANDBOX_REFERENCE_STATUS: &str =
+        "0a0b6c65676163792d6e616d6512056167656e7430023807";
     const STORAGE_MESSAGE_NAMES: [&str; 9] = [
         "DraftChunkPayload",
         "PolicyRevisionPayload",
@@ -627,7 +632,6 @@ mod tests {
         assert_eq!(metadata.name, "sandbox");
         assert_eq!(metadata.workspace, "default");
         let status = sandbox.status.expect("sandbox status");
-        assert_eq!(status.sandbox_name, "sandbox");
         assert_eq!(status.phase(), SandboxPhase::Ready);
         assert_eq!(status.current_policy_version, 7);
         assert_eq!(status.main_process_instance_id, "supervisor-id");
@@ -718,6 +722,17 @@ mod tests {
         assert_eq!(draft.host, "example.com");
         assert_eq!(draft.port, 443);
         assert_eq!(draft.hit_count, 1);
+    }
+
+    #[test]
+    fn sandbox_status_without_parent_reference_decodes_previous_payload() {
+        let status =
+            SandboxStatus::decode(legacy_bytes(PRE_CANONICAL_SANDBOX_REFERENCE_STATUS).as_slice())
+                .expect("previous sandbox status must decode");
+
+        assert_eq!(status.agent_pod, "agent");
+        assert_eq!(status.phase, SandboxPhase::Ready as i32);
+        assert_eq!(status.current_policy_version, 7);
     }
 
     #[tokio::test]

@@ -83,7 +83,7 @@ fn receipt(hello: &SupervisorHello) -> ProviderMutationReceipt {
         kind: ProviderMutationKind::Attach.into(),
         desired: Some(ProviderDesiredIdentity {
             sandbox_id: hello.sandbox_id.clone(),
-            sandbox_name: "synthetic".to_string(),
+            sandbox: "synthetic".to_string(),
             attachment_epoch: Uuid::new_v4().to_string(),
             provider_id: Uuid::new_v4().to_string(),
             provider_resource_version: 2,
@@ -812,7 +812,7 @@ async fn attach_waiting_for_update_captures_published_revision_and_becomes_ready
         authed_request(CreateProviderRequest {
             request_id: String::new(),
             provider: Some(provider("synthetic-first")),
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            workspace: "default".to_string(),
         }),
     )
     .await
@@ -834,7 +834,7 @@ async fn attach_waiting_for_update_captures_published_revision_and_becomes_ready
                 provider: Some(replacement),
                 credential_expiration_times: HashMap::new(),
                 clear_credential_expiration_keys: Vec::new(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                workspace: "default".to_string(),
             }),
         )
         .await
@@ -846,10 +846,10 @@ async fn attach_waiting_for_update_captures_published_revision_and_becomes_ready
     let attach_wait_probe = Arc::new(tokio::sync::Notify::new());
     let mut attach_request = authed_request(AttachSandboxProviderRequest {
         request_id: String::new(),
-        sandbox_name: "attach-race".to_string(),
+        sandbox: "attach-race".to_string(),
         provider_name: "work-github".to_string(),
         expected_resource_version: 0,
-        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        workspace: "default".to_string(),
     });
     attach_request
         .extensions_mut()
@@ -899,10 +899,10 @@ async fn attach_waiting_for_update_captures_published_revision_and_becomes_ready
     let status = handle_get_sandbox_provider_status(
         &state,
         authed_request(GetSandboxProviderStatusRequest {
-            sandbox_name: "attach-race".to_string(),
+            sandbox: "attach-race".to_string(),
             provider_name: "work-github".to_string(),
             receipt_id: receipt.receipt_id,
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            workspace: "default".to_string(),
         }),
     )
     .await
@@ -933,10 +933,10 @@ async fn status_rejects_oversized_provider_name_before_persisting_receipt() {
     let response = handle_get_sandbox_provider_status(
         &state,
         authed_request(GetSandboxProviderStatusRequest {
-            sandbox_name: "s1".to_string(),
+            sandbox: "s1".to_string(),
             provider_name: "x".repeat(super::super::MAX_NAME_LEN + 1),
             receipt_id: String::new(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            workspace: "default".to_string(),
         }),
     )
     .await;
@@ -982,10 +982,10 @@ async fn status_accepts_maximum_provider_name_and_receipt_only_lookup() {
     let response = handle_get_sandbox_provider_status(
         &state,
         authed_request(GetSandboxProviderStatusRequest {
-            sandbox_name: "s1".to_string(),
+            sandbox: "s1".to_string(),
             provider_name: provider_name.clone(),
             receipt_id: String::new(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            workspace: "default".to_string(),
         }),
     )
     .await
@@ -1006,10 +1006,10 @@ async fn status_accepts_maximum_provider_name_and_receipt_only_lookup() {
     let repeated = handle_get_sandbox_provider_status(
         &state,
         authed_request(GetSandboxProviderStatusRequest {
-            sandbox_name: "s1".to_string(),
+            sandbox: "s1".to_string(),
             provider_name: String::new(),
             receipt_id: receipt.receipt_id.clone(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            workspace: "default".to_string(),
         }),
     )
     .await
@@ -1059,10 +1059,10 @@ async fn observation_fixture() -> (
     state.store.put_message(&sandbox).await.unwrap();
     state.store.put_message(&provider).await.unwrap();
     let query = GetSandboxProviderStatusRequest {
-        sandbox_name: "observe-sandbox".to_string(),
+        sandbox: "observe-sandbox".to_string(),
         provider_name: "observe-provider".to_string(),
         receipt_id: String::new(),
-        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        workspace: "default".to_string(),
     };
     (state, sandbox, provider, query)
 }
@@ -1197,10 +1197,10 @@ async fn stored_change_is_bound_to_its_sandbox_and_provider() {
     for (sandbox_name, provider_name) in [("other", "provider-owner"), ("owner", "other-provider")]
     {
         let request = GetSandboxProviderStatusRequest {
-            sandbox_name: sandbox_name.to_string(),
+            sandbox: sandbox_name.to_string(),
             provider_name: provider_name.to_string(),
             receipt_id: receipt.receipt_id.clone(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            workspace: "default".to_string(),
         };
         assert_eq!(
             handle_get_sandbox_provider_status(&state, authed_request(request))
@@ -1275,10 +1275,10 @@ async fn detach_receipt_persists_but_gateway_restart_requires_fresh_installation
             .is_err()
     );
     let query = GetSandboxProviderStatusRequest {
-        sandbox_name: "readiness".to_string(),
+        sandbox: "readiness".to_string(),
         provider_name: "detached".to_string(),
         receipt_id: receipt.receipt_id.clone(),
-        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        workspace: "default".to_string(),
     };
     let initial = handle_get_sandbox_provider_status(&state, authed_request(query.clone()))
         .await

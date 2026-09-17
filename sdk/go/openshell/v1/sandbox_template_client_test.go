@@ -57,7 +57,7 @@ func (s *mockSandboxTemplateServer) CreateSandboxTemplate(_ context.Context, req
 	if template.Metadata == nil {
 		template.Metadata = &dm.ObjectMeta{}
 	}
-	template.Metadata.Workspace = req.GetWorkspaceScope().GetWorkspace()
+	template.Metadata.Workspace = req.GetWorkspace()
 	template.Metadata.ResourceVersion = 1
 	s.templates[template.Metadata.GetName()] = template
 	return &pb.SandboxTemplateResponse{Template: proto.Clone(template).(*pb.SandboxWorkloadTemplate)}, nil
@@ -164,7 +164,7 @@ func TestSandboxTemplateCreate(t *testing.T) {
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
 	require.NotNil(t, mock.createRequest)
-	assert.Equal(t, "default", mock.createRequest.GetWorkspaceScope().GetWorkspace())
+	assert.Equal(t, "default", mock.createRequest.GetWorkspace())
 	assert.Equal(t, "gpu-kata", mock.createRequest.Template.Metadata.Name)
 	assert.Equal(t, "2", mock.createRequest.Template.Spec.Workload.Resources.Cpu)
 	assert.Equal(t, "8Gi", mock.createRequest.Template.Spec.Workload.Resources.Memory)
@@ -235,7 +235,7 @@ func TestSandboxTemplateGetListDelete(t *testing.T) {
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
 	require.NotNil(t, mock.getRequest)
-	assert.Equal(t, "default", mock.getRequest.GetWorkspaceScope().GetWorkspace())
+	assert.Equal(t, "default", mock.getRequest.GetWorkspace())
 	assert.Equal(t, "gpu-kata", mock.getRequest.Name)
 	require.NotNil(t, mock.listRequest)
 	assert.Equal(t, "default", mock.listRequest.GetWorkspaceScope().GetWorkspace())
@@ -243,7 +243,7 @@ func TestSandboxTemplateGetListDelete(t *testing.T) {
 	assert.Empty(t, mock.listRequest.PageToken)
 	assert.Equal(t, "team=runtime", mock.listRequest.LabelSelector)
 	require.NotNil(t, mock.deleteRequest)
-	assert.Equal(t, "default", mock.deleteRequest.GetWorkspaceScope().GetWorkspace())
+	assert.Equal(t, "default", mock.deleteRequest.GetWorkspace())
 	assert.Equal(t, "gpu-kata", mock.deleteRequest.Name)
 }
 

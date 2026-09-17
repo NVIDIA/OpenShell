@@ -171,8 +171,7 @@ func (c *fakePolicyClient) GetStatus(_ context.Context, workspace, sandboxName s
 }
 
 // List returns policy revisions. When the global option is set, it returns
-// global revisions; otherwise it returns all sandbox-scoped revisions for the
-// given workspace.
+// global revisions; otherwise it returns revisions for the specified sandbox.
 func (c *fakePolicyClient) List(workspace, sandboxName string, opts ...v1.ListPolicyOption) (*v1.Pager[types.SandboxPolicyRevision], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}

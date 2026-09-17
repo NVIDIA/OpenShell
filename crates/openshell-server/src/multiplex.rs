@@ -48,7 +48,7 @@ use crate::{
     auth::identity::Identity,
     auth::oidc::{self, OidcAuthenticator},
     auth::principal::{Principal, UserPrincipal},
-    auth::workspace_authz::{MinWorkspaceRole, authorize_workspace_selector},
+    auth::workspace_authz::{MinWorkspaceRole, authorize_workspace},
     gateway_listener::GatewayListenerScope,
     http_router, service_http_router,
 };
@@ -565,11 +565,11 @@ async fn hydrate_update_provider_identity(
 
     let principal =
         principal.ok_or_else(|| tonic::Status::unauthenticated("authentication required"))?;
-    let authorized = authorize_workspace_selector(
+    let authorized = authorize_workspace(
         state.store.as_ref(),
         &state.admin_role,
         principal,
-        request.workspace_scope.as_ref(),
+        &request.workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
@@ -1761,9 +1761,7 @@ mod tests {
                 )]),
                 ..Default::default()
             }),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                "default".to_string(),
-            )),
+            workspace: "default".to_string(),
             ..Default::default()
         };
         let authed = crate::grpc::test_support::authed_request(());
@@ -1987,7 +1985,7 @@ mod tests {
         let input = CreateSandboxRequest {
             name: "client-original".into(),
             request_id: uuid::Uuid::new_v4().to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            workspace: "default".to_string(),
             spec: Some(SandboxSpec::default()),
             ..Default::default()
         };

@@ -97,7 +97,6 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 
 func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 	result := types.SandboxStatus{
-		SandboxName:          status.GetSandboxName(),
 		AgentPod:             status.GetAgentPod(),
 		AgentFd:              status.GetAgentFd(),
 		SandboxFd:            status.GetSandboxFd(),

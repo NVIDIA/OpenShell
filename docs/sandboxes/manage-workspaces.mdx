@@ -163,29 +163,34 @@ openshell provider list --all-workspaces
 openshell service list --all-workspaces
 ```
 
-The public API represents this choice with a `WorkspaceSelector` oneof. Set
-`workspace` to a non-empty name, including the literal `default`, or set the
-`all_workspaces` marker on list requests that support it. Omitting the selector
-or sending an unset selector is invalid for workspace-scoped operations. The
-all-workspaces variant is accepted only by sandbox, sandbox template, provider,
-and service list requests, and it requires Platform Admin access.
+Single-workspace public requests use a non-empty string `workspace`, including
+the literal `default`. Only the sandbox, sandbox template, provider, and service
+collection list requests use the `WorkspaceSelector` oneof because those APIs
+also accept `all_workspaces`. The all-workspaces selection requires Platform
+Admin access. For services, choose either a sandbox name or `--all-workspaces`;
+the options are mutually exclusive.
 
-Clients migrating from the previous request fields should make the scope
-explicit:
+Every sandbox-scoped RPC identifies the sandbox by its human-readable name and
+keeps workspace selection in a separate field:
 
-| Previous request | Typed selector |
-| --- | --- |
-| `workspace: "team-ml"` | `workspace_scope.workspace: "team-ml"` |
-| Empty or omitted `workspace` for the default | `workspace_scope.workspace: "default"` |
-| `all_workspaces: true` | `workspace_scope.all_workspaces: {}` |
-| `global: true` | Omit `workspace_scope` |
+```json
+{
+  "sandbox": "agent",
+  "workspace": "team-ml"
+}
+```
+
+Public requests do not accept canonical sandbox IDs as references. This is a
+breaking API change: regenerate protobuf clients and replace stored ID
+references with sandbox names before calling the public API. The four collection
+list RPCs use the request-level `workspace_scope` selector.
 
 The Rust and Python SDKs expose separate all-workspaces list methods. The Go
 SDK passes `AllWorkspaces: true` in `ListOptions` to `ListAll`, and the
 TypeScript SDK uses a discriminated option type, so a caller cannot select a
 named workspace and all workspaces in one typed call.
-The TUI starts in the `default` workspace and sends that named selector
-explicitly. Its all-workspaces view sends the marker instead.
+The TUI starts in the `default` workspace and sends that name explicitly. Its
+all-workspaces collection views send the selector marker instead.
 
 Provider profiles and policy also have explicit `--global` operations. Those
 operations target platform scope and require Platform Admin access. A

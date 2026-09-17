@@ -7,7 +7,7 @@ use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::open_shell_server::OpenShell;
 use openshell_core::proto::{
     SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, WorkspaceMember,
-    WorkspaceRole, workspace_selector,
+    WorkspaceRole,
 };
 use openshell_core::rpc_error::StatusExt;
 use std::collections::HashMap;
@@ -494,7 +494,7 @@ async fn template_replay_stores_only_reference_and_checks_original_version() {
     // Delete is also routed through the public dispatch adapter.
     let req = DeleteSandboxTemplateRequest {
         name: "missing".into(),
-        workspace_scope: Some(workspace_selector("default")),
+        workspace: "default".to_string(),
         allow_missing: true,
         request_id: uuid::Uuid::new_v4().to_string(),
     };
@@ -528,7 +528,7 @@ async fn template_replay_stores_only_reference_and_checks_original_version() {
                 ..Default::default()
             }),
         }),
-        workspace_scope: Some(workspace_selector("default")),
+        workspace: "default".to_string(),
         request_id: uuid::Uuid::new_v4().to_string(),
     };
     let created = run(&state, authed_request(req.clone()))
@@ -828,8 +828,8 @@ fn replay_allowlist_remains_outside_interception_and_ids_have_reviewed_wire_tags
         ("DeleteWorkspace", 3),
         ("AddWorkspaceMember", 4),
         ("RemoveWorkspaceMember", 4),
-        ("CreateSandboxTemplate", 4),
-        ("DeleteSandboxTemplate", 5),
+        ("CreateSandboxTemplate", 3),
+        ("DeleteSandboxTemplate", 4),
     ] {
         assert!(!openshell_gateway_interceptors::routes::INTERCEPTABLE_METHODS.contains(&method));
         let descriptor = DESCRIPTORS
@@ -846,7 +846,7 @@ async fn unrelated_oidc_configuration_does_not_reset_mtls_admission_identity() {
     let mut state = test_server_state().await;
     let req = DeleteSandboxTemplateRequest {
         name: "mtls-template".into(),
-        workspace_scope: Some(workspace_selector("default")),
+        workspace: "default".to_string(),
         allow_missing: true,
         request_id: "550e8400-e29b-41d4-a716-446655440000".into(),
     };

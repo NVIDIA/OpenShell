@@ -30,8 +30,8 @@ func (s *sandboxTemplateClient) Create(ctx context.Context, workspace string, te
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
 	}
 	resp, err := s.client.CreateSandboxTemplate(ctx, &pb.CreateSandboxTemplateRequest{
-		Template:       protoTemplate,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		Template:  protoTemplate,
+		Workspace: workspace,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -41,8 +41,8 @@ func (s *sandboxTemplateClient) Create(ctx context.Context, workspace string, te
 
 func (s *sandboxTemplateClient) Get(ctx context.Context, workspace, name string) (*SandboxWorkloadTemplate, error) {
 	resp, err := s.client.GetSandboxTemplate(ctx, &pb.GetSandboxTemplateRequest{
-		Name:           name,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		Name:      name,
+		Workspace: workspace,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -93,9 +93,9 @@ func (s *sandboxTemplateClient) ListAll(ctx context.Context, workspace string, o
 
 func (s *sandboxTemplateClient) Delete(ctx context.Context, workspace, name string, opts ...DeleteOptions) (*DeletionResult, error) {
 	resp, err := s.client.DeleteSandboxTemplate(ctx, &pb.DeleteSandboxTemplateRequest{
-		AllowMissing:   allowMissing(opts),
-		Name:           name,
-		WorkspaceScope: namedWorkspaceScope(workspace),
+		AllowMissing: allowMissing(opts),
+		Name:         name,
+		Workspace:    workspace,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)

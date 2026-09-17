@@ -172,7 +172,7 @@ impl OpenShellClient {
                 let request = proto::CreateSandboxTemplateRequest {
                     request_id: String::new(),
                     template: Some(template.clone()),
-                    workspace_scope: Some(proto::workspace_selector("default")),
+                    workspace: "default".to_string(),
                 };
                 async move { grpc.create_sandbox_template(request).await }
             })
@@ -186,7 +186,7 @@ impl OpenShellClient {
             .unary(|mut grpc| {
                 let request = proto::GetSandboxTemplateRequest {
                     name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector("default")),
+                    workspace: "default".to_string(),
                 };
                 async move { grpc.get_sandbox_template(request).await }
             })
@@ -286,7 +286,7 @@ impl OpenShellClient {
                     request_id: String::new(),
                     allow_missing: opts.allow_missing,
                     name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector("default")),
+                    workspace: "default".to_string(),
                 };
                 async move { grpc.delete_sandbox_template(request).await }
             })
@@ -302,8 +302,8 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::GetSandboxRequest {
-                    name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector("default")),
+                    sandbox: name.to_string(),
+                    workspace: "default".to_string(),
                 };
                 async move { grpc.get_sandbox(request).await }
             })
@@ -358,8 +358,8 @@ impl OpenShellClient {
                 let request = proto::DeleteSandboxRequest {
                     request_id: String::new(),
                     allow_missing: opts.allow_missing,
-                    name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector("default")),
+                    sandbox: name.to_string(),
+                    workspace: "default".to_string(),
                 };
                 async move { grpc.delete_sandbox(request).await }
             })
@@ -376,8 +376,8 @@ impl OpenShellClient {
             .unary(|mut grpc| {
                 let request = proto::StopSandboxRequest {
                     request_id: String::new(),
-                    name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector("default")),
+                    sandbox: name.to_string(),
+                    workspace: "default".to_string(),
                 };
                 async move { grpc.stop_sandbox(request).await }
             })
@@ -391,8 +391,8 @@ impl OpenShellClient {
             .unary(|mut grpc| {
                 let request = proto::StartSandboxRequest {
                     request_id: String::new(),
-                    name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector("default")),
+                    sandbox: name.to_string(),
+                    workspace: "default".to_string(),
                 };
                 async move { grpc.start_sandbox(request).await }
             })
@@ -606,9 +606,9 @@ impl OpenShellClient {
     /// For streaming output, drop down to [`OpenShellClient::raw_grpc`] and
     /// call `exec_sandbox` directly.
     pub async fn exec(&self, name: &str, cmd: &[String], opts: ExecOptions) -> Result<ExecResult> {
-        let sandbox = self.get_sandbox(name).await?;
         let request = proto::ExecSandboxRequest {
-            sandbox_id: sandbox.id,
+            sandbox: name.to_string(),
+            workspace: "default".to_string(),
             command: cmd.to_vec(),
             workdir: opts.workdir.unwrap_or_default(),
             environment: opts.environment,
@@ -766,7 +766,7 @@ impl WorkspaceScopedClient {
     /// Create a new sandbox in this workspace.
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
         let mut request = create_sandbox_request(spec);
-        request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
+        request.workspace.clone_from(&self.workspace);
         let response = self
             .client
             .unary(|mut grpc| {
@@ -783,7 +783,7 @@ impl WorkspaceScopedClient {
         spec: SandboxTemplateCreateSpec,
     ) -> Result<SandboxRef> {
         let mut request = create_sandbox_from_template_request(spec);
-        request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
+        request.workspace.clone_from(&self.workspace);
         let response = self
             .client
             .unary(|mut grpc| {
@@ -805,7 +805,7 @@ impl WorkspaceScopedClient {
                 let request = proto::CreateSandboxTemplateRequest {
                     request_id: String::new(),
                     template: Some(template.clone()),
-                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                    workspace: self.workspace.clone(),
                 };
                 async move { grpc.create_sandbox_template(request).await }
             })
@@ -820,7 +820,7 @@ impl WorkspaceScopedClient {
             .unary(|mut grpc| {
                 let request = proto::GetSandboxTemplateRequest {
                     name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                    workspace: self.workspace.clone(),
                 };
                 async move { grpc.get_sandbox_template(request).await }
             })
@@ -882,7 +882,7 @@ impl WorkspaceScopedClient {
                     request_id: String::new(),
                     allow_missing: opts.allow_missing,
                     name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                    workspace: self.workspace.clone(),
                 };
                 async move { grpc.delete_sandbox_template(request).await }
             })
@@ -899,8 +899,8 @@ impl WorkspaceScopedClient {
             .client
             .unary(|mut grpc| {
                 let request = proto::GetSandboxRequest {
-                    name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                    sandbox: name.to_string(),
+                    workspace: self.workspace.clone(),
                 };
                 async move { grpc.get_sandbox(request).await }
             })
@@ -955,8 +955,8 @@ impl WorkspaceScopedClient {
                 let request = proto::DeleteSandboxRequest {
                     request_id: String::new(),
                     allow_missing: opts.allow_missing,
-                    name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                    sandbox: name.to_string(),
+                    workspace: self.workspace.clone(),
                 };
                 async move { grpc.delete_sandbox(request).await }
             })
@@ -974,8 +974,8 @@ impl WorkspaceScopedClient {
             .unary(|mut grpc| {
                 let request = proto::StopSandboxRequest {
                     request_id: String::new(),
-                    name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                    sandbox: name.to_string(),
+                    workspace: self.workspace.clone(),
                 };
                 async move { grpc.stop_sandbox(request).await }
             })
@@ -990,8 +990,8 @@ impl WorkspaceScopedClient {
             .unary(|mut grpc| {
                 let request = proto::StartSandboxRequest {
                     request_id: String::new(),
-                    name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                    sandbox: name.to_string(),
+                    workspace: self.workspace.clone(),
                 };
                 async move { grpc.start_sandbox(request).await }
             })
@@ -1066,9 +1066,9 @@ impl WorkspaceScopedClient {
 
     /// Run a command inside a sandbox and buffer stdout/stderr.
     pub async fn exec(&self, name: &str, cmd: &[String], opts: ExecOptions) -> Result<ExecResult> {
-        let sandbox = self.get_sandbox(name).await?;
         let request = proto::ExecSandboxRequest {
-            sandbox_id: sandbox.id,
+            sandbox: name.to_string(),
+            workspace: self.workspace.clone(),
             command: cmd.to_vec(),
             workdir: opts.workdir.unwrap_or_default(),
             environment: opts.environment,
@@ -1200,7 +1200,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         name: name.unwrap_or_default(),
         labels,
         annotations: HashMap::new(),
-        workspace_scope: Some(proto::workspace_selector("default")),
+        workspace: "default".to_string(),
         await_main_process_attachment: false,
         workload_template_name: String::new(),
     }
@@ -1230,7 +1230,7 @@ fn create_sandbox_from_template_request(
         name: name.unwrap_or_default(),
         labels,
         annotations: HashMap::new(),
-        workspace_scope: Some(proto::workspace_selector("default")),
+        workspace: "default".to_string(),
         workload_template_name: template_name,
         await_main_process_attachment: false,
     }

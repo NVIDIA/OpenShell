@@ -62,19 +62,6 @@ const SYNTHETIC_PROFILE_BACKEND_ERROR: &str = "TESTLEAK";
 const SYNTHETIC_MUTATION_ERROR_METADATA: &str = "fixture-mutation-error-metadata";
 const STORAGE_UNCERTAIN_REASON: &str = "CONFIG_OPERATION_STORAGE_UNCERTAIN";
 
-fn selected_workspace(
-    scope: &Option<openshell_core::proto::datamodel::v1::WorkspaceSelector>,
-) -> Option<&str> {
-    match scope.as_ref()?.selection.as_ref()? {
-        openshell_core::proto::datamodel::v1::workspace_selector::Selection::Workspace(
-            workspace,
-        ) => Some(workspace),
-        openshell_core::proto::datamodel::v1::workspace_selector::Selection::AllWorkspaces(_) => {
-            None
-        }
-    }
-}
-
 #[derive(Clone, Default)]
 struct ProviderState {
     providers: Arc<Mutex<HashMap<String, Provider>>>,
@@ -182,7 +169,7 @@ impl TestOpenShell {
             kind: kind.into(),
             desired: Some(ProviderDesiredIdentity {
                 sandbox_id: format!("sb-{sandbox_name}"),
-                sandbox_name: sandbox_name.to_string(),
+                sandbox: sandbox_name.to_string(),
                 attachment_epoch: format!("attachment-{sandbox_name}"),
                 provider_id: if detached {
                     String::new()
@@ -305,7 +292,8 @@ impl OpenShell for TestOpenShell {
         if self.state.fail_sandbox_reads.load(Ordering::SeqCst) {
             return Err(Status::internal(SYNTHETIC_READINESS_BACKEND_ERROR));
         }
-        let name = request.into_inner().name;
+        let request = request.into_inner();
+        let name = request.sandbox;
         // Return a minimal sandbox with metadata for CAS operations
         Ok(Response::new(SandboxResponse {
             sandbox: Some(Sandbox {
@@ -339,7 +327,8 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<ListSandboxProvidersRequest>,
     ) -> Result<Response<ListSandboxProvidersResponse>, Status> {
-        let sandbox_name = request.into_inner().sandbox_name;
+        let request = request.into_inner();
+        let sandbox_name = request.sandbox.clone();
         self.state
             .sandbox_provider_requests
             .lock()
@@ -368,15 +357,14 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<AttachSandboxProviderRequest>,
     ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
         let request = request.into_inner();
-        let workspace = selected_workspace(&request.workspace_scope)
-            .filter(|workspace| !workspace.is_empty())
-            .ok_or_else(|| Status::invalid_argument("one explicit workspace is required"))?;
+        let workspace = request.workspace.as_str();
+        let sandbox_name = request.sandbox.clone();
         self.state
             .sandbox_provider_requests
             .lock()
             .await
             .push(SandboxProviderRequestLog::Attach {
-                sandbox_name: request.sandbox_name.clone(),
+                sandbox_name: sandbox_name.clone(),
                 provider_name: request.provider_name.clone(),
             });
         if !self
@@ -389,9 +377,7 @@ impl OpenShell for TestOpenShell {
             return Err(Status::failed_precondition("provider not found"));
         }
         let mut sandbox_providers = self.state.sandbox_providers.lock().await;
-        let providers = sandbox_providers
-            .entry(request.sandbox_name.clone())
-            .or_default();
+        let providers = sandbox_providers.entry(sandbox_name.clone()).or_default();
         let attached = if providers.contains(&request.provider_name) {
             false
         } else {
@@ -403,7 +389,7 @@ impl OpenShell for TestOpenShell {
         self.check_mutation_receipt_storage().await?;
         let receipt = self
             .provider_receipt(
-                &request.sandbox_name,
+                &sandbox_name,
                 &request.provider_name,
                 workspace,
                 ProviderMutationKind::Attach,
@@ -412,7 +398,7 @@ impl OpenShell for TestOpenShell {
             .await;
         let sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                name: request.sandbox_name,
+                name: sandbox_name,
                 ..Default::default()
             }),
             spec: Some(openshell_core::proto::SandboxSpec {
@@ -433,21 +419,18 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<DetachSandboxProviderRequest>,
     ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
         let request = request.into_inner();
-        let workspace = selected_workspace(&request.workspace_scope)
-            .filter(|workspace| !workspace.is_empty())
-            .ok_or_else(|| Status::invalid_argument("one explicit workspace is required"))?;
+        let workspace = request.workspace.as_str();
+        let sandbox_name = request.sandbox.clone();
         self.state
             .sandbox_provider_requests
             .lock()
             .await
             .push(SandboxProviderRequestLog::Detach {
-                sandbox_name: request.sandbox_name.clone(),
+                sandbox_name: sandbox_name.clone(),
                 provider_name: request.provider_name.clone(),
             });
         let mut sandbox_providers = self.state.sandbox_providers.lock().await;
-        let providers = sandbox_providers
-            .entry(request.sandbox_name.clone())
-            .or_default();
+        let providers = sandbox_providers.entry(sandbox_name.clone()).or_default();
         let before_len = providers.len();
         providers.retain(|name| name != &request.provider_name);
         let detached = providers.len() != before_len;
@@ -456,7 +439,7 @@ impl OpenShell for TestOpenShell {
         self.check_mutation_receipt_storage().await?;
         let receipt = self
             .provider_receipt(
-                &request.sandbox_name,
+                &sandbox_name,
                 &request.provider_name,
                 workspace,
                 ProviderMutationKind::Detach,
@@ -465,7 +448,7 @@ impl OpenShell for TestOpenShell {
             .await;
         let sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                name: request.sandbox_name,
+                name: sandbox_name,
                 ..Default::default()
             }),
             spec: Some(openshell_core::proto::SandboxSpec {
@@ -522,9 +505,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<GetSandboxProviderStatusRequest>,
     ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
         let request = request.into_inner();
-        let workspace = selected_workspace(&request.workspace_scope)
-            .filter(|workspace| !workspace.is_empty())
-            .ok_or_else(|| Status::invalid_argument("one explicit workspace is required"))?;
+        let workspace = request.workspace.as_str();
         self.state
             .readiness_requests
             .lock()
@@ -540,7 +521,7 @@ impl OpenShell for TestOpenShell {
                         && receipt
                             .desired
                             .as_ref()
-                            .is_some_and(|desired| desired.sandbox_name == request.sandbox_name)
+                            .is_some_and(|desired| desired.sandbox == request.sandbox)
                 })
                 .max_by_key(|receipt| {
                     receipt
@@ -561,7 +542,7 @@ impl OpenShell for TestOpenShell {
             .readiness_scripts
             .lock()
             .await
-            .get_mut(&request.sandbox_name)
+            .get_mut(&request.sandbox)
             .and_then(|script| {
                 if script.len() > 1 {
                     script.pop_front()
@@ -934,9 +915,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<UpdateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
         let request = request.into_inner();
-        let workspace = selected_workspace(&request.workspace_scope)
-            .filter(|workspace| !workspace.is_empty())
-            .ok_or_else(|| Status::invalid_argument("one explicit workspace is required"))?;
+        let workspace = request.workspace.as_str();
         let provider = request
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
@@ -1665,7 +1644,7 @@ async fn latest_readiness_receipt(
             receipt
                 .desired
                 .as_ref()
-                .is_some_and(|desired| desired.sandbox_name == sandbox_name)
+                .is_some_and(|desired| desired.sandbox == sandbox_name)
         })
         .max_by_key(|receipt| {
             receipt
@@ -1993,11 +1972,7 @@ async fn provider_readiness_mutations_reject_unbound_receipts_before_output_or_p
             receipt.kind = ProviderMutationKind::Observe.into();
         }),
         ("sandbox_name", |receipt| {
-            receipt
-                .desired
-                .as_mut()
-                .expect("desired identity")
-                .sandbox_name = "other".to_string();
+            receipt.desired.as_mut().expect("desired identity").sandbox = "other".to_string();
         }),
         ("sandbox_id", |receipt| {
             receipt
@@ -2380,7 +2355,7 @@ async fn assert_later_readiness_targets_are_polled(
     let requests = server.state.readiness_requests.lock().await;
     for (index, target) in targets.iter().enumerate() {
         let sandbox = format!("sandbox-{index:02}");
-        assert_eq!(target["receipt"]["desired"]["sandbox_name"], sandbox);
+        assert_eq!(target["receipt"]["desired"]["sandbox"], sandbox);
         if index < blocked_targets {
             assert_eq!(target["wait_outcome"], "timed_out");
             assert_eq!(target["state"], expected_state);
@@ -2389,7 +2364,7 @@ async fn assert_later_readiness_targets_are_polled(
         }
         let target_requests = requests
             .iter()
-            .filter(|request| request.sandbox_name == sandbox)
+            .filter(|request| request.sandbox == sandbox)
             .collect::<Vec<_>>();
         assert!(!target_requests.is_empty(), "{sandbox} was never queried");
         if index >= blocked_targets {
@@ -2407,10 +2382,7 @@ async fn assert_later_readiness_targets_are_polled(
                     .expect("receipt ID")
             );
             assert_eq!(request.provider_name, READINESS_PROVIDER);
-            assert_eq!(
-                selected_workspace(&request.workspace_scope),
-                Some("default")
-            );
+            assert_eq!(request.workspace, "default");
         }
     }
 }
@@ -2492,12 +2464,12 @@ async fn assert_slow_readiness_targets_complete(target_count: usize, delay: Dura
     let requests = server.state.readiness_requests.lock().await;
     for (index, target) in targets.iter().enumerate() {
         let sandbox = format!("slow-sandbox-{index:02}");
-        assert_eq!(target["receipt"]["desired"]["sandbox_name"], sandbox);
+        assert_eq!(target["receipt"]["desired"]["sandbox"], sandbox);
         assert_eq!(target["wait_outcome"], "complete");
         assert_eq!(
             requests
                 .iter()
-                .filter(|request| request.sandbox_name == sandbox)
+                .filter(|request| request.sandbox == sandbox)
                 .count(),
             1,
             "a healthy response must not be discarded and retried"
@@ -2559,7 +2531,7 @@ async fn provider_readiness_attach_wait_observes_pending_then_ready() {
     assert!(
         requests
             .iter()
-            .all(|request| selected_workspace(&request.workspace_scope) == Some("default"))
+            .all(|request| request.workspace == "default")
     );
 }
 
@@ -3067,7 +3039,7 @@ async fn provider_readiness_detach_wait_requires_revoked() {
     assert!(
         requests
             .iter()
-            .all(|request| selected_workspace(&request.workspace_scope) == Some("default"))
+            .all(|request| request.workspace == "default")
     );
 }
 
@@ -3132,9 +3104,7 @@ async fn provider_readiness_update_reports_every_target_failure() {
         .iter()
         .map(|target| {
             (
-                target["receipt"]["desired"]["sandbox_name"]
-                    .as_str()
-                    .unwrap(),
+                target["receipt"]["desired"]["sandbox"].as_str().unwrap(),
                 target,
             )
         })
@@ -3162,7 +3132,7 @@ async fn provider_readiness_update_reports_every_target_failure() {
     assert!(
         requests
             .iter()
-            .all(|request| selected_workspace(&request.workspace_scope) == Some("default"))
+            .all(|request| request.workspace == "default")
     );
 }
 
@@ -4884,7 +4854,7 @@ async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
     let response = client
         .get_provider(GetProviderRequest {
             name: "my-nvidia".to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            workspace: "default".to_string(),
         })
         .await
         .expect("get provider should succeed")

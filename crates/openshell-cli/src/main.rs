@@ -644,7 +644,7 @@ enum Commands {
     /// Two mutually exclusive modes:
     ///
     /// **Token mode** (used internally by `sandbox connect`):
-    ///   `openshell ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
+    ///   `openshell ssh-proxy --gateway <url> --sandbox <name> --token <token>`
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
     ///   `openshell ssh-proxy --gateway <name> --name <sandbox-name>`
@@ -655,9 +655,9 @@ enum Commands {
         #[arg(long, short = 'g')]
         gateway: Option<String>,
 
-        /// Sandbox id. Required in token mode.
+        /// Sandbox name. Required in token mode.
         #[arg(long)]
-        sandbox_id: Option<String>,
+        sandbox: Option<String>,
 
         /// SSH session token. Required in token mode.
         #[arg(long)]
@@ -2208,7 +2208,7 @@ enum ServiceCommands {
         page_token: String,
 
         /// List services across all workspaces (overrides --workspace).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "sandbox")]
         all_workspaces: bool,
 
         /// Output format.
@@ -2571,19 +2571,21 @@ async fn run_async() -> Result<()> {
             command: Some(fwd_cmd),
         }) => match fwd_cmd {
             ForwardCommands::Stop { port, name } => {
-                let name = match name {
-                    Some(n) => n,
+                let (workspace, name) = match name {
+                    Some(n) => (cli.workspace.clone(), n),
                     None => {
-                        if let Some(n) = run::find_forward_by_port(port)? {
-                            eprintln!("→ Found forward on sandbox '{n}'");
-                            n
+                        if let Some((workspace, name)) = run::find_forward_by_port(port)? {
+                            eprintln!(
+                                "→ Found forward on sandbox '{name}' in workspace '{workspace}'"
+                            );
+                            (workspace, name)
                         } else {
                             eprintln!("{} No active forward found for port {port}", "!".yellow());
                             return Ok(());
                         }
                     }
                 };
-                if run::stop_forward(&name, port)? {
+                if run::stop_forward(&workspace, &name, port)? {
                     eprintln!(
                         "{} Stopped forward of port {port} for sandbox {name}",
                         "✓".green().bold(),
@@ -2602,6 +2604,7 @@ async fn run_async() -> Result<()> {
                     &forwards,
                     |forward| {
                         serde_json::json!({
+                            "workspace": forward.workspace,
                             "sandbox": forward.sandbox_name,
                             "bind_address": forward.bind_addr,
                             "port": forward.port,
@@ -2615,6 +2618,12 @@ async fn run_async() -> Result<()> {
                 if forwards.is_empty() {
                     eprintln!("No active forwards.");
                 } else {
+                    let workspace_width = forwards
+                        .iter()
+                        .map(|f| f.workspace.len())
+                        .max()
+                        .unwrap_or(9)
+                        .max(9);
                     let name_width = forwards
                         .iter()
                         .map(|f| f.sandbox_name.len())
@@ -2628,11 +2637,13 @@ async fn run_async() -> Result<()> {
                         .unwrap_or(4)
                         .max(4);
                     println!(
-                        "{:<nw$} {:<bw$} {:<8} {:<10} STATUS",
+                        "{:<ww$} {:<nw$} {:<bw$} {:<8} {:<10} STATUS",
+                        "WORKSPACE",
                         "SANDBOX",
                         "BIND",
                         "PORT",
                         "PID",
+                        ww = workspace_width,
                         nw = name_width,
                         bw = bind_width,
                     );
@@ -2643,12 +2654,14 @@ async fn run_async() -> Result<()> {
                             "dead".red().to_string()
                         };
                         println!(
-                            "{:<nw$} {:<bw$} {:<8} {:<10} {}",
+                            "{:<ww$} {:<nw$} {:<bw$} {:<8} {:<10} {}",
+                            f.workspace,
                             f.sandbox_name,
                             f.bind_addr,
                             f.port,
                             f.pid,
                             status,
+                            ww = workspace_width,
                             nw = name_width,
                             bw = bind_width,
                         );
@@ -3885,15 +3898,15 @@ async fn run_async() -> Result<()> {
         }
         Some(Commands::SshProxy {
             gateway,
-            sandbox_id,
+            sandbox,
             token,
             server,
             gateway_name,
             name,
         }) => {
-            match (gateway, sandbox_id, token, server, gateway_name, name) {
+            match (gateway, sandbox, token, server, gateway_name, name) {
                 // Token mode (existing behavior): pre-created session credentials.
-                (Some(gw), Some(sid), Some(tok), _, gateway_name_opt, _) => {
+                (Some(gw), Some(sandbox), Some(tok), _, gateway_name_opt, _) => {
                     let mut effective_tls = match gateway_name_opt {
                         Some(ref g) => tls.with_gateway_name(g),
                         None => tls,
@@ -3901,7 +3914,8 @@ async fn run_async() -> Result<()> {
                     if let Some(ref g) = gateway_name_opt {
                         apply_auth(&mut effective_tls, g)?;
                     }
-                    run::sandbox_ssh_proxy(&gw, &sid, &tok, &effective_tls).await?;
+                    run::sandbox_ssh_proxy(&gw, &sandbox, &cli.workspace, &tok, &effective_tls)
+                        .await?;
                 }
                 // Name mode with --gateway-name: resolve endpoint from metadata.
                 (_, _, _, server_override, Some(g), Some(n)) => {
@@ -3927,7 +3941,7 @@ async fn run_async() -> Result<()> {
                 }
                 _ => {
                     return Err(miette::miette!(
-                        "provide either --gateway/--sandbox-id/--token or --gateway-name/--name (or --server/--name)"
+                        "provide either --gateway/--sandbox/--token or --gateway-name/--name (or --server/--name)"
                     ));
                 }
             }
@@ -4733,19 +4747,22 @@ mod tests {
             "ssh-proxy",
             "--gateway",
             "https://gw.example.com:8080/proxy/connect",
-            "--sandbox-id",
-            "sbx-123",
+            "--sandbox",
+            "my-box",
+            "--workspace",
+            "team-a",
             "--token",
             "tok-abc",
             "--gateway-name",
             "my-gateway",
         ])
         .expect("TUI proxy command flags must be accepted by the CLI");
+        assert_eq!(cli.workspace, "team-a");
 
         match cli.command {
             Some(Commands::SshProxy {
                 gateway,
-                sandbox_id,
+                sandbox,
                 token,
                 gateway_name,
                 ..
@@ -4755,7 +4772,7 @@ mod tests {
                     Some("https://gw.example.com:8080/proxy/connect"),
                     "gateway URL must land in SshProxy.gateway, not the global flag"
                 );
-                assert_eq!(sandbox_id.as_deref(), Some("sbx-123"));
+                assert_eq!(sandbox.as_deref(), Some("my-box"));
                 assert_eq!(token.as_deref(), Some("tok-abc"));
                 assert_eq!(gateway_name.as_deref(), Some("my-gateway"));
             }
@@ -6345,6 +6362,19 @@ mod tests {
             }
             other => panic!("expected service list command, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn service_list_rejects_sandbox_with_all_workspaces() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "service",
+            "list",
+            "my-sandbox",
+            "--all-workspaces",
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]

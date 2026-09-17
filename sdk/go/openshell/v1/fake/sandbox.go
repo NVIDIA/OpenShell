@@ -314,8 +314,7 @@ func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, sp
 		ResourceVersion: 1,
 		Spec:            copySandboxSpec(*spec),
 		Status: types.SandboxStatus{
-			SandboxName: name,
-			Phase:       types.SandboxProvisioning,
+			Phase: types.SandboxProvisioning,
 		},
 	}
 
@@ -375,8 +374,7 @@ func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, nam
 			ResourceVersion: fmt.Sprint(template.ResourceVersion),
 		},
 		Status: types.SandboxStatus{
-			SandboxName: name,
-			Phase:       types.SandboxProvisioning,
+			Phase: types.SandboxProvisioning,
 		},
 	}
 

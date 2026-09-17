@@ -10,7 +10,7 @@ use super::{
     deterministic_policy_hash, load_global_settings, policy_static_credential_endpoint_bindings,
 };
 use crate::ServerState;
-use crate::persistence::{ObjectId, ObjectName, ObjectWorkspace};
+use crate::persistence::{ObjectId, ObjectWorkspace};
 use crate::policy_store::PolicyStoreExt;
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 use crate::supervisor_session::EndpointReportCursor;
@@ -709,14 +709,7 @@ pub(super) fn reconcile_endpoint_statuses(
 ) {
     let phase = sandbox.phase();
     let current_policy_version = sandbox.current_policy_version();
-    let sandbox_name = if sandbox.object_name().is_empty() {
-        sandbox.object_id()
-    } else {
-        sandbox.object_name()
-    }
-    .to_string();
     let status = sandbox.status.get_or_insert_with(|| SandboxStatus {
-        sandbox_name,
         phase,
         current_policy_version,
         ..Default::default()

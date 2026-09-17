@@ -21,12 +21,12 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
     sandbox_client: SandboxClient,
 ) -> None:
     name = f"replay-{uuid.uuid4().hex[:8]}"
-    scope = datamodel_pb2.WorkspaceSelector(workspace="default")
+    scope = "default"
     stub = sandbox_client._stub
     create = openshell_pb2.CreateSandboxRequest(
         name=name,
         spec=openshell_pb2.SandboxSpec(),
-        workspace_scope=scope,
+        workspace=scope,
         request_id=str(uuid.uuid4()),
     )
 
@@ -41,7 +41,7 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
         assert replay(stub.CreateSandbox, create).sandbox.metadata.id == original
         stop = openshell_pb2.StopSandboxRequest(
             name=name,
-            workspace_scope=scope,
+            workspace=scope,
             request_id=str(uuid.uuid4()),
         )
         stub.StopSandbox(stop, timeout=60)
@@ -49,7 +49,7 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
         assert replay(stub.StopSandbox, stop).sandbox.metadata.id == original
         start = openshell_pb2.StartSandboxRequest(
             name=name,
-            workspace_scope=scope,
+            workspace=scope,
             request_id=str(uuid.uuid4()),
         )
         stub.StartSandbox(start, timeout=60)
@@ -57,7 +57,7 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
         assert replay(stub.StartSandbox, start).sandbox.metadata.id == original
         update = openshell_pb2.UpdateConfigRequest(
             name=name,
-            workspace_scope=scope,
+            workspace=scope,
             setting_key="ocsf_json_enabled",
             setting_value=sandbox_pb2.SettingValue(bool_value=True),
             request_id=str(uuid.uuid4()),
@@ -66,7 +66,7 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
         assert replay(stub.UpdateConfig, update) == updated
         delete = openshell_pb2.DeleteSandboxRequest(
             name=name,
-            workspace_scope=scope,
+            workspace=scope,
             request_id=str(uuid.uuid4()),
         )
         deleted = stub.DeleteSandbox(delete, timeout=60)
@@ -139,10 +139,11 @@ def test_sandbox_interactive_exec_honors_tty(
     stdout_sentinel = b"stdout-sentinel"
     stderr_sentinel = b"stderr-sentinel"
 
-    def exec_interactive(sandbox_id: str, *, tty: bool) -> tuple[bytes, bytes]:
+    def exec_interactive(sandbox_name: str, *, tty: bool) -> tuple[bytes, bytes]:
         request = openshell_pb2.ExecSandboxInput(
             start=openshell_pb2.ExecSandboxRequest(
-                sandbox_id=sandbox_id,
+                sandbox=sandbox_name,
+                workspace="default",
                 command=[
                     "/bin/sh",
                     "-c",
@@ -186,7 +187,7 @@ def test_sandbox_interactive_exec_honors_tty(
         return b"".join(stdout), b"".join(stderr)
 
     with sandbox(delete_on_exit=True) as sb:
-        stdout, stderr = exec_interactive(sb.id, tty=False)
+        stdout, stderr = exec_interactive(sb.sandbox.name, tty=False)
         assert b"NNN" in stdout
         assert b"stdin:" + stdin_sentinel in stdout
         assert stdout_sentinel in stdout
@@ -194,7 +195,7 @@ def test_sandbox_interactive_exec_honors_tty(
         assert stderr_sentinel in stderr
         assert stderr_sentinel not in stdout
 
-        stdout, stderr = exec_interactive(sb.id, tty=True)
+        stdout, stderr = exec_interactive(sb.sandbox.name, tty=True)
         assert b"TTT" in stdout + stderr
 
 

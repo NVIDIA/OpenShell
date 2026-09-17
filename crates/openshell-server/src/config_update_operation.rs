@@ -432,7 +432,7 @@ mod tests {
             kind: ProviderMutationKind::Update.into(),
             desired: Some(ProviderDesiredIdentity {
                 sandbox_id: Uuid::new_v4().to_string(),
-                sandbox_name: "sandbox".to_string(),
+                sandbox: "sandbox".to_string(),
                 attachment_epoch: Uuid::new_v4().to_string(),
                 provider_id: Uuid::new_v4().to_string(),
                 provider_resource_version: 3,

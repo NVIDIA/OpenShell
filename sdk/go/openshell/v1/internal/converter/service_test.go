@@ -20,7 +20,7 @@ func TestServiceEndpointFromProto(t *testing.T) {
 				Id: "svc-1",
 			},
 			SandboxId:   "sb-1",
-			SandboxName: "my-sandbox",
+			Sandbox:     "my-sandbox",
 			ServiceName: "http-server",
 			TargetPort:  8080,
 			Domain:      true,
@@ -33,7 +33,7 @@ func TestServiceEndpointFromProto(t *testing.T) {
 	require.NotNil(t, se)
 	assert.Equal(t, "svc-1", se.ID)
 	assert.Equal(t, "sb-1", se.SandboxID)
-	assert.Equal(t, "my-sandbox", se.SandboxName)
+	assert.Equal(t, "my-sandbox", se.Sandbox)
 	assert.Equal(t, "http-server", se.ServiceName)
 	assert.Equal(t, uint32(8080), se.TargetPort)
 	assert.True(t, se.Domain)
@@ -80,7 +80,7 @@ func TestServiceEndpointToProto(t *testing.T) {
 	se := &v1.ServiceEndpoint{
 		ID:          "svc-1",
 		SandboxID:   "sb-1",
-		SandboxName: "my-sandbox",
+		Sandbox:     "my-sandbox",
 		ServiceName: "http-server",
 		TargetPort:  8080,
 		Domain:      true,
@@ -94,7 +94,7 @@ func TestServiceEndpointToProto(t *testing.T) {
 	require.NotNil(t, resp.Endpoint.Metadata)
 	assert.Equal(t, "svc-1", resp.Endpoint.Metadata.Id)
 	assert.Equal(t, "sb-1", resp.Endpoint.SandboxId)
-	assert.Equal(t, "my-sandbox", resp.Endpoint.SandboxName)
+	assert.Equal(t, "my-sandbox", resp.Endpoint.Sandbox)
 	assert.Equal(t, "http-server", resp.Endpoint.ServiceName)
 	assert.Equal(t, uint32(8080), resp.Endpoint.TargetPort)
 	assert.True(t, resp.Endpoint.Domain)
@@ -110,7 +110,7 @@ func TestServiceEndpointRoundTrip(t *testing.T) {
 	original := &v1.ServiceEndpoint{
 		ID:          "svc-rt",
 		SandboxID:   "sb-rt",
-		SandboxName: "round-trip",
+		Sandbox:     "round-trip",
 		ServiceName: "web",
 		TargetPort:  9090,
 		Domain:      false,
@@ -123,7 +123,7 @@ func TestServiceEndpointRoundTrip(t *testing.T) {
 	require.NotNil(t, back)
 	assert.Equal(t, original.ID, back.ID)
 	assert.Equal(t, original.SandboxID, back.SandboxID)
-	assert.Equal(t, original.SandboxName, back.SandboxName)
+	assert.Equal(t, original.Sandbox, back.Sandbox)
 	assert.Equal(t, original.ServiceName, back.ServiceName)
 	assert.Equal(t, original.TargetPort, back.TargetPort)
 	assert.Equal(t, original.Domain, back.Domain)

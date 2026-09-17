@@ -100,17 +100,11 @@ fn validate_status_for_request(
     if (expected.receipt_id.is_empty() && expected.provider_name.is_empty())
         || (!expected.receipt_id.is_empty() && receipt.receipt_id != expected.receipt_id)
         || (!expected.provider_name.is_empty() && receipt.provider_name != expected.provider_name)
-        || expected.workspace_scope.as_ref().is_some_and(|scope| {
-            !matches!(
-                scope.selection.as_ref(),
-                Some(openshell_core::proto::workspace_selector::Selection::Workspace(workspace))
-                    if workspace == &receipt.workspace
-            )
-        })
+        || (!expected.workspace.is_empty() && expected.workspace != receipt.workspace)
         || receipt
             .desired
             .as_ref()
-            .is_none_or(|desired| desired.sandbox_name != expected.sandbox_name)
+            .is_none_or(|desired| desired.sandbox != expected.sandbox)
     {
         return Err(ProviderReadinessError::InvalidStatus);
     }
@@ -296,7 +290,7 @@ pub fn validate_provider_receipt(
     if receipt.receipt_id.is_empty()
         || receipt.mutation_id.is_empty()
         || desired.sandbox_id.is_empty()
-        || desired.sandbox_name.is_empty()
+        || desired.sandbox.is_empty()
         || receipt.provider_name.is_empty()
         || receipt.workspace.is_empty()
         || matches!(
@@ -319,12 +313,10 @@ fn request_for_receipt(
         .as_ref()
         .ok_or(ProviderReadinessError::InvalidReceipt)?;
     Ok(GetSandboxProviderStatusRequest {
-        sandbox_name: desired.sandbox_name.clone(),
+        sandbox: desired.sandbox.clone(),
         provider_name: receipt.provider_name.clone(),
         receipt_id: receipt.receipt_id.clone(),
-        workspace_scope: Some(openshell_core::proto::workspace_selector(
-            &receipt.workspace,
-        )),
+        workspace: receipt.workspace.clone(),
     })
 }
 
@@ -485,7 +477,7 @@ mod tests {
             kind: kind.into(),
             desired: Some(ProviderDesiredIdentity {
                 sandbox_id: "sandbox-id".into(),
-                sandbox_name: "sandbox".into(),
+                sandbox: "sandbox".into(),
                 provider_id: if kind == ProviderMutationKind::Detach {
                     String::new()
                 } else {
@@ -590,9 +582,9 @@ mod tests {
         let receipt = receipt(ProviderMutationKind::Attach);
         let status = completed_status(&receipt, ProviderReadinessState::Ready);
         let mut request = GetSandboxProviderStatusRequest {
-            sandbox_name: "sandbox".into(),
+            sandbox: "sandbox".into(),
             receipt_id: receipt.receipt_id.clone(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            workspace: "default".into(),
             ..Default::default()
         };
         assert!(validate_status_for_request(&status, &request).is_ok());
@@ -609,9 +601,9 @@ mod tests {
         let receipt = receipt(ProviderMutationKind::Attach);
         let status = completed_status(&receipt, ProviderReadinessState::Ready);
         let request = GetSandboxProviderStatusRequest {
-            sandbox_name: "sandbox".into(),
+            sandbox: "sandbox".into(),
             receipt_id: receipt.receipt_id,
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            workspace: "default".into(),
             ..Default::default()
         };
         for invalid in [
@@ -628,11 +620,11 @@ mod tests {
                 ..request.clone()
             },
             GetSandboxProviderStatusRequest {
-                sandbox_name: "other-sandbox".into(),
+                sandbox: "other-sandbox".into(),
                 ..request.clone()
             },
             GetSandboxProviderStatusRequest {
-                workspace_scope: Some(openshell_core::proto::workspace_selector("other-workspace")),
+                workspace: "other-workspace".into(),
                 ..request
             },
         ] {

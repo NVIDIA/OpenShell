@@ -665,9 +665,9 @@ validated process state:
 openshell forward list --output json
 ```
 
-Each record includes `sandbox`, `bind_address`, `port`, `pid`, and `alive`.
-The `alive` boolean validates the tracked process identity; it does not probe
-the forwarded socket.
+Each record includes `workspace`, `sandbox`, `bind_address`, `port`, `pid`, and
+`alive`. The `alive` boolean validates the workspace-scoped sandbox and tracked
+process identity; it does not probe the forwarded socket.
 
 Create and forward in one command:
 
@@ -829,6 +829,9 @@ openshell service list my-app --output json
 openshell service get my-app web
 openshell service delete my-app web
 ```
+
+Use `openshell service list --all-workspaces` for a Platform Admin view across
+workspaces. A sandbox name and `--all-workspaces` are mutually exclusive.
 
 Prefer loopback binds unless the user explicitly needs LAN-visible local access.
 

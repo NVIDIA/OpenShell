@@ -350,10 +350,10 @@ message NetworkBinary {
   reserved "harness";
 }
 
-// Request to get sandbox settings by sandbox ID.
+// Request to get sandbox settings by sandbox name.
 message GetSandboxConfigRequest {
-  // The sandbox ID.
-  string sandbox_id = 1;
+  string sandbox = 1;
+  string workspace = 3;
 }
 
 // Request to get gateway-global settings.

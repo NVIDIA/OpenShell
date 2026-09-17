@@ -93,7 +93,7 @@ pub async fn handle_issue_sandbox_token(
         Status::unavailable("sandbox JWT minting is not configured on this gateway")
     })?;
 
-    ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
+    let _ = ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
 
     let minted = issuer.mint(&sandbox.sandbox_id)?;
     info!(
@@ -197,6 +197,7 @@ pub async fn handle_refresh_sandbox_token(
     };
     let authentication =
         session_authority.mint_persisted_launch(&sandbox.sandbox_id, &successor)?;
+    let sandbox_record = ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
     let extension_credentials = if requested_extension_services.is_empty() {
         Vec::new()
     } else if !state
@@ -216,7 +217,11 @@ pub async fn handle_refresh_sandbox_token(
         ));
     } else {
         let mut config_request = Request::new(GetSandboxConfigRequest {
-            sandbox_id: sandbox.sandbox_id.clone(),
+            sandbox: sandbox_record
+                .metadata
+                .as_ref()
+                .map_or_else(String::new, |metadata| metadata.name.clone()),
+            workspace: String::new(),
         });
         config_request
             .extensions_mut()
@@ -373,7 +378,10 @@ fn mint_extension_credentials(
         .collect()
 }
 
-async fn ensure_sandbox_exists(state: &Arc<ServerState>, sandbox_id: &str) -> Result<(), Status> {
+async fn ensure_sandbox_exists(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+) -> Result<Sandbox, Status> {
     if sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
@@ -383,9 +391,7 @@ async fn ensure_sandbox_exists(state: &Arc<ServerState>, sandbox_id: &str) -> Re
         .get_message::<Sandbox>(sandbox_id)
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
-
-    Ok(())
+        .ok_or_else(|| Status::not_found("sandbox not found"))
 }
 
 #[cfg(test)]
