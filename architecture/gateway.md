@@ -672,8 +672,9 @@ and `page_token` fields, and responses carry `next_page_token`. The gateway
 clamps page sizes to 1,000 and returns opaque base64url continuation tokens.
 Tokens bind the RPC and every request parameter except `page_size`, contain no
 authorization grant, and use immutable keyset cursors. Each page repeats normal
-authentication and authorization. Pagination is weakly consistent under
-concurrent writes and deletes; it does not provide a historical snapshot.
+authentication and authorization. Pagination is resumable and keyset-based; it
+does not provide a historical snapshot while the collection is mutated
+concurrently.
 
 Object-backed lists (`ListSandboxTemplates`, `ListSandboxes`, `ListServices`,
 `ListProviders`, `ListWorkspaces`, and `ListWorkspaceMembers`) sort ascending
