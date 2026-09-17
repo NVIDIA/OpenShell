@@ -585,6 +585,25 @@ fn stage_tls_ca_files(
     Ok(Some((staged_ca, staged_bundle)))
 }
 
+/// Resolve the CA paths to hand the sandboxed agent for TLS trust.
+///
+/// A curated `ProcessContainer` cannot read the host proxy's private temp
+/// folder, regardless of env tier -- stage only the public CA material
+/// beneath `share_dir`, whose `AppContainer` DACL is already granted by the
+/// policy, so HTTPS clients can authenticate the `OpenShell` inspection proxy
+/// without broadening filesystem access. Staging must happen whenever a
+/// host proxy CA exists at all, independent of `pc_minimal_env`.
+fn resolve_agent_proxy_ca_paths(
+    host_proxy_ca_paths: Option<&(PathBuf, PathBuf)>,
+    share_dir: &str,
+    sandbox_id: &str,
+) -> std::io::Result<Option<(PathBuf, PathBuf)>> {
+    if host_proxy_ca_paths.is_none() {
+        return Ok(None);
+    }
+    stage_tls_ca_files(host_proxy_ca_paths, share_dir, sandbox_id)
+}
+
 /// PROTOTYPE (2026-09-10): env-var-based governed egress, as an alternative
 /// to MXC's own `network.proxy`/`runtimeConfig.networkProxy` transparent
 /// redirect (both confirmed broken for this driver's use case -- see
@@ -1500,31 +1519,23 @@ async fn run_lifecycle(
     let host_proxy_ca_paths = host_proxy
         .as_ref()
         .and_then(openshell_supervisor_network::host::HostProxyHandle::ca_file_paths);
-    // A curated ProcessContainer cannot read the host's private temp folder.
-    // Stage only the public CA material beneath the per-sandbox working directory,
-    // DACL is already granted by the policy, so HTTPS clients can authenticate
-    // the OpenShell inspection proxy without broadening filesystem access.
-    let agent_proxy_ca_paths = if config.pc_minimal_env && host_proxy_ca_paths.is_some() {
-        match stage_tls_ca_files(
-            host_proxy_ca_paths.as_ref(),
-            &sandbox_config.cwd,
-            &sandbox_id,
-        ) {
-            Ok(paths) => paths,
-            Err(error) => {
-                set_failed(
-                    &registry,
-                    &watch_tx,
-                    &sandbox,
-                    &sandbox_id,
-                    &format!("failed to stage MXC egress proxy CA files: {error}"),
-                )
-                .await;
-                return;
-            }
+    let agent_proxy_ca_paths = match resolve_agent_proxy_ca_paths(
+        host_proxy_ca_paths.as_ref(),
+        &sandbox_config.cwd,
+        &sandbox_id,
+    ) {
+        Ok(paths) => paths,
+        Err(error) => {
+            set_failed(
+                &registry,
+                &watch_tx,
+                &sandbox,
+                &sandbox_id,
+                &format!("failed to stage MXC egress proxy CA files: {error}"),
+            )
+            .await;
+            return;
         }
-    } else {
-        host_proxy_ca_paths.clone()
     };
     if let Some(addr) = proxy_addr {
         {
@@ -2874,6 +2885,49 @@ mod lifecycle_tests {
         }
         assert_eq!(std::fs::read_dir(share.path()).unwrap().count(), 0);
         assert_eq!(stage_tls_ca_files(None, "", "").unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_agent_proxy_ca_paths_stages_regardless_of_env_tier() {
+        // Regression test for the bug where CA staging was gated behind
+        // `config.pc_minimal_env`, so the default env tier (`pc_minimal_env
+        // == false`) left the agent pointed at the host proxy's private,
+        // AppContainer-unreadable temp directory instead of a staged copy.
+        // `resolve_agent_proxy_ca_paths` takes no env-tier argument at all,
+        // so this can't regress silently.
+        let source = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let ca = source.path().join("source-ca.pem");
+        let bundle = source.path().join("source-bundle.pem");
+        std::fs::write(&ca, b"ca").unwrap();
+        std::fs::write(&bundle, b"bundle").unwrap();
+        let host_proxy_ca_paths = (ca, bundle);
+
+        let resolved = resolve_agent_proxy_ca_paths(
+            Some(&host_proxy_ca_paths),
+            share.path().to_str().expect("UTF-8 test path"),
+            "sandbox-default-env-tier",
+        )
+        .unwrap()
+        .expect("resolved paths");
+
+        assert_eq!(
+            resolved.0.parent().unwrap(),
+            share
+                .path()
+                .join(".openshell-proxy")
+                .join("sandbox-default-env-tier")
+        );
+        assert_ne!(resolved.0, host_proxy_ca_paths.0);
+        assert_ne!(resolved.1, host_proxy_ca_paths.1);
+    }
+
+    #[test]
+    fn resolve_agent_proxy_ca_paths_is_none_without_a_host_proxy() {
+        assert_eq!(
+            resolve_agent_proxy_ca_paths(None, "unused-share", "sandbox-a").unwrap(),
+            None
+        );
     }
 
     #[test]
