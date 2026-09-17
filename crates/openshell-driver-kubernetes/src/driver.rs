@@ -109,7 +109,7 @@ const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_VERSION: &str =
 enum SandboxRuntimeBootstrapPhase {
     Preparing,
     Released,
-    StoppingSupervisor,
+    Releasing,
     RollingBack,
 }
 
@@ -118,7 +118,7 @@ impl SandboxRuntimeBootstrapPhase {
         match self {
             Self::Preparing => "preparing",
             Self::Released => "released",
-            Self::StoppingSupervisor => "stopping-supervisor",
+            Self::Releasing => "releasing",
             Self::RollingBack => "rolling-back",
         }
     }
@@ -127,7 +127,7 @@ impl SandboxRuntimeBootstrapPhase {
         match value {
             "preparing" => Some(Self::Preparing),
             "released" => Some(Self::Released),
-            "stopping-supervisor" => Some(Self::StoppingSupervisor),
+            "releasing" => Some(Self::Releasing),
             "rolling-back" => Some(Self::RollingBack),
             _ => None,
         }
@@ -3115,8 +3115,7 @@ impl KubernetesComputeDriver {
         if !matches!(
             phase,
             Some(
-                SandboxRuntimeBootstrapPhase::StoppingSupervisor
-                    | SandboxRuntimeBootstrapPhase::RollingBack
+                SandboxRuntimeBootstrapPhase::Releasing | SandboxRuntimeBootstrapPhase::RollingBack
             )
         ) {
             patch_dynamic_object_with_resource_version_retry(
@@ -3455,10 +3454,11 @@ impl KubernetesComputeDriver {
                 .unwrap_or(&self.config.namespace);
             let cr_name = object.metadata.name.as_deref().unwrap_or_default();
             if sandbox_runtime_bootstrap_phase(&object)
-                == Some(SandboxRuntimeBootstrapPhase::StoppingSupervisor)
+                == Some(SandboxRuntimeBootstrapPhase::Releasing)
             {
-                self.reconcile_sandbox_runtime_stopping_supervisor(
+                self.reconcile_sandbox_runtime_control_release(
                     &lookup_api,
+                    &object,
                     &sandbox_id,
                     namespace,
                     cr_name,
@@ -3654,9 +3654,10 @@ impl KubernetesComputeDriver {
         }
     }
 
-    async fn reconcile_sandbox_runtime_stopping_supervisor(
+    async fn reconcile_sandbox_runtime_control_release(
         &self,
         lookup_api: &AgentSandboxApi,
+        object: &DynamicObject,
         sandbox_id: &str,
         namespace: &str,
         cr_name: &str,
@@ -3665,18 +3666,32 @@ impl KubernetesComputeDriver {
             .delete_sandbox_runtime_supervisor_pod(sandbox_id, namespace)
             .await
         {
-            warn!(sandbox_id, %error, "could not stop sandbox-runtime supervisor; reconciliation will retry");
+            warn!(sandbox_id, %error, "could not release sandbox-runtime control; reconciliation will retry");
             return;
         }
+        let Some(resource_version) = object.metadata.resource_version.as_deref() else {
+            return;
+        };
         let api =
             Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
-        if let Err(error) =
-            patch_dynamic_object_with_resource_version_retry(&api.api, cr_name, |version| {
-                sandbox_runtime_rollback_patch(&lookup_api.resource.version, version)
-            })
-            .await
+        let patch = sandbox_runtime_rollback_patch(&lookup_api.resource.version, resource_version);
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.api
+                .patch(cr_name, &PatchParams::default(), &Patch::Merge(&patch)),
+        )
+        .await
         {
-            debug!(sandbox_id, %error, "sandbox-runtime stop transition raced; reconciliation will retry");
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                debug!(sandbox_id, %error, "sandbox-runtime control release raced; reconciliation will retry");
+            }
+            Err(_) => {
+                warn!(
+                    sandbox_id,
+                    "timed out completing sandbox-runtime control release"
+                );
+            }
         }
     }
 
@@ -6610,7 +6625,7 @@ fn sandbox_runtime_stop_begin_patch(resource_version: &str) -> serde_json::Value
                 ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true",
                 ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: openshell_core::time::now_ms().to_string(),
                 ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "stop",
-                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: SandboxRuntimeBootstrapPhase::StoppingSupervisor.as_str(),
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: SandboxRuntimeBootstrapPhase::Releasing.as_str(),
                 ANNOTATION_SANDBOX_RUNTIME_READINESS: "unavailable",
             },
         },
@@ -7565,7 +7580,7 @@ mod tests {
         );
         assert_eq!(
             stop_begin["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE],
-            SandboxRuntimeBootstrapPhase::StoppingSupervisor.as_str()
+            SandboxRuntimeBootstrapPhase::Releasing.as_str()
         );
         assert!(stop_begin.get("spec").is_none());
 
@@ -7714,12 +7729,95 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_phase_round_trips_stopping_supervisor() {
-        let phase = SandboxRuntimeBootstrapPhase::StoppingSupervisor;
+    fn bootstrap_phase_round_trips_releasing() {
+        let phase = SandboxRuntimeBootstrapPhase::Releasing;
         assert_eq!(
             SandboxRuntimeBootstrapPhase::parse(phase.as_str()),
             Some(phase)
         );
+    }
+
+    #[tokio::test]
+    async fn control_release_reconcile_does_not_retry_a_stale_transition() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox-cr", &resource);
+        sandbox.metadata.namespace = Some("openshell".to_string());
+        sandbox.metadata.resource_version = Some("42".to_string());
+        sandbox.metadata.annotations = Some(BTreeMap::from([
+            (
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION.to_string(),
+                "stop".to_string(),
+            ),
+            (
+                ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE.to_string(),
+                SandboxRuntimeBootstrapPhase::Releasing.as_str().to_string(),
+            ),
+        ]));
+
+        let steps = Arc::new(std::sync::Mutex::new(VecDeque::from([
+            (
+                http::Method::GET,
+                "/api/v1/namespaces/openshell/pods/os-supervisor-sandbox-1",
+                kube_test_not_found("pods", "os-supervisor-sandbox-1"),
+            ),
+            (
+                http::Method::PATCH,
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr",
+                kube_test_response(
+                    http::StatusCode::CONFLICT,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Status",
+                        "status": "Failure",
+                        "message": "the object has been modified",
+                        "reason": "Conflict",
+                        "code": 409
+                    }),
+                ),
+            ),
+        ])));
+        let service_steps = steps.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let steps = service_steps.clone();
+            async move {
+                let (method, path, response) =
+                    steps.lock().unwrap().pop_front().expect(
+                        "stale reconciliation must not retry with a newer resource version",
+                    );
+                assert_eq!(request.method(), method);
+                assert_eq!(request.uri().path(), path);
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        let client = Client::new(service, "openshell");
+        let lookup_api = KubernetesComputeDriver::agent_sandbox_api(
+            client.clone(),
+            SANDBOX_VERSION_V1BETA1,
+            "openshell",
+        );
+        let driver = KubernetesComputeDriver {
+            client: client.clone(),
+            watch_client: client,
+            sandbox_api_version: Arc::new(OnceCell::new()),
+            config: KubernetesComputeConfig::default(),
+            operator_allowlist: None,
+        };
+
+        driver
+            .reconcile_sandbox_runtime_control_release(
+                &lookup_api,
+                &sandbox,
+                "sandbox-1",
+                "openshell",
+                "sandbox-cr",
+            )
+            .await;
+
+        assert!(steps.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -10398,9 +10496,7 @@ mod tests {
 
         sandbox.metadata.annotations.as_mut().unwrap().insert(
             ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE.to_string(),
-            SandboxRuntimeBootstrapPhase::StoppingSupervisor
-                .as_str()
-                .to_string(),
+            SandboxRuntimeBootstrapPhase::Releasing.as_str().to_string(),
         );
         assert!(!sandbox_runtime_bootstrap_is_ready_to_complete(&sandbox));
 

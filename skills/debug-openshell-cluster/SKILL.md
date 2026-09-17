@@ -646,6 +646,26 @@ a required unprivileged seccomp, task-memory, or Landlock operation. Do not add
 capabilities, gateway egress, or credentials to the workload Pod as a
 workaround.
 
+If a Sandbox remains in the `releasing` bootstrap phase, inspect the supervisor
+Pod first. The gateway keeps the workload running during this phase so the
+supervisor can release that sandbox's runtime-control relationship cleanly.
+Check the Pod's deletion timestamp, termination grace period, events, and
+finalizers, and verify that the gateway ServiceAccount can delete Pods in the
+sandbox namespace:
+
+```bash
+kubectl -n <sandbox-namespace> get pod \
+  -l openshell.ai/sandbox-id=<sandbox-id>,openshell.ai/boundary-role=supervisor \
+  -o yaml
+kubectl auth can-i delete pods \
+  --namespace <sandbox-namespace> \
+  --as system:serviceaccount:openshell:openshell
+```
+
+Do not suspend or delete the workload Pod manually. The driver advances to
+`rolling-back` only after runtime control has been released, and then suspends
+the workload.
+
 If a Sandbox remains in the `rolling-back` bootstrap phase, verify that the
 gateway ServiceAccount can create, list, and delete Secrets in the sandbox
 namespace. Recovery lists generation Secrets by sandbox and component labels
