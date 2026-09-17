@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Register OpenShell gateway for tmachine test client
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/openshell
+      - gateway
+      - add
+      - http://127.0.0.1:17670
+      - --local
+      - --name
+      - tmachine

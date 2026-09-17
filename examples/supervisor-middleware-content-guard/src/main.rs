@@ -240,13 +240,13 @@ impl SupervisorMiddleware for ContentGuard {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: PHASE as i32,
                     max_payload_bytes: MAX_PAYLOAD_BYTES,
-                    timeout: String::new(),
+                    request_timeout: None,
                 },
                 MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                     phase: PHASE as i32,
                     max_payload_bytes: MAX_PAYLOAD_BYTES,
-                    timeout: String::new(),
+                    request_timeout: None,
                 },
                 MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::HttpResponse as i32,

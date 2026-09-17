@@ -132,7 +132,7 @@ type EndpointStatus struct {
 	Ports      []uint32
 	Path       string
 	LastResult EndpointResult
-	// LastReportedAt is the RFC 3339 UTC time when the gateway accepted the
+	// LastReportedAt is the RFC 3339 UTC rendering of the time when the gateway accepted the
 	// observation, not the request time. Retained evidence can be accepted after
 	// a reset. NoObservedExchange has no report timestamp.
 	LastReportedAt string

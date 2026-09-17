@@ -30,6 +30,8 @@ jobs:
       run_any_e2e: ${{ steps.labels.outputs.run_any_e2e }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - id: gate
         uses: ./.github/actions/pr-gate
       - id: labels
@@ -90,6 +92,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Compute version
         id: version
@@ -97,56 +100,18 @@ jobs:
           cargo="$(python3 tasks/scripts/release.py get-version --cargo)"
           echo "cargo=$cargo" >> "$GITHUB_OUTPUT"
 
-  build-cli:
+  build-binaries:
     needs: version
     permissions:
       contents: read
-    uses: ./.github/workflows/build-cli-binaries.yml
-    with:
-      cargo-version: ${{ needs.version.outputs.cargo }}
-    secrets: inherit
-
-  build-conformance:
-    needs: [pr_metadata, version]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
-    permissions:
-      contents: read
-    strategy:
-      matrix:
-        include:
-          - triple: x86_64-unknown-linux-musl
-            runner: linux-amd64-cpu8
-          - triple: aarch64-unknown-linux-musl
-            runner: linux-arm64-cpu8
     uses: ./.github/workflows/build-binaries.yml
     with:
-      package: openshell-conformance-cli
-      binary: openshell-conformance
-      artifact-name: openshell-conformance-${{ matrix.triple }}
-      triple: ${{ matrix.triple }}
-      runner: ${{ matrix.runner }}
       cargo-version: ${{ needs.version.outputs.cargo }}
-    secrets: inherit
-
-  build-runtimes:
-    needs: version
-    permissions:
-      contents: read
-    uses: ./.github/workflows/build-runtime-binaries.yml
-    with:
-      cargo-version: ${{ needs.version.outputs.cargo }}
-    secrets: inherit
-
-  build-gateway:
-    needs: version
-    permissions:
-      contents: read
-    uses: ./.github/workflows/build-gateway-binaries.yml
-    with:
-      cargo-version: ${{ needs.version.outputs.cargo }}
-    secrets: inherit
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   build-gateway-plain:
+    name: openshell-gateway driver-free (${{ matrix.triple }})
     needs: [pr_metadata, version]
     if: needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
@@ -158,114 +123,84 @@ jobs:
             runner: linux-amd64-cpu8
           - triple: aarch64-unknown-linux-gnu
             runner: linux-arm64-cpu8
-    uses: ./.github/workflows/build-binaries.yml
-    with:
-      package: openshell-gateway
-      binary: openshell-gateway
-      artifact-name: openshell-gateway-plain-${{ matrix.triple }}
-      triple: ${{ matrix.triple }}
-      runner: ${{ matrix.runner }}
-      cargo-version: ${{ needs.version.outputs.cargo }}
-      extra-cargo-flags: --no-default-features
-    secrets: inherit
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: ./.github/actions/build-rust-binary
+        with:
+          package: openshell-gateway
+          binary: openshell-gateway
+          artifact-name: openshell-gateway-plain-${{ matrix.triple }}
+          triple: ${{ matrix.triple }}
+          cargo-version: ${{ needs.version.outputs.cargo }}
+          extra-cargo-flags: --no-default-features
 
-  build-driver-docker:
+  build-external-drivers:
+    name: ${{ matrix.binary }} (${{ matrix.triple }})
     needs: [pr_metadata, version]
     if: needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       contents: read
-    uses: ./.github/workflows/build-binaries.yml
-    with:
-      package: openshell-driver-docker
-      binary: openshell-driver-docker
-      triple: aarch64-unknown-linux-gnu
-      runner: linux-arm64-cpu8
-      cargo-version: ${{ needs.version.outputs.cargo }}
-    secrets: inherit
-
-  build-driver-podman:
-    needs: [pr_metadata, version]
-    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
-    permissions:
-      contents: read
-    uses: ./.github/workflows/build-binaries.yml
-    with:
-      package: openshell-driver-podman
-      binary: openshell-driver-podman
-      triple: x86_64-unknown-linux-gnu
-      runner: linux-amd64-cpu8
-      cargo-version: ${{ needs.version.outputs.cargo }}
-    secrets: inherit
-
-  build-driver-kubernetes:
-    needs: [pr_metadata, version]
-    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
-    permissions:
-      contents: read
-    uses: ./.github/workflows/build-binaries.yml
-    with:
-      package: openshell-driver-kubernetes
-      binary: openshell-driver-kubernetes
-      triple: x86_64-unknown-linux-gnu
-      runner: linux-amd64-cpu8
-      cargo-version: ${{ needs.version.outputs.cargo }}
-    secrets: inherit
+    strategy:
+      matrix:
+        include:
+          - package: openshell-driver-docker
+            binary: openshell-driver-docker
+            triple: aarch64-unknown-linux-gnu
+            runner: linux-arm64-cpu8
+          - package: openshell-driver-podman
+            binary: openshell-driver-podman
+            triple: x86_64-unknown-linux-gnu
+            runner: linux-amd64-cpu8
+          - package: openshell-driver-kubernetes
+            binary: openshell-driver-kubernetes
+            triple: x86_64-unknown-linux-gnu
+            runner: linux-amd64-cpu8
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: ./.github/actions/build-rust-binary
+        with:
+          package: ${{ matrix.package }}
+          binary: ${{ matrix.binary }}
+          triple: ${{ matrix.triple }}
+          cargo-version: ${{ needs.version.outputs.cargo }}
 
   build-vm-driver:
-    needs: [pr_metadata, version, build-runtimes]
+    needs: [pr_metadata, version, build-binaries]
     if: needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/build-vm-driver.yml
     with:
       cargo-version: ${{ needs.version.outputs.cargo }}
-    secrets: inherit
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-  build-gateway-image:
-    needs: [pr_metadata, build-gateway]
-    if: >-
-      needs.pr_metadata.outputs.should_run == 'true' &&
-      (needs.pr_metadata.outputs.run_core_e2e == 'true' ||
-      needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true' ||
-      needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true')
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: gateway
-      binary: openshell-gateway
-      target-suffix: unknown-linux-gnu
-    secrets: inherit
-
-  build-sandbox-image:
-    needs: [pr_metadata, build-runtimes]
+  build-images:
+    needs: [pr_metadata, build-binaries]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: sandbox
-      binary: openshell-sandbox
-      target-suffix: unknown-linux-musl
-    secrets: inherit
-
-  build-supervisor-image:
-    needs: [pr_metadata, build-runtimes]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: supervisor
-      binary: openshell-supervisor
-      target-suffix: unknown-linux-gnu
-    secrets: inherit
+    uses: ./.github/workflows/build-images.yml
 
   docker-e2e:
-    needs: [pr_metadata, build-cli, build-conformance, build-gateway, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -278,7 +213,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   podman-e2e:
-    needs: [pr_metadata, build-cli, build-conformance, build-gateway, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -290,7 +225,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   vm-e2e:
-    needs: [pr_metadata, build-cli, build-conformance, build-gateway, build-vm-driver]
+    needs: [pr_metadata, build-binaries, build-vm-driver]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -301,7 +236,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   docker-external-driver-e2e:
-    needs: [pr_metadata, build-cli, build-conformance, build-gateway-plain, build-driver-docker, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -318,7 +253,7 @@ jobs:
         [{"suite":"external-driver","cmd":"mise run --no-deps --skip-deps e2e:docker:external-driver","apt_packages":"openssh-client","python_proto":false,"mcp":false}]
 
   podman-external-driver-e2e:
-    needs: [pr_metadata, build-cli, build-conformance, build-gateway-plain, build-driver-podman, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -334,7 +269,7 @@ jobs:
         [{"suite":"external-driver","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:external-driver"}]
 
   vm-external-driver-e2e:
-    needs: [pr_metadata, build-cli, build-conformance, build-gateway-plain, build-vm-driver]
+    needs: [pr_metadata, build-binaries, build-gateway-plain, build-vm-driver]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -348,7 +283,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   gpu-e2e:
-    needs: [pr_metadata, build-cli, build-conformance, build-gateway, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_gpu_e2e == 'true'
     permissions:
       actions: read
@@ -360,7 +295,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-e2e:
-    needs: [pr_metadata, build-cli, build-conformance, build-gateway-image, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     strategy:
       fail-fast: false
@@ -382,7 +317,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-workspace-managed-e2e:
-    needs: [pr_metadata, build-cli, build-conformance, build-gateway-image, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -396,7 +331,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-external-driver-e2e:
-    needs: [pr_metadata, build-cli, build-conformance, build-gateway-plain, build-driver-kubernetes, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -413,7 +348,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-workspace-operator-e2e:
-    needs: [pr_metadata, build-cli, build-conformance, build-gateway-image, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -427,7 +362,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-ha-e2e:
-    needs: [pr_metadata, build-cli, build-conformance, build-gateway-image, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
     permissions:
       actions: read
@@ -442,7 +377,7 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-credential-drivers-e2e:
-    needs: [pr_metadata, build-cli, build-conformance, build-gateway-image, build-sandbox-image, build-supervisor-image]
+    needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
     permissions:
       actions: read

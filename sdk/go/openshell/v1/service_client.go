@@ -85,14 +85,15 @@ func (s *serviceClient) ListAll(ctx context.Context, workspace, sandboxName stri
 	return pager.All(ctx)
 }
 
-func (s *serviceClient) Delete(ctx context.Context, workspace, sandboxName, serviceName string) error {
-	_, err := s.client.DeleteService(ctx, &pb.DeleteServiceRequest{
+func (s *serviceClient) Delete(ctx context.Context, workspace, sandboxName, serviceName string, opts ...DeleteOptions) (*DeletionResult, error) {
+	resp, err := s.client.DeleteService(ctx, &pb.DeleteServiceRequest{
+		AllowMissing:   allowMissing(opts),
 		Sandbox:        sandboxName,
 		Service:        serviceName,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
-		return converter.FromGRPCError(err)
+		return nil, converter.FromGRPCError(err)
 	}
-	return nil
+	return &DeletionResult{Outcome: DeletionOutcome(resp.GetOutcome())}, nil
 }

@@ -59,8 +59,39 @@ write conflicts attach `google.rpc.ErrorInfo` with a stable reason and current
 version when available. `google.rpc.RetryInfo` expresses a minimum retry delay;
 it does not establish that a mutation is safe to repeat. SDKs retain the original
 transport status, metadata, and unknown details alongside decoded fields.
-Python cleanup inspects the original gRPC call beneath a typed error wrapper,
-preserving missing-resource handling without suppressing other failures.
+SDK deletion waits recognize missing-resource status through typed error wrappers
+without suppressing other failures.
+
+Ordinary user-callable unary mutations explicitly opt into durable request
+admission when the client supplies a UUID. Typed adapters
+check current authorization before looking up a caller/method/workspace-scoped
+key. The payload fingerprint excludes that UUID and canonicalizes protobuf maps.
+An atomic, quota-checked insert chooses one executor; owned execution survives
+client cancellation. Success is persisted before acknowledgment. Errors or
+interruption leave permanent unresolved claims, never stealable leases.
+
+Admission rows live outside user workspace namespaces and are bounded per caller.
+Successes expire after 24 hours; cleanup uses the unique admission incarnation
+and version so an old cleaner cannot delete a new attempt. Replay stores only
+resource references and reviewed public scalar/diagnostic receipts, never
+credential-bearing response snapshots. It checks original identities and current
+authorization and never substitutes a same-name resource. Sandbox responses are
+live projections of the original UUID; normal status reconciliation does not
+invalidate replay. Refresh status additionally requires the original grant epoch
+and no deletion timestamp, including a timestamp at the Unix epoch.
+Other resource projections retain exact-version guards. Terminal delete receipts
+do not require the deleted target or parent to remain present.
+
+Sandbox, service, provider/profile, and policy/config adapters use keyed payload
+fingerprints derived from existing gateway JWT or primary TLS private material.
+Replicas must share that material; missing keys or key changes fail closed without
+changing admission identity. Workspace/template adapters retain their original
+format. Intercepted requests carry the original decoded payload only in a private
+in-memory extension. Replay reauthorizes original and current effective scopes,
+requires the same effective payload, and reruns current interceptor validation.
+Interceptors cannot mutate the request UUID. Server-marked replay suppresses
+post-commit observation, which remains best-effort rather than an outbox.
+Credential capabilities and streaming execution require separate contracts.
 
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
 The default local single-user deployment mode is mTLS user authentication:
@@ -362,16 +393,37 @@ Storage-only messages live in the private, versioned
 `openshell.storage.v1` package under `crates/openshell-server/proto`. The server
 generates these types separately, so the public descriptor set and the Rust,
 Go, Python, and TypeScript client generation inputs do not advertise them.
+When a frozen scalar storage field cannot distinguish absence from its zero
+value, gateway-owned object metadata annotations carry that presence bit rather
+than extending the frozen message.
 
 | Storage classification | Protobuf messages | Durable use |
 |---|---|---|
-| Encoded storage roots | `StoredProviderCredentialRefreshState`, `StoredProviderProfile`, `PolicyRevisionPayload`, `DraftChunkPayload` | Complete protobuf payload stored in an object row or a scoped policy row. |
+| Encoded storage roots | `StoredProviderCredentialRefreshStateV2`, `StoredProviderProfile`, `PolicyRevisionPayload`, `DraftChunkPayload` | Complete protobuf payload stored in an object row or a scoped policy row. The frozen V1 refresh state remains available only for transactional upgrade decoding. |
 | Nested storage-only type | `StoredRefreshMaterialDeletion` | Repeated child records inside provider refresh state. |
 | SQL materializations | `StoredPolicyRevision`, `StoredDraftChunk` | Server-only typed results assembled from indexed columns and decoded payloads; not public RPC messages. |
 | Public messages used directly as encoded storage roots | `Sandbox`, `SandboxWorkloadTemplate`, `Provider`, `Workspace`, `WorkspaceMember`, `SshSession`, `ServiceEndpoint` | The generated public type is also the persisted payload. `SshSession` is not in the current public RPC message closure. |
 | Embedded encoded root | `SandboxPolicy` | Stored in policy rows and inside the JSON settings envelope. |
 
 The descriptor-derived test inventories the complete message and enum closure of the encoded durable roots and its intersection with the public RPC closure. The tables here record the reviewed roots and classifications.
+
+Public delete, membership-removal, and SSH-revocation responses use
+`DeletionOutcome`, not a transport-success boolean. `COMPLETED` establishes
+logical gateway deletion or revocation; it does not guarantee that downstream
+platform garbage collection has finished. Sandbox deletion returns `ACCEPTED`
+while its captured object ID remains in the store, and returns that ID so callers
+can distinguish the original sandbox from a same-name replacement. Identity-aware
+SDK deletion waits complete on absence or a different observed ID; name-only waits
+continue until the name is absent. The existing owned deletion worker continues
+after request cancellation.
+
+Missing targets return `NOT_FOUND` unless `allow_missing` explicitly requests
+`ALREADY_ABSENT`. Authorization, parent resolution, preconditions, and backend
+failures remain errors. Already-revoked sessions complete without another write
+after current authorization. The removed response booleans are reserved by name
+and number; this coordinated pre-1.0 API change does not alter durable schemas.
+The outcome alone does not provide request deduplication. Opted-in unary methods
+require a request UUID for the admission contract.
 
 | Dual-purpose encoded root | Current decision |
 |---|---|
@@ -422,6 +474,14 @@ populate `scope`, `version`, `status`, `dedup_key`, and `hit_count` so the
 gateway can efficiently fetch the latest policy, track load status, and manage
 advisor drafts without creating resource-specific tables.
 
+Mutation admission uses a private, version-tagged JSON envelope in the same
+object store. Its identity namespace stays stable across format changes, and an
+unknown format fails closed. It contains explicit typed receipts, not arbitrary
+public response payloads, and is not part of the protobuf storage closure.
+Workspace create/delete admissions include the requested workspace name in the
+key, but omit a workspace UUID guard. Different names have independent request-ID
+namespaces; deletion receipts remain replayable after the target disappears.
+
 Each sandbox policy revision stores the complete provenance annotation map
 supplied with that update. The revision payload is the authoritative immutable
 record; sandbox metadata receives the same annotations only as a convenience
@@ -444,6 +504,19 @@ scope semantics.
 For in-memory SQLite, the adapter retains a dedicated keepalive connection for
 the store lifetime. Operational connection replacement therefore preserves the
 shared in-memory schema and objects instead of creating an empty database.
+
+Public protobuf APIs represent absolute times with `google.protobuf.Timestamp`
+and elapsed time with `google.protobuf.Duration`. The integer
+`created_at_ms` and `updated_at_ms` database columns are intentionally internal
+bookkeeping values, not part of that public convention. On startup, both
+storage backends transactionally rewrite legacy scalar time fields inside
+protobuf payloads before serving requests. A malformed affected payload aborts
+and rolls back startup migration. Legacy driver-provided condition strings that
+cannot be represented as timestamps are dropped so an accepted historical
+value cannot make the upgraded gateway unavailable.
+Gateway and Sandbox Protocol token responses follow the same convention: a
+present expiration timestamp carries the absolute deadline, while absence means
+the issued token does not expire.
 
 The SQLite adapter tightens the on-disk database file to mode `0o600` on every
 connect so that provider API keys, SSH session tokens, and sandbox metadata are

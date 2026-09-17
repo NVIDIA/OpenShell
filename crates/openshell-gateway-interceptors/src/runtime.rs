@@ -755,6 +755,7 @@ mod tests {
 
     fn create_provider_operation(codec: &ProtoJsonCodec) -> ValidatedOperation {
         let request = CreateProviderRequest {
+            request_id: String::new(),
             provider: Some(Provider {
                 r#type: "github".to_string(),
                 credentials: HashMap::from([(
@@ -1009,6 +1010,7 @@ mod tests {
             codec: codec.clone(),
         };
         let request = UpdateConfigRequest {
+            request_id: String::new(),
             name: "demo".to_string(),
             expected_resource_version: u64::MAX - 1,
             annotations: HashMap::from([
@@ -1049,6 +1051,7 @@ mod tests {
         let codec =
             ProtoJsonCodec::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
         let request = CreateSandboxRequest {
+            request_id: String::new(),
             spec: Some(SandboxSpec {
                 template: Some(SandboxTemplate {
                     resources: Some(

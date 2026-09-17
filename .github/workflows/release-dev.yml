@@ -6,8 +6,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+  packages: read
 
 defaults:
   run:
@@ -37,6 +37,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -58,112 +59,58 @@ jobs:
             echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --dev --rpm-release)"
           } >> "$GITHUB_OUTPUT"
 
-  build-cli:
+  build-binaries:
     needs: compute-versions
     permissions:
       contents: read
-    uses: ./.github/workflows/build-cli-binaries.yml
-    with:
-      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-      image-tag: dev
-    secrets: inherit
-
-  build-conformance:
-    needs: compute-versions
-    permissions:
-      contents: read
-    strategy:
-      matrix:
-        include:
-          - triple: x86_64-unknown-linux-musl
-            runner: linux-amd64-cpu8
-          - triple: aarch64-unknown-linux-musl
-            runner: linux-arm64-cpu8
     uses: ./.github/workflows/build-binaries.yml
     with:
-      package: openshell-conformance-cli
-      binary: openshell-conformance
-      artifact-name: openshell-conformance-${{ matrix.triple }}
-      triple: ${{ matrix.triple }}
-      runner: ${{ matrix.runner }}
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-    secrets: inherit
-
-  build-gateway:
-    needs: compute-versions
-    permissions:
-      contents: read
-    uses: ./.github/workflows/build-gateway-binaries.yml
-    with:
-      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-      image-tag: dev
-    secrets: inherit
-
-  build-runtimes:
-    needs: compute-versions
-    permissions:
-      contents: read
-    uses: ./.github/workflows/build-runtime-binaries.yml
-    with:
-      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-      image-tag: dev
-    secrets: inherit
+      supervisor-image-tag: dev
+      checkout-ref: ${{ github.sha }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   build-vm-driver:
-    needs: [compute-versions, build-runtimes]
+    needs: [compute-versions, build-binaries]
     permissions:
       contents: read
     uses: ./.github/workflows/build-vm-driver.yml
     with:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-      image-tag: dev
-    secrets: inherit
+      supervisor-image-tag: dev
+      checkout-ref: ${{ github.sha }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   package-binaries:
-    needs: [build-cli, build-gateway, build-runtimes, build-vm-driver]
+    needs: [build-binaries, build-vm-driver]
     permissions:
       actions: read
       contents: read
     uses: ./.github/workflows/package-release-binaries.yml
 
-  build-gateway-image:
-    needs: build-gateway
+  build-images:
+    needs: build-binaries
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/docker-build.yml
+    uses: ./.github/workflows/build-images.yml
     with:
-      component: gateway
-      binary: openshell-gateway
-      target-suffix: unknown-linux-gnu
-    secrets: inherit
+      checkout-ref: ${{ github.sha }}
 
-  build-sandbox-image:
-    needs: build-runtimes
+  conformance:
+    needs: [build-binaries, build-images]
     permissions:
+      actions: read
       contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
+    uses: ./.github/workflows/conformance.yml
     with:
-      component: sandbox
-      binary: openshell-sandbox
-      target-suffix: unknown-linux-musl
-    secrets: inherit
-
-  build-supervisor-image:
-    needs: build-runtimes
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: supervisor
-      binary: openshell-supervisor
-      target-suffix: unknown-linux-gnu
-    secrets: inherit
+      scenarios: '["ubuntu-docker-rootful", "fedora-podman-rootful", "fedora-podman-rootless"]'
+      testsuites: '["smoke"]'
 
   docker-e2e:
-    needs: [build-cli, build-conformance, build-gateway, build-sandbox-image, build-supervisor-image]
+    needs: [build-binaries, build-images]
     permissions:
       actions: read
       contents: read
@@ -171,11 +118,12 @@ jobs:
     uses: ./.github/workflows/e2e-docker-test.yml
     with:
       image-tag: ${{ github.sha }}
+      checkout-ref: ${{ github.sha }}
       runner: linux-arm64-cpu8
       conformance-artifact-prefix: openshell-conformance
 
   podman-e2e:
-    needs: [build-cli, build-conformance, build-gateway, build-sandbox-image, build-supervisor-image]
+    needs: [build-binaries, build-images]
     permissions:
       actions: read
       contents: read
@@ -183,23 +131,27 @@ jobs:
     uses: ./.github/workflows/e2e-podman-test.yml
     with:
       image-tag: ${{ github.sha }}
+      checkout-ref: ${{ github.sha }}
       conformance-artifact-prefix: openshell-conformance
 
   vm-e2e:
-    needs: [build-cli, build-conformance, build-gateway, build-vm-driver]
+    needs: [build-binaries, build-vm-driver]
     permissions:
       actions: read
       contents: read
       packages: read
     uses: ./.github/workflows/e2e-vm-test.yml
     with:
+      checkout-ref: ${{ github.sha }}
       conformance-artifact-prefix: openshell-conformance
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
-    needs: [build-gateway-image, build-sandbox-image, build-supervisor-image, release-dev]
+    needs: [build-images, release-dev]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
+    permissions:
+      packages: write
     steps:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
@@ -233,6 +185,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -256,16 +210,15 @@ jobs:
 
   build-deb:
     name: Build Debian Packages
-    needs: [compute-versions, build-cli, build-gateway, build-vm-driver]
+    needs: [compute-versions, build-binaries, build-vm-driver]
     uses: ./.github/workflows/deb-package.yml
     with:
       deb-version: ${{ needs.compute-versions.outputs.deb_version }}
       checkout-ref: ${{ github.sha }}
-    secrets: inherit
 
   build-snap:
     name: Build Snap
-    needs: [compute-versions, build-cli, build-gateway, build-runtimes]
+    needs: [compute-versions, build-binaries]
     uses: ./.github/workflows/snap-package.yml
     with:
       checkout-ref: ${{ github.sha }}
@@ -276,150 +229,20 @@ jobs:
 
   build-rpm:
     name: Build RPM Packages
-    needs: [compute-versions, build-cli, build-gateway]
+    needs: [compute-versions, build-binaries]
     uses: ./.github/workflows/rpm-package.yml
     with:
       checkout-ref: ${{ github.sha }}
       rpm-version: ${{ needs.compute-versions.outputs.rpm_version }}
       rpm-release: ${{ needs.compute-versions.outputs.rpm_release }}
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-    secrets: inherit
-
-  smoke-linux-dev-artifacts:
-    name: Smoke Linux Dev Artifacts (${{ matrix.name }})
-    needs: [package-binaries, build-deb, build-rpm, build-python-wheel]
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: ubuntu-20.04-binaries-amd64
-            runner: linux-amd64-cpu8
-            image: ubuntu:20.04
-            kind: binary
-            artifact_arch: amd64
-            target: x86_64-unknown-linux-gnu
-            sandbox_target: x86_64-unknown-linux-musl
-          - name: ubuntu-20.04-binaries-arm64
-            runner: linux-arm64-cpu8
-            image: ubuntu:20.04
-            kind: binary
-            artifact_arch: arm64
-            target: aarch64-unknown-linux-gnu
-            sandbox_target: aarch64-unknown-linux-musl
-          - name: ubuntu-22.04-deb-amd64
-            runner: linux-amd64-cpu8
-            image: ubuntu:22.04
-            kind: deb
-            artifact_arch: amd64
-            rpm_arch: x86_64
-          - name: ubuntu-22.04-deb-arm64
-            runner: linux-arm64-cpu8
-            image: ubuntu:22.04
-            kind: deb
-            artifact_arch: arm64
-            rpm_arch: aarch64
-          - name: fedora-rpm-amd64
-            runner: linux-amd64-cpu8
-            image: fedora:latest
-            kind: rpm
-            artifact_arch: amd64
-            rpm_arch: x86_64
-          - name: fedora-rpm-arm64
-            runner: linux-arm64-cpu8
-            image: fedora:latest
-            kind: rpm
-            artifact_arch: arm64
-            rpm_arch: aarch64
-          - name: python-wheel
-            runner: linux-amd64-cpu8
-            image: python:3.12-slim
-            kind: wheel
-    runs-on: ${{ matrix.runner }}
-    container:
-      image: ${{ matrix.image }}
-    steps:
-      - name: Download sandbox binary artifact
-        if: matrix.kind == 'binary'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: sandbox-binary-linux-${{ matrix.artifact_arch }}
-          path: runtime-input/
-
-      - name: Download supervisor binary artifact
-        if: matrix.kind == 'binary'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: supervisor-binary-linux-${{ matrix.artifact_arch }}
-          path: runtime-input/
-
-      - name: Smoke runtime binary artifacts
-        if: matrix.kind == 'binary'
-        run: |
-          set -euo pipefail
-          mkdir -p runtime-bin
-          tar -xzf "runtime-input/openshell-sandbox-${{ matrix.sandbox_target }}.tar.gz" -C runtime-bin
-          tar -xzf "runtime-input/openshell-supervisor-${{ matrix.target }}.tar.gz" -C runtime-bin
-          runtime-bin/openshell-sandbox --version
-          LD_BIND_NOW=1 runtime-bin/openshell-supervisor --version
-
-      - name: Download Debian package artifact
-        if: matrix.kind == 'deb'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: deb-linux-${{ matrix.artifact_arch }}
-          path: package-input/
-
-      - name: Smoke Debian package on Ubuntu 22.04
-        if: matrix.kind == 'deb'
-        run: |
-          set -euo pipefail
-          apt-get update
-          apt-get install -y --no-install-recommends ./package-input/*.deb
-          LD_BIND_NOW=1 openshell-gateway --version
-          /usr/libexec/openshell/openshell-driver-vm --version
-
-      - name: Download RPM package artifacts
-        if: matrix.kind == 'rpm'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: rpm-linux-${{ matrix.rpm_arch }}
-          path: package-input/
-
-      - name: Smoke RPM packages on Fedora
-        if: matrix.kind == 'rpm'
-        run: |
-          set -euo pipefail
-          dnf install -y ./package-input/openshell-[0-9]*.rpm ./package-input/openshell-gateway-*.rpm
-          LD_BIND_NOW=1 openshell-gateway --version
-
-      - name: Download Python wheel artifact
-        if: matrix.kind == 'wheel'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: python-wheel
-          path: wheel-input/
-
-      - name: Smoke Python wheel
-        if: matrix.kind == 'wheel'
-        run: |
-          set -euo pipefail
-          python -m venv /tmp/openshell-wheel-smoke
-          /tmp/openshell-wheel-smoke/bin/pip install --no-cache-dir wheel-input/*.whl
-          /tmp/openshell-wheel-smoke/bin/python - <<'PY'
-          import importlib
-          for name in ("openshell", "openshell._proto", "openshell.sandbox"):
-              importlib.import_module(name)
-              print(name, "OK")
-          PY
-          test ! -e /tmp/openshell-wheel-smoke/bin/openshell
 
   # ---------------------------------------------------------------------------
   # Create / update the dev GitHub Release with CLI, gateway, driver, and wheels
   # ---------------------------------------------------------------------------
   release-dev:
     name: Release Dev
-    needs: [compute-versions, package-binaries, build-python-wheel, docker-e2e, podman-e2e, vm-e2e, build-deb, build-rpm, build-snap, smoke-linux-dev-artifacts]
+    needs: [compute-versions, package-binaries, build-python-wheel, conformance, docker-e2e, podman-e2e, vm-e2e, build-deb, build-rpm, build-snap]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:
@@ -686,6 +509,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/release-helm-oci
         with:
@@ -708,7 +533,8 @@ jobs:
       display_name: Dev
       availability: beta
       publish: true
-    secrets: inherit
+    secrets:
+      FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
 
   trigger-wheel-publish:
     name: Trigger Wheel Publish

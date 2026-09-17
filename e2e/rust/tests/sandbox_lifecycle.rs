@@ -302,9 +302,15 @@ async fn sandbox_can_be_deleted_while_stopped() {
     );
 
     let delete_output = run_sandbox_lifecycle_command("delete", &sandbox.name).await;
+    // Deletion may return before the owned cleanup worker finishes. Both
+    // outcomes must still reach absence, which is checked below.
     assert!(
-        delete_output.contains("Deleted sandbox"),
-        "expected delete confirmation in:\n{delete_output}",
+        delete_output.contains(&format!("Deleted sandbox {}", sandbox.name))
+            || delete_output.contains(&format!(
+                "Sandbox {} deletion accepted; cleanup is pending",
+                sandbox.name
+            )),
+        "expected completed or accepted deletion in:\n{delete_output}",
     );
 
     if let Err(last_sandbox_list) = assert_sandbox_presence_eventually(&sandbox.name, false).await {
@@ -465,6 +471,77 @@ async fn detached_canonical_main_nonzero_exit_reaches_error() {
     assert!(
         details.contains("Phase: Error") && details.contains("Exit Code: 11"),
         "detached failing main should retain its terminal result:\n{details}"
+    );
+
+    sandbox.cleanup().await;
+}
+
+#[tokio::test]
+async fn canonical_main_and_exec_receive_declared_environment() {
+    for mode in ["--tty", "--no-tty"] {
+        let script = r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}"; while true; do sleep 1; done"#;
+        let mut sandbox = SandboxGuard::create_keep_with_args(
+            &[
+                mode,
+                "--no-auto-providers",
+                "--env",
+                "REPRO_SENTINEL=present",
+            ],
+            &["sh", "-c", script],
+            "declared_env=",
+        )
+        .await
+        .expect("create canonical process with declared environment");
+        let initial = normalize_output(&sandbox.create_output);
+        let later = sandbox
+            .exec(&[
+                "sh",
+                "-c",
+                r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}""#,
+            ])
+            .await;
+        sandbox.cleanup().await;
+
+        assert!(
+            initial.lines().any(|line| line == "declared_env=present"),
+            "initial process must receive declared environment ({mode}): {initial}"
+        );
+        let later = normalize_output(&later.expect("exec environment probe"));
+        assert!(
+            later.lines().any(|line| line == "declared_env=present"),
+            "exec must receive the same declared environment ({mode}): {later}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn detached_main_exit_during_provisioning_is_classified_as_workload_result() {
+    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", "exit 11"])
+        .await
+        .expect("fast detached main exit should not be reported as a provisioning failure");
+
+    wait_for_sandbox_phase(&sandbox.name, "Error", SANDBOX_PRESENCE_TIMEOUT)
+        .await
+        .unwrap_or_else(|err| panic!("fast detached main did not reach Error:\n{err}"));
+
+    let mut get_cmd = openshell_cmd();
+    get_cmd
+        .args(["sandbox", "get", &sandbox.name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let get_output = get_cmd.output().await.expect("spawn openshell sandbox get");
+    let details = normalize_output(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&get_output.stdout),
+        String::from_utf8_lossy(&get_output.stderr),
+    ));
+    assert!(
+        get_output.status.success(),
+        "sandbox get failed:\n{details}"
+    );
+    assert!(
+        details.contains("Phase: Error") && details.contains("Exit Code: 11"),
+        "fast detached main should retain its workload result:\n{details}"
     );
 
     sandbox.cleanup().await;

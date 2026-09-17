@@ -660,10 +660,10 @@ struct MiddlewareServiceState {
 
 impl MiddlewareServiceState {
     fn timeout_for_binding(&self, binding: &MiddlewareBinding) -> Result<Duration> {
-        if binding.timeout.trim().is_empty() {
+        if binding.request_timeout.is_none() {
             Ok(self.operator_timeout)
         } else {
-            parse_middleware_timeout(&binding.timeout)
+            middleware_proto_timeout_or_default(binding.request_timeout.as_ref())
                 .map(|binding_timeout| binding_timeout.min(self.operator_timeout))
                 .map_err(|reason| miette!("middleware binding has invalid timeout: {reason}"))
         }
@@ -796,7 +796,7 @@ fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<D
             registration.name
         ));
     }
-    middleware_timeout_or_default(&registration.timeout).map_err(|reason| {
+    middleware_proto_timeout_or_default(registration.request_timeout.as_ref()).map_err(|reason| {
         miette!(
             "middleware registration '{}' has invalid timeout: {reason}",
             registration.name
@@ -905,8 +905,8 @@ fn validate_manifest_bindings(
             ));
         }
         let advertised = validate_payload_limit(source, binding)?;
-        if !binding.timeout.trim().is_empty() {
-            parse_middleware_timeout(&binding.timeout)
+        if binding.request_timeout.is_some() {
+            middleware_proto_timeout_or_default(binding.request_timeout.as_ref())
                 .map_err(|reason| miette!("{source} has invalid timeout for binding: {reason}"))?;
         }
         if operator_max_payload_bytes.is_some_and(|limit| limit > advertised) {
@@ -922,6 +922,24 @@ fn validate_manifest_bindings(
         }
     }
     Ok(())
+}
+
+fn middleware_proto_timeout_or_default(
+    value: Option<&prost_types::Duration>,
+) -> std::result::Result<Duration, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_MIDDLEWARE_TIMEOUT);
+    };
+    let timeout =
+        openshell_core::time::duration_to_std(value).map_err(|error| error.to_string())?;
+    if !(MIN_MIDDLEWARE_TIMEOUT..=MAX_MIDDLEWARE_TIMEOUT).contains(&timeout) {
+        return Err(format!(
+            "must be between {}ms and {}s",
+            MIN_MIDDLEWARE_TIMEOUT.as_millis(),
+            MAX_MIDDLEWARE_TIMEOUT.as_secs()
+        ));
+    }
+    Ok(timeout)
 }
 
 fn validate_external_manifest(
@@ -1510,7 +1528,7 @@ impl ChainRunner {
                 });
                 continue;
             };
-            let Some(binding) = Self::binding(manifest, operation, phase).cloned() else {
+            let Some(binding) = Self::binding(manifest, operation, phase).copied() else {
                 // The config remains globally ordered, but it does not
                 // participate in this exact operation/phase chain.
                 unbound.push(entry);
@@ -2048,6 +2066,18 @@ mod tests {
 
     use tokio_stream::wrappers::TcpListenerStream;
 
+    fn proto_duration(value: &str) -> prost_types::Duration {
+        let duration = match (value.strip_suffix("ms"), value.strip_suffix('s')) {
+            (Some(milliseconds), _) => {
+                Duration::from_millis(milliseconds.parse().expect("integer milliseconds"))
+            }
+            (_, Some(seconds)) => Duration::from_secs(seconds.parse().expect("integer seconds")),
+            (None, None) => panic!("test duration must use ms or s"),
+        };
+        openshell_core::time::duration_from_std(duration)
+            .expect("test duration is in protobuf range")
+    }
+
     #[test]
     fn advertised_audience_mismatch_fails_registration() {
         let configured = "urn:openshell:extension:middleware:content-guard";
@@ -2163,7 +2193,7 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
             }
@@ -2299,7 +2329,7 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
             }
@@ -2390,7 +2420,7 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
-                    timeout: "10ms".into(),
+                    request_timeout: Some(proto_duration("10ms")),
                 }],
                 expected_audience: String::new(),
             }
@@ -2650,7 +2680,7 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: self.max_body_bytes,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
             }))
@@ -2679,7 +2709,7 @@ mod tests {
 
     struct SlowService {
         delay: Duration,
-        binding_timeout: String,
+        binding_timeout: Option<prost_types::Duration>,
     }
 
     #[tonic::async_trait]
@@ -2705,7 +2735,7 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
-                    timeout: self.binding_timeout.clone(),
+                    request_timeout: self.binding_timeout,
                 }],
                 expected_audience: String::new(),
             }))
@@ -2764,7 +2794,7 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 256 * 1024,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
             }))
@@ -3034,7 +3064,7 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
             }))
@@ -3090,7 +3120,7 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
             }
@@ -3149,7 +3179,7 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
             }))
@@ -3646,7 +3676,7 @@ mod tests {
                 operation: HTTP_REQUEST_OPERATION as i32,
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_payload_bytes: 4096,
-                timeout: String::new(),
+                request_timeout: None,
             }],
             expected_audience: String::new(),
         };
@@ -3673,7 +3703,7 @@ mod tests {
                 operation: HTTP_REQUEST_OPERATION as i32,
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_payload_bytes: u64::MAX,
-                timeout: String::new(),
+                request_timeout: None,
             }],
             expected_audience: String::new(),
         };
@@ -3689,7 +3719,7 @@ mod tests {
             operation: HTTP_REQUEST_OPERATION as i32,
             phase: PRE_CREDENTIALS_PHASE as i32,
             max_payload_bytes: 4096,
-            timeout: String::new(),
+            request_timeout: None,
         };
         let manifest = MiddlewareManifest {
             name: "example/service".into(),
@@ -3717,7 +3747,10 @@ mod tests {
                 operation: SupervisorMiddlewareOperation::HttpResponse as i32,
                 phase: SupervisorMiddlewarePhase::PreReturn as i32,
                 max_payload_bytes: 4096,
-                timeout: "500ms".into(),
+                request_timeout: Some(prost_types::Duration {
+                    seconds: 0,
+                    nanos: 500_000_000,
+                }),
             }],
             expected_audience: String::new(),
         };
@@ -3732,7 +3765,7 @@ mod tests {
             operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
             phase: phase as i32,
             max_payload_bytes: MAX_MIDDLEWARE_PAYLOAD_BYTES as u64,
-            timeout: "500ms".into(),
+            request_timeout: Some(proto_duration("500ms")),
         };
         let mut manifest = MiddlewareManifest {
             name: "example/websocket".into(),
@@ -3759,7 +3792,7 @@ mod tests {
                 operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                 max_payload_bytes: 4096,
-                timeout: String::new(),
+                request_timeout: None,
             }],
             expected_audience: String::new(),
         };
@@ -3783,7 +3816,7 @@ mod tests {
                 operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                 max_payload_bytes: 4096,
-                timeout: String::new(),
+                request_timeout: None,
             }],
             expected_audience: String::new(),
         };
@@ -3832,7 +3865,7 @@ mod tests {
         assert_eq!(timeout, DEFAULT_MIDDLEWARE_TIMEOUT);
 
         let mut registration = external_registration(4096);
-        registration.timeout = "2s".into();
+        registration.request_timeout = Some(proto_duration("2s"));
         let timeout = validate_registration(&registration).expect("operator timeout");
         assert_eq!(timeout, Duration::from_secs(2));
     }
@@ -3841,7 +3874,7 @@ mod tests {
     fn registration_timeout_enforces_bounds() {
         for timeout in ["9ms", "31s"] {
             let mut registration = external_registration(4096);
-            registration.timeout = timeout.into();
+            registration.request_timeout = Some(proto_duration(timeout));
             assert!(validate_registration(&registration).is_err());
         }
     }
@@ -3857,7 +3890,7 @@ mod tests {
                     operation: HTTP_REQUEST_OPERATION as i32,
                     phase: PRE_CREDENTIALS_PHASE as i32,
                     max_payload_bytes: 4096,
-                    timeout: timeout.into(),
+                    request_timeout: Some(proto_duration(timeout)),
                 }],
                 expected_audience: String::new(),
             };
@@ -3870,11 +3903,11 @@ mod tests {
     #[tokio::test]
     async fn binding_timeout_override_controls_evaluation_and_on_error() {
         let mut registration = external_registration(4096);
-        registration.timeout = "2s".into();
+        registration.request_timeout = Some(proto_duration("2s"));
         let registry = registry_with_external(
             Arc::new(SlowService {
                 delay: Duration::from_millis(50),
-                binding_timeout: "10ms".into(),
+                binding_timeout: Some(proto_duration("10ms")),
             }),
             registration,
         )
@@ -3912,11 +3945,11 @@ mod tests {
     #[tokio::test]
     async fn operator_timeout_controls_binding_without_manifest_override() {
         let mut registration = external_registration(4096);
-        registration.timeout = "10ms".into();
+        registration.request_timeout = Some(proto_duration("10ms"));
         let registry = registry_with_external(
             Arc::new(SlowService {
                 delay: Duration::from_millis(50),
-                binding_timeout: String::new(),
+                binding_timeout: None,
             }),
             registration,
         )
@@ -3947,11 +3980,14 @@ mod tests {
     #[tokio::test]
     async fn operator_timeout_caps_longer_binding_timeout_for_validation_and_evaluation() {
         let mut registration = external_registration(4096);
-        registration.timeout = "10ms".into();
+        registration.request_timeout = Some(proto_duration("10ms"));
         let registry = registry_with_external(
             Arc::new(SlowService {
                 delay: Duration::from_millis(50),
-                binding_timeout: "2s".into(),
+                binding_timeout: Some(prost_types::Duration {
+                    seconds: 2,
+                    nanos: 0,
+                }),
             }),
             registration,
         )
@@ -4929,7 +4965,10 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: MAX_MIDDLEWARE_PAYLOAD_BYTES as u64,
-                    timeout: "1s".into(),
+                    request_timeout: Some(prost_types::Duration {
+                        seconds: 1,
+                        nanos: 0,
+                    }),
                 }],
                 expected_audience: String::new(),
             }))

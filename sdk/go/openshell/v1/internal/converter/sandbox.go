@@ -26,12 +26,12 @@ func SandboxFromProto(s *pb.Sandbox) *types.Sandbox {
 	if m := s.GetMetadata(); m != nil {
 		result.ID = m.GetId()
 		result.Name = m.GetName()
-		result.CreatedAt = TimeFromMillis(m.GetCreatedAtMs())
+		result.CreatedAt = TimeFromProto(m.GetCreatedTime())
 		result.Labels = CopyStringMap(m.GetLabels())
 		result.Annotations = CopyStringMap(m.GetAnnotations())
 		result.ResourceVersion = m.GetResourceVersion()
 		result.Workspace = m.GetWorkspace()
-		result.DeletionTimestamp = TimeFromMillisPtr(m.GetDeletionTimestampMs())
+		result.DeletionTimestamp = TimePtrFromProto(m.GetDeletionTime())
 	}
 
 	if provenance := s.GetCreatedFromWorkloadTemplate(); provenance != nil {
@@ -111,7 +111,7 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			Status:             c.GetStatus(),
 			Reason:             c.GetReason(),
 			Message:            c.GetMessage(),
-			LastTransitionTime: c.GetLastTransitionTime(),
+			LastTransitionTime: TimestampStringFromProto(c.GetTransitionTime()),
 		})
 	}
 	for _, endpoint := range status.GetEndpointStatuses() {
@@ -121,7 +121,7 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			Ports:          slices.Clone(endpoint.GetPorts()),
 			Path:           endpoint.GetPath(),
 			LastResult:     endpointResultFromProto(endpoint.GetLastResult()),
-			LastReportedAt: endpoint.GetLastReportedAt(),
+			LastReportedAt: TimestampStringFromProto(endpoint.GetLastReportedTime()),
 		})
 	}
 	result.ExitCode = CopyInt32Ptr(status.ExitCode)
@@ -211,14 +211,14 @@ func SandboxToProto(s *types.Sandbox) *pb.Sandbox {
 
 	return &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{
-			Id:                  s.ID,
-			Name:                s.Name,
-			CreatedAtMs:         MillisFromTime(s.CreatedAt),
-			Labels:              CopyStringMap(s.Labels),
-			Annotations:         CopyStringMap(s.Annotations),
-			ResourceVersion:     s.ResourceVersion,
-			Workspace:           s.Workspace,
-			DeletionTimestampMs: MillisFromTimePtr(s.DeletionTimestamp),
+			Id:              s.ID,
+			Name:            s.Name,
+			CreatedTime:     TimestampFromTime(s.CreatedAt),
+			Labels:          CopyStringMap(s.Labels),
+			Annotations:     CopyStringMap(s.Annotations),
+			ResourceVersion: s.ResourceVersion,
+			Workspace:       s.Workspace,
+			DeletionTime:    TimestampFromTimePtr(s.DeletionTimestamp),
 		},
 		Spec: SandboxSpecToProto(&s.Spec),
 	}
@@ -320,12 +320,12 @@ func SandboxWorkloadTemplateFromProto(t *pb.SandboxWorkloadTemplate) *types.Sand
 	if m := t.GetMetadata(); m != nil {
 		result.ID = m.GetId()
 		result.Name = m.GetName()
-		result.CreatedAt = TimeFromMillis(m.GetCreatedAtMs())
+		result.CreatedAt = TimeFromProto(m.GetCreatedTime())
 		result.Labels = CopyStringMap(m.GetLabels())
 		result.Annotations = CopyStringMap(m.GetAnnotations())
 		result.ResourceVersion = m.GetResourceVersion()
 		result.Workspace = m.GetWorkspace()
-		result.DeletionTimestamp = TimeFromMillisPtr(m.GetDeletionTimestampMs())
+		result.DeletionTimestamp = TimePtrFromProto(m.GetDeletionTime())
 	}
 	if spec := t.GetSpec(); spec != nil {
 		result.Spec = SandboxWorkloadTemplateSpecFromProto(spec)
@@ -399,14 +399,14 @@ func SandboxWorkloadTemplateToProto(t *types.SandboxWorkloadTemplate) *pb.Sandbo
 	}
 	return &pb.SandboxWorkloadTemplate{
 		Metadata: &dm.ObjectMeta{
-			Id:                  t.ID,
-			Name:                t.Name,
-			CreatedAtMs:         MillisFromTime(t.CreatedAt),
-			Labels:              CopyStringMap(t.Labels),
-			Annotations:         CopyStringMap(t.Annotations),
-			ResourceVersion:     t.ResourceVersion,
-			Workspace:           t.Workspace,
-			DeletionTimestampMs: MillisFromTimePtr(t.DeletionTimestamp),
+			Id:              t.ID,
+			Name:            t.Name,
+			CreatedTime:     TimestampFromTime(t.CreatedAt),
+			Labels:          CopyStringMap(t.Labels),
+			Annotations:     CopyStringMap(t.Annotations),
+			ResourceVersion: t.ResourceVersion,
+			Workspace:       t.Workspace,
+			DeletionTime:    TimestampFromTimePtr(t.DeletionTimestamp),
 		},
 		Spec: SandboxWorkloadTemplateSpecToProto(&t.Spec),
 	}
