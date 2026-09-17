@@ -12,6 +12,27 @@ fn service() -> GovernanceInterceptorService {
     GovernanceInterceptorService::from_profiles(profiles).unwrap()
 }
 
+#[tokio::test]
+async fn describe_rejects_incompatible_gateway_metadata() {
+    let service = service();
+    let mut gateway = openshell_core::extension_protocol::gateway_metadata(
+        openshell_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
+    );
+    gateway.protocol_version.as_mut().unwrap().major = 2;
+
+    let error = GatewayInterceptor::describe(
+        &service,
+        Request::new(DescribeRequest {
+            gateway: Some(gateway),
+        }),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("unsupported protocol"));
+}
+
 fn evaluation(
     method: &str,
     phase: GatewayInterceptorPhase,

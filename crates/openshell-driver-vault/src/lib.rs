@@ -501,9 +501,9 @@ impl Clone for VaultCredentialDriver {
 impl CredentialDriver for CredentialDriverService {
     async fn get_capabilities(
         &self,
-        _request: Request<GetCredentialDriverCapabilitiesRequest>,
+        request: Request<GetCredentialDriverCapabilitiesRequest>,
     ) -> Result<Response<GetCredentialDriverCapabilitiesResponse>, Status> {
-        Ok(Response::new(GetCredentialDriverCapabilitiesResponse {
+        let capabilities = GetCredentialDriverCapabilitiesResponse {
             driver_name: VaultCredentialDriver::NAME.to_string(),
             driver_version: VERSION.to_string(),
             backend_kind: VaultCredentialDriver::NAME.to_string(),
@@ -515,7 +515,15 @@ impl CredentialDriver for CredentialDriverService {
                 VERSION,
                 [],
             )),
-        }))
+        };
+        openshell_core::extension_protocol::validate_gateway_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::Credentials,
+            VaultCredentialDriver::NAME,
+            capabilities.extension.as_ref(),
+            request.into_inner().gateway,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(capabilities))
     }
 
     async fn store_credential(
@@ -1008,6 +1016,38 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), token).unwrap();
         file
+    }
+
+    #[tokio::test]
+    async fn capabilities_reject_missing_gateway_metadata() {
+        let token = token_file("dev-token");
+        let driver = VaultCredentialDriver::from_config(&table(&[
+            (
+                "address",
+                toml::Value::String("http://127.0.0.1:8200".to_string()),
+            ),
+            ("auth_method", toml::Value::String("token_file".to_string())),
+            (
+                "token_path",
+                toml::Value::String(token.path().display().to_string()),
+            ),
+        ]))
+        .unwrap();
+        let service = CredentialDriverService::new(driver);
+
+        let error = CredentialDriver::get_capabilities(
+            &service,
+            Request::new(GetCredentialDriverCapabilitiesRequest::default()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .contains("gateway did not provide protocol metadata")
+        );
     }
 
     fn test_ca() -> (rcgen::Certificate, KeyPair) {

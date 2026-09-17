@@ -60,6 +60,10 @@ pub enum NegotiationError {
         "{family} extension '{name}' did not provide protocol metadata; upgrade the extension to a version that supports OpenShell extension negotiation"
     )]
     MissingMetadata { family: &'static str, name: String },
+    #[error(
+        "gateway did not provide protocol metadata to {family} extension '{name}'; upgrade the gateway and extension together"
+    )]
+    MissingGatewayMetadata { family: &'static str, name: String },
     #[error("{family} extension '{name}' did not provide a protocol version")]
     MissingProtocolVersion { family: &'static str, name: String },
     #[error(
@@ -240,6 +244,20 @@ pub fn negotiate(
         supported_capabilities: extension_supported.into_iter().collect(),
         required_capabilities: extension_required.into_iter().collect(),
     })
+}
+
+pub fn validate_gateway_metadata(
+    family: ExtensionFamily,
+    extension_name: impl Into<String>,
+    extension: Option<&PeerMetadata>,
+    gateway: Option<PeerMetadata>,
+) -> Result<(), NegotiationError> {
+    let extension_name = extension_name.into();
+    let gateway = gateway.ok_or_else(|| NegotiationError::MissingGatewayMetadata {
+        family: family.as_str(),
+        name: extension_name.clone(),
+    })?;
+    negotiate(family, extension_name, &gateway, extension.cloned()).map(drop)
 }
 
 fn validate_text(
@@ -447,6 +465,26 @@ mod tests {
                 Some(extension)
             ),
             Err(NegotiationError::InvalidMetadata { .. })
+        ));
+    }
+
+    #[test]
+    fn extension_side_rejects_missing_and_incompatible_gateway_metadata() {
+        let (mut gateway, extension) = compatible();
+        assert!(matches!(
+            validate_gateway_metadata(ExtensionFamily::Compute, "example", Some(&extension), None,),
+            Err(NegotiationError::MissingGatewayMetadata { .. })
+        ));
+
+        gateway.protocol_version.as_mut().unwrap().major = 2;
+        assert!(matches!(
+            validate_gateway_metadata(
+                ExtensionFamily::Compute,
+                "example",
+                Some(&extension),
+                Some(gateway),
+            ),
+            Err(NegotiationError::IncompatibleProtocol { .. })
         ));
     }
 }

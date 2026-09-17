@@ -57,8 +57,8 @@ Built-in and external extensions follow the same validator. A built-in cannot by
 1. Regenerate bindings from the current OpenShell protobuf files. Supervisor middleware authors must update `Describe` from `google.protobuf.Empty` to `MiddlewareDescribeRequest`.
 2. Read and validate the gateway metadata supplied in the startup request.
 3. Return protocol `1.0`, a stable implementation name, the extension build version, the family base capability, and any additional supported or required capabilities.
-4. Deploy the upgraded extension before upgrading the gateway. A gateway with mandatory negotiation rejects an older extension that omits metadata.
-5. Run mixed-minor tests with required capabilities present and absent. Verify that a major mismatch and missing metadata fail before runtime traffic.
+4. Schedule a coordinated gateway and extension upgrade. There is no supported mixed legacy/current pairing: current extensions reject legacy gateways that omit metadata, and current gateways reject legacy extensions that omit metadata. Stop traffic, upgrade both peers, and restart them together.
+5. Run mixed-minor tests with required capabilities present and absent after both peers implement negotiation. Verify that a major mismatch and missing metadata fail before runtime traffic.
 
 The legacy compute and credential `driver_version` fields and middleware `service_version` field remain populated during migration. New integrations must use `PeerMetadata.implementation_version`; the legacy fields are diagnostic compatibility fields and may be removed in a future protocol major.
 

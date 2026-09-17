@@ -555,9 +555,17 @@ impl GovernanceInterceptorService {
 impl GatewayInterceptor for GovernanceInterceptorService {
     async fn describe(
         &self,
-        _request: Request<DescribeRequest>,
+        request: Request<DescribeRequest>,
     ) -> Result<Response<InterceptorManifest>, Status> {
-        Ok(Response::new(self.manifest()))
+        let manifest = self.manifest();
+        openshell_core::extension_protocol::validate_gateway_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
+            "provider-governance",
+            manifest.extension.as_ref(),
+            request.into_inner().gateway,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(manifest))
     }
 
     async fn evaluate(
