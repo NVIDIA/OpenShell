@@ -38,7 +38,7 @@ func TestFakeService_List_ReturnsUnimplemented(t *testing.T) {
 
 func TestFakeService_Delete_ReturnsUnimplemented(t *testing.T) {
 	c := newFakeServiceClient(func() bool { return false })
-	err := c.Delete(context.Background(), "default", "sb1", "svc1")
+	_, err := c.Delete(context.Background(), "default", "sb1", "svc1")
 	require.Error(t, err)
 	assert.True(t, types.IsUnimplemented(err))
 }
@@ -66,7 +66,7 @@ func TestFakeService_List_ClosedReturnsUnavailable(t *testing.T) {
 
 func TestFakeService_Delete_ClosedReturnsUnavailable(t *testing.T) {
 	c := newFakeServiceClient(func() bool { return true })
-	err := c.Delete(context.Background(), "default", "sb1", "svc1")
+	_, err := c.Delete(context.Background(), "default", "sb1", "svc1")
 	require.Error(t, err)
 	assert.True(t, types.IsUnavailable(err))
 }

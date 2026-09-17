@@ -75,7 +75,7 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
 
         let log = SandboxLogLine {
             sandbox_id: self.sandbox_id.clone(),
-            timestamp_ms: ts,
+            event_time: openshell_core::time::timestamp_from_millis(ts).ok(),
             level: if is_ocsf {
                 "OCSF".to_string()
             } else {
@@ -375,7 +375,7 @@ mod tests {
         assert_eq!(line.sandbox_id, "sb-test");
         assert_eq!(line.message, expected_shorthand);
         assert!(line.fields.is_empty());
-        assert!(line.timestamp_ms > 0);
+        assert!(line.event_time.is_some());
     }
 
     #[test]
@@ -447,7 +447,7 @@ mod tests {
     fn test_line(message: &str) -> SandboxLogLine {
         SandboxLogLine {
             sandbox_id: "sb-test".to_string(),
-            timestamp_ms: 1,
+            event_time: openshell_core::time::timestamp_from_millis(1).ok(),
             level: "INFO".to_string(),
             target: "t".to_string(),
             message: message.to_string(),

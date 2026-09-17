@@ -302,9 +302,15 @@ async fn sandbox_can_be_deleted_while_stopped() {
     );
 
     let delete_output = run_sandbox_lifecycle_command("delete", &sandbox.name).await;
+    // Deletion may return before the owned cleanup worker finishes. Both
+    // outcomes must still reach absence, which is checked below.
     assert!(
-        delete_output.contains("Deleted sandbox"),
-        "expected delete confirmation in:\n{delete_output}",
+        delete_output.contains(&format!("Deleted sandbox {}", sandbox.name))
+            || delete_output.contains(&format!(
+                "Sandbox {} deletion accepted; cleanup is pending",
+                sandbox.name
+            )),
+        "expected completed or accepted deletion in:\n{delete_output}",
     );
 
     if let Err(last_sandbox_list) = assert_sandbox_presence_eventually(&sandbox.name, false).await {
@@ -468,6 +474,44 @@ async fn detached_canonical_main_nonzero_exit_reaches_error() {
     );
 
     sandbox.cleanup().await;
+}
+
+#[tokio::test]
+async fn canonical_main_and_exec_receive_declared_environment() {
+    for mode in ["--tty", "--no-tty"] {
+        let script = r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}"; while true; do sleep 1; done"#;
+        let mut sandbox = SandboxGuard::create_keep_with_args(
+            &[
+                mode,
+                "--no-auto-providers",
+                "--env",
+                "REPRO_SENTINEL=present",
+            ],
+            &["sh", "-c", script],
+            "declared_env=",
+        )
+        .await
+        .expect("create canonical process with declared environment");
+        let initial = normalize_output(&sandbox.create_output);
+        let later = sandbox
+            .exec(&[
+                "sh",
+                "-c",
+                r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}""#,
+            ])
+            .await;
+        sandbox.cleanup().await;
+
+        assert!(
+            initial.lines().any(|line| line == "declared_env=present"),
+            "initial process must receive declared environment ({mode}): {initial}"
+        );
+        let later = normalize_output(&later.expect("exec environment probe"));
+        assert!(
+            later.lines().any(|line| line == "declared_env=present"),
+            "exec must receive the same declared environment ({mode}): {later}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -41,8 +41,26 @@ await client.sandbox.waitReady(sandbox.name, 120)
 const result = await client.sandbox.exec(sandbox.name, ['/bin/sh', '-c', 'echo hello'])
 console.log(result.stdout.toString())
 
-await client.sandbox.delete(sandbox.name)
+const deletion = await client.sandbox.delete(sandbox.name)
+console.log(deletion.outcome) // completed, accepted, or already_absent
+if (deletion.outcome === 'accepted') {
+  await client.sandbox.waitDeleted(sandbox.name, 60, {
+    expectedSandboxId: deletion.sandboxId,
+  })
+}
 ```
+
+Deletion returns a typed result, not a boolean. `accepted` means cleanup is
+pending; `unspecified` and unknown outcomes do not establish completion.
+`sandboxId` identifies the original sandbox. Missing targets are errors unless
+you pass `{ allowMissing: true }`; this does not suppress missing parents or make
+retries safe when names are reused. Upgrade gateway and SDK together for this
+pre-1.0 API change.
+
+`waitDeleted` with `expectedSandboxId` completes when the name is absent or
+resolves to a different ID. Without that option, it waits for name absence,
+including any same-name replacement. Pass the same `workspace` to deletion and
+its wait when using a non-default workspace.
 
 `connect()` constructs a lazy client; call `health()` when startup must verify
 gateway reachability. Static `oidcToken` and `edgeToken` values remain fixed for

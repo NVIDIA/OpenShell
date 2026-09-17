@@ -498,10 +498,11 @@ impl RequestEnvelope {
 }
 
 fn request_payload_digest(request: &Request) -> Result<String, FrameError> {
-    // Round-tripping through Value canonicalizes every JSON object by key. In
-    // particular, this makes HashMap-backed provider environments stable
-    // across process restarts and independently serialized retries.
-    let normalized = serde_json::to_value(request).map_err(FrameError::Serialize)?;
+    // Sort every object explicitly: dependency features may make Value retain
+    // insertion order. Provider environments must hash identically after
+    // deserialization and across independently serialized retries.
+    let mut normalized = serde_json::to_value(request).map_err(FrameError::Serialize)?;
+    normalized.sort_all_objects();
     let payload = serde_json::to_vec(&normalized).map_err(FrameError::Serialize)?;
     let digest = Sha256::digest(payload);
     Ok(format!("{digest:x}"))
@@ -1302,10 +1303,39 @@ mod tests {
             revision: 2,
             provider_env,
         };
-        assert_eq!(
-            request_payload_digest(&build(first)).expect("first digest"),
-            request_payload_digest(&build(second)).expect("second digest")
+        // Pin the canonical bytes, including the nested environment object.
+        // Two randomized HashMaps can otherwise happen to iterate identically
+        // and conceal a serializer that preserves insertion order.
+        let expected = format!(
+            "{:x}",
+            Sha256::digest(
+                br#"{"expected_revision":1,"operation":"update_provider_environment","provider_env":{"A":"1","B":"2"},"revision":2}"#
+            )
         );
+        for provider_env in [first, second] {
+            let request = build(provider_env);
+            assert_eq!(request_payload_digest(&request).expect("digest"), expected);
+
+            // Deserialization reconstructs the map with an independent hash
+            // seed; validation must retain the sender's canonical digest.
+            let envelope = RequestEnvelope::new(request).expect("request envelope");
+            let frame = encode_frame(&envelope).expect("encode envelope");
+            let mut decoded: RequestEnvelope = decode_frame(&frame).expect("decode envelope");
+            assert_eq!(decoded.payload_digest, expected);
+            decoded
+                .validate_payload_digest()
+                .expect("round-trip digest");
+
+            let Request::UpdateProviderEnvironment { provider_env, .. } = &mut decoded.request
+            else {
+                panic!("decoded the wrong request variant");
+            };
+            provider_env.insert("A".to_string(), "changed".to_string());
+            assert!(matches!(
+                decoded.validate_payload_digest(),
+                Err(FrameError::PayloadDigestMismatch)
+            ));
+        }
 
         let mut envelope = RequestEnvelope::new(build(std::collections::HashMap::new()))
             .expect("request envelope");

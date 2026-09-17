@@ -3,17 +3,13 @@
 
 //! `OpenShell`-owned MCP policy revisions, allowlist parsing, and resource limits.
 
-use std::collections::BTreeSet;
-use std::fmt;
-use std::str::FromStr;
-
 use crate::proto::{McpOptions, ProviderProfile};
 
-/// Fixed `OpenShell` batch-member bound for inspected MCP requests.
-///
-/// The bound is distinct from protocol batch availability and the separately
-/// enforced request-body byte limit.
-pub const MAX_MCP_LEGACY_BATCH_MESSAGES: usize = 64;
+pub use openshell_policy_schema::{
+    DEFAULT_MCP_PROTOCOL_VERSION, MAX_MCP_LEGACY_BATCH_MESSAGES, McpProtocolVersion,
+    ParseMcpProtocolVersionError, ParseMcpVersionsError, canonicalize_mcp_versions,
+    parse_mcp_versions,
+};
 
 /// Return whether a policy protocol name denotes MCP.
 ///
@@ -22,90 +18,6 @@ pub const MAX_MCP_LEGACY_BATCH_MESSAGES: usize = 64;
 #[must_use]
 pub fn is_mcp_protocol(protocol: &str) -> bool {
     protocol.trim().eq_ignore_ascii_case("mcp")
-}
-
-/// Stable MCP protocol revisions accepted by `OpenShell` policy configuration.
-///
-/// Variant order is the canonical semantic order used when normalizing policy
-/// allowlists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[non_exhaustive]
-pub enum McpProtocolVersion {
-    /// MCP protocol revision `2025-03-26`.
-    V2025_03_26,
-    /// MCP protocol revision `2025-06-18`.
-    V2025_06_18,
-    /// MCP protocol revision `2025-11-25`.
-    V2025_11_25,
-    /// Sessionless MCP protocol revision `2026-07-28`.
-    V2026_07_28,
-}
-
-/// Pinned MCP protocol revision used when policy authoring omits a revision.
-///
-/// This value is assigned directly rather than derived from
-/// [`McpProtocolVersion::ALL`] or its order. Adding support for a newer
-/// revision therefore cannot silently change versionless policies.
-pub const DEFAULT_MCP_PROTOCOL_VERSION: McpProtocolVersion = McpProtocolVersion::V2025_11_25;
-
-/// Sort MCP policy revisions without hiding invalid input.
-///
-/// Supported revisions use [`McpProtocolVersion::ALL`] semantic order, followed
-/// by unsupported identifiers in lexical order. Duplicate values and the exact
-/// spelling of every identifier remain available to subsequent validation.
-/// Empty lists remain empty; the caller owns omission and default handling.
-pub fn canonicalize_mcp_versions(versions: &mut [String]) {
-    versions.sort_by(|left, right| {
-        match (
-            left.parse::<McpProtocolVersion>(),
-            right.parse::<McpProtocolVersion>(),
-        ) {
-            (Ok(left), Ok(right)) => left.cmp(&right),
-            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-            (Err(_), Err(_)) => left.cmp(right),
-        }
-    });
-}
-
-/// Parse an explicit MCP policy allowlist into canonical semantic order.
-///
-/// This does not choose a default or modify the input. Callers must handle
-/// omitted fields before passing an explicit list to this function.
-///
-/// # Errors
-///
-/// Returns [`ParseMcpVersionsError::Empty`] for an empty list, or the first
-/// unsupported or duplicate revision in input order.
-pub fn parse_mcp_versions(
-    values: &[String],
-) -> Result<BTreeSet<McpProtocolVersion>, ParseMcpVersionsError> {
-    if values.is_empty() {
-        return Err(ParseMcpVersionsError::Empty);
-    }
-
-    let mut versions = BTreeSet::new();
-    for value in values {
-        let version = value.parse::<McpProtocolVersion>()?;
-        if !versions.insert(version) {
-            return Err(ParseMcpVersionsError::Duplicate(version));
-        }
-    }
-    Ok(versions)
-}
-
-/// Error returned when an explicit MCP policy allowlist is invalid.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ParseMcpVersionsError {
-    /// The explicitly supplied allowlist contains no revisions.
-    #[error("mcp.versions must contain at least one supported protocol version")]
-    Empty,
-    /// An identifier does not exactly match a supported revision.
-    #[error(transparent)]
-    Unsupported(#[from] ParseMcpProtocolVersionError),
-    /// A supported revision occurs more than once in the list.
-    #[error("duplicate MCP protocol version '{0}'")]
-    Duplicate(McpProtocolVersion),
 }
 
 /// Normalize only the MCP option fields in a provider profile.
@@ -147,75 +59,6 @@ pub fn normalize_provider_profile_mcp_fields(profile: &mut ProviderProfile) {
             .collect();
     }
 }
-
-impl McpProtocolVersion {
-    /// Every supported MCP protocol revision in canonical semantic order.
-    pub const ALL: &'static [Self] = &[
-        Self::V2025_03_26,
-        Self::V2025_06_18,
-        Self::V2025_11_25,
-        Self::V2026_07_28,
-    ];
-
-    /// Return the exact protocol identifier used on the MCP wire.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::V2025_03_26 => "2025-03-26",
-            Self::V2025_06_18 => "2025-06-18",
-            Self::V2025_11_25 => "2025-11-25",
-            Self::V2026_07_28 => "2026-07-28",
-        }
-    }
-}
-
-impl fmt::Display for McpProtocolVersion {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl FromStr for McpProtocolVersion {
-    type Err = ParseMcpProtocolVersionError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "2025-03-26" => Ok(Self::V2025_03_26),
-            "2025-06-18" => Ok(Self::V2025_06_18),
-            "2025-11-25" => Ok(Self::V2025_11_25),
-            "2026-07-28" => Ok(Self::V2026_07_28),
-            _ => Err(ParseMcpProtocolVersionError {
-                value: value.to_string(),
-            }),
-        }
-    }
-}
-
-/// Error returned when a string is not an exact supported MCP revision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseMcpProtocolVersionError {
-    value: String,
-}
-
-impl ParseMcpProtocolVersionError {
-    /// Return the exact input that failed MCP revision parsing.
-    #[must_use]
-    pub fn value(&self) -> &str {
-        &self.value
-    }
-}
-
-impl fmt::Display for ParseMcpProtocolVersionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "unsupported MCP protocol version '{}'",
-            self.value
-        )
-    }
-}
-
-impl std::error::Error for ParseMcpProtocolVersionError {}
 
 #[cfg(test)]
 mod tests {
@@ -268,9 +111,11 @@ mod tests {
     #[test]
     fn parse_mcp_versions_reports_the_first_error_without_repairing_input() {
         let duplicate = ParseMcpVersionsError::Duplicate(McpProtocolVersion::V2025_03_26);
-        let unsupported = ParseMcpVersionsError::Unsupported(ParseMcpProtocolVersionError {
-            value: " 2025-11-25".to_string(),
-        });
+        let unsupported = ParseMcpVersionsError::Unsupported(
+            " 2025-11-25"
+                .parse::<McpProtocolVersion>()
+                .expect_err("revision is unsupported"),
+        );
         for (values, expected) in [
             (vec![], ParseMcpVersionsError::Empty),
             (vec!["2025-03-26", "2025-03-26", " 2025-11-25"], duplicate),
@@ -442,13 +287,10 @@ mod tests {
             "draft",
             "latest",
         ] {
-            let error = unsupported.parse::<McpProtocolVersion>();
-            assert_eq!(
-                error,
-                Err(ParseMcpProtocolVersionError {
-                    value: unsupported.to_string(),
-                })
-            );
+            let error = unsupported
+                .parse::<McpProtocolVersion>()
+                .expect_err("unsupported revision must fail");
+            assert_eq!(error.value(), unsupported);
         }
     }
 

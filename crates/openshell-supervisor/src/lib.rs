@@ -1292,8 +1292,8 @@ async fn flush_proposals_to_gateway(
             binary: s.binary,
             ancestors: s.ancestors,
             deny_reason: s.deny_reason,
-            first_seen_ms: s.first_seen_ms,
-            last_seen_ms: s.last_seen_ms,
+            first_seen_time: openshell_core::time::timestamp_from_millis(s.first_seen_ms).ok(),
+            last_seen_time: openshell_core::time::timestamp_from_millis(s.last_seen_ms).ok(),
             count: s.count,
             suppressed_count: 0,
             total_count: s.count,
@@ -2444,10 +2444,10 @@ fn discover_policy_from_disk_or_default() -> openshell_core::proto::SandboxPolic
 /// hardcoded restrictive default if the file is missing or invalid.
 fn discover_policy_from_path(path: &std::path::Path) -> openshell_core::proto::SandboxPolicy {
     use openshell_policy::{
-        parse_sandbox_policy, restrictive_default_policy, validate_sandbox_policy,
+        parse_sandbox_policy_file, restrictive_default_policy, validate_sandbox_policy,
     };
 
-    let Ok(yaml) = std::fs::read_to_string(path) else {
+    if !path.exists() {
         ocsf_emit!(
             ConfigStateChangeBuilder::new(ocsf_ctx())
                 .severity(SeverityId::Informational)
@@ -2460,20 +2460,20 @@ fn discover_policy_from_path(path: &std::path::Path) -> openshell_core::proto::S
                 .build()
         );
         return restrictive_default_policy();
-    };
-    ocsf_emit!(
-        ConfigStateChangeBuilder::new(ocsf_ctx())
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .state(StateId::Enabled, "loaded")
-            .message(format!(
-                "Loaded sandbox policy from container disk [path:{}]",
-                path.display()
-            ))
-            .build()
-    );
-    match parse_sandbox_policy(&yaml) {
+    }
+    match parse_sandbox_policy_file(path) {
         Ok(policy) => {
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Enabled, "loaded")
+                    .message(format!(
+                        "Loaded sandbox policy from container disk [path:{}]",
+                        path.display()
+                    ))
+                    .build()
+            );
             // Validate the disk-loaded policy for safety.
             if let Err(violations) = validate_sandbox_policy(&policy) {
                 let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
@@ -4588,6 +4588,21 @@ network_policies:
         // Falls back to restrictive default.
         assert!(policy.network_policies.is_empty());
         assert!(policy.filesystem.is_some());
+    }
+
+    #[test]
+    fn discover_policy_from_oversized_file_returns_restrictive_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        let oversized = format!("version: 1\n{}", " ".repeat(4 * 1024 * 1024));
+        std::fs::write(&path, oversized).unwrap();
+
+        let policy = discover_policy_from_path(&path);
+        assert!(policy.network_policies.is_empty());
+        assert!(
+            policy.filesystem.is_some(),
+            "an oversized otherwise-valid policy must fall back instead of parsing"
+        );
     }
 
     #[test]

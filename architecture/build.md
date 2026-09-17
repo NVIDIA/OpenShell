@@ -88,9 +88,8 @@ SONAMEs.
 
 The workload-side `openshell-sandbox` binary is statically linked with musl so
 drivers can stage it into an arbitrary agent image without depending on that
-image's libc. The supervisor is also statically linked: release images use the
-default musl build, while distribution-specific builds may select the
-`glibc-static` variant.
+image's libc. The separate `openshell-supervisor` binary is dynamically linked
+with GNU libc and uses the same glibc 2.28 compatibility floor as the gateway.
 
 ## Container Builds
 
@@ -115,11 +114,8 @@ package-managed VM support does not raise the package runtime requirement.
 Gateway staging and release workflows set up the Zig C/C++ wrapper before
 bundled Z3 builds and verify the maximum referenced `GLIBC_*` symbol version
 before publishing or copying artifacts.
-Supervisor binaries are static in every configuration. The default `musl`
-variant uses `cargo zigbuild` when available, including native CPU
-architectures, so C dependencies are compiled for the musl target instead of the
-host GNU libc target. The `glibc-static` variant uses plain `cargo build` with
-`+crt-static` and requires a native per-architecture build. Local Docker image tasks infer the
+Supervisor staging uses the GNU build path and verifies the glibc 2.28 floor.
+Sandbox staging uses the static musl build path. Local Docker image tasks infer the
 target architecture from `DOCKER_PLATFORM` when set. Otherwise, they require
 valid container engine host metadata and fail when the engine query is
 unavailable or reports an unsupported architecture, avoiding host-kernel
@@ -184,9 +180,16 @@ Runtime layout:
 - **Sandbox**: Alpine-based `openshell/sandbox` image containing the static
   musl `/openshell-sandbox` binary and its static VM guest-init helper.
   Drivers stage this binary into the workload trust domain.
-- **Supervisor**: Debian-based `openshell/supervisor` image containing only the
-  dynamically linked GNU `/openshell-supervisor` binary. GNU supervisor builds
-  must not reference `GLIBC_*` symbols newer than `GLIBC_2.28`.
+- **Supervisor**: digest-pinned `gcr.io/distroless/base-nossl-debian13` base
+  with the dynamically linked GNU `/openshell-supervisor` binary. The base
+  supplies glibc and CA roots without a shell, package manager, OpenSSL or zlib.
+  GNU supervisor builds must not reference `GLIBC_*` symbols newer than
+  `GLIBC_2.28`. Image defaults remain UID 0 and working directory `/`; compute
+  drivers set the runtime identity and writable mounts. Docker stages private
+  files with the same numeric identity as the supervisor so archive uploads
+  preserve access regardless of the base image's default user. Health probes execute
+  the supervisor binary directly. Base updates require refreshing the
+  multi-architecture digest and rebuilding the image.
 
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.
@@ -227,6 +230,8 @@ The Nix test guest harness under `nix/test-guest` boots native-architecture clou
 through QEMU for package, release, and E2E validation. A prepared cache entry is
 captured after the exact ordered Ansible configuration list and before
 test-specific packages, copied binaries, forwarded ports, or commands.
+On macOS, the test guest and tmachine paths use the same pinned QEMU and OVMF
+package set so the hypervisor and firmware remain compatible.
 
 Prepared disks are flattened, sanitized QCOW2 images. The local cache keeps them
 read-only and each test receives a fresh writable overlay and cloud-init
@@ -241,6 +246,23 @@ for explicit publication.
 CLI conformance runs after target provisioning and operates only through the
 configured OpenShell CLI. The smoke scenario verifies the black-box sandbox
 lifecycle by creating, inspecting, executing in, and deleting a sandbox.
+
+The `tests/tmachine` setup and installation caches include a digest of the
+entire directory containing `ANSIBLE_CONFIG`, including local roles, task
+includes, templates, inventory, and requirements. The digest uses sorted
+relative paths, file contents, and executable permissions; source symlinks
+are unsupported. Both keys also retain the ordered playbook paths and contents,
+their base disk contents, and whether Galaxy is enabled; installation keys
+include named binary inputs. The top-level `.roles` directory is excluded:
+Galaxy release pins in `requirements.yaml` are treated as immutable, including
+any transitive dependency pins. Cache misses with Galaxy enabled reinstall
+the required roles and their dependencies before running playbooks.
+
+The `tests/artifacts.nix` helpers build the CLI, conformance CLI, and sandbox
+with musl, and the gateway and supervisor with GNU. Image assembly stages
+the gateway, sandbox, and supervisor as separate binaries for their respective
+Dockerfiles. The Ubuntu Docker and Fedora Podman scenarios import both local
+runtime images and configure the gateway to use them.
 
 ## Python Wheel Packaging
 
@@ -420,10 +442,18 @@ job republishes the analysis job's outcome as the
 required statuses, so they do not gate merges.
 
 Codex Security findings are informational during the observation phase, and the
-workflow only reports on candidates that already exist. Creating pre-release
-tags and gating stable promotion on qualification results are part of
-[RFC 0014](../rfc/0014-release-stability/release-qualification.md) and are not
-implemented yet.
+workflow only reports on candidates that already exist. Gating stable promotion
+on qualification results remains proposed in
+[RFC 0014](../rfc/0014-release-stability/release-qualification.md).
+
+`release-auto-tag.yml` runs at 14:00 Europe/Zurich on weekdays (including daylight
+saving time changes) and supports manual dispatch. Maintainers start weekday
+pre-release publishing by tagging the initial `vX.Y.Z-pre.1` release candidate.
+The workflow increments the highest release series' pre-release number on `main`
+only when that seed exists, its stable tag does not exist, and new commits are
+available. It never chooses a minor or patch version or creates the initial seed.
+After pushing the tag, it explicitly dispatches `release-tag.yml` to build the
+candidate.
 
 See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 

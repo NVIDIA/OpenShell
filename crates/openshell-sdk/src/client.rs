@@ -16,8 +16,9 @@ use crate::raw::AuthedGrpcClient;
 use crate::refresh::{RefreshedToken, TokenSource};
 use crate::transport;
 use crate::types::{
-    ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxSpec,
-    SandboxTemplateCreateSpec, SandboxTemplateListOptions, SandboxWorkloadTemplate, WorkspaceRef,
+    DeleteOptions, DeletionResult, ExecOptions, ExecResult, Health, ListOptions, SandboxPhase,
+    SandboxRef, SandboxSpec, SandboxTemplateCreateSpec, SandboxTemplateListOptions,
+    SandboxWorkloadTemplate, WorkspaceRef,
 };
 use futures::StreamExt;
 use openshell_core::proto;
@@ -273,17 +274,25 @@ impl OpenShellClient {
     }
 
     /// Delete a reusable sandbox template by name from the default workspace.
-    pub async fn delete_sandbox_template(&self, name: &str) -> Result<bool> {
+    pub async fn delete_sandbox_template(
+        &self,
+        name: &str,
+        opts: DeleteOptions,
+    ) -> Result<DeletionResult> {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxTemplateRequest {
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.delete_sandbox_template(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: None,
+        })
     }
 
     /// Fetch a sandbox by name.
@@ -339,21 +348,23 @@ impl OpenShellClient {
 
     /// Delete a sandbox by name.
     ///
-    /// Returns `true` when the gateway acknowledges the deletion, `false`
-    /// when it was already absent. The sandbox may still be in
-    /// [`SandboxPhase::Deleting`] when this returns — pair with
-    /// [`OpenShellClient::wait_deleted`] when you need a terminal guarantee.
-    pub async fn delete_sandbox(&self, name: &str) -> Result<bool> {
+    /// An accepted outcome is not completion. The result identifies the original
+    /// sandbox; a same-name replacement is not part of this operation.
+    pub async fn delete_sandbox(&self, name: &str, opts: DeleteOptions) -> Result<DeletionResult> {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.delete_sandbox(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: (!response.sandbox_id.is_empty()).then_some(response.sandbox_id),
+        })
     }
 
     /// Stop a sandbox by name.
@@ -406,16 +417,26 @@ impl OpenShellClient {
         .await
     }
 
-    /// Poll until the sandbox is gone (gRPC `NotFound`) or the `timeout`
-    /// elapses.
-    pub async fn wait_deleted(&self, name: &str, timeout: Duration) -> Result<()> {
+    /// Poll until the sandbox is gone (gRPC `NotFound`) or the timeout elapses.
+    ///
+    /// Pass the deletion result's `sandbox_id` as `expected_sandbox_id` to also
+    /// complete when the name resolves to a different sandbox. With `None`,
+    /// waits for the name to be absent, including any same-name replacement.
+    pub async fn wait_deleted(
+        &self,
+        name: &str,
+        timeout: Duration,
+        expected_sandbox_id: Option<&str>,
+    ) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut delay = Duration::from_millis(250);
         loop {
             match self.get_sandbox(name).await {
                 Err(SdkError::NotFound { .. }) => return Ok(()),
                 Err(other) => return Err(other),
-                Ok(snapshot) if snapshot.phase == SandboxPhase::Deleting => {}
+                Ok(snapshot) if expected_sandbox_id.is_some_and(|id| snapshot.id != id) => {
+                    return Ok(());
+                }
                 Ok(_) => {}
             }
             if Instant::now() >= deadline {
@@ -553,16 +574,24 @@ impl OpenShellClient {
     }
 
     /// Delete a workspace by name.
-    pub async fn delete_workspace(&self, name: &str) -> Result<bool> {
+    pub async fn delete_workspace(
+        &self,
+        name: &str,
+        opts: DeleteOptions,
+    ) -> Result<DeletionResult> {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::DeleteWorkspaceRequest {
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                 };
                 async move { grpc.delete_workspace(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: None,
+        })
     }
 
     /// Run a command inside a sandbox and buffer stdout/stderr to the end.
@@ -576,9 +605,11 @@ impl OpenShellClient {
             command: cmd.to_vec(),
             workdir: opts.workdir.unwrap_or_default(),
             environment: opts.environment,
-            timeout_seconds: opts
+            execution_timeout: opts
                 .timeout
-                .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX)),
+                .map(openshell_core::time::duration_from_std)
+                .transpose()
+                .map_err(|error| SdkError::invalid_config(error.to_string()))?,
             stdin: opts.stdin.unwrap_or_default(),
             tty: false,
             cols: 0,
@@ -831,18 +862,26 @@ impl WorkspaceScopedClient {
     }
 
     /// Delete a reusable sandbox template by name in this workspace.
-    pub async fn delete_sandbox_template(&self, name: &str) -> Result<bool> {
+    pub async fn delete_sandbox_template(
+        &self,
+        name: &str,
+        opts: DeleteOptions,
+    ) -> Result<DeletionResult> {
         let response = self
             .client
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxTemplateRequest {
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.delete_sandbox_template(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: None,
+        })
     }
 
     /// Fetch a sandbox by name in this workspace.
@@ -900,18 +939,22 @@ impl WorkspaceScopedClient {
     }
 
     /// Delete a sandbox by name in this workspace.
-    pub async fn delete_sandbox(&self, name: &str) -> Result<bool> {
+    pub async fn delete_sandbox(&self, name: &str, opts: DeleteOptions) -> Result<DeletionResult> {
         let response = self
             .client
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.delete_sandbox(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: (!response.sandbox_id.is_empty()).then_some(response.sandbox_id),
+        })
     }
 
     /// Stop a sandbox by name in this workspace.
@@ -978,13 +1021,25 @@ impl WorkspaceScopedClient {
     }
 
     /// Poll until the sandbox is gone (`NotFound`) or the timeout elapses.
-    pub async fn wait_deleted(&self, name: &str, timeout: Duration) -> Result<()> {
+    ///
+    /// Pass the deletion result's `sandbox_id` as `expected_sandbox_id` to also
+    /// complete when the name resolves to a different sandbox. With `None`,
+    /// waits for the name to be absent, including any same-name replacement.
+    pub async fn wait_deleted(
+        &self,
+        name: &str,
+        timeout: Duration,
+        expected_sandbox_id: Option<&str>,
+    ) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut delay = Duration::from_millis(250);
         loop {
             match self.get_sandbox(name).await {
                 Err(SdkError::NotFound { .. }) => return Ok(()),
                 Err(other) => return Err(other),
+                Ok(snapshot) if expected_sandbox_id.is_some_and(|id| snapshot.id != id) => {
+                    return Ok(());
+                }
                 Ok(_) => {}
             }
             if Instant::now() >= deadline {
@@ -1005,9 +1060,11 @@ impl WorkspaceScopedClient {
             command: cmd.to_vec(),
             workdir: opts.workdir.unwrap_or_default(),
             environment: opts.environment,
-            timeout_seconds: opts
+            execution_timeout: opts
                 .timeout
-                .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX)),
+                .map(openshell_core::time::duration_from_std)
+                .transpose()
+                .map_err(|error| SdkError::invalid_config(error.to_string()))?,
             stdin: opts.stdin.unwrap_or_default(),
             tty: false,
             cols: 0,

@@ -710,7 +710,7 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
         let req = openshell_core::proto::GetSandboxLogsRequest {
             sandbox_id: sandbox_id.clone(),
             lines: 500,
-            since_ms: 0,
+            since_time: None,
             sources: vec![],
             min_level: String::new(),
             workspace_scope: Some(named_workspace_scope(workspace)),
@@ -787,7 +787,11 @@ fn proto_to_log_line(log: openshell_core::proto::SandboxLogLine) -> LogLine {
         log.source
     };
     LogLine {
-        timestamp_ms: log.timestamp_ms,
+        timestamp_ms: log
+            .event_time
+            .as_ref()
+            .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+            .unwrap_or_default(),
         level: log.level,
         source,
         target: log.target,
@@ -815,11 +819,21 @@ async fn handle_sandbox_delete(app: &mut App, tx: mpsc::UnboundedSender<Event>) 
     }
 
     let req = openshell_core::proto::DeleteSandboxRequest {
+        allow_missing: true,
         name: sandbox_name,
         workspace_scope: Some(named_workspace_scope(app.selected_sandbox_workspace())),
     };
     match app.client.delete_sandbox(req).await {
-        Ok(_) => {
+        Ok(response) => {
+            use openshell_core::proto::DeletionOutcome;
+            app.status_text = match response.into_inner().outcome() {
+                DeletionOutcome::Completed => "sandbox deleted".into(),
+                DeletionOutcome::Accepted => "sandbox deletion accepted; cleanup is pending".into(),
+                DeletionOutcome::AlreadyAbsent => "sandbox already deleted".into(),
+                DeletionOutcome::Unspecified => {
+                    "delete failed: unsupported deletion outcome".into()
+                }
+            };
             app.cancel_log_stream();
             app.screen = Screen::Dashboard;
             app.focus = Focus::Sandboxes;
@@ -1742,17 +1756,17 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                         id: String::new(),
                         name: provider_name.clone(),
-                        created_at_ms: 0,
+                        created_time: None,
                         labels: HashMap::new(),
                         resource_version: 0,
                         annotations: HashMap::new(),
                         workspace: workspace.clone(),
-                        deletion_timestamp_ms: 0,
+                        deletion_time: None,
                     }),
                     r#type: ptype.clone(),
                     credentials: credentials.clone(),
                     config: config.clone(),
-                    credential_expires_at_ms: HashMap::default(),
+                    credential_expiration_times: HashMap::default(),
                     profile_workspace: workspace.clone(),
                     credential_handles: HashMap::default(),
                 }),
@@ -1859,22 +1873,23 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: name.clone(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: workspace.clone(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: ptype,
                 credentials,
                 config,
-                credential_expires_at_ms: HashMap::default(),
+                credential_expiration_times: HashMap::default(),
                 profile_workspace: String::new(),
                 credential_handles: HashMap::default(),
             }),
-            credential_expires_at_ms: HashMap::default(),
+            credential_expiration_times: HashMap::default(),
             workspace_scope: Some(named_workspace_scope(workspace)),
+            clear_credential_expiration_keys: Vec::new(),
         };
 
         match tokio::time::timeout(Duration::from_secs(5), client.update_provider(req)).await {
@@ -1904,12 +1919,21 @@ fn spawn_delete_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
     tokio::spawn(async move {
         let req = openshell_core::proto::DeleteProviderRequest {
+            allow_missing: true,
             name,
             workspace_scope: Some(named_workspace_scope(workspace)),
         };
         match tokio::time::timeout(Duration::from_secs(5), client.delete_provider(req)).await {
             Ok(Ok(resp)) => {
-                let _ = tx.send(Event::ProviderDeleteResult(Ok(resp.into_inner().deleted)));
+                let outcome = resp.into_inner().outcome();
+                let result = match outcome {
+                    openshell_core::proto::DeletionOutcome::Completed => Ok(true),
+                    openshell_core::proto::DeletionOutcome::AlreadyAbsent => Ok(false),
+                    _ => {
+                        Err("gateway returned an unsupported provider deletion outcome".to_string())
+                    }
+                };
+                let _ = tx.send(Event::ProviderDeleteResult(result));
             }
             Ok(Err(e)) => {
                 let _ = tx.send(Event::ProviderDeleteResult(Err(e.message().to_string())));
@@ -2727,7 +2751,9 @@ fn apply_sandbox_refresh(app: &mut App, sandboxes: Vec<openshell_core::proto::Sa
         .map(|s| {
             s.metadata
                 .as_ref()
-                .map_or_else(|| "?".to_string(), |m| format_age(m.created_at_ms))
+                .and_then(|m| m.created_time.as_ref())
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                .map_or_else(|| "?".to_string(), format_age)
         })
         .collect();
     app.sandbox_created = sandboxes
@@ -2735,7 +2761,9 @@ fn apply_sandbox_refresh(app: &mut App, sandboxes: Vec<openshell_core::proto::Sa
         .map(|s| {
             s.metadata
                 .as_ref()
-                .map_or_else(|| "?".to_string(), |m| format_timestamp(m.created_at_ms))
+                .and_then(|m| m.created_time.as_ref())
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                .map_or_else(|| "?".to_string(), format_timestamp)
         })
         .collect();
 

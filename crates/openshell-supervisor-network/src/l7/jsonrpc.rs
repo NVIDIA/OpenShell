@@ -1132,6 +1132,17 @@ mod tests {
     }
 
     #[test]
+    fn every_policy_revision_selects_the_matching_tower_profile() {
+        // Policy support is deliberately independent of Tower's vocabulary;
+        // every enabled revision must still have an exact inspector profile.
+        for revision in McpProtocolVersion::ALL {
+            let inspector = McpInspector::new(revision.as_str())
+                .expect("supported policy revision must have an inspector");
+            assert_eq!(inspector.revision().as_str(), revision.as_str());
+        }
+    }
+
+    #[test]
     fn parses_method_from_request_body() {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
         let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::JsonRpc);

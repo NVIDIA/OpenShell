@@ -79,8 +79,7 @@ mod tests {
 
     async fn authenticator(driver: NoopTestDriver) -> ComputeDriverAuthenticator {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
-        let compute =
-            new_test_runtime_with_driver(store, "external-kubernetes", Arc::new(driver)).await;
+        let compute = new_test_runtime_with_driver(store, "external-kubernetes", Arc::new(driver));
         ComputeDriverAuthenticator::new(compute)
     }
 

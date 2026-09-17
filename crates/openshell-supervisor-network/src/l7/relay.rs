@@ -4163,7 +4163,10 @@ network_policies:
                             as i32,
                         max_payload_bytes:
                             openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES as u64,
-                        timeout: "2s".into(),
+                        request_timeout: Some(prost_types::Duration {
+                            seconds: 2,
+                            nanos: 0,
+                        }),
                     }],
                     expected_audience: String::new(),
                 },
@@ -4275,7 +4278,10 @@ network_policies:
                 grpc_endpoint: format!("http://{address}"),
                 max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
-                timeout: "2s".into(),
+                request_timeout: Some(prost_types::Duration {
+                    seconds: 2,
+                    nanos: 0,
+                }),
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
@@ -6009,7 +6015,7 @@ network_policies:
                         as i32,
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
             }
@@ -6156,7 +6162,7 @@ network_policies:
                         as i32,
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
             }
@@ -6627,7 +6633,7 @@ network_policies:
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: self.max_body_bytes,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
             }

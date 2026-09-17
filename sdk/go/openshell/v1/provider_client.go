@@ -5,6 +5,7 @@ package v1
 
 import (
 	"context"
+	"sort"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/converter"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
@@ -99,7 +100,13 @@ func (p *providerClient) Update(ctx context.Context, workspace string, provider 
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	}
 	if proto != nil {
-		req.CredentialExpiresAtMs = proto.CredentialExpiresAtMs
+		req.CredentialExpirationTimes = proto.CredentialExpirationTimes
+		for key, expiresAt := range provider.Spec.CredentialExpiresAt {
+			if expiresAt.IsZero() {
+				req.ClearCredentialExpirationKeys = append(req.ClearCredentialExpirationKeys, key)
+			}
+		}
+		sort.Strings(req.ClearCredentialExpirationKeys)
 	}
 
 	resp, err := p.client.UpdateProvider(ctx, req)
@@ -109,15 +116,16 @@ func (p *providerClient) Update(ctx context.Context, workspace string, provider 
 	return converter.ProviderFromProto(resp.GetProvider()), nil
 }
 
-func (p *providerClient) Delete(ctx context.Context, workspace, name string) error {
-	_, err := p.client.DeleteProvider(ctx, &pb.DeleteProviderRequest{
+func (p *providerClient) Delete(ctx context.Context, workspace, name string, opts ...DeleteOptions) (*DeletionResult, error) {
+	resp, err := p.client.DeleteProvider(ctx, &pb.DeleteProviderRequest{
+		AllowMissing:   allowMissing(opts),
 		Name:           name,
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
-		return converter.FromGRPCError(err)
+		return nil, converter.FromGRPCError(err)
 	}
-	return nil
+	return &DeletionResult{Outcome: DeletionOutcome(resp.GetOutcome())}, nil
 }
 
 func (p *providerClient) Ensure(ctx context.Context, workspace string, provider *Provider) (*Provider, error) {

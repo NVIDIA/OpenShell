@@ -114,7 +114,7 @@ func (s *mockServiceServer) DeleteService(_ context.Context, req *pb.DeleteServi
 		return nil, status.Errorf(codes.NotFound, "service %q not found in sandbox %q", req.GetService(), req.GetSandbox())
 	}
 	delete(s.endpoints, key)
-	return &pb.DeleteServiceResponse{Deleted: true}, nil
+	return &pb.DeleteServiceResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED}, nil
 }
 
 // --- Test setup ---
@@ -308,7 +308,7 @@ func TestServiceDelete(t *testing.T) {
 	_, err := client.Expose(context.Background(), "default", "web-app", "api", 8080, true)
 	require.NoError(t, err)
 
-	err = client.Delete(context.Background(), "default", "web-app", "api")
+	_, err = client.Delete(context.Background(), "default", "web-app", "api")
 
 	require.NoError(t, err)
 
@@ -324,7 +324,7 @@ func TestServiceDelete_NotFound(t *testing.T) {
 	client, cleanup := setupServiceTest(t, mock)
 	defer cleanup()
 
-	err := client.Delete(context.Background(), "default", "web-app", "nonexistent")
+	_, err := client.Delete(context.Background(), "default", "web-app", "nonexistent")
 
 	require.Error(t, err)
 	assert.True(t, IsNotFound(err))
@@ -336,7 +336,7 @@ func TestServiceDelete_Error(t *testing.T) {
 	client, cleanup := setupServiceTest(t, mock)
 	defer cleanup()
 
-	err := client.Delete(context.Background(), "default", "web-app", "api")
+	_, err := client.Delete(context.Background(), "default", "web-app", "api")
 
 	require.Error(t, err)
 }

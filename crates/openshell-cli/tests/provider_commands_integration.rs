@@ -190,12 +190,12 @@ impl OpenShell for TestOpenShell {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: format!("sb-{name}"),
                     name,
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 1,
                     annotations: HashMap::new(),
                     workspace: String::new(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: None,
                 status: None,
@@ -331,7 +331,10 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        Ok(Response::new(DeleteSandboxResponse { deleted: true }))
+        Ok(Response::new(DeleteSandboxResponse {
+            sandbox_id: String::new(),
+            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+        }))
     }
 
     async fn get_sandbox_config(
@@ -688,38 +691,34 @@ impl OpenShell for TestOpenShell {
             }
             base
         };
-        let merge_expiry = |mut base: HashMap<String, i64>, incoming: HashMap<String, i64>| {
-            if incoming.is_empty() {
-                return base;
-            }
-            for (k, v) in incoming {
-                if v <= 0 {
-                    base.remove(&k);
-                } else {
-                    base.insert(k, v);
+        let merge_expiry =
+            |mut base: HashMap<String, prost_types::Timestamp>,
+             incoming: HashMap<String, prost_types::Timestamp>| {
+                if incoming.is_empty() {
+                    return base;
                 }
-            }
-            base
-        };
+                base.extend(incoming);
+                base
+            };
         let existing_metadata = existing.metadata.clone().unwrap_or_default();
         let provider_metadata = provider.metadata.clone().unwrap_or_default();
         let updated = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: existing_metadata.id,
                 name: provider_metadata.name,
-                created_at_ms: existing_metadata.created_at_ms,
+                created_time: existing_metadata.created_time,
                 labels: existing_metadata.labels,
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: String::new(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),
             config: merge(existing.config, provider.config),
-            credential_expires_at_ms: merge_expiry(
-                existing.credential_expires_at_ms,
-                provider.credential_expires_at_ms,
+            credential_expiration_times: merge_expiry(
+                existing.credential_expiration_times,
+                provider.credential_expiration_times,
             ),
             profile_workspace: existing.profile_workspace,
             credential_handles: if provider.credential_handles.is_empty() {
@@ -780,7 +779,10 @@ impl OpenShell for TestOpenShell {
                 credential_key: request.credential_key.clone(),
                 material: request.material.clone(),
                 secret_material_keys: request.secret_material_keys.clone(),
-                expires_at_ms: request.expires_at_ms,
+                expires_at_ms: request
+                    .expiration_time
+                    .as_ref()
+                    .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok()),
             });
         let configure_failure = self
             .state
@@ -801,14 +803,14 @@ impl OpenShell for TestOpenShell {
             credential_key: request.credential_key.clone(),
             strategy: request.strategy,
             status: "configured".to_string(),
-            expires_at_ms: request.expires_at_ms.unwrap_or_default(),
-            next_refresh_at_ms: 0,
-            last_refresh_at_ms: 0,
+            expiration_time: request.expiration_time,
+            next_refresh_time: None,
+            last_refresh_time: None,
             last_error: String::new(),
             recovery_action: 0,
             failure_code: String::new(),
             provider_error_subtype: String::new(),
-            last_error_at_ms: 0,
+            last_error_time: None,
         };
         drop(providers);
         self.state
@@ -847,9 +849,9 @@ impl OpenShell for TestOpenShell {
             .get_mut(&(provider_name.clone(), credential_key.clone()))
             .ok_or_else(|| Status::not_found("provider refresh state not found"))?;
         status.status = "refreshed".to_string();
-        status.last_refresh_at_ms = 1;
-        status.next_refresh_at_ms = 3_600_000;
-        status.expires_at_ms = 3_600_000;
+        status.last_refresh_time = openshell_core::time::timestamp_from_millis(1).ok();
+        status.next_refresh_time = openshell_core::time::timestamp_from_millis(3_600_000).ok();
+        status.expiration_time = openshell_core::time::timestamp_from_millis(3_600_000).ok();
         let status = status.clone();
         drop(refresh_statuses);
         let mut providers = self.state.providers.lock().await;
@@ -859,9 +861,10 @@ impl OpenShell for TestOpenShell {
         provider
             .credentials
             .insert(credential_key.clone(), format!("minted-{credential_key}"));
-        provider
-            .credential_expires_at_ms
-            .insert(credential_key, 3_600_000);
+        provider.credential_expiration_times.insert(
+            credential_key,
+            openshell_core::time::timestamp_from_millis(3_600_000).unwrap(),
+        );
         Ok(Response::new(RotateProviderCredentialResponse {
             status: Some(status),
         }))
@@ -887,7 +890,13 @@ impl OpenShell for TestOpenShell {
             .await
             .remove(&(request.provider, request.credential_key))
             .is_some();
-        Ok(Response::new(DeleteProviderRefreshResponse { deleted }))
+        Ok(Response::new(DeleteProviderRefreshResponse {
+            outcome: if deleted {
+                openshell_core::proto::DeletionOutcome::Completed.into()
+            } else {
+                openshell_core::proto::DeletionOutcome::AlreadyAbsent.into()
+            },
+        }))
     }
 
     async fn delete_provider(
@@ -905,7 +914,13 @@ impl OpenShell for TestOpenShell {
             return Err(Status::internal(message));
         }
         let deleted = self.state.providers.lock().await.remove(&name).is_some();
-        Ok(Response::new(DeleteProviderResponse { deleted }))
+        Ok(Response::new(DeleteProviderResponse {
+            outcome: if deleted {
+                openshell_core::proto::DeletionOutcome::Completed.into()
+            } else {
+                openshell_core::proto::DeletionOutcome::AlreadyAbsent.into()
+            },
+        }))
     }
 
     async fn delete_provider_profile(
@@ -929,7 +944,13 @@ impl OpenShell for TestOpenShell {
         }
         let deleted = self.state.profiles.lock().await.remove(&id).is_some();
         Ok(Response::new(
-            openshell_core::proto::DeleteProviderProfileResponse { deleted },
+            openshell_core::proto::DeleteProviderProfileResponse {
+                outcome: if deleted {
+                    openshell_core::proto::DeletionOutcome::Completed.into()
+                } else {
+                    openshell_core::proto::DeletionOutcome::AlreadyAbsent.into()
+                },
+            },
         ))
     }
 
@@ -2347,7 +2368,7 @@ async fn provider_update_from_existing_uses_profile_discovery() {
             r#type: "custom-update-discovery".to_string(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         },

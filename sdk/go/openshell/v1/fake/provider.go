@@ -159,12 +159,12 @@ func (c *fakeProviderClient) Update(_ context.Context, workspace string, provide
 }
 
 // Delete removes a provider by name. The operation is idempotent.
-func (c *fakeProviderClient) Delete(_ context.Context, workspace, name string) error {
+func (c *fakeProviderClient) Delete(_ context.Context, workspace, name string, opts ...v1.DeleteOptions) (*types.DeletionResult, error) {
 	if c.closedFunc() {
-		return &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-	c.store.Delete(workspace, name)
-	return nil
+	_, existed := c.store.DeleteAndGet(workspace, name)
+	return deletionResult(existed, "", opts)
 }
 
 // Ensure creates a provider if it does not exist, or updates it if it does.

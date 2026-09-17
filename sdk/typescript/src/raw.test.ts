@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { MessageInitShape } from '@bufbuild/protobuf';
+import { timestampFromDate } from '@bufbuild/protobuf/wkt';
 import { createRouterTransport } from '@connectrpc/connect';
 import { describe, expect, it } from 'vitest';
 import { SandboxClient } from './index.js';
@@ -17,6 +18,7 @@ describe('raw sandbox endpoint status', () => {
       ];
       let lastResult = EndpointResult.TRANSPORT_FAILED;
       const reportedAt = '2026-09-11T10:00:01Z';
+      const reportedTime = timestampFromDate(new Date(reportedAt));
       const readyCondition = { type: 'Ready', status: 'True', reason: 'Ready', message: 'Sandbox is ready' };
       const sandbox = new SandboxClient(
         createRouterTransport(
@@ -33,7 +35,9 @@ describe('raw sandbox endpoint status', () => {
                       endpointStatuses: endpoints.map((endpoint) => ({
                         ...endpoint,
                         lastResult,
-                        lastReportedAt: lastResult === EndpointResult.NO_OBSERVED_EXCHANGE ? '' : reportedAt,
+                        ...(lastResult === EndpointResult.NO_OBSERVED_EXCHANGE
+                          ? {}
+                          : { lastReportedTime: reportedTime }),
                       })),
                       conditions: [readyCondition],
                     },
@@ -65,7 +69,7 @@ describe('raw sandbox endpoint status', () => {
           endpoints.map((endpoint) => ({
             ...endpoint,
             lastResult: result,
-            lastReportedAt: result === EndpointResult.NO_OBSERVED_EXCHANGE ? '' : reportedAt,
+            ...(result === EndpointResult.NO_OBSERVED_EXCHANGE ? {} : { lastReportedTime: reportedTime }),
           })),
         );
       }
