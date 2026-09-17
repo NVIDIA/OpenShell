@@ -155,6 +155,12 @@ pub struct PolicyDocument {
         skip_serializing_if = "Option::is_none"
     )]
     pub process: Option<ProcessPolicy>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_optional_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ui: Option<UiPolicy>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub network_policies: BTreeMap<String, NetworkPolicyRule>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -194,6 +200,27 @@ pub struct ProcessPolicy {
     pub run_as_user: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub run_as_group: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiPolicy {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_graphical_ui: bool,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub clipboard: UiClipboardAccess,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_input_injection: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiClipboardAccess {
+    #[default]
+    None,
+    Read,
+    Write,
+    All,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -660,6 +687,7 @@ fn inspect_document(root: &serde_yml::Value) -> InspectionResult {
             "filesystem_policy",
             "landlock",
             "process",
+            "ui",
             "network_policies",
             "network_middlewares",
         ],
@@ -678,6 +706,11 @@ fn inspect_document(root: &serde_yml::Value) -> InspectionResult {
         root.get("process"),
         "process",
         &["run_as_user", "run_as_group"],
+    )?;
+    inspect_named(
+        root.get("ui"),
+        "ui",
+        &["allow_graphical_ui", "clipboard", "allow_input_injection"],
     )?;
 
     for (name, rule) in open_map(root.get("network_policies")) {
@@ -1140,6 +1173,7 @@ mod tests {
         for source in [
             "version: 1\nfilesystem_policy: null\n",
             "version: 1\nprocess: null\n",
+            "version: 1\nui: null\n",
             "version: 1\nmetadata: null\n",
             "version: 1\nnetwork_policies:\n  x:\n    endpoints:\n      - host: x\n        port: 443\n        mcp: null\n",
         ] {
@@ -1176,6 +1210,7 @@ mod tests {
                 "landlock.future",
             ),
             ("version: 1\nprocess: { future: true }\n", "process.future"),
+            ("version: 1\nui: { future: true }\n", "ui.future"),
             (
                 "version: 1\nnetwork_policies: { api: { future: true } }\n",
                 "network_policies.api.future",
@@ -1240,6 +1275,25 @@ mod tests {
                 error.to_string().contains(expected_path),
                 "missing path {expected_path} in {error:?}"
             );
+        }
+    }
+
+    #[test]
+    fn ui_presence_defaults_and_values_round_trip() {
+        let absent = parse_policy("version: 1\n").expect("absent UI parses");
+        assert!(absent.ui.is_none());
+
+        let explicit = parse_policy("version: 1\nui: {}\n").expect("empty UI parses");
+        assert_eq!(explicit.ui, Some(UiPolicy::default()));
+        assert_eq!(serialize_policy(&explicit).unwrap(), "version: 1\nui: {}");
+
+        for clipboard in ["none", "read", "write", "all"] {
+            let source = format!(
+                "version: 1\nui:\n  allow_graphical_ui: true\n  clipboard: {clipboard}\n  allow_input_injection: true\n"
+            );
+            let parsed = parse_policy(&source).expect("UI policy parses");
+            let serialized = serialize_policy(&parsed).expect("UI policy serializes");
+            assert_eq!(parse_policy(&serialized).unwrap(), parsed);
         }
     }
 

@@ -37,6 +37,8 @@ mod etw_consumer;
 pub use driver::{MxcBackend, MxcComputeBackend, MxcComputeConfig};
 #[cfg(target_os = "windows")]
 pub use grpc::ComputeDriverService;
+#[cfg(target_os = "windows")]
+pub use mxc::MXC_SCHEMA_VERSION;
 // Re-export the embedded mapper API so the windows-only example and integration
 // test can reach it without making `policy_map` a public module.
 #[cfg(target_os = "windows")]
@@ -47,3 +49,34 @@ pub use policy_map::{
     MxcMappingResult, OPEN_SHELL_SUPERSET_GAPS, SplitPolicyResult, build_loss_report, map_to_mxc,
     render_readme, split_policy,
 };
+
+/// Internal production-config surface used by the real-MXC integration tests.
+///
+/// This stays hidden from generated API documentation. It intentionally calls
+/// the same serializer as the live driver so schema acceptance tests cannot
+/// drift onto a hand-authored payload.
+#[cfg(target_os = "windows")]
+#[doc(hidden)]
+pub mod test_support {
+    pub use crate::mxc::{
+        MxcClipboardAccess, MxcFilesystem, MxcNetwork, MxcProcess, MxcProcessContainer, MxcUi,
+    };
+
+    pub fn oneshot_config_json(
+        container_id: &str,
+        filesystem: &MxcFilesystem,
+        process_container: &MxcProcessContainer,
+        process: &MxcProcess,
+        network: Option<&MxcNetwork>,
+        ui: Option<&MxcUi>,
+    ) -> serde_json::Value {
+        crate::mxc::oneshot_config_json(
+            container_id,
+            filesystem,
+            process_container,
+            process,
+            network,
+            ui,
+        )
+    }
+}
