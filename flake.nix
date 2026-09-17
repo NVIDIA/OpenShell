@@ -162,6 +162,10 @@
         devShells = {
           default = pkgs.mkShellNoCC commonDevShell;
 
+          rust-toolchain = pkgs.mkShellNoCC {
+            packages = [ rustToolchain ];
+          };
+
           testing = pkgs.mkShellNoCC (
             commonDevShell
             // {

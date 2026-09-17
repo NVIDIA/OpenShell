@@ -51,7 +51,9 @@ runs:
         cache-on-failure: "true"
         cache-workspace-crates: "true"
         cache-bin: "false"
-        cmd-format: nix develop -c {0}
+        # rust-cache wraps its rustc, rustup, and cargo metadata probes with
+        # this command. Keep those probes out of the much larger build shell.
+        cmd-format: nix develop .#rust-toolchain -c {0}
 
     - name: Set version
       shell: nix develop -c bash -euo pipefail {0}

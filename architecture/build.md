@@ -124,6 +124,10 @@ in platform-specific Nix development shells through reusable workflows and the
 shared `build-rust-binary` action. The image build downloads each binary artifact
 into the staging directory before running Buildx.
 
+The flake also exposes a minimal `rust-toolchain` shell containing only the
+pinned Rust toolchain. CI uses it for cache-key discovery without realizing the
+full build environment.
+
 Gateway and supervisor binaries staged into branch E2E, Release Dev, and Release
 Tag images are compiled through `cargo auditable` (pinned in `mise.toml`), which
 embeds a `.dep-v0` section describing the Rust dependencies actually compiled
