@@ -2334,6 +2334,7 @@ async fn load_policy_with_gateway(
         .await?;
         let discovery = image_discovery.unwrap_or_else(discover_image_policy);
         let mut reconciliation_attempts = 0u32;
+        let mut rejection_log = StartupRejectionLog::default();
         loop {
             if reconciliation_attempts == 5 {
                 return Err(miette::miette!(
@@ -2347,7 +2348,7 @@ async fn load_policy_with_gateway(
             if snapshot.policy.is_none() && !snapshot.configuration_error.is_empty() {
                 reject_startup_configuration(
                     gateway,
-                    endpoint,
+                    &mut rejection_log,
                     id,
                     &instance_id,
                     &snapshot,
@@ -2376,7 +2377,7 @@ async fn load_policy_with_gateway(
                     ImagePolicyDiscovery::Policy(policy) => *policy.clone(),
                     ImagePolicyDiscovery::Missing => openshell_policy::restrictive_default_policy(),
                     ImagePolicyDiscovery::Invalid => {
-                        reject_startup_configuration(gateway, endpoint, id, &instance_id, &snapshot, "Image policy is invalid; replace the sandbox policy to repair configuration").await?;
+                        reject_startup_configuration(gateway, &mut rejection_log, id, &instance_id, &snapshot, "Image policy is invalid; replace the sandbox policy to repair configuration").await?;
                         reconciliation_attempts = 0;
                         continue;
                     }
@@ -2409,7 +2410,7 @@ async fn load_policy_with_gateway(
                     }
                     reject_startup_configuration(
                         gateway,
-                        endpoint,
+                        &mut rejection_log,
                         id,
                         &instance_id,
                         &snapshot,
@@ -2455,12 +2456,11 @@ async fn load_policy_with_gateway(
             // The initial load uses pid=0 (no symlink resolution) because the
             // container hasn't started yet. After the entrypoint spawns, the
             // engine is rebuilt with the real PID for symlink resolution.
-            info!("Creating OPA engine from proto policy data");
             let has_last_valid_policy = true;
             if !snapshot.configuration_admitted {
                 reject_startup_configuration(
                     gateway,
-                    endpoint,
+                    &mut rejection_log,
                     id,
                     &instance_id,
                     &snapshot,
@@ -2481,6 +2481,7 @@ async fn load_policy_with_gateway(
                     .await;
                 continue;
             }
+            debug!("Creating OPA engine from proto policy data");
             let (engine, policy, captured_provider_credentials) =
                 match prepare_startup_configuration(&snapshot, &proto_policy, &provider) {
                     Ok(prepared) => prepared,
@@ -2494,7 +2495,7 @@ async fn load_policy_with_gateway(
                         .await;
                         reject_startup_configuration(
                             gateway,
-                            endpoint,
+                            &mut rejection_log,
                             id,
                             &instance_id,
                             &snapshot,
@@ -2592,6 +2593,16 @@ async fn load_policy_with_gateway(
                     .await;
                 continue;
             }
+            if rejection_log.0.is_some() {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Other, "configuration_recovered")
+                        .message("Startup configuration repaired and accepted")
+                        .build()
+                );
+            }
             return Ok((
                 policy,
                 opa_engine,
@@ -2684,9 +2695,31 @@ fn prepare_provider_environment(
     .map_err(|_| miette::miette!("Provider credential bindings are invalid"))
 }
 
+// Retain only the most recent rejection, so A -> B -> A emits all transitions.
+#[derive(Default)]
+struct StartupRejectionLog(Option<(LoadedPolicyRevision, String)>);
+
+impl StartupRejectionLog {
+    fn changed(
+        &mut self,
+        snapshot: &openshell_core::grpc_client::SettingsPollResult,
+        error: &str,
+    ) -> bool {
+        let rejection = (
+            LoadedPolicyRevision::from_snapshot(snapshot),
+            error.to_owned(),
+        );
+        if self.0.as_ref() == Some(&rejection) {
+            return false;
+        }
+        self.0 = Some(rejection);
+        true
+    }
+}
+
 async fn reject_startup_configuration(
     gateway: &impl StartupGateway,
-    _endpoint: &str,
+    rejection_log: &mut StartupRejectionLog,
     sandbox_id: &str,
     instance_id: &str,
     snapshot: &openshell_core::grpc_client::SettingsPollResult,
@@ -2702,15 +2735,18 @@ async fn reject_startup_configuration(
         )
     })
     .await?;
+    // Keep reporting readiness on every retry, but log only changed rejections.
     // Fixed, bounded diagnostics deliberately omit the candidate and credentials.
-    ocsf_emit!(
-        ConfigStateChangeBuilder::new(ocsf_ctx())
-            .severity(SeverityId::High)
-            .status(StatusId::Failure)
-            .state(StateId::Disabled, "configuration_error")
-            .message(error)
-            .build()
-    );
+    if rejection_log.changed(snapshot, error) {
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::High)
+                .status(StatusId::Failure)
+                .state(StateId::Disabled, "configuration_error")
+                .message(error)
+                .build()
+        );
+    }
     tokio::time::sleep(Duration::from_secs(2)).await;
     Ok(())
 }
@@ -5212,6 +5248,31 @@ network_policies:
         }
     }
 
+    #[test]
+    fn startup_rejection_logs_only_changed_configuration_or_error() {
+        let mut snapshot = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let mut log = StartupRejectionLog::default();
+        assert!(log.changed(&snapshot, "invalid policy"));
+        for _ in 0..10 {
+            assert!(!log.changed(&snapshot, "invalid policy"));
+        }
+        snapshot.config_revision += 1;
+        assert!(log.changed(&snapshot, "invalid policy"));
+        snapshot.provider_env_revision += 1;
+        assert!(log.changed(&snapshot, "invalid policy"));
+        snapshot.policy_hash.push_str("changed");
+        assert!(log.changed(&snapshot, "invalid policy"));
+        snapshot.version += 1;
+        assert!(log.changed(&snapshot, "invalid policy"));
+        assert!(log.changed(&snapshot, "invalid provider"));
+        assert!(!log.changed(&snapshot, "invalid provider"));
+        assert!(log.changed(&snapshot, "invalid policy"));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn startup_pending_gateway_calls_exhaust_their_budgets() {
         for pending_snapshot in [true, false] {
@@ -5378,6 +5439,13 @@ network_policies:
         assert!(
             !handle.is_finished(),
             "rejected configuration must not return a launch bundle"
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(5), reported.recv())
+                .await
+                .unwrap(),
+            Some(ConfigurationAdmissionState::Rejected),
+            "unchanged rejection must still report readiness on subsequent polls"
         );
         {
             let mut desired = gateway.desired.lock().unwrap();

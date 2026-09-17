@@ -305,6 +305,24 @@ binaries:
         "invalid configuration must not crash-loop"
     );
     assert_marker(&engine, &container, false);
+    let logs = engine
+        .command()
+        .args(["logs", &supervisor])
+        .output()
+        .expect("read quarantined supervisor logs");
+    assert!(logs.status.success());
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&logs.stdout),
+        String::from_utf8_lossy(&logs.stderr)
+    );
+    assert_eq!(
+        logs.matches("credentialed endpoint 'api.example.com:443'")
+            .count(),
+        1,
+        "unchanged startup rejection must be logged only once: {logs}"
+    );
+    assert!(!logs.contains("Creating OPA engine from proto policy data"));
     let repaired = context.path().join("repaired.yaml");
     std::fs::write(
         &repaired,

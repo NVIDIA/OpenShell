@@ -626,6 +626,9 @@ A blocked startup remains `Provisioning` with a `ConfigurationInvalid` readiness
 condition, even when the container backend reports readiness. Gateway management
 operations remain available. Replacing the policy or repairing providers allows
 the same supervisor to reconcile and launch; it does not recreate the sandbox.
+Startup retries continue reporting readiness, but unchanged configuration rejections
+produce only one log event. A changed configuration or diagnostic emits a new
+rejection event; successful repair emits a recovery event.
 Static policy fields can be replaced before the first accepted activation.
 A durable first-activation marker closes this repair window permanently, including
 across stop/start and later rejected configurations. Legacy records without the
