@@ -18,8 +18,9 @@ use std::time::Duration;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
     FinalizeMainProcessExitRequest, GatewayMessage, RelayFrame, RelayInit, RelayOpen,
-    RelayOpenResult, ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello,
-    SupervisorMessage, TcpRelayTarget, gateway_message, relay_open, supervisor_message,
+    RelayOpenResult, ReportMainProcessExitRequest, SessionAccepted, SupervisorHeartbeat,
+    SupervisorHello, SupervisorMessage, TcpRelayTarget, gateway_message, relay_open,
+    supervisor_message,
 };
 use openshell_isolation_interface::contract::{BoundaryLoopbackConnector, LoopbackTarget};
 use openshell_ocsf::{
@@ -27,15 +28,36 @@ use openshell_ocsf::{
     SeverityId, StatusId, ocsf_emit,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::StreamExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use openshell_core::grpc_client;
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
+use crate::otlp::{RelayLifecycle, export_message};
+
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Capability name under which the supervisor offers OTLP relaying.
+const OTEL_EXPORT_CAPABILITY: &str = "otel_export";
+
+/// Final-drain request: the session acks on this sender once the OTLP
+/// receiver is stopped and the buffer is flushed onto the session stream.
+pub type DrainRequest = oneshot::Sender<()>;
+
+/// OTLP relay state handed to the session task.
+///
+/// The session owns the relay for the sandbox lifetime: it forwards buffered
+/// telemetry while the gateway has confirmed `otel_export`, and services one
+/// final drain request before the main-process exit is reported.
+pub struct TelemetryRelay {
+    /// Running relay: receiver handle and bounded buffer.
+    pub relay: RelayLifecycle,
+    /// Receives the final drain request from the access plane.
+    pub drain_rx: oneshot::Receiver<DrainRequest>,
+}
 
 /// Runtime identity and status channel shared with a supervisor session task.
 pub struct SessionRuntimeContext {
@@ -43,6 +65,27 @@ pub struct SessionRuntimeContext {
     pub instance_id: String,
     /// Publishes the currently accepted gateway session to sibling reporters.
     pub session_id_updates: Option<watch::Sender<Option<String>>>,
+    /// OTLP relay, when the supervisor started one.
+    pub telemetry: Option<TelemetryRelay>,
+}
+
+/// Capabilities the supervisor advertises in `SupervisorHello`.
+fn advertised_capabilities(relay_running: bool) -> Vec<String> {
+    if relay_running {
+        vec![OTEL_EXPORT_CAPABILITY.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Whether buffered telemetry may be forwarded on this session: the relay
+/// must be running and the gateway must have confirmed `otel_export`.
+fn otel_forwarding_active(relay_running: bool, accepted: &SessionAccepted) -> bool {
+    relay_running
+        && accepted
+            .capabilities
+            .iter()
+            .any(|capability| capability == OTEL_EXPORT_CAPABILITY)
 }
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
@@ -318,6 +361,7 @@ pub fn spawn_with_readiness(
         instance_id: runtime.instance_id,
         session_id_updates: runtime.session_id_updates,
         ready_tx,
+        telemetry: runtime.telemetry,
     };
     (tokio::spawn(run_session_loop(config)), ready_rx)
 }
@@ -333,16 +377,25 @@ struct SessionConfig {
     /// Publishes the currently accepted session to sibling control-plane reporters.
     session_id_updates: Option<watch::Sender<Option<String>>>,
     ready_tx: watch::Sender<bool>,
+    telemetry: Option<TelemetryRelay>,
 }
 
-async fn run_session_loop(config: SessionConfig) {
+async fn run_session_loop(mut config: SessionConfig) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
+
+    // The relay and the pending drain request live here, outside the
+    // reconnect loop, so the receiver and its buffer survive gateway
+    // reconnects instead of being re-created per session.
+    let (mut relay, mut drain_rx) = match config.telemetry.take() {
+        Some(TelemetryRelay { relay, drain_rx }) => (relay, Some(drain_rx)),
+        None => (RelayLifecycle::stopped(), None),
+    };
 
     loop {
         attempt += 1;
 
-        let result = run_single_session(&config).await;
+        let result = run_single_session(&config, &mut relay, &mut drain_rx).await;
         if let Some(updates) = &config.session_id_updates {
             updates.send_replace(None);
         }
@@ -375,6 +428,8 @@ async fn run_session_loop(config: SessionConfig) {
 
 async fn run_single_session(
     config: &SessionConfig,
+    relay: &mut RelayLifecycle,
+    drain_rx: &mut Option<oneshot::Receiver<DrainRequest>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -394,9 +449,8 @@ async fn run_single_session(
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
             sandbox_id: config.sandbox_id.clone(),
             instance_id: config.instance_id.clone(),
-            // Advertised once the supervisor-side relay lands; the gateway
-            // confirms only capabilities it can serve.
-            capabilities: Vec::new(),
+            // The gateway confirms only capabilities it can serve.
+            capabilities: advertised_capabilities(relay.is_running()),
             supports_provider_readiness: true,
         })),
     })
@@ -424,6 +478,16 @@ async fn run_single_session(
         _ => return Err("expected SessionAccepted or SessionRejected".into()),
     };
 
+    // Forwarding is gated per session on the negotiated capability. The
+    // receiver keeps serving either way; a declining session just leaves
+    // items in the bounded buffer until a later session confirms.
+    let mut otel_active = otel_forwarding_active(relay.is_running(), &accepted);
+    if otel_active {
+        info!("gateway confirmed otel_export capability; OTLP forwarding active");
+    } else if relay.is_running() {
+        debug!("gateway did not confirm otel_export; OTLP forwarding paused for this session");
+    }
+
     let heartbeat_secs = accepted
         .heartbeat_interval
         .as_ref()
@@ -441,12 +505,41 @@ async fn run_single_session(
     ocsf_emit!(event);
     config.ready_tx.send_replace(true);
 
-    // Main loop: receive gateway messages + send heartbeats.
+    // Main loop: receive gateway messages, send heartbeats, forward OTLP
+    // exports, and service the final telemetry drain request.
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
     heartbeat_interval.tick().await; // skip immediate tick
 
     loop {
         tokio::select! {
+            item = relay.next_item(), if otel_active => {
+                match item {
+                    Some(item) => {
+                        // Non-blocking on purpose: telemetry must never stall
+                        // control traffic on the shared outbound channel.
+                        if tx.try_send(export_message(&config.sandbox_id, item)).is_err() {
+                            debug!("OTEL relay: session channel full or closed, dropping message");
+                        }
+                    }
+                    None => otel_active = false,
+                }
+            }
+            request = async {
+                match drain_rx.as_mut() {
+                    Some(rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // A completed oneshot must not be polled again.
+                *drain_rx = None;
+                otel_active = false;
+                if let Ok(done_tx) = request {
+                    relay.stop_and_drain(&config.sandbox_id, &tx).await;
+                    let _ = done_tx.send(());
+                }
+                // Keep the session up: heartbeats and relays must continue
+                // until the gateway finalizes the main-process exit.
+            }
             msg = inbound.message() => {
                 let msg = match map_session_stream_message(
                     msg,
@@ -813,6 +906,48 @@ async fn open_tcp_target(
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
     Ok(Box::new(stream))
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+
+    fn accepted_with(capabilities: &[&str]) -> SessionAccepted {
+        SessionAccepted {
+            session_id: "s1".to_string(),
+            capabilities: capabilities.iter().map(|c| (*c).to_string()).collect(),
+            heartbeat_interval: None,
+        }
+    }
+
+    #[test]
+    fn otel_export_is_advertised_only_with_a_running_relay() {
+        assert_eq!(
+            advertised_capabilities(true),
+            vec!["otel_export".to_string()]
+        );
+        assert!(advertised_capabilities(false).is_empty());
+    }
+
+    #[test]
+    fn forwarding_requires_both_a_running_relay_and_gateway_confirmation() {
+        assert!(otel_forwarding_active(
+            true,
+            &accepted_with(&["otel_export"])
+        ));
+        assert!(
+            !otel_forwarding_active(true, &accepted_with(&[])),
+            "a declining gateway pauses forwarding"
+        );
+        assert!(
+            !otel_forwarding_active(false, &accepted_with(&["otel_export"])),
+            "a stopped relay never forwards, whatever the gateway says"
+        );
+        assert!(
+            !otel_forwarding_active(true, &accepted_with(&["metrics_export"])),
+            "only the exact capability name counts"
+        );
+    }
 }
 
 #[cfg(test)]

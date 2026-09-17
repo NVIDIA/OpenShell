@@ -3,8 +3,8 @@
 
 //! Supervisor-owned access-plane assembly for a remote sandbox.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use miette::Result;
@@ -13,9 +13,16 @@ use openshell_isolation_interface::contract::{
 };
 use openshell_ocsf::{ActivityId, AppLifecycleBuilder, SeverityId, StatusId, ocsf_emit};
 
+use crate::otlp::RelayLifecycle;
+use crate::supervisor_session::{DrainRequest, SessionRuntimeContext, TelemetryRelay};
+
 fn ocsf_ctx() -> &'static openshell_ocsf::EventContext {
     openshell_ocsf::ctx::ctx()
 }
+
+/// Upper bound on the final OTLP relay drain before the exit is reported, so
+/// an unreachable gateway cannot delay the exit report.
+pub const OTEL_FINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Supervisor-owned SSH and gateway-session tasks for a running sandbox.
 pub struct BoundaryAccess {
@@ -25,6 +32,8 @@ pub struct BoundaryAccess {
     session_task: Option<tokio::task::JoinHandle<()>>,
     session_readiness: Option<tokio::sync::watch::Receiver<bool>>,
     main_session: Option<Arc<crate::main_session::MainSession>>,
+    /// Sends the one-shot final drain request to the session task.
+    telemetry_drain: Mutex<Option<tokio::sync::oneshot::Sender<DrainRequest>>>,
 }
 
 impl BoundaryAccess {
@@ -32,6 +41,32 @@ impl BoundaryAccess {
     #[must_use]
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// Ask the session to stop the OTLP receiver and flush buffered telemetry
+    /// onto its stream. Returns when the session acks or `deadline` elapses.
+    /// A boundary without a relay or session returns at once. Only the first
+    /// call sends a request.
+    pub async fn drain_telemetry(&self, deadline: Duration) {
+        let request_tx = self
+            .telemetry_drain
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(request_tx) = request_tx else {
+            return;
+        };
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        if request_tx.send(done_tx).is_err() {
+            tracing::debug!("OTEL relay drain skipped: session task is gone");
+            return;
+        }
+        if tokio::time::timeout(deadline, done_rx).await.is_err() {
+            tracing::warn!(
+                ?deadline,
+                "OTEL relay final drain did not complete within deadline"
+            );
+        }
     }
 
     /// Observe whether the gateway has accepted the current supervisor
@@ -87,9 +122,13 @@ pub async fn start_boundary_access(
     port_forward: Arc<dyn BoundaryLoopbackConnector>,
     agent: Arc<dyn BoundaryProcess>,
     supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
+    telemetry: Option<RelayLifecycle>,
 ) -> Result<BoundaryAccess> {
     let instance_id = uuid::Uuid::new_v4().to_string();
     let terminating = Arc::new(AtomicBool::new(false));
+    // Without a gateway session the relay has nowhere to forward; dropping
+    // it here leaves the connection server accepting into a closed buffer,
+    // which counts drops and never blocks the workload.
     let Some(ssh_socket_path) = ssh_socket_path.map(std::path::PathBuf::from) else {
         return Ok(BoundaryAccess {
             instance_id,
@@ -98,6 +137,7 @@ pub async fn start_boundary_access(
             session_task: None,
             session_readiness: None,
             main_session: None,
+            telemetry_drain: Mutex::new(None),
         });
     };
 
@@ -154,8 +194,13 @@ pub async fn start_boundary_access(
         }
     }
 
-    let (session_task, session_readiness) = match (openshell_endpoint, sandbox_id) {
+    let (session_task, session_readiness, telemetry_drain) = match (openshell_endpoint, sandbox_id)
+    {
         (Some(endpoint), Some(id)) => {
+            let (telemetry, drain_tx) = telemetry.map_or((None, None), |relay| {
+                let (drain_tx, drain_rx) = tokio::sync::oneshot::channel();
+                (Some(TelemetryRelay { relay, drain_rx }), Some(drain_tx))
+            });
             let (task, mut accepted) = crate::supervisor_session::spawn_with_readiness(
                 endpoint.to_string(),
                 id.to_string(),
@@ -163,9 +208,10 @@ pub async fn start_boundary_access(
                 port_forward,
                 None,
                 terminating.clone(),
-                crate::supervisor_session::SessionRuntimeContext {
+                SessionRuntimeContext {
                     instance_id: instance_id.clone(),
                     session_id_updates: supervisor_session_updates,
+                    telemetry,
                 },
             );
             let accepted_result =
@@ -173,7 +219,7 @@ pub async fn start_boundary_access(
                     .await
                     .map(|result| result.map(|_| ()));
             match accepted_result {
-                Ok(Ok(())) => (Some(task), Some(accepted)),
+                Ok(Ok(())) => (Some(task), Some(accepted), drain_tx),
                 Ok(Err(_)) => {
                     task.abort();
                     return Err(miette::miette!(
@@ -188,7 +234,7 @@ pub async fn start_boundary_access(
                 }
             }
         }
-        _ => (None, None),
+        _ => (None, None, None),
     };
 
     Ok(BoundaryAccess {
@@ -198,6 +244,7 @@ pub async fn start_boundary_access(
         session_task,
         session_readiness,
         main_session: Some(main_session),
+        telemetry_drain: Mutex::new(telemetry_drain),
     })
 }
 
@@ -253,6 +300,20 @@ pub async fn finalize_main_process_exit(endpoint: &str, sandbox_id: &str, instan
 mod tests {
     use super::*;
 
+    fn access_with_drain(
+        drain: Option<tokio::sync::oneshot::Sender<DrainRequest>>,
+    ) -> BoundaryAccess {
+        BoundaryAccess {
+            instance_id: "instance".to_string(),
+            terminating: Arc::new(AtomicBool::new(false)),
+            ssh_task: None,
+            session_task: None,
+            session_readiness: None,
+            main_session: None,
+            telemetry_drain: Mutex::new(drain),
+        }
+    }
+
     #[tokio::test]
     async fn expected_post_exit_attachment_is_preserved_for_remote_main() {
         let main_session = crate::main_session::MainSession::inert();
@@ -263,6 +324,7 @@ mod tests {
             session_task: None,
             session_readiness: None,
             main_session: Some(main_session.clone()),
+            telemetry_drain: Mutex::new(None),
         };
 
         access.publish_main_exit(7, true).await;
@@ -271,5 +333,78 @@ mod tests {
             .begin_terminal_attachment()
             .expect("declared CLI attachment must remain valid after a fast remote main exits");
         main_session.end_terminal_attachment();
+    }
+
+    #[tokio::test]
+    async fn drain_telemetry_returns_at_once_without_a_relay() {
+        let access = access_with_drain(None);
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            access.drain_telemetry(Duration::from_secs(5)),
+        )
+        .await
+        .expect("no relay means nothing to wait for");
+    }
+
+    #[tokio::test]
+    async fn drain_telemetry_returns_at_once_when_the_session_is_gone() {
+        let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<DrainRequest>();
+        drop(drain_rx);
+        let access = access_with_drain(Some(drain_tx));
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            access.drain_telemetry(Duration::from_secs(5)),
+        )
+        .await
+        .expect("a dropped session receiver must not stall the exit path");
+    }
+
+    #[tokio::test]
+    async fn drain_telemetry_waits_for_the_session_ack_and_sends_once() {
+        let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<DrainRequest>();
+        let access = access_with_drain(Some(drain_tx));
+
+        let session = tokio::spawn(async move {
+            let done_tx = drain_rx.await.expect("drain request arrives");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = done_tx.send(());
+        });
+
+        let started = std::time::Instant::now();
+        access.drain_telemetry(Duration::from_secs(5)).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "drain waits for the session's ack"
+        );
+        session.await.unwrap();
+
+        // Second call finds the request already sent and returns immediately.
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            access.drain_telemetry(Duration::from_secs(5)),
+        )
+        .await
+        .expect("only the first call sends a request");
+    }
+
+    #[tokio::test]
+    async fn drain_telemetry_gives_up_at_the_deadline() {
+        let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<DrainRequest>();
+        let access = access_with_drain(Some(drain_tx));
+        // Hold the request open and never ack.
+        let held = tokio::spawn(async move {
+            let done_tx = drain_rx.await.expect("drain request arrives");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(done_tx);
+        });
+
+        let started = std::time::Instant::now();
+        access.drain_telemetry(Duration::from_millis(100)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(2),
+            "drain returns at the deadline, got {elapsed:?}"
+        );
+        held.abort();
     }
 }
