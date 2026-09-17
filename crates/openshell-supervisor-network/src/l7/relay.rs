@@ -9636,7 +9636,16 @@ network_policies:
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         for route_selected in [false, true] {
-            for version in ["2025-11-25", "2026-07-28"] {
+            // A shared allowlist must preserve the selected revision's request
+            // profile as well as its membership in the permitted revisions.
+            for (version, configured_versions) in [
+                ("2025-06-18", &["2025-06-18"][..]),
+                ("2025-11-25", &["2025-11-25"][..]),
+                ("2026-07-28", &["2026-07-28"][..]),
+                ("2025-11-25", &["2025-11-25", "2026-07-28"][..]),
+                ("2026-07-28", &["2025-11-25", "2026-07-28"][..]),
+            ] {
+                let configured_versions = serde_json::to_string(configured_versions).unwrap();
                 let sessionless = version == "2026-07-28";
                 let body_for = |name, arguments| {
                     let params = serde_json::json!({"name": name, "arguments": arguments});
@@ -9680,7 +9689,7 @@ network_policies:
         protocol: mcp
         enforcement: {enforcement}
         mcp:
-          versions: ["{version}"]
+          versions: {configured_versions}
         rules:
           - allow:
               method: tools/call
