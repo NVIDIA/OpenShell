@@ -90,11 +90,14 @@ attachment and delete its sandbox after the service exits.
 
 When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
 
-**Shortcut for known tools**: When the trailing command is a recognized tool, the CLI auto-creates the required provider from local credentials:
+Provider attachment is explicit. Name each provider with `--provider`; the
+trailing command does not select or attach one. If the named provider does not
+exist but a profile with that ID is available, the CLI can create it from local
+credentials:
 
 ```bash
-openshell sandbox create -- claude        # Auto-creates claude provider
-openshell sandbox create -- codex         # Auto-creates codex provider
+openshell sandbox create --provider claude-code -- claude
+openshell sandbox create --provider codex -- codex
 ```
 
 The agent will be prompted interactively if credentials are missing.

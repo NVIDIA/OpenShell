@@ -4399,6 +4399,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
+                request_id: String::new(),
                 name: "orphan-sandbox".to_string(),
                 spec: Some(SandboxSpec {
                     providers: vec!["orphan".to_string()],
@@ -4441,6 +4442,7 @@ mod tests {
         let err = handle_attach_sandbox_provider(
             &state,
             authed_request(AttachSandboxProviderRequest {
+                request_id: String::new(),
                 sandbox_name: "work".to_string(),
                 provider_name: "orphan".to_string(),
                 expected_resource_version: 0,

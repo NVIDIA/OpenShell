@@ -14967,6 +14967,7 @@ mod tests {
         let response = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(github),
                     source: "providers/github.yaml".to_string(),

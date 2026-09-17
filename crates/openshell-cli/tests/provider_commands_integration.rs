@@ -2173,7 +2173,7 @@ async fn provider_profile_permission_denial_preserves_safe_workspace_guidance() 
     seed_readiness_provider(&server).await;
     for (profile, failed_lookup, expected_lookups) in [
         ("openai", "openai", vec!["openai"]),
-        ("gh", "github", vec!["gh", "github"]),
+        ("github", "github", vec!["github"]),
     ] {
         server
             .state
@@ -2260,12 +2260,12 @@ async fn provider_profile_permission_denial_preserves_safe_workspace_guidance() 
 }
 
 #[tokio::test]
-async fn provider_readiness_update_redacts_exact_and_alias_profile_lookup_errors() {
+async fn provider_readiness_update_redacts_exact_profile_lookup_errors() {
     let server = run_server().await;
     seed_readiness_provider(&server).await;
     for (profile, failed_lookup, expected_lookups) in [
         ("openai", "openai", vec!["openai"]),
-        ("gh", "github", vec!["gh", "github"]),
+        ("github", "github", vec!["github"]),
     ] {
         server
             .state
