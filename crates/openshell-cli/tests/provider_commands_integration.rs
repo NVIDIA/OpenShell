@@ -82,6 +82,7 @@ struct ProviderState {
     scoped_profiles: Arc<Mutex<HashMap<(String, String), ProviderProfile>>>,
     refresh_statuses: Arc<Mutex<HashMap<(String, String), ProviderCredentialRefreshStatus>>>,
     refresh_requests: Arc<Mutex<Vec<ProviderRefreshRequestLog>>>,
+    provider_create_requests: Arc<AtomicU64>,
     provider_update_requests: Arc<Mutex<Vec<Provider>>>,
     deny_provider_reads: Arc<AtomicBool>,
     fail_provider_reads: Arc<AtomicBool>,
@@ -667,6 +668,9 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<CreateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
+        self.state
+            .provider_create_requests
+            .fetch_add(1, Ordering::SeqCst);
         let mut provider = request
             .into_inner()
             .provider
@@ -2160,6 +2164,98 @@ async fn provider_readiness_update_with_no_targets_preserves_saved_success() {
                 .is_empty()
         );
         assert!(server.state.readiness_requests.lock().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn provider_profile_permission_denial_preserves_safe_workspace_guidance() {
+    let server = run_server().await;
+    seed_readiness_provider(&server).await;
+    for (profile, failed_lookup, expected_lookups) in [
+        ("openai", "openai", vec!["openai"]),
+        ("gh", "github", vec!["gh", "github"]),
+    ] {
+        server
+            .state
+            .providers
+            .lock()
+            .await
+            .get_mut(READINESS_PROVIDER)
+            .expect("seeded provider")
+            .r#type = profile.to_string();
+        let mut errors = server.state.profile_read_errors.lock().await;
+        errors.clear();
+        errors.insert(failed_lookup.to_string(), Code::PermissionDenied);
+        drop(errors);
+        for args in [
+            vec![
+                "provider",
+                "create",
+                "--name",
+                "denied-new-provider",
+                "--type",
+                profile,
+                "--credential",
+                "OPENAI_API_KEY=fixture-provider-credential",
+            ],
+            vec![
+                "provider",
+                "update",
+                READINESS_PROVIDER,
+                "--from-existing",
+                "--wait",
+                "--output",
+                "json",
+            ],
+        ] {
+            server.state.profile_read_requests.lock().await.clear();
+            let output = run_readiness_cli(&server, &args).await;
+            assert!(!output.status.success(), "{args:?}");
+            assert!(output.stdout.is_empty());
+            assert_readiness_output_redacted(&output);
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            let compact: String = diagnostic
+                .chars()
+                .filter(|character| !character.is_whitespace() && *character != '│')
+                .collect();
+            assert!(
+                compact.contains("providerprofilelookupdenied"),
+                "{diagnostic}"
+            );
+            // The permission code supports recovery guidance without revealing
+            // backend text or inferring which membership or role check failed.
+            assert!(compact.contains("PERMISSION_DENIED"), "{diagnostic}");
+            assert!(
+                compact.contains("verifyworkspacemembershipandrequiredpermissions"),
+                "{diagnostic}"
+            );
+            assert!(!diagnostic.contains("unsupported provider type or profile"));
+            assert_eq!(
+                *server.state.profile_read_requests.lock().await,
+                expected_lookups
+            );
+            assert!(
+                !server
+                    .state
+                    .providers
+                    .lock()
+                    .await
+                    .contains_key("denied-new-provider")
+            );
+            assert_eq!(
+                server.state.provider_create_requests.load(Ordering::SeqCst),
+                0
+            );
+            assert!(
+                server
+                    .state
+                    .provider_update_requests
+                    .lock()
+                    .await
+                    .is_empty()
+            );
+            assert!(server.state.readiness_requests.lock().await.is_empty());
+        }
     }
 }
 

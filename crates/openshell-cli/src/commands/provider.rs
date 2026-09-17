@@ -757,6 +757,19 @@ async fn rollback_provider_create_after_gcloud_adc_failure(
     }
 }
 
+fn provider_profile_lookup_error(status: &Status) -> miette::Report {
+    // A permission code supports recovery guidance, but cannot distinguish a
+    // missing membership from an insufficient role. Never expose backend text.
+    if status.code() == Code::PermissionDenied {
+        miette!(
+            "provider profile lookup denied (PERMISSION_DENIED): \
+             verify workspace membership and required permissions"
+        )
+    } else {
+        miette!("provider profile lookup failed ({})", status.code())
+    }
+}
+
 async fn fetch_provider_profile(
     client: &mut crate::tls::GrpcClient,
     provider_type: &str,
@@ -781,16 +794,11 @@ async fn fetch_provider_profile(
                             "provider profile '{requested}' not found; import a matching profile before using this provider type"
                         )
                     } else {
-                        miette!("provider profile lookup failed ({})", fallback_status.code())
+                        provider_profile_lookup_error(&fallback_status)
                     }
                 })?
         }
-        Err(status) => {
-            return Err(miette!(
-                "provider profile lookup failed ({})",
-                status.code()
-            ));
-        }
+        Err(status) => return Err(provider_profile_lookup_error(&status)),
     };
 
     Ok(response)
@@ -1077,11 +1085,10 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
     if profile_id.is_empty() {
         return Err(miette::miette!("provider type is required"));
     }
-    let provider_profile = fetch_provider_profile(&mut client, profile_id, profile_workspace)
-        .await
-        .map_err(|err| {
-            miette::miette!("unsupported provider type or profile: {profile_id} ({err})")
-        })?;
+    // Lookup already distinguishes absent profiles from permission and transport
+    // failures; those failures do not establish that the profile is unsupported.
+    let provider_profile =
+        fetch_provider_profile(&mut client, profile_id, profile_workspace).await?;
     let provider_type = provider_profile.id.clone();
 
     let adc_credential_key = if from_gcloud_adc {
