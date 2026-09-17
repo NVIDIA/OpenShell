@@ -30,6 +30,9 @@ use tracing::info;
 pub fn ensure_sandbox_scope(principal: &Principal, claimed_sandbox_id: &str) -> Result<(), Status> {
     match principal {
         Principal::User(_) => Ok(()),
+        Principal::Peer(_) => Err(Status::permission_denied(
+            "gateway peer principals may not call sandbox-scoped methods",
+        )),
         Principal::Sandbox(p) => {
             if p.sandbox_id == claimed_sandbox_id {
                 Ok(())
@@ -84,7 +87,7 @@ pub fn ensure_sandbox_principal_scope(
             ensure_sandbox_scope(principal, claimed_sandbox_id)?;
             Ok(p.clone())
         }
-        Principal::User(_) => Err(Status::permission_denied(
+        Principal::User(_) | Principal::Peer(_) => Err(Status::permission_denied(
             "supervisor RPCs require a sandbox principal",
         )),
         Principal::Anonymous => Err(Status::unauthenticated(

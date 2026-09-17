@@ -408,7 +408,7 @@ async fn global_policy_update_waits_for_endpoint_report_guard() {
         let before = load_global_settings(state.store.as_ref())
             .await
             .expect("read settings before update");
-        let guard = state.compute.sandbox_sync_guard().await;
+        let guard = state.compute.sandbox_sync_guard().await.unwrap();
         let mut pending = Box::pin(handle_update_config(&state, authed_request(update)));
 
         // Poll the actual writer while an endpoint report owns the mutation

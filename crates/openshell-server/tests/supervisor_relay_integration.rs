@@ -23,7 +23,7 @@ use hyper_util::{
     server::conn::auto::Builder,
 };
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, SupervisorMessage, TcpForwardFrame,
+    GatewayMessage, PeerRelayFrame, RelayFrame, RelayInit, SupervisorMessage, TcpForwardFrame,
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
@@ -123,6 +123,16 @@ impl OpenShell for RelayGateway {
         &self,
         _request: tonic::Request<openshell_core::proto::DeleteSandboxTemplateRequest>,
     ) -> Result<Response<openshell_core::proto::DeleteSandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    type PeerRelayStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<PeerRelayFrame, Status>> + Send>>;
+
+    async fn peer_relay(
+        &self,
+        _: tonic::Request<tonic::Streaming<PeerRelayFrame>>,
+    ) -> Result<Response<Self::PeerRelayStream>, Status> {
         Err(Status::unimplemented("unused"))
     }
 

@@ -192,7 +192,7 @@ The most commonly changed values are:
 | Value | Purpose |
 |---|---|
 | `image.repository` / `image.tag` | Gateway container image. Defaults to `ghcr.io/nvidia/openshell/gateway:latest`. |
-| `replicaCount` | Number of gateway replicas. Leave at `1` unless you are explicitly testing multi-replica behavior. |
+| `replicaCount` | Number of gateway replicas. Values above `1` require shared PostgreSQL through `server.externalDbSecret`. |
 | `workload.kind` | Gateway workload controller. Use `statefulset` for SQLite or `deployment` with `server.externalDbSecret`. |
 | `workload.allowMultiReplicaStatefulSet` | Allow `replicaCount > 1` with `workload.kind=statefulset`. Prefer Deployment for external database-backed multi-replica gateways. |
 | `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
@@ -209,6 +209,24 @@ The most commonly changed values are:
 | `supervisor.sandboxRuntime.networkPolicyEnforced` | Required acknowledgement that the cluster CNI enforces ingress and egress `NetworkPolicy` in sandbox namespaces. |
 | `supervisor.sandboxRuntime.boundaryPort` | Non-privileged TLS port used between paired supervisor and sandbox Pods. |
 | `upstreamProxy` | Operator-owned corporate HTTP forward proxy for policy-approved TLS egress. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
+
+### Run multiple gateway replicas
+
+Use a Deployment and shared PostgreSQL for high availability:
+
+```yaml
+replicaCount: 2
+workload:
+  kind: deployment
+server:
+  externalDbSecret: openshell-postgres
+```
+
+The chart creates the peer Service, projected ServiceAccount identity, and RBAC
+that gateway replicas use to route exec, forwarding, file-sync, and service
+traffic to the replica holding the external supervisor's live session. Peer
+traffic uses the chart TLS materials when gateway TLS is enabled. Do not use
+the per-pod SQLite database with more than one replica.
 
 Use a values file for repeatable deployments:
 
