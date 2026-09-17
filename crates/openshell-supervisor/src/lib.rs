@@ -6754,8 +6754,17 @@ network_policies:
                 LocalPolicyIdentity::Required,
             )
         };
-        let (_, engine, proto, registry, origin, proposals, extension_authentication_enabled) =
-            startup().await.expect("load valid local policy");
+        let (
+            _,
+            engine,
+            proto,
+            registry,
+            origin,
+            proposals,
+            extension_authentication_enabled,
+            provider_credentials,
+        ) = startup().await.expect("load valid local policy");
+        assert!(provider_credentials.is_none());
         assert!(proto.is_none());
         assert!(matches!(origin, LoadedPolicyOrigin::LocalOverride));
         assert!(matches!(registry, MiddlewareRegistryStatus::Synchronized));
