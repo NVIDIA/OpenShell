@@ -2670,6 +2670,11 @@ fn prepare_startup_configuration(
             "Effective configuration admission rejected"
         ));
     }
+    if provider.readiness_reason != ProviderReadinessReason::Unspecified {
+        return Err(miette::miette!(
+            "Provider credentials are not ready for installation"
+        ));
+    }
     if snapshot.provider_env_revision != provider.provider_env_revision {
         return Err(miette::miette!(
             "Provider environment revision changed during configuration preparation"
@@ -4173,8 +4178,11 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         let recovering_rejected_policy = reloads_gateway_policy
             && rejected_policy_generation.is_some()
             && result.configuration_admitted;
-        let policy_runtime_changed = (reloads_gateway_policy && current_policy_generation.as_ref().is_some_and(PolicyGenerationGuard::is_stale))
-            || (reloads_gateway_policy && provider_env_changed)
+        let policy_runtime_changed = (reloads_gateway_policy
+            && (provider_env_changed
+                || current_policy_generation
+                    .as_ref()
+                    .is_some_and(PolicyGenerationGuard::is_stale)))
             || recovering_rejected_policy
             || extension_authentication_changed
             || gateway_policy_runtime_needs_reconciliation(
@@ -4276,17 +4284,35 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
 
         // Prepare the matching environment before activation. Failed refreshes
         // revoke static credentials while preserving independently bound dynamic grants.
+        let mut prepared_identity = None;
         let prepared_provider = if provider_env_changed {
-            let provider = match openshell_core::grpc_client::fetch_provider_environment(
-                &ctx.endpoint,
-                &ctx.sandbox_id,
-            )
-            .await
+            ctx.provider_readiness.credentials_failed(
+                desired_identity.clone(),
+                ProviderReadinessReason::WaitingForCredentials,
+            );
+            let provider = match client
+                .fetch_provider_environment(&ctx.endpoint, &ctx.sandbox_id)
+                .await
             {
-                Ok(provider) if provider.provider_env_revision == result.provider_env_revision => {
+                Ok(provider)
+                    if EnvironmentIdentity::from_environment(&provider) == desired_identity
+                        && provider.readiness_reason == ProviderReadinessReason::Unspecified =>
+                {
                     provider
                 }
-                _ => {
+                failed => {
+                    let reason = match failed {
+                        Ok(provider)
+                            if provider.readiness_reason
+                                != ProviderReadinessReason::Unspecified =>
+                        {
+                            provider.readiness_reason
+                        }
+                        Ok(_) => ProviderReadinessReason::SnapshotMismatch,
+                        Err(_) => ProviderReadinessReason::CredentialInstallFailed,
+                    };
+                    ctx.provider_readiness
+                        .credentials_failed(desired_identity.clone(), reason);
                     ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
                         .severity(SeverityId::High)
                         .status(StatusId::Failure)
@@ -4313,6 +4339,15 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 }
             };
             if let Ok(prepared) = prepare_provider_environment(&provider) {
+                prepared_identity = Some((
+                    EnvironmentIdentity::from_environment(&provider),
+                    provider
+                        .credential_expires_at_ms
+                        .values()
+                        .copied()
+                        .filter(|expiry| *expiry > 0)
+                        .min(),
+                ));
                 Some(prepared)
             } else {
                 ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -4321,6 +4356,10 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     .state(StateId::Disabled, "fail_closed")
                     .message("Provider environment bindings failed validation; static credentials were revoked and fetched dynamic grants remain active")
                     .build());
+                ctx.provider_readiness.credentials_failed(
+                    desired_identity.clone(),
+                    ProviderReadinessReason::CredentialInstallFailed,
+                );
                 // Repeat the rejected binding validation on the live state to
                 // revoke static material and retain the fetched dynamic grants.
                 let _ = ctx.provider_credentials.install_bound_environment(
@@ -4378,6 +4417,13 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             match runtime_result {
                 Ok(generation) => {
                     policy_runtime_reconciled = true;
+                    if let Some((identity, expires_at_ms)) = prepared_identity.as_ref() {
+                        ctx.provider_readiness.credentials_installed(
+                            identity.clone(),
+                            &ctx.provider_credentials,
+                            *expires_at_ms,
+                        );
+                    }
                     ctx.provider_readiness.policy_activated(
                         &desired_identity,
                         result.config_revision,
@@ -4574,6 +4620,13 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         }
         if !reloads_gateway_policy && let Some(prepared) = prepared_provider.as_ref() {
             ctx.provider_credentials.install_prepared(prepared);
+            if let Some((identity, expires_at_ms)) = prepared_identity.as_ref() {
+                ctx.provider_readiness.credentials_installed(
+                    identity.clone(),
+                    &ctx.provider_credentials,
+                    *expires_at_ms,
+                );
+            }
         }
         if provider_env_changed || policy_runtime_reconciled {
             current_provider_env_revision = result.provider_env_revision;
@@ -5482,6 +5535,9 @@ network_policies:
     fn startup_provider(revision: u64) -> openshell_core::grpc_client::ProviderEnvironmentResult {
         openshell_core::grpc_client::ProviderEnvironmentResult {
             provider_env_revision: revision,
+            provider_attachment_epoch: String::new(),
+            policy_hash: String::new(),
+            readiness_reason: ProviderReadinessReason::Unspecified,
             environment: std::collections::HashMap::new(),
             credential_expires_at_ms: std::collections::HashMap::new(),
             dynamic_credentials: std::collections::HashMap::new(),
@@ -5554,6 +5610,7 @@ network_policies:
             >,
         >,
         reports: UnboundedSender<(u32, bool, String)>,
+        environment_identity: Arc<std::sync::Mutex<EnvironmentIdentity>>,
     }
 
     #[tonic::async_trait]
@@ -5562,12 +5619,31 @@ network_policies:
             &self,
             _sandbox_id: &str,
         ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
-            self.polls
+            let result = self
+                .polls
                 .lock()
                 .await
                 .recv()
                 .await
-                .ok_or_else(|| miette::miette!("scripted policy poll channel closed"))
+                .ok_or_else(|| miette::miette!("scripted policy poll channel closed"))?;
+            *self.environment_identity.lock().unwrap() =
+                EnvironmentIdentity::from_settings(&result);
+            Ok(result)
+        }
+
+        async fn fetch_provider_environment(
+            &self,
+            _endpoint: &str,
+            _sandbox_id: &str,
+        ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
+            let identity = self.environment_identity.lock().unwrap().clone();
+            let mut provider = startup_provider(identity.revision);
+            provider.provider_attachment_epoch = identity.attachment_epoch;
+            provider.policy_hash = identity.policy_hash;
+            if provider.policy_hash.is_empty() {
+                provider.readiness_reason = ProviderReadinessReason::SnapshotMismatch;
+            }
+            Ok(provider)
         }
 
         async fn report_policy_status(
@@ -5600,6 +5676,16 @@ network_policies:
             sandbox_id: &str,
         ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
             self.inner.poll_settings(sandbox_id).await
+        }
+
+        async fn fetch_provider_environment(
+            &self,
+            endpoint: &str,
+            sandbox_id: &str,
+        ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
+            self.inner
+                .fetch_provider_environment(endpoint, sandbox_id)
+                .await
         }
 
         async fn report_policy_status(
@@ -5641,6 +5727,9 @@ network_policies:
             ScriptedPolicyGateway {
                 polls: Arc::new(tokio::sync::Mutex::new(poll_rx)),
                 reports: report_tx,
+                environment_identity: Arc::new(std::sync::Mutex::new(
+                    EnvironmentIdentity::default(),
+                )),
             },
             poll_tx,
             report_rx,
@@ -5889,6 +5978,16 @@ network_policies:
                     .enter_fail_closed("generation replaced while first poll was pending")?;
             }
             Ok(result)
+        }
+
+        async fn fetch_provider_environment(
+            &self,
+            endpoint: &str,
+            sandbox_id: &str,
+        ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
+            self.inner
+                .fetch_provider_environment(endpoint, sandbox_id)
+                .await
         }
 
         async fn report_policy_status(
@@ -6152,6 +6251,25 @@ network_policies:
         middleware_connector: MiddlewareConnector,
     ) -> PolicyPollLoopContext {
         let (workspace_tx, _workspace_rx) = tokio::sync::watch::channel(String::new());
+        let provider_credentials =
+            ProviderCredentialState::from_child_env_snapshot(0, std::collections::HashMap::new());
+        let provider_readiness = ProviderReadinessTracker::new();
+        // This fixture models a successfully installed initial launch snapshot.
+        if let LoadedPolicyOrigin::Gateway {
+            revision: Some(revision),
+            ..
+        } = &loaded_policy_origin
+        {
+            provider_readiness.credentials_installed(
+                EnvironmentIdentity {
+                    revision: 0,
+                    attachment_epoch: String::new(),
+                    policy_hash: revision.policy_hash.clone(),
+                },
+                &provider_credentials,
+                None,
+            );
+        }
         PolicyPollLoopContext {
             endpoint: String::new(),
             sandbox_id: "sandbox-test".to_string(),
@@ -6160,11 +6278,8 @@ network_policies:
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
             interval_secs: 0,
             ocsf_enabled: Arc::new(AtomicBool::new(false)),
-            provider_credentials: ProviderCredentialState::from_child_env_snapshot(
-                0,
-                std::collections::HashMap::new(),
-            ),
-            provider_readiness: ProviderReadinessTracker::new(),
+            provider_credentials,
+            provider_readiness,
             policy_local_ctx: None,
             agent_proposals: AgentProposals::default(),
             middleware_registry_status: MiddlewareRegistryStatus::Synchronized,

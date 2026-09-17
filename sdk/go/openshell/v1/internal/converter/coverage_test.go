@@ -128,8 +128,10 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 	}
 	// The instance ID coordinates internal gateway/supervisor lifecycle
 	// fencing. The first-activation marker governs static policy repair.
-	// Both are exposed only through the raw protobuf API.
-	skipped := fieldSet{"main_process_instance_id": true, "configuration_activated": true}
+	// Provisioning carries gateway-owned attempt, deadline, and cleanup state;
+	// the curated API exposes its outcome through phase and conditions. Detailed
+	// lifecycle bookkeeping remains available through the raw protobuf API.
+	skipped := fieldSet{"main_process_instance_id": true, "configuration_activated": true, "provisioning": true}
 
 	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, skipped)
 }

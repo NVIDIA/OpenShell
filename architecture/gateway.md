@@ -454,9 +454,9 @@ including deletion tombstones. Legacy values acquire stable source identities
 on read; a subsequent write preserves them. These clocks distinguish effective
 edits from no-op writes without treating status updates as configuration edits.
 With timestamp types, deletion outcomes, and optional mutation request IDs, the
-admission contract brings the public closure to 287 messages and 15 enums, the
-durable closure to 85 messages and 10 enums, and their overlap to 75 messages
-and 10 enums. Mutation request IDs extend public request fields without adding
+admission contract brings the public closure to 298 messages and 21 enums, the
+durable closure to 92 messages and 16 enums, and their overlap to 80 messages
+and 16 enums. Mutation request IDs extend public request fields without adding
 messages to these closures or changing the durable protobuf schema.
 
 | Dual-purpose encoded root | Current decision |
