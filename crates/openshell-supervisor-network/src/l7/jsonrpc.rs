@@ -403,7 +403,7 @@ fn request_accepts_sse(request: &L7Request) -> bool {
 /// Parse a JSON-RPC-family body using the endpoint's inspection mode.
 ///
 /// Mode-only MCP inspection accepts the bootstrap `initialize` request but
-/// rejects later requests until the negotiated revision is supplied through
+/// rejects later requests until the transport-selected request revision is supplied through
 /// [`parse_jsonrpc_body_with_options`].
 pub fn parse_jsonrpc_body(
     body: &[u8],
