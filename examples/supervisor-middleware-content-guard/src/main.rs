@@ -230,9 +230,9 @@ impl SupervisorMiddleware for ContentGuard {
 
     async fn describe(
         &self,
-        _request: Request<MiddlewareDescribeRequest>,
+        request: Request<MiddlewareDescribeRequest>,
     ) -> Result<Response<MiddlewareManifest>, Status> {
-        Ok(Response::new(MiddlewareManifest {
+        let manifest = MiddlewareManifest {
             name: MANIFEST_NAME.into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
             bindings: vec![
@@ -262,7 +262,15 @@ impl SupervisorMiddleware for ContentGuard {
                 openshell_core::VERSION,
                 [],
             )),
-        }))
+        };
+        openshell_core::extension_protocol::validate_gateway_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+            MANIFEST_NAME,
+            manifest.extension.as_ref(),
+            request.into_inner().gateway,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(manifest))
     }
 
     async fn validate_config(
@@ -686,7 +694,11 @@ mod tests {
     async fn manifest_advertises_request_response_and_websocket_bindings() {
         let manifest = SupervisorMiddleware::describe(
             &ContentGuard,
-            Request::new(MiddlewareDescribeRequest::default()),
+            Request::new(MiddlewareDescribeRequest {
+                gateway: Some(openshell_core::extension_protocol::gateway_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                )),
+            }),
         )
         .await
         .expect("describe")
@@ -807,6 +819,23 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn describe_rejects_missing_gateway_metadata() {
+        let error = SupervisorMiddleware::describe(
+            &ContentGuard,
+            Request::new(MiddlewareDescribeRequest::default()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .contains("gateway did not provide protocol metadata")
+        );
     }
 
     #[tokio::test]

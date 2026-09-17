@@ -736,11 +736,12 @@ placeholder generations from an earlier provider credential snapshot.
 
 All gateway-owned extension registries negotiate the same peer metadata envelope
 before accepting work. Compute drivers, credential drivers, gateway interceptors,
-and supervisor middleware retain their typed family manifests, while the shared
-validator enforces protocol-major compatibility and mutual required-capability
-sets. The gateway aggregates immutable, non-secret startup snapshots for the
-protected gateway-info API; it does not publish transport, authentication, or
-backend configuration.
+and supervisor middleware retain their typed family manifests. Both the gateway
+and extension run the shared validator against the startup exchange, enforcing
+protocol-major compatibility and mutual required-capability sets before either
+peer accepts the other. The gateway aggregates immutable, non-secret startup
+snapshots for the protected gateway-info API; it does not publish transport,
+authentication, or backend configuration.
 
 Static credential delivery is capability-negotiated and endpoint-bound. The
 gateway classifies each returned environment entry as either a credential or

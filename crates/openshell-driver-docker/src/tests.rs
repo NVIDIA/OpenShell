@@ -235,6 +235,23 @@ fn capabilities_report_static_resource_support() {
     assert!(gpu.count_selection_supported);
 }
 
+#[tokio::test]
+async fn capabilities_reject_missing_gateway_metadata() {
+    let driver = test_driver_with_config(runtime_config());
+
+    let error =
+        ComputeDriver::get_capabilities(&driver, Request::new(GetCapabilitiesRequest::default()))
+            .await
+            .unwrap_err();
+
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error
+            .message()
+            .contains("gateway did not provide protocol metadata")
+    );
+}
+
 type TestDriverClient =
     openshell_core::proto::compute::v1::compute_driver_client::ComputeDriverClient<
         tonic::transport::Channel,
@@ -297,7 +314,11 @@ async fn tracing_standalone_rpc_layer_propagates_context_and_records_errors() {
     let (mut client, shutdown, server) = standalone_traced_client().await;
 
     client
-        .get_capabilities(request_with_traceparent(GetCapabilitiesRequest::default()))
+        .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {
+            gateway: Some(openshell_core::extension_protocol::gateway_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::Compute,
+            )),
+        }))
         .await
         .expect("capabilities should succeed");
     client
@@ -450,9 +471,16 @@ async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
             otel.name = "openshell.compute.v1.ComputeDriver/GetCapabilities",
             otel.kind = "client"
         );
-        ComputeDriver::get_capabilities(&service, Request::new(GetCapabilitiesRequest::default()))
-            .instrument(gateway_span)
-            .await?;
+        ComputeDriver::get_capabilities(
+            &service,
+            Request::new(GetCapabilitiesRequest {
+                gateway: Some(openshell_core::extension_protocol::gateway_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                )),
+            }),
+        )
+        .instrument(gateway_span)
+        .await?;
 
         let unrelated = tracing::info_span!(
             target: "openshell_driver_kubernetes::compute",

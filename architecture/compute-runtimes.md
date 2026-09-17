@@ -119,7 +119,8 @@ image used by the gateway. GPU availability stays driver-local and is validated
 when a sandbox create request asks for GPU resources.
 
 The gateway sends its common extension peer metadata with the startup capability
-request and rejects a driver whose protocol major or capability requirements are
+request. The driver validates that metadata before responding, and the gateway
+rejects a driver whose protocol major or capability requirements are
 incompatible. It records the negotiated protocol, implementation identity and
 version, capability sets, and typed resource support once. Elevated gateway info
 reports that immutable snapshot instead of re-querying drivers on each request.
