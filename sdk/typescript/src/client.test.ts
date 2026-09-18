@@ -1642,7 +1642,8 @@ describe('raw escape hatch', () => {
       },
     });
     await sandbox.raw.updateConfig({
-      name: 'sb',
+      sandbox: 'sb',
+      workspace: 'default',
       mergeOperations: [
         {
           operation: {

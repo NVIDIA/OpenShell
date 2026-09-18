@@ -2808,11 +2808,8 @@ fn apply_sandbox_refresh(app: &mut App, sandboxes: Vec<openshell_core::proto::Sa
         .iter()
         .map(|s| {
             let name = s.object_name();
-            let forwards = openshell_core::forward::build_sandbox_notes(
-                s.object_workspace(),
-                name,
-                &forwards,
-            );
+            let forwards =
+                openshell_core::forward::build_sandbox_notes(s.object_workspace(), name, &forwards);
             sandbox_notes(s, forwards)
         })
         .collect();
