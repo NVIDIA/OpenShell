@@ -1793,6 +1793,52 @@ pub async fn validate_provider_environment_keys_unique(
     .await
 }
 
+/// Reject a sandbox composition whose providers name profiles this gateway does
+/// not serve.
+///
+/// Provider profiles are import-only, so a provider whose profile was never
+/// imported — or was deleted, or lives at a scope this workspace cannot see —
+/// resolves to nothing. Composing it silently would produce a sandbox that
+/// looks ready but carries none of the provider's credentials or policy, and
+/// the failure would surface later as a denied connection. Name the missing
+/// profile and the command that supplies it instead.
+pub async fn validate_provider_profiles_present(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
+    workspace: &str,
+    provider_names: &[String],
+) -> Result<(), Status> {
+    for name in provider_names {
+        let Some(provider) = store
+            .get_message_by_name::<Provider>(workspace, name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+        else {
+            continue;
+        };
+        if get_provider_type_profile_for_scope(
+            catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+        )
+        .is_some()
+        {
+            continue;
+        }
+        let requested = provider.r#type.trim();
+        let scope_flag = if provider.profile_workspace.trim().is_empty() {
+            " --global"
+        } else {
+            ""
+        };
+        return Err(Status::failed_precondition(format!(
+            "provider '{name}' references provider profile '{requested}', which is not in this gateway's profile catalog; \
+             import it with 'openshell provider profile import -f <file>{scope_flag}'"
+        )));
+    }
+    Ok(())
+}
+
 pub async fn validate_provider_environment_keys_unique_with_catalog(
     store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
@@ -1961,14 +2007,12 @@ fn inject_provider_plugin_environment(
     registry: &openshell_providers::ProviderRegistry,
     environment: &mut HashMap<String, String>,
 ) {
+    // A plugin activates only for a profile the gateway actually resolved. With
+    // no profile there is nothing to project.
     if let Some(profile) =
         get_provider_type_profile_for_scope(catalog, &provider.r#type, &provider.profile_workspace)
     {
         registry.inject_env_for_profile_id(provider, &profile.id, environment);
-    } else {
-        // Preserve config projection for legacy records when their profile
-        // source is temporarily unavailable.
-        registry.inject_env(provider, environment);
     }
 }
 
@@ -2291,7 +2335,7 @@ fn provider_credential_not_expired(provider: &Provider, key: &str, now_ms: i64) 
 }
 
 fn is_non_injectable_provider_credential(provider: &Provider, key: &str) -> bool {
-    normalize_provider_type(&provider.r#type) == Some("google-vertex-ai")
+    normalize_profile_id(&provider.r#type).as_deref() == Some("google-vertex-ai")
         && key == "GOOGLE_SERVICE_ACCOUNT_KEY"
 }
 
@@ -2340,8 +2384,8 @@ use openshell_core::spiffe::{
 };
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile,
-    normalize_profile_id, normalize_provider_type, strategy_output_env_key, strategy_output_spec,
-    strategy_primary_env_key, validate_profile_set,
+    normalize_profile_id, strategy_output_env_key, strategy_output_spec, strategy_primary_env_key,
+    validate_profile_set,
 };
 use std::sync::{Arc, LazyLock, RwLock};
 use tonic::{Request, Response};
@@ -3024,34 +3068,59 @@ pub(super) fn get_provider_type_profile_for_scope(
     catalog.get_type_profile_for_scope(id, profile_workspace)
 }
 
-/// Prevent a legacy alternate-upstream provider from binding its credential to
-/// the built-in public vendor endpoint. Alternate endpoints must be expressed
-/// by an explicitly imported endpoint-bearing profile.
+/// Whether a profile's endpoints apply to this provider.
+///
+/// A profile's endpoints are the boundary its credential is bound to. When a
+/// provider redirects its client to a different upstream — `OPENAI_BASE_URL`
+/// pointing somewhere other than the hosts the `openai` profile declares — the
+/// profile no longer describes where that credential goes. Treating it as if it
+/// did would bind the credential to hosts the workload never contacts while
+/// leaving the real upstream uncovered, so the profile is treated as
+/// endpointless instead: no policy layer, and the credential binds only through
+/// explicit sandbox policy.
+///
+/// A profile that declares no endpoints has no boundary to contradict.
 pub(super) fn provider_profile_endpoints_are_active(
     profile: &ProviderTypeProfile,
     provider: &Provider,
 ) -> bool {
-    if profile.source != "builtin" {
+    if profile.endpoints.is_empty() {
         return true;
     }
 
-    let (base_url_key, default_base_url) = match profile.id.as_str() {
-        "openai" => ("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        "anthropic" => ("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1"),
-        _ => return true,
-    };
-
     provider
         .config
-        .get(base_url_key)
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none_or(|configured| {
-            configured
-                .trim_end_matches('/')
-                .eq_ignore_ascii_case(default_base_url.trim_end_matches('/'))
+        .iter()
+        .filter(|(key, _)| is_upstream_base_url_key(key))
+        .filter_map(|(_, value)| configured_upstream_host(value))
+        .all(|host| {
+            profile.endpoints.iter().any(|endpoint| {
+                openshell_core::host_pattern::host_matches(&endpoint.host, &host).unwrap_or(false)
+            })
         })
+}
+
+/// Config keys that redirect a client to a different upstream.
+///
+/// `OpenShell` provider config spells these `<VENDOR>_BASE_URL` throughout —
+/// `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `VERTEX_AI_BASE_URL`.
+fn is_upstream_base_url_key(key: &str) -> bool {
+    key.to_ascii_uppercase().ends_with("_BASE_URL")
+}
+
+/// The host a configured base URL points at, if it names one.
+///
+/// A value that does not parse as an absolute URL with a host is not a
+/// redirect we can reason about, so it does not deactivate the profile.
+fn configured_upstream_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    url::Url::parse(value)
+        .ok()?
+        .host_str()
+        .map(str::to_ascii_lowercase)
 }
 
 #[cfg(test)]
@@ -3558,15 +3627,8 @@ async fn profile_attached_sandbox_diagnostics(
             else {
                 continue;
             };
-            let requested_profile_id = normalize_profile_id(&provider.r#type)
+            let profile_id = normalize_profile_id(&provider.r#type)
                 .unwrap_or_else(|| provider.r#type.trim().to_string());
-            let profile_id = if candidate_profiles.contains_key(&requested_profile_id) {
-                requested_profile_id
-            } else {
-                normalize_provider_type(&provider.r#type)
-                    .filter(|alias| candidate_profiles.contains_key(*alias))
-                    .map_or(requested_profile_id, str::to_string)
-            };
             let scope_mismatch = (is_platform_scope && !provider.profile_workspace.is_empty())
                 || (!is_platform_scope && provider.profile_workspace.is_empty());
             if scope_mismatch {
@@ -5023,19 +5085,20 @@ async fn provider_profile_for_name(
         .map(|provider| telemetry_provider_profile(&provider.r#type))
 }
 
+/// Bucket a provider type for telemetry.
+///
+/// Matches the profile ID exactly. Any ID without a bucket, including every
+/// operator-authored profile, reports as `Custom`.
 fn telemetry_provider_profile(provider_type: &str) -> TelemetryProviderProfile {
-    match normalize_provider_type(provider_type) {
+    match normalize_profile_id(provider_type).as_deref() {
         Some("anthropic") => TelemetryProviderProfile::Anthropic,
-        Some("claude" | "claude-code") => TelemetryProviderProfile::Claude,
+        Some("claude-code") => TelemetryProviderProfile::Claude,
         Some("codex") => TelemetryProviderProfile::Codex,
         Some("copilot") => TelemetryProviderProfile::Copilot,
         Some("deepinfra") => TelemetryProviderProfile::Deepinfra,
         Some("github") => TelemetryProviderProfile::Github,
-        Some("gitlab") => TelemetryProviderProfile::Gitlab,
         Some("nvidia") => TelemetryProviderProfile::Nvidia,
         Some("openai") => TelemetryProviderProfile::Openai,
-        Some("opencode") => TelemetryProviderProfile::Opencode,
-        Some("outlook") => TelemetryProviderProfile::Outlook,
         _ => TelemetryProviderProfile::Custom,
     }
 }
@@ -5049,9 +5112,28 @@ mod tests {
     use super::*;
     use crate::auth::identity::{Identity, IdentityProvider};
     use crate::auth::principal::{Principal, UserPrincipal};
-    use crate::grpc::test_support::{authed_request, test_server_state};
+    use crate::grpc::test_support::{
+        authed_request, test_server_state, test_server_state_without_provider_profiles,
+    };
     use crate::grpc::{MAX_MAP_KEY_LEN, MAX_PROVIDER_TYPE_LEN};
-    use crate::persistence::test_store;
+
+    /// An in-memory store with the example profiles imported at platform scope.
+    ///
+    /// Provider profiles are import-only, so a gateway resolves only what an
+    /// operator imported. Tests that expect `github`, `openai` or
+    /// `google-cloud` to resolve have to import them first.
+    async fn test_store() -> Store {
+        let store = crate::persistence::test_store().await;
+        for profile in openshell_providers::example_profiles::load_all() {
+            store
+                .put_message(&crate::provider_profile_sources::stored_provider_profile(
+                    profile.to_proto(),
+                ))
+                .await
+                .expect("store example provider profile");
+        }
+        store
+    }
     use openshell_core::proto::{
         AttachSandboxProviderRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
         CreateWorkspaceRequest, DeleteProviderProfileRequest, DeleteProviderRefreshRequest,
@@ -5140,19 +5222,33 @@ mod tests {
     #[test]
     fn telemetry_provider_profile_maps_unknown_to_custom() {
         assert_eq!(
-            telemetry_provider_profile("CLAUDE"),
+            telemetry_provider_profile("CLAUDE-CODE"),
             TelemetryProviderProfile::Claude
+        );
+        // A legacy alias is not a profile ID, so it buckets as custom.
+        assert_eq!(
+            telemetry_provider_profile("claude"),
+            TelemetryProviderProfile::Custom
         );
         assert_eq!(
             telemetry_provider_profile("github"),
             TelemetryProviderProfile::Github
         );
+        // Legacy aliases are not profile IDs.
         assert_eq!(
             telemetry_provider_profile("gh"),
-            TelemetryProviderProfile::Github
+            TelemetryProviderProfile::Custom
         );
         assert_eq!(
             telemetry_provider_profile("glab"),
+            TelemetryProviderProfile::Custom
+        );
+        assert_eq!(
+            telemetry_provider_profile("gitlab"),
+            TelemetryProviderProfile::Custom
+        );
+        assert_eq!(
+            telemetry_provider_profile("opencode"),
             TelemetryProviderProfile::Custom
         );
         assert_eq!(
@@ -5541,30 +5637,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_provider_profile_rejects_built_in_and_missing_profiles() {
-        let state = test_server_state().await;
+    async fn update_provider_profile_rejects_source_managed_and_missing_profiles() {
+        let state = test_server_state_with_source_managed_profile("vended-api").await;
 
-        let built_in = handle_update_provider_profiles(
+        let source_managed = handle_update_provider_profiles(
             &state,
             authed_request(UpdateProviderProfilesRequest {
                 request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
-                    profile: Some(custom_profile("github")),
-                    source: "github.yaml".to_string(),
+                    profile: Some(custom_profile("vended-api")),
+                    source: "vended-api.yaml".to_string(),
                 }),
                 expected_resource_version: 0,
-                id: "github".to_string(),
+                id: "vended-api".to_string(),
                 workspace: "default".to_string(),
             }),
         )
         .await
         .unwrap()
         .into_inner();
-        assert!(!built_in.updated);
-        assert!(built_in.diagnostics.iter().any(|diagnostic| {
+        assert!(!source_managed.updated);
+        assert!(source_managed.diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .message
-                .contains("managed by source 'builtin' and cannot be updated")
+                .contains("managed by source 'test' and cannot be updated")
         }));
 
         let missing = handle_update_provider_profiles(
@@ -5784,6 +5880,103 @@ mod tests {
         }));
     }
 
+    fn provider_with_config(provider_type: &str, config: &[(&str, &str)]) -> Provider {
+        Provider {
+            r#type: provider_type.to_string(),
+            config: config
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn profile_endpoints_stay_active_for_declared_upstreams() {
+        let openai = openshell_providers::example_profiles::load("openai");
+
+        assert!(provider_profile_endpoints_are_active(
+            &openai,
+            &provider_with_config("openai", &[])
+        ));
+        assert!(provider_profile_endpoints_are_active(
+            &openai,
+            &provider_with_config(
+                "openai",
+                &[("OPENAI_BASE_URL", "https://api.openai.com/v1")]
+            )
+        ));
+        // An empty value is not a redirect.
+        assert!(provider_profile_endpoints_are_active(
+            &openai,
+            &provider_with_config("openai", &[("OPENAI_BASE_URL", "   ")])
+        ));
+        // Neither is a value that names no host.
+        assert!(provider_profile_endpoints_are_active(
+            &openai,
+            &provider_with_config("openai", &[("OPENAI_BASE_URL", "not-a-url")])
+        ));
+    }
+
+    #[test]
+    fn profile_endpoints_deactivate_for_an_undeclared_upstream() {
+        let openai = openshell_providers::example_profiles::load("openai");
+        assert!(!provider_profile_endpoints_are_active(
+            &openai,
+            &provider_with_config(
+                "openai",
+                &[("OPENAI_BASE_URL", "https://api.example.com/v1")]
+            )
+        ));
+
+        // The rule is not keyed on the profile ID: it applies to any
+        // endpoint-bearing profile, including an operator's own.
+        let mut mine = openai;
+        mine.id = "my-inference".to_string();
+        assert!(!provider_profile_endpoints_are_active(
+            &mine,
+            &provider_with_config(
+                "my-inference",
+                &[("MY_INFERENCE_BASE_URL", "https://elsewhere.example.com")]
+            )
+        ));
+    }
+
+    #[test]
+    fn profile_endpoints_honor_wildcard_hosts() {
+        let vertex = openshell_providers::example_profiles::load("google-vertex-ai");
+        assert!(provider_profile_endpoints_are_active(
+            &vertex,
+            &provider_with_config(
+                "google-vertex-ai",
+                &[(
+                    "VERTEX_AI_BASE_URL",
+                    "https://us-central1-aiplatform.googleapis.com/v1"
+                )]
+            )
+        ));
+        assert!(!provider_profile_endpoints_are_active(
+            &vertex,
+            &provider_with_config(
+                "google-vertex-ai",
+                &[("VERTEX_AI_BASE_URL", "https://aiplatform.example.com/v1")]
+            )
+        ));
+    }
+
+    #[test]
+    fn a_profile_without_endpoints_has_no_boundary_to_contradict() {
+        let google_cloud = openshell_providers::example_profiles::load("google-cloud");
+        assert!(google_cloud.endpoints.is_empty());
+        assert!(provider_profile_endpoints_are_active(
+            &google_cloud,
+            &provider_with_config(
+                "google-cloud",
+                &[("GCP_BASE_URL", "https://anything.example.com")]
+            )
+        ));
+    }
+
     fn provider_with_values(name: &str, provider_type: &str) -> Provider {
         Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -5868,6 +6061,20 @@ mod tests {
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         }
+    }
+
+    /// A test state whose catalog carries one source-managed profile beside the
+    /// user-managed source.
+    ///
+    /// Provider profiles are import-only, so the only profiles a gateway cannot
+    /// edit are the ones a non-user source vends. This models that shape.
+    async fn test_server_state_with_source_managed_profile(id: &str) -> Arc<ServerState> {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .expect("test server state should be uniquely owned")
+            .provider_profile_sources =
+            ProviderProfileSources::from_test_profiles_with_user_source(vec![custom_profile(id)]);
+        state
     }
 
     fn custom_profile(id: &str) -> ProviderProfile {
@@ -6436,15 +6643,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn import_provider_profile_rejects_builtin_overwrite() {
-        let state = test_server_state().await;
+    async fn import_provider_profile_rejects_source_managed_overwrite() {
+        let state = test_server_state_with_source_managed_profile("vended-api").await;
         let response = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
                 request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
-                    profile: Some(custom_profile("github")),
-                    source: "github.yaml".to_string(),
+                    profile: Some(custom_profile("vended-api")),
+                    source: "vended-api.yaml".to_string(),
                 }],
                 workspace: "default".to_string(),
             }),
@@ -6458,7 +6665,7 @@ mod tests {
             response
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains("managed by source 'builtin'"))
+                .any(|diagnostic| diagnostic.message.contains("managed by source 'test'"))
         );
     }
 
@@ -6842,8 +7049,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_provider_profile_rejects_builtin_and_provider_referenced_profiles() {
-        let state = test_server_state().await;
+    async fn delete_provider_profile_rejects_source_managed_and_provider_referenced_profiles() {
+        let state = test_server_state_with_source_managed_profile("vended-api").await;
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
@@ -6858,18 +7065,18 @@ mod tests {
         .await
         .unwrap();
 
-        let builtin_err = handle_delete_provider_profile(
+        let source_managed_err = handle_delete_provider_profile(
             &state,
             authed_request(DeleteProviderProfileRequest {
                 request_id: String::new(),
                 allow_missing: false,
-                id: "github".to_string(),
+                id: "vended-api".to_string(),
                 workspace: "default".to_string(),
             }),
         )
         .await
         .unwrap_err();
-        assert_eq!(builtin_err.code(), Code::FailedPrecondition);
+        assert_eq!(source_managed_err.code(), Code::FailedPrecondition);
 
         create_provider_record(
             state.store.as_ref(),
@@ -10531,7 +10738,7 @@ mod tests {
                 workspace: "default".to_string(),
                 deletion_time: None,
             }),
-            r#type: "claude".to_string(),
+            r#type: "claude-code".to_string(),
             credentials: [
                 ("ANTHROPIC_API_KEY".to_string(), "sk-abc".to_string()),
                 ("CLAUDE_API_KEY".to_string(), "sk-abc".to_string()),
@@ -13870,7 +14077,11 @@ mod tests {
         use openshell_core::google_cloud;
         let provider = google_cloud_provider(HashMap::new());
         let mut env = HashMap::new();
-        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
+            &provider,
+            &provider.r#type,
+            &mut env,
+        );
         assert_eq!(
             env.get("GCE_METADATA_HOST").map(String::as_str),
             Some(google_cloud::METADATA_HOST),
@@ -13889,7 +14100,11 @@ mod tests {
             "my-project".to_string(),
         )]));
         let mut env = HashMap::new();
-        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
+            &provider,
+            &provider.r#type,
+            &mut env,
+        );
         for var in google_cloud::PROJECT_ID_ENV_VARS {
             assert_eq!(
                 env.get(*var).map(String::as_str),
@@ -13907,7 +14122,11 @@ mod tests {
             "us-central1".to_string(),
         )]));
         let mut env = HashMap::new();
-        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
+            &provider,
+            &provider.r#type,
+            &mut env,
+        );
         for var in google_cloud::REGION_ENV_VARS {
             assert_eq!(
                 env.get(*var).map(String::as_str),
@@ -13925,7 +14144,11 @@ mod tests {
             "sa@proj.iam.gserviceaccount.com".to_string(),
         )]));
         let mut env = HashMap::new();
-        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
+            &provider,
+            &provider.r#type,
+            &mut env,
+        );
         for var in google_cloud::SERVICE_ACCOUNT_EMAIL_ENV_VARS {
             assert_eq!(
                 env.get(*var).map(String::as_str),
@@ -13942,7 +14165,11 @@ mod tests {
             "from-config".to_string(),
         )]));
         let mut env = HashMap::from([("GCP_PROJECT_ID".to_string(), "user-override".to_string())]);
-        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
+            &provider,
+            &provider.r#type,
+            &mut env,
+        );
         assert_eq!(
             env.get("GCP_PROJECT_ID").map(String::as_str),
             Some("user-override"),
@@ -13971,7 +14198,11 @@ mod tests {
             credential_handles: HashMap::new(),
         };
         let mut env = HashMap::new();
-        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
+            &provider,
+            &provider.r#type,
+            &mut env,
+        );
         assert!(
             env.is_empty(),
             "non-GCP provider should not inject any env vars"
@@ -14709,6 +14940,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_gateway_with_nothing_imported_serves_an_empty_catalog() {
+        let state = test_server_state_without_provider_profiles().await;
+
+        let response = handle_list_provider_profiles(
+            &state,
+            authed_request(ListProviderProfilesRequest {
+                page_size: 200,
+                page_token: String::new(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect("an empty catalog is a valid state, not an error")
+        .into_inner();
+
+        assert!(response.profiles.is_empty());
+        assert!(response.next_page_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn importing_an_example_profile_registers_it_at_its_canonical_id() {
+        let state = test_server_state_without_provider_profiles().await;
+        let github = openshell_providers::example_profiles::load("github").to_proto();
+
+        let response = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(github),
+                    source: "providers/github.yaml".to_string(),
+                }],
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .expect("import at platform scope")
+        .into_inner();
+        assert!(response.imported, "{:?}", response.diagnostics);
+
+        let stored = handle_get_provider_profile(
+            &state,
+            authed_request(GetProviderProfileRequest {
+                id: "github".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect("imported profile resolves at its canonical id")
+        .into_inner()
+        .profile
+        .expect("profile payload");
+
+        assert_eq!(stored.id, "github");
+        assert_eq!(stored.source, "user");
+        assert_eq!(stored.scope, "platform");
+
+        // The imported profile is the only definition for that id: nothing is
+        // shadowed behind it, so it is editable and deletable.
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .expect("catalog snapshot");
+        assert_eq!(catalog.static_source_for_profile("github"), None);
+        assert_eq!(
+            catalog
+                .list_all_scoped_profiles()
+                .iter()
+                .filter(|(_, profile)| profile.id == "github")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn list_profiles_shows_source_and_scope() {
         let state = test_server_state().await;
 
@@ -14746,12 +15053,13 @@ mod tests {
         assert_eq!(user_profile.source, "user");
         assert_eq!(user_profile.scope, "workspace");
 
-        let builtin = resp
+        let platform_profile = resp
             .profiles
             .iter()
-            .find(|p| p.source == "builtin")
-            .expect("builtin profiles should appear");
-        assert!(builtin.scope.is_empty());
+            .find(|p| p.id == "github")
+            .expect("imported platform profile should appear in list");
+        assert_eq!(platform_profile.source, "user");
+        assert_eq!(platform_profile.scope, "platform");
     }
 
     #[tokio::test]

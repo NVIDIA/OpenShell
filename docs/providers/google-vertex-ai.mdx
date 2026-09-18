@@ -24,6 +24,14 @@ native Vertex endpoint and request format for its selected model.
 
 ## Create a Provider
 
+Import the `google-vertex-ai` profile first; a gateway serves only the profiles you
+imported:
+
+```shell
+curl -LsSfO https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/google-vertex-ai.yaml
+openshell provider profile import -f google-vertex-ai.yaml --global
+```
+
 ### Service Account Key
 
 Create the provider with the JSON key as gateway-only bootstrap material:

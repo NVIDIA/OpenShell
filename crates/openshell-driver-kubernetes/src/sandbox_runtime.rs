@@ -43,6 +43,7 @@ pub const PROXY_CA_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/proxy-ca.key
 pub const CONTROL_HEALTH_SOCKET_PATH: &str = "/run/openshell/health.sock";
 pub const NAMESPACE_WORKLOAD_POLICY_NAME: &str = "openshell-sandbox-workloads";
 pub const NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME: &str = "openshell-sandbox-supervisors";
+pub const SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS: i64 = 30;
 
 pub struct ProxyCaMaterial {
     pub certificate_pem: String,
@@ -389,6 +390,7 @@ pub fn supervisor_pod(
             ..Default::default()
         },
         spec: Some(PodSpec {
+            termination_grace_period_seconds: Some(SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS),
             service_account_name: Some(service_account_name.to_string()),
             image_pull_secrets: Some(
                 image_pull_secrets
@@ -656,6 +658,10 @@ mod tests {
         assert_eq!(container.image_pull_policy.as_deref(), Some("IfNotPresent"));
         assert_eq!(pod_spec.automount_service_account_token, Some(false));
         assert_eq!(pod_spec.restart_policy.as_deref(), Some("Never"));
+        assert_eq!(
+            pod_spec.termination_grace_period_seconds,
+            Some(SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS)
+        );
         assert_eq!(
             pod_spec
                 .scheduling_gates

@@ -407,7 +407,6 @@ jobs:
           cat openshell-supervisor-checksums-sha256.txt
 
       - name: Generate Homebrew formula
-        if: needs.compute-versions.outputs.is_prerelease != 'true'
         run: |
           set -euo pipefail
           python3 tasks/scripts/release.py generate-homebrew-formula \
@@ -493,12 +492,64 @@ jobs:
             release/openshell-supervisor-checksums-sha256.txt
             release/openshell-prover-checksums-sha256.txt
 
-      - name: Upload pre-release artifacts
+      - name: Upload amd64 Debian prerelease package
         if: needs.compute-versions.outputs.is_prerelease == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: openshell-${{ env.RELEASE_TAG }}
-          path: release/
+          name: openshell-${{ env.RELEASE_TAG }}-linux-amd64-deb
+          path: |
+            release/openshell_*_amd64.deb
+            release/openshell-checksums-sha256.txt
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload arm64 Debian prerelease package
+        if: needs.compute-versions.outputs.is_prerelease == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openshell-${{ env.RELEASE_TAG }}-linux-arm64-deb
+          path: |
+            release/openshell_*_arm64.deb
+            release/openshell-checksums-sha256.txt
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload x86_64 RPM prerelease packages
+        if: needs.compute-versions.outputs.is_prerelease == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openshell-${{ env.RELEASE_TAG }}-linux-x86_64-rpm
+          path: |
+            release/openshell-*.x86_64.rpm
+            release/openshell-checksums-sha256.txt
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload aarch64 RPM prerelease packages
+        if: needs.compute-versions.outputs.is_prerelease == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openshell-${{ env.RELEASE_TAG }}-linux-aarch64-rpm
+          path: |
+            release/openshell-*.aarch64.rpm
+            release/openshell-checksums-sha256.txt
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload macOS prerelease packages
+        if: needs.compute-versions.outputs.is_prerelease == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openshell-${{ env.RELEASE_TAG }}-macos-arm64
+          path: |
+            release/openshell-aarch64-apple-darwin.tar.gz
+            release/openshell-gateway-aarch64-apple-darwin.tar.gz
+            release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
+            release/openshell-prover-aarch64-apple-darwin.tar.gz
+            release/openshell.rb
+            release/openshell-checksums-sha256.txt
+            release/openshell-gateway-checksums-sha256.txt
+            release/openshell-prover-checksums-sha256.txt
           retention-days: 90
           if-no-files-found: error
 

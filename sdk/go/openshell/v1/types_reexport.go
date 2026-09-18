@@ -50,6 +50,9 @@ type RemoveNetworkRule = types.RemoveNetworkRule
 // AddDenyRules appends layer-7 deny rules to a specific endpoint.
 type AddDenyRules = types.AddDenyRules
 
+// L7RuleTarget identifies an endpoint and declares its complete affected scope.
+type L7RuleTarget = types.L7RuleTarget
+
 // AddAllowRules appends layer-7 allow rules to a specific endpoint.
 type AddAllowRules = types.AddAllowRules
 

@@ -5,6 +5,7 @@ package converter
 
 import (
 	"fmt"
+	"slices"
 
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
@@ -258,8 +259,7 @@ func PolicyMergeOperationToProto(op *v1.PolicyMergeOperation) (*pb.PolicyMergeOp
 		}
 		pmo.Operation = &pb.PolicyMergeOperation_AddDenyRules{
 			AddDenyRules: &pb.AddDenyRules{
-				Host:      op.AddDenyRules.Host,
-				Port:      op.AddDenyRules.Port,
+				Target:    l7RuleTargetToProto(op.AddDenyRules.Target),
 				DenyRules: denyRules,
 			},
 		}
@@ -273,9 +273,8 @@ func PolicyMergeOperationToProto(op *v1.PolicyMergeOperation) (*pb.PolicyMergeOp
 		}
 		pmo.Operation = &pb.PolicyMergeOperation_AddAllowRules{
 			AddAllowRules: &pb.AddAllowRules{
-				Host:  op.AddAllowRules.Host,
-				Port:  op.AddAllowRules.Port,
-				Rules: rules,
+				Target: l7RuleTargetToProto(op.AddAllowRules.Target),
+				Rules:  rules,
 			},
 		}
 	case op.RemoveBinary != nil:
@@ -287,6 +286,33 @@ func PolicyMergeOperationToProto(op *v1.PolicyMergeOperation) (*pb.PolicyMergeOp
 		}
 	}
 	return pmo, nil
+}
+
+// l7RuleTargetToProto preserves the caller's declaration without inferring scope.
+// The gateway rejects missing or mismatched scope against the current policy.
+func l7RuleTargetToProto(target *v1.L7RuleTarget) *pb.L7RuleTarget {
+	if target == nil {
+		return nil
+	}
+	result := &pb.L7RuleTarget{
+		RuleName:  target.RuleName,
+		Host:      target.Host,
+		Ports:     slices.Clone(target.Ports),
+		AnyBinary: target.AnyBinary,
+	}
+	// Copy optional presence as well as value: an empty path selects an
+	// unscoped endpoint, while nil leaves path disambiguation to the gateway.
+	if target.Path != nil {
+		path := *target.Path
+		result.Path = &path
+	}
+	if target.Binaries != nil {
+		result.Binaries = make([]*sbv1.NetworkBinary, len(target.Binaries))
+		for i, binary := range target.Binaries {
+			result.Binaries[i] = &sbv1.NetworkBinary{Path: binary.Path}
+		}
+	}
+	return result
 }
 
 // --- ConfigUpdateResult ---

@@ -1250,11 +1250,7 @@ impl PodmanComputeDriver {
     )]
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let container = self
-            .find_container(sandbox_id)
-            .await?
-            .ok_or(ComputeDriverError::NotFound)?;
-        let container_id = container.id;
+        let container = self.find_container(sandbox_id).await?;
         let supervisor = crate::isolation::supervisor_name(sandbox_id);
         match self
             .client
@@ -1264,6 +1260,8 @@ impl PodmanComputeDriver {
             Ok(()) | Err(PodmanApiError::NotFound(_)) => {}
             Err(error) => return Err(error.into()),
         }
+        let container = container.ok_or(ComputeDriverError::NotFound)?;
+        let container_id = container.id;
         if container.state == "stopping" {
             let result = async {
                 let finished_at = self
@@ -2011,6 +2009,24 @@ mod tests {
     fn podman_driver_error_from_not_found() {
         let err = ComputeDriverError::from(PodmanApiError::NotFound("gone".into()));
         assert!(matches!(err, ComputeDriverError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn stop_missing_workload_still_reclaims_supervisor() {
+        let (socket, requests, handle) = spawn_podman_stub(
+            "stop-orphan-supervisor",
+            vec![
+                StubResponse::new(StatusCode::OK, "[]"),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+            ],
+        );
+        let result = test_driver(socket).stop_sandbox("sandbox-1").await;
+        assert!(matches!(result, Err(ComputeDriverError::NotFound)));
+        handle.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("/stop?timeout=10"));
+        assert!(requests[1].contains(&crate::isolation::supervisor_name("sandbox-1")));
     }
 
     #[tokio::test]

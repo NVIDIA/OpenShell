@@ -3,7 +3,7 @@
 
 //! Configuration management for `OpenShell` components.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -473,15 +473,44 @@ pub enum GatewayInterceptorBindingPolicy {
 }
 
 /// One configured source in the gateway's effective provider-profile catalog.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Deserialization is hand-written so that the removed `builtin` source is
+/// recognized and rejected with the migration step, rather than reported as an
+/// unknown variant.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayProviderProfileSourceConfig {
-    /// Profiles bundled with the `OpenShell` build.
-    Builtin,
     /// Profiles managed through the provider profile mutation APIs.
     User,
     /// Profiles vended by a configured gateway interceptor instance.
     Interceptor { name: String },
+}
+
+pub(crate) const BUILTIN_PROFILE_SOURCE_REMOVED: &str = "provider profile source type \"builtin\" was removed: provider profiles are import-only. \
+     Remove the entry and import the profiles this gateway needs with \
+     'openshell provider profile import --from providers --global'";
+
+impl<'de> Deserialize<'de> for GatewayProviderProfileSourceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        /// Mirrors the public shape, plus the retired `builtin` tag so it can be
+        /// named in the error instead of surfacing as an unknown variant.
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum Shadow {
+            Builtin,
+            User,
+            Interceptor { name: String },
+        }
+
+        match Shadow::deserialize(deserializer)? {
+            Shadow::Builtin => Err(de::Error::custom(BUILTIN_PROFILE_SOURCE_REMOVED)),
+            Shadow::User => Ok(Self::User),
+            Shadow::Interceptor { name } => Ok(Self::Interceptor { name }),
+        }
+    }
 }
 
 /// Failure behavior when an interceptor evaluation cannot produce a valid
@@ -678,10 +707,10 @@ impl Serialize for AppArmorProfile {
 impl<'de> Deserialize<'de> for AppArmorProfile {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Self::from_str(&value).map_err(serde::de::Error::custom)
+        Self::from_str(&value).map_err(de::Error::custom)
     }
 }
 
@@ -814,10 +843,7 @@ impl Config {
             oidc: None,
             auth: GatewayAuthConfig::default(),
             gateway_interceptors: Vec::new(),
-            provider_profile_sources: vec![
-                GatewayProviderProfileSourceConfig::Builtin,
-                GatewayProviderProfileSourceConfig::User,
-            ],
+            provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),
@@ -1124,14 +1150,42 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_to_builtin_and_user_provider_profile_sources() {
+    fn config_defaults_to_the_user_provider_profile_source() {
         let cfg = Config::new(None);
         assert_eq!(
             cfg.provider_profile_sources,
-            vec![
-                GatewayProviderProfileSourceConfig::Builtin,
-                GatewayProviderProfileSourceConfig::User,
-            ]
+            vec![GatewayProviderProfileSourceConfig::User]
+        );
+    }
+
+    #[test]
+    fn builtin_provider_profile_source_is_rejected_with_the_import_step() {
+        let error =
+            serde_json::from_str::<GatewayProviderProfileSourceConfig>(r#"{"type":"builtin"}"#)
+                .expect_err("the builtin source was removed");
+        let message = error.to_string();
+        assert!(message.contains("import-only"), "{message}");
+        assert!(
+            message.contains("openshell provider profile import"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn user_and_interceptor_provider_profile_sources_still_parse() {
+        assert_eq!(
+            serde_json::from_str::<GatewayProviderProfileSourceConfig>(r#"{"type":"user"}"#)
+                .unwrap(),
+            GatewayProviderProfileSourceConfig::User
+        );
+        assert_eq!(
+            serde_json::from_str::<GatewayProviderProfileSourceConfig>(
+                r#"{"type":"interceptor","name":"governance"}"#
+            )
+            .unwrap(),
+            GatewayProviderProfileSourceConfig::Interceptor {
+                name: "governance".to_string()
+            }
         );
     }
 

@@ -1,6 +1,33 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/aws-s3.yaml
+#   openshell provider profile import -f providers/aws-s3.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   python, python3, curl, aws, bash.
+# Reference layout:  the venv and uv paths below (/sandbox/.venv,
+#                    /sandbox/.uv/python) are OpenShell Community image paths,
+#                    and /usr/local/bin/aws assumes the AWS CLI v2 installer.
+#                    Edit `binaries` to match your image before importing.
+#                    `binaries` also matches a process's ancestors, so the
+#                    /bin/bash entry reaches every process descended from a
+#                    shell — far broader than the other entries. Review it
+#                    against your workload before importing.
+# Credential scope:  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and
+#                    AWS_SESSION_TOKEN, minted by the gateway with one STS
+#                    AssumeRole call. The proxy re-signs requests with SigV4 for
+#                    the s3 service, so the sandbox never holds a usable
+#                    long-lived key.
+# Endpoint access:   the S3 regional, dualstack and virtual-hosted-style hosts,
+#                    read-write, TLS terminated for SigV4 signing.
+# Smoke test:        openshell sandbox create --provider <name> -- \
+#                      aws s3 ls s3://<your-bucket>
+
 id: aws-s3
 display_name: AWS S3
 description: AWS S3 storage via STS temporary credentials

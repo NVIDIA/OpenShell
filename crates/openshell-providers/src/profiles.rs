@@ -20,28 +20,9 @@ use openshell_policy::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::OnceLock;
 
 const PATH_TEMPLATE_CREDENTIAL_PLACEHOLDER: &str = "{credential}";
 const MCP_VERSION_REMEDIATION: &str = "omit mcp.versions to use the pinned default revision; use an exact supported revision; or omit protocol and mcp for deliberate uninspected L4 passthrough only when that weaker boundary is acceptable";
-
-const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
-    include_str!("../../../providers/aws.yaml"),
-    include_str!("../../../providers/aws-bedrock.yaml"),
-    include_str!("../../../providers/aws-s3.yaml"),
-    include_str!("../../../providers/anthropic.yaml"),
-    include_str!("../../../providers/claude-code.yaml"),
-    include_str!("../../../providers/codex.yaml"),
-    include_str!("../../../providers/copilot.yaml"),
-    include_str!("../../../providers/cursor.yaml"),
-    include_str!("../../../providers/deepinfra.yaml"),
-    include_str!("../../../providers/github.yaml"),
-    include_str!("../../../providers/google-cloud.yaml"),
-    include_str!("../../../providers/google-vertex-ai.yaml"),
-    include_str!("../../../providers/nvidia.yaml"),
-    include_str!("../../../providers/openai.yaml"),
-    include_str!("../../../providers/pypi.yaml"),
-];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProfileError {
@@ -1933,6 +1914,14 @@ pub fn profiles_to_json(profiles: &[ProviderTypeProfile]) -> Result<String, Prof
     Ok(serde_json::to_string_pretty(profiles)?)
 }
 
+/// Parse several profile YAML documents as one validated, id-sorted catalog.
+///
+/// Nothing in a release binary parses a profile *set* from YAML any more: the
+/// gateway validates the sets its configured sources return, through
+/// `validate_profile_set`. This is the loader behind the example profiles in
+/// `providers/`, so it is compiled for tests and for the `example-profiles`
+/// feature only.
+#[cfg(any(test, feature = "example-profiles"))]
 pub fn parse_profile_catalog_yamls(
     inputs: &[&str],
 ) -> Result<Vec<ProviderTypeProfile>, ProfileError> {
@@ -1945,10 +1934,12 @@ pub fn parse_profile_catalog_yamls(
     Ok(profiles)
 }
 
+#[cfg(any(test, feature = "example-profiles"))]
 fn is_mcp_diagnostic_field(field: &str) -> bool {
     field.split('.').any(|segment| segment == "mcp")
 }
 
+#[cfg(any(test, feature = "example-profiles"))]
 fn validate_profiles(profiles: &[ProviderTypeProfile]) -> Result<(), ProfileError> {
     let diagnostics = validate_profile_set(
         &profiles
@@ -3454,18 +3445,6 @@ fn is_kubernetes_service_host(host: &str) -> bool {
     (is_service_name || is_cluster_local_service) && labels.iter().all(|label| !label.is_empty())
 }
 
-static BUILTIN_PROFILES: OnceLock<Vec<ProviderTypeProfile>> = OnceLock::new();
-
-#[must_use]
-pub fn builtin_profiles() -> &'static [ProviderTypeProfile] {
-    BUILTIN_PROFILES
-        .get_or_init(|| {
-            parse_profile_catalog_yamls(BUILT_IN_PROFILE_YAMLS)
-                .expect("built-in provider profiles must be valid YAML")
-        })
-        .as_slice()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -3475,18 +3454,30 @@ mod tests {
 
     use super::{
         DiscoveryProfile, EndpointProfile, L7AllowProfile, L7QueryMatcherProfile,
-        ProfileDurationWkt, ProfileError, ProviderTypeProfile, builtin_profiles,
-        is_mcp_diagnostic_field, normalize_profile_id, parse_profile_catalog_yamls,
-        parse_profile_json, parse_profile_yaml, profile_duration_to_proto, profile_to_json,
-        profile_to_yaml, profiles_to_json, profiles_to_yaml, token_grant_from_proto,
-        token_grant_to_proto, validate_profile_duration, validate_profile_set,
+        ProfileDurationWkt, ProfileError, ProviderTypeProfile, is_mcp_diagnostic_field,
+        normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
+        profile_duration_to_proto, profile_to_json, profile_to_yaml, profiles_to_json,
+        profiles_to_yaml, token_grant_from_proto, token_grant_to_proto, validate_profile_duration,
+        validate_profile_set,
     };
 
-    fn builtin_profile(id: &str) -> &'static ProviderTypeProfile {
-        builtin_profiles()
+    /// The example profiles in `providers/`, parsed once per test binary.
+    ///
+    /// These files are reviewable examples an operator imports, not platform
+    /// data, so the tests below are golden tests over their content rather than
+    /// assertions about anything the gateway ships.
+    fn example_catalog() -> &'static [ProviderTypeProfile] {
+        static CATALOG: std::sync::OnceLock<Vec<ProviderTypeProfile>> = std::sync::OnceLock::new();
+        CATALOG
+            .get_or_init(crate::example_profiles::load_all)
+            .as_slice()
+    }
+
+    fn example_profile(id: &str) -> &'static ProviderTypeProfile {
+        example_catalog()
             .iter()
             .find(|profile| profile.id == id)
-            .unwrap_or_else(|| panic!("built-in profile {id} should exist"))
+            .unwrap_or_else(|| panic!("example profile {id} should exist"))
     }
 
     #[test]
@@ -3645,7 +3636,7 @@ credentials:
                 .collect(),
         };
         for id in ["codex", "claude-code", "copilot"] {
-            let profile = builtin_profile(id);
+            let profile = example_profile(id);
             let model_key = profile.credential_env_vars()[0].to_owned();
             let state = ProviderCredentialState::from_bound_environment(
                 42,
@@ -3656,7 +3647,7 @@ credentials:
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::from([
-                    ("GITHUB_TOKEN".into(), binding(builtin_profile("github"))),
+                    ("GITHUB_TOKEN".into(), binding(example_profile("github"))),
                     (model_key.clone(), binding(profile)),
                 ]),
                 vec![],
@@ -3695,19 +3686,40 @@ credentials:
     }
 
     #[test]
-    fn builtin_profiles_are_sorted_by_id() {
-        let ids = builtin_profiles()
+    fn example_profiles_parse_and_validate_as_one_catalog() {
+        let profiles = example_catalog();
+        assert!(
+            !profiles.is_empty(),
+            "providers/ should contain example profiles"
+        );
+
+        let ids = profiles
             .iter()
             .map(|profile| profile.id.as_str())
             .collect::<Vec<_>>();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         assert_eq!(ids, sorted);
+
+        let diagnostics = validate_profile_set(
+            &profiles
+                .iter()
+                .map(|profile| (String::new(), profile.clone()))
+                .collect::<Vec<_>>(),
+        );
+        let errors = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == "error")
+            .collect::<Vec<_>>();
+        assert!(
+            errors.is_empty(),
+            "example profiles must lint clean: {errors:?}"
+        );
     }
 
     #[test]
     fn github_profile_materializes_policy_metadata() {
-        let profile = builtin_profile("github");
+        let profile = example_profile("github");
         let proto = profile.to_proto();
 
         assert_eq!(proto.id, "github");
@@ -3743,7 +3755,7 @@ credentials:
 
     #[test]
     fn github_git_transport_allows_clone_but_not_push() {
-        let profile = builtin_profile("github");
+        let profile = example_profile("github");
         let proto = profile.to_proto();
 
         let git_transport = proto
@@ -3803,7 +3815,7 @@ credentials:
 
     #[test]
     fn credential_env_vars_are_deduplicated_in_profile_order() {
-        let profile = builtin_profile("claude-code");
+        let profile = example_profile("claude-code");
         assert_eq!(
             profile.credential_env_vars(),
             vec!["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]
@@ -3837,7 +3849,7 @@ credentials:
 
     #[test]
     fn vertex_profile_declares_discovery_and_fallback_token_env_vars() {
-        let profile = builtin_profile("google-vertex-ai");
+        let profile = example_profile("google-vertex-ai");
         let service_account_token = profile
             .credentials
             .iter()
@@ -3951,13 +3963,13 @@ endpoints:
 
     #[test]
     fn adc_credential_returns_oauth2_refresh_token_credential_with_adc_material() {
-        let profile = builtin_profile("google-cloud");
+        let profile = example_profile("google-cloud");
         let adc = profile
             .adc_credential()
             .expect("google-cloud should have an ADC credential");
         assert_eq!(adc.env_vars[0], "GCP_ADC_ACCESS_TOKEN");
 
-        let profile = builtin_profile("google-vertex-ai");
+        let profile = example_profile("google-vertex-ai");
         let adc = profile
             .adc_credential()
             .expect("vertex should have an ADC credential");
@@ -3966,10 +3978,10 @@ endpoints:
 
     #[test]
     fn adc_credential_returns_none_for_profiles_without_adc() {
-        let profile = builtin_profile("github");
+        let profile = example_profile("github");
         assert!(profile.adc_credential().is_none());
 
-        let profile = builtin_profile("claude-code");
+        let profile = example_profile("claude-code");
         assert!(profile.adc_credential().is_none());
     }
 
@@ -5417,7 +5429,7 @@ endpoints:
 
     #[test]
     fn profile_json_round_trip_preserves_compact_dto_shape() {
-        let profile = builtin_profile("github");
+        let profile = example_profile("github");
         let json = profile_to_json(profile).expect("profile should serialize");
         let parsed = parse_profile_json(&json).expect("profile should parse");
 
@@ -5874,7 +5886,7 @@ binaries:
 
     #[test]
     fn aws_profile_parses_correctly() {
-        let aws = builtin_profile("aws");
+        let aws = example_profile("aws");
         assert_eq!(aws.display_name, "AWS");
         assert_eq!(aws.credentials.len(), 3);
         let access_key = aws
@@ -5898,7 +5910,7 @@ binaries:
 
     #[test]
     fn aws_s3_profile_parses_with_endpoints() {
-        let aws_s3 = builtin_profile("aws-s3");
+        let aws_s3 = example_profile("aws-s3");
         assert_eq!(aws_s3.display_name, "AWS S3");
         assert!(!aws_s3.endpoints.is_empty());
         assert!(
@@ -5948,7 +5960,7 @@ binaries:
     #[test]
     fn aws_profile_declares_additional_outputs() {
         for id in ["aws", "aws-s3"] {
-            let profile = builtin_profile(id);
+            let profile = example_profile(id);
             let refresh = profile
                 .credentials
                 .iter()
@@ -5977,7 +5989,7 @@ binaries:
         // required credentials are runtime-resolvable, so `--runtime-credentials`
         // (empty provider creation) is allowed.
         for id in ["aws", "aws-s3"] {
-            let profile = builtin_profile(id);
+            let profile = example_profile(id);
             assert!(
                 profile.allows_empty_provider_credentials(),
                 "{id} should allow empty provider credentials"

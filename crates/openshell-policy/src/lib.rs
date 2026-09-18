@@ -41,8 +41,9 @@ pub use l7_validate::{
     validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics,
 };
 pub use merge::{
-    PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning,
-    canonicalize_advisor_add_rule, generated_rule_name, merge_policy, policy_covers_rule,
+    L7BinaryScope, L7RuleTarget, PolicyMergeError, PolicyMergeOp, PolicyMergeResult,
+    PolicyMergeWarning, canonicalize_advisor_add_rule, generated_rule_name, merge_policy,
+    policy_covers_rule,
 };
 pub use middleware::middleware_host_matches;
 pub use middleware::validate_json as validate_network_middleware_json;

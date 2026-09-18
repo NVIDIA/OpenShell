@@ -566,6 +566,9 @@ run_scenario() {
   export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
 
+  e2e_import_example_provider_profiles \
+    "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" "${ROOT}" || return 1
+
   echo "Running e2e command against ${GATEWAY_ENDPOINT}: ${E2E_CMD[*]}"
   "${E2E_CMD[@]}" || scenario_exit=$?
 
@@ -1208,6 +1211,9 @@ else
   export OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
+
+  e2e_import_example_provider_profiles \
+    "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" "${ROOT}" || exit 1
 
   echo "Running e2e command against ${GATEWAY_ENDPOINT}: $*"
   "$@"

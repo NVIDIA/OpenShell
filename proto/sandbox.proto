@@ -402,6 +402,13 @@ message GetSandboxConfigResponse {
   // Gateway-owned attachment identity captured with this desired configuration.
   // Compare for equality; reattachment invalidates previous installation evidence.
   string provider_attachment_epoch = 14;
+  // True only after validating this complete policy/provider composition.
+  // Missing (older gateway) is deliberately not admission.
+  bool configuration_admitted = 13;
+  // Bounded, credential-free admission diagnostic. Empty for admitted policy.
+  string configuration_error = 16;
+  // Registration fence for a new supervisor; capture once and retain on retry.
+  string configuration_instance_id = 15;
 }
 
 // Connection details for one operator-registered supervisor middleware service.

@@ -91,4 +91,38 @@ if err != nil {
 }
 ```
 
+## Append allow or deny rules
+
+Use `client.Config().Update` with `AddAllowRules` or `AddDenyRules` to append request matchers to an existing base-policy endpoint. Both operations require an `L7RuleTarget` naming the rule, host, every affected port, and every binary governed by that rule. The gateway rejects missing scope or a scope that differs from the current policy without applying the merge batch.
+
+```go
+result, err := client.Config().Update(ctx, "default", &v1.ConfigUpdate{
+    Name: "my-sandbox",
+    MergeOperations: []v1.PolicyMergeOperation{{
+        AddAllowRules: &v1.AddAllowRules{
+            Target: &v1.L7RuleTarget{
+                RuleName: "api",
+                Host: "api.example.com",
+                Ports: []uint32{443, 8443},
+                Binaries: []v1.PolicyNetworkBinary{
+                    {Path: "/usr/bin/curl"},
+                    {Path: "/usr/bin/wget"},
+                },
+            },
+            Rules: []v1.L7Rule{{
+                Allow: &v1.L7Allow{Method: "POST", Path: "/admin"},
+            }},
+        },
+    }},
+})
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("Policy version: %d\n", result.Version)
+```
+
+This example explicitly permits both binaries to make the new request on both ports. For a rule that permits any binary, set `AnyBinary: true` and omit `Binaries`. Omitting both fields is invalid; the SDK never infers any-binary permission.
+
+`Target.Path` selects the existing endpoint path and is separate from the appended request matcher's path. Leave it `nil` when the rule, host, and ports identify a unique endpoint. To choose an endpoint with a specific path, pass a pointer to that path; a pointer to an empty string selects an endpoint without a path selector. Use `AddDenyRules` with the same target shape and a `DenyRules` payload to append deny matchers.
+
 See also: [Error Handling](../error-handling.md), [Testing](../testing.md)

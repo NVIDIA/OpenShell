@@ -20,7 +20,7 @@ Provider profiles keep those pieces together:
 
 | Need | Profile-backed behavior |
 |---|---|
-| Repeatable provider setup | Built-in and custom provider profiles define reusable provider types. |
+| Repeatable provider setup | Imported provider profiles define reusable provider types. |
 | Provider-aware policy | Attached providers contribute `_provider_*` network policy entries to the effective sandbox policy. |
 | Custom provider definitions | You can export, edit, lint, import, list, and delete custom profiles. |
 | Runtime provider lifecycle | You can list, attach, and detach providers on existing sandboxes. |
@@ -31,14 +31,14 @@ Provider profiles keep those pieces together:
 
 Provider profiles include these user-facing features:
 
-- Built-in provider profiles loaded by the gateway by default.
-- Gateway configuration can compose built-in, user-managed, and interceptor-vended profile sources. Selecting only an interceptor makes its catalog authoritative by omission.
-- A user-managed profile shadows a built-in profile with the same ID in its applicable workspace or platform scope. The built-in remains the fallback outside that scope. Source-managed interceptor collisions still fail closed.
+- An import-only catalog: the gateway serves the profiles you imported and nothing else. A gateway with none imported serves an empty catalog.
+- Gateway configuration can compose user-managed and interceptor-vended profile sources. Selecting only an interceptor makes its catalog authoritative by omission.
+- Platform-scoped and workspace-scoped profiles. A workspace profile takes precedence over a platform profile with the same ID inside that workspace, and the platform profile applies outside it. An interceptor-vended profile cannot share an ID with an imported one; that collision fails closed.
 - `openshell provider list-profiles` with table, YAML, and JSON output.
 - `openshell provider profile export`, `import`, `update`, `lint`, and `delete` for custom profiles.
-- Provider instances created from built-in or imported profile IDs with `openshell provider create --type <id>`.
+- Provider instances created from imported profile IDs with `openshell provider create --type <id>`.
 - Provider instances whose submitted credentials can be stored by a configured gateway credential driver.
-- Profile-backed credential discovery for explicit `openshell provider create --from-existing` and `openshell provider update --from-existing` flows. The built-in `google-vertex-ai` profile also supplements discovery with Vertex config env vars such as `VERTEX_AI_PROJECT_ID` and `VERTEX_AI_REGION`.
+- Profile-backed credential discovery for explicit `openshell provider create --from-existing` and `openshell provider update --from-existing` flows. The `google-vertex-ai` profile also supplements discovery with Vertex config env vars such as `VERTEX_AI_PROJECT_ID` and `VERTEX_AI_REGION`.
 - Just-in-time effective policy composition from sandbox policy plus attached provider profiles.
 - Runtime sandbox provider commands under `openshell sandbox provider list|attach|detach|status`, with an option to wait until the sandbox applies a change.
 - Credential refresh configuration with `openshell provider refresh status|configure|rotate|delete`.
@@ -55,11 +55,13 @@ supply that boundary by default. For an endpointless profile, a sandbox policy
 endpoint can name the attached provider instance explicitly. The proxy checks
 the resulting association before it substitutes the real value.
 
-The built-in `openai` and `anthropic` profiles bind credentials to their public
+The example `openai` and `anthropic` profiles bind credentials to their public
 vendor endpoints. To use a proxy or compatible API at another host, import a
-custom profile that declares that host and attach a provider created from that
-profile. OpenShell never broadens a built-in profile's credential boundary from
-a base URL environment variable alone.
+separate profile that declares that host and attach a provider created from that
+profile. OpenShell never broadens a profile's credential boundary from a base URL
+environment variable alone: if a provider's `*_BASE_URL` points outside the hosts
+its profile declares, the profile is treated as endpointless and its credential
+binds only through explicit sandbox policy.
 
 A request can use a static credential only when all of these checks pass:
 
@@ -220,51 +222,53 @@ List available profiles:
 openshell provider list-profiles
 ```
 
-By default the gateway lists built-in profiles plus custom profiles imported
-through the profile APIs. When a configured gateway interceptor vends an
-authoritative provider profile catalog, that catalog becomes the visible source
-of truth: list, export, provider creation, policy composition, and sandbox
-provider environment resolution use the interceptor-vended profiles instead of
-built-in or user-imported profiles.
+A gateway serves exactly the profiles you imported. OpenShell ships no profiles
+inside the gateway binary, so a new gateway lists an empty catalog until you
+import one. When a configured gateway interceptor vends an authoritative
+provider profile catalog, that catalog becomes the visible source of truth:
+list, export, provider creation, policy composition, and sandbox provider
+environment resolution use the interceptor-vended profiles.
 
-Built-in provider profiles currently include:
+### Import the Example Profiles
 
-| Profile ID | Category | Credential environment variables |
-|---|---|---|
-| `anthropic` | `inference` | `ANTHROPIC_API_KEY` |
-| `claude-code` | `agent` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` |
-| `codex` | `agent` | `CODEX_AUTH_ACCESS_TOKEN`, `CODEX_AUTH_REFRESH_TOKEN`, `CODEX_AUTH_ACCOUNT_ID`, `CODEX_AUTH_ID_TOKEN` |
-| `copilot` | `agent` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` |
-| `cursor` | `agent` | None |
-| `deepinfra` | `inference` | `DEEPINFRA_API_KEY` |
-| `github` | `source_control` | `GITHUB_TOKEN`, `GH_TOKEN` |
-| `google-vertex-ai` | `inference` | `GOOGLE_SERVICE_ACCOUNT_KEY`, `GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN`, `VERTEX_AI_SERVICE_ACCOUNT_TOKEN`, `GOOGLE_VERTEX_AI_TOKEN`, `VERTEX_AI_TOKEN` |
-| `nvidia` | `inference` | `NVIDIA_API_KEY` |
-| `openai` | `inference` | `OPENAI_API_KEY` |
-| `pypi` | `data` | None |
+The OpenShell repository ships example profiles for GitHub, PyPI, and the major
+inference and agent providers in
+[`providers/`](https://github.com/NVIDIA/OpenShell/tree/main/providers). They are
+reviewable starting points, not platform defaults.
 
-Export a built-in profile as YAML:
-
-```shell
-openshell provider profile export github -o yaml > github-profile.yaml
-```
+Read a file's header before importing it. Each one names the client binaries it
+expects, the image layout those paths assume, the credential scope, the endpoint
+access it grants, and a smoke test. Several name paths that exist only in the
+OpenShell Community image, such as `/sandbox/.venv` or
+`/usr/lib/node_modules/@openai`. Imported unchanged into a different image the
+profile matches nothing: the catalog still lists it, but the credential is never
+injected and the traffic is denied. Copy the file, edit `binaries` and
+`endpoints` for your image and workload, and import your copy.
 
 Lint a profile before importing it:
 
 ```shell
-openshell provider profile lint -f github-profile.yaml
+openshell provider profile lint -f providers/github.yaml
 ```
 
-Import one profile file:
+Import one profile file at platform scope:
 
 ```shell
-openshell provider profile import -f github-profile.yaml
+openshell provider profile import -f providers/github.yaml --global
 ```
 
 Import all non-recursive `*.yaml`, `*.yml`, and `*.json` files from a directory:
 
 ```shell
-openshell provider profile import --from ./provider-profiles
+openshell provider profile import --from ./providers --global
+```
+
+Omit `--global` to import into the current workspace instead.
+
+Export a profile as YAML, to edit or to keep before an upgrade:
+
+```shell
+openshell provider profile export github -o yaml --global > github-profile.yaml
 ```
 
 Import is create-only. It fails if a custom profile with the same ID already exists.
@@ -278,7 +282,7 @@ openshell provider profile update github-profile -f github-profile.yaml
 
 Exported custom profiles include `resource_version`. OpenShell requires that version during update so stale files cannot silently overwrite newer profile definitions. The target ID in the command must match the profile ID in the file. Update accepts one file at a time. If an update would make dynamic token grants ambiguous for an attached sandbox, OpenShell rejects it before changing the profile.
 
-Custom profile IDs must use lowercase kebab-case with `a-z`, `0-9`, and `-`. Built-in profile IDs and legacy provider aliases are reserved. Built-in and interceptor-managed profiles are read-only through the profile APIs. OpenShell also rejects deleting a custom profile while a sandbox-attached provider uses it.
+Profile IDs must use lowercase kebab-case with `a-z`, `0-9`, and `-`. No IDs are reserved: `github`, `openai`, and every other example profile imports at its own ID, and the imported profile is the only definition for it. Interceptor-managed profiles are read-only through the profile APIs. OpenShell rejects deleting a profile while a sandbox-attached provider uses it.
 
 ### Category Enum
 
@@ -559,9 +563,9 @@ The gateway only brokers an intermediate token for a sandbox principal, and only
 
 ## Provider Instances
 
-A provider instance stores concrete credentials and config for a profile type. Built-in profile IDs and imported custom profile IDs are accepted by `--type`.
+A provider instance stores concrete credentials and config for a profile type. `--type` accepts the ID of any imported profile, matched exactly. Creating a provider for a profile the gateway does not serve fails and names the import command.
 
-Create a GitHub provider from the built-in `github` profile:
+Create a GitHub provider from an imported `github` profile:
 
 ```shell
 openshell provider create \
@@ -581,11 +585,11 @@ openshell provider create \
 
 `--from-existing` uses the provider profile's `discovery` section. If no
 profile exists for the requested type, the command fails instead of falling
-back to the retired provider registry. The built-in `openai` profile discovers
-`OPENAI_API_KEY`; the built-in `anthropic` profile discovers
+back to the retired provider registry. The example `openai` profile discovers
+`OPENAI_API_KEY`; the example `anthropic` profile discovers
 `ANTHROPIC_API_KEY`.
 
-Create a provider from an imported custom profile:
+Create a provider from another imported profile:
 
 ```shell
 openshell provider create \
@@ -863,7 +867,7 @@ includes credential values, opaque credential handles, or config values.
 
 OpenShell stores the base policy and provider attachments separately. When a sandbox asks for its effective policy, the gateway composes the current base policy with provider policy layers just in time.
 
-For example, the built-in GitHub profile contains these endpoints and binaries:
+For example, the GitHub example profile contains these endpoints and binaries:
 
 ```yaml wordWrap showLineNumbers={false}
 id: github

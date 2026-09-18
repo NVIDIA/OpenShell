@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Fern site config — merged with skills/convert-to-fern/assets/theme/nvidia/docs-theme.yml pattern
 # Production: https://docs.nvidia.com/openshell/ — preview + custom-domain share path prefix `openshell`.
-# Internal MDX links use /latest/...; basepath-aware resolves them under /openshell/ on production.
+# Source checkouts and pull request previews expose the current documentation at /dev.
 instances:
   - url: openshell.docs.buildwithfern.com/openshell
     custom-domain: docs.nvidia.com/openshell
@@ -38,7 +38,7 @@ logo:
   dark: ./assets/NVIDIA_dark.svg
   light: ./assets/NVIDIA_light.svg
   height: 20
-  href: /openshell/latest
+  href: /openshell
   right-text: OpenShell
 
 favicon: ./assets/NVIDIA_symbol.svg
@@ -56,9 +56,12 @@ experimental:
     - ./components
 
 versions:
-  - display-name: Latest
+  - display-name: Dev
     path: ../docs/index.yml
-    slug: latest
+    slug: dev
+    availability: beta
+    announcement:
+      message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>OpenShell 0.1.0 is coming soon.</strong> <a href="https://github.com/NVIDIA/OpenShell/milestone/10" target="_blank" rel="noreferrer">Track progress in the 0.1.0 milestone</a>, <a href="https://docs.nvidia.com/openshell/dev/index.html" target="_blank" rel="noreferrer">read the prerelease documentation</a>, or <a href="https://docs.nvidia.com/openshell/dev/about/installation#install-a-prerelease" target="_blank" rel="noreferrer">install a prerelease</a>.</span>'
 
 redirects:
   - source: "/openshell/latest/sandboxes/providers-v2"

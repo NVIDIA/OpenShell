@@ -69,6 +69,20 @@ pub struct OpenShellRuntimeBackend {
 }
 
 impl OpenShellRuntimeBackend {
+    /// Read the workload image policy over the authenticated boundary before admission.
+    pub async fn discover_policy(
+        descriptor: SandboxRuntimeDescriptor,
+        bearer: openshell_core::jwt::SessionBearerTokenSlot,
+    ) -> Result<(Option<String>, bool), BackendError> {
+        let client = BoundaryClient::new(descriptor, bearer);
+        match client.call_idempotent(Request::DiscoverPolicy).await? {
+            Response::ImagePolicy { yaml, invalid } => Ok((yaml, invalid)),
+            _ => Err(BackendError::Descriptor(
+                "expected image policy discovery response".to_string(),
+            )),
+        }
+    }
+
     pub fn new(
         ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
         provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
@@ -792,7 +806,10 @@ struct RemoteNetworkMediation {
 #[async_trait]
 impl NetworkMediationSource for RemoteNetworkMediation {
     async fn accept_tcp(&self) -> Result<PendingTcpOpen, BackendError> {
-        let (stream, response) = self.client.open_exchange(Request::AcceptNetwork).await?;
+        // An idle accept has no deadline. Recover transport loss before exposing
+        // a source error, which permanently stops the proxy. The boundary drops
+        // the interrupted pending open; a retry never replays its decision.
+        let (stream, response) = self.client.call_wait_stream(Request::AcceptNetwork).await?;
         let Response::NetworkConnected {
             identity,
             destination,
@@ -1071,7 +1088,7 @@ impl BoundaryClient {
     async fn call_idempotent(&self, request: Request) -> Result<Response, BackendError> {
         let remember_attach = matches!(request, Request::Attach { .. });
         let remember_confirm = matches!(request, Request::Confirm);
-        let timeout = if remember_attach {
+        let timeout = if remember_attach || matches!(request, Request::DiscoverPolicy) {
             ATTACH_REQUEST_TIMEOUT
         } else {
             REQUEST_TIMEOUT
@@ -1079,6 +1096,7 @@ impl BoundaryClient {
         let envelope = Self::prepare_request(request)?;
         tokio::time::timeout(timeout, async {
             loop {
+                let generation = self.connection_generation().await;
                 match self.exchange_envelope(&envelope).await {
                     Ok(response) => {
                         if remember_attach {
@@ -1100,7 +1118,7 @@ impl BoundaryClient {
                     Err(BackendError::Unavailable(message))
                         if is_transport_unavailable(&message) =>
                     {
-                        self.recover_after_unavailable().await?;
+                        self.recover_after_unavailable(generation).await?;
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                     Err(error) => return Err(error),
@@ -1116,10 +1134,21 @@ impl BoundaryClient {
     }
 
     async fn call_wait(&self, request: Request) -> Result<Response, BackendError> {
+        let (_, response) = self.call_wait_stream(request).await?;
+        Ok(response)
+    }
+
+    /// Wait without an idle timeout, retaining the stream for TCP mediation.
+    /// Only transport failures enter recovery; boundary rejections stay terminal.
+    async fn call_wait_stream(
+        &self,
+        request: Request,
+    ) -> Result<(BoundaryDuplexStream, Response), BackendError> {
         let envelope = Self::prepare_request(request)?;
         let mut recovery_deadline = None;
         loop {
-            match self.exchange_envelope(&envelope).await {
+            let generation = self.connection_generation().await;
+            match self.open_exchange_envelope(&envelope).await {
                 Ok(response) => return Ok(response),
                 Err(BackendError::Unavailable(message)) if is_transport_unavailable(&message) => {
                     let deadline =
@@ -1127,7 +1156,7 @@ impl BoundaryClient {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(BackendError::Unavailable(message));
                     }
-                    self.recover_after_unavailable().await?;
+                    self.recover_after_unavailable(generation).await?;
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
                 Err(error) => return Err(error),
@@ -1142,12 +1171,13 @@ impl BoundaryClient {
         let envelope = Self::prepare_request(request)?;
         tokio::time::timeout(REQUEST_TIMEOUT, async {
             loop {
+                let generation = self.connection_generation().await;
                 match self.open_exchange_envelope(&envelope).await {
                     Ok(response) => return Ok(response),
                     Err(BackendError::Unavailable(message))
                         if is_transport_unavailable(&message) =>
                     {
-                        self.recover_after_unavailable().await?;
+                        self.recover_after_unavailable(generation).await?;
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                     Err(error) => return Err(error),
@@ -1165,12 +1195,13 @@ impl BoundaryClient {
         let envelope = Self::prepare_request(request)?;
         tokio::time::timeout(REQUEST_TIMEOUT, async {
             loop {
+                let generation = self.connection_generation().await;
                 match self.open_exchange_envelope(&envelope).await {
                     Ok(response) => return Ok(response),
                     Err(BackendError::Unavailable(message))
                         if is_transport_unavailable(&message) =>
                     {
-                        self.recover_after_unavailable().await?;
+                        self.recover_after_unavailable(generation).await?;
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                     Err(error) => return Err(error),
@@ -1194,6 +1225,7 @@ impl BoundaryClient {
             .map_err(|error| BackendError::Process(format!("encode control request: {error}")))
     }
 
+    #[cfg(test)]
     async fn open_exchange(
         &self,
         request: Request,
@@ -1353,15 +1385,21 @@ impl BoundaryClient {
         Ok(())
     }
 
-    /// Replace a failed physical transport and replay the authenticated
-    /// lifecycle needed to make the new HTTP/2 connection authoritative.
-    async fn recover_after_unavailable(&self) -> Result<(), BackendError> {
-        let observed_generation = self
-            .grpc_channel
+    async fn connection_generation(&self) -> Option<u64> {
+        self.grpc_channel
             .lock()
             .await
             .as_ref()
-            .map(|cached| cached.generation);
+            .map(|cached| cached.generation)
+    }
+
+    /// Replace a failed physical transport and replay its authenticated lifecycle.
+    /// Capture the generation before the attempt: a late failure from an old
+    /// connection must not retire one another caller has already recovered.
+    async fn recover_after_unavailable(
+        &self,
+        observed_generation: Option<u64>,
+    ) -> Result<(), BackendError> {
         let _reconnect = self.reconnect.lock().await;
         if self
             .grpc_channel
@@ -1481,12 +1519,13 @@ impl BoundaryClient {
         // waiting. Never multiply that deadline with message-matching retries.
         let session = tokio::time::timeout(REQUEST_TIMEOUT, async {
             loop {
+                let generation = self.connection_generation().await;
                 match self.open_mediation_session().await {
                     Ok(session) => return Ok(session),
                     Err(BackendError::Unavailable(message))
                         if is_transport_unavailable(&message) =>
                     {
-                        self.recover_after_unavailable().await?;
+                        self.recover_after_unavailable(generation).await?;
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                     Err(error) => return Err(error),
@@ -1750,6 +1789,10 @@ where
             }
             Err(error) => {
                 tracing::debug!(%error, "boundary gRPC response stream ended");
+                // The request pump still owns the other duplex half. Explicitly
+                // close this direction so a waiting exchange observes EOF and
+                // can recover instead of waiting for both halves to drop.
+                let _ = writer.shutdown().await;
                 return;
             }
         }
@@ -1864,6 +1907,7 @@ fn is_transport_unavailable(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     mod credential_renewal;
+    mod network_recovery;
 
     use std::path::PathBuf;
     use std::pin::Pin;
@@ -1969,6 +2013,10 @@ mod tests {
                     match encode_frame(&ResponseEnvelope {
                         request_id: envelope.request_id,
                         response: match envelope.request {
+                            Request::DiscoverPolicy => Response::ImagePolicy {
+                                yaml: None,
+                                invalid: false,
+                            },
                             Request::Attach { .. } => Response::Attached {
                                 snapshot: crate::boundary_protocol::SessionSnapshotWire {
                                     generation: "test-generation".to_string(),
@@ -2175,11 +2223,29 @@ mod tests {
             Response::Confirmed { .. }
         ));
 
-        client.recover_after_unavailable().await.unwrap();
+        let failed_generation = client.connection_generation().await;
+        client
+            .recover_after_unavailable(failed_generation)
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(1), server)
             .await
             .expect("replacement connection accepted")
             .unwrap();
+        assert_eq!(accepted.load(Ordering::Acquire), 2);
+        assert_eq!(requests.load(Ordering::Acquire), 4);
+
+        // Another accept can report the same transport loss after recovery.
+        // It must reuse the replacement without a third connection or replay.
+        let recovered_generation = client.connection_generation().await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            client.recover_after_unavailable(failed_generation),
+        )
+        .await
+        .expect("stale failure must reuse the recovered connection")
+        .unwrap();
+        assert_eq!(client.connection_generation().await, recovered_generation);
         assert_eq!(accepted.load(Ordering::Acquire), 2);
         assert_eq!(requests.load(Ordering::Acquire), 4);
     }

@@ -159,22 +159,38 @@ type RemoveNetworkRule struct {
 	RuleName string
 }
 
+// L7RuleTarget identifies an endpoint and declares its complete affected scope.
+// The gateway requires the ports and binary scope to match the stored endpoint
+// and rule before appending any layer-7 rules.
+type L7RuleTarget struct {
+	// RuleName names the base-policy rule containing the endpoint.
+	RuleName string
+	// Host is the endpoint host, matched case-insensitively.
+	Host string
+	// Ports lists every port affected by the append, not only a lookup port.
+	Ports []uint32
+	// Path selects the endpoint path, distinct from an appended request path.
+	// Nil requires a unique endpoint; a pointer to "" selects an unscoped endpoint.
+	Path *string
+	// Binaries lists every binary governed by the containing rule.
+	// Exactly one of a nonempty Binaries list or AnyBinary=true is required.
+	Binaries []PolicyNetworkBinary
+	// AnyBinary explicitly acknowledges a rule with unrestricted binary scope.
+	AnyBinary bool
+}
+
 // AddDenyRules appends layer-7 deny rules to a specific endpoint.
 type AddDenyRules struct {
-	// Host identifies the target endpoint host.
-	Host string
-	// Port identifies the target endpoint port.
-	Port uint32
+	// Target is required and declares the full scope affected by the append.
+	Target *L7RuleTarget
 	// DenyRules are the deny rules to append.
 	DenyRules []L7DenyRule
 }
 
 // AddAllowRules appends layer-7 allow rules to a specific endpoint.
 type AddAllowRules struct {
-	// Host identifies the target endpoint host.
-	Host string
-	// Port identifies the target endpoint port.
-	Port uint32
+	// Target is required and declares the full scope affected by the append.
+	Target *L7RuleTarget
 	// Rules are the allow rules to append.
 	Rules []L7Rule
 }

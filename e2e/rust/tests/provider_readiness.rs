@@ -186,14 +186,14 @@ impl FixtureImage {
         &self.tag
     }
 
-    async fn build(&self, dockerfile: &Path, context: &Path) -> Result<(), String> {
+    async fn build(&self, dockerfile: &Path, context: &Path, label: &str) -> Result<(), String> {
         let mut command = Command::from(self.engine.command());
         command
             .args(["build", "--file"])
             .arg(dockerfile)
             .args(["--tag", &self.tag])
             .arg(context);
-        checked_command_with_timeout(&mut command, "build fixture image", IMAGE_BUILD_TIMEOUT)
+        checked_command_with_timeout(&mut command, label, IMAGE_BUILD_TIMEOUT)
             .await
             .map(|_| ())
     }
@@ -1369,16 +1369,26 @@ async fn acknowledged_provider_changes_apply_to_fresh_clients_and_revoke_retaine
             "FROM {base}\nUSER root\nCOPY client.py /opt/provider-readiness-client.py\nUSER sandbox\n"
         )).map_err(|_| "could not write fixture Dockerfile")?;
         let supervisor_dockerfile = context.join("Dockerfile.supervisor");
-        // Outbound TLS belongs to the separate supervisor. Its combined public
-        // trust bundle is delivered to the workload through the sandbox protocol.
-        // Preserve the base image's user setting: Docker's archive upload applies
-        // an explicit image user to the supervisor's private bootstrap files.
+        // Outbound TLS belongs to the separate supervisor. Assemble its combined
+        // public trust bundle in the shell-capable workload image because the
+        // final supervisor image is intentionally distroless. Preserve the final
+        // image's user setting: Docker's archive upload applies an explicit image
+        // user to the supervisor's private bootstrap files.
         std::fs::write(&supervisor_dockerfile, format!(
-            "FROM {}\nCOPY fixture-ca.crt /tmp/readiness-fixture-ca.crt\nRUN cat /tmp/readiness-fixture-ca.crt >> /etc/ssl/certs/ca-certificates.crt && rm /tmp/readiness-fixture-ca.crt\n",
-            gateway_config.supervisor_image
+            "FROM {} AS supervisor\nFROM {base} AS trust-bundle\nUSER 0\nCOPY --from=supervisor /etc/ssl/certs/ca-certificates.crt /tmp/ca-certificates.crt\nCOPY fixture-ca.crt /tmp/readiness-fixture-ca.crt\nRUN [\"/usr/bin/python3\", \"-c\", \"from pathlib import Path; bundle = Path('/tmp/ca-certificates.crt'); bundle.write_bytes(bundle.read_bytes() + Path('/tmp/readiness-fixture-ca.crt').read_bytes())\"]\nFROM {}\nCOPY --from=trust-bundle /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt\n",
+            gateway_config.supervisor_image,
+            gateway_config.supervisor_image,
         )).map_err(|_| "could not write fixture supervisor Dockerfile")?;
-        image.build(&dockerfile, &context).await?;
-        supervisor_image.build(&supervisor_dockerfile, &context).await?;
+        image
+            .build(&dockerfile, &context, "build workload fixture image")
+            .await?;
+        supervisor_image
+            .build(
+                &supervisor_dockerfile,
+                &context,
+                "build supervisor fixture image",
+            )
+            .await?;
         gateway_config.apply(supervisor_image.tag()).await?;
         let profile = directory.path().join("profile.json");
         let policy = directory.path().join("policy.json");

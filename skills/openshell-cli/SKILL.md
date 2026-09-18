@@ -90,11 +90,14 @@ attachment and delete its sandbox after the service exits.
 
 When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
 
-**Shortcut for known tools**: When the trailing command is a recognized tool, the CLI auto-creates the required provider from local credentials:
+Provider attachment is explicit. Name each provider with `--provider`; the
+trailing command does not select or attach one. If the named provider does not
+exist but a profile with that ID is available, the CLI can create it from local
+credentials:
 
 ```bash
-openshell sandbox create -- claude        # Auto-creates claude provider
-openshell sandbox create -- codex         # Auto-creates codex provider
+openshell sandbox create --provider claude-code -- claude
+openshell sandbox create --provider codex -- codex
 ```
 
 The agent will be prompted interactively if credentials are missing.
@@ -111,7 +114,7 @@ openshell sandbox delete <name>
 
 ## Workflow 2: Provider Management
 
-Providers supply credentials and provider-specific configuration to sandboxes. Provider types come from built-in and custom profiles; do not rely on a hard-coded type list. Discover the profiles available on the selected gateway:
+Providers supply credentials and provider-specific configuration to sandboxes. Provider profiles are import-only: a gateway serves exactly what an operator imported, and a new gateway serves an empty catalog. Never rely on a hard-coded type list or on a legacy alias such as `gh` or `claude` — `--type` matches a profile ID exactly. Discover the profiles available on the selected gateway:
 
 ```bash
 openshell provider list-profiles
@@ -444,7 +447,21 @@ the operation that removes retained state.
 
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
-**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
+**Key concept**: Policies have static fields (immutable after activation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
+
+If startup reports `ConfigurationInvalid`, inspect `openshell sandbox get` and
+repair the complete policy or provider set through the gateway. The workload
+has not started on its first activation, so static fields can also be replaced
+during this initial repair. A previously activated sandbox retains static-field
+restrictions while restart admission is pending or rejected.
+Before the gateway's 300-second repair window expires, successful validation
+completes startup in place. Effective stored configuration changes and their
+first failed load reset that window; repeated failures do not. After
+`ProvisioningTimedOut`, inspect the retained record and cleanup status, repair
+configuration, and explicitly run `sandbox start` once cleanup completes. A CLI
+wait timeout is separate from this gateway deadline. Follow the
+published [policy repair guidance](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
+and confirm current replacement/detach syntax with installed CLI help.
 
 An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
 `protocol: tcp` requests policy DNS and transparent TCP and currently requires
@@ -691,7 +708,7 @@ When denied actions appear:
 
 1. Prefer incremental updates for additive network changes:
    `openshell policy update work-session --add-endpoint api.github.com:443:read-only:rest:enforce --binary /usr/bin/gh --wait`
-   `openshell policy update work-session --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
+   `openshell policy update work-session --rule-name allow_api_github_com_443 --binary /usr/bin/gh --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
 
    A rule authorizes every binary it lists to reach every endpoint it lists, so
    an update that adds a binary or an endpoint to an existing rule must declare
@@ -702,10 +719,7 @@ When denied actions appear:
    `--rule-name`; it stays on its own rule instead of folding into the broader
    one.
 
-   `--add-allow` and `--add-deny` select an endpoint by host and port alone. If
-   that host and port appears in more than one rule, or twice in one rule under
-   different paths, the update is rejected as ambiguous. Fall back to full YAML
-   replacement for those endpoints.
+   `--add-allow` and `--add-deny` require `--rule-name` and the complete binary scope through repeated `--binary` or explicit `--any-binary`. Declare every port on the endpoint in the operation, for example `api.example.com:443,8443:POST:/admin`. Use `--endpoint-path` to disambiguate endpoints within the selected rule; an explicitly empty path selects an endpoint without a path selector. The gateway rejects missing or mismatched scope before persistence. Inspect the current policy and confirm the intended affected scope; do not automatically fill declarations from current policy just to make a rejection pass.
 2. Use full YAML replacement for broad changes or non-network fields, including
    any change that would otherwise require restating a large existing scope:
    `openshell policy get work-session --full > policy.yaml`
@@ -848,4 +862,4 @@ $ openshell sandbox upload --help
 |-------|------------|
 | `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration, and network middleware) |
 | `debug-openshell-cluster` | Diagnosing gateway deployment, runtime, or health failures |
-| `debug-inference` | Diagnosing attached-provider inference, native endpoints, host-backed models, and migration from `inference.local` |
+| `debug-inference` | Diagnosing attached-provider inference, native endpoints, host-backed models, and migration from the retired managed endpoint |

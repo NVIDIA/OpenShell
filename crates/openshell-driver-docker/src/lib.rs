@@ -89,7 +89,6 @@ use url::Url;
 const WATCH_BUFFER: usize = 128;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
-const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(90);
 // The gateway closes a supervisor session as soon as it commits a sandbox to
 // Stopping, just before the compute-driver StopSandbox RPC arrives. Give that
 // request a bounded opportunity to mark the control exit intentional before
@@ -2131,26 +2130,35 @@ impl DockerComputeDriver {
     }
 
     async fn stop_sandbox_inner(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
-        let Some(container) = self
+        let container = self
             .find_managed_container_summary(sandbox_id, sandbox_name)
-            .await?
-        else {
-            if let Some(record) = self
-                .remove_pending_sandbox(sandbox_id, sandbox_name)
-                .await?
-            {
+            .await?;
+        // Startup can still be waiting for supervisor readiness after the
+        // workload container exists. Cancel it before removing the supervisor
+        // so its failure path cannot delete retained workload storage.
+        let mut pending = self
+            .remove_pending_sandbox(sandbox_id, sandbox_name)
+            .await?;
+        if let Some(task) = pending.as_mut().and_then(|record| record.task.take()) {
+            task.abort();
+            let _ = task.await;
+        }
+        let Some(container) = container else {
+            if let Some(record) = pending {
                 self.stop_control_process(&record.sandbox.id).await;
                 self.remove_auxiliary_containers_for_sandbox(&record.sandbox.id)
                     .await?;
                 self.clear_runtime_failure(&record.sandbox.id).await;
-                if let Some(task) = record.task {
-                    task.abort();
-                }
                 remove_docker_channel_volume_by_id(&self.docker, &record.sandbox.id, &self.config)
                     .await?;
                 cleanup_docker_boundary_state(&record.sandbox, &self.config);
                 self.publish_deleted(record.sandbox.id);
                 return Ok(());
+            }
+            if !sandbox_id.is_empty() {
+                self.stop_control_process(sandbox_id).await;
+                self.remove_auxiliary_containers_for_sandbox(sandbox_id)
+                    .await?;
             }
             return Err(Status::not_found("sandbox not found"));
         };
@@ -5161,64 +5169,43 @@ async fn wait_for_docker_supervisor_ready(
     supervisor_id: &str,
     sandbox_id: &str,
 ) -> Result<(), Status> {
-    let wait = async {
-        loop {
-            let sandbox = docker
-                .inspect_container(sandbox_id, None)
-                .await
-                .map_err(|error| {
-                    Status::internal(format!("inspect Docker sandbox container: {error}"))
-                })?;
-            if sandbox.state.unwrap_or_default().running == Some(false) {
+    // Gateway provisioning deadlines own startup expiration, including policy
+    // repairs that extend the window. Unhealthy means not ready while the
+    // supervisor is quarantined; only a stopped process is a startup failure.
+    loop {
+        let sandbox = docker
+            .inspect_container(sandbox_id, None)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("inspect Docker sandbox container: {error}"))
+            })?;
+        if sandbox.state.unwrap_or_default().running == Some(false) {
+            let sandbox_log_tail = docker_container_log_tail(docker, sandbox_id).await;
+            return Err(Status::unavailable(format!(
+                "Docker sandbox exited before supervisor became ready{}",
+                format_named_log_tail("sandbox log tail", &sandbox_log_tail)
+            )));
+        }
+        let inspected = docker
+            .inspect_container(supervisor_id, None)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("inspect Docker supervisor container: {error}"))
+            })?;
+        let state = inspected.state.unwrap_or_default();
+        match state.health.and_then(|health| health.status) {
+            Some(HealthStatusEnum::HEALTHY) => return Ok(()),
+            _ if state.running == Some(false) => {
+                let log_tail = docker_container_log_tail(docker, supervisor_id).await;
                 let sandbox_log_tail = docker_container_log_tail(docker, sandbox_id).await;
                 return Err(Status::unavailable(format!(
-                    "Docker sandbox exited before supervisor became ready{}",
+                    "Docker supervisor exited before becoming ready{}{}",
+                    format_log_tail(&log_tail),
                     format_named_log_tail("sandbox log tail", &sandbox_log_tail)
                 )));
             }
-            let inspected = docker
-                .inspect_container(supervisor_id, None)
-                .await
-                .map_err(|error| {
-                    Status::internal(format!("inspect Docker supervisor container: {error}"))
-                })?;
-            let state = inspected.state.unwrap_or_default();
-            match state.health.and_then(|health| health.status) {
-                Some(HealthStatusEnum::HEALTHY) => return Ok(()),
-                Some(HealthStatusEnum::UNHEALTHY) => {
-                    let log_tail = docker_container_log_tail(docker, supervisor_id).await;
-                    let sandbox_log_tail = docker_container_log_tail(docker, sandbox_id).await;
-                    return Err(Status::unavailable(format!(
-                        "Docker supervisor failed its readiness check{}{}",
-                        format_log_tail(&log_tail),
-                        format_named_log_tail("sandbox log tail", &sandbox_log_tail)
-                    )));
-                }
-                _ if state.running == Some(false) => {
-                    let log_tail = docker_container_log_tail(docker, supervisor_id).await;
-                    let sandbox_log_tail = docker_container_log_tail(docker, sandbox_id).await;
-                    return Err(Status::unavailable(format!(
-                        "Docker supervisor exited before becoming ready{}{}",
-                        format_log_tail(&log_tail),
-                        format_named_log_tail("sandbox log tail", &sandbox_log_tail)
-                    )));
-                }
-                _ => tokio::time::sleep(Duration::from_millis(100)).await,
-            }
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
         }
-    };
-
-    if let Ok(result) = tokio::time::timeout(SUPERVISOR_READY_TIMEOUT, wait).await {
-        result
-    } else {
-        let log_tail = docker_container_log_tail(docker, supervisor_id).await;
-        let sandbox_log_tail = docker_container_log_tail(docker, sandbox_id).await;
-        Err(Status::deadline_exceeded(format!(
-            "Docker supervisor did not become ready within {} seconds{}{}",
-            SUPERVISOR_READY_TIMEOUT.as_secs(),
-            format_log_tail(&log_tail),
-            format_named_log_tail("sandbox log tail", &sandbox_log_tail)
-        )))
     }
 }
 

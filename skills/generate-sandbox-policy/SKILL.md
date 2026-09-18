@@ -173,6 +173,12 @@ When middleware is requested, also read the published [supervisor middleware gui
 
 For enforcement concepts and the shipped baseline, read [sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md) and the [default policy reference](https://docs.nvidia.com/openshell/latest/reference/default-policy.md). The default policy is baked into the community base image (`ghcr.io/nvidia/openshell-community/sandboxes/base:latest`).
 
+Validate the intended provider combination as well as the authored policy.
+An image endpoint can become credentialed after provider composition and block
+startup with `ConfigurationInvalid`. Repair the complete policy or provider
+selection using the published policy workflow; do not add
+`allow_uninspected_credentials` merely to bypass a startup error.
+
 ## Step 4: Choose Policy Shape
 
 Follow this decision tree based on the detail tier and user intent:

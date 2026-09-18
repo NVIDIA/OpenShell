@@ -1613,6 +1613,62 @@ describe('enum name maps', () => {
 });
 
 describe('raw escape hatch', () => {
+  it('preserves explicit L7 target scope and optional endpoint path on the wire', async () => {
+    const observed: MessageInitShape<typeof OpenShell.method.updateConfig.input>[] = [];
+    const sandbox = client({
+      updateConfig: (req) => {
+        observed.push(req);
+        return { version: 2, policyHash: 'updated' };
+      },
+    });
+    await sandbox.raw.updateConfig({
+      name: 'sb',
+      mergeOperations: [
+        {
+          operation: {
+            case: 'addAllowRules',
+            value: {
+              target: {
+                ruleName: 'internal_api',
+                host: 'api.example.com',
+                ports: [443, 8443],
+                path: '',
+                binaries: [{ path: '/usr/bin/curl' }, { path: '/usr/bin/python3' }],
+              },
+              rules: [{ allow: { method: 'POST', path: '/admin' } }],
+            },
+          },
+        },
+        {
+          operation: {
+            case: 'addDenyRules',
+            value: {
+              target: { ruleName: 'public_api', host: 'api.example.com', ports: [443], anyBinary: true },
+              denyRules: [{ method: 'POST', path: '/admin/private' }],
+            },
+          },
+        },
+      ],
+    });
+    const operations = observed[0]?.mergeOperations;
+    const allow = operations?.[0]?.operation;
+    const deny = operations?.[1]?.operation;
+    expect(allow?.case).toBe('addAllowRules');
+    expect(deny?.case).toBe('addDenyRules');
+    if (allow?.case !== 'addAllowRules' || deny?.case !== 'addDenyRules') throw new Error('wrong operations');
+    expect(allow.value.target).toMatchObject({
+      ruleName: 'internal_api',
+      host: 'api.example.com',
+      ports: [443, 8443],
+      path: '',
+      binaries: [{ path: '/usr/bin/curl' }, { path: '/usr/bin/python3' }],
+      anyBinary: false,
+    });
+    expect(deny.value.target?.anyBinary).toBe(true);
+    expect(deny.value.target?.binaries).toEqual([]);
+    expect(deny.value.target?.path).toBeUndefined();
+  });
+
   it('reaches uncurated RPCs and returns generated wire messages', async () => {
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id-1'),

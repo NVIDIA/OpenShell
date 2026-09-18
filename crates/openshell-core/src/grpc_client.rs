@@ -43,6 +43,15 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::{debug, info, warn};
 
+/// Preserve the gRPC status as a source so callers can classify retryable errors.
+/// `IntoDiagnostic` alone hides the wrapped error's concrete type.
+pub fn grpc_status_error(status: Status) -> miette::Report {
+    #[derive(Debug, thiserror::Error, miette::Diagnostic)]
+    #[error("{0}")]
+    struct GrpcStatusError(#[source] Status);
+    GrpcStatusError(status).into()
+}
+
 /// Channel type after the [`AuthInterceptor`] is applied. Aliased so the
 /// generated client type signatures stay readable.
 pub type AuthedChannel = InterceptedService<Channel, AuthInterceptor>;
@@ -920,7 +929,7 @@ async fn fetch_settings_snapshot_with_client(
             sandbox_id: sandbox_id.to_string(),
         })
         .await
-        .into_diagnostic()?;
+        .map_err(grpc_status_error)?;
 
     Ok(settings_poll_result(response.into_inner()))
 }
@@ -957,7 +966,7 @@ async fn sync_policy_with_client(
             ..Default::default()
         })
         .await
-        .into_diagnostic()
+        .map_err(grpc_status_error)
         .wrap_err("failed to sync policy to server")?;
 
     Ok(())
@@ -1022,6 +1031,40 @@ pub async fn sync_policy_and_fetch_snapshot(
     fetch_settings_snapshot_with_client(&mut client, sandbox_id).await
 }
 
+/// Report an exact runtime configuration generation. Pending registration uses
+/// the snapshot's instance fence; retain that snapshot across registration retries.
+pub async fn report_sandbox_configuration(
+    endpoint: &str,
+    sandbox_id: &str,
+    instance_id: &str,
+    snapshot: Option<&SettingsPollResult>,
+    state: crate::proto::ConfigurationAdmissionState,
+    error: &str,
+) -> Result<()> {
+    let mut client = connect(endpoint).await?;
+    client
+        .report_sandbox_configuration(crate::proto::ReportSandboxConfigurationRequest {
+            sandbox_id: sandbox_id.to_string(),
+            expected_instance_id: snapshot.map_or_else(String::new, |snapshot| {
+                snapshot.configuration_instance_id.clone()
+            }),
+            admission: Some(crate::proto::SandboxConfigurationAdmission {
+                instance_id: instance_id.to_string(),
+                state: state.into(),
+                policy_version: snapshot.map_or(0, |snapshot| snapshot.version),
+                policy_hash: snapshot
+                    .map_or_else(String::new, |snapshot| snapshot.policy_hash.clone()),
+                config_revision: snapshot.map_or(0, |snapshot| snapshot.config_revision),
+                provider_env_revision: snapshot
+                    .map_or(0, |snapshot| snapshot.provider_env_revision),
+                error: error.to_string(),
+            }),
+        })
+        .await
+        .map_err(grpc_status_error)?;
+    Ok(())
+}
+
 /// Fetch provider environment variables for a sandbox from `OpenShell` server via gRPC.
 ///
 /// Returns the credential snapshot and its exact readiness identity. An empty
@@ -1041,7 +1084,7 @@ pub async fn fetch_provider_environment(
             supports_static_credential_bindings: true,
         })
         .await
-        .into_diagnostic()?;
+        .map_err(grpc_status_error)?;
 
     provider_environment_result(response.into_inner())
 }
@@ -1218,6 +1261,9 @@ pub struct CachedOpenShellClient {
 /// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
 #[derive(Clone, Debug)]
 pub struct SettingsPollResult {
+    pub configuration_instance_id: String,
+    pub configuration_admitted: bool,
+    pub configuration_error: String,
     pub policy: Option<ProtoSandboxPolicy>,
     pub version: u32,
     pub policy_hash: String,
@@ -1241,6 +1287,9 @@ pub struct SettingsPollResult {
 
 fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
     SettingsPollResult {
+        configuration_instance_id: inner.configuration_instance_id,
+        configuration_admitted: inner.configuration_admitted,
+        configuration_error: inner.configuration_error,
         policy: inner.policy,
         version: inner.version,
         policy_hash: inner.policy_hash,

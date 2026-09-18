@@ -230,11 +230,13 @@ The following steps outline the hot-reload policy update workflow.
      --wait
 
    openshell policy update <name> \
+     --rule-name allow_api_github_com_443 \
+     --binary /usr/bin/gh \
      --add-allow 'api.github.com:443:POST:/repos/*/issues' \
      --wait
    ```
 
-   `--add-allow` and `--add-deny` target existing `protocol: rest` or `protocol: websocket` endpoints. If you pass multiple update flags in one command, OpenShell applies them as one atomic merge batch and persists at most one new revision.
+   `--add-allow` and `--add-deny` target existing `protocol: rest` or `protocol: websocket` endpoints. They require the rule name and complete affected binary and port scope. Run endpoint creation and L7 appends as separate commands; `--add-endpoint` cannot share a command with `--add-allow` or `--add-deny`. Compatible update flags in one command form one atomic merge batch and persist at most one new revision.
 
 4. For larger edits, pull the current base policy and edit the YAML directly. The base policy is the user-authored policy without provider-composed `_provider_*` entries, so it is safe to round-trip through `openshell policy set`. Before reusing the file, strip the metadata header above the `---` line.
 
@@ -266,6 +268,38 @@ The following steps outline the hot-reload policy update workflow.
    `openshell policy list --global --output json` for global history.
 
 ### Validation failures
+
+Before starting a workload, OpenShell validates its effective policy together
+with attached provider rules and credential bindings. An image policy can be
+valid alone and fail after composition, for example when an L4-only endpoint
+overlaps a credentialed provider that requires L7 inspection.
+
+When startup validation fails, the sandbox stays in `Provisioning` with a
+`ConfigurationInvalid` readiness condition. Its workload has not started. Inspect
+the condition with `openshell sandbox get <name>`, then submit a complete repaired
+policy or detach the conflicting provider:
+
+```shell
+openshell policy set <name> --policy repaired-policy.yaml --wait
+openshell sandbox provider detach <name> <provider>
+```
+
+These are alternative repairs; choose the one that matches the intended access.
+Startup has a [300-second provisioning repair window](/sandboxes/manage-sandboxes#sandbox-lifecycle).
+Effective configuration changes and their first failed load reset the window;
+repeated failures do not. If it expires, the gateway records `ProvisioningTimedOut`
+and reclaims compute. Repair the configuration, wait for cleanup, then run
+`openshell sandbox start <name>` to retry. Before expiry, repair resumes the same
+provisioning attempt.
+The supervisor starts the workload after the repaired configuration passes
+validation. You can replace static policy fields while the first startup is
+blocked. After the first accepted activation, the usual static-field restrictions
+apply permanently, including while a restart is pending or rejected. Images without an
+embedded policy use the restrictive baseline and gain network access only from
+operator-selected configuration. Explicit user/global policy precedence remains
+unchanged. Gateway authorization or compatibility errors, exhausted connection
+retries, and unavailable sandbox boundary connections terminate startup rather than
+waiting for policy repair.
 
 OpenShell validates a complete candidate policy before activating any part of it. Endpoints may overlap when their connection and request-processing metadata agree. For example, two `api.example.com:443` REST entries can contribute different allow and deny rules when they use the same TLS, destination, credential, parser, and enforcement settings. A plain L4 endpoint may overlap an L7 endpoint because it authorizes the destination without contributing request-processing metadata. A more-specific path endpoint may override request-processing metadata from a broader endpoint, such as a `/graphql` GraphQL endpoint alongside a general REST endpoint for the same host. OpenShell rejects the candidate when overlapping exact or wildcard host selectors can both contribute equally specific endpoint configuration and disagree on those fields.
 
@@ -301,7 +335,7 @@ Operators that explicitly prioritize availability can retain the previous genera
 policy_validation_failure_mode = "retain_last_valid"
 ```
 
-In `retain_last_valid` mode, the rejected candidate remains inactive and the previous valid generation remains active. If no previous valid generation exists, such as during initial startup, OpenShell still fails closed. Restart the gateway after changing `gateway.toml`; connected sandbox supervisors receive the configured posture from the restarted gateway. Individual sandboxes cannot override it.
+In `retain_last_valid` mode, the rejected candidate remains inactive and the previous valid generation remains active. During initial startup, a rejected configuration keeps the workload unstarted in either mode. Restart the gateway after changing `gateway.toml`; connected sandbox supervisors receive the configured posture from the restarted gateway. Individual sandboxes cannot override it.
 
 OCSF configuration and finding events identify the rejected candidate, validation rationale, configured and effective modes, active generation, and whether the previous policy is active. When `retain_last_valid` is configured without a previous valid generation, the effective mode remains `fail_closed`. Connection denials during quarantine include the validation failure as their policy denial rationale.
 
@@ -329,8 +363,10 @@ The incremental update surface is split into endpoint-level operations and metho
 | `--remove-rule <NAME>` | Deletes a named `network_policies` entry. | Remove a whole rule by name when you no longer need it. |
 | `--add-allow <SPEC>` | Appends method/path allow rules to an existing REST or WebSocket endpoint. | Permit one additional REST method/path or WebSocket `WEBSOCKET_TEXT` path on an API that is already configured. |
 | `--add-deny <SPEC>` | Appends method/path deny rules to an existing REST or WebSocket endpoint. | Block a sensitive REST path or WebSocket text-message path under an endpoint that is otherwise allowed. |
-| `--binary <PATH>` | Adds binaries to every `--add-endpoint` rule in the same command. | Bind a new endpoint to one or more executables. |
-| `--rule-name <NAME>` | Overrides the generated rule name. | Keep a stable human-chosen rule name when adding exactly one endpoint. |
+| `--binary <PATH>` | Adds binaries for `--add-endpoint`; declares the complete existing binary set for L7 appends. | Repeat for every executable sharing the target rule. |
+| `--rule-name <NAME>` | Names one new endpoint rule or selects the existing rule for L7 appends. | Required for `--add-allow` and `--add-deny`. |
+| `--any-binary` | Explicitly acknowledges an existing rule that authorizes every binary. | Use for L7 appends instead of `--binary` when the target rule has no binary restriction. |
+| `--endpoint-path <PATH>` | Selects an exact existing endpoint path for L7 appends. | Resolve path ambiguity; pass `''` to select an endpoint without a path scope. |
 | `--dry-run` | Shows the merged policy locally and does not call the gateway. | Review the result before persisting it. |
 | `--wait` | Polls until the sandbox reports that the new revision loaded. | Confirm the change took effect before continuing. |
 | `--timeout <SECS>` | Sets the timeout for `--wait`. | Extend the wait window for slower sandboxes. |
@@ -430,7 +466,7 @@ In shell commands, quote the full `SPEC` when it contains `*` or `**` so your sh
 | Segment | Meaning |
 |---|---|
 | `host` | Existing endpoint host. |
-| `port` | Existing endpoint port. |
+| `port` | Complete comma-separated port set of the existing endpoint, such as `443,8443`. |
 | `METHOD` | HTTP method for REST endpoints, or `GET` / `WEBSOCKET_TEXT` for WebSocket endpoints. The CLI normalizes it to uppercase. |
 | `path_glob` | URL path glob. For WebSocket text messages, this still matches the upgraded request path, not message payload content. It must start with `/`, or be `**`, or start with `**/`. |
 
@@ -455,7 +491,9 @@ Path globs follow the same semantics as YAML allow and deny rules:
 - `/repos/*/issues` matches any intervening text, including multiple path segments.
 - `/repos/**` matches everything under `/repos/`.
 
-The rule-level commands only modify method and path constraints. They do not change binaries, hostnames, ports, protocol settings, or WebSocket message payload matching.
+The rule-level commands only modify method and path constraints. They do not change binaries, hostnames, ports, protocol settings, or WebSocket message payload matching. Each change applies to every binary and port on the target endpoint. Supply `--rule-name` and every binary with repeated `--binary`, or use `--any-binary` when the stored rule has an empty binary list. The declared binary and port sets must match the stored scope exactly; OpenShell reports the expected scope when they differ.
+
+Use `--endpoint-path` to select an endpoint by its stored path when the rule contains more than one endpoint matching the host and ports. `--endpoint-path ''` selects an endpoint without a path selector. This selector is separate from the request path in the allow or deny rule. All L7 additions in one command use the same rule name, binary declaration, and endpoint-path selector.
 
 ### Common Workflows
 
@@ -496,6 +534,8 @@ Use `--add-allow` after the REST endpoint already exists.
 ```shell
 openshell policy update demo \
   --add-allow 'api.github.com:443:POST:/repos/*/issues' \
+  --rule-name allow_api_github_com_443 \
+  --binary /usr/bin/gh \
   --wait
 ```
 
@@ -508,6 +548,8 @@ Use `--add-deny` when you want to carve out a blocked subtree under an existing 
 ```shell
 openshell policy update demo \
   --add-deny 'api.github.com:443:POST:/admin/**' \
+  --rule-name allow_api_github_com_443 \
+  --binary /usr/bin/gh \
   --wait
 ```
 
@@ -533,6 +575,8 @@ Use `WEBSOCKET_TEXT` when you want to refine client-to-server text-frame policy 
 ```shell
 openshell policy update demo \
   --add-deny 'realtime.example.com:443:WEBSOCKET_TEXT:/v1/admin/**' \
+  --rule-name allow_realtime_example_com_443 \
+  --binary /usr/bin/node \
   --wait
 ```
 
@@ -568,6 +612,8 @@ Use `--dry-run` when you want to inspect the merged YAML before you send it to t
 ```shell
 openshell policy update demo \
   --add-allow 'api.github.com:443:GET:/repos/**' \
+  --rule-name allow_api_github_com_443 \
+  --binary /usr/bin/gh \
   --dry-run
 ```
 
@@ -577,7 +623,7 @@ The CLI validates the argument shapes before it sends the request. The gateway t
 - a port is outside `1` through `65535`.
 - `--add-allow` or `--add-deny` points at an endpoint that does not exist.
 - `--add-allow` or `--add-deny` targets an endpoint that is neither REST nor WebSocket.
-- `--add-allow` or `--add-deny` targets a host and port that resolves to more than one endpoint.
+- `--add-allow` or `--add-deny` omits the rule name or binary declaration, names incomplete binary or port scope, or still matches several endpoints within the selected rule.
 - `--add-deny` targets an endpoint that has no base allow set.
 - an update names an existing rule and adds a binary to it without declaring every endpoint and port that rule already authorizes.
 - an update names an existing rule and adds or changes an endpoint on it without declaring every binary that rule already authorizes.
@@ -595,7 +641,20 @@ The sandbox picks the parser for a request by most-specific path, but it authori
 
 To grant one binary access to only part of an existing rule's endpoints, send it under its own `--rule-name`. The gateway normally folds an update into an existing rule that shares an endpoint, but it keeps your rule name whenever folding would grant authorization you did not declare, so the narrow grant lands as its own rule authorizing exactly what you asked for. The update reports that it kept your rule name and names the rule it would otherwise have folded into. An MCP contract conflict is the exception: one host and port carry a single MCP contract regardless of which rule holds them, so a conflicting update is rejected rather than moved to a separate rule.
 
-Once a host and port appears in more than one rule, `--add-allow` and `--add-deny` can no longer target it. They select an endpoint by host and port alone, so they cannot say which rule's binary scope to widen, and the gateway rejects the update rather than guessing. The same applies when one rule carries two endpoints on that host and port under different paths. Use full YAML replacement to change L7 rules on an endpoint that appears more than once.
+When several rules contain the same host and port, `--rule-name` selects the rule to change. Within that rule, use `--endpoint-path` if several endpoints match. OpenShell rejects missing, ambiguous, or mismatched targets atomically. Provider-owned rules cannot be changed through these operations; update the provider profile instead.
+
+For example, this appends one permission to an endpoint shared by two binaries on two ports:
+
+```shell
+openshell policy update demo \
+  --rule-name internal_api \
+  --binary /usr/bin/curl \
+  --binary /usr/bin/python3 \
+  --add-allow 'api.example.com:443,8443:POST:/admin' \
+  --wait
+```
+
+The command explicitly declares all four binary-to-port combinations affected by the new permission. Omitting either binary or either port rejects the whole update. To grant a permission to a smaller scope, create a separate rule with `--add-endpoint` or edit the policy structure first.
 
 ## Global Policy Override
 
@@ -648,7 +707,7 @@ for the complete authorization model.
 For small changes, prefer `openshell policy update` over rewriting the full YAML:
 
 ```shell
-openshell policy update <name> --add-allow 'api.github.com:443:GET:/repos/**' --wait
+openshell policy update <name> --rule-name allow_api_github_com_443 --binary /usr/bin/gh --add-allow 'api.github.com:443:GET:/repos/**' --wait
 ```
 
 ## Examples
