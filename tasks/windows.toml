@@ -85,6 +85,20 @@ description = "Run native ARM64 real-wxc-exec Tier-2 integration tests (skip-saf
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-mxc-real aarch64-pc-windows-msvc"
 
+["windows:test:mxc-gb300:arm64"]
+description = "Run native ARM64 GB300 real-MXC tests (strict: any required missing prerequisite or SKIP fails)"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-mxc-gb300 aarch64-pc-windows-msvc"
+
+["windows:qualify:mxc:gb300:contract"]
+description = "Validate the NVBug 6643699 GB300 Windows ARM64 MXC scope contract"
+run = "uv run python crates/openshell-driver-mxc/qualification/validate.py contract"
+
+["windows:qualify:mxc:gb300"]
+description = "Execute and validate the complete GB300 Windows ARM64 MXC qualification contract"
+run = "echo 'GB300 qualification requires a native Windows ARM64 host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File crates/openshell-driver-mxc/qualification/run-gb300-woa.ps1"
+
 ["windows:e2e:mxc"]
 description = "Run MXC Tier-3 e2e scenario runner against real wxc-exec (probe-gated; skip-safe on hosts without the binary)"
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"

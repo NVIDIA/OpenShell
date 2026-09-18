@@ -6,7 +6,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("check", "lint", "build", "test", "test-precommit", "test-unsupported", "test-mxc-real", "artifacts", "ci")]
+    [ValidateSet("check", "lint", "build", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-gb300", "artifacts", "ci")]
     [string] $Action,
 
     [Parameter(Position = 1)]
@@ -591,6 +591,46 @@ function Invoke-MxcRealTests([string] $RustTarget) {
         -LogName "test-$RustTarget-mxc-real.log"
 }
 
+function Invoke-MxcGb300Tests([string] $RustTarget) {
+    Assert-NativeTestTarget $RustTarget
+    if ($RustTarget -ne "aarch64-pc-windows-msvc") {
+        throw "The GB300 qualification contract requires native ARM64; target $RustTarget cannot receive credit."
+    }
+
+    $tests = @(
+        "dryrun_accepts_minimal_processcontainer_config",
+        "dryrun_accepts_processcontainer_ui_policy_matrix",
+        "dryrun_accepts_network_block_without_proxy",
+        "dryrun_accepts_localhost_proxy_shape",
+        "dryrun_rejects_host_port_proxy_shape",
+        "dryrun_rejects_unknown_containment",
+        "dryrun_accepts_split_policy_output",
+        "pc_oneshot_in_policy_write_succeeds",
+        "pc_https_egress_reads_injected_ca_bundle",
+        "pc_oneshot_out_of_policy_write_denied"
+    )
+    $logName = "test-$RustTarget-mxc-gb300.log"
+    Invoke-VsCargo `
+        -RustTarget $RustTarget `
+        -CargoArgs "cargo test -p openshell-driver-mxc --test wxc_exec_real --target $RustTarget -- --ignored --test-threads=1 --nocapture" `
+        -LogName $logName
+
+    $logPath = Join-Path $LogDir $logName
+    $allowedSkipPattern = '^test (dryrun_current_schema_rejects_isolation_session_ui|iso_lifecycle_round_trip) \.\.\. SKIP:'
+    $unexpectedSkips = @(Select-String -Path $logPath -SimpleMatch "SKIP:" | Where-Object {
+        $_.Line -notmatch $allowedSkipPattern
+    })
+    if ($unexpectedSkips.Count -gt 0) {
+        throw "A required GB300 MXC test skipped: $($unexpectedSkips.Line -join '; '). See $logPath"
+    }
+    foreach ($test in $tests) {
+        $escapedTest = [Regex]::Escape($test)
+        if (-not (Select-String -Path $logPath -Pattern "^test $escapedTest \.\.\. ok$" -Quiet)) {
+            throw "Required GB300 MXC test $test did not report a passing assertion. See $logPath"
+        }
+    }
+}
+
 function Get-Sha256([string] $Path) {
     $stream = [System.IO.File]::OpenRead($Path)
     try {
@@ -635,13 +675,13 @@ if ($Action -eq "ci" -and (Get-HostArch) -ne "amd64") {
 }
 
 $targets = Get-SelectedTargets $Target
-if ($Action -in @("test", "test-precommit", "test-unsupported", "test-mxc-real")) {
+if ($Action -in @("test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-gb300")) {
     foreach ($rustTarget in $targets) {
         Assert-NativeTestTarget $rustTarget
     }
 }
 
-if ($Action -in @("check", "lint", "build", "test", "test-precommit", "test-unsupported", "test-mxc-real", "ci")) {
+if ($Action -in @("check", "lint", "build", "test", "test-precommit", "test-unsupported", "test-mxc-real", "test-mxc-gb300", "ci")) {
     $z3Features = Configure-Z3
     $Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
     $Z3ServerFeatures = $z3Features.ServerFeatures
@@ -687,6 +727,11 @@ switch ($Action) {
     "test-mxc-real" {
         foreach ($rustTarget in $targets) {
             Invoke-MxcRealTests $rustTarget
+        }
+    }
+    "test-mxc-gb300" {
+        foreach ($rustTarget in $targets) {
+            Invoke-MxcGb300Tests $rustTarget
         }
     }
     "artifacts" {
