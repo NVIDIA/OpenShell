@@ -9,8 +9,10 @@ use crate::compute::ComputeRuntime;
 use async_trait::async_trait;
 use tonic::Status;
 
-/// The only public gateway method on which driver-native credentials apply.
+/// Legacy token exchange endpoint accepting driver-native credentials.
 pub const ISSUE_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/IssueSandboxToken";
+/// Runtime assignment endpoint accepting driver-native credentials.
+pub const REGISTER_SUPERVISOR_PATH: &str = "/openshell.v1.OpenShell/RegisterSupervisor";
 
 #[derive(Clone, Debug)]
 pub struct ComputeDriverAuthenticator {
@@ -30,7 +32,7 @@ impl Authenticator for ComputeDriverAuthenticator {
         headers: &http::HeaderMap,
         path: &str,
     ) -> Result<Option<Principal>, Status> {
-        if path != ISSUE_SANDBOX_TOKEN_PATH {
+        if path != ISSUE_SANDBOX_TOKEN_PATH && path != REGISTER_SUPERVISOR_PATH {
             return Ok(None);
         }
 
@@ -42,6 +44,18 @@ impl Authenticator for ComputeDriverAuthenticator {
             return Ok(None);
         };
 
+        if path == REGISTER_SUPERVISOR_PATH {
+            let response = self.compute.authenticate_supervisor(credential).await?;
+            return Ok(Some(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: response.sandbox_id,
+                source: SandboxIdentitySource::SupervisorRegistration {
+                    registration: response.registration.ok_or_else(|| {
+                        Status::permission_denied("missing registration identity")
+                    })?,
+                },
+                trust_domain: Some("openshell".to_string()),
+            })));
+        }
         let authenticated = self.compute.authenticate_sandbox(credential).await?;
         let sandbox_id = authenticated.sandbox_id;
         if sandbox_id.is_empty() {

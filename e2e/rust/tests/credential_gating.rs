@@ -550,14 +550,20 @@ with socket.create_connection((host, port), timeout=10) as sock:
     sock.sendall(request)
     sock.settimeout(3)
     response = b""
+    timed_out = False
     while True:
         try:
             chunk = sock.recv(4096)
         except socket.timeout:
+            timed_out = True
             break
         if not chunk:
             break
         response += chunk
+    # Report framing/timing without printing credential-bearing response data.
+    status_parts = response.split(b"\r\n", 1)[0].split(b" ", 2)
+    status = status_parts[1].decode("ascii") if len(status_parts) > 1 and status_parts[1].isdigit() else "unknown"
+    print(f"BODY_RESPONSE status={{status}} bytes={{len(response)}} timed_out={{timed_out}}")
     print("BODY_REWRITTEN" if b"BODY_REWRITTEN" in response else "BODY_TEXT" if b"BODY_TEXT" in response else "BODY_DENIED")
 "#
     )
@@ -842,7 +848,11 @@ async fn run_profile_body_sandbox(port: u16) -> Result<String, String> {
 
 async fn assert_rest_body_preserves_placeholder(server: &HttpProbeServer) -> Result<(), String> {
     let output = run_profile_body_sandbox(server.port).await?;
-    assert!(output.contains("BODY_TEXT"));
+    assert!(
+        output.contains("BODY_TEXT"),
+        "expected unmodified REST body response; sandbox output: {}",
+        output.replace(TEST_SECRET, "[redacted]")
+    );
     let observations = server.wait_for_observations(1).await;
     assert_eq!(observations.len(), 1, "observations: {observations:?}");
     assert!(observations[0].saw_placeholder);
@@ -915,14 +925,24 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
             CredentialSource::PolicyBinding,
         )
         .await?;
-        assert!(literal.contains("BODY_TEXT"));
+        assert!(
+            literal.contains("BODY_TEXT"),
+            "expected literal body response; output: {}; observations: {:?}",
+            literal.replace(TEST_SECRET, "[redacted]"),
+            server.observations.lock().unwrap()
+        );
         let rewritten = run_body_sandbox(
             server.port,
             EndpointMode::RestBody { rewrite: true },
             CredentialSource::PolicyBinding,
         )
         .await?;
-        assert!(rewritten.contains("BODY_REWRITTEN"));
+        assert!(
+            rewritten.contains("BODY_REWRITTEN"),
+            "expected rewritten body response; output: {}; observations: {:?}",
+            rewritten.replace(TEST_SECRET, "[redacted]"),
+            server.observations.lock().unwrap()
+        );
         assert!(!rewritten.contains(TEST_SECRET));
         assert!(!rewritten.contains(PLACEHOLDER_PREFIX));
         let observations = server.wait_for_observations(3).await;

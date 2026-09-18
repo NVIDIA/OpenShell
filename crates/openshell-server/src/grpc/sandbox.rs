@@ -591,8 +591,15 @@ async fn handle_create_sandbox_inner(
             status
         })?;
 
-    let runtime_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+    let mut runtime_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
         .map_err(|error| Status::internal(error.to_string()))?;
+    crate::compute::warm_pool::prepare(
+        state,
+        &mut sandbox,
+        &mut runtime_identity,
+        await_main_process_attachment,
+    )
+    .await?;
     if let Some(metadata) = sandbox.metadata.as_mut() {
         runtime_identity.write(&mut metadata.annotations);
     }
@@ -621,15 +628,33 @@ async fn handle_create_sandbox_inner(
         })
         .transpose()?;
 
-    let sandbox = Box::pin(state.compute.create_sandbox_authenticated_with_guards(
-        sandbox,
-        sandbox_token,
-        launch_authentication,
-        await_main_process_attachment,
-        sandbox_lifecycle_guard,
-        sandbox_sync_guard,
-    ))
-    .await?;
+    let mut sandbox_lifecycle_guard = Some(sandbox_lifecycle_guard);
+    let mut sandbox_sync_guard = Some(sandbox_sync_guard);
+    let sandbox = if crate::compute::warm_pool::pending(&sandbox) {
+        Box::pin(crate::compute::warm_pool::create(
+            state,
+            sandbox,
+            sandbox_lifecycle_guard,
+            sandbox_sync_guard,
+        ))
+        .await?
+    } else {
+        let sandbox = Box::pin(state.compute.create_sandbox_authenticated_with_guards(
+            sandbox,
+            sandbox_token,
+            launch_authentication,
+            await_main_process_attachment,
+            &mut sandbox_lifecycle_guard,
+            &mut sandbox_sync_guard,
+        ))
+        .await?;
+        // Creation retains the per-sandbox guard so compensation can run
+        // atomically. Release it before later create steps can trigger the
+        // ordinary delete path (for example, service-exposure rollback).
+        drop(sandbox_lifecycle_guard);
+        drop(sandbox_sync_guard);
+        sandbox
+    };
 
     let mut service_urls = HashMap::with_capacity(request.service_exposures.len());
     for exposure in &request.service_exposures {
@@ -751,7 +776,7 @@ fn validate_template_create_governance_spec(spec: &SandboxSpec) -> Result<(), St
     Ok(())
 }
 
-fn sandbox_spec_from_stored_workload_template(
+pub fn sandbox_spec_from_stored_workload_template(
     template: &SandboxWorkloadTemplate,
 ) -> Result<SandboxSpec, Status> {
     sandbox_spec_from_workload_template(template, tonic::Code::Internal)

@@ -283,6 +283,12 @@ server:
       # "managed": auto-creates per-workspace namespaces.
       # "operator": uses pre-provisioned namespaces.
       workspaceMode: "shared"
+      # -- Prepare and claim single-use sandbox/proxy pairs for templates with startup hints.
+      warmPool:
+        enabled: true
+        maxPairs: 10
+        preparationTimeoutSeconds: 300
+        maxIdleSeconds: 3600
       # -- K8s label selector for namespace discovery in operator mode.
       # The driver watches namespaces matching this label.
       operatorNamespaceLabel: ""

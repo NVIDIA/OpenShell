@@ -113,6 +113,10 @@ struct Args {
     #[arg(long)]
     auth_bundle_file: Option<PathBuf>,
 
+    /// Wait for gateway assignment using the projected proxy identity.
+    #[arg(long, conflicts_with = "auth_bundle_file")]
+    register_supervisor: bool,
+
     /// Loopback HTTP/CONNECT listener used by `--role=network-proxy`.
     #[arg(long)]
     listen: Option<std::net::SocketAddr>,
@@ -210,9 +214,9 @@ fn validate_role_arguments(args: &Args) -> Result<()> {
                     "--backend-descriptor-file is required for --role=isolation-backend"
                 ));
             }
-            if args.auth_bundle_file.is_none() {
+            if args.auth_bundle_file.is_none() && !args.register_supervisor {
                 return Err(miette::miette!(
-                    "--auth-bundle-file is required for --role=isolation-backend"
+                    "--auth-bundle-file or --register-supervisor is required for --role=isolation-backend"
                 ));
             }
             if args.listen.is_some() {
@@ -229,6 +233,7 @@ fn validate_role_arguments(args: &Args) -> Result<()> {
         SupervisorRole::NetworkProxy => {
             if args.backend_descriptor_file.is_some()
                 || args.auth_bundle_file.is_some()
+                || args.register_supervisor
                 || args.sandbox_id.is_some()
                 || args.sandbox.is_some()
                 || args.openshell_endpoint.is_some()
@@ -289,13 +294,64 @@ fn main() -> Result<()> {
         return openshell_supervisor::check_control_readiness(&args.socket);
     }
 
-    let args = Args::parse();
+    let mut args = Args::parse();
     validate_role_arguments(&args)?;
     arm_parent_liveness(args.parent_liveness_fd)?;
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
+    let assignment = if args.register_supervisor {
+        let endpoint = args
+            .openshell_endpoint
+            .as_deref()
+            .ok_or_else(|| miette::miette!("registration requires a gateway endpoint"))?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .into_diagnostic()?;
+        let bootstrap_logging = tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
+            )
+            .with_writer(std::io::stderr)
+            .finish();
+        let assignment = tracing::subscriber::with_default(bootstrap_logging, || {
+            info!("Waiting for gateway runtime assignment");
+            runtime.block_on(openshell_core::grpc_client::register_supervisor(endpoint))
+        })?;
+        args.sandbox_id = Some(assignment.sandbox_id.clone());
+        args.sandbox = Some(assignment.sandbox_name.clone());
+        Some(assignment)
+    } else {
+        None
+    };
     let isolation_inputs = if args.role == SupervisorRole::IsolationBackend {
-        let descriptor = backend_descriptor(&args)?;
-        let auth = auth_bundle(&args)?;
+        let (descriptor, auth) = if let Some(assignment) = &assignment {
+            let prepared = backend_descriptor(&args)?;
+            let prepared: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor =
+                serde_json::from_slice(&prepared.payload).into_diagnostic()?;
+            let assigned: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor =
+                serde_json::from_slice(&assignment.backend_descriptor).into_diagnostic()?;
+            let mut expected = prepared;
+            expected.boundary_id.clone_from(&assignment.sandbox_id);
+            if expected != assigned {
+                return Err(miette::miette!(
+                    "assignment does not match the prepared runtime"
+                ));
+            }
+            let auth: openshell_core::jwt::SupervisorAuthBundle =
+                serde_json::from_slice(&assignment.auth_bundle).into_diagnostic()?;
+            auth.validate().into_diagnostic()?;
+            if auth.session_id != assigned.session_id
+                || auth.runtime_generation.as_str() != assigned.generation
+            {
+                return Err(miette::miette!(
+                    "assignment credentials do not match prepared generation"
+                ));
+            }
+            (assigned.backend_descriptor().into_diagnostic()?, auth)
+        } else {
+            (backend_descriptor(&args)?, auth_bundle(&args)?)
+        };
         // Install the driver-provisioned session before starting log push or
         // any other gateway client. `run_sandbox` obtains the same Sandbox
         // Protocol bearer slot after validating the descriptor binding.
@@ -391,7 +447,11 @@ fn main() -> Result<()> {
         let workdir = args.workdir.clone();
         let (command, interactive, await_main_process_attachment) = if !args.command.is_empty() {
             (args.command, args.interactive, false)
-        } else if let Ok(json) = std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC) {
+        } else if let Some(json) = assignment
+            .as_ref()
+            .map(|a| a.main_process_spec.clone())
+            .or_else(|| std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC).ok())
+        {
             let config = openshell_core::sandbox_env::MainProcessConfig::decode(&json)
                 .map_err(|error| miette::miette!("{error}"))?;
             (
@@ -506,6 +566,35 @@ mod tests {
     #[test]
     fn isolation_backend_inputs_are_mandatory() {
         let args = Args::try_parse_from(["openshell-supervisor"]).expect("parse defaults");
+        assert!(validate_role_arguments(&args).is_err());
+    }
+
+    #[test]
+    fn registration_replaces_the_auth_file_only_for_isolation_backends() {
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--backend-descriptor-file",
+            "/tmp/runtime.json",
+            "--register-supervisor",
+        ])
+        .unwrap();
+        assert!(validate_role_arguments(&args).is_ok());
+        assert!(
+            Args::try_parse_from([
+                "openshell-supervisor",
+                "--register-supervisor",
+                "--auth-bundle-file",
+                "/tmp/auth.json",
+            ])
+            .is_err()
+        );
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--role",
+            "network-proxy",
+            "--register-supervisor",
+        ])
+        .unwrap();
         assert!(validate_role_arguments(&args).is_err());
     }
 

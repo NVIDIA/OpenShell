@@ -663,6 +663,13 @@ enabled = true
 gateway_namespace = "openshell"
 gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes.io/instance" = "openshell" }
 
+# Optional preparation and allocation of idle workload/proxy pairs.
+[openshell.drivers.kubernetes.warm_pool]
+enabled = true
+max_pairs = 10
+preparation_timeout_seconds = 300
+max_idle_seconds = 3600
+
 [openshell.drivers.kubernetes.sandbox_runtime]
 # Required acknowledgement that the cluster CNI enforces NetworkPolicy and the
 # sandbox namespaces prevent untrusted policy, pod, label, and Secret changes.
@@ -670,6 +677,55 @@ network_policy_enforced = true
 # TLS-protected boundary listener reached only by the paired control pod.
 boundary_port = 5500
 ```
+
+Warm pooling is experimental and enabled by default. Disable it in Helm
+with `server.drivers.kubernetes.warmPool.enabled=false`, or set `enabled = false`
+in `[openshell.drivers.kubernetes.warm_pool]`. Templates with
+`startup.ready_within` and a positive `startup.max_burst` request spare pairs;
+`max_pairs` caps total unassigned inventory across templates. Preparing pairs
+count toward the cap. When the cap is exhausted, some templates may have fewer
+spares than requested. Creating a sandbox with `--template` claims a compatible
+ready pair from that template. Without a matching spare, creation uses the cold
+path. Command, TTY, policy and providers are applied on assignment; the workload
+shape comes from the template. An uncertain claim remains pending until the
+gateway resolves it. Assigned pairs support ordinary stop/start and are deleted
+with their sandbox; they are never returned to the pool.
+
+In operator workspace mode, templates outside the namespace allowlist are skipped
+without interrupting pools in eligible workspaces. Their templates become eligible
+again when the namespace returns to the allowlist. Interrupted preparation can
+resume after Pod release when the recorded resource identities and bootstrap
+journal still match.
+
+Claimed Pods retain their prepared names. The gateway asynchronously labels both
+Pods with the assigned `openshell.ai/sandbox-name` and `openshell.ai/sandbox-id`.
+It also updates their `openshell.ai/sandbox-id` annotations so SPIRE uses the
+logical sandbox ID. Reconciliation repairs missing or stale labels and annotations,
+including after stop/start. Display the mapping with:
+
+```shell
+kubectl -n <sandbox-namespace> get pods \
+  -L openshell.ai/sandbox-name,openshell.ai/boundary-role
+```
+
+Select both Pods for a sandbox with `-l openshell.ai/sandbox-name=<sandbox-name>`.
+Idle and claimed warm-pool Pods also carry `openshell.ai/template-name` and
+`openshell.ai/template-id`. Add `-L openshell.ai/template-name` to display the
+template, or use `-l openshell.ai/template-id=<template-id>` to select its Pods.
+These labels remain after assignment; existing idle pairs are backfilled during
+pool reconciliation.
+In shared namespaces, sandbox names can repeat across workspaces; use
+`-l openshell.ai/sandbox-id=<sandbox-id>` for an unambiguous lookup.
+Assignment wakes waiting supervisors on the same gateway replica immediately;
+other replicas discover it through the one-second recovery poll.
+
+The controller needs `get`, `create`, and `update` permission for Kubernetes
+Leases in the driver's `namespace`; the chart grants these permissions. Pool
+preparation uses the existing Sandbox, Pod, Service, Secret and NetworkPolicy
+permissions. Disabling preparation retires unassigned inventory. Claimed pairs
+are not retired by the pool controller. `preparation_timeout_seconds` must be at
+least 30; `max_idle_seconds` must be at least that timeout and at most 86400.
+`max_pairs` may be zero and must not exceed 1000.
 
 In managed workspace mode, the Kubernetes driver copies each explicitly named
 `image_pull_secrets` Secret from `namespace` into the managed workspace

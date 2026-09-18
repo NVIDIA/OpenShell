@@ -410,6 +410,7 @@ mod tests {
 
     fn principal(auth_epoch: u64, token_id: Uuid) -> AuthenticatedSandboxSession {
         AuthenticatedSandboxSession {
+            resource_binding: std::collections::BTreeMap::default(),
             sandbox_id: SandboxId::parse("sandbox-a").expect("sandbox ID"),
             runtime_generation: SandboxGenerationId::parse("generation-a")
                 .expect("runtime generation"),

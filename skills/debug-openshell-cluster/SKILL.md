@@ -90,6 +90,30 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 
 ### Step 3: Check Gateway Startup Dependencies
 
+For missing Kubernetes warm capacity, check template startup hints
+(`startup.ready_within` and a positive `startup.max_burst`) and whether the
+deployment explicitly disables `server.drivers.kubernetes.warmPool.enabled`
+or `[openshell.drivers.kubernetes.warm_pool].enabled`. Pooling is enabled by
+default, but templates without these hints request no spare pairs. Inspect
+gateway logs for warm pool election or preparation failures and check the
+configured inventory cap.
+
+Warm-pool Pod names retain their prepared identities after assignment. Use
+`kubectl -n <namespace> get pods -L openshell.ai/sandbox-name,openshell.ai/boundary-role`
+to display logical sandbox names, or select `openshell.ai/sandbox-id=<id>` to
+find both Pods across potentially duplicate names in different workspaces.
+These labels and the `openshell.ai/sandbox-id` annotation are repaired
+asynchronously from the Sandbox resource; the `openshell.ai/boundary-pair` label
+continues to identify the physical pair. When SPIFFE provider token grants fail
+after warm assignment, check that the supervisor Pod's sandbox-ID annotation
+matches the logical sandbox ID used by the SPIRE identity mapping.
+Use `-L openshell.ai/template-name` to identify idle warm capacity by template;
+`openshell.ai/template-id` distinguishes templates across workspaces. Both labels
+remain on claimed pairs, so a template selector includes assigned Pods too.
+Local assignment notifications avoid the registration polling delay, but a
+registration handled by another gateway replica can still wait up to one poll
+interval before noticing the claim.
+
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 
 For out-of-tree compute drivers, confirm the selected driver name and socket agree across CLI flags or `gateway.toml`, and that the operator-owned driver is running before the gateway starts:
@@ -203,6 +227,21 @@ launching the workload while configuration is repaired. An unavailable boundary
 fails discovery within its control-request deadline. Permanent
 gateway errors and exhausted transient retries terminate startup; inspect those
 errors as connectivity, authorization, or lifecycle failures.
+
+For Kubernetes registration-based startup, distinguish waiting for assignment
+from failure to attach the workload. Check gateway `RegisterSupervisor` errors,
+projected-token audience and TokenReview access, and live Sandbox/Pod ownership.
+The gateway also needs `get` on Secrets in sandbox namespaces to validate the
+prepared proxy descriptor. Repeated `Unavailable` registration responses with
+`failed to read proxy registration bootstrap Secret` in the gateway log can
+indicate missing RBAC permission; check the API error without dumping the Secret.
+Stop and rollback cleanup also require Secret `list` and `delete` permissions.
+Supervisor deletion allows the Pod termination grace period plus cleanup time;
+capture terminating Pod status and logs before test cleanup removes them.
+The proxy bootstrap Secret contains transport and proxy-CA material; an absent
+`auth.json` is expected. Operational credentials arrive through registration.
+Use the [gateway authentication reference](https://docs.nvidia.com/openshell/latest/reference/gateway-auth.md)
+for the authentication flow. Do not print Secret contents or projected tokens.
 
 ### Step 4: Check Docker-Backed Gateways
 
@@ -641,6 +680,40 @@ RoleBinding subject matches the gateway ServiceAccount name and namespace.
 If SSH relay connections fail, verify the workspace NetworkPolicy selects the
 gateway's actual `app.kubernetes.io/name` and
 `app.kubernetes.io/instance` labels.
+
+For optional warm-pool preparation, inspect Sandbox labels
+`openshell.ai/warm-pool` and `openshell.ai/warm-pool-state`. A `ready` spare has
+no logical sandbox ID and its proxy is still waiting in `RegisterSupervisor`;
+the proxy Pod's ordinary readiness probe remains false until activation. Check
+the workload's `boundary-health` probe and the
+`openshell.ai/warm-proxy-registered-at-ms` annotation for standby readiness.
+Controller election needs Lease get/create/update permissions in the driver's
+configured namespace. Repeated preparation failures appear in gateway logs;
+template removal or pool disablement should retire only unassigned pairs.
+In operator mode, `skipping unavailable warm pool workspace` means that template's
+namespace is outside the allowlist; other eligible pools continue refreshing.
+An interrupted preparation can resume after its workload scheduling gate is gone
+if the recorded resource identities and existing bootstrap journal still match.
+The preparation Secret journal contains TLS private keys: inspect metadata,
+never print its data. Assignment removes the pool labels and adds the logical
+sandbox ID to the parent. The `openshell.ai/warm-pair-id` annotation remains the
+physical identity used by companion resources, including after stop/start.
+For an allocation stuck in Provisioning, inspect the logical sandbox's
+`internal.openshell.ai/warm-pair-pending` annotation and gateway claim-recovery logs.
+An uncertain claim deliberately keeps the same candidate; do not manually clear
+its annotations or return an assigned pair to the pool.
+Target reservations survive gateway restart and have no TTL. Reservation
+conflicts immediately try another candidate without retiring the other sandbox's
+pair; definite claim rejection uses bounded retries before cold fallback.
+Do not remove allocation reservations to force progress on an uncertain claim.
+Completed and failed main-process results finalize pending claim recovery. Explicit
+restart clears that pending marker with its new attempt while retaining the assigned
+pair and reservation; recovery must not select another pair for that restart.
+After `ProvisioningTimedOut`, recovery retires the pending candidate instead of
+retrying allocation. Cleanup remains pending until candidate retirement and
+compute reclamation succeed. Leftover allocation annotations require cleanup
+even if an older gateway recorded completion; explicitly start the sandbox only
+after cleanup finishes.
 
 Check the configured sandbox service account when TokenReview bootstrap or
 sandbox registration fails. Helm creates a dedicated sandbox service account by

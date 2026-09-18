@@ -53,6 +53,93 @@ pub(super) struct PostgresAdvisoryLockGuard {
 }
 
 impl PostgresStore {
+    pub(crate) async fn allocation_conflicts(
+        &self,
+        claim: &super::AllocationClaim,
+    ) -> PersistenceResult<bool> {
+        let owner = sqlx::query("SELECT sandbox_id, attempt_id, runtime_generation FROM allocation_claims WHERE target = $1")
+            .bind(&claim.target).fetch_optional(&self.pool).await.map_err(|e| map_db_error(&e))?;
+        Ok(owner.is_some_and(|owner| {
+            owner.get::<String, _>("sandbox_id") != claim.sandbox_id
+                || owner.get::<String, _>("attempt_id") != claim.attempt_id
+                || owner.get::<String, _>("runtime_generation") != claim.runtime_generation
+        }))
+    }
+
+    pub(crate) async fn put_sandbox_allocation(
+        &self,
+        sandbox: &Sandbox,
+        claim: Option<&super::AllocationClaim>,
+        condition: WriteCondition,
+    ) -> PersistenceResult<WriteResult> {
+        use openshell_core::{ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
+        let now_ms = current_time_ms();
+        let labels = serde_json::to_value(sandbox.object_labels().unwrap_or_default())
+            .map_err(|error| PersistenceError::Encode(error.to_string()))?;
+        let payload = sandbox.encode_to_vec();
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        let row = match condition {
+            WriteCondition::MustCreate => sqlx::query(
+                "INSERT INTO objects (object_type, id, name, workspace, payload, labels, created_at_ms, updated_at_ms, resource_version)
+                 VALUES ('sandbox', $1, $2, $3, $4, $5, $6, $6, 1)
+                 RETURNING resource_version, created_at_ms, updated_at_ms"
+            )
+            .bind(sandbox.object_id()).bind(sandbox.object_name()).bind(sandbox.object_workspace())
+            .bind(&payload).bind(&labels).bind(now_ms)
+            .fetch_optional(&mut *tx).await.map_err(|e| map_db_error(&e))?,
+            WriteCondition::MatchResourceVersion(version) => sqlx::query(
+                "UPDATE objects SET payload = $1, labels = $2, updated_at_ms = $3, resource_version = resource_version + 1
+                 WHERE object_type = 'sandbox' AND id = $4 AND resource_version = $5
+                 RETURNING resource_version, created_at_ms, updated_at_ms"
+            )
+            .bind(&payload).bind(&labels).bind(now_ms).bind(sandbox.object_id())
+            .bind(i64::try_from(version).unwrap_or(i64::MAX))
+            .fetch_optional(&mut *tx).await.map_err(|e| map_db_error(&e))?,
+            WriteCondition::Unconditional => return Err(PersistenceError::Config("allocation intent requires a conditional write".into())),
+        }.ok_or(PersistenceError::Conflict { current_resource_version: None })?;
+        if let Some(claim) = claim {
+            sqlx::query(
+                "INSERT INTO allocation_claims (target, sandbox_id, attempt_id, runtime_generation)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (target) DO NOTHING",
+            )
+            .bind(&claim.target)
+            .bind(&claim.sandbox_id)
+            .bind(&claim.attempt_id)
+            .bind(&claim.runtime_generation)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+            let owner = sqlx::query("SELECT sandbox_id, attempt_id, runtime_generation FROM allocation_claims WHERE target = $1")
+                .bind(&claim.target).fetch_one(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+            if owner.get::<String, _>("sandbox_id") != claim.sandbox_id
+                || owner.get::<String, _>("attempt_id") != claim.attempt_id
+                || owner.get::<String, _>("runtime_generation") != claim.runtime_generation
+            {
+                return Err(PersistenceError::AllocationTargetReserved);
+            }
+        }
+        let version: i64 = row.get("resource_version");
+        let result = WriteResult {
+            resource_version: version.max(1).cast_unsigned(),
+            created_at_ms: row.get("created_at_ms"),
+            updated_at_ms: row.get("updated_at_ms"),
+        };
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(result)
+    }
+
+    pub(crate) async fn release_allocation(
+        &self,
+        claim: &super::AllocationClaim,
+    ) -> PersistenceResult<()> {
+        sqlx::query(
+            "DELETE FROM allocation_claims WHERE target = $1 AND sandbox_id = $2 AND attempt_id = $3 AND runtime_generation = $4"
+        )
+        .bind(&claim.target).bind(&claim.sandbox_id).bind(&claim.attempt_id).bind(&claim.runtime_generation)
+        .execute(&self.pool).await.map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
     pub async fn connect(url: &str) -> PersistenceResult<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(10)

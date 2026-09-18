@@ -13,6 +13,16 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: permits registration to read prepared proxy Secrets in shared mode
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "get", "list", "delete"]
+
   - it: defaults the Kubernetes driver namespace to release namespace
     template: templates/gateway-config.yaml
     asserts:
@@ -73,7 +83,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
+            verbs: ["create", "get", "list", "delete"]
 
   - it: uses explicit sandboxNamespace for sandbox RoleBinding
     template: templates/rolebinding.yaml

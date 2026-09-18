@@ -274,6 +274,60 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
         .wrap_err("failed to connect to OpenShell server")
 }
 
+/// Register with a driver-native projected credential, before installing any
+/// operational token slots. Re-read the token on every reconnect for rotation.
+pub async fn register_supervisor(
+    endpoint: &str,
+) -> Result<crate::proto::RegisterSupervisorResponse> {
+    let path = std::env::var(sandbox_env::K8S_SA_TOKEN_FILE)
+        .into_diagnostic()
+        .wrap_err("registration requires a projected service-account token")?;
+    loop {
+        let token = tokio::fs::read_to_string(&path).await.into_diagnostic()?;
+        let result = match build_plain_channel(endpoint).await {
+            Ok(channel) => {
+                let mut client = OpenShellClient::new(channel);
+                let mut request = tonic::Request::new(crate::proto::RegisterSupervisorRequest {});
+                request.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", token.trim())
+                        .parse()
+                        .into_diagnostic()?,
+                );
+                request.set_timeout(Duration::from_secs(45));
+                client
+                    .register_supervisor(request)
+                    .await
+                    .map(tonic::Response::into_inner)
+            }
+            Err(_) => Err(Status::unavailable("registration transport unavailable")),
+        };
+        match result {
+            Ok(assignment) => return Ok(assignment),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    tonic::Code::Unavailable
+                        | tonic::Code::DeadlineExceeded
+                        | tonic::Code::Cancelled
+                        | tonic::Code::Aborted
+                        | tonic::Code::Unauthenticated
+                ) =>
+            {
+                // Log only the code, never credential-bearing response bodies.
+                debug!(code = ?error.code(), "supervisor registration unavailable; retrying");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => {
+                return Err(miette::miette!(
+                    "supervisor registration rejected ({:?})",
+                    error.code()
+                ));
+            }
+        }
+    }
+}
+
 /// Build a Bearer-authenticated channel to the gateway.
 ///
 /// First call per process resolves the sandbox JWT via the three-step

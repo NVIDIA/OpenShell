@@ -895,6 +895,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn register_supervisor(
+        &self,
+        _request: tonic::Request<proto::RegisterSupervisorRequest>,
+    ) -> Result<Response<proto::RegisterSupervisorResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn issue_sandbox_token(
         &self,
         _: tonic::Request<proto::IssueSandboxTokenRequest>,

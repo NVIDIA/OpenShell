@@ -862,6 +862,15 @@ retaining the sandbox record, diagnostic, and restartable storage. Cleanup can
 remain pending if the backend is unavailable; the gateway retries it. Inspect
 `provisioning` in JSON output for the deadline, timeout, and cleanup timestamps.
 TUI NOTES distinguishes pending cleanup from reclaimed compute.
+Cleanup also retires any pending warm-pool allocation. Background recovery does
+not resume an expired provisioning attempt, including after a gateway restart.
+
+Concurrent creates using a warm pool reserve separate targets. If a target is
+already reserved or its claim is rejected, the gateway immediately tries another
+candidate within a bounded retry budget, then falls back to cold creation.
+An uncertain claim keeps its target for recovery to avoid duplicate allocations.
+If the command finishes before claim recovery completes, restarting the sandbox
+reuses its assigned pair without retrying the previous allocation.
 
 Repair the configuration, wait for cleanup to complete, then explicitly restart:
 

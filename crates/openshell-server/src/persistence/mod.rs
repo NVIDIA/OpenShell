@@ -3,7 +3,9 @@
 
 //! Persistence layer for `OpenShell` Server.
 
+mod allocation;
 mod legacy_time_wire;
+pub use allocation::AllocationClaim;
 mod postgres;
 mod sqlite;
 
@@ -36,6 +38,8 @@ pub const DELETE_MANY_BATCH_SIZE: usize = 128;
 /// Persistence-layer error type.
 #[derive(Debug, Error, Clone)]
 pub enum PersistenceError {
+    #[error("allocation target is reserved by another attempt")]
+    AllocationTargetReserved,
     #[error("configuration error: {0}")]
     Config(String),
     #[error("database error: {0}")]
@@ -67,7 +71,10 @@ impl PersistenceError {
     /// a race is how [`crate::compute::lease`] learns the lease is held, and a
     /// version conflict is what drives an optimistic-concurrency retry.
     pub fn is_expected(&self) -> bool {
-        matches!(self, Self::UniqueViolation { .. } | Self::Conflict { .. })
+        matches!(
+            self,
+            Self::UniqueViolation { .. } | Self::Conflict { .. } | Self::AllocationTargetReserved
+        )
     }
 
     pub fn unique_violation(constraint: Option<String>, detail: Option<String>) -> Self {

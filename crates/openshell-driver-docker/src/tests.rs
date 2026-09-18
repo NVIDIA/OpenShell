@@ -638,7 +638,10 @@ async fn tracing_lifecycle_rpc_failures_export_docker_operation_spans() {
     async {
         ComputeDriver::create_sandbox(
             &driver,
-            Request::new(CreateSandboxRequest { sandbox: None }),
+            Request::new(CreateSandboxRequest {
+                sandbox: None,
+                ..Default::default()
+            }),
         )
         .await
         .expect_err("missing sandbox should fail");

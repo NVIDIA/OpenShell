@@ -75,6 +75,10 @@ pub struct PeerPrincipal {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum SandboxIdentitySource {
+    /// Driver-verified physical proxy identity, valid only on `RegisterSupervisor`.
+    SupervisorRegistration {
+        registration: openshell_core::proto::compute::v1::SupervisorRegistration,
+    },
     /// Gateway-minted JWT validated against the gateway's signing key.
     /// Produced by [`super::sandbox_jwt::SandboxJwtAuthenticator`].
     BootstrapJwt { issuer: String },

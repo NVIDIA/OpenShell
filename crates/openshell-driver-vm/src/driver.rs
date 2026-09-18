@@ -4273,6 +4273,23 @@ fn configure_main_exit_marker(command: &mut Command, state_dir: &Path) {
 
 #[tonic::async_trait]
 impl ComputeDriver for VmDriver {
+    async fn select_warm_pair(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>, Status> {
+        let _ = &request;
+        Err(Status::unimplemented(
+            "warm pair allocation is not supported",
+        ))
+    }
+
+    async fn sync_warm_pools(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>, Status> {
+        Err(Status::unimplemented("warm pools are not supported"))
+    }
+
     async fn authenticate_sandbox(
         &self,
         _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
@@ -4346,6 +4363,7 @@ impl ComputeDriver for VmDriver {
 
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
+            runtime_identity: String::new(),
         }))
     }
 
@@ -7246,6 +7264,7 @@ mod tests {
             client
                 .create_sandbox(request_with_traceparent(CreateSandboxRequest {
                     sandbox: None,
+                    ..Default::default()
                 }))
                 .await
                 .is_err()
@@ -7276,6 +7295,7 @@ mod tests {
             .delete_sandbox(request_with_traceparent(DeleteSandboxRequest {
                 sandbox_id: String::new(),
                 name: String::new(),
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -7353,6 +7373,7 @@ mod tests {
         };
         let request = request_with_traceparent(CreateSandboxRequest {
             sandbox: Some(sandbox),
+            ..Default::default()
         });
 
         let mut client = traced_driver_client(driver.clone()).await;

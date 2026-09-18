@@ -544,6 +544,13 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn register_supervisor(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RegisterSupervisorRequest>,
+    ) -> Result<Response<openshell_core::proto::RegisterSupervisorResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn issue_sandbox_token(
         &self,
         _: tonic::Request<openshell_core::proto::IssueSandboxTokenRequest>,

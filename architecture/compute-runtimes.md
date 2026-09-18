@@ -401,6 +401,66 @@ credentials. The driver removes its scheduling gate only after the companions
 exist; measured confirmation and supervisor-session registration gate public
 readiness.
 
+Kubernetes supervisor startup uses `RegisterSupervisor` before any tenant RPC.
+The driver validates the projected token, live proxy/workload Pods and Sandbox
+ownership, and returns the prepared runtime coordinates to the gateway. The
+driver requires Secret read permission in sandbox namespaces to validate the
+proxy descriptor and its owner UID during registration, plus list/delete
+permission for generation Secret cleanup during stop and rollback. The
+gateway checks the persisted runtime generation and delivers the operational
+authentication bundle and launch configuration. Proxy Secrets retain physical
+transport and proxy-CA material, but contain no operational auth bundle.
+
+The workload listener can wait without a logical sandbox ID. Its first token
+must carry a signed binding matching all protected runtime resource claims;
+only then does it pin the logical sandbox identity. Later tokens must match that
+identity, generation and epoch. Transport retries preserve assignment and the
+existing agent-launch replay protection. Other compute drivers retain their
+file-provisioned authentication path.
+
+Optional Kubernetes warm pooling uses the same provisioning path.
+The gateway periodically supplies complete template snapshots and public trust;
+the driver elects a controller using a Kubernetes Lease. Templates from unavailable
+operator workspaces are excluded without blocking snapshot refreshes for eligible
+workspaces. Template startup hints set desired spare capacity, bounded by a
+driver-wide spare-pair cap. Preparing and ready pairs count toward capacity.
+A Kubernetes Sandbox owns each pair and
+records its physical identity, preparation revision and state without a logical
+sandbox ID. Pool inventory selects managed resources by gateway and pool labels;
+it must not require the logical sandbox-ID label. Ordinary sandbox listing and lifecycle reconciliation exclude it.
+An immutable parent-owned Secret journals both bootstrap Secrets so interrupted
+preparation preserves TLS material. Recovery accepts an already released workload
+only when its recorded Pod, Service and network-policy identities still match;
+it requires the existing journal and validates both bootstrap Secrets before
+finishing release. Generation cleanup also removes this journal.
+The authentication generation is also used in Sandbox metadata and generation-scoped
+resource names, so allocation and proxy registration refer to the same runtime.
+
+Standby readiness requires a local workload-listener probe, a live paired proxy
+with recent authenticated registration, the boundary Service and network fence.
+It does not mean the agent has started. The leader conditionally retires spare
+pairs when preparation stalls, standby age expires, templates or trust change,
+or pooling is disabled. Retirement competes with allocation through resource
+versions. Claimed resources remain under ordinary lifecycle management.
+
+Template-based creation selects a compatible ready pair and persists its Sandbox
+UID and prepared generation in the logical record before attempting a conditional
+claim. The claim removes availability and records the logical ID and command on
+the parent Sandbox. Registration checks that parent UID against the persisted
+assignment before delivering credentials. Both Pods retain their physical identity;
+stop/start and cleanup derive companion names from that identity.
+
+Uncertain claims remain pending against the same candidate across gateway restarts.
+Recovery fences a rejected, still-unassigned candidate before recording another;
+it adopts an already committed claim instead of retiring it. With no eligible
+candidate, creation uses the cold path. Readiness and terminal main-process results
+finalize claim recovery. Explicit restart also clears pending claim recovery
+atomically with the new provisioning attempt, retaining the physical assignment
+and its reservation so recovery cannot replace a restarting runtime's identity.
+Pending deletion fences allocation before removing the logical record. Assigned
+pairs are single-use and are deleted with the sandbox; template changes or removal
+retire only spare inventory.
+
 ## Images
 
 The gateway image and Helm chart are built from this repository. Users supply

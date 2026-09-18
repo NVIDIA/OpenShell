@@ -3543,6 +3543,7 @@ async fn handle_update_config_inner(
     let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     validate_annotations(&req.annotations, "annotations")?;
+    crate::compute::warm_pool::validate_user_annotations(&req.annotations)?;
     let sandbox = if req.global {
         if !req.sandbox.is_empty() || req.workspace_scope.is_some() {
             return Err(Status::invalid_argument(

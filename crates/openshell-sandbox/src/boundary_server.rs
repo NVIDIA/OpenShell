@@ -292,8 +292,20 @@ mod linux {
     }
 
     fn validate_config(config: &BoundaryConfig) -> Result<(), String> {
-        if config.boundary_id.is_empty() {
-            return Err("boundary ID must not be empty".to_string());
+        if config.boundary_id.is_empty()
+            && [
+                "kubernetes.sandbox_resource_uid",
+                "kubernetes.workload_pod_uid",
+            ]
+            .iter()
+            .any(|key| {
+                config
+                    .resource_claims
+                    .get(*key)
+                    .is_none_or(String::is_empty)
+            })
+        {
+            return Err("unassigned boundary requires Sandbox and workload Pod UIDs".to_string());
         }
         if config.generation.is_empty() {
             return Err("boundary generation must not be empty".to_string());
@@ -481,6 +493,16 @@ mod linux {
     fn serve(config: &BoundaryListenerConfig, runtime: Arc<BoundaryRuntime>) -> Result<(), String> {
         let listener = ControlListener::bind(config)
             .map_err(|error| format!("bind boundary control listener: {error}"))?;
+        if matches!(config, BoundaryListenerConfig::TlsTcp { .. })
+            && Path::new("/.openshell/state").is_dir()
+        {
+            // The probe also verifies the current process start time, so a stale
+            // marker in the runtime volume cannot make a replacement ready.
+            let stat = std::fs::read_to_string("/proc/self/stat")
+                .map_err(|error| format!("read boundary process identity: {error}"))?;
+            std::fs::write("/.openshell/state/boundary-ready", stat)
+                .map_err(|error| format!("publish boundary listener readiness: {error}"))?;
+        }
         let active_connections = Arc::new(AtomicUsize::new(0));
         let pending_handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
         tracing::info!(?config, "Boundary control listener ready");
@@ -1501,8 +1523,6 @@ mod linux {
             workload_launcher: openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
             qualification: crate::RuntimeQualification,
         ) -> Result<Self, String> {
-            let sandbox_id = SandboxId::parse(config.boundary_id.clone())
-                .map_err(|error| format!("validate sandbox ID: {error}"))?;
             let runtime_generation =
                 openshell_core::sandbox_generation::SandboxGenerationId::parse(
                     config.generation.clone(),
@@ -1521,13 +1541,24 @@ mod linux {
                 Arc::new(SystemJwtClock),
             )
             .map_err(|error| format!("configure Sandbox Protocol JWT verifier: {error}"))?;
-            Ok(Self {
-                authenticator: SandboxProtocolAuthenticator::new(
+            let authenticator = if config.boundary_id.is_empty() {
+                SandboxProtocolAuthenticator::unassigned(
                     verifier,
-                    sandbox_id,
+                    config.resource_claims.clone(),
                     runtime_generation,
                     config.auth_epoch,
-                ),
+                )
+            } else {
+                SandboxProtocolAuthenticator::new(
+                    verifier,
+                    SandboxId::parse(config.boundary_id.clone())
+                        .map_err(|error| format!("validate sandbox ID: {error}"))?,
+                    runtime_generation,
+                    config.auth_epoch,
+                )
+            };
+            Ok(Self {
+                authenticator,
                 connections: SandboxConnectionRegistry::new(
                     config.session_id,
                     config.session_rotation,
