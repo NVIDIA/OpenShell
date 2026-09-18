@@ -184,9 +184,18 @@ async fn provider_identity(provider_name: &str) -> Result<ProviderIdentity, Stri
     }
     let listing: serde_json::Value = serde_json::from_str(&clean)
         .map_err(|err| format!("failed to parse provider list JSON: {err}\n{clean}"))?;
-    let provider = listing["providers"]
+    let next_page_token = listing["next_page_token"]
+        .as_str()
+        .ok_or_else(|| format!("provider list response omitted next_page_token:\n{clean}"))?;
+    if !next_page_token.is_empty() {
+        return Err(format!(
+            "provider list response was incomplete; received continuation token:\n{clean}"
+        ));
+    }
+    let providers = listing["providers"]
         .as_array()
-        .ok_or_else(|| format!("provider list JSON has no providers array:\n{clean}"))?
+        .ok_or_else(|| format!("provider list response omitted providers array:\n{clean}"))?;
+    let provider = providers
         .iter()
         .find(|provider| provider["name"].as_str() == Some(provider_name))
         .ok_or_else(|| format!("provider '{provider_name}' was not returned by provider list"))?;
@@ -227,7 +236,7 @@ async fn assert_provider_placeholder_available_in_sandbox(
     sandbox_name: &str,
     secret_value: &str,
 ) -> Result<(), String> {
-    let mut guard = SandboxGuard::create(&[
+    let guard = SandboxGuard::create(&[
         "--name",
         sandbox_name,
         "--provider",
@@ -241,9 +250,6 @@ async fn assert_provider_placeholder_available_in_sandbox(
     ])
     .await?;
     let clean = strip_ansi(&guard.create_output);
-    // Delete the sandbox before returning: the gateway refuses to delete a
-    // provider that is still attached to a sandbox.
-    guard.cleanup().await;
     if !contains_placeholder_for_env_key(&clean, CREDENTIAL_KEY) {
         return Err(format!(
             "sandbox {sandbox_name} did not receive provider credential placeholder:\n{clean}"
@@ -379,12 +385,7 @@ async fn provider_credentials_are_stored_in_configured_backend() {
     let suffix = unique_suffix();
     let driver_slug = driver.replace('-', "");
     let provider_name = format!("cred-storage-{driver_slug}-{suffix}");
-    // Sandbox names are DNS-routable and limited to 19 characters.
-    let sandbox_name = format!(
-        "cred-{}-{}",
-        &driver_slug[..1],
-        &suffix[suffix.len() - 10..]
-    );
+    let sandbox_name = format!("cred-storage-sandbox-{driver_slug}-{suffix}");
     let secret_value = format!("example-e2e-{driver_slug}-{suffix}");
 
     delete_provider(&provider_name).await;
