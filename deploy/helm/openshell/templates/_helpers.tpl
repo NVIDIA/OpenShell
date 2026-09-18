@@ -84,6 +84,66 @@ default to enabled so upgrades with --reuse-values preserve the old topology.
 {{- end }}
 
 {{/*
+Whether this chart owns gateway RBAC objects. Missing legacy values default to
+enabled so upgrades with --reuse-values preserve the old topology.
+*/}}
+{{- define "openshell.rbacCreate" -}}
+{{- $rbac := .Values.rbac | default dict -}}
+{{- $create := true -}}
+{{- if hasKey $rbac "create" -}}
+{{- $create = get $rbac "create" -}}
+{{- end -}}
+{{- if $create -}}true{{- end -}}
+{{- end }}
+
+{{/*
+The rbac.clusterScoped values map, tolerating missing legacy values.
+*/}}
+{{- define "openshell.clusterScopedRbacValues" -}}
+{{- $rbac := .Values.rbac | default dict -}}
+{{- $clusterScoped := dict -}}
+{{- if hasKey $rbac "clusterScoped" -}}
+{{- $clusterScoped = get $rbac "clusterScoped" | default dict -}}
+{{- end -}}
+{{- toYaml $clusterScoped -}}
+{{- end }}
+
+{{/*
+Whether this chart owns the cluster-scoped ClusterRole and ClusterRoleBinding.
+Disable for a namespace-admin install where a cluster-admin applies them
+separately. Missing legacy values default to enabled.
+*/}}
+{{- define "openshell.clusterRbacCreate" -}}
+{{- if include "openshell.rbacCreate" . -}}
+{{- $clusterScoped := include "openshell.clusterScopedRbacValues" . | fromYaml -}}
+{{- $create := true -}}
+{{- if hasKey $clusterScoped "create" -}}
+{{- $create = get $clusterScoped "create" -}}
+{{- end -}}
+{{- if $create -}}true{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Name of the gateway ClusterRole. The release namespace is part of the default
+name so multiple releases on one cluster do not collide.
+*/}}
+{{- define "openshell.clusterRoleName" -}}
+{{- $clusterScoped := include "openshell.clusterScopedRbacValues" . | fromYaml -}}
+{{- $default := printf "%s-node-reader-%s" (include "openshell.fullname" .) .Release.Namespace -}}
+{{- default $default (get $clusterScoped "clusterRoleName") -}}
+{{- end }}
+
+{{/*
+Name of the gateway ClusterRoleBinding.
+*/}}
+{{- define "openshell.clusterRoleBindingName" -}}
+{{- $clusterScoped := include "openshell.clusterScopedRbacValues" . | fromYaml -}}
+{{- $default := printf "%s-node-reader-%s" (include "openshell.fullname" .) .Release.Namespace -}}
+{{- default $default (get $clusterScoped "clusterRoleBindingName") -}}
+{{- end }}
+
+{{/*
 Gateway image reference. Uses image.tag when set; falls back to .Chart.AppVersion
 so a released chart automatically pulls the matching image without extra overrides.
 */}}

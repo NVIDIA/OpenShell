@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Namespace-admin overlay — renders only namespaced objects.
+#
+# Use this when a cluster-admin applies the gateway ClusterRole and
+# ClusterRoleBinding once, out of band, and the OpenShell release is installed
+# and upgraded by an installer that holds no cluster-scoped permissions.
+#
+# Generate the cluster-scoped objects for the cluster-admin step from the same
+# release values, then apply them as cluster-admin:
+#   helm template openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+#     --version <version> --namespace openshell -f my-values.yaml \
+#     --set rbac.clusterScoped.create=true \
+#     --set agentSandbox.preflight.enabled=false \
+#     --show-only templates/clusterrole.yaml \
+#     --show-only templates/clusterrolebinding.yaml | kubectl apply -f -
+#
+# The gateway ServiceAccount name and release namespace are unchanged, so the
+# pre-created ClusterRoleBinding still matches this release.
+
+rbac:
+  clusterScoped:
+    create: false

@@ -93,6 +93,26 @@ sandboxServiceAccount:
   # -- Existing service account name for sandbox pods when sandboxServiceAccount.create is false.
   name: ""
 
+# RBAC objects created for the gateway ServiceAccount. Cluster-scoped objects
+# can be omitted so a cluster-admin applies them once and a namespace-admin
+# installs and upgrades the gateway release without cluster-scoped permissions.
+rbac:
+  # -- Create the RBAC objects that grant the gateway ServiceAccount access.
+  # Disable to supply the namespaced sandbox Role/RoleBinding and the
+  # cluster-scoped ClusterRole/ClusterRoleBinding out of band. The certgen hook
+  # and credential driver RBAC keep their own flags.
+  create: true
+  clusterScoped:
+    # -- Create the cluster-scoped ClusterRole and ClusterRoleBinding. Disable
+    # for a namespace-admin install where a cluster-admin applies them
+    # separately; the gateway ServiceAccount name and namespace are unchanged,
+    # so a pre-created ClusterRoleBinding still matches.
+    create: true
+    # -- Name for the ClusterRole. Empty uses the `<fullname>-node-reader-<release namespace>` default.
+    clusterRoleName: ""
+    # -- Name for the ClusterRoleBinding. Empty uses the `<fullname>-node-reader-<release namespace>` default.
+    clusterRoleBindingName: ""
+
 # Namespace-scoped resources needed to run sandboxes. Disable this when the
 # gateway and workspace prerequisites are managed as separate Helm releases
 # using the openshell-workspace chart.

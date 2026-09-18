@@ -186,3 +186,43 @@ tests:
             apiGroups: [""]
             resources: ["secrets"]
             verbs: ["create", "list", "delete"]
+
+  - it: omits the ClusterRole when cluster-scoped RBAC is disabled
+    set:
+      rbac.clusterScoped.create: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: omits the ClusterRole when all chart-managed RBAC is disabled
+    set:
+      rbac.create: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: omits the ClusterRole independently of the workspace mode
+    set:
+      rbac.clusterScoped.create: false
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: uses the configured ClusterRole name
+    set:
+      rbac.clusterScoped.clusterRoleName: platform-openshell-node-reader
+    asserts:
+      - equal:
+          path: metadata.name
+          value: platform-openshell-node-reader
+
+  - it: creates the ClusterRole when legacy values omit the rbac block
+    set:
+      rbac: null
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: openshell-node-reader-my-namespace
