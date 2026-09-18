@@ -4,7 +4,6 @@
 //! Process management and signal handling.
 
 use crate::child_env;
-#[cfg(target_os = "linux")]
 use crate::managed_children;
 use crate::sandbox;
 #[cfg(target_os = "linux")]
@@ -442,13 +441,11 @@ pub fn spawn_std_command_with_workload_launcher(
 
 /// Handle to a running process.
 pub struct ProcessHandle {
-    child: Child,
+    child: managed_children::ManagedChild<Child>,
     pid: u32,
     io: Option<ProcessIo>,
     terminal: Arc<AtomicBool>,
     signal_lock: Arc<std::sync::Mutex<()>>,
-    #[cfg(target_os = "linux")]
-    managed_child: Option<managed_children::ManagedChild>,
 }
 
 /// Supervisor-owned canonical-process I/O. These handles outlive individual
@@ -648,29 +645,26 @@ impl ProcessHandle {
         // or interpreter, and is a common failure on images that lack the
         // requested shell/binary (e.g. bash on Alpine).
         #[cfg(target_os = "linux")]
-        let mut child_registry = managed_children::lock();
-        #[cfg(target_os = "linux")]
-        let mut child = spawn_command_with_workload_launcher(launcher, cmd)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to spawn sandbox entrypoint process '{program}'"))?;
+        let mut child = managed_children::ManagedChild::spawn(
+            || spawn_command_with_workload_launcher(launcher, cmd),
+            Child::id,
+        )
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to spawn sandbox entrypoint process '{program}'"))?;
         #[cfg(not(target_os = "linux"))]
-        let mut child = cmd
-            .spawn()
+        let mut child = managed_children::ManagedChild::spawn(|| cmd.spawn(), Child::id)
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to spawn sandbox entrypoint process '{program}'"))?;
         let pid = child.id().unwrap_or(0);
-        let managed_child = child_registry.register(pid);
-        drop(child_registry);
 
-        let io = if let Some(master) = pty_master {
-            ProcessIo::Pty(master)
-        } else {
-            ProcessIo::Pipes {
-                stdin: child.stdin.take().expect("canonical stdin must be piped"),
-                stdout: child.stdout.take().expect("canonical stdout must be piped"),
-                stderr: child.stderr.take().expect("canonical stderr must be piped"),
-            }
-        };
+        let io = pty_master.map_or_else(
+            || ProcessIo::Pipes {
+                stdin: child.take_stdin().expect("canonical stdin must be piped"),
+                stdout: child.take_stdout().expect("canonical stdout must be piped"),
+                stderr: child.take_stderr().expect("canonical stderr must be piped"),
+            },
+            ProcessIo::Pty,
+        );
 
         debug!(pid, program, "Process spawned");
 
@@ -680,8 +674,6 @@ impl ProcessHandle {
             io: Some(io),
             terminal: Arc::new(AtomicBool::new(false)),
             signal_lock: Arc::new(std::sync::Mutex::new(())),
-            #[cfg(target_os = "linux")]
-            managed_child,
         })
     }
 
@@ -782,22 +774,20 @@ impl ProcessHandle {
             }
         }
 
-        let mut child = cmd.spawn().into_diagnostic()?;
+        let mut child =
+            managed_children::ManagedChild::spawn(|| cmd.spawn(), Child::id).into_diagnostic()?;
         let pid = child.id().unwrap_or(0);
-        #[cfg(target_os = "linux")]
-        managed_children::register(pid);
 
         debug!(pid, program, "Process spawned");
 
-        let io = if let Some(master) = pty_master {
-            ProcessIo::Pty(master)
-        } else {
-            ProcessIo::Pipes {
-                stdin: child.stdin.take().expect("canonical stdin must be piped"),
-                stdout: child.stdout.take().expect("canonical stdout must be piped"),
-                stderr: child.stderr.take().expect("canonical stderr must be piped"),
-            }
-        };
+        let io = pty_master.map_or_else(
+            || ProcessIo::Pipes {
+                stdin: child.take_stdin().expect("canonical stdin must be piped"),
+                stdout: child.take_stdout().expect("canonical stdout must be piped"),
+                stderr: child.take_stderr().expect("canonical stderr must be piped"),
+            },
+            ProcessIo::Pty,
+        );
 
         Ok(Self {
             child,
@@ -837,10 +827,6 @@ impl ProcessHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.terminal.store(true, Ordering::Release);
-        #[cfg(target_os = "linux")]
-        if let Some(child) = self.managed_child.take() {
-            managed_children::unregister(child);
-        }
         let status = status?;
         Ok(ProcessStatus::from(status))
     }
@@ -854,10 +840,6 @@ impl ProcessHandle {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.terminal.store(true, Ordering::Release);
-            #[cfg(target_os = "linux")]
-            if let Some(child) = self.managed_child.take() {
-                managed_children::unregister(child);
-            }
         }
         Ok(status.map(ProcessStatus::from))
     }
@@ -908,15 +890,6 @@ impl ProcessHandle {
         }
 
         Ok(())
-    }
-}
-
-impl Drop for ProcessHandle {
-    fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
-        if let Some(child) = self.managed_child.take() {
-            managed_children::unregister(child);
-        }
     }
 }
 

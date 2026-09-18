@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -142,16 +142,20 @@ impl LocalBoundaryExec {
         )
         .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(target_os = "linux")]
-        let mut child_registry = crate::managed_children::lock();
-        #[cfg(target_os = "linux")]
-        let mut child =
-            crate::process::spawn_std_command_with_workload_launcher(&self.launcher, command)
-                .map_err(|error| BackendError::Process(error.to_string()))?;
+        let mut child = crate::managed_children::ManagedChild::spawn(
+            || crate::process::spawn_std_command_with_workload_launcher(&self.launcher, command),
+            |child| Some(child.id()),
+        )
+        .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(not(target_os = "linux"))]
-        let mut child = command
-            .spawn()
-            .map_err(|error| BackendError::Process(error.to_string()))?;
-        let pid = child.id();
+        let mut child = crate::managed_children::ManagedChild::spawn(
+            || command.spawn(),
+            |child| Some(child.id()),
+        )
+        .map_err(|error| BackendError::Process(error.to_string()))?;
+        let pid = child
+            .id()
+            .expect("a spawned standard child always has a valid PID");
         let process_terminal = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let signal_lock = Arc::new(std::sync::Mutex::new(()));
         if let Err(error) =
@@ -165,23 +169,18 @@ impl LocalBoundaryExec {
             let _ = child.wait();
             return Err(error);
         }
-        #[cfg(target_os = "linux")]
-        let managed_child = child_registry.register(pid);
-        #[cfg(target_os = "linux")]
-        drop(child_registry);
-        let stdin = child.stdin.take().map(|file| -> BoundaryInput {
+        let stdin = child.take_stdin().map(|file| -> BoundaryInput {
             let fd: OwnedFd = file.into();
             Box::new(tokio::fs::File::from_std(std::fs::File::from(fd)))
         });
         let stdout = child
-            .stdout
-            .take()
+            .take_stdout()
             .map(|file| -> BoundaryOutput {
                 let fd: OwnedFd = file.into();
                 Box::new(tokio::fs::File::from_std(std::fs::File::from(fd)))
             })
             .ok_or_else(|| BackendError::Process("exec stdout pipe missing".to_string()))?;
-        let stderr = child.stderr.take().map(|file| -> BoundaryOutput {
+        let stderr = child.take_stderr().map(|file| -> BoundaryOutput {
             let fd: OwnedFd = file.into();
             Box::new(tokio::fs::File::from_std(std::fs::File::from(fd)))
         });
@@ -191,8 +190,6 @@ impl LocalBoundaryExec {
             self.runtime.clone(),
             process_terminal,
             signal_lock,
-            #[cfg(target_os = "linux")]
-            managed_child,
         ));
         Ok(SpawnedExec {
             session: Some(ExecSession {
@@ -253,16 +250,20 @@ impl LocalBoundaryExec {
         )
         .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(target_os = "linux")]
-        let mut child_registry = crate::managed_children::lock();
-        #[cfg(target_os = "linux")]
-        let mut child =
-            crate::process::spawn_std_command_with_workload_launcher(&self.launcher, command)
-                .map_err(|error| BackendError::Process(error.to_string()))?;
+        let mut child = crate::managed_children::ManagedChild::spawn(
+            || crate::process::spawn_std_command_with_workload_launcher(&self.launcher, command),
+            |child| Some(child.id()),
+        )
+        .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(not(target_os = "linux"))]
-        let mut child = command
-            .spawn()
-            .map_err(|error| BackendError::Process(error.to_string()))?;
-        let pid = child.id();
+        let mut child = crate::managed_children::ManagedChild::spawn(
+            || command.spawn(),
+            |child| Some(child.id()),
+        )
+        .map_err(|error| BackendError::Process(error.to_string()))?;
+        let pid = child
+            .id()
+            .expect("a spawned standard child always has a valid PID");
         let process_terminal = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let signal_lock = Arc::new(std::sync::Mutex::new(()));
         if let Err(error) =
@@ -276,10 +277,6 @@ impl LocalBoundaryExec {
             let _ = child.wait();
             return Err(error);
         }
-        #[cfg(target_os = "linux")]
-        let managed_child = child_registry.register(pid);
-        #[cfg(target_os = "linux")]
-        drop(child_registry);
         let terminal: Arc<dyn BoundaryTerminal> = Arc::new(LocalTerminal { master });
         let process = Arc::new(LocalExecProcess::new(
             child,
@@ -287,8 +284,6 @@ impl LocalBoundaryExec {
             self.runtime.clone(),
             process_terminal,
             signal_lock,
-            #[cfg(target_os = "linux")]
-            managed_child,
         ));
         Ok(SpawnedExec {
             session: Some(ExecSession {
@@ -379,12 +374,11 @@ struct LocalExecProcess {
 
 impl LocalExecProcess {
     fn new(
-        child: Child,
+        child: crate::managed_children::ManagedChild<std::process::Child>,
         pid: u32,
         runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
         terminal: Arc<std::sync::atomic::AtomicBool>,
         signal_lock: Arc<std::sync::Mutex<()>>,
-        #[cfg(target_os = "linux")] managed_child: Option<crate::managed_children::ManagedChild>,
     ) -> Self {
         let result = Arc::new(std::sync::Mutex::new(None));
         let exited = Arc::new(tokio::sync::Notify::new());
@@ -406,9 +400,6 @@ impl LocalExecProcess {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let result = child.wait();
                     terminal_for_wait.store(true, std::sync::atomic::Ordering::Release);
-                    if let Some(managed_child) = managed_child {
-                        crate::managed_children::unregister(managed_child);
-                    }
                     match (terminal_observed, result) {
                         (_, Ok(status)) => Ok(status),
                         (Err(observe_error), Err(wait_error)) => Err(std::io::Error::other(
