@@ -9,7 +9,7 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
-    VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, VsockPortMap, procguard, run_vm,
+    VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, VmMount, VsockPortMap, procguard, run_vm,
 };
 use std::io;
 use std::net::SocketAddr;
@@ -215,6 +215,9 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_PROXY_CA_BUNDLE")]
     proxy_ca_bundle: Option<String>,
 
+    #[arg(long, env = "OPENSHELL_VM_ENABLE_BIND_MOUNTS", default_value_t = false)]
+    enable_bind_mounts: bool,
+
     #[arg(long, env = "OPENSHELL_VM_ROOTFS_TAR_STAGING_DIR")]
     rootfs_tar_staging_dir: Option<PathBuf>,
 
@@ -235,6 +238,9 @@ struct Args {
 
     #[arg(long, hide = true)]
     vm_vsock_control_socket: Option<PathBuf>,
+
+    #[arg(long, hide = true)]
+    vm_mount: Vec<String>,
 }
 
 #[tokio::main]
@@ -308,6 +314,7 @@ async fn main() -> Result<()> {
         sandbox_gid: args.sandbox_gid,
         rootfs_tar_staging_dir: args.rootfs_tar_staging_dir.clone(),
         rootfs_tar_max_bytes: args.rootfs_tar_max_bytes,
+        enable_bind_mounts: args.enable_bind_mounts,
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;
@@ -594,6 +601,12 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         Some(other) => return Err(format!("unknown VM backend: {other}")),
     };
 
+    let mounts = args
+        .vm_mount
+        .iter()
+        .map(|m| parse_vm_mount_arg(m))
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(VmLaunchConfig {
         root_disk,
         overlay_disk,
@@ -627,6 +640,38 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
                 );
             }
         },
+        mounts,
+    })
+}
+
+fn parse_vm_mount_arg(arg: &str) -> std::result::Result<VmMount, String> {
+    let mut parts = arg.splitn(4, '\t');
+    let source = parts
+        .next()
+        .ok_or_else(|| format!("invalid --vm-mount format: {arg}"))?;
+    let target = parts
+        .next()
+        .ok_or_else(|| format!("invalid --vm-mount format (missing target): {arg}"))?;
+    let tag = parts
+        .next()
+        .ok_or_else(|| format!("invalid --vm-mount format (missing tag): {arg}"))?;
+    let mode = parts
+        .next()
+        .ok_or_else(|| format!("invalid --vm-mount format (missing mode): {arg}"))?;
+    let read_only = match mode {
+        "ro" => true,
+        "rw" => false,
+        _ => {
+            return Err(format!(
+                "invalid --vm-mount mode '{mode}': expected 'ro' or 'rw'"
+            ));
+        }
+    };
+    Ok(VmMount {
+        host_path: PathBuf::from(source),
+        guest_target: target.to_string(),
+        tag: tag.to_string(),
+        read_only,
     })
 }
 
@@ -686,7 +731,7 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
 mod tests {
     use super::{
         Args, ComputeDriverListenMode, PeerCredentials, authorize_peer_credentials,
-        compute_driver_listen_mode,
+        compute_driver_listen_mode, parse_vm_mount_arg,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -925,5 +970,32 @@ mod tests {
                 expected_peer_pid: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_parses_readonly() {
+        let m = parse_vm_mount_arg("/host/src\t/guest/dst\tosfs0\tro").unwrap();
+        assert_eq!(m.host_path, PathBuf::from("/host/src"));
+        assert_eq!(m.guest_target, "/guest/dst");
+        assert_eq!(m.tag, "osfs0");
+        assert!(m.read_only);
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_parses_readwrite() {
+        let m = parse_vm_mount_arg("/host/src\t/guest/dst\tosfs1\trw").unwrap();
+        assert!(!m.read_only);
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_rejects_unknown_mode() {
+        let err = parse_vm_mount_arg("/host/src\t/guest/dst\tosfs0\treadonly").unwrap_err();
+        assert!(err.contains("expected 'ro' or 'rw'"));
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_rejects_missing_fields() {
+        assert!(parse_vm_mount_arg("/host/src\t/guest/dst").is_err());
+        assert!(parse_vm_mount_arg("/host/src").is_err());
     }
 }

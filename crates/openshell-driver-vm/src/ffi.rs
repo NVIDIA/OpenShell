@@ -54,6 +54,14 @@ type KrunDisableImplicitVsock = unsafe extern "C" fn(ctx_id: u32) -> i32;
 type KrunAddVsock = unsafe extern "C" fn(ctx_id: u32, tsi_features: u32) -> i32;
 type KrunAddVsockPort2 =
     unsafe extern "C" fn(ctx_id: u32, port: u32, filepath: *const c_char, listen: bool) -> i32;
+type KrunAddVirtiofs4 = unsafe extern "C" fn(
+    ctx_id: u32,
+    tag: *const c_char,
+    path: *const c_char,
+    shm_size: u64,
+    read_only: bool,
+    semantics: u32,
+) -> i32;
 
 // Field names mirror the libkrun C API symbol names (`krun_*`); preserving
 // the prefix keeps the FFI binding 1:1 with the upstream library.
@@ -72,6 +80,7 @@ pub struct LibKrun {
     pub krun_disable_implicit_vsock: KrunDisableImplicitVsock,
     pub krun_add_vsock: KrunAddVsock,
     pub krun_add_vsock_port2: KrunAddVsockPort2,
+    pub krun_add_virtiofs4: KrunAddVirtiofs4,
 }
 
 static LIBKRUN: OnceLock<LibKrun> = OnceLock::new();
@@ -134,6 +143,7 @@ impl LibKrun {
             )?,
             krun_add_vsock: load_symbol(library, b"krun_add_vsock\0", &libkrun_path)?,
             krun_add_vsock_port2: load_symbol(library, b"krun_add_vsock_port2\0", &libkrun_path)?,
+            krun_add_virtiofs4: load_symbol(library, b"krun_add_virtiofs4\0", &libkrun_path)?,
         })
     }
 }

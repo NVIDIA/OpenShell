@@ -538,6 +538,35 @@ run_openshell_init_dropins() {
     done < <(LC_ALL=C sort -u "$manifest")
 }
 
+mount_virtiofs_shares() {
+    local manifest
+    manifest="$(root_path /.openshell/mounts.manifest)"
+    [ -f "$manifest" ] || return 0
+
+    ts "mounting virtiofs shares"
+    local tag target mode mount_opts guest_target
+    while IFS=$'\t' read -r tag target mode; do
+        [ -n "$tag" ] || continue
+        case "$mode" in
+            ro)  mount_opts="-o ro" ;;
+            rw)  mount_opts="" ;;
+            *)
+                ts "FATAL: unknown virtiofs mount mode '${mode}' for tag ${tag}"
+                exit 1
+                ;;
+        esac
+        guest_target="$(root_path "$target")"
+        mkdir -p "$guest_target" 2>/dev/null || true
+        # shellcheck disable=SC2086
+        if mount -t virtiofs $mount_opts "$tag" "$guest_target"; then
+            ts "  mounted virtiofs ${tag} -> ${target} (${mode})"
+        else
+            ts "FATAL: failed to mount virtiofs ${tag} at ${target}"
+            exit 1
+        fi
+    done < "$manifest"
+}
+
 run_post_overlay_setup() {
     # Source QEMU-injected environment variables if present. The file lives in
     # the overlay upperdir so the cached bootstrap rootfs remains immutable.
@@ -562,6 +591,8 @@ run_post_overlay_setup() {
     mount -t tmpfs tmpfs "$(root_path /dev/shm)" 2>/dev/null &
     mount -t cgroup2 cgroup2 "$(root_path /sys/fs/cgroup)" 2>/dev/null &
     wait
+
+    mount_virtiofs_shares
 
     reconcile_sandbox_account
     setup_sandbox_workdir
