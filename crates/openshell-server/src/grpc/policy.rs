@@ -4702,7 +4702,7 @@ pub(super) async fn handle_get_sandbox_logs(
         .into_iter()
         .filter_map(|evt| {
             if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
-                evt.payload
+                evt.event.payload
             {
                 if let Some(since_time) = since_time.as_ref() {
                     let event_time = log.event_time.as_ref()?;

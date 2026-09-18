@@ -51,8 +51,8 @@ pub use pagination::{Page, Pager};
 pub use refresh::{Refresh, RefreshError, RefreshedToken, TokenSource};
 pub use types::{
     DeleteOptions, DeletionOutcome, DeletionResult, ExecOptions, ExecResult, Health, ListOptions,
-    SandboxPhase, SandboxRef, SandboxResources, SandboxServiceLevel, SandboxSpec, SandboxStartup,
-    SandboxTemplateCreateSpec, SandboxTemplateListOptions, SandboxWorkloadConfig,
-    SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec,
-    ServiceStatus, WorkspaceRef,
+    LogLine, PlatformEvent, SandboxPhase, SandboxRef, SandboxResources, SandboxServiceLevel,
+    SandboxSpec, SandboxStartup, SandboxTemplateCreateSpec, SandboxTemplateListOptions,
+    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
+    SandboxWorkloadTemplateSpec, ServiceStatus, WatchEvent, WatchOptions, WorkspaceRef,
 };

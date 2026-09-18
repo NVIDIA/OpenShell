@@ -4584,6 +4584,7 @@ dependencies = [
 name = "openshell-sdk"
 version = "0.0.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "futures",
  "hyper",
