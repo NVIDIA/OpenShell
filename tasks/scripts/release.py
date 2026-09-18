@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
+import tarfile
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -42,6 +45,374 @@ GITHUB_RELEASE_DOWNLOADS = "https://github.com/NVIDIA/OpenShell/releases/downloa
 LOCAL_GATEWAY_PORT = 17670
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _RELEASE_TAG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# This inventory describes the standalone core runtime, not every package or SDK
+# shipped by a release. Targets include libc because architecture alone cannot
+# distinguish the static sandbox from the dynamically linked supervisor.
+CORE_ARCHIVES = {
+    "cli": ("openshell", "musl", True),
+    "gateway": ("openshell-gateway", "gnu", True),
+    "sandbox": ("openshell-sandbox", "musl", False),
+    "supervisor": ("openshell-supervisor", "gnu", False),
+}
+IMAGE_COMPONENTS = ("gateway", "sandbox", "supervisor")
+IMAGE_REGISTRY = "ghcr.io/nvidia/openshell"
+OCI_INDEX = "application/vnd.oci.image.index.v1+json"
+OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
+MAX_EXECUTABLE_SIZE = 1024 * 1024 * 1024
+
+
+def _sha256_stream(stream) -> str:
+    digest = hashlib.sha256()
+    while chunk := stream.read(1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_path(path: Path) -> str:
+    with path.open("rb") as stream:
+        return _sha256_stream(stream)
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _read_json(path: Path) -> dict:
+    if path.stat().st_size > 1024 * 1024:
+        raise ValueError(f"{path.name}: identity document exceeds 1 MiB")
+    value = json.loads(path.read_bytes(), object_pairs_hook=_unique_json_object)
+    if not isinstance(value, dict):
+        raise ValueError(f"{path.name}: expected a JSON object")
+    return value
+
+
+def _identity_text(value: object, pattern: str, field: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+def _source_identity(source_sha: object, run_id: object, run_attempt: object) -> dict:
+    """Validate producer identity strings supplied by the CLI or decoded JSON."""
+    return {
+        "source_sha": _identity_text(source_sha, r"[0-9a-f]{40}", "source SHA"),
+        "run_id": _identity_text(run_id, r"[1-9][0-9]*", "workflow run ID"),
+        "run_attempt": _identity_text(
+            run_attempt, r"[1-9][0-9]*", "workflow run attempt"
+        ),
+    }
+
+
+def _image_digest(value: object) -> str:
+    return _identity_text(value, r"sha256:[0-9a-f]{64}", "OCI digest")
+
+
+def _write_identity(output: Path, value: dict) -> None:
+    # Validation finishes before publication. Atomic replacement prevents an
+    # interrupted writer from leaving a truncated but apparently final document.
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=output.parent, delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(value, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        temporary.replace(output)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _executable_architecture(header: bytes, target: str) -> None:
+    if "linux" in target:
+        expected = 62 if target.startswith("x86_64-") else 183
+        if (
+            len(header) < 20
+            or header[:6] != b"\x7fELF\x02\x01"
+            or int.from_bytes(header[18:20], "little") != expected
+        ):
+            raise ValueError(f"executable architecture does not match {target}")
+    elif (
+        len(header) < 8
+        or header[:4] != b"\xcf\xfa\xed\xfe"
+        or int.from_bytes(header[4:8], "little") != 0x0100000C
+    ):
+        raise ValueError(f"executable architecture does not match {target}")
+
+
+def _archive_executable_sha256(path: Path, binary: str, target: str) -> str:
+    # The packaging job creates one executable at the archive root. Never
+    # extract a release archive: symlinks, traversal and additional members are
+    # invalid inputs even if their compressed bytes have a matching checksum.
+    with tarfile.open(path, mode="r|gz") as archive:
+        member = archive.next()
+        if (
+            member is None
+            or member.name != binary
+            or not member.isfile()
+            or not member.mode & 0o111
+            or not 0 < member.size <= MAX_EXECUTABLE_SIZE
+        ):
+            raise ValueError(f"{path.name}: expected one executable named {binary}")
+        stream = archive.extractfile(member)
+        if stream is None:
+            raise ValueError(f"{path.name}: executable is unavailable")
+        with stream:
+            header = stream.read(64)
+            _executable_architecture(header, target)
+            digest = hashlib.sha256(header)
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        if archive.next() is not None:
+            raise ValueError(f"{path.name}: unexpected additional archive member")
+        return digest.hexdigest()
+
+
+def record_image_identity(
+    *,
+    component: str,
+    source_sha: str,
+    run_id: str,
+    run_attempt: str,
+    metadata_file: Path,
+    index_file: Path,
+    binary_dir: Path,
+    output: Path,
+) -> None:
+    """Record a producing image job's immutable index and staged binary identity."""
+    identity = _source_identity(source_sha, run_id, run_attempt)
+    if component not in IMAGE_COMPONENTS:
+        raise ValueError("unknown image component")
+    metadata = _read_json(metadata_file)
+    digest = _image_digest(metadata.get("containerimage.digest"))
+    index = _read_json(index_file)
+    raw = index_file.read_bytes()
+    # Some CLI versions add a display newline. Accept it only when removing
+    # that terminator recovers the exact producing build's content digest.
+    if digest[7:] not in {
+        hashlib.sha256(raw).hexdigest(),
+        hashlib.sha256(raw.rstrip(b"\r\n")).hexdigest(),
+    }:
+        raise ValueError("OCI index bytes do not match producing image digest")
+    if index.get("schemaVersion") != 2 or index.get("mediaType") != OCI_INDEX:
+        raise ValueError("expected an OCI image index")
+    manifests = index.get("manifests")
+    if not isinstance(manifests, list):
+        raise ValueError("OCI index has no manifest descriptors")
+    platforms = {}
+    for descriptor in manifests:
+        if (
+            not isinstance(descriptor, dict)
+            or descriptor.get("mediaType") != OCI_MANIFEST
+        ):
+            raise ValueError("invalid OCI manifest descriptor")
+        platform = descriptor.get("platform")
+        if not isinstance(platform, dict):
+            raise ValueError("OCI descriptor has no platform")
+        platform_digest = _image_digest(descriptor.get("digest"))
+        annotations = descriptor.get("annotations", {})
+        if not isinstance(annotations, dict):
+            raise ValueError("invalid OCI descriptor annotations")
+        if (
+            platform.get("os") == "unknown"
+            and platform.get("architecture") == "unknown"
+            and annotations.get("vnd.docker.reference.type") == "attestation-manifest"
+        ):
+            # BuildKit embeds provenance/SBOM manifests in the index. These are
+            # evidence, never extra executable platforms available to a client.
+            continue
+        arch = platform.get("architecture")
+        variant = platform.get("variant", "")
+        if (
+            platform.get("os") != "linux"
+            or arch not in ("amd64", "arm64")
+            or variant not in ("", "v8")
+            or (arch == "amd64" and variant)
+            or arch in platforms
+        ):
+            raise ValueError("unexpected or duplicate executable image platform")
+        binary = binary_dir / arch / CORE_ARCHIVES[component][0]
+        target_arch = "x86_64" if arch == "amd64" else "aarch64"
+        with binary.open("rb") as stream:
+            _executable_architecture(stream.read(64), f"{target_arch}-unknown-linux")
+        platforms[arch] = {
+            "os": "linux",
+            "architecture": arch,
+            "digest": platform_digest,
+            "binary_sha256": _sha256_path(binary),
+        }
+        if variant:
+            platforms[arch]["variant"] = variant
+    if set(platforms) != {"amd64", "arm64"}:
+        raise ValueError("image must provide Linux amd64 and arm64")
+    _write_identity(
+        output,
+        {
+            "schema_version": 1,
+            **identity,
+            "component": component,
+            "repository": f"{IMAGE_REGISTRY}/{component}",
+            "index_digest": digest,
+            "platforms": [platforms[key] for key in sorted(platforms)],
+        },
+    )
+
+
+def _manifest_checksums(path: Path) -> dict[str, str]:
+    checksums = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) != 2:
+            raise ValueError(f"{path.name}: malformed checksum entry")
+        digest, name = parts
+        name = name.removeprefix("*")
+        _identity_text(digest, r"[0-9a-f]{64}", "archive SHA256")
+        if Path(name).name != name or name in checksums:
+            raise ValueError(f"{path.name}: unsafe or duplicate archive name")
+        checksums[name] = digest
+    return checksums
+
+
+def generate_release_manifest(
+    *,
+    source_sha: str,
+    run_id: str,
+    run_attempt: str,
+    cargo_version: str,
+    release_dir: Path,
+    image_dir: Path,
+    output: Path,
+) -> None:
+    """Validate and publish the complete core-runtime inventory of a dev build."""
+    identity = _source_identity(source_sha, run_id, run_attempt)
+    # A development workflow at an exact stable tag receives a plain version.
+    # Otherwise Git's abbreviation can exceed nine characters to remain unique;
+    # the suffix must still identify the full source recorded by producing jobs.
+    _identity_text(
+        cargo_version,
+        r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+        r"(?:-dev\.[1-9][0-9]*\+g[0-9a-f]{9,40})?",
+        "development version/source association",
+    )
+    if "+g" in cargo_version and not source_sha.startswith(
+        cargo_version.rsplit("+g", 1)[1]
+    ):
+        raise ValueError("invalid development version/source association")
+    archives = []
+    binary_hashes = {}
+    for component, (binary, libc, darwin) in CORE_ARCHIVES.items():
+        checksums = _manifest_checksums(release_dir / f"{binary}-checksums-sha256.txt")
+        targets = [f"x86_64-unknown-linux-{libc}", f"aarch64-unknown-linux-{libc}"]
+        if darwin:
+            targets.append("aarch64-apple-darwin")
+        for target in targets:
+            filename = f"{binary}-{target}.tar.gz"
+            expected = checksums.get(filename)
+            if expected is None:
+                raise ValueError(f"missing checksum for {filename}")
+            path = release_dir / filename
+            actual = _sha256_path(path)
+            if actual != expected:
+                raise ValueError(f"{filename}: archive checksum mismatch")
+            executable_hash = _archive_executable_sha256(path, binary, target)
+            binary_hashes[(component, target)] = executable_hash
+            archives.append(
+                {
+                    "component": component,
+                    "target": target,
+                    "filename": filename,
+                    "sha256": actual,
+                    "size_bytes": path.stat().st_size,
+                    "binary_sha256": executable_hash,
+                }
+            )
+    expected_names = {f"{component}.json" for component in IMAGE_COMPONENTS}
+    if {path.name for path in image_dir.iterdir()} != expected_names:
+        raise ValueError("expected exactly one identity file for each core image")
+    images = []
+    for component in IMAGE_COMPONENTS:
+        image = _read_json(image_dir / f"{component}.json")
+        if (
+            type(image.get("schema_version")) is not int
+            or image.get("schema_version") != 1
+            or set(image)
+            != {
+                "schema_version",
+                "source_sha",
+                "run_id",
+                "run_attempt",
+                "component",
+                "repository",
+                "index_digest",
+                "platforms",
+            }
+            or image.get("source_sha") != source_sha
+            or image.get("run_id") != run_id
+            or image.get("component") != component
+            or image.get("repository") != f"{IMAGE_REGISTRY}/{component}"
+        ):
+            raise ValueError(f"{component}: image identity belongs to another build")
+        # A successful producing job from an earlier attempt of this same run
+        # remains usable when only downstream release assembly is retried.
+        _source_identity(source_sha, run_id, image.get("run_attempt"))
+        _image_digest(image.get("index_digest"))
+        platforms = image.get("platforms")
+        if not isinstance(platforms, list) or len(platforms) != 2:
+            raise ValueError(f"{component}: expected both executable platforms")
+        seen = set()
+        for platform in platforms:
+            if not isinstance(platform, dict):
+                raise ValueError(f"{component}: invalid image platform")
+            arch = platform.get("architecture")
+            variant = platform.get("variant", "")
+            if (
+                platform.get("os") != "linux"
+                or arch not in ("amd64", "arm64")
+                or arch in seen
+                or variant not in ("", "v8")
+                or (arch == "amd64" and variant)
+                or set(platform)
+                - {
+                    "os",
+                    "architecture",
+                    "variant",
+                    "digest",
+                    "binary_sha256",
+                }
+            ):
+                raise ValueError(f"{component}: unexpected or duplicate platform")
+            seen.add(arch)
+            _image_digest(platform.get("digest"))
+            triple_arch = "x86_64" if arch == "amd64" else "aarch64"
+            target = f"{triple_arch}-unknown-linux-{CORE_ARCHIVES[component][1]}"
+            if platform.get("binary_sha256") != binary_hashes[(component, target)]:
+                raise ValueError(
+                    f"{component}/{arch}: staged image binary does not match archive"
+                )
+        images.append(image)
+    _write_identity(
+        output,
+        {
+            "schema_version": 1,
+            "inventory_scope": "core-runtime",
+            **identity,
+            "source_repository": "https://github.com/NVIDIA/OpenShell",
+            "cargo_version": cargo_version,
+            "archive_download_base": f"{GITHUB_RELEASE_DOWNLOADS}/dev",
+            "archives": sorted(archives, key=lambda item: item["filename"]),
+            "images": images,
+        },
+    )
 
 
 def _repo_root() -> Path:
@@ -586,6 +957,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to write the generated Formula Ruby file.",
     )
 
+    digest_parser = sub.add_parser(
+        "image-build-digest", help="Read the producing Buildx image digest."
+    )
+    digest_parser.add_argument("--metadata-file", type=Path, required=True)
+    image_parser = sub.add_parser(
+        "record-image-identity", help="Record an image-producing job's identity."
+    )
+    manifest_parser = sub.add_parser(
+        "generate-release-manifest", help="Validate the complete dev core inventory."
+    )
+    for identity_parser in (image_parser, manifest_parser):
+        identity_parser.add_argument("--source-sha", required=True)
+        identity_parser.add_argument("--run-id", required=True)
+        identity_parser.add_argument("--run-attempt", required=True)
+        identity_parser.add_argument("--output", type=Path, required=True)
+    image_parser.add_argument("--component", choices=IMAGE_COMPONENTS, required=True)
+    image_parser.add_argument("--metadata-file", type=Path, required=True)
+    image_parser.add_argument("--index-file", type=Path, required=True)
+    image_parser.add_argument("--binary-dir", type=Path, required=True)
+    manifest_parser.add_argument("--cargo-version", required=True)
+    manifest_parser.add_argument("--release-dir", type=Path, required=True)
+    manifest_parser.add_argument("--image-dir", type=Path, required=True)
+
     return parser
 
 
@@ -618,6 +1012,31 @@ def main() -> None:
         generate_homebrew_formula(
             release_tag=args.release_tag,
             release_dir=args.release_dir,
+            output=args.output,
+        )
+    elif args.command == "image-build-digest":
+        print(
+            _image_digest(_read_json(args.metadata_file).get("containerimage.digest"))
+        )
+    elif args.command == "record-image-identity":
+        record_image_identity(
+            component=args.component,
+            source_sha=args.source_sha,
+            run_id=args.run_id,
+            run_attempt=args.run_attempt,
+            metadata_file=args.metadata_file,
+            index_file=args.index_file,
+            binary_dir=args.binary_dir,
+            output=args.output,
+        )
+    elif args.command == "generate-release-manifest":
+        generate_release_manifest(
+            source_sha=args.source_sha,
+            run_id=args.run_id,
+            run_attempt=args.run_attempt,
+            cargo_version=args.cargo_version,
+            release_dir=args.release_dir,
+            image_dir=args.image_dir,
             output=args.output,
         )
 

@@ -24,6 +24,12 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Set up release identity tooling
+      uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+      with:
+        version: "0.10.12"
+        enable-cache: false
+
     - uses: ./.github/actions/setup-buildx
       with:
         buildkitd-config: /etc/buildkit/buildkitd.toml
@@ -56,6 +62,8 @@ runs:
         install -Dm0755 artifact/arm64/${BINARY} deploy/docker/.build/prebuilt-binaries/arm64/${BINARY}
 
     - name: Build ${{ inputs.component }} image
+      # Keep both exporters' manifest options identical: Buildx reports one
+      # image digest, which must also identify the pushed registry object.
       shell: bash
       env:
         COMPONENT: ${{ inputs.component }}
@@ -72,15 +80,46 @@ runs:
           --cache-to type=gha,mode=max,scope=${COMPONENT} \
           --provenance=mode=min \
           --attest type=sbom \
+          --metadata-file artifacts/images/${COMPONENT}-build-metadata.json \
           --output type=image,push=true,oci-mediatypes=true,oci-artifact=true \
-          --output type=oci,dest=artifacts/images/${COMPONENT}.tar \
+          --output type=oci,dest=artifacts/images/${COMPONENT}.tar,oci-mediatypes=true,oci-artifact=true \
           .
+
+    - name: Record immutable image identity
+      shell: bash
+      env:
+        COMPONENT: ${{ inputs.component }}
+      run: |
+        set -euo pipefail
+        metadata="artifacts/images/${COMPONENT}-build-metadata.json"
+        digest=$(uv run --no-project --offline --no-python-downloads --python python3 python tasks/scripts/release.py image-build-digest --metadata-file "$metadata")
+        docker buildx imagetools inspect "ghcr.io/nvidia/openshell/${COMPONENT}@${digest}" --raw > "artifacts/images/${COMPONENT}-index.json"
+        uv run --no-project --offline --no-python-downloads --python python3 python tasks/scripts/release.py record-image-identity \
+          --component "$COMPONENT" \
+          --source-sha "$(git rev-parse HEAD)" \
+          --run-id "$GITHUB_RUN_ID" \
+          --run-attempt "$GITHUB_RUN_ATTEMPT" \
+          --metadata-file "$metadata" \
+          --index-file "artifacts/images/${COMPONENT}-index.json" \
+          --binary-dir artifact \
+          --output "image-identities/${COMPONENT}.json"
 
     - name: Verify SBOM attestation
       shell: bash
       env:
-        IMAGE_REF: ghcr.io/nvidia/openshell/${{ inputs.component }}:${{ inputs.image-tag }}
-      run: tasks/scripts/verify-image-sbom.sh "${IMAGE_REF}" --require-cargo
+        COMPONENT: ${{ inputs.component }}
+      run: |
+        set -euo pipefail
+        digest=$(uv run --no-project --offline --no-python-downloads --python python3 python tasks/scripts/release.py image-build-digest --metadata-file "artifacts/images/${COMPONENT}-build-metadata.json")
+        tasks/scripts/verify-image-sbom.sh "ghcr.io/nvidia/openshell/${COMPONENT}@${digest}" --require-cargo
+
+    - name: Upload ${{ inputs.component }} identity
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        name: core-image-identity-${{ inputs.component }}
+        path: image-identities/${{ inputs.component }}.json
+        retention-days: 5
+        if-no-files-found: error
 
     - name: Upload ${{ inputs.component }} image
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
