@@ -1767,14 +1767,10 @@ async fn run_lifecycle(
     } else {
         (None, None)
     };
-    // Target-ready signal from the spawner (see control_channel.rs's
-    // try_route_target_ready) -- fired once the target is actually running
-    // and its configured port is accepting connections, distinct from the
-    // "launch" response below (which only confirms the command/env
-    // arrived). Awaited after "launch" succeeds and before publishing
-    // Ready=True, so Ready can't be reported while the target is still
-    // unreachable. Always Ok(()) when it fires (no version gate on this
-    // event -- see try_route_target_ready).
+    // Target-status signal from the spawner (see control_channel.rs's
+    // try_route_target_status): Ok once the target port accepts connections,
+    // or Err with the target's real exit/stderr diagnostic. Distinct from the
+    // "launch" response below, which only confirms the command/env arrived.
     let (target_ready_slot, target_ready_rx) = if spawner_wrapping_active {
         let (tx, rx) = oneshot::channel::<Result<(), String>>();
         (Some(Arc::new(Mutex::new(Some(tx)))), Some(rx))
@@ -1796,7 +1792,9 @@ async fn run_lifecycle(
                             None => false,
                         };
                         let routed_target_ready = match &target_ready_slot {
-                            Some(slot) => ControlChannel::try_route_target_ready(slot, &line).await,
+                            Some(slot) => {
+                                ControlChannel::try_route_target_status(slot, &line).await
+                            }
                             None => false,
                         };
                         let routed = routed_ready
@@ -1827,7 +1825,7 @@ async fn run_lifecycle(
         });
     }
     // Drop this scope's Arc clones now that the stdout task holds its own:
-    // if the spawner exits before ever sending "ready"/"target_ready", the
+    // if the spawner exits before ever sending "ready"/target status, the
     // stdout task's clone is the only thing keeping the
     // Mutex<Option<Sender>> alive, so its loop ending (EOF) drops the last
     // reference -- which drops the still-`Some` Sender and makes
@@ -2014,11 +2012,8 @@ async fn run_lifecycle(
                             info!(sandbox = %sandbox_name, "control-channel target ready");
                             None
                         }
-                        // No version gate on this event, so this arm
-                        // never actually fires today -- see
-                        // try_route_target_ready -- but match it
-                        // explicitly rather than unreachable!(), in case
-                        // that ever changes.
+                        // `target_failed` carries the bounded target stderr
+                        // diagnostic supplied by openshell-supervisor-relay.
                         Ok(Ok(Err(target_err))) => Some(target_err),
                         Ok(Err(_)) => {
                             Some("spawner exited before its target became ready".to_string())

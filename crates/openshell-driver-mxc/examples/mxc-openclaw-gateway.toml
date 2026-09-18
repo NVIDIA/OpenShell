@@ -15,6 +15,9 @@
 # (the AppContainer here can only read paths granted by policy -- see the
 # script's "Stage artifacts into share_dir" step for why).
 
+[openshell]
+version = 2
+
 [openshell.drivers.mxc]
 wxc_exec_path = "C:\\mxc-kit\\bin\\wxc-exec.exe"
 
