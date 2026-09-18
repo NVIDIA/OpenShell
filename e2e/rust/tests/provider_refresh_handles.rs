@@ -97,7 +97,7 @@ async fn run_cli_with_env(args: &[&str], env: &[(&str, &str)]) -> Result<String,
 
 async fn delete_provider_resources() {
     let _ = run_cli(&["provider", "delete", PROVIDER_NAME]).await;
-    let _ = run_cli(&["provider", "profile", "delete", PROFILE_ID]).await;
+    let _ = run_cli(&["profile", "delete", PROFILE_ID]).await;
 }
 
 fn write_profile(resource_port: u16, token_port: u16) -> Result<NamedTempFile, String> {
@@ -193,7 +193,7 @@ network_policies:
 
 async fn configure_refresh(profile: &NamedTempFile) -> Result<(), String> {
     let profile_path = profile.path().to_string_lossy().into_owned();
-    run_cli(&["provider", "profile", "import", "--file", &profile_path]).await?;
+    run_cli(&["profile", "import", "--file", &profile_path]).await?;
     run_cli_with_env(
         &[
             "provider",
