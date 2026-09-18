@@ -4433,7 +4433,8 @@ async fn prepare_docker_boundary_files(
         workload_identity: workload_identity.clone(),
         child_env: docker_child_environment(sandbox),
     }
-    .provision();
+    .provision()
+    .map_err(|error| Status::failed_precondition(error.to_string()))?;
     let boundary_config = provisioning
         .boundary_config
         .encode()

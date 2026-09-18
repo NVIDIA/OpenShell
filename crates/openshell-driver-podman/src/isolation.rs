@@ -10,7 +10,9 @@ use std::path::PathBuf;
 
 use openshell_core::ComputeDriverError;
 use openshell_core::proto::compute::v1::DriverSandbox;
-use openshell_isolation_interface::contract::{DriverFenceEvidence, ResolvedWorkloadIdentity};
+use openshell_isolation_interface::contract::{
+    OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+};
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
@@ -26,6 +28,40 @@ pub const RUNTIME_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descri
 pub const AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
 pub const RESTART_METADATA_PATH: &str = "/.openshell/supervisor/restart-metadata.json";
 const SOCKET_PATH: &str = "/.openshell/channel/sandbox/control.sock";
+
+#[derive(Serialize)]
+struct PodmanOuterFenceEvidence<'a> {
+    container_id: &'a str,
+    network_mode: &'static str,
+    unexpected_networks: &'a [String],
+}
+
+impl PodmanOuterFenceEvidence<'_> {
+    fn project(&self, generation: &str) -> Result<OuterFenceGuarantees, ComputeDriverError> {
+        if self.container_id.is_empty() {
+            return Err(invalid("Podman outer fence evidence is incomplete"));
+        }
+        let mut established = Vec::new();
+        if self.network_mode == "none" {
+            // With no container network namespace attachment, workload egress
+            // remains denied both after revocation and if the supervisor exits.
+            established.extend([
+                OuterFenceGuarantee::DefaultDenyEgress,
+                OuterFenceGuarantee::RevocationVerified,
+                OuterFenceGuarantee::ControllerLossFailsClosed,
+            ]);
+        }
+        if self.unexpected_networks.is_empty() {
+            established.push(OuterFenceGuarantee::NoUnmanagedEgressPath);
+        }
+        let encoded = serde_json::to_vec(self).map_err(invalid)?;
+        let projection =
+            OuterFenceGuarantees::from_enforcement_evidence(generation, established, &encoded)
+                .map_err(invalid)?;
+        projection.validate(generation).map_err(invalid)?;
+        Ok(projection)
+    }
+}
 
 pub fn supervisor_name(id: &str) -> String {
     format!("openshell-supervisor-{id}")
@@ -159,15 +195,17 @@ pub fn bootstrap_archives(
             identity.resource_digest.clone(),
         ),
     ]);
-    let driver_fence = DriverFenceEvidence::Podman {
-        container_id: container_id.into(),
-        network_mode: "none".into(),
-        unexpected_networks: Vec::new(),
-    };
     let runtime_generation = launch_authentication
         .supervisor
         .runtime_generation
         .to_string();
+    let unexpected_networks = Vec::new();
+    let outer_fence = PodmanOuterFenceEvidence {
+        container_id,
+        network_mode: "none",
+        unexpected_networks: &unexpected_networks,
+    }
+    .project(&runtime_generation)?;
     let verification_keys = launch_authentication
         .verification_keys
         .iter()
@@ -198,7 +236,7 @@ pub fn bootstrap_archives(
         resource_claims: resource_claims.clone(),
         resource_claim_files: BTreeMap::new(),
         workload_identity: identity.clone(),
-        driver_fence: driver_fence.clone(),
+        outer_fence: outer_fence.clone(),
         child_env: child_env.clone(),
     };
     let runtime_descriptor = SandboxRuntimeDescriptor {
@@ -215,7 +253,7 @@ pub fn bootstrap_archives(
         host_gateway_ip: None,
         resource_claims,
         workload_identity: identity.clone(),
-        driver_fence,
+        outer_fence,
     };
     // Libpod resolves the requested upload destination once for a stopped
     // container. Archive entries must be relative to the selected named volume,
@@ -326,6 +364,30 @@ mod tests {
         CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionVerificationKey,
         SupervisorAuthBundle,
     };
+
+    #[test]
+    fn outer_fence_projection_rejects_each_missing_native_fact() {
+        let unexpected_networks = vec!["podman".to_string()];
+        for evidence in [
+            PodmanOuterFenceEvidence {
+                container_id: "",
+                network_mode: "none",
+                unexpected_networks: &[],
+            },
+            PodmanOuterFenceEvidence {
+                container_id: "container",
+                network_mode: "bridge",
+                unexpected_networks: &[],
+            },
+            PodmanOuterFenceEvidence {
+                container_id: "container",
+                network_mode: "none",
+                unexpected_networks: &unexpected_networks,
+            },
+        ] {
+            assert!(evidence.project("generation-1").is_err());
+        }
+    }
 
     fn authentication() -> SandboxLaunchAuthentication {
         SandboxLaunchAuthentication {
@@ -440,9 +502,12 @@ mod tests {
         .unwrap();
         assert_eq!(config.boundary_id, runtime_descriptor.boundary_id);
         assert_eq!(config.session_id, runtime_descriptor.session_id);
-        assert_eq!(config.driver_fence, runtime_descriptor.driver_fence);
+        assert_eq!(config.outer_fence, runtime_descriptor.outer_fence);
         assert_eq!(config.workload_identity, identity);
-        runtime_descriptor.driver_fence.validate().unwrap();
+        runtime_descriptor
+            .outer_fence
+            .validate(&runtime_descriptor.generation)
+            .unwrap();
         let restart_metadata: RestartMetadata = serde_json::from_slice(
             supervisor
                 .get(&PathBuf::from(

@@ -239,7 +239,7 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         wait_killable_recv: notification.wait_killable_recv,
     };
     let qualification = openshell_sandbox::RuntimeQualification {
-        seccomp: openshell_isolation_interface::contract::SeccompEvidence {
+        seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {
             new_listener: notification.notification_round_trip(),
             notification_round_trip: notification.notification_round_trip(),
             id_validation: notification.notification_round_trip(),

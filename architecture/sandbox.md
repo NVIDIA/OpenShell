@@ -63,19 +63,51 @@ replacement from granting authority.
 ## Startup Flow
 
 1. The driver resolves the immutable workload identity, installs the outer
-   network fence, and starts `openshell-sandbox` with one-use bootstrap state.
+   network fence, validates its native evidence, and starts `openshell-sandbox`
+   with one-use bootstrap state. Docker inspects container networking,
+   Kubernetes verifies its NetworkPolicy, and VM drivers inspect the guest
+   device model; those native schemas remain in their driver crates.
 2. The sandbox consumes and unlinks bootstrap material, proves the admitted
    runtime posture, and listens on the protected driver channel. It does not
    run untrusted code yet.
 3. `openshell-supervisor` loads policy and runtime settings from the gateway,
    attaches to the sandbox, and verifies the driver's generation and evidence.
 4. The sandbox installs its seccomp notification broker and Landlock baseline,
-   then reports measured confirmation. The supervisor must accept that evidence
-before it sends the launch permit.
+   validates its mechanism-specific audit evidence, and reports backend-neutral
+   enforcement properties. The supervisor must accept those properties and
+   their immutable session and resource binding before it sends the launch
+   permit. Other isolation backends may establish the same properties with
+   different mechanisms and retain their detailed evidence in backend-owned
+   audit data.
 5. The sandbox starts the canonical process through its single workload
    launcher. The supervisor starts SSH and registers its gateway session.
 6. Exec, signaling, PTY, DNS, TCP, and loopback-forwarding operations cross the
    authenticated channel for the lifetime of the sandbox generation.
+
+The shared isolation contract receives only normalized outer-fence guarantees:
+egress is default-deny, there is no unmanaged egress path, the evidence is bound
+to the sandbox generation, revocation has been verified, and controller loss
+fails closed. A digest commits those guarantees to the native
+evidence without teaching the shared contract about container networks,
+Kubernetes objects, VM devices, or accelerator resources.
+
+The component that owns the outer fence also validates its native evidence and
+makes that projection explicitly. In the current Docker, Podman, Kubernetes,
+and VM placements, that component is the compute driver. A delegated isolation
+backend may own the fence and make the same projection instead. Non-empty native
+evidence alone does not establish a guarantee:
+
+| Current enforcement owner | Native evidence | Guarantees projected by the owner |
+|---|---|---|
+| Docker | Pinned container ID, `network_mode=none`, and no unexpected network attachments | No workload route establishes default-deny, revocation, and controller-loss behavior; the attachment inspection establishes that no unmanaged route exists. |
+| Podman | Pinned container ID, `--network=none`, and no unexpected network attachments | The same container-network facts establish the same four guarantees. |
+| Kubernetes | NetworkPolicy UID and resource version, ingress and egress isolation, and zero workload egress rules | The persisted, selecting policy establishes default-deny and continued denial after revocation or controller loss; zero egress rules establish that no unmanaged route is permitted. |
+| VM | Generation and zero guest network devices | The absent NIC establishes all four guarantees; approved traffic uses the separate supervisor-owned channel. |
+
+The shared contract checks that all four guarantees are present, that the
+projection names the admitted generation, and that its evidence digest matches
+the value passed to the workload-side runtime. It does not infer guarantees or
+interpret the native fields.
 
 When the admitted main process exits, its status and retained terminal output
 remain available. The confirmed sandbox and supervisor-owned access plane continue
@@ -100,7 +132,7 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 | Filesystem policy | Landlock restricts the paths the agent can read or write. |
 | Process policy | Sandbox and children run as one immutable non-root identity with zero capabilities. |
 | Seccomp notification | Virtualizes supported INET sockets and sends DNS/TCP decisions to the supervisor without nftables or proxy environment variables. |
-| Driver outer fence | Docker `network_mode=none`, a NIC-less VM, or Kubernetes NetworkPolicy prevents any missed or unsupported kernel path from escaping. |
+| Outer network fence | The component that owns network enforcement prevents any missed or unsupported kernel path from escaping. Current examples are Docker `network_mode=none`, a NIC-less VM, and Kubernetes NetworkPolicy. |
 | Policy proxy | Evaluates destination, binary identity, TLS/L7 rules, SSRF checks, and inference interception. |
 
 The supervisor may enrich baseline filesystem allowances for runtime-required
@@ -201,7 +233,7 @@ cannot transfer that approval to another socket.
 
 The outer fence remains mandatory. If notification handling misses a syscall,
 loses the supervisor, exceeds a bound, or encounters an unsupported socket
-type, the request fails and the driver-owned fence still blocks direct egress.
+type, the request fails and the outer fence still blocks direct egress.
 
 CONNECT and absolute-form forward HTTP are explicit-proxy adapters over the same
 egress pipeline. Each adapter normalizes its request into an egress intent, and
