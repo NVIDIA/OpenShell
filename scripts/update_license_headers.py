@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -47,6 +48,26 @@ COMMENT_STYLES: dict[str, str] = {
     ".tsx": "//",
     ".mts": "//",
     ".cts": "//",
+    ".mjs": "//",
+    ".css": "/*",
+    ".in": "#",
+    ".service": "#",
+    ".tpl": "#",
+}
+
+# Extensionless source files that cannot be identified by suffix.
+FILE_COMMENT_STYLES: dict[str, str] = {
+    "scripts/bin/openshell": "#",
+}
+
+# Strict JSON does not support comments. Keep SPDX data in REUSE-compatible
+# sidecars so these files remain valid inputs to their consumers.
+SIDECAR_LICENSE_FILES: set[str] = {
+    "scripts/keycloak-realm.json",
+    "sdk/conformance/oauth-client-credentials.json",
+    "sdk/typescript/biome.json",
+    "sdk/typescript/tsconfig.build.json",
+    "sdk/typescript/tsconfig.json",
 }
 
 # Directories to skip entirely (relative to repo root).
@@ -83,6 +104,13 @@ EXCLUDE_DIR_PREFIXES: tuple[str, ...] = (
 
 def make_header(comment: str) -> str:
     """Return the two-line SPDX header for a given comment prefix."""
+    if comment == "/*":
+        return (
+            "/*\n"
+            f" * SPDX-FileCopyrightText: {COPYRIGHT_TEXT}\n"
+            f" * SPDX-License-Identifier: {LICENSE_ID}\n"
+            " */\n"
+        )
     return (
         f"{comment} SPDX-FileCopyrightText: {COPYRIGHT_TEXT}\n"
         f"{comment} SPDX-License-Identifier: {LICENSE_ID}\n"
@@ -173,6 +201,8 @@ def is_dockerfile(path: Path) -> bool:
 
 def get_comment_style(path: Path) -> str | None:
     """Return the comment prefix for a file, or None if unsupported."""
+    if path.as_posix() in FILE_COMMENT_STYLES:
+        return FILE_COMMENT_STYLES[path.as_posix()]
     if is_dockerfile(path):
         return "#"
     return COMMENT_STYLES.get(path.suffix)
@@ -190,7 +220,10 @@ def discover_files(root: Path) -> list[Path]:
                 continue
             if is_excluded(rel):
                 continue
-            if get_comment_style(rel) is not None:
+            if (
+                get_comment_style(rel) is not None
+                or rel.as_posix() in SIDECAR_LICENSE_FILES
+            ):
                 results.append(path)
         return sorted(results)
 
@@ -205,7 +238,10 @@ def discover_files(root: Path) -> list[Path]:
             rel = fpath.relative_to(root)
             if is_excluded(rel):
                 continue
-            if get_comment_style(rel) is not None:
+            if (
+                get_comment_style(rel) is not None
+                or rel.as_posix() in SIDECAR_LICENSE_FILES
+            ):
                 results.append(fpath)
 
     return sorted(results)
@@ -216,11 +252,20 @@ def discover_files(root: Path) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 SPDX_MARKER = "SPDX-License-Identifier"
+SPDX_COPYRIGHT_RE = re.compile(
+    r"SPDX-FileCopyrightText: Copyright \(c\) \d{4}(?:-\d{4})? "
+    r"NVIDIA CORPORATION & AFFILIATES\. All rights reserved\."
+)
 
 
 def has_header(lines: list[str]) -> bool:
-    """Check if the SPDX header is present in the first 10 lines."""
-    return any(SPDX_MARKER in line for line in lines[:10])
+    """Check if the complete NVIDIA SPDX header is in the first 10 lines."""
+    header_lines = lines[:10]
+    has_license = any(
+        f"{SPDX_MARKER}: {LICENSE_ID}" in line for line in header_lines
+    )
+    has_copyright = any(SPDX_COPYRIGHT_RE.search(line) for line in header_lines)
+    return has_license and has_copyright
 
 
 def find_insertion_point(lines: list[str], path: Path) -> int:
@@ -276,6 +321,30 @@ def insert_header(content: str, comment: str, path: Path) -> str:
 def process_file(path: Path, root: Path, *, check: bool, verbose: bool) -> bool:
     """Process a single file. Returns True if the file is compliant."""
     rel = path.relative_to(root)
+
+    if rel.as_posix() in SIDECAR_LICENSE_FILES:
+        sidecar = path.with_name(f"{path.name}.license")
+        lines = (
+            sidecar.read_text(encoding="utf-8").splitlines()
+            if sidecar.exists()
+            else []
+        )
+        if has_header(lines):
+            if verbose:
+                print(f"  ok: {rel} ({sidecar.name})")
+            return True
+        if check:
+            print(f"  MISSING: {rel} ({sidecar.name})")
+            return False
+        sidecar.write_text(
+            f"SPDX-FileCopyrightText: {COPYRIGHT_TEXT}\n"
+            f"SPDX-License-Identifier: {LICENSE_ID}\n",
+            encoding="utf-8",
+        )
+        if verbose:
+            print(f"  added: {rel} ({sidecar.name})")
+        return True
+
     comment = get_comment_style(rel)
     if comment is None:
         return True
@@ -338,7 +407,10 @@ def main() -> int:
                 continue
             if is_excluded(rel) or is_git_ignored(root, rel):
                 continue
-            if get_comment_style(rel) is not None:
+            if (
+                get_comment_style(rel) is not None
+                or rel.as_posix() in SIDECAR_LICENSE_FILES
+            ):
                 files.append(p)
     else:
         files = discover_files(root)
