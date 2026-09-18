@@ -297,34 +297,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let protocol_val = get_object_str(val, "protocol")?;
     let protocol = L7Protocol::parse(&protocol_val)?;
 
-    let tls = match get_object_str(val, "tls").as_deref() {
-        Some("skip") => TlsMode::Skip,
-        Some("terminate") => {
-            let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(openshell_ocsf::ActivityId::Other)
-                .severity(openshell_ocsf::SeverityId::Medium)
-                .message(
-                    "'tls: terminate' is deprecated; TLS termination is now automatic. \
-                     Use 'tls: skip' to explicitly disable. This field will be removed in a future version.",
-                )
-                .build();
-            openshell_ocsf::ocsf_emit!(event);
-            TlsMode::Auto
-        }
-        Some("passthrough") => {
-            let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(openshell_ocsf::ActivityId::Other)
-                .severity(openshell_ocsf::SeverityId::Medium)
-                .message(
-                    "'tls: passthrough' is deprecated; TLS termination is now automatic. \
-                     Use 'tls: skip' to explicitly disable. This field will be removed in a future version.",
-                )
-                .build();
-            openshell_ocsf::ocsf_emit!(event);
-            TlsMode::Auto
-        }
-        _ => TlsMode::Auto,
-    };
+    let tls = parse_tls_mode(val);
 
     let enforcement = match get_object_str(val, "enforcement").as_deref() {
         Some("enforce") => EnforcementMode::Enforce,
@@ -457,10 +430,12 @@ pub fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
 ///
 /// Used to check for `tls: skip` even on L4-only endpoints (no `protocol`
 /// field) that explicitly opt out of TLS auto-detection.
+///
+/// Unsupported values fall through to `Auto`, which inspects, so an
+/// unvalidated path still fails closed.
 pub fn parse_tls_mode(val: &regorus::Value) -> TlsMode {
     match get_object_str(val, "tls").as_deref() {
         Some("skip") => TlsMode::Skip,
-        // "terminate" and "passthrough" are deprecated aliases (logged by parse_l7_config); fall through to Auto.
         _ => TlsMode::Auto,
     }
 }
@@ -1342,6 +1317,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
             let l7_fields = L7EndpointFields {
                 protocol,
                 access,
+                tls,
                 has_rules,
                 has_deny_rules,
                 rules_would_deny_all,
@@ -1479,13 +1455,6 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 }
             }
 
-            // Deprecated tls values: warn but don't error
-            if tls == "terminate" || tls == "passthrough" {
-                warnings.push(format!(
-                    "{loc}: 'tls: {tls}' is deprecated; TLS termination is now automatic. Use 'tls: skip' to disable."
-                ));
-            }
-
             // tls: skip with L7 on port 443 won't work
             if tls == "skip" && !protocol.is_empty() && ports.contains(&443) {
                 warnings.push(format!(
@@ -1499,10 +1468,6 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                     "{loc}: SQL enforcement requires full SQL parsing (not available in v1). Use `enforcement: audit`."
                 ));
             }
-
-            // port 443 + rest + tls: skip — L7 won't work (already handled above)
-            // The old warning about missing `tls: terminate` is no longer needed
-            // because TLS termination is now automatic.
 
             // Per-rule deny_rules validation (semantic checks handled by
             // shared validator above).
@@ -1943,12 +1908,11 @@ mod tests {
     #[test]
     fn parse_l7_config_rest_enforce() {
         let val = regorus::Value::from_json_str(
-            r#"{"protocol": "rest", "tls": "terminate", "enforcement": "enforce", "host": "api.example.com", "port": 443}"#,
+            r#"{"protocol": "rest", "enforcement": "enforce", "host": "api.example.com", "port": 443}"#,
         )
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
         assert_eq!(config.protocol, L7Protocol::Rest);
-        // "terminate" is deprecated and treated as Auto.
         assert_eq!(config.tls, TlsMode::Auto);
         assert_eq!(config.enforcement, EnforcementMode::Enforce);
     }
@@ -3400,31 +3364,51 @@ mod tests {
         assert!(errors.iter().any(|e| e.contains("SQL enforcement")));
     }
 
-    #[test]
-    fn validate_tls_terminate_deprecated_warning() {
-        let data = serde_json::json!({
+    fn policy_data_with_tls(tls: &str) -> serde_json::Value {
+        serde_json::json!({
             "network_policies": {
                 "test": {
                     "endpoints": [{
                         "host": "api.example.com",
                         "port": 443,
-                        "tls": "terminate",
+                        "tls": tls,
                         "protocol": "rest",
                         "access": "full"
                     }],
                     "binaries": []
                 }
             }
-        });
-        let (errors, warnings) = validate_l7_policies(&data);
+        })
+    }
+
+    /// The issue's acceptance criterion: a legacy value is an error naming the
+    /// endpoint, and no deprecation warning survives anywhere.
+    #[test]
+    fn validate_rejects_legacy_tls_without_warning() {
+        let (errors, warnings) = validate_l7_policies(&policy_data_with_tls("terminate"));
         assert!(
-            errors.is_empty(),
-            "deprecated tls should not error: {errors:?}"
+            errors.iter().any(|e| e.contains("test.endpoints[0]")
+                && e.contains("unsupported tls value 'terminate'")),
+            "should be rejected: {errors:?}"
         );
         assert!(
-            warnings.iter().any(|w| w.contains("deprecated")),
-            "should warn about deprecated tls: {warnings:?}"
+            !warnings.iter().any(|w| w.contains("deprecated")),
+            "no deprecation warning should survive: {warnings:?}"
         );
+    }
+
+    #[test]
+    fn accepted_tls_values_reach_their_intended_mode() {
+        for (tls, expected) in [("", TlsMode::Auto), ("skip", TlsMode::Skip)] {
+            let (errors, _) = validate_l7_policies(&policy_data_with_tls(tls));
+            assert!(
+                !errors.iter().any(|e| e.contains("unsupported tls value")),
+                "tls: {tls:?} must validate: {errors:?}"
+            );
+
+            let val = regorus::Value::from_json_str(&format!(r#"{{"tls": "{tls}"}}"#)).unwrap();
+            assert_eq!(parse_tls_mode(&val), expected, "tls: {tls:?}");
+        }
     }
 
     #[test]

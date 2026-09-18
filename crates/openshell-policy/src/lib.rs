@@ -38,7 +38,7 @@ pub use compose::{
 };
 pub use l7_validate::{
     L7EndpointFields, L7Protocol, agent_authored_transport_rejection,
-    validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics,
+    validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics, validate_tls_mode,
 };
 pub use merge::{
     L7BinaryScope, L7RuleTarget, PolicyMergeError, PolicyMergeOp, PolicyMergeResult,
@@ -1514,6 +1514,7 @@ fn validate_sandbox_policy_with_mcp_presence(
             let fields = L7EndpointFields {
                 protocol: &ep.protocol,
                 access: &ep.access,
+                tls: &ep.tls,
                 has_rules: !ep.rules.is_empty(),
                 has_deny_rules: !ep.deny_rules.is_empty(),
                 rules_would_deny_all,
@@ -3870,6 +3871,35 @@ network_policies:
             },
         );
         assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_tls_mode() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    tls: "terminate".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let violations =
+            validate_sandbox_policy(&policy).expect_err("unsupported tls value must be rejected");
+        assert!(
+            violations.iter().any(|v| matches!(
+                v,
+                PolicyViolation::InvalidL7Endpoint { reason, .. }
+                    if reason.contains("unsupported tls value 'terminate'")
+            )),
+            "should be rejected: {violations:?}"
+        );
     }
 
     #[test]

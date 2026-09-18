@@ -113,7 +113,9 @@ message NetworkEndpoint {
   // Endpoint protocol. "tcp" and "" select L4-only handling; "rest",
   // "websocket", "graphql", "sql", "json-rpc", and "mcp" select L7 inspection.
   string protocol = 3;
-  // TLS handling: "terminate" or "passthrough" (default).
+  // TLS handling. Empty (default) auto-detects and terminates TLS for
+  // inspection; "skip" disables detection for this endpoint. Any other value
+  // is rejected at validation.
   string tls = 4;
   // Enforcement mode: "enforce" or "audit" (default).
   string enforcement = 5;

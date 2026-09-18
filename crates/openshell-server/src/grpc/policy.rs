@@ -10960,7 +10960,6 @@ mod tests {
         let mut policy = test_policy_with_rule("aws", host);
         let endpoint = &mut policy.network_policies.get_mut("aws").unwrap().endpoints[0];
         endpoint.protocol = "rest".to_string();
-        endpoint.tls = "terminate".to_string();
         endpoint.access = "full".to_string();
         endpoint.credential_signing = "sigv4".to_string();
         endpoint.signing_service = "s3".to_string();
@@ -12996,7 +12995,6 @@ mod tests {
             .endpoints[0];
         bound_endpoint.protocol = "rest".to_string();
         bound_endpoint.access = "full".to_string();
-        bound_endpoint.tls = "terminate".to_string();
         openshell_policy::ensure_sandbox_process_identity(&mut policy);
         state
             .store

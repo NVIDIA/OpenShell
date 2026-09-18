@@ -42,6 +42,16 @@ OpenShell 0.1.0 removes the deprecated `NetworkBinary.harness` protobuf field an
 
 Remove `harness` from sandbox policies and provider profiles before upgrading. Policy and profile YAML now reject the property. Provider profiles should list binaries as scalar paths, such as `- /usr/bin/curl`; the transitional object form `- path: /usr/bin/curl` remains accepted and is exported as a scalar.
 
+### Network endpoint TLS handling
+
+OpenShell 0.1.0 closes the network endpoint `tls` field to two forms: omit it to auto-detect and terminate TLS for inspection, or set `skip` to stop inspecting that endpoint. The gateway, the sandbox supervisor, provider profile lint, and agent-authored policy proposals all reject any other value, including the former `terminate` and `passthrough` spellings. Those values previously logged a deprecation warning on every sandbox start and had no effect on behavior.
+
+Remove the `tls` field from affected endpoints before upgrading. Removal preserves behavior, because `terminate` and `passthrough` already selected automatic termination.
+
+Do not substitute `tls: skip` for a removed `terminate`. `skip` stops TLS inspection, credential placeholder rewriting, dynamic token grant injection, and L7 rule enforcement for that endpoint, so it widens what the endpoint allows.
+
+A stored global or sandbox policy that carries a removed `tls` value fails validation on read, so `GetSandboxConfig` returns `FAILED_PRECONDITION` and affected sandboxes cannot start. Run `openshell policy list --global` to see which revision is invalid and why, then re-apply a corrected policy with `openshell policy set --global`.
+
 | Resource | Description |
 |---|---|
 | [Releases](https://github.com/NVIDIA/OpenShell/releases) | Versioned release notes and downloadable assets. |

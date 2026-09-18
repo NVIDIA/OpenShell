@@ -1131,6 +1131,9 @@ fn network_endpoint_from_json(
     {
         return Err(reason.to_string());
     }
+    if let Some(reason) = openshell_policy::validate_tls_mode(&endpoint.tls) {
+        return Err(reason);
+    }
 
     let mut ports = endpoint.ports;
     if ports.is_empty() && endpoint.port > 0 {
@@ -1424,7 +1427,6 @@ mod tests {
                                     "host": "api.github.com",
                                     "port": 443,
                                     "protocol": "rest",
-                                    "tls": "terminate",
                                     "enforcement": "enforce",
                                     "rules": [
                                         {
@@ -1519,6 +1521,30 @@ mod tests {
 
             let error = proposal_chunks_from_body(body.as_bytes()).unwrap_err();
             assert!(error.contains("administrator"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_rejects_unsupported_tls_values() {
+        for tls in ["terminate", "passthrough", "bogus"] {
+            let body = format!(
+                r#"{{
+                    "operations": [{{
+                        "addRule": {{
+                            "ruleName": "legacy_tls",
+                            "rule": {{
+                                "endpoints": [{{"host":"api.example.com","port":443,"tls":"{tls}"}}]
+                            }}
+                        }}
+                    }}]
+                }}"#
+            );
+
+            let error = proposal_chunks_from_body(body.as_bytes()).unwrap_err();
+            assert!(
+                error.contains(&format!("unsupported tls value '{tls}'")),
+                "tls: {tls} unexpected error: {error}"
+            );
         }
     }
 

@@ -4534,7 +4534,6 @@ endpoints:
   - host: api.advanced.example
     ports: [443, 8443]
     protocol: rest
-    tls: terminate
     enforcement: enforce
     rules:
       - allow:

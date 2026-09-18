@@ -9607,6 +9607,48 @@ network_policies:
     }
 
     #[test]
+    fn unsupported_tls_value_fails_policy_load() {
+        for tls in ["terminate", "passthrough", "bogus"] {
+            let data = format!(
+                r#"
+network_policies:
+  legacy_tls:
+    name: legacy_tls
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        access: read-only
+        tls: {tls}
+    binaries:
+      - {{ path: /usr/bin/curl }}
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#
+            );
+            let Err(error) = OpaEngine::from_strings(TEST_POLICY, &data) else {
+                panic!("tls: {tls} must reject the policy");
+            };
+            let error = error.to_string();
+            assert!(
+                error.contains("L7 policy validation failed"),
+                "tls: {tls} should fail policy load: {error}"
+            );
+            assert!(
+                error.contains("legacy_tls.endpoints[0]") && error.contains("remove the tls field"),
+                "tls: {tls} error should locate the endpoint and state the fix: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn wildcard_host_l7_rules_apply() {
         let data = r#"
 network_policies:
@@ -9617,7 +9659,6 @@ network_policies:
         port: 8080
         protocol: rest
         enforcement: enforce
-        tls: terminate
         rules:
           - allow:
               method: GET
@@ -9660,7 +9701,6 @@ network_policies:
         port: 8080
         protocol: rest
         enforcement: enforce
-        tls: terminate
         rules:
           - allow:
               method: GET
@@ -9708,7 +9748,6 @@ network_policies:
         ports: [8080, 9090]
         protocol: rest
         enforcement: enforce
-        tls: terminate
         rules:
           - allow:
               method: GET

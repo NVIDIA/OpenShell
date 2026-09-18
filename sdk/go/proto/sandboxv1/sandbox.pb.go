@@ -656,7 +656,9 @@ type NetworkEndpoint struct {
 	// Endpoint protocol. "tcp" and "" select L4-only handling; "rest",
 	// "websocket", "graphql", "sql", "json-rpc", and "mcp" select L7 inspection.
 	Protocol string `protobuf:"bytes,3,opt,name=protocol,proto3" json:"protocol,omitempty"`
-	// TLS handling: "terminate" or "passthrough" (default).
+	// TLS handling. Empty (default) auto-detects and terminates TLS for
+	// inspection; "skip" disables detection for this endpoint. Any other value
+	// is rejected at validation.
 	Tls string `protobuf:"bytes,4,opt,name=tls,proto3" json:"tls,omitempty"`
 	// Enforcement mode: "enforce" or "audit" (default).
 	Enforcement string `protobuf:"bytes,5,opt,name=enforcement,proto3" json:"enforcement,omitempty"`

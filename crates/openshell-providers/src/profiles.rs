@@ -2526,6 +2526,7 @@ pub fn validate_profile_set(
             let l7_fields = L7EndpointFields {
                 protocol: &endpoint.protocol,
                 access: &endpoint.access,
+                tls: &endpoint.tls,
                 has_rules: endpoint.rules.as_ref().is_some_and(|r| !r.is_empty()),
                 has_deny_rules: endpoint.deny_rules.as_ref().is_some_and(|r| !r.is_empty()),
                 rules_would_deny_all: endpoint.rules.as_ref().is_some_and(|r| {
@@ -3614,6 +3615,34 @@ credentials:
             diagnostic.field == "credentials.refresh.max_lifetime"
                 && diagnostic.message.contains("greater than zero")
         }));
+    }
+
+    #[test]
+    fn profile_lint_rejects_unsupported_tls_value() {
+        let profile = parse_profile_yaml(
+            r"
+id: legacy-tls
+display_name: Legacy TLS
+category: other
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: read-only
+    tls: terminate
+",
+        )
+        .expect("profile should parse");
+        let diagnostics = validate_profile_set(&[("legacy.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.field == "endpoints[0]"
+                    && diagnostic
+                        .message
+                        .contains("unsupported tls value 'terminate'")
+            }),
+            "expected a tls diagnostic: {diagnostics:?}"
+        );
     }
 
     #[test]
@@ -5493,7 +5522,6 @@ endpoints:
   - host: api.example.com
     ports: [443, 8443]
     protocol: rest
-    tls: terminate
     enforcement: enforce
     rules:
       - allow:
@@ -5537,7 +5565,7 @@ binaries:
         let rest_ep = &proto.endpoints[1];
         assert_eq!(rest_ep.port, 0);
         assert_eq!(rest_ep.ports, vec![443, 8443]);
-        assert_eq!(rest_ep.tls, "terminate");
+        assert_eq!(rest_ep.tls, "");
         assert_eq!(rest_ep.allowed_ips, vec!["10.0.0.0/24"]);
         assert!(rest_ep.allow_encoded_slash);
         assert!(rest_ep.allow_uninspected_credentials);

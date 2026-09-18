@@ -8569,12 +8569,12 @@ mod tests {
     /// placeholders in request headers before forwarding to upstream.
     ///
     /// This is the code path exercised when an endpoint has `protocol: rest`
-    /// and `tls: terminate` — the proxy terminates TLS, sees plaintext HTTP,
-    /// and replaces placeholder tokens with real secrets.
+    /// and terminated TLS — the proxy sees plaintext HTTP and replaces
+    /// placeholder tokens with real secrets.
     ///
-    /// Without this test, a misconfigured endpoint (missing `tls: terminate`)
-    /// silently leaks placeholder strings like `openshell:resolve:env:NVIDIA_API_KEY`
-    /// to the upstream API, causing 401 Unauthorized errors.
+    /// A regression here forwards placeholder strings like
+    /// `openshell:resolve:env:NVIDIA_API_KEY` to the upstream API verbatim,
+    /// causing 401 Unauthorized errors.
     #[tokio::test]
     async fn relay_request_with_resolver_rewrites_credential_placeholders() {
         let provider_env: HashMap<String, String> = [(

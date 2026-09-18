@@ -49,6 +49,23 @@ pub fn is_explicit_tcp_protocol(protocol: &str) -> bool {
     protocol.eq_ignore_ascii_case("tcp")
 }
 
+/// `skip` is deliberately not offered as an alternative: it is a posture
+/// downgrade, not a fix.
+const TLS_MODE_REMEDIATION: &str = "remove the tls field to keep automatic TLS termination";
+
+/// Reject `tls` values outside the supported set.
+///
+/// Omitted means auto-detect and terminate for inspection; `skip` opts out.
+pub fn validate_tls_mode(tls: &str) -> Option<String> {
+    if tls.is_empty() || tls == "skip" {
+        return None;
+    }
+
+    Some(format!(
+        "unsupported tls value '{tls}'; {TLS_MODE_REMEDIATION}"
+    ))
+}
+
 /// Reject transport choices that an in-sandbox agent must not grant itself.
 ///
 /// An omitted protocol remains allowed: it uses the established explicit
@@ -101,9 +118,30 @@ mod agent_transport_tests {
     #[test]
     fn agent_cannot_request_native_tcp_or_skip_tls_inspection() {
         assert!(agent_authored_transport_rejection("tcp", "").is_some());
-        assert!(agent_authored_transport_rejection("TCP", "terminate").is_some());
+        assert!(agent_authored_transport_rejection("TCP", "").is_some());
         assert!(agent_authored_transport_rejection("", "skip").is_some());
         assert!(agent_authored_transport_rejection("rest", "SKIP").is_some());
+    }
+}
+
+#[cfg(test)]
+mod tls_mode_tests {
+    use super::validate_tls_mode;
+
+    #[test]
+    fn omitted_and_skip_are_accepted() {
+        for tls in ["", "skip"] {
+            assert_eq!(validate_tls_mode(tls), None, "tls: {tls:?}");
+        }
+    }
+
+    #[test]
+    fn every_other_value_is_rejected() {
+        for tls in ["terminate", "passthrough", "bogus", "SKIP"] {
+            let error = validate_tls_mode(tls).expect("must be rejected");
+            assert!(error.contains(&format!("unsupported tls value '{tls}'")));
+            assert!(error.contains("remove the tls field"));
+        }
     }
 }
 
@@ -120,6 +158,9 @@ pub struct L7EndpointFields<'a> {
     /// means no access preset.
     pub access: &'a str,
 
+    /// TLS handling as authored. Empty string means the default.
+    pub tls: &'a str,
+
     /// `true` when the endpoint has a non-empty rules list.
     pub has_rules: bool,
 
@@ -134,8 +175,8 @@ pub struct L7EndpointFields<'a> {
     pub allow_all_known_mcp_methods: bool,
 }
 
-/// Validate the semantic consistency of an L7 endpoint's field
-/// combination.
+/// Validate an L7 endpoint's individual field values and their semantic
+/// consistency with each other.
 ///
 /// Returns a list of error message strings. An empty list means the
 /// endpoint passes validation. Messages are bare — callers prepend
@@ -226,6 +267,11 @@ pub fn validate_l7_endpoint_semantics(ep: &L7EndpointFields<'_>) -> Vec<String> 
         errors.push("deny_rules require rules or access to define the base allow set".to_string());
     }
 
+    // 10. Unsupported tls value.
+    if let Some(reason) = validate_tls_mode(ep.tls) {
+        errors.push(reason);
+    }
+
     errors
 }
 
@@ -237,6 +283,7 @@ mod tests {
         L7EndpointFields {
             protocol: "rest",
             access: "read-only",
+            tls: "",
             has_rules: false,
             has_deny_rules: false,
             rules_would_deny_all: false,
@@ -255,6 +302,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "ftp",
             access: "",
+            tls: "",
             has_rules: false,
             has_deny_rules: false,
             rules_would_deny_all: false,
@@ -269,6 +317,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "rest",
             access: "full",
+            tls: "",
             has_rules: true,
             has_deny_rules: false,
             rules_would_deny_all: false,
@@ -283,6 +332,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "json-rpc",
             access: "full",
+            tls: "",
             has_rules: false,
             has_deny_rules: false,
             rules_would_deny_all: false,
@@ -301,6 +351,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "mcp",
             access: "full",
+            tls: "",
             has_rules: false,
             has_deny_rules: false,
             rules_would_deny_all: false,
@@ -319,6 +370,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "json-rpc",
             access: "",
+            tls: "",
             has_rules: false,
             has_deny_rules: false,
             rules_would_deny_all: false,
@@ -333,6 +385,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "rest",
             access: "",
+            tls: "",
             has_rules: false,
             has_deny_rules: false,
             rules_would_deny_all: false,
@@ -351,6 +404,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "mcp",
             access: "",
+            tls: "",
             has_rules: false,
             has_deny_rules: false,
             rules_would_deny_all: false,
@@ -365,6 +419,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "mcp",
             access: "",
+            tls: "",
             has_rules: false,
             has_deny_rules: false,
             rules_would_deny_all: false,
@@ -379,6 +434,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "rest",
             access: "",
+            tls: "",
             has_rules: true,
             has_deny_rules: false,
             rules_would_deny_all: true,
@@ -393,6 +449,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "mcp",
             access: "",
+            tls: "",
             has_rules: true,
             has_deny_rules: false,
             rules_would_deny_all: true,
@@ -410,6 +467,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "",
             access: "",
+            tls: "",
             has_rules: false,
             has_deny_rules: true,
             rules_would_deny_all: false,
@@ -428,6 +486,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "rest",
             access: "",
+            tls: "",
             has_rules: false,
             has_deny_rules: true,
             rules_would_deny_all: false,
@@ -446,6 +505,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "",
             access: "",
+            tls: "",
             has_rules: false,
             has_deny_rules: false,
             rules_would_deny_all: false,
@@ -460,6 +520,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "tcp",
             access: "",
+            tls: "",
             has_rules: false,
             has_deny_rules: false,
             rules_would_deny_all: false,
@@ -476,6 +537,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "tcp",
             access: "full",
+            tls: "",
             has_rules: false,
             has_deny_rules: false,
             rules_would_deny_all: false,
@@ -520,6 +582,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "json-rpc",
             access: "full",
+            tls: "",
             has_rules: false,
             has_deny_rules: false,
             rules_would_deny_all: false,
@@ -541,6 +604,7 @@ mod tests {
         let ep = L7EndpointFields {
             protocol: "json-rpc",
             access: "",
+            tls: "",
             has_rules: false,
             has_deny_rules: false,
             rules_would_deny_all: false,

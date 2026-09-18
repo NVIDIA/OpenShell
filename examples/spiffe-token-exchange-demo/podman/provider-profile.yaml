@@ -44,13 +44,11 @@ endpoints:
   - host: alpha-exchange
     port: 8080
     protocol: rest
-    tls: none
     access: read-write
     enforcement: enforce
   - host: beta-exchange
     port: 8080
     protocol: rest
-    tls: none
     access: read-write
     enforcement: enforce
 binaries:

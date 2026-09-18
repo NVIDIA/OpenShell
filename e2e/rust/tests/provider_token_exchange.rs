@@ -583,7 +583,6 @@ endpoints:
   - host: host.openshell.internal
     port: {target_port}
     protocol: rest
-    tls: none
     access: read-write
     enforcement: enforce
     allowed_ips:
