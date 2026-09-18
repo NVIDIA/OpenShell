@@ -85,6 +85,17 @@ OpenShell labels, or read bootstrap Secrets. Set
 `supervisor.sandboxRuntime.networkPolicyEnforced: true` only after you verify that the
 cluster CNI enforces both ingress and egress policies for these namespaces.
 
+## Relay Agent Telemetry
+
+When the gateway has `[openshell.gateway.otlp]` configured, agents in the
+workload Pod export OpenTelemetry traces to `http://192.0.0.8:4318`. That
+address is never routed. The sandbox seccomp broker stages the connection for
+the supervisor over the existing boundary channel, and the supervisor serves
+the OTLP receiver on that stream, adds sandbox attributes to the spans, and
+forwards them to the collector through the gateway. The workload egress fence
+stays empty and no NetworkPolicy change is needed. See
+[OTLP Export](/reference/gateway-config#otlp-export).
+
 ## Bootstrap a Sandbox
 
 The driver creates each sandbox generation in a fail-closed order:

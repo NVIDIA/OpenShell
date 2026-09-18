@@ -1012,7 +1012,10 @@ pub async fn handle_connect_supervisor(
         return Err(error);
     }
 
-    // Step 3: Send SessionAccepted.
+    // Step 3: Determine confirmed capabilities.
+    let confirmed_capabilities = confirm_capabilities(&hello.capabilities, state);
+
+    // Step 4: Send SessionAccepted.
     let accepted = GatewayMessage {
         payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
             session_id: session_id.clone(),
@@ -1020,6 +1023,7 @@ pub async fn handle_connect_supervisor(
                 u64::from(HEARTBEAT_INTERVAL_SECS),
             ))
             .ok(),
+            capabilities: confirmed_capabilities,
         })),
     };
     if tx.send(accepted).await.is_err() {
@@ -1278,12 +1282,130 @@ fn handle_supervisor_message(
                 "supervisor session: relay closed by supervisor"
             );
         }
+        Some(supervisor_message::Payload::OtelExport(otel_data)) => {
+            handle_otel_export(state, sandbox_id, session_id, otel_data);
+        }
         _ => {
-            warn!(
+            debug!(
                 sandbox_id = %sandbox_id,
                 session_id = %session_id,
-                "supervisor session: unexpected message type"
+                "supervisor session: unknown message type (future extension)"
             );
+        }
+    }
+}
+
+/// Check which advertised capabilities the gateway can confirm.
+fn confirm_capabilities(advertised: &[String], state: &Arc<ServerState>) -> Vec<String> {
+    let confirmed = select_confirmed_capabilities(advertised, state.otel_relay_exporter.is_some());
+    if !confirmed.is_empty() {
+        info!(capabilities = ?confirmed, "confirmed supervisor capabilities");
+    }
+    confirmed
+}
+
+/// Keep each advertised capability the gateway can actually serve and drop
+/// the rest. `otel_relay_enabled` reflects whether `[openshell.gateway.otlp]`
+/// produced a relay exporter at startup.
+fn select_confirmed_capabilities(advertised: &[String], otel_relay_enabled: bool) -> Vec<String> {
+    let mut confirmed = Vec::new();
+    for cap in advertised {
+        match cap.as_str() {
+            "otel_export" if otel_relay_enabled => {
+                confirmed.push(cap.clone());
+            }
+            "otel_export" => {
+                debug!(
+                    capability = "otel_export",
+                    "supervisor advertised otel_export but gateway has no \
+                     [openshell.gateway.otlp] config; capability not confirmed"
+                );
+            }
+            other => {
+                debug!(capability = %other, "ignoring unknown supervisor capability");
+            }
+        }
+    }
+    confirmed
+}
+
+/// Upper bound on a single relayed OCSF event; larger events are skipped.
+const MAX_OCSF_EVENT_SIZE: usize = 256 * 1024;
+
+/// Why a relayed OCSF event was not emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OcsfEventRejection {
+    TooLarge,
+    NotUtf8,
+    NotJson,
+}
+
+/// Accept a relayed OCSF event only when it is within the size bound and is
+/// valid UTF-8 JSON. Returns the event text ready for the `ocsf_relay` log
+/// target.
+fn relayable_ocsf_event(event: &[u8]) -> Result<&str, OcsfEventRejection> {
+    if event.len() > MAX_OCSF_EVENT_SIZE {
+        return Err(OcsfEventRejection::TooLarge);
+    }
+    let json_str = std::str::from_utf8(event).map_err(|_| OcsfEventRejection::NotUtf8)?;
+    if serde_json::from_str::<serde_json::Value>(json_str).is_err() {
+        return Err(OcsfEventRejection::NotJson);
+    }
+    Ok(json_str)
+}
+
+/// Handle incoming OTEL export data from the supervisor: forward trace data to
+/// the configured OTLP collector and dispatch OCSF events to the log sink.
+fn handle_otel_export(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    session_id: &str,
+    otel_data: openshell_core::proto::OtelExportData,
+) {
+    if let Some(openshell_core::proto::otel_export_data::Signal::TraceData(trace_data)) =
+        otel_data.signal
+        && !trace_data.is_empty()
+        && let Some(relay_exporter) = state.otel_relay_exporter.as_ref()
+    {
+        let exporter = relay_exporter.clone();
+        let sandbox_id = sandbox_id.to_string();
+        tokio::spawn(async move {
+            match tokio::time::timeout(Duration::from_secs(10), exporter.export_raw(trace_data))
+                .await
+            {
+                Ok(Err(e)) => {
+                    debug!(
+                        sandbox_id = %sandbox_id,
+                        error = %e,
+                        "OTEL relay: failed to export trace data"
+                    );
+                }
+                Err(_) => {
+                    debug!(
+                        sandbox_id = %sandbox_id,
+                        "OTEL relay: export timed out"
+                    );
+                }
+                Ok(Ok(())) => {}
+            }
+        });
+    }
+
+    for ocsf_event in &otel_data.ocsf_events {
+        match relayable_ocsf_event(ocsf_event) {
+            Ok(json_str) => info!(
+                target: "ocsf_relay",
+                sandbox_id = %sandbox_id,
+                session_id = %session_id,
+                ocsf_json = %json_str,
+                "relayed OCSF event"
+            ),
+            Err(reason) => debug!(
+                sandbox_id = %sandbox_id,
+                size = ocsf_event.len(),
+                reason = ?reason,
+                "OTEL relay: skipping OCSF event"
+            ),
         }
     }
 }
@@ -1342,6 +1464,81 @@ mod tests {
             },
             created_at,
         }
+    }
+
+    // ---- capability negotiation and OCSF relay filtering ----
+
+    fn caps(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn select_confirmed_capabilities_keeps_otel_export_when_relay_enabled() {
+        let confirmed = select_confirmed_capabilities(&caps(&["otel_export"]), true);
+        assert_eq!(confirmed, caps(&["otel_export"]));
+    }
+
+    #[test]
+    fn select_confirmed_capabilities_drops_otel_export_without_relay() {
+        let confirmed = select_confirmed_capabilities(&caps(&["otel_export"]), false);
+        assert!(confirmed.is_empty());
+    }
+
+    #[test]
+    fn select_confirmed_capabilities_ignores_unknown_capabilities() {
+        let confirmed =
+            select_confirmed_capabilities(&caps(&["metrics_export", "otel_export", "bogus"]), true);
+        assert_eq!(confirmed, caps(&["otel_export"]));
+    }
+
+    #[test]
+    fn select_confirmed_capabilities_empty_advertisement_confirms_nothing() {
+        assert!(select_confirmed_capabilities(&[], true).is_empty());
+    }
+
+    #[test]
+    fn relayable_ocsf_event_accepts_bounded_valid_json() {
+        assert_eq!(
+            relayable_ocsf_event(br#"{"class_uid":4001}"#),
+            Ok(r#"{"class_uid":4001}"#)
+        );
+    }
+
+    #[test]
+    fn relayable_ocsf_event_accepts_event_exactly_at_size_limit() {
+        // The bound is strictly greater-than, so an event of exactly
+        // MAX_OCSF_EVENT_SIZE bytes still passes. `{` + padding + `}` is an
+        // empty JSON object.
+        let mut at_limit = vec![b' '; MAX_OCSF_EVENT_SIZE - 2];
+        at_limit.insert(0, b'{');
+        at_limit.push(b'}');
+        assert_eq!(at_limit.len(), MAX_OCSF_EVENT_SIZE);
+        assert!(relayable_ocsf_event(&at_limit).is_ok());
+    }
+
+    #[test]
+    fn relayable_ocsf_event_rejects_oversized_event() {
+        let oversized = vec![b' '; MAX_OCSF_EVENT_SIZE + 1];
+        assert_eq!(
+            relayable_ocsf_event(&oversized),
+            Err(OcsfEventRejection::TooLarge)
+        );
+    }
+
+    #[test]
+    fn relayable_ocsf_event_rejects_non_utf8() {
+        assert_eq!(
+            relayable_ocsf_event(&[0xff, 0xfe, b'{']),
+            Err(OcsfEventRejection::NotUtf8)
+        );
+    }
+
+    #[test]
+    fn relayable_ocsf_event_rejects_invalid_json() {
+        assert_eq!(
+            relayable_ocsf_event(b"{not json"),
+            Err(OcsfEventRejection::NotJson)
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@ mod activity_aggregator;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
+mod otlp_relay;
 mod provider_readiness;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -512,6 +513,7 @@ pub async fn run_network_proxy(
         #[cfg(target_os = "linux")]
         None,
         None,
+        None,
     )
     .await?;
 
@@ -772,6 +774,10 @@ pub async fn run_sandbox(
     let (backend, verified) = registry
         .resolve(backend_descriptor, &admitted_backend_name)
         .map_err(|error| miette::miette!(error.to_string()))?;
+    // Span enrichment reads these after the descriptor's identity moves into
+    // the sandbox context below.
+    let workload_uid = runtime_descriptor.workload_identity.uid;
+    let driver_name = runtime_descriptor.driver_fence.driver_name();
     let context = openshell_isolation_interface::contract::SandboxContext {
         sandbox_id: sandbox_id.clone().unwrap_or_default(),
         session_id,
@@ -855,6 +861,25 @@ pub async fn run_sandbox(
     // API read the current value so proposals target the correct workspace.
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
 
+    // OTLP relay: agent processes export to the reserved relay address and
+    // the proxy serves those staged streams with this server. It starts
+    // before networking so the first staged stream finds it; forwarding to
+    // the gateway waits until a session confirms `otel_export`.
+    let (otlp_server, otlp_relay) = openshell_supervisor_process::otlp::start(
+        &openshell_supervisor_process::otlp::RelayConfig::default(),
+        openshell_supervisor_process::otlp::SandboxMetadata {
+            sandbox_id: sandbox_id.clone().unwrap_or_default(),
+            workspace_id: workspace_rx.borrow().clone(),
+            policy: sandbox_name_for_agg.clone().unwrap_or_default(),
+            user: workload_uid.to_string(),
+            // Only the Podman driver sets this today; the OCSF context reads
+            // the same variable and shares the gap.
+            image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
+            driver: driver_name.to_string(),
+        },
+    );
+    let otlp_destination = otlp_relay::reserved_destination(otlp_server);
+
     let remote_network_source = remote_boundary.0.network_mediation_source();
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
     let (remote_ready, backend_name, ca_file_paths) = {
@@ -894,6 +919,7 @@ pub async fn run_sandbox(
             #[cfg(target_os = "linux")]
             None,
             Some(remote_network_source),
+            Some(otlp_destination),
         )
         .await?,
     );
@@ -1100,6 +1126,7 @@ pub async fn run_sandbox(
             running.loopback_connector(),
             agent.clone(),
             Some(supervisor_session_updates),
+            Some(otlp_relay),
         )
         .await?;
         info!(backend = %backend_name, "Control-mode access plane started");
@@ -1189,6 +1216,15 @@ pub async fn run_sandbox(
             persist_main_exit_marker(marker, exit_code)
                 .into_diagnostic()
                 .wrap_err("persist canonical-process completion marker")?;
+        }
+        // Flush relayed telemetry before the exit is reported so final spans
+        // still reach the gateway; bounded so an unreachable gateway cannot
+        // delay the report.
+        if !completion_cancelled {
+            let drain = boundary_access
+                .drain_telemetry(openshell_supervisor_process::delegated::OTEL_FINAL_DRAIN_TIMEOUT);
+            completion_cancelled =
+                completion_phase_or_shutdown(drain, shutdown_requested.as_mut()).await;
         }
         if !completion_cancelled
             && let (Some(endpoint), Some(id)) =

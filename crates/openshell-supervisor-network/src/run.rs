@@ -203,6 +203,7 @@ pub async fn run_networking(
     host_gateway_ip: Option<IpAddr>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
     network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
+    reserved_destination: Option<crate::proxy::ReservedDestination>,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
@@ -494,6 +495,7 @@ pub async fn run_networking(
                 .as_ref()
                 .map(|runtime| runtime.store.clone()),
             None,
+            reserved_destination,
         )
         .await?;
         Some(proxy_handle)
