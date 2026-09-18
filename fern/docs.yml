@@ -60,7 +60,7 @@ versions:
     path: ../docs/index.yml
     slug: latest
     announcement:
-      message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>OpenShell 0.1.0 is coming soon.</strong> OpenShell 0.0.116 will no longer be supported, and upgrading to 0.1.0 will require migration. Migration notes will be provided with the 0.1.0 release. <a href="https://github.com/NVIDIA/OpenShell/milestone/10" target="_blank" rel="noreferrer">Track progress in the 0.1.0 milestone</a>, <a href="https://docs.nvidia.com/openshell/dev/index.html" target="_blank" rel="noreferrer">read the prerelease documentation</a>, or <a href="https://docs.nvidia.com/openshell/dev/about/installation#install-a-prerelease" target="_blank" rel="noreferrer">install a prerelease</a>.</span>'
+      message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>OpenShell 0.1.0 is coming soon.</strong> <a href="https://github.com/NVIDIA/OpenShell/milestone/10" target="_blank" rel="noreferrer">Track progress in the 0.1.0 milestone</a>, <a href="https://docs.nvidia.com/openshell/dev/index.html" target="_blank" rel="noreferrer">read the prerelease documentation</a>, or <a href="https://docs.nvidia.com/openshell/dev/about/installation#install-a-prerelease" target="_blank" rel="noreferrer">install a prerelease</a>.<br/><strong>OpenShell 0.0.116 will no longer be supported.</strong> Upgrading to 0.1.0 will require migration. Migration notes will be provided with the 0.1.0 release.</span>'
 
 redirects:
   # Paths are relative to the site root; subpath prefix matches instances + custom-domain.
