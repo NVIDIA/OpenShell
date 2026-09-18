@@ -103,11 +103,36 @@ when it runs inside a container or microVM:
 | -------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | [Landlock LSM](https://docs.kernel.org/security/landlock.html) | Required | ABI 3 or newer, introduced in Linux 6.2, with Landlock enabled. The mandatory baseline protects private channel and bootstrap files, including against truncation. A filesystem policy's `best_effort` setting never disables this baseline. |
 | seccomp | Required | Nested user-notification filters and atomic `SECCOMP_IOCTL_NOTIF_ADDFD` with `SECCOMP_ADDFD_FLAG_SEND`, usable under the runtime's existing seccomp profile without added capabilities. The sandbox actively probes these operations before admitting the workload. |
+| seccomp `WAIT_KILLABLE_RECV` | Recommended (Linux 5.19+) | Keeps a notified workload thread in a kill-only wait so the broker can safely write mediated results into workload memory. Without it (kernels &lt; 5.19, for example RHEL 9.x / RHCOS 5.14) the sandbox still starts, in a reduced **legacy read-only** mode described below. |
 
 A kernel version alone does not establish support. A disabled Landlock LSM or a
 runtime profile that blocks the required seccomp operations causes launch to
 fail closed. An upstream Linux 6.2 or newer kernel provides the required
 Landlock ABI; distribution backports must pass the same active qualification.
+
+### Legacy read-only mode (kernels before Linux 5.19)
+
+`SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` was added in Linux 5.19. On older
+kernels — notably RHEL 9.x and RHCOS, which ship a 5.14 kernel — the sandbox
+cannot install a kill-only listener, so it falls back to a plain listener and
+runs in a **legacy read-only** cancellation mode. The sandbox starts and
+enforces the full isolation boundary (Landlock, the outer NetworkPolicy fence,
+DNS and TCP authorization); the only difference is that the broker refuses the
+mediated operations that write results back into workload memory, failing them
+closed with `EOPNOTSUPP`:
+
+- `getpeername`;
+- `accept` / `accept4` **when a non-null peer-address argument is supplied**
+  (a null address argument still works);
+- `sendmmsg` paths that write per-message lengths back to the caller.
+
+Socket creation, `connect`, `bind`, `listen`, `sendto`, and `sendmsg` are
+unaffected. Outbound-oriented workloads generally run unchanged; server
+workloads whose accept wrappers request the peer address will see `EOPNOTSUPP`
+until the node runs a kernel that provides `WAIT_KILLABLE_RECV` (Linux 5.19+, or
+a distribution backport). The selected mode is reported in the sandbox
+qualification output as `seccomp_listener_mode` (`killable` or
+`legacy_read_only`).
 
 On macOS, these kernel modules run inside the Docker Desktop Linux VM, not on the host kernel.
 
