@@ -1092,6 +1092,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(current_user.name.clone()),
             run_as_group: None,
+            ..Default::default()
         });
         let workspace = ResolvedWorkspace::default();
         let mut cmd = Command::new("/usr/bin/env");
@@ -1129,6 +1130,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(current_user.name),
             run_as_group: None,
+            ..Default::default()
         });
         for interactive in [false, true] {
             let mut cmd = Command::new("/usr/bin/env");
