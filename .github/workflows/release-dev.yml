@@ -122,13 +122,6 @@ jobs:
       category: conformance
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
-      test-matrix: >-
-        [
-          {"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"conformance"},
-          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
-          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"conformance"},
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"conformance"}
-        ]
 
   feature-specific-integration:
     needs: prepare-integration
