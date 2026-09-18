@@ -218,6 +218,36 @@ VM sandboxes have no network interface. All traffic flows through the OpenShell 
 
 If the gateway is briefly unavailable while a VM starts, its supervisor retries the session connection. The sandbox stays in provisioning until the gateway accepts the session.
 
+### MicroVM Mounts
+
+The VM driver shares gateway-host directories into the guest with virtiofs. Each entry in `mounts` takes `source` (absolute host directory), `target`, optional `read_only` (default `true`), and optional `type`, which must be `bind` so Docker and Podman bind entries work unchanged:
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"vm":{"mounts":[{"type":"bind","source":"/srv/datasets","target":"/sandbox/datasets"}]}}' \
+  -- claude
+```
+
+A sandbox takes at most 32 mounts on an arm64 gateway host and three on an x86_64 host. Single-file sources, sources that are symbolic links, `selinux_label`, and other mount types are not supported. VM mounts work only with the libkrun backend, so GPU sandboxes cannot use them.
+
+<Warning>
+VM mounts carry the same risk as [Docker bind mounts](#docker-mounts). The VM launcher serves each share as the gateway user, so `source` constrains the sandbox workload, not a compromised guest kernel. VM mounts require the same opt-in:
+
+```toml
+[openshell.drivers.vm]
+allow_driver_config = true
+enable_bind_mounts = true
+
+[openshell.drivers.vm.resource_admission]
+enabled = false
+```
+
+</Warning>
+
+Targets cannot replace the workspace root, OpenShell paths, or VM-internal paths such as `/tmp`, `/proc`, `/dev`, and `/srv`, and cannot be nested inside one another. The guest refuses a target that passes through a symlink in the image.
+
+On Linux with a non-root gateway, the sandbox can create files in a read-write mount only when its UID and GID match the gateway user's. Set `sandbox_uid` and `sandbox_gid` under `[openshell.drivers.vm]` to match. Otherwise the sandbox cannot create files, and its access to existing files follows the host permission bits for its numeric UID and GID.
+
 ## Kubernetes Driver
 
 The Kubernetes driver runs sandboxes as pods in a sandbox namespace. It requires the [Agent Sandbox](https://github.com/kubernetes-sigs/agent-sandbox) controller. Install the gateway with the Helm chart; see [Kubernetes setup](/kubernetes/setup).

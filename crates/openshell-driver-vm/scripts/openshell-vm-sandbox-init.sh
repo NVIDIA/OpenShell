@@ -544,6 +544,74 @@ run_openshell_init_dropins() {
     done < <(LC_ALL=C sort -u "$manifest")
 }
 
+# Create a virtiofs mount point under ROOT_PREFIX without following symlinks,
+# so an image cannot redirect a validated target onto another guest path.
+# Directories created under /sandbox are handed to the sandbox user.
+prepare_virtiofs_target() {
+    local target="$1" owner="$2"
+    local path="${ROOT_PREFIX:-}" component
+    local -a components
+    IFS=/ read -r -a components <<<"${target#/}"
+    for component in "${components[@]}"; do
+        [ -n "$component" ] || continue
+        path="${path}/${component}"
+        if [ -L "$path" ]; then
+            ts >&2 "FATAL: virtiofs mount target ${target} traverses symlink ${path#"${ROOT_PREFIX:-}"}"
+            exit 1
+        fi
+        if [ ! -e "$path" ]; then
+            if ! mkdir "$path"; then
+                ts >&2 "FATAL: failed to create virtiofs mount point ${target}"
+                exit 1
+            fi
+            case "${path#"${ROOT_PREFIX:-}"}" in
+                /sandbox/*)
+                    if ! chown "$owner" "$path"; then
+                        ts >&2 "FATAL: failed to hand virtiofs mount point parent ${path#"${ROOT_PREFIX:-}"} to ${owner}"
+                        exit 1
+                    fi
+                    ;;
+            esac
+        elif [ ! -d "$path" ]; then
+            ts >&2 "FATAL: virtiofs mount target ${target} is not a directory"
+            exit 1
+        fi
+    done
+    printf '%s\n' "$path"
+}
+
+# Runs after every /sandbox ownership fixup and the root-run init drop-ins so
+# nothing in init walks into host-backed shares.
+mount_virtiofs_shares() {
+    local manifest
+    manifest="$(root_path /.openshell/mounts.manifest)"
+    # The driver always writes the manifest; it is empty without mounts.
+    [ -s "$manifest" ] || return 0
+
+    ts "mounting virtiofs shares"
+    local tag target mode mount_opts guest_target owner
+    owner="$(sandbox_owner)"
+    while IFS=$'\t' read -r tag target mode; do
+        [ -n "$tag" ] || continue
+        case "$mode" in
+            ro)  mount_opts="-o ro" ;;
+            rw)  mount_opts="" ;;
+            *)
+                ts "FATAL: unknown virtiofs mount mode '${mode}' for tag ${tag}"
+                exit 1
+                ;;
+        esac
+        guest_target="$(prepare_virtiofs_target "$target" "$owner")" || exit 1
+        # shellcheck disable=SC2086
+        if mount -t virtiofs $mount_opts "$tag" "$guest_target"; then
+            ts "  mounted virtiofs ${tag} -> ${target} (${mode})"
+        else
+            ts "FATAL: failed to mount virtiofs ${tag} at ${target}"
+            exit 1
+        fi
+    done < "$manifest"
+}
+
 run_post_overlay_setup() {
     # Source QEMU-injected environment variables if present. The file lives in
     # the overlay upperdir so the cached bootstrap rootfs remains immutable.
@@ -616,6 +684,8 @@ if [ -d /sandbox ]; then
 fi
 
 run_openshell_init_dropins
+
+mount_virtiofs_shares
 
 if [ -n "${OPENSHELL_SANDBOX_ID:-}" ]; then
     ts "OPENSHELL_SANDBOX_ID=${OPENSHELL_SANDBOX_ID}"
