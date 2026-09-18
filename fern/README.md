@@ -54,7 +54,7 @@ The sync and publish workflows share the `docs-website` concurrency group. This 
 
 The `dev` snapshot also owns the shared Fern configuration, components, assets, and CSS on `docs-website`. The `latest` snapshot copies its documentation and navigation but does not replace those shared files. This keeps the site configuration aligned with `main` while preserving the released content.
 
-A `dev` sync copies announcement settings from the source `fern/docs.yml`. The top-level `announcement` is the global fallback and removing it from the source removes it from `docs-website`. An announcement under a `versions` entry applies only to the matching version and overrides the global announcement for that version.
+A `dev` sync copies the top-level `announcement` from the source `fern/docs.yml`. This announcement is the global fallback, and removing it from the source removes it from `docs-website`. Each snapshot sync copies the source version announcement only to the channel being updated. A version announcement overrides the global announcement for that version, so Release Dev cannot change the `latest` announcement and Release Tag cannot change the `dev` announcement.
 
 ## Manual maintenance and publishing
 

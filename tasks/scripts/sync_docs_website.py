@@ -370,48 +370,28 @@ def render_versions(entries: list[VersionEntry]) -> list[YamlMapping]:
     return rendered
 
 
-def sync_announcements(source_docs_yml: Path, target_docs_yml: Path) -> None:
+def sync_global_announcement(source_docs_yml: Path, target_docs_yml: Path) -> None:
     source_data = read_yaml(source_docs_yml)
     source_announcement = source_data.get("announcement")
     if source_announcement is not None and not isinstance(source_announcement, dict):
         raise ValueError("docs.yml announcement must be a mapping")
 
-    source_entries = {
-        entry.slug: entry for entry in parse_versions(source_data.get("versions"))
-    }
     target_data = read_yaml(target_docs_yml)
     if source_announcement is None:
         target_data.pop("announcement", None)
     else:
         target_data["announcement"] = source_announcement
-
-    target_entries = parse_versions(target_data.get("versions"))
-    for entry in target_entries:
-        source_entry = source_entries.get(entry.slug)
-        if source_entry is not None:
-            entry.announcement = source_entry.announcement
-    target_data["versions"] = render_versions(target_entries)
     write_yaml(target_docs_yml, target_data)
 
 
-def version_announcement(docs_yml: Path, slug: str) -> YamlMapping | None:
-    return next(
-        (
-            entry.announcement
-            for entry in parse_versions(read_yaml(docs_yml).get("versions"))
-            if entry.slug == slug
-        ),
-        None,
-    )
-
-
-def resolve_version_announcement(
-    source_docs_yml: Path, target_docs_yml: Path, slug: str
-) -> YamlMapping | None:
-    for entry in parse_versions(read_yaml(source_docs_yml).get("versions")):
+def source_version_announcement(docs_yml: Path, slug: str) -> YamlMapping | None:
+    entries = parse_versions(read_yaml(docs_yml).get("versions"))
+    for entry in entries:
         if entry.slug == slug:
             return entry.announcement
-    return version_announcement(target_docs_yml, slug)
+    if len(entries) == 1:
+        return entries[0].announcement
+    return None
 
 
 def component_dirs(fern_dir: Path) -> list[str]:
@@ -459,7 +439,7 @@ def write_snapshot(
         copy_if_exists(
             source_fern / "fern.config.json", target_fern / "fern.config.json"
         )
-        sync_announcements(source_fern / "docs.yml", target_fern / "docs.yml")
+        sync_global_announcement(source_fern / "docs.yml", target_fern / "docs.yml")
 
     versions_dir = target_fern / "versions"
     versions_dir.mkdir(parents=True, exist_ok=True)
@@ -535,8 +515,8 @@ def sync_docs(args: argparse.Namespace) -> None:
                 display_name=slug,
                 path=f"./versions/{slug}.yml",
                 availability=stable_availability,
-                announcement=resolve_version_announcement(
-                    source_fern / "docs.yml", docs_yml, slug
+                announcement=source_version_announcement(
+                    source_fern / "docs.yml", slug
                 ),
             ),
             refresh_shared=False,
@@ -564,8 +544,8 @@ def sync_docs(args: argparse.Namespace) -> None:
                     display_name=display_override or f"Latest ({slug})",
                     path="./versions/latest.yml",
                     availability=stable_availability,
-                    announcement=resolve_version_announcement(
-                        source_fern / "docs.yml", docs_yml, "latest"
+                    announcement=source_version_announcement(
+                        source_fern / "docs.yml", "latest"
                     ),
                 ),
                 refresh_shared=False,
@@ -606,9 +586,7 @@ def sync_docs(args: argparse.Namespace) -> None:
             display_name=display_name,
             path=f"./versions/{slug}.yml",
             availability=availability,
-            announcement=resolve_version_announcement(
-                source_fern / "docs.yml", docs_yml, slug
-            ),
+            announcement=source_version_announcement(source_fern / "docs.yml", slug),
         ),
         refresh_shared=channel == "dev",
     )
