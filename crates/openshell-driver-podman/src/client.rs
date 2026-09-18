@@ -767,26 +767,6 @@ impl PodmanClient {
         .await
     }
 
-    /// Inspect a network and return the gateway IP of its first subnet.
-    ///
-    /// The gateway IP is the host's address on the bridge network, used by
-    /// sandbox containers to call back to the gateway server.
-    pub async fn network_gateway_ip(&self, name: &str) -> Result<Option<String>, PodmanApiError> {
-        validate_name(name)?;
-        let encoded = url_encode(name);
-        let path = format!("/libpod/networks/{encoded}/json");
-        let resp: Value = self.request_json(hyper::Method::GET, &path, None).await?;
-        // The response has "subnets": [{"gateway": "10.89.1.1", "subnet": "..."}]
-        let gateway = resp
-            .get("subnets")
-            .and_then(|s| s.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|sub| sub.get("gateway"))
-            .and_then(|g| g.as_str())
-            .map(String::from);
-        Ok(gateway)
-    }
-
     // ── Image operations ────────────────────────────────────────────────
 
     /// Pull an image if it is not already present locally.

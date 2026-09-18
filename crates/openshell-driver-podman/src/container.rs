@@ -1612,16 +1612,32 @@ fn provider_spiffe_workload_api_socket_mount_source(config: &PodmanComputeConfig
 
 fn hostadd_entries(config: &PodmanComputeConfig) -> Vec<String> {
     let host_gateway_ip = config.host_gateway_ip.trim();
-    if host_gateway_ip.is_empty() {
+    if !host_gateway_ip.is_empty() {
         return vec![
-            "host.containers.internal:host-gateway".into(),
-            "host.openshell.internal:host-gateway".into(),
+            format!("host.containers.internal:{host_gateway_ip}"),
+            format!("host.openshell.internal:{host_gateway_ip}"),
         ];
     }
 
+    if cfg!(target_os = "linux") {
+        // Since RFC 0012 (#2942), the callback-capable supervisor always
+        // shares the host network namespace with the gateway. Resolve the
+        // alias to loopback directly instead of Podman's `host-gateway`
+        // magic value, which independently picks a host interface and can
+        // select a different, unreachable one on multi-homed hosts
+        // (#3412). `gateway_listener_requirements` requests a matching
+        // loopback listener for the same reason.
+        return vec![
+            "host.containers.internal:127.0.0.1".into(),
+            "host.openshell.internal:127.0.0.1".into(),
+        ];
+    }
+
+    // Non-Linux (Podman Machine): gvproxy already forwards `host-gateway`
+    // to the VM host's loopback, so the magic value resolves correctly.
     vec![
-        format!("host.containers.internal:{host_gateway_ip}"),
-        format!("host.openshell.internal:{host_gateway_ip}"),
+        "host.containers.internal:host-gateway".into(),
+        "host.openshell.internal:host-gateway".into(),
     ]
 }
 
@@ -2600,7 +2616,44 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn container_spec_injects_host_aliases() {
+        // Since RFC 0012 (#2942), the supervisor shares the host network
+        // namespace with the gateway, so the automatic (no explicit
+        // host_gateway_ip) alias resolves directly to loopback rather than
+        // Podman's `host-gateway` magic value, which can select a
+        // different, unreachable interface on multi-homed hosts (#3412).
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let hostadd: Vec<&str> = spec["hostadd"]
+            .as_array()
+            .expect("hostadd should be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+
+        assert!(
+            hostadd.contains(&"host.containers.internal:127.0.0.1"),
+            "missing Podman host alias"
+        );
+        assert!(
+            hostadd.contains(&"host.openshell.internal:127.0.0.1"),
+            "missing OpenShell stable host alias"
+        );
+        assert!(
+            !hostadd.contains(&"host.docker.internal:127.0.0.1"),
+            "Podman should not inject Docker's host alias"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn container_spec_injects_host_aliases() {
+        // Podman Machine's gvproxy forwards the `host-gateway` magic value
+        // to the VM host's loopback correctly, so the automatic path keeps
+        // using it unchanged on non-Linux hosts.
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
         let spec = build_container_spec(&sandbox, &config);
