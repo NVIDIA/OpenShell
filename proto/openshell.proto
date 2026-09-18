@@ -806,7 +806,7 @@ message IssueSandboxTokenResponse {
 message RefreshSandboxTokenRequest {
   // Operator registration names for extension services selected by the
   // sandbox's effective policy.
-  repeated string extension_services = 1;
+  repeated string extension_service_names = 1;
 }
 
 // RefreshSandboxToken response. The new token replaces the supervisor's
@@ -893,7 +893,7 @@ message ComputeDriverInfo {
 // Public compute driver capability snapshot.
 message ComputeDriverCapabilities {
   // Driver-reported human-readable name from the startup capability snapshot.
-  string name = 1;
+  string driver_name = 1;
 
   // Driver-reported implementation version from the startup capability snapshot.
   string driver_version = 2;
@@ -1005,7 +1005,7 @@ message SandboxTemplate {
   // Fully-qualified OCI image reference used to boot the sandbox.
   string image = 1;
   // Optional runtime class name requested from the compute platform.
-  string runtime_class = 2;
+  string runtime_class_name = 2;
   // Optional agent socket path exposed to the workload.
   string agent_socket = 3;
   // Labels applied to compute-platform resources for this sandbox.
@@ -2585,24 +2585,24 @@ message PolicyMergeOperation {
 }
 
 message AddNetworkRule {
-  string name = 1;
+  string rule_name = 1;
   openshell.sandbox.v1.NetworkPolicyRule rule = 2;
 }
 
 message RemoveNetworkEndpoint {
-  string rule = 1;
+  string rule_name = 1;
   string host = 2;
   uint32 port = 3;
 }
 
 message RemoveNetworkRule {
-  string name = 1;
+  string rule_name = 1;
 }
 
 // Exact endpoint and complete authorization scope affected by an L7 append.
 // All ports and binaries must match the stored target; omitted scope is invalid.
 message L7RuleTarget {
-  string rule = 1;
+  string rule_name = 1;
   string host = 2;
   repeated uint32 ports = 3;
   // An absent path requires a unique endpoint. An empty path selects an
@@ -2628,7 +2628,7 @@ message AddAllowRules {
 }
 
 message RemoveNetworkBinary {
-  string rule = 1;
+  string rule_name = 1;
   string binary_path = 2;
 }
 
@@ -3051,7 +3051,7 @@ message PolicyChunk {
   // Approval status: "pending", "approved", "rejected".
   string status = 2;
   // Proposed network_policies map key.
-  string rule = 3;
+  string rule_name = 3;
   // The proposed network policy rule.
   openshell.sandbox.v1.NetworkPolicyRule proposed_rule = 4;
   // Human-readable explanation of why this rule is proposed.
@@ -3496,7 +3496,7 @@ message ExtensionServiceCredential {
   reserved "expires_at_ms";
   // Operator registration name used to correlate the credential with the
   // stable service registration delivered by GetSandboxConfig.
-  string service = 1;
+  string service_name = 1;
   // Gateway-minted JWT with an audience derived from the registration.
   string token = 2 [(openshell.options.v1.secret) = true];
   // Absolute expiry of the token.

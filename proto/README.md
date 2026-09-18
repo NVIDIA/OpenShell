@@ -15,8 +15,10 @@ changing existing APIs; generated SDK naming follows from these definitions.
 - Use the resource's role for a related resource reference, such as `sandbox`,
   `provider`, `service`, or `rule`.
 - Do not append `_name` to a canonical entity reference. Its value is already
-  the canonical name. Descriptive values that are not entity references, such
-  as `display_name`, `file_name`, and `operation_name`, may retain the suffix.
+  the canonical name. Descriptive values, local map keys, implementation
+  labels, and configured registration names that are not entity references may
+  retain the suffix. Examples include `display_name`, `file_name`,
+  `driver_name`, `runtime_class_name`, `rule_name`, and `middleware_name`.
 - Public callers reference entities by canonical name. Keep immutable IDs at
   authentication, persistence, compute-driver, and other internal boundaries.
 

@@ -114,7 +114,7 @@ pub async fn handle_refresh_sandbox_token(
     state: &Arc<ServerState>,
     request: Request<RefreshSandboxTokenRequest>,
 ) -> Result<Response<RefreshSandboxTokenResponse>, Status> {
-    let requested_extension_services = request.get_ref().extension_services.clone();
+    let requested_extension_services = request.get_ref().extension_service_names.clone();
     let principal = request
         .extensions()
         .get::<Principal>()
@@ -367,7 +367,7 @@ fn mint_extension_credentials(
                 },
             )?;
             Ok(ExtensionServiceCredential {
-                service: name.clone(),
+                service_name: name.clone(),
                 token: minted.token,
                 expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(
                     minted.expires_at_ms,
@@ -563,7 +563,7 @@ mod tests {
     async fn refresh_returns_new_token() {
         let state = state_with_issuer().await;
         let mut req = Request::new(RefreshSandboxTokenRequest {
-            extension_services: Vec::new(),
+            extension_service_names: Vec::new(),
         });
         req.extensions_mut().insert(sandbox_principal("sandbox-a"));
         let _ = authorize_refresh(&state, &mut req).await;
@@ -581,7 +581,7 @@ mod tests {
         let state = state_with_issuer().await;
         let request = || {
             let mut request = Request::new(RefreshSandboxTokenRequest {
-                extension_services: Vec::new(),
+                extension_service_names: Vec::new(),
             });
             request
                 .extensions_mut()
@@ -611,7 +611,7 @@ mod tests {
         );
 
         let mut changed_retry = request();
-        changed_retry.get_mut().extension_services = vec!["content-guard".to_string()];
+        changed_retry.get_mut().extension_service_names = vec!["content-guard".to_string()];
         set_refresh_authorization(&mut changed_retry, &first);
         let error = handle_refresh_sandbox_token(&state, changed_retry)
             .await
@@ -636,7 +636,7 @@ mod tests {
     async fn failed_refresh_does_not_consume_the_gateway_bearer() {
         let state = state_with_issuer().await;
         let mut rejected = Request::new(RefreshSandboxTokenRequest {
-            extension_services: vec!["unknown-service".to_string()],
+            extension_service_names: vec!["unknown-service".to_string()],
         });
         rejected
             .extensions_mut()
@@ -649,7 +649,7 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
 
         let mut retry = Request::new(RefreshSandboxTokenRequest {
-            extension_services: Vec::new(),
+            extension_service_names: Vec::new(),
         });
         retry
             .extensions_mut()
@@ -679,7 +679,7 @@ mod tests {
         )
         .expect("selected service credential");
         assert_eq!(credentials.len(), 1);
-        assert_eq!(credentials[0].service, "content-guard");
+        assert_eq!(credentials[0].service_name, "content-guard");
         assert!(!credentials[0].token.is_empty());
         assert!(credentials[0].expiration_time.is_some());
 
@@ -755,7 +755,7 @@ mod tests {
     async fn refresh_rejects_missing_sandbox() {
         let state = state_with_issuer().await;
         let mut req = Request::new(RefreshSandboxTokenRequest {
-            extension_services: Vec::new(),
+            extension_service_names: Vec::new(),
         });
         req.extensions_mut()
             .insert(sandbox_principal("sandbox-deleted"));
@@ -812,7 +812,7 @@ mod tests {
         use crate::auth::identity::{Identity, IdentityProvider};
         let state = state_with_issuer().await;
         let mut req = Request::new(RefreshSandboxTokenRequest {
-            extension_services: Vec::new(),
+            extension_service_names: Vec::new(),
         });
         req.extensions_mut().insert(Principal::User(UserPrincipal {
             identity: Identity {
@@ -837,7 +837,7 @@ mod tests {
         use crate::auth::principal::SandboxIdentitySource;
         let state = state_with_issuer().await;
         let mut req = Request::new(RefreshSandboxTokenRequest {
-            extension_services: Vec::new(),
+            extension_service_names: Vec::new(),
         });
         req.extensions_mut()
             .insert(Principal::Sandbox(SandboxPrincipal {
@@ -890,7 +890,7 @@ mod tests {
         )
         .await;
         let mut req = Request::new(RefreshSandboxTokenRequest {
-            extension_services: Vec::new(),
+            extension_service_names: Vec::new(),
         });
         req.extensions_mut().insert(sandbox_principal("sandbox-a"));
         let err = handle_refresh_sandbox_token(&state, req)

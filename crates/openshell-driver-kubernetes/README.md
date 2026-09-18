@@ -209,7 +209,7 @@ Resource keys use native Kubernetes resource names and quantity strings. The
 parser renders the keys listed above and rejects unknown fields.
 `pod.runtime_class_name` maps to PodSpec `runtimeClassName` and overrides the
 driver's configured `default_runtime_class_name`; the typed public
-`SandboxTemplate.runtime_class` still takes precedence when set. Use the
+`SandboxTemplate.runtime_class_name` still takes precedence when set. Use the
 public `--gpu` flag for the default GPU request, pass a count to `--gpu` for
 counted GPU requests, and use `driver_config` only for additional driver-owned
 resource details.

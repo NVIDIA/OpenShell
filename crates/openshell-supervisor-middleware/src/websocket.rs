@@ -970,7 +970,7 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
             query: String::new(),
         }),
         requested_subprotocols: input.requested_subprotocols,
-        middleware: entry.entry.implementation.clone(),
+        middleware_name: entry.entry.implementation.clone(),
         config: Some(entry.entry.config.clone()),
     };
     if validate_preflight_envelope(&preflight).is_err() {

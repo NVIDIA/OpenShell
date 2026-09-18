@@ -65,13 +65,13 @@ func TestSandboxFromProto(t *testing.T) {
 			LogLevel:    "debug",
 			Environment: map[string]string{"FOO": "bar"},
 			Template: &pb.SandboxTemplate{
-				Image:          "nvidia/sandbox:latest",
-				RuntimeClass:   "kata",
-				AgentSocket:    "/var/run/agent.sock",
-				Labels:         map[string]string{"app": "test"},
-				Annotations:    map[string]string{"note": "hello"},
-				Environment:    map[string]string{"TMPL_VAR": "val"},
-				UserNamespaces: &userNS,
+				Image:            "nvidia/sandbox:latest",
+				RuntimeClassName: "kata",
+				AgentSocket:      "/var/run/agent.sock",
+				Labels:           map[string]string{"app": "test"},
+				Annotations:      map[string]string{"note": "hello"},
+				Environment:      map[string]string{"TMPL_VAR": "val"},
+				UserNamespaces:   &userNS,
 				Resources: func() *structpb.Struct {
 					s, _ := structpb.NewStruct(map[string]any{"cpu": "2", "memory": "4Gi"})
 					return s
@@ -143,7 +143,7 @@ func TestSandboxFromProto(t *testing.T) {
 	// Template
 	require.NotNil(t, s.Spec.Template)
 	assert.Equal(t, "nvidia/sandbox:latest", s.Spec.Template.Image)
-	assert.Equal(t, "kata", s.Spec.Template.RuntimeClass)
+	assert.Equal(t, "kata", s.Spec.Template.RuntimeClassName)
 	assert.Equal(t, "/var/run/agent.sock", s.Spec.Template.AgentSocket)
 	assert.Equal(t, map[string]string{"app": "test"}, s.Spec.Template.Labels)
 	assert.Equal(t, map[string]string{"note": "hello"}, s.Spec.Template.Annotations)
@@ -365,13 +365,13 @@ func TestSandboxToProto(t *testing.T) {
 			LogLevel:    "info",
 			Environment: map[string]string{"KEY": "val"},
 			Template: &v1.SandboxTemplate{
-				Image:          "img:v1",
-				RuntimeClass:   "runc",
-				AgentSocket:    "/sock",
-				Labels:         map[string]string{"l": "v"},
-				Annotations:    map[string]string{"a": "v"},
-				Environment:    map[string]string{"E": "V"},
-				UserNamespaces: &userNS,
+				Image:            "img:v1",
+				RuntimeClassName: "runc",
+				AgentSocket:      "/sock",
+				Labels:           map[string]string{"l": "v"},
+				Annotations:      map[string]string{"a": "v"},
+				Environment:      map[string]string{"E": "V"},
+				UserNamespaces:   &userNS,
 			},
 			Providers: []string{"prov-a"},
 			GPUCount:  &gpuCount,
@@ -406,7 +406,7 @@ func TestSandboxToProto(t *testing.T) {
 
 	require.NotNil(t, p.Spec.Template)
 	assert.Equal(t, "img:v1", p.Spec.Template.Image)
-	assert.Equal(t, "runc", p.Spec.Template.RuntimeClass)
+	assert.Equal(t, "runc", p.Spec.Template.RuntimeClassName)
 	assert.Equal(t, "/sock", p.Spec.Template.AgentSocket)
 	assert.Equal(t, map[string]string{"l": "v"}, p.Spec.Template.Labels)
 	assert.Equal(t, map[string]string{"a": "v"}, p.Spec.Template.Annotations)

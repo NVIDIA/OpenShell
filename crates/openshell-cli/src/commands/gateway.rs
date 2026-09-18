@@ -43,7 +43,7 @@ struct ComputeDriverInfoView {
 
 #[derive(Debug, Clone)]
 struct ComputeDriverCapabilitiesView {
-    name: String,
+    driver_name: String,
     driver_version: String,
 }
 
@@ -390,7 +390,7 @@ pub async fn gateway_info(
                 ComputeDriverInfoView {
                     name: driver.name,
                     capabilities: ComputeDriverCapabilitiesView {
-                        name: capabilities.name,
+                        driver_name: capabilities.driver_name,
                         driver_version: capabilities.driver_version,
                     },
                 }
@@ -434,11 +434,11 @@ fn print_compute_driver_info(drivers: &[ComputeDriverInfoView]) {
     println!("  {}", "Compute drivers:".dimmed());
     for driver in drivers {
         println!("    {}", driver.name);
-        if driver.capabilities.name != driver.name {
+        if driver.capabilities.driver_name != driver.name {
             println!(
                 "      {} {}",
                 "Driver name:".dimmed(),
-                driver.capabilities.name
+                driver.capabilities.driver_name
             );
         }
         println!(
@@ -462,7 +462,7 @@ fn gateway_info_to_json(view: &GatewayInfoView) -> serde_json::Value {
             .map(|driver| serde_json::json!({
                 "name": &driver.name,
                 "capabilities": {
-                    "name": &driver.capabilities.name,
+                    "driver_name": &driver.capabilities.driver_name,
                     "driver_version": &driver.capabilities.driver_version,
                 },
             }))
@@ -1820,7 +1820,7 @@ mod tests {
             compute_drivers: vec![ComputeDriverInfoView {
                 name: "podman".to_string(),
                 capabilities: ComputeDriverCapabilitiesView {
-                    name: "podman".to_string(),
+                    driver_name: "podman".to_string(),
                     driver_version: "0.0.75".to_string(),
                 },
             }],
@@ -1832,7 +1832,10 @@ mod tests {
         assert_eq!(json["status"], "healthy");
         assert_eq!(json["version"], "0.0.75");
         assert_eq!(json["compute_drivers"][0]["name"], "podman");
-        assert_eq!(json["compute_drivers"][0]["capabilities"]["name"], "podman");
+        assert_eq!(
+            json["compute_drivers"][0]["capabilities"]["driver_name"],
+            "podman"
+        );
         assert_eq!(
             json["compute_drivers"][0]["capabilities"]["driver_version"],
             "0.0.75"

@@ -418,7 +418,7 @@
 //	}
 //	fmt.Printf("Gateway %s (status: %s)\n", info.Version, info.Status)
 //	for _, d := range info.ComputeDrivers {
-//	    fmt.Printf("  Driver: %s %s\n", d.Driver, d.DriverVersion)
+//	    fmt.Printf("  Driver: %s %s\n", d.DriverName, d.DriverVersion)
 //	}
 //
 // # Current User

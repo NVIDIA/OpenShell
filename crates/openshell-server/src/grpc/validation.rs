@@ -315,7 +315,7 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
     // String fields.
     for (field, value) in [
         ("spec.template.image", &tmpl.image),
-        ("spec.template.runtime_class", &tmpl.runtime_class),
+        ("spec.template.runtime_class_name", &tmpl.runtime_class_name),
         ("spec.template.agent_socket", &tmpl.agent_socket),
     ] {
         if value.len() > MAX_TEMPLATE_STRING_LEN {
@@ -1428,7 +1428,7 @@ mod tests {
             environment: std::iter::once(("KEY".to_string(), "val".to_string())).collect(),
             template: Some(SandboxTemplate {
                 image: "nvcr.io/test:latest".to_string(),
-                runtime_class: "kata".to_string(),
+                runtime_class_name: "kata".to_string(),
                 labels: std::iter::once(("app".to_string(), "test".to_string())).collect(),
                 ..Default::default()
             }),

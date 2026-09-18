@@ -445,7 +445,7 @@ async fn refresh_token_loop(
         tokio::time::sleep(sleep).await;
         match client
             .refresh_sandbox_token(RefreshSandboxTokenRequest {
-                extension_services: Vec::new(),
+                extension_service_names: Vec::new(),
             })
             .await
         {
@@ -567,7 +567,7 @@ async fn refresh_extension_credentials_with_client(
 
     let response = client
         .refresh_sandbox_token(RefreshSandboxTokenRequest {
-            extension_services: names.clone(),
+            extension_service_names: names.clone(),
         })
         .await
         .into_diagnostic()
@@ -588,8 +588,8 @@ async fn refresh_extension_credentials_with_client(
         .collect::<std::collections::HashSet<_>>();
     let mut validated = HashMap::with_capacity(response.extension_credentials.len());
     for credential in response.extension_credentials {
-        if !expected.contains(credential.service.as_str())
-            || validated.contains_key(&credential.service)
+        if !expected.contains(credential.service_name.as_str())
+            || validated.contains_key(&credential.service_name)
         {
             return Err(miette::miette!(
                 "gateway returned an unexpected or duplicate extension credential"
@@ -599,7 +599,7 @@ async fn refresh_extension_credentials_with_client(
             miette::miette!("gateway returned an extension credential without an expiration time")
         })?;
         let expires_at_ms = timestamp_to_millis(expiration_time).into_diagnostic()?;
-        validated.insert(credential.service, (credential.token, expires_at_ms));
+        validated.insert(credential.service_name, (credential.token, expires_at_ms));
     }
     if validated.len() != expected.len() {
         return Err(miette::miette!(

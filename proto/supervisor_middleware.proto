@@ -85,7 +85,7 @@ message ValidateConfigRequest {
   // Service-specific policy configuration.
   google.protobuf.Struct config = 1;
   // Built-in middleware name or operator-owned registration name.
-  string middleware = 2;
+  string middleware_name = 2;
 }
 
 // ValidateConfigResponse reports whether a policy configuration is accepted.
@@ -117,7 +117,7 @@ message HttpRequestEvaluation {
   // Buffered request body, limited to 4 MiB. Empty for a bodyless request.
   bytes body = 6;
   // Built-in middleware name or operator-owned registration name.
-  string middleware = 7;
+  string middleware_name = 7;
 }
 
 // HttpHeader is one HTTP header line.
@@ -173,7 +173,7 @@ message HttpResponsePreflight {
   // Limited to 128 lines and 64 KiB encoded.
   repeated HttpHeader headers = 4;
   // Built-in middleware name or operator-owned registration name.
-  string middleware = 5;
+  string middleware_name = 5;
   // Validated service configuration. Limited to 64 KiB encoded.
   google.protobuf.Struct config = 6;
   // Effective minimum of platform, registration, and binding limits. Applies to
@@ -483,7 +483,7 @@ message WebSocketPreflight {
   HttpRequestTarget target = 4;
   repeated string requested_subprotocols = 5;
   // Built-in middleware name or operator-owned registration name.
-  string middleware = 6;
+  string middleware_name = 6;
   google.protobuf.Struct config = 7;
 }
 

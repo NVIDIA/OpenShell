@@ -104,7 +104,7 @@ impl InProcessMiddleware for GeneratedMiddlewareEndpoint {
             .service
             .validate_config(Request::new(ValidateConfigRequest {
                 config: Some(config.clone()),
-                middleware: middleware_name.to_string(),
+                middleware_name: middleware_name.to_string(),
             }))
             .await
             .map_err(|error| miette!("{error}"))?
@@ -160,7 +160,7 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
             .endpoint
             .validate_config(Request::new(ValidateConfigRequest {
                 config: Some(config.clone()),
-                middleware: middleware_name.to_string(),
+                middleware_name: middleware_name.to_string(),
             }))
             .await
             .map_err(|error| miette!("{error}"))?
@@ -561,7 +561,7 @@ fn request_view_to_evaluation(request: HttpRequestView<'_>) -> HttpRequestEvalua
         target: Some(request.target().clone()),
         headers: request.headers().to_vec(),
         body: request.body().to_vec(),
-        middleware: request.middleware_name().to_string(),
+        middleware_name: request.middleware_name().to_string(),
     }
 }
 
@@ -3380,7 +3380,7 @@ mod tests {
 
         let validated = service.validated.lock().expect("validated configs");
         assert_eq!(validated.len(), 1);
-        assert_eq!(validated[0].middleware, "test/recorder");
+        assert_eq!(validated[0].middleware_name, "test/recorder");
         assert_eq!(validated[0].config.as_ref(), Some(&validation_config));
         drop(validated);
 
@@ -3393,7 +3393,7 @@ mod tests {
             received[0].phase,
             SupervisorMiddlewarePhase::PreCredentials as i32
         );
-        assert_eq!(received[0].middleware, "test/recorder");
+        assert_eq!(received[0].middleware_name, "test/recorder");
         assert_eq!(received[0].config.as_ref(), Some(&evaluation_config));
         let context = received[0].context.as_ref().expect("request context");
         assert_eq!(context.request_id, "req");

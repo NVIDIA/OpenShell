@@ -314,7 +314,7 @@ async fn evaluate_plan(
         None
     };
     let request = InterceptorEvaluation {
-        interceptor: plan.interceptor_name.clone(),
+        interceptor_name: plan.interceptor_name.clone(),
         binding_id: plan.binding_id.clone(),
         service: plan.selector.service.clone(),
         method: plan.selector.method.clone(),

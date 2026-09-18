@@ -212,7 +212,7 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
         proposals.push(PolicyChunk {
             id: String::new(), // Assigned by the gateway on persist
             status: "pending".to_string(),
-            rule: rule_name,
+            rule_name,
             proposed_rule: Some(proposed_rule),
             rationale,
             security_notes,
@@ -526,7 +526,7 @@ mod tests {
 
         let proposals = generate_proposals(&summaries);
         assert_eq!(proposals.len(), 1);
-        assert_eq!(proposals[0].rule, "allow_api_example_com_443");
+        assert_eq!(proposals[0].rule_name, "allow_api_example_com_443");
         assert!(proposals[0].proposed_rule.is_some());
 
         let rule = proposals[0].proposed_rule.as_ref().unwrap();

@@ -208,7 +208,7 @@ func TestPolicyGetDraft(t *testing.T) {
 			{
 				Id:               "chunk-1",
 				Status:           "pending",
-				Rule:             "allow-dns",
+				RuleName:         "allow-dns",
 				Rationale:        "DNS access needed",
 				Confidence:       0.95,
 				DenialSummaryIds: []string{"ds-1", "ds-2"},
@@ -221,9 +221,9 @@ func TestPolicyGetDraft(t *testing.T) {
 				},
 			},
 			{
-				Id:     "chunk-2",
-				Status: "approved",
-				Rule:   "allow-https",
+				Id:       "chunk-2",
+				Status:   "approved",
+				RuleName: "allow-https",
 			},
 		},
 		RollingSummary:   "Two rules proposed",
@@ -255,7 +255,7 @@ func TestPolicyGetDraft(t *testing.T) {
 	c1 := draft.Chunks[0]
 	assert.Equal(t, "chunk-1", c1.ID)
 	assert.Equal(t, "pending", c1.Status)
-	assert.Equal(t, "allow-dns", c1.Rule)
+	assert.Equal(t, "allow-dns", c1.RuleName)
 	assert.Equal(t, "DNS access needed", c1.Rationale)
 	assert.InDelta(t, float32(0.95), c1.Confidence, 0.001)
 	assert.Equal(t, []string{"ds-1", "ds-2"}, c1.DenialSummaryIDs)

@@ -49,8 +49,8 @@ type PolicyChunk struct {
 	ID string
 	// Status is the approval status: "pending", "approved", "rejected".
 	Status string
-	// Rule is the proposed network_policies map key.
-	Rule string
+	// RuleName is the proposed network_policies map key.
+	RuleName string
 	// ProposedRule is the proposed network policy rule.
 	ProposedRule *NetworkPolicyRule
 

@@ -684,12 +684,12 @@ impl ComputeRuntime {
             .into_inner();
         info!(
             configured_driver = %driver_name,
-            advertised_driver = %capabilities.name,
+            advertised_driver = %capabilities.driver_name,
             "Compute driver connected"
         );
         let driver_info = ComputeDriverInfoSnapshot {
             name: driver_name.clone(),
-            driver_name: capabilities.name,
+            driver_name: capabilities.driver_name,
             driver_version: capabilities.driver_version,
             gateway_manages_lifecycle: capabilities.gateway_manages_lifecycle,
             supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
@@ -4494,11 +4494,11 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
 
     let mut fields = std::collections::BTreeMap::new();
 
-    if !template.runtime_class.is_empty() {
+    if !template.runtime_class_name.is_empty() {
         fields.insert(
             "runtime_class_name".to_string(),
             Value {
-                kind: Some(Kind::StringValue(template.runtime_class.clone())),
+                kind: Some(Kind::StringValue(template.runtime_class_name.clone())),
             },
         );
     }
@@ -5287,7 +5287,7 @@ impl ComputeDriver for NoopTestDriver {
     {
         Ok(tonic::Response::new(
             openshell_core::proto::compute::v1::GetCapabilitiesResponse {
-                name: "noop-test-driver".to_string(),
+                driver_name: "noop-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
@@ -5847,7 +5847,7 @@ mod tests {
             _request: Request<GetCapabilitiesRequest>,
         ) -> Result<tonic::Response<GetCapabilitiesResponse>, Status> {
             Ok(tonic::Response::new(GetCapabilitiesResponse {
-                name: "test-driver".to_string(),
+                driver_name: "test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
@@ -6200,7 +6200,7 @@ mod tests {
             _request: Request<GetCapabilitiesRequest>,
         ) -> Result<tonic::Response<GetCapabilitiesResponse>, Status> {
             Ok(tonic::Response::new(GetCapabilitiesResponse {
-                name: "controlled-test-driver".to_string(),
+                driver_name: "controlled-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,

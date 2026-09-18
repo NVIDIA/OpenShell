@@ -78,7 +78,7 @@ message GetCapabilitiesResponse {
   reserved "supports_gpu", "gpu_count";
 
   // Human-readable driver name.
-  string name = 1;
+  string driver_name = 1;
   // Driver implementation version string.
   string driver_version = 2;
   // Default sandbox image recommended by the driver.

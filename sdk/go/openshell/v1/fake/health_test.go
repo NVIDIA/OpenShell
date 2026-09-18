@@ -63,7 +63,7 @@ func TestHealth_GetGatewayInfo_Custom(t *testing.T) {
 		Status:  types.ServiceStatusDegraded,
 		Version: "1.2.3",
 		ComputeDrivers: []types.ComputeDriverInfo{
-			{Name: "k8s", Driver: "kubernetes", DriverVersion: "2.0.0"},
+			{Name: "k8s", DriverName: "kubernetes", DriverVersion: "2.0.0"},
 		},
 	}))
 

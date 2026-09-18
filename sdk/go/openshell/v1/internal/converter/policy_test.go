@@ -70,7 +70,7 @@ func TestPolicyChunkFromProto(t *testing.T) {
 	proto := &pb.PolicyChunk{
 		Id:                "chunk-1",
 		Status:            "pending",
-		Rule:              "web-api",
+		RuleName:          "web-api",
 		Rationale:         "Observed DNS resolution",
 		SecurityNotes:     "No concerns",
 		Confidence:        0.95,
@@ -98,7 +98,7 @@ func TestPolicyChunkFromProto(t *testing.T) {
 	require.NotNil(t, chunk)
 	assert.Equal(t, "chunk-1", chunk.ID)
 	assert.Equal(t, "pending", chunk.Status)
-	assert.Equal(t, "web-api", chunk.Rule)
+	assert.Equal(t, "web-api", chunk.RuleName)
 	assert.Equal(t, "Observed DNS resolution", chunk.Rationale)
 	assert.Equal(t, "No concerns", chunk.SecurityNotes)
 	assert.InDelta(t, float32(0.95), chunk.Confidence, 0.001)
@@ -141,8 +141,8 @@ func TestPolicyChunkDeepCopy(t *testing.T) {
 func TestDraftPolicyFromProto(t *testing.T) {
 	proto := &pb.GetDraftPolicyResponse{
 		Chunks: []*pb.PolicyChunk{
-			{Id: "c1", Status: "pending", Rule: "rule1"},
-			{Id: "c2", Status: "approved", Rule: "rule2"},
+			{Id: "c1", Status: "pending", RuleName: "rule1"},
+			{Id: "c2", Status: "approved", RuleName: "rule2"},
 		},
 		RollingSummary:   "Analysis summary",
 		DraftVersion:     42,

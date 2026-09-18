@@ -747,7 +747,7 @@ impl KubernetesComputeDriver {
 
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
         Ok(GetCapabilitiesResponse {
-            name: "kubernetes".to_string(),
+            driver_name: "kubernetes".to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: false,

@@ -38,7 +38,7 @@ fn evaluation(
         GatewayInterceptorPhase::Unspecified => panic!("test evaluation phase must be specified"),
     };
     InterceptorEvaluation {
-        interceptor: "test".to_string(),
+        interceptor_name: "test".to_string(),
         binding_id: "binding".to_string(),
         service: SERVICE.to_string(),
         method: method.to_string(),

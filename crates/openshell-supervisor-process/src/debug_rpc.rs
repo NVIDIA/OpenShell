@@ -107,7 +107,7 @@ async fn run_refresh() -> Result<i32> {
     let mut client = open_client().await?;
     let resp = client
         .refresh_sandbox_token(RefreshSandboxTokenRequest {
-            extension_services: Vec::new(),
+            extension_service_names: Vec::new(),
         })
         .await;
     match resp {

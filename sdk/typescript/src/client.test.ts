@@ -1649,7 +1649,7 @@ describe('raw escape hatch', () => {
             case: 'addAllowRules',
             value: {
               target: {
-                rule: 'internal_api',
+                ruleName: 'internal_api',
                 host: 'api.example.com',
                 ports: [443, 8443],
                 path: '',
@@ -1663,7 +1663,12 @@ describe('raw escape hatch', () => {
           operation: {
             case: 'addDenyRules',
             value: {
-              target: { rule: 'public_api', host: 'api.example.com', ports: [443], anyBinary: true },
+              target: {
+                ruleName: 'public_api',
+                host: 'api.example.com',
+                ports: [443],
+                anyBinary: true,
+              },
               denyRules: [{ method: 'POST', path: '/admin/private' }],
             },
           },
@@ -1677,7 +1682,7 @@ describe('raw escape hatch', () => {
     expect(deny?.case).toBe('addDenyRules');
     if (allow?.case !== 'addAllowRules' || deny?.case !== 'addDenyRules') throw new Error('wrong operations');
     expect(allow.value.target).toMatchObject({
-      rule: 'internal_api',
+      ruleName: 'internal_api',
       host: 'api.example.com',
       ports: [443, 8443],
       path: '',

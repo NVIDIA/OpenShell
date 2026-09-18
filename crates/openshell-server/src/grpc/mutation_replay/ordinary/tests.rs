@@ -1029,7 +1029,7 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
             proposed_chunks: ["alpha", "beta", "gamma"]
                 .into_iter()
                 .map(|name| PolicyChunk {
-                    rule: name.into(),
+                    rule_name: name.into(),
                     proposed_rule: Some(rule(name)),
                     ..Default::default()
                 })

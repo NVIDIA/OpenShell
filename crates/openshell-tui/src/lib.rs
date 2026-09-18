@@ -1949,7 +1949,7 @@ fn spawn_draft_approve(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let rule_name = app
         .draft_chunks
         .get(abs)
-        .map_or_else(String::new, |c| c.rule.clone());
+        .map_or_else(String::new, |c| c.rule_name.clone());
     let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
@@ -1995,7 +1995,7 @@ fn spawn_draft_reject(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let rule_name = app
         .draft_chunks
         .get(abs)
-        .map_or_else(String::new, |c| c.rule.clone());
+        .map_or_else(String::new, |c| c.rule_name.clone());
     let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {

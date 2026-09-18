@@ -978,7 +978,7 @@ impl VmDriver {
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
-            name: DRIVER_NAME.to_string(),
+            driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,

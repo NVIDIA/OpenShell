@@ -121,7 +121,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .map(format_endpoint_summary)
                 .unwrap_or_default();
 
-            spans.push(Span::styled(&chunk.rule, name_style));
+            spans.push(Span::styled(&chunk.rule_name, name_style));
             if !endpoint_str.is_empty() {
                 spans.push(Span::styled("  ", t.muted));
                 spans.push(Span::styled(endpoint_str, t.accent));
@@ -209,7 +209,7 @@ pub fn draw_detail_popup(
     };
 
     let block = Block::default()
-        .title(Span::styled(format!(" {} ", chunk.rule), t.heading))
+        .title(Span::styled(format!(" {} ", chunk.rule_name), t.heading))
         .borders(Borders::ALL)
         .border_style(t.accent)
         .padding(Padding::new(1, 1, 0, 0));
@@ -511,15 +511,15 @@ pub fn draw_approve_all_popup(
         let prefix_len = 5;
         let sep_len = 2;
         let budget = inner_width.saturating_sub(prefix_len + sep_len);
-        let (name_str, ep_str) = if chunk.rule.len() + endpoint_str.len() > budget {
+        let (name_str, ep_str) = if chunk.rule_name.len() + endpoint_str.len() > budget {
             let ep_budget = endpoint_str.len().min(budget / 2);
             let name_budget = budget.saturating_sub(ep_budget);
             (
-                truncate_str(&chunk.rule, name_budget),
+                truncate_str(&chunk.rule_name, name_budget),
                 truncate_str(&endpoint_str, ep_budget),
             )
         } else {
-            (chunk.rule.clone(), endpoint_str)
+            (chunk.rule_name.clone(), endpoint_str)
         };
 
         let mut row_spans = vec![
@@ -1183,7 +1183,7 @@ mod tests {
         let chunk = PolicyChunk {
             status: "rejected".to_string(),
             rejection_reason: long_reason(),
-            rule: "allow-github".to_string(),
+            rule_name: "allow-github".to_string(),
             ..Default::default()
         };
 
@@ -1206,7 +1206,7 @@ mod tests {
         let chunk = PolicyChunk {
             status: "rejected".to_string(),
             rejection_reason: long_reason(),
-            rule: "allow-github".to_string(),
+            rule_name: "allow-github".to_string(),
             ..Default::default()
         };
 
@@ -1227,7 +1227,7 @@ mod tests {
         let chunk = PolicyChunk {
             status: "rejected".to_string(),
             rejection_reason: long_reason(),
-            rule: "allow-github".to_string(),
+            rule_name: "allow-github".to_string(),
             ..Default::default()
         };
         let (_, max_scroll) = render(&chunk, 80, 24, 0);
@@ -1250,7 +1250,7 @@ mod tests {
         rationale.push_str(" SUFFIX_MARKER");
         let chunk = PolicyChunk {
             status: "pending".to_string(),
-            rule: "allow-github".to_string(),
+            rule_name: "allow-github".to_string(),
             rationale,
             ..Default::default()
         };
@@ -1279,7 +1279,7 @@ mod tests {
         let chunk = PolicyChunk {
             status: "rejected".to_string(),
             rejection_reason: reason,
-            rule: "allow-github".to_string(),
+            rule_name: "allow-github".to_string(),
             ..Default::default()
         };
 
@@ -1304,7 +1304,7 @@ mod tests {
         let chunk = PolicyChunk {
             status: "rejected".to_string(),
             rejection_reason: "too broad".to_string(),
-            rule: "allow-github".to_string(),
+            rule_name: "allow-github".to_string(),
             ..Default::default()
         };
         let (screen, max_scroll) = render(&chunk, 80, 24, 0);
@@ -1320,7 +1320,7 @@ mod tests {
         PolicyChunk {
             status: status.to_string(),
             rejection_reason: reason.to_string(),
-            rule: "allow-github".to_string(),
+            rule_name: "allow-github".to_string(),
             confidence: 0.82,
             hit_count: 3,
             first_seen_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),

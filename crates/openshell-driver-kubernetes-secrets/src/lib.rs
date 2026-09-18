@@ -464,7 +464,7 @@ impl CredentialDriver for CredentialDriverService {
         _request: Request<GetCredentialDriverCapabilitiesRequest>,
     ) -> Result<Response<GetCredentialDriverCapabilitiesResponse>, Status> {
         Ok(Response::new(GetCredentialDriverCapabilitiesResponse {
-            name: KubernetesSecretsCredentialDriver::NAME.to_string(),
+            driver_name: KubernetesSecretsCredentialDriver::NAME.to_string(),
             driver_version: VERSION.to_string(),
             backend_kind: KubernetesSecretsCredentialDriver::NAME.to_string(),
             supports_list: false,

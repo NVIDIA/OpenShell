@@ -453,7 +453,7 @@ impl MxcComputeBackend {
 
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
-            name: DRIVER_NAME.to_string(),
+            driver_name: DRIVER_NAME.to_string(),
             driver_version: DRIVER_VERSION.to_string(),
             default_image: DEFAULT_IMAGE_SENTINEL.to_string(),
             gateway_manages_lifecycle: false,

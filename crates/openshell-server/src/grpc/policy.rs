@@ -413,7 +413,7 @@ fn summarize_l7_target(target: &L7RuleTarget) -> String {
     // endpoint selection, while Some("") selects an endpoint with no path scope.
     format!(
         "{}:{ports} rule={} endpoint-path={:?} binaries=[{binaries}]",
-        target.host, target.rule, target.path,
+        target.host, target.rule_name, target.path,
     )
 }
 
@@ -4940,7 +4940,7 @@ pub(super) async fn handle_submit_policy_analysis(
     let mut accepted_chunk_ids: Vec<String> = Vec::new();
 
     for chunk in &req.proposed_chunks {
-        if chunk.rule.is_empty() {
+        if chunk.rule_name.is_empty() {
             rejected += 1;
             rejection_reasons.push("chunk missing rule_name".to_string());
             continue;
@@ -4952,17 +4952,17 @@ pub(super) async fn handle_submit_policy_analysis(
         // own rule so the prover sees their contribution honestly. Reject at
         // the entry boundary — the agent never has reason to address a
         // provider rule by name.
-        if openshell_policy::is_provider_rule_name(&chunk.rule) {
+        if openshell_policy::is_provider_rule_name(&chunk.rule_name) {
             rejected += 1;
             rejection_reasons.push(format!(
                 "chunk '{}' uses reserved '_provider_' rule-name prefix",
-                chunk.rule
+                chunk.rule_name
             ));
             continue;
         }
         if chunk.proposed_rule.is_none() {
             rejected += 1;
-            rejection_reasons.push(format!("chunk '{}' missing proposed_rule", chunk.rule));
+            rejection_reasons.push(format!("chunk '{}' missing proposed_rule", chunk.rule_name));
             continue;
         }
         let first_seen_ms = match chunk
@@ -4976,7 +4976,7 @@ pub(super) async fn handle_submit_policy_analysis(
                 rejected += 1;
                 rejection_reasons.push(format!(
                     "chunk '{}' has invalid first_seen_time: {error}",
-                    chunk.rule
+                    chunk.rule_name
                 ));
                 continue;
             }
@@ -4992,7 +4992,7 @@ pub(super) async fn handle_submit_policy_analysis(
                 rejected += 1;
                 rejection_reasons.push(format!(
                     "chunk '{}' has invalid last_seen_time: {error}",
-                    chunk.rule
+                    chunk.rule_name
                 ));
                 continue;
             }
@@ -5008,7 +5008,7 @@ pub(super) async fn handle_submit_policy_analysis(
             })
         {
             rejected += 1;
-            rejection_reasons.push(format!("chunk '{}': {reason}", chunk.rule));
+            rejection_reasons.push(format!("chunk '{}': {reason}", chunk.rule_name));
             continue;
         }
         let incoming_observation_key = rule_ref.endpoints.first().and_then(|endpoint| {
@@ -5054,7 +5054,9 @@ pub(super) async fn handle_submit_policy_analysis(
         let evaluation_rule_name = existing_mechanistic
             .as_ref()
             .filter(|existing| existing.status == "pending")
-            .map_or(chunk.rule.as_str(), |existing| existing.rule_name.as_str());
+            .map_or(chunk.rule_name.as_str(), |existing| {
+                existing.rule_name.as_str()
+            });
         let evaluation_mode = if existing_pending_rule.is_some() {
             "stored"
         } else {
@@ -5093,7 +5095,7 @@ pub(super) async fn handle_submit_policy_analysis(
             rejected += 1;
             rejection_reasons.push(format!(
                 "chunk '{}': {}",
-                chunk.rule, evaluation.application_error
+                chunk.rule_name, evaluation.application_error
             ));
             continue;
         }
@@ -6276,7 +6278,7 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
     Ok(PolicyChunk {
         id: record.id.clone(),
         status: record.status.clone(),
-        rule: record.rule_name.clone(),
+        rule_name: record.rule_name.clone(),
         proposed_rule,
         rationale: record.rationale.clone(),
         security_notes,
@@ -6565,7 +6567,7 @@ fn parse_merge_operations(
 
             match operation {
                 policy_merge_operation::Operation::AddRule(add_rule) => {
-                    let rule_name = add_rule.name.trim();
+                    let rule_name = add_rule.rule_name.trim();
                     if rule_name.is_empty() {
                         return Err(Status::invalid_argument(format!(
                             "merge_operations[{index}].add_rule.rule_name is required"
@@ -6587,10 +6589,10 @@ fn parse_merge_operations(
                             "merge_operations[{index}].remove_endpoint requires host and non-zero port"
                         )));
                     }
-                    let rule_name = if remove_endpoint.rule.trim().is_empty() {
+                    let rule_name = if remove_endpoint.rule_name.trim().is_empty() {
                         None
                     } else {
-                        Some(remove_endpoint.rule.trim().to_string())
+                        Some(remove_endpoint.rule_name.trim().to_string())
                     };
                     Ok(PolicyMergeOp::RemoveEndpoint {
                         rule_name,
@@ -6599,7 +6601,7 @@ fn parse_merge_operations(
                     })
                 }
                 policy_merge_operation::Operation::RemoveRule(remove_rule) => {
-                    let rule_name = remove_rule.name.trim();
+                    let rule_name = remove_rule.rule_name.trim();
                     if rule_name.is_empty() {
                         return Err(Status::invalid_argument(format!(
                             "merge_operations[{index}].remove_rule.rule_name is required"
@@ -6616,7 +6618,7 @@ fn parse_merge_operations(
                     parse_proto_add_allow_rules(index, add_allow_rules)
                 }
                 policy_merge_operation::Operation::RemoveBinary(remove_binary) => {
-                    let rule_name = remove_binary.rule.trim();
+                    let rule_name = remove_binary.rule_name.trim();
                     let binary_path = remove_binary.binary_path.trim();
                     if rule_name.is_empty() || binary_path.is_empty() {
                         return Err(Status::invalid_argument(format!(
@@ -6693,7 +6695,7 @@ fn parse_proto_l7_target(
         }
     };
     let target = L7RuleTarget {
-        rule: target.rule.clone(),
+        rule_name: target.rule_name.clone(),
         host: target.host.clone(),
         ports: target.ports.clone(),
         path: target.path.clone(),
@@ -9747,7 +9749,7 @@ mod tests {
             .await
             .unwrap();
         let chunk = |name: &str| PolicyChunk {
-            rule: name.to_string(),
+            rule_name: name.to_string(),
             proposed_rule: Some(NetworkPolicyRule {
                 name: name.to_string(),
                 endpoints: vec![NetworkEndpoint {
@@ -9959,7 +9961,7 @@ mod tests {
 
     fn l7_scope_target() -> ProtoL7RuleTarget {
         ProtoL7RuleTarget {
-            rule: "selected".to_string(),
+            rule_name: "selected".to_string(),
             host: "api.example.com".to_string(),
             ports: vec![443, 8443],
             path: Some(String::new()),
@@ -10077,10 +10079,10 @@ mod tests {
     fn l7_target_scope_ingress_rejects_malformed_targets() {
         let mut invalid_targets = Vec::new();
         let mut target = l7_scope_target();
-        target.rule.clear();
+        target.rule_name.clear();
         invalid_targets.push(target);
         let mut target = l7_scope_target();
-        target.rule = "_provider_example".to_string();
+        target.rule_name = "_provider_example".to_string();
         invalid_targets.push(target);
         let mut target = l7_scope_target();
         target.host = "https://api.example.com".to_string();
@@ -10169,7 +10171,7 @@ mod tests {
         let mut ambiguous = l7_scope_target();
         ambiguous.path = None;
         let mut missing_rule = l7_scope_target();
-        missing_rule.rule = "absent".to_string();
+        missing_rule.rule_name = "absent".to_string();
         let mut wrong_any = l7_scope_target();
         wrong_any.binaries.clear();
         wrong_any.any_binary = true;
@@ -11220,7 +11222,7 @@ mod tests {
                 name: "snapshot-consistency".to_string(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "snapshot_consistency_test".to_string(),
+                    rule_name: "snapshot_consistency_test".to_string(),
                     proposed_rule: Some(NetworkPolicyRule {
                         name: "snapshot_consistency_test".to_string(),
                         endpoints: vec![NetworkEndpoint {
@@ -11983,7 +11985,7 @@ mod tests {
         let add_bound_rule = |policy: &ProtoSandboxPolicy| PolicyMergeOperation {
             operation: Some(policy_merge_operation::Operation::AddRule(
                 openshell_core::proto::AddNetworkRule {
-                    name: "bound".to_string(),
+                    rule_name: "bound".to_string(),
                     rule: Some(policy.network_policies["bound"].clone()),
                 },
             )),
@@ -14440,7 +14442,7 @@ mod tests {
                 ]
                 .into_iter()
                 .map(|(name, host, binary)| PolicyChunk {
-                    rule: name.to_string(),
+                    rule_name: name.to_string(),
                     proposed_rule: Some(NetworkPolicyRule {
                         name: name.to_string(),
                         endpoints: vec![NetworkEndpoint {
@@ -14565,7 +14567,7 @@ mod tests {
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![
                     PolicyChunk {
-                        rule: "inspected".to_string(),
+                        rule_name: "inspected".to_string(),
                         proposed_rule: Some(NetworkPolicyRule {
                             name: "inspected".to_string(),
                             endpoints: vec![NetworkEndpoint {
@@ -14584,7 +14586,7 @@ mod tests {
                         ..Default::default()
                     },
                     PolicyChunk {
-                        rule: "conflicting".to_string(),
+                        rule_name: "conflicting".to_string(),
                         proposed_rule: Some(NetworkPolicyRule {
                             name: "conflicting".to_string(),
                             endpoints: vec![NetworkEndpoint {
@@ -14790,7 +14792,7 @@ mod tests {
                 name: sandbox_name.to_string(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "private_service".to_string(),
+                    rule_name: "private_service".to_string(),
                     proposed_rule: Some(NetworkPolicyRule {
                         name: "private_service".to_string(),
                         endpoints: vec![NetworkEndpoint {
@@ -14921,7 +14923,7 @@ mod tests {
                 name: sandbox_name.to_string(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "edited_service".to_string(),
+                    rule_name: "edited_service".to_string(),
                     proposed_rule: Some(safe_rule.clone()),
                     ..Default::default()
                 }],
@@ -15095,7 +15097,7 @@ mod tests {
                 name: sandbox_name.to_string(),
                 analysis_mode: "mechanistic".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "private_service".to_string(),
+                    rule_name: "private_service".to_string(),
                     proposed_rule: Some(NetworkPolicyRule {
                         name: "private_service".to_string(),
                         endpoints: vec![NetworkEndpoint {
@@ -15179,7 +15181,7 @@ mod tests {
                 name: sandbox_name.to_string(),
                 analysis_mode: "mechanistic".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: safe_rule.name.clone(),
+                    rule_name: safe_rule.name.clone(),
                     proposed_rule: Some(safe_rule.clone()),
                     ..Default::default()
                 }],
@@ -15257,7 +15259,7 @@ mod tests {
                 name: sandbox_name.to_string(),
                 analysis_mode: "mechanistic".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: safe_rule.name.clone(),
+                    rule_name: safe_rule.name.clone(),
                     proposed_rule: Some(safe_rule),
                     ..Default::default()
                 }],
@@ -15348,7 +15350,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "allow_github".to_string(),
+                    rule_name: "allow_github".to_string(),
                     proposed_rule: Some(proposed_rule.clone()),
                     rationale: "observed denied request".to_string(),
                     confidence: 0.85,
@@ -15604,7 +15606,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "allow_example".to_string(),
+                    rule_name: "allow_example".to_string(),
                     proposed_rule: Some(proposed_rule),
                     rationale: "agent intent".to_string(),
                     ..Default::default()
@@ -15731,7 +15733,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "github_contents_write".to_string(),
+                    rule_name: "github_contents_write".to_string(),
                     proposed_rule: Some(proposed_rule),
                     rationale: "write one demo file".to_string(),
                     ..Default::default()
@@ -15842,7 +15844,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "mechanistic".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "allow_api_github_com_443".to_string(),
+                    rule_name: "allow_api_github_com_443".to_string(),
                     proposed_rule: Some(mechanistic_rule),
                     rationale: "Allow /usr/bin/curl to connect to api.github.com:443.".to_string(),
                     ..Default::default()
@@ -15922,7 +15924,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "github_contents_put".to_string(),
+                    rule_name: "github_contents_put".to_string(),
                     proposed_rule: Some(agent_rule),
                     rationale: "refined L7 scope for the demo write".to_string(),
                     ..Default::default()
@@ -16056,7 +16058,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "mechanistic".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "anon_l4".to_string(),
+                    rule_name: "anon_l4".to_string(),
                     proposed_rule: Some(proposed_rule),
                     rationale: "Allow /usr/bin/curl to connect to example.com:443.".to_string(),
                     ..Default::default()
@@ -16149,7 +16151,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "mechanistic".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "allow_index_crates_io_443".to_string(),
+                    rule_name: "allow_index_crates_io_443".to_string(),
                     proposed_rule: Some(NetworkPolicyRule {
                         name: "allow_index_crates_io_443".to_string(),
                         endpoints: vec![NetworkEndpoint {
@@ -16188,7 +16190,7 @@ mod tests {
             "application error: {}; prover: {}",
             chunk.application_error, chunk.validation_result
         );
-        assert_eq!(chunk.rule, "allow_index_crates_io_443");
+        assert_eq!(chunk.rule_name, "allow_index_crates_io_443");
         assert_eq!(chunk.validation_result, "prover: no new findings");
         assert!(chunk.application_error.is_empty());
         assert!(!chunk.review_token.is_empty());
@@ -16269,7 +16271,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "bad_graphql".to_string(),
+                    rule_name: "bad_graphql".to_string(),
                     proposed_rule: Some(NetworkPolicyRule {
                         name: "bad-graphql".to_string(),
                         endpoints: vec![NetworkEndpoint {
@@ -16354,7 +16356,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "example".to_string(),
+                    rule_name: "example".to_string(),
                     proposed_rule: Some(NetworkPolicyRule {
                         name: "example".to_string(),
                         endpoints: vec![NetworkEndpoint {
@@ -16506,7 +16508,7 @@ mod tests {
                 name: sandbox_name.to_string(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "example".to_string(),
+                    rule_name: "example".to_string(),
                     proposed_rule: Some(rule.clone()),
                     ..Default::default()
                 }],
@@ -16611,7 +16613,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "github_l7_full".to_string(),
+                    rule_name: "github_l7_full".to_string(),
                     proposed_rule: Some(proposed_rule),
                     rationale: "broad L7 dressing".to_string(),
                     ..Default::default()
@@ -16717,7 +16719,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "anon_l4".to_string(),
+                    rule_name: "anon_l4".to_string(),
                     proposed_rule: Some(proposed_rule),
                     rationale: "un-credentialed L4 — prover sees no finding".to_string(),
                     ..Default::default()
@@ -16816,7 +16818,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "anon_l4".to_string(),
+                    rule_name: "anon_l4".to_string(),
                     proposed_rule: Some(proposed_rule),
                     rationale: "un-credentialed L4".to_string(),
                     ..Default::default()
@@ -16906,7 +16908,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "anon_l4".to_string(),
+                    rule_name: "anon_l4".to_string(),
                     proposed_rule: Some(proposed_rule),
                     rationale: "un-credentialed L4 — prover sees no finding".to_string(),
                     ..Default::default()
@@ -17000,7 +17002,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "anon_l4".to_string(),
+                    rule_name: "anon_l4".to_string(),
                     proposed_rule: Some(proposed_rule),
                     rationale: "un-credentialed L4 — empty delta".to_string(),
                     ..Default::default()
@@ -17097,7 +17099,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "anon_l4".to_string(),
+                    rule_name: "anon_l4".to_string(),
                     proposed_rule: Some(proposed_rule),
                     rationale: "un-credentialed L4 — empty delta".to_string(),
                     ..Default::default()
@@ -17190,7 +17192,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "_provider_work_github".to_string(),
+                    rule_name: "_provider_work_github".to_string(),
                     proposed_rule: Some(proposed_rule),
                     rationale: "should be rejected — addresses provider rule by name".to_string(),
                     ..Default::default()
@@ -17240,7 +17242,7 @@ mod tests {
             ..Default::default()
         };
         let chunk = |name: &str, endpoint: NetworkEndpoint| PolicyChunk {
-            rule: name.to_string(),
+            rule_name: name.to_string(),
             proposed_rule: Some(NetworkPolicyRule {
                 name: name.to_string(),
                 endpoints: vec![endpoint],
@@ -17299,7 +17301,7 @@ mod tests {
         .unwrap()
         .into_inner();
         assert_eq!(draft.chunks.len(), 1);
-        assert_eq!(draft.chunks[0].rule, "explicit_proxy");
+        assert_eq!(draft.chunks[0].rule_name, "explicit_proxy");
     }
 
     #[tokio::test]
@@ -17461,7 +17463,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "github_l4".to_string(),
+                    rule_name: "github_l4".to_string(),
                     proposed_rule: Some(proposed_rule),
                     rationale: "broad fallback".to_string(),
                     ..Default::default()
@@ -17563,7 +17565,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "anon_l4".to_string(),
+                    rule_name: "anon_l4".to_string(),
                     proposed_rule: Some(proposed_rule),
                     rationale: "no privileged access available".to_string(),
                     ..Default::default()
@@ -17654,7 +17656,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "metadata_endpoint".to_string(),
+                    rule_name: "metadata_endpoint".to_string(),
                     proposed_rule: Some(proposed_rule),
                     rationale: "agent is curious about IMDS".to_string(),
                     ..Default::default()
@@ -17810,7 +17812,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "github_contents_write".to_string(),
+                    rule_name: "github_contents_write".to_string(),
                     proposed_rule: Some(proposed_rule),
                     rationale: "write one demo file".to_string(),
                     ..Default::default()
@@ -17997,7 +17999,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "github_raw_openapi_get".to_string(),
+                    rule_name: "github_raw_openapi_get".to_string(),
                     proposed_rule: Some(uncredentialed_rule),
                     rationale: "fetch the public github openapi description".to_string(),
                     ..Default::default()
@@ -18038,7 +18040,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "github_contents_put".to_string(),
+                    rule_name: "github_contents_put".to_string(),
                     proposed_rule: Some(credentialed_rule),
                     rationale: "write the demo file via the GitHub Contents API".to_string(),
                     ..Default::default()
@@ -18181,7 +18183,7 @@ mod tests {
                         name: sandbox_name,
                         analysis_mode: "agent_authored".to_string(),
                         proposed_chunks: vec![PolicyChunk {
-                            rule: rule_name,
+                            rule_name,
                             proposed_rule: Some(rule),
                             ..Default::default()
                         }],
@@ -18298,7 +18300,7 @@ mod tests {
                         name: sandbox_name,
                         analysis_mode: "mechanistic".to_string(),
                         proposed_chunks: vec![PolicyChunk {
-                            rule: "allow_example".to_string(),
+                            rule_name: "allow_example".to_string(),
                             proposed_rule: Some(rule),
                             ..Default::default()
                         }],
@@ -18418,7 +18420,7 @@ mod tests {
                         name: sandbox_name,
                         analysis_mode: "mechanistic".to_string(),
                         proposed_chunks: vec![PolicyChunk {
-                            rule: "allow_example_8080".to_string(),
+                            rule_name: "allow_example_8080".to_string(),
                             proposed_rule: Some(rule),
                             ..Default::default()
                         }],
@@ -18681,7 +18683,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "allow_example".to_string(),
+                    rule_name: "allow_example".to_string(),
                     proposed_rule: Some(proposed_rule),
                     ..Default::default()
                 }],
@@ -18842,7 +18844,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_a.object_name().to_string(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule: "allow_example".to_string(),
+                    rule_name: "allow_example".to_string(),
                     proposed_rule: Some(proposed_rule.clone()),
                     rationale: "observed denied request".to_string(),
                     confidence: 0.85,
@@ -19020,7 +19022,7 @@ mod tests {
     fn summarize_cli_policy_merge_op_formats_rest_allow_rules() {
         let operation = PolicyMergeOp::AddAllowRules {
             target: L7RuleTarget {
-                rule: "github".to_string(),
+                rule_name: "github".to_string(),
                 host: "api.github.com".to_string(),
                 ports: vec![443],
                 path: Some(String::new()),
@@ -19422,7 +19424,7 @@ mod tests {
 
         let add_allow = [PolicyMergeOp::AddAllowRules {
             target: L7RuleTarget {
-                rule: "github".to_string(),
+                rule_name: "github".to_string(),
                 host: "api.github.com".to_string(),
                 ports: vec![443],
                 path: None,
@@ -19443,7 +19445,7 @@ mod tests {
         }];
         let add_deny = [PolicyMergeOp::AddDenyRules {
             target: L7RuleTarget {
-                rule: "github".to_string(),
+                rule_name: "github".to_string(),
                 host: "api.github.com".to_string(),
                 ports: vec![443],
                 path: None,
@@ -19603,7 +19605,7 @@ mod tests {
     fn validate_merge_operations_rejects_add_allow_for_known_metadata_hostname() {
         let operation = PolicyMergeOp::AddAllowRules {
             target: L7RuleTarget {
-                rule: "metadata".to_string(),
+                rule_name: "metadata".to_string(),
                 host: "metadata.google.internal".to_string(),
                 ports: vec![80],
                 path: None,
@@ -21455,7 +21457,7 @@ mod tests {
                 merge_operations: vec![PolicyMergeOperation {
                     operation: Some(policy_merge_operation::Operation::AddRule(
                         openshell_core::proto::AddNetworkRule {
-                            name: "allow_api_example".to_string(),
+                            rule_name: "allow_api_example".to_string(),
                             rule: Some(NetworkPolicyRule {
                                 name: "allow_api_example".to_string(),
                                 endpoints: vec![NetworkEndpoint {
@@ -21529,7 +21531,7 @@ mod tests {
                 merge_operations: vec![PolicyMergeOperation {
                     operation: Some(policy_merge_operation::Operation::AddRule(
                         openshell_core::proto::AddNetworkRule {
-                            name: "allow_api_example".to_string(),
+                            rule_name: "allow_api_example".to_string(),
                             rule: Some(NetworkPolicyRule {
                                 name: "allow_api_example".to_string(),
                                 endpoints: vec![NetworkEndpoint {

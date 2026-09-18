@@ -64,13 +64,13 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 
 	if tmpl := spec.GetTemplate(); tmpl != nil {
 		t := &types.SandboxTemplate{
-			Image:          tmpl.GetImage(),
-			RuntimeClass:   tmpl.GetRuntimeClass(),
-			AgentSocket:    tmpl.GetAgentSocket(),
-			Labels:         CopyStringMap(tmpl.GetLabels()),
-			Annotations:    CopyStringMap(tmpl.GetAnnotations()),
-			Environment:    CopyStringMap(tmpl.GetEnvironment()),
-			UserNamespaces: CopyBoolPtr(tmpl.UserNamespaces),
+			Image:            tmpl.GetImage(),
+			RuntimeClassName: tmpl.GetRuntimeClassName(),
+			AgentSocket:      tmpl.GetAgentSocket(),
+			Labels:           CopyStringMap(tmpl.GetLabels()),
+			Annotations:      CopyStringMap(tmpl.GetAnnotations()),
+			Environment:      CopyStringMap(tmpl.GetEnvironment()),
+			UserNamespaces:   CopyBoolPtr(tmpl.UserNamespaces),
 		}
 		if res := tmpl.GetResources(); res != nil {
 			t.Resources = res.AsMap()
@@ -257,13 +257,13 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 
 	if spec.Template != nil {
 		tmpl := &pb.SandboxTemplate{
-			Image:          spec.Template.Image,
-			RuntimeClass:   spec.Template.RuntimeClass,
-			AgentSocket:    spec.Template.AgentSocket,
-			Labels:         CopyStringMap(spec.Template.Labels),
-			Annotations:    CopyStringMap(spec.Template.Annotations),
-			Environment:    CopyStringMap(spec.Template.Environment),
-			UserNamespaces: CopyBoolPtr(spec.Template.UserNamespaces),
+			Image:            spec.Template.Image,
+			RuntimeClassName: spec.Template.RuntimeClassName,
+			AgentSocket:      spec.Template.AgentSocket,
+			Labels:           CopyStringMap(spec.Template.Labels),
+			Annotations:      CopyStringMap(spec.Template.Annotations),
+			Environment:      CopyStringMap(spec.Template.Environment),
+			UserNamespaces:   CopyBoolPtr(spec.Template.UserNamespaces),
 		}
 		if spec.Template.Resources != nil {
 			// Non-JSON-compatible values (e.g., chan, func) are silently dropped.

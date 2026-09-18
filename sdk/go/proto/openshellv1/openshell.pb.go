@@ -1192,9 +1192,9 @@ type RefreshSandboxTokenRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Operator registration names for extension services selected by the
 	// sandbox's effective policy.
-	ExtensionServices []string `protobuf:"bytes,1,rep,name=extension_services,json=extensionServices,proto3" json:"extension_services,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	ExtensionServiceNames []string `protobuf:"bytes,1,rep,name=extension_service_names,json=extensionServiceNames,proto3" json:"extension_service_names,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *RefreshSandboxTokenRequest) Reset() {
@@ -1227,9 +1227,9 @@ func (*RefreshSandboxTokenRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{2}
 }
 
-func (x *RefreshSandboxTokenRequest) GetExtensionServices() []string {
+func (x *RefreshSandboxTokenRequest) GetExtensionServiceNames() []string {
 	if x != nil {
-		return x.ExtensionServices
+		return x.ExtensionServiceNames
 	}
 	return nil
 }
@@ -1708,7 +1708,7 @@ func (x *ComputeDriverInfo) GetCapabilities() *ComputeDriverCapabilities {
 type ComputeDriverCapabilities struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Driver-reported human-readable name from the startup capability snapshot.
-	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	DriverName string `protobuf:"bytes,1,opt,name=driver_name,json=driverName,proto3" json:"driver_name,omitempty"`
 	// Driver-reported implementation version from the startup capability snapshot.
 	DriverVersion string `protobuf:"bytes,2,opt,name=driver_version,json=driverVersion,proto3" json:"driver_version,omitempty"`
 	// Static portable resource request forms reported by the driver.
@@ -1747,9 +1747,9 @@ func (*ComputeDriverCapabilities) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{11}
 }
 
-func (x *ComputeDriverCapabilities) GetName() string {
+func (x *ComputeDriverCapabilities) GetDriverName() string {
 	if x != nil {
-		return x.Name
+		return x.DriverName
 	}
 	return ""
 }
@@ -2279,7 +2279,7 @@ type SandboxTemplate struct {
 	// Fully-qualified OCI image reference used to boot the sandbox.
 	Image string `protobuf:"bytes,1,opt,name=image,proto3" json:"image,omitempty"`
 	// Optional runtime class name requested from the compute platform.
-	RuntimeClass string `protobuf:"bytes,2,opt,name=runtime_class,json=runtimeClass,proto3" json:"runtime_class,omitempty"`
+	RuntimeClassName string `protobuf:"bytes,2,opt,name=runtime_class_name,json=runtimeClassName,proto3" json:"runtime_class_name,omitempty"`
 	// Optional agent socket path exposed to the workload.
 	AgentSocket string `protobuf:"bytes,3,opt,name=agent_socket,json=agentSocket,proto3" json:"agent_socket,omitempty"`
 	// Labels applied to compute-platform resources for this sandbox.
@@ -2342,9 +2342,9 @@ func (x *SandboxTemplate) GetImage() string {
 	return ""
 }
 
-func (x *SandboxTemplate) GetRuntimeClass() string {
+func (x *SandboxTemplate) GetRuntimeClassName() string {
 	if x != nil {
-		return x.RuntimeClass
+		return x.RuntimeClassName
 	}
 	return ""
 }
@@ -10903,7 +10903,7 @@ func (x *ExchangeProviderSubjectTokenResponse) GetTokenType() string {
 // Update sandbox policy request.
 type UpdateConfigRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Workspace scope. Only a named workspace selection is accepted.
+	// Workspace scope. Omit for global updates; otherwise select one named workspace.
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,10,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	// The new policy to apply.
 	//
@@ -11202,7 +11202,7 @@ func (*PolicyMergeOperation_RemoveBinary) isPolicyMergeOperation_Operation() {}
 
 type AddNetworkRule struct {
 	state         protoimpl.MessageState       `protogen:"open.v1"`
-	Name          string                       `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	RuleName      string                       `protobuf:"bytes,1,opt,name=rule_name,json=ruleName,proto3" json:"rule_name,omitempty"`
 	Rule          *sandboxv1.NetworkPolicyRule `protobuf:"bytes,2,opt,name=rule,proto3" json:"rule,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -11238,9 +11238,9 @@ func (*AddNetworkRule) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{140}
 }
 
-func (x *AddNetworkRule) GetName() string {
+func (x *AddNetworkRule) GetRuleName() string {
 	if x != nil {
-		return x.Name
+		return x.RuleName
 	}
 	return ""
 }
@@ -11254,7 +11254,7 @@ func (x *AddNetworkRule) GetRule() *sandboxv1.NetworkPolicyRule {
 
 type RemoveNetworkEndpoint struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Rule          string                 `protobuf:"bytes,1,opt,name=rule,proto3" json:"rule,omitempty"`
+	RuleName      string                 `protobuf:"bytes,1,opt,name=rule_name,json=ruleName,proto3" json:"rule_name,omitempty"`
 	Host          string                 `protobuf:"bytes,2,opt,name=host,proto3" json:"host,omitempty"`
 	Port          uint32                 `protobuf:"varint,3,opt,name=port,proto3" json:"port,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -11291,9 +11291,9 @@ func (*RemoveNetworkEndpoint) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{141}
 }
 
-func (x *RemoveNetworkEndpoint) GetRule() string {
+func (x *RemoveNetworkEndpoint) GetRuleName() string {
 	if x != nil {
-		return x.Rule
+		return x.RuleName
 	}
 	return ""
 }
@@ -11314,7 +11314,7 @@ func (x *RemoveNetworkEndpoint) GetPort() uint32 {
 
 type RemoveNetworkRule struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	RuleName      string                 `protobuf:"bytes,1,opt,name=rule_name,json=ruleName,proto3" json:"rule_name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -11349,9 +11349,9 @@ func (*RemoveNetworkRule) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{142}
 }
 
-func (x *RemoveNetworkRule) GetName() string {
+func (x *RemoveNetworkRule) GetRuleName() string {
 	if x != nil {
-		return x.Name
+		return x.RuleName
 	}
 	return ""
 }
@@ -11359,10 +11359,10 @@ func (x *RemoveNetworkRule) GetName() string {
 // Exact endpoint and complete authorization scope affected by an L7 append.
 // All ports and binaries must match the stored target; omitted scope is invalid.
 type L7RuleTarget struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	Rule  string                 `protobuf:"bytes,1,opt,name=rule,proto3" json:"rule,omitempty"`
-	Host  string                 `protobuf:"bytes,2,opt,name=host,proto3" json:"host,omitempty"`
-	Ports []uint32               `protobuf:"varint,3,rep,packed,name=ports,proto3" json:"ports,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	RuleName string                 `protobuf:"bytes,1,opt,name=rule_name,json=ruleName,proto3" json:"rule_name,omitempty"`
+	Host     string                 `protobuf:"bytes,2,opt,name=host,proto3" json:"host,omitempty"`
+	Ports    []uint32               `protobuf:"varint,3,rep,packed,name=ports,proto3" json:"ports,omitempty"`
 	// An absent path requires a unique endpoint. An empty path selects an
 	// endpoint without a path selector. This is not the appended request path.
 	Path *string `protobuf:"bytes,4,opt,name=path,proto3,oneof" json:"path,omitempty"`
@@ -11403,9 +11403,9 @@ func (*L7RuleTarget) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{143}
 }
 
-func (x *L7RuleTarget) GetRule() string {
+func (x *L7RuleTarget) GetRuleName() string {
 	if x != nil {
-		return x.Rule
+		return x.RuleName
 	}
 	return ""
 }
@@ -11551,7 +11551,7 @@ func (x *AddAllowRules) GetTarget() *L7RuleTarget {
 
 type RemoveNetworkBinary struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Rule          string                 `protobuf:"bytes,1,opt,name=rule,proto3" json:"rule,omitempty"`
+	RuleName      string                 `protobuf:"bytes,1,opt,name=rule_name,json=ruleName,proto3" json:"rule_name,omitempty"`
 	BinaryPath    string                 `protobuf:"bytes,2,opt,name=binary_path,json=binaryPath,proto3" json:"binary_path,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -11587,9 +11587,9 @@ func (*RemoveNetworkBinary) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{146}
 }
 
-func (x *RemoveNetworkBinary) GetRule() string {
+func (x *RemoveNetworkBinary) GetRuleName() string {
 	if x != nil {
-		return x.Rule
+		return x.RuleName
 	}
 	return ""
 }
@@ -11686,7 +11686,7 @@ func (x *UpdateConfigResponse) GetAnnotations() map[string]string {
 // Get sandbox policy status request.
 type GetSandboxPolicyStatusRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Workspace scope. Only a named workspace selection is accepted.
+	// Workspace scope. Omit for global queries; otherwise select one named workspace.
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,4,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	// The specific policy version to query. 0 means latest.
 	Version uint32 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"`
@@ -11813,7 +11813,7 @@ func (x *GetSandboxPolicyStatusResponse) GetActiveVersion() uint32 {
 // List sandbox policies request.
 type ListSandboxPoliciesRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Workspace scope. Only a named workspace selection is accepted.
+	// Workspace scope. Omit for global queries; otherwise select one named workspace.
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,5,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	// The maximum number of revisions to return. Zero uses 100. Values above
 	// 1000 are coerced to 1000; negative values are invalid.
@@ -14117,7 +14117,7 @@ type PolicyChunk struct {
 	// Approval status: "pending", "approved", "rejected".
 	Status string `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
 	// Proposed network_policies map key.
-	Rule string `protobuf:"bytes,3,opt,name=rule,proto3" json:"rule,omitempty"`
+	RuleName string `protobuf:"bytes,3,opt,name=rule_name,json=ruleName,proto3" json:"rule_name,omitempty"`
 	// The proposed network policy rule.
 	ProposedRule *sandboxv1.NetworkPolicyRule `protobuf:"bytes,4,opt,name=proposed_rule,json=proposedRule,proto3" json:"proposed_rule,omitempty"`
 	// Human-readable explanation of why this rule is proposed.
@@ -14215,9 +14215,9 @@ func (x *PolicyChunk) GetStatus() string {
 	return ""
 }
 
-func (x *PolicyChunk) GetRule() string {
+func (x *PolicyChunk) GetRuleName() string {
 	if x != nil {
-		return x.Rule
+		return x.RuleName
 	}
 	return ""
 }
@@ -16591,7 +16591,7 @@ type ExtensionServiceCredential struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Operator registration name used to correlate the credential with the
 	// stable service registration delivered by GetSandboxConfig.
-	Service string `protobuf:"bytes,1,opt,name=service,proto3" json:"service,omitempty"`
+	ServiceName string `protobuf:"bytes,1,opt,name=service_name,json=serviceName,proto3" json:"service_name,omitempty"`
 	// Gateway-minted JWT with an audience derived from the registration.
 	Token string `protobuf:"bytes,2,opt,name=token,proto3" json:"token,omitempty"`
 	// Absolute expiry of the token.
@@ -16630,9 +16630,9 @@ func (*ExtensionServiceCredential) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{221}
 }
 
-func (x *ExtensionServiceCredential) GetService() string {
+func (x *ExtensionServiceCredential) GetServiceName() string {
 	if x != nil {
-		return x.Service
+		return x.ServiceName
 	}
 	return ""
 }
@@ -17080,9 +17080,9 @@ const file_openshell_proto_rawDesc = "" +
 	"\x18IssueSandboxTokenRequest\"\x91\x01\n" +
 	"\x19IssueSandboxTokenResponse\x12\x1a\n" +
 	"\x05token\x18\x01 \x01(\tB\x04\x88\xb5\x18\x01R\x05token\x12C\n" +
-	"\x0fexpiration_time\x18f \x01(\v2\x1a.google.protobuf.TimestampR\x0eexpirationTimeJ\x04\b\x02\x10\x03R\rexpires_at_ms\"K\n" +
-	"\x1aRefreshSandboxTokenRequest\x12-\n" +
-	"\x12extension_services\x18\x01 \x03(\tR\x11extensionServices\"\xd8\x03\n" +
+	"\x0fexpiration_time\x18f \x01(\v2\x1a.google.protobuf.TimestampR\x0eexpirationTimeJ\x04\b\x02\x10\x03R\rexpires_at_ms\"T\n" +
+	"\x1aRefreshSandboxTokenRequest\x126\n" +
+	"\x17extension_service_names\x18\x01 \x03(\tR\x15extensionServiceNames\"\xd8\x03\n" +
 	"\x1bRefreshSandboxTokenResponse\x12\x1a\n" +
 	"\x05token\x18\x01 \x01(\tB\x04\x88\xb5\x18\x01R\x05token\x12C\n" +
 	"\x0fexpiration_time\x18f \x01(\v2\x1a.google.protobuf.TimestampR\x0eexpirationTime\x12]\n" +
@@ -17110,9 +17110,10 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0fcompute_drivers\x18\x03 \x03(\v2\x1f.openshell.v1.ComputeDriverInfoR\x0ecomputeDrivers\"t\n" +
 	"\x11ComputeDriverInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12K\n" +
-	"\fcapabilities\x18\x02 \x01(\v2'.openshell.v1.ComputeDriverCapabilitiesR\fcapabilities\"\xaf\x01\n" +
-	"\x19ComputeDriverCapabilities\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12%\n" +
+	"\fcapabilities\x18\x02 \x01(\v2'.openshell.v1.ComputeDriverCapabilitiesR\fcapabilities\"\xbc\x01\n" +
+	"\x19ComputeDriverCapabilities\x12\x1f\n" +
+	"\vdriver_name\x18\x01 \x01(\tR\n" +
+	"driverName\x12%\n" +
 	"\x0edriver_version\x18\x02 \x01(\tR\rdriverVersion\x12W\n" +
 	"\x15resource_capabilities\x18\x03 \x01(\v2\".openshell.v1.ResourceCapabilitiesR\x14resourceCapabilities\"\xca\x01\n" +
 	"\x14ResourceCapabilities\x127\n" +
@@ -17150,10 +17151,10 @@ const file_openshell_proto_rawDesc = "" +
 	"\x03gpu\x18\x01 \x01(\v2%.openshell.v1.GpuResourceRequirementsR\x03gpu\">\n" +
 	"\x17GpuResourceRequirements\x12\x19\n" +
 	"\x05count\x18\x01 \x01(\rH\x00R\x05count\x88\x01\x01B\b\n" +
-	"\x06_count\"\xe6\x05\n" +
+	"\x06_count\"\xef\x05\n" +
 	"\x0fSandboxTemplate\x12\x14\n" +
-	"\x05image\x18\x01 \x01(\tR\x05image\x12#\n" +
-	"\rruntime_class\x18\x02 \x01(\tR\fruntimeClass\x12!\n" +
+	"\x05image\x18\x01 \x01(\tR\x05image\x12,\n" +
+	"\x12runtime_class_name\x18\x02 \x01(\tR\x10runtimeClassName\x12!\n" +
 	"\fagent_socket\x18\x03 \x01(\tR\vagentSocket\x12A\n" +
 	"\x06labels\x18\x04 \x03(\v2).openshell.v1.SandboxTemplate.LabelsEntryR\x06labels\x12P\n" +
 	"\vannotations\x18\x05 \x03(\v2..openshell.v1.SandboxTemplate.AnnotationsEntryR\vannotations\x12P\n" +
@@ -17897,18 +17898,18 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0eadd_deny_rules\x18\x04 \x01(\v2\x1a.openshell.v1.AddDenyRulesH\x00R\faddDenyRules\x12E\n" +
 	"\x0fadd_allow_rules\x18\x05 \x01(\v2\x1b.openshell.v1.AddAllowRulesH\x00R\raddAllowRules\x12H\n" +
 	"\rremove_binary\x18\x06 \x01(\v2!.openshell.v1.RemoveNetworkBinaryH\x00R\fremoveBinaryB\v\n" +
-	"\toperation\"a\n" +
-	"\x0eAddNetworkRule\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12;\n" +
-	"\x04rule\x18\x02 \x01(\v2'.openshell.sandbox.v1.NetworkPolicyRuleR\x04rule\"S\n" +
-	"\x15RemoveNetworkEndpoint\x12\x12\n" +
-	"\x04rule\x18\x01 \x01(\tR\x04rule\x12\x12\n" +
+	"\toperation\"j\n" +
+	"\x0eAddNetworkRule\x12\x1b\n" +
+	"\trule_name\x18\x01 \x01(\tR\bruleName\x12;\n" +
+	"\x04rule\x18\x02 \x01(\v2'.openshell.sandbox.v1.NetworkPolicyRuleR\x04rule\"\\\n" +
+	"\x15RemoveNetworkEndpoint\x12\x1b\n" +
+	"\trule_name\x18\x01 \x01(\tR\bruleName\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\x12\x12\n" +
-	"\x04port\x18\x03 \x01(\rR\x04port\"'\n" +
-	"\x11RemoveNetworkRule\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\"\xce\x01\n" +
-	"\fL7RuleTarget\x12\x12\n" +
-	"\x04rule\x18\x01 \x01(\tR\x04rule\x12\x12\n" +
+	"\x04port\x18\x03 \x01(\rR\x04port\"0\n" +
+	"\x11RemoveNetworkRule\x12\x1b\n" +
+	"\trule_name\x18\x01 \x01(\tR\bruleName\"\xd7\x01\n" +
+	"\fL7RuleTarget\x12\x1b\n" +
+	"\trule_name\x18\x01 \x01(\tR\bruleName\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\x12\x14\n" +
 	"\x05ports\x18\x03 \x03(\rR\x05ports\x12\x17\n" +
 	"\x04path\x18\x04 \x01(\tH\x00R\x04path\x88\x01\x01\x12?\n" +
@@ -17922,9 +17923,9 @@ const file_openshell_proto_rawDesc = "" +
 	"\x06target\x18\x04 \x01(\v2\x1a.openshell.v1.L7RuleTargetR\x06targetJ\x04\b\x01\x10\x02J\x04\b\x02\x10\x03R\x04hostR\x04port\"\x8f\x01\n" +
 	"\rAddAllowRules\x122\n" +
 	"\x05rules\x18\x03 \x03(\v2\x1c.openshell.sandbox.v1.L7RuleR\x05rules\x122\n" +
-	"\x06target\x18\x04 \x01(\v2\x1a.openshell.v1.L7RuleTargetR\x06targetJ\x04\b\x01\x10\x02J\x04\b\x02\x10\x03R\x04hostR\x04port\"J\n" +
-	"\x13RemoveNetworkBinary\x12\x12\n" +
-	"\x04rule\x18\x01 \x01(\tR\x04rule\x12\x1f\n" +
+	"\x06target\x18\x04 \x01(\v2\x1a.openshell.v1.L7RuleTargetR\x06targetJ\x04\b\x01\x10\x02J\x04\b\x02\x10\x03R\x04hostR\x04port\"S\n" +
+	"\x13RemoveNetworkBinary\x12\x1b\n" +
+	"\trule_name\x18\x01 \x01(\tR\bruleName\x12\x1f\n" +
 	"\vbinary_path\x18\x02 \x01(\tR\n" +
 	"binaryPath\"\xaf\x02\n" +
 	"\x14UpdateConfigResponse\x12\x18\n" +
@@ -18121,11 +18122,11 @@ const file_openshell_proto_rawDesc = "" +
 	"\x16NetworkActivitySummary\x124\n" +
 	"\x16network_activity_count\x18\x01 \x01(\rR\x14networkActivityCount\x12.\n" +
 	"\x13denied_action_count\x18\x02 \x01(\rR\x11deniedActionCount\x12H\n" +
-	"\x10denials_by_group\x18\x03 \x03(\v2\x1e.openshell.v1.DenialGroupCountR\x0edenialsByGroup\"\xf0\t\n" +
+	"\x10denials_by_group\x18\x03 \x03(\v2\x1e.openshell.v1.DenialGroupCountR\x0edenialsByGroup\"\xf9\t\n" +
 	"\vPolicyChunk\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
-	"\x06status\x18\x02 \x01(\tR\x06status\x12\x12\n" +
-	"\x04rule\x18\x03 \x01(\tR\x04rule\x12L\n" +
+	"\x06status\x18\x02 \x01(\tR\x06status\x12\x1b\n" +
+	"\trule_name\x18\x03 \x01(\tR\bruleName\x12L\n" +
 	"\rproposed_rule\x18\x04 \x01(\v2'.openshell.sandbox.v1.NetworkPolicyRuleR\fproposedRule\x12\x1c\n" +
 	"\trationale\x18\x05 \x01(\tR\trationale\x12%\n" +
 	"\x0esecurity_notes\x18\x06 \x01(\tR\rsecurityNotes\x12\x1e\n" +
@@ -18308,9 +18309,9 @@ const file_openshell_proto_rawDesc = "" +
 	"page_token\x18\x03 \x01(\tR\tpageToken\"\x7f\n" +
 	"\x1cListWorkspaceMembersResponse\x127\n" +
 	"\amembers\x18\x01 \x03(\v2\x1d.openshell.v1.WorkspaceMemberR\amembers\x12&\n" +
-	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xac\x01\n" +
-	"\x1aExtensionServiceCredential\x12\x18\n" +
-	"\aservice\x18\x01 \x01(\tR\aservice\x12\x1a\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xb5\x01\n" +
+	"\x1aExtensionServiceCredential\x12!\n" +
+	"\fservice_name\x18\x01 \x01(\tR\vserviceName\x12\x1a\n" +
 	"\x05token\x18\x02 \x01(\tB\x04\x88\xb5\x18\x01R\x05token\x12C\n" +
 	"\x0fexpiration_time\x18g \x01(\v2\x1a.google.protobuf.TimestampR\x0eexpirationTimeJ\x04\b\x03\x10\x04R\rexpires_at_ms\"l\n" +
 	"\x13EndpointObservation\x12\x1f\n" +

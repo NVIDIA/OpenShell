@@ -98,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .submit_policy_analysis(SubmitPolicyAnalysisRequest {
             name: sandbox_name.clone(),
             proposed_chunks: vec![PolicyChunk {
-                rule: "sandbox_added".to_string(),
+                rule_name: "sandbox_added".to_string(),
                 proposed_rule: Some(added_rule),
                 rationale: "authenticated governance bypass regression".to_string(),
                 ..Default::default()

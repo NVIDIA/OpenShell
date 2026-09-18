@@ -504,7 +504,7 @@ impl CredentialDriver for CredentialDriverService {
         _request: Request<GetCredentialDriverCapabilitiesRequest>,
     ) -> Result<Response<GetCredentialDriverCapabilitiesResponse>, Status> {
         Ok(Response::new(GetCredentialDriverCapabilitiesResponse {
-            name: VaultCredentialDriver::NAME.to_string(),
+            driver_name: VaultCredentialDriver::NAME.to_string(),
             driver_version: VERSION.to_string(),
             backend_kind: VaultCredentialDriver::NAME.to_string(),
             supports_list: false,

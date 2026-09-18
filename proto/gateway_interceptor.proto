@@ -38,7 +38,7 @@ enum GatewayInterceptorPhase {
 
 message InterceptorEvaluation {
   // Configured interceptor instance name.
-  string interceptor = 1;
+  string interceptor_name = 1;
   // Manifest binding id selected for this evaluation.
   string binding_id = 2;
   // Public gRPC service name, e.g. "openshell.v1.OpenShell".

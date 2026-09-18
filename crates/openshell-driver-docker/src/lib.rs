@@ -1012,7 +1012,7 @@ impl DockerComputeDriver {
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
-            name: "docker".to_string(),
+            driver_name: "docker".to_string(),
             driver_version: self.config.daemon_version.clone(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,

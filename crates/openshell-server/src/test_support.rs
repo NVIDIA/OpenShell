@@ -150,7 +150,7 @@ impl FakeComputeDriver {
         Self {
             state: Arc::new(Mutex::new(FakeComputeDriverState {
                 capabilities: GetCapabilitiesResponse {
-                    name: "fake-compute-driver".to_string(),
+                    driver_name: "fake-compute-driver".to_string(),
                     driver_version: "test".to_string(),
                     default_image: "openshell/sandbox:test".to_string(),
                     gateway_manages_lifecycle: false,
@@ -171,7 +171,7 @@ impl FakeComputeDriver {
 
     #[must_use]
     pub fn with_driver_name(self, driver_name: impl Into<String>) -> Self {
-        self.with_state(|state| state.capabilities.name = driver_name.into());
+        self.with_state(|state| state.capabilities.driver_name = driver_name.into());
         self
     }
 

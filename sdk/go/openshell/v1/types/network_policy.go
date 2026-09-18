@@ -177,16 +177,16 @@ type PolicyMergeOperation struct {
 
 // AddNetworkRule adds a named network policy rule with a full rule definition.
 type AddNetworkRule struct {
-	// Name is the name key for the rule.
-	Name string
+	// RuleName is the name key for the rule.
+	RuleName string
 	// Rule is the full network policy rule to add.
 	Rule NetworkPolicyRule
 }
 
 // RemoveNetworkEndpoint removes a specific endpoint from a named rule.
 type RemoveNetworkEndpoint struct {
-	// Rule is the name of the rule containing the endpoint.
-	Rule string
+	// RuleName is the name of the rule containing the endpoint.
+	RuleName string
 	// Host is the endpoint host to remove.
 	Host string
 	// Port is the endpoint port to remove.
@@ -195,16 +195,16 @@ type RemoveNetworkEndpoint struct {
 
 // RemoveNetworkRule removes an entire named rule from the policy.
 type RemoveNetworkRule struct {
-	// Name is the name of the rule to remove.
-	Name string
+	// RuleName is the name of the rule to remove.
+	RuleName string
 }
 
 // L7RuleTarget identifies an endpoint and declares its complete affected scope.
 // The gateway requires the ports and binary scope to match the stored endpoint
 // and rule before appending any layer-7 rules.
 type L7RuleTarget struct {
-	// Rule names the base-policy rule containing the endpoint.
-	Rule string
+	// RuleName names the base-policy rule containing the endpoint.
+	RuleName string
 	// Host is the endpoint host, matched case-insensitively.
 	Host string
 	// Ports lists every port affected by the append, not only a lookup port.
@@ -237,8 +237,8 @@ type AddAllowRules struct {
 
 // RemoveNetworkBinary removes a binary from a named rule.
 type RemoveNetworkBinary struct {
-	// Rule is the name of the rule containing the binary.
-	Rule string
+	// RuleName is the name of the rule containing the binary.
+	RuleName string
 	// BinaryPath is the filesystem path of the binary to remove.
 	BinaryPath string
 }

@@ -38,7 +38,7 @@ template, err := client.SandboxTemplates().Create(ctx, "default", &v1.SandboxWor
         DriverConfig: map[string]any{
             "kubernetes": map[string]any{
                 "pod": map[string]any{
-                    "runtime_class": "kata",
+                    "runtime_class_name": "kata",
                 },
             },
         },

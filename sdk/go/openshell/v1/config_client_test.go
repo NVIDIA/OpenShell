@@ -529,7 +529,7 @@ func TestConfigUpdate_MergeOperationsAccepted(t *testing.T) {
 
 	update := &ConfigUpdate{
 		Name:            "my-sandbox",
-		MergeOperations: []types.PolicyMergeOperation{{RemoveRule: &types.RemoveNetworkRule{Name: "test"}}},
+		MergeOperations: []types.PolicyMergeOperation{{RemoveRule: &types.RemoveNetworkRule{RuleName: "test"}}},
 	}
 
 	result, err := client.Update(context.Background(), "default", update)
@@ -559,7 +559,7 @@ func TestConfigUpdate_L7TargetScopeSurvivesTransport(t *testing.T) {
 		MergeOperations: []PolicyMergeOperation{
 			{AddAllowRules: &AddAllowRules{
 				Target: &L7RuleTarget{
-					Rule: "api", Host: "api.example.com",
+					RuleName: "api", Host: "api.example.com",
 					Ports:    []uint32{443, 8443},
 					Path:     &path,
 					Binaries: []PolicyNetworkBinary{{Path: "/usr/bin/curl"}, {Path: "/usr/bin/wget"}},
@@ -568,7 +568,7 @@ func TestConfigUpdate_L7TargetScopeSurvivesTransport(t *testing.T) {
 			}},
 			{AddDenyRules: &AddDenyRules{
 				Target: &L7RuleTarget{
-					Rule: "public-api", Host: "public.example.com",
+					RuleName: "public-api", Host: "public.example.com",
 					Ports:     []uint32{443},
 					AnyBinary: true,
 				},
@@ -587,7 +587,7 @@ func TestConfigUpdate_L7TargetScopeSurvivesTransport(t *testing.T) {
 	require.NotNil(t, allow)
 	allowTarget := allow.GetTarget()
 	require.NotNil(t, allowTarget)
-	assert.Equal(t, "api", allowTarget.GetRule())
+	assert.Equal(t, "api", allowTarget.GetRuleName())
 	assert.Equal(t, "api.example.com", allowTarget.GetHost())
 	assert.Equal(t, []uint32{443, 8443}, allowTarget.GetPorts())
 	require.NotNil(t, allowTarget.Path, "empty endpoint path must survive protobuf encoding")
@@ -604,7 +604,7 @@ func TestConfigUpdate_L7TargetScopeSurvivesTransport(t *testing.T) {
 	require.NotNil(t, deny)
 	denyTarget := deny.GetTarget()
 	require.NotNil(t, denyTarget)
-	assert.Equal(t, "public-api", denyTarget.GetRule())
+	assert.Equal(t, "public-api", denyTarget.GetRuleName())
 	assert.Equal(t, "public.example.com", denyTarget.GetHost())
 	assert.Equal(t, []uint32{443}, denyTarget.GetPorts())
 	assert.Nil(t, denyTarget.Path)

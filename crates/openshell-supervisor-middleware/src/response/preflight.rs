@@ -86,7 +86,7 @@ impl ChainRunner {
                 target: Some(input.target.clone()),
                 status_code: u32::from(input.status_code),
                 headers: headers.clone(),
-                middleware: entry.entry.implementation.clone(),
+                middleware_name: entry.entry.implementation.clone(),
                 config: Some(entry.entry.config.clone()),
                 max_payload_bytes: entry.max_payload_bytes as u64,
                 permitted_body_modes: permitted_body_modes(
