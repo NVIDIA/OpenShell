@@ -383,7 +383,7 @@ final enforcement boundary.
 
 The standalone `openshell-prover check` command compares a fully composed local
 candidate policy with an operator-supplied local boundary. It establishes
-`Allowed(candidate) ⊆ Allowed(boundary)` for the scope reported in its
+`Allowed(candidate) ⊆ Allowed(boundary)` for the policy domains reported in its
 result. It does not fetch gateway state, compose provider rules, apply policy,
 or decide whether an in-boundary change is eligible for automatic approval.
 

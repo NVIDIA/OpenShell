@@ -78,16 +78,17 @@ fn contained_policy_returns_stable_json_and_zero() {
     assert_eq!(value["result"], "within_boundary");
     assert_eq!(value["exit_code"], 0);
     assert_eq!(
-        value["scope"],
+        value["coverage"],
         serde_json::json!({
             "domains": ["filesystem", "network_l4", "network_rest", "process", "landlock"]
         })
     );
+    assert!(value.get("scope").is_none());
     assert!(value["counterexample"].is_null());
 }
 
 #[test]
-fn contained_policy_returns_stable_text_scope_and_zero() {
+fn contained_policy_returns_stable_text_coverage_and_zero() {
     let output = run(&[
         "check",
         fixture("candidate-contained.yaml")
@@ -107,7 +108,7 @@ fn contained_policy_returns_stable_text_scope_and_zero() {
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).expect("UTF-8 text output"),
-        "result: within_boundary\nscope: domains=filesystem,network_l4,network_rest,process,landlock\n"
+        "result: within_boundary\ncoverage: domains=filesystem,network_l4,network_rest,process,landlock\n"
     );
 }
 

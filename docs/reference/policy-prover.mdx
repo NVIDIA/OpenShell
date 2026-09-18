@@ -103,9 +103,10 @@ openshell-prover check candidate.yaml \
 The JSON object includes the result, exit code, input paths, schema version,
 prover version, and modeled domains. `schema_version` versions the JSON contract,
 `prover_version` identifies the implementation that produced the result, and
-`scope.domains` is the machine-readable coverage declaration. An exceeding
-result also includes a typed counterexample. Automation should use `result` and
-`reason_code` instead of parsing the human-readable explanation.
+`coverage.domains` is the machine-readable declaration of modeled policy
+domains. An exceeding result also includes a typed counterexample. Automation
+should use `result` and `reason_code` instead of parsing the human-readable
+explanation.
 
 | Field | When populated |
 |---|---|
@@ -147,7 +148,7 @@ openshell-prover check candidate.yaml \
 
 | Exit | Result | Meaning |
 |---|---|---|
-| `0` | `within_boundary` | Containment was established for the reported scope. |
+| `0` | `within_boundary` | Containment was established for the reported modeled domains. |
 | `1` | `exceeds_boundary` | The candidate exceeds the boundary; inspect the counterexample. |
 | `2` | `error` | Arguments, input files, policy syntax, or command execution prevented a valid check. |
 | `3` | `unsupported` or `inconclusive` | The model cannot soundly cover the policy shape, or the solver did not reach a determination. |
@@ -161,9 +162,9 @@ inconclusive results as failures in CI.
 The containment check covers filesystem paths, process identity settings,
 Landlock compatibility requirements, L4 destination authority, and enforced
 REST method and path authority, including explicit REST denies. The result
-object reports the domains used for each check. Policies that use recognized
-authority outside that scope return `unsupported` rather than silently ignoring
-it.
+object reports the policy domains modeled by each check. Policies that use
+recognized authority outside that coverage return `unsupported` rather than
+silently ignoring it.
 
 Both inputs use the same bounded YAML/JSON parser and authored policy schema as
 OpenShell. Unknown fields, duplicate keys, malformed field types, and unsupported
@@ -212,7 +213,7 @@ literal suffixes differ. CIDR unions within a supported endpoint are checked by
 the solver. Unsupported IP-literal wildcard selectors and ranges rejected by
 the runtime also cannot produce a successful proof.
 
-Consumers must inspect `scope.domains` and require every domain relevant to
+Consumers must inspect `coverage.domains` and require every domain relevant to
 their authorization decision. A successful result applies only to those
 reported domains and the documented assumptions.
 
@@ -266,5 +267,5 @@ state. In particular:
   returns `exceeds_boundary`.
 
 Use the [Policy Schema Reference](/reference/policy-schema) for the full policy
-language. A successful prover result covers only the scope reported in its
-evidence.
+language. A successful prover result covers only the policy domains reported in
+its evidence.

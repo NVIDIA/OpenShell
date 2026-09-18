@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use openshell_prover::containment::{
-    CheckDomain, CheckOptions, CheckResult, Counterexample, Protocol, ReasonCode,
+    CheckCoverage, CheckDomain, CheckOptions, CheckResult, Counterexample, Protocol, ReasonCode,
     check_within_boundary, parse_policy_str,
 };
 
@@ -44,6 +44,13 @@ fn domain_name(domain: CheckDomain) -> &'static str {
     }
 }
 
+fn covers(coverage: &CheckCoverage, expected: &str) -> bool {
+    coverage
+        .domains
+        .iter()
+        .any(|domain| domain_name(*domain) == expected)
+}
+
 #[test]
 fn external_callers_use_extensible_construction_and_matching_patterns() {
     let boundary = parse_policy_str(
@@ -65,13 +72,7 @@ fn external_callers_use_extensible_construction_and_matching_patterns() {
     let CheckResult::Exceeds(evidence) = &result else {
         panic!("expected filesystem violation, got {result:?}");
     };
-    assert!(
-        evidence
-            .scope()
-            .domains
-            .iter()
-            .any(|domain| domain_name(*domain) == "filesystem")
-    );
+    assert!(covers(evidence.coverage(), "filesystem"));
     match evidence.counterexample() {
         Counterexample::Filesystem { access, path, .. } => {
             assert_eq!(access.as_str(), "write");
@@ -105,11 +106,5 @@ fn external_callers_read_reason_evidence_and_authorize_only_within() {
         ReasonCode::SolverTimeout => {}
         _ => panic!("unexpected reason code"),
     }
-    assert!(
-        evidence
-            .scope()
-            .domains
-            .iter()
-            .any(|domain| domain_name(*domain) == "landlock")
-    );
+    assert!(covers(evidence.coverage(), "landlock"));
 }

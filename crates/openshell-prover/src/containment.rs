@@ -203,10 +203,11 @@ impl CheckDomain {
     }
 }
 
-/// Scope attached to every completed or recoverably incomplete check.
+/// Modeled authority coverage attached to every completed or recoverably
+/// incomplete check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct CheckScope {
+pub struct CheckCoverage {
     pub domains: &'static [CheckDomain],
 }
 
@@ -217,9 +218,9 @@ static DOMAINS: &[CheckDomain] = &[
     CheckDomain::Process,
     CheckDomain::Landlock,
 ];
-fn check_scope() -> &'static CheckScope {
-    static SCOPE: CheckScope = CheckScope { domains: DOMAINS };
-    &SCOPE
+fn check_coverage() -> &'static CheckCoverage {
+    static COVERAGE: CheckCoverage = CheckCoverage { domains: DOMAINS };
+    &COVERAGE
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,8 +294,8 @@ pub struct WithinEvidence;
 
 impl WithinEvidence {
     #[must_use]
-    pub fn scope(&self) -> &'static CheckScope {
-        check_scope()
+    pub fn coverage(&self) -> &'static CheckCoverage {
+        check_coverage()
     }
 }
 
@@ -303,8 +304,8 @@ pub struct ExceedsEvidence(Counterexample);
 
 impl ExceedsEvidence {
     #[must_use]
-    pub fn scope(&self) -> &'static CheckScope {
-        check_scope()
+    pub fn coverage(&self) -> &'static CheckCoverage {
+        check_coverage()
     }
 
     #[must_use]
@@ -321,8 +322,8 @@ pub struct ReasonEvidence {
 
 impl ReasonEvidence {
     #[must_use]
-    pub fn scope(&self) -> &'static CheckScope {
-        check_scope()
+    pub fn coverage(&self) -> &'static CheckCoverage {
+        check_coverage()
     }
 
     #[must_use]

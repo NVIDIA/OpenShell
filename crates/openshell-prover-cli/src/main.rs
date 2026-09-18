@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use openshell_prover::containment::{
-    CheckOptions, CheckResult, CheckScope, ContainmentPolicy, Counterexample, parse_policy_str,
+    CheckCoverage, CheckOptions, CheckResult, ContainmentPolicy, Counterexample, parse_policy_str,
 };
 use serde::Serialize;
 
@@ -62,7 +62,7 @@ struct Envelope<'a> {
     schema_version: u32,
     prover_version: &'static str,
     check: &'static str,
-    scope: Option<ScopeJson<'a>>,
+    coverage: Option<CoverageJson<'a>>,
     result: &'static str,
     exit_code: u8,
     inputs: InputsJson,
@@ -72,7 +72,7 @@ struct Envelope<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct ScopeJson<'a> {
+struct CoverageJson<'a> {
     domains: Vec<&'a str>,
 }
 
@@ -293,7 +293,7 @@ fn render_input_error(
             schema_version: 1,
             prover_version: env!("CARGO_PKG_VERSION"),
             check: "boundary",
-            scope: None,
+            coverage: None,
             result: "error",
             exit_code: 2,
             inputs,
@@ -317,10 +317,12 @@ fn render_cancelled(output: OutputFormat, inputs: InputsJson) -> Result<u8, Stri
 }
 
 fn result_envelope(result: &CheckResult, inputs: InputsJson) -> Result<Envelope<'_>, String> {
-    let (scope, result_name, exit_code, counterexample, reason_code, reason) = match result {
-        CheckResult::Within(evidence) => (evidence.scope(), "within_boundary", 0, None, None, None),
+    let (coverage, result_name, exit_code, counterexample, reason_code, reason) = match result {
+        CheckResult::Within(evidence) => {
+            (evidence.coverage(), "within_boundary", 0, None, None, None)
+        }
         CheckResult::Exceeds(evidence) => (
-            evidence.scope(),
+            evidence.coverage(),
             "exceeds_boundary",
             1,
             Some(counterexample_json(evidence.counterexample())?),
@@ -328,7 +330,7 @@ fn result_envelope(result: &CheckResult, inputs: InputsJson) -> Result<Envelope<
             None,
         ),
         CheckResult::Unsupported(evidence) => (
-            evidence.scope(),
+            evidence.coverage(),
             "unsupported",
             3,
             None,
@@ -343,7 +345,7 @@ fn result_envelope(result: &CheckResult, inputs: InputsJson) -> Result<Envelope<
                     3
                 };
             (
-                evidence.scope(),
+                evidence.coverage(),
                 "inconclusive",
                 exit_code,
                 None,
@@ -356,7 +358,7 @@ fn result_envelope(result: &CheckResult, inputs: InputsJson) -> Result<Envelope<
         schema_version: 1,
         prover_version: env!("CARGO_PKG_VERSION"),
         check: "boundary",
-        scope: Some(scope_json(scope)),
+        coverage: Some(coverage_json(coverage)),
         result: result_name,
         exit_code,
         inputs,
@@ -366,9 +368,13 @@ fn result_envelope(result: &CheckResult, inputs: InputsJson) -> Result<Envelope<
     })
 }
 
-fn scope_json(scope: &CheckScope) -> ScopeJson<'_> {
-    ScopeJson {
-        domains: scope.domains.iter().map(|domain| domain.as_str()).collect(),
+fn coverage_json(coverage: &CheckCoverage) -> CoverageJson<'_> {
+    CoverageJson {
+        domains: coverage
+            .domains
+            .iter()
+            .map(|domain| domain.as_str())
+            .collect(),
     }
 }
 
@@ -441,8 +447,8 @@ fn render(output: OutputFormat, envelope: &Envelope<'_>) -> Result<(), String> {
 fn render_text(mut writer: impl Write, envelope: &Envelope<'_>) -> Result<(), String> {
     writeln!(writer, "result: {}", envelope.result)
         .map_err(|error| format!("failed to write output: {error}"))?;
-    if let Some(scope) = &envelope.scope {
-        writeln!(writer, "scope: domains={}", scope.domains.join(","))
+    if let Some(coverage) = &envelope.coverage {
+        writeln!(writer, "coverage: domains={}", coverage.domains.join(","))
             .map_err(|error| format!("failed to write output: {error}"))?;
     }
     if let Some(counterexample) = &envelope.counterexample {
@@ -586,7 +592,7 @@ mod tests {
             schema_version: 1,
             prover_version: env!("CARGO_PKG_VERSION"),
             check: "boundary",
-            scope: None,
+            coverage: None,
             result: "within_boundary",
             exit_code: 0,
             inputs: InputsJson {

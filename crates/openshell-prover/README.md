@@ -54,7 +54,7 @@ let authorized = matches!(result, CheckResult::Within(_));
 ```
 
 `ReasonCode`, `CheckDomain`, `Protocol`, and `Counterexample` are open to new
-variants. `CheckOptions`, `CheckScope`, `WithinEvidence`, and existing
+variants. `CheckOptions`, `CheckCoverage`, `WithinEvidence`, and existing
 counterexample variants are open to new fields. Match these types with `..`
 and wildcard arms, use their accessors and `as_str()` identifiers, and treat
 unknown values as a fail-closed result. Existing identifier strings are stable.
@@ -65,8 +65,8 @@ unknown values as a fail-closed result. Existing identifier strings are stable.
 breaking API change. Rust source compatibility is separate from the CLI JSON
 schema contract. The CLI's numeric `schema_version` versions that JSON contract,
 while `prover_version` identifies the implementation that produced a result.
-The result's `scope.domains` list is the machine-readable declaration of modeled
-authority.
+The result's `coverage.domains` list is the machine-readable declaration of
+modeled authority.
 
 Used by the gateway to gate auto-approval of agent-authored policy
 proposals: any finding blocks auto-approval, an empty delta lets the
