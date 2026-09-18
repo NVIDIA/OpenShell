@@ -132,6 +132,8 @@ not substitute the current `main` tip or the event's older PR base SHA. Merge
 groups and manual runs use their explicit baseline. Findings are reported by
 `Reject new high or critical findings`; distinguish those from scanner failures.
 
+For core runtime release identity failures, inspect `Record immutable image identity` and `Verify SBOM attestation` in the Build Images jobs, then `Download producing image identities`, `Assemble immutable core runtime manifest` and `Attest core runtime manifest` in Release Dev. Build Images is shared by Branch E2E, Release Dev and Release Tag; only Release Dev assembles and publishes `openshell-release-manifest.json`. Compare the `core-image-identity-*` artifacts' source SHA and workflow run ID with the failing release job. A downstream retry can reuse completed image jobs from the same source and run; identities from a different run are rejected. Assembly also checks archive checksums and matches staged image executable hashes to the corresponding archives, so inspect the failed component and platform before rerunning jobs. Assembly and attestation finish before development release assets are replaced or image tags are promoted; successful canary installation does not verify the manifest.
+
 View logs for a specific run:
 
 ```bash

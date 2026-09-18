@@ -20,6 +20,8 @@ The script detects your operating system and installs the OpenShell CLI, standal
 
 You can also download release artifacts directly from the [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
 
+Development builds publish `openshell-release-manifest.json` with an artifact attestation. Its `schema_version: 1` and `inventory_scope: "core-runtime"` describe the standalone CLI, gateway, sandbox and supervisor archives, and gateway/sandbox/supervisor container images. The manifest records the full source commit, Cargo version, workflow run, archive targets and SHA256 checksums, and image index and platform digests. Native installer packages, VM-driver bundles, the prover and SDKs are outside this inventory. Retain the manifest, verify downloaded archive bytes against its checksums, and use image references in the form `<repository>@<index_digest>` or the selected platform digest. The development download location can move; a checksum mismatch requires obtaining the matching build instead of silently adopting the new bytes. These identities describe one build and do not establish runtime qualification or upgrade compatibility.
+
 ### Install a prerelease
 
 Prerelease packages are retained as GitHub Actions artifacts for 90 days and require an authenticated [GitHub CLI](https://cli.github.com/) session. The `pre` alias installs the latest prerelease:
