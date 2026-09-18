@@ -91,8 +91,10 @@ To override the default image references, use Helm values:
 
 | Helm value | Purpose |
 |---|---|
-| `image.repository` / `image.tag` | Override the gateway image reference. |
-| `server.sandboxImage` | Override the default sandbox image. |
+| `global.image.registry` / `global.image.tag` / `global.image.pullPolicy` | Override shared image settings for the gateway, supervisor, and trusted sandbox runtime. |
+| `gateway.image.registry` / `gateway.image.repository` / `gateway.image.tag` / `gateway.image.digest` | Override the gateway image reference. |
+| `supervisor.image.registry` / `supervisor.image.repository` / `supervisor.image.tag` / `supervisor.image.digest` | Override the supervisor image reference. |
+| `sandbox.image.repository` / `sandbox.image.tag` / `sandbox.image.digest` | Override the default workload sandbox image. |
 
 ## Kernel Requirements
 

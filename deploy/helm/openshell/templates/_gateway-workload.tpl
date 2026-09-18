@@ -43,7 +43,7 @@ spec:
       securityContext:
         {{- toYaml .Values.securityContext | nindent 8 }}
       image: {{ include "openshell.image" . | quote }}
-      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default .Values.global.image.pullPolicy }}
       args:
         - --config
         - /etc/openshell/gateway.toml

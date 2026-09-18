@@ -517,12 +517,9 @@ run_scenario() {
     --namespace "${NAMESPACE}" --create-namespace \
     "${helm_values_args[@]}" \
     --set "fullnameOverride=openshell" \
-    --set "image.repository=${REGISTRY_VALUE}/gateway" \
-    --set "image.tag=${IMAGE_TAG_VALUE}" \
-    --set "sandboxRuntime.image.repository=${REGISTRY_VALUE}/sandbox" \
-    --set "sandboxRuntime.image.tag=${IMAGE_TAG_VALUE}" \
-    --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
-    --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    "${GATEWAY_HELM_IMAGE_ARGS[@]}" \
+    "${SUPERVISOR_HELM_IMAGE_ARGS[@]}" \
+    "${SANDBOX_RUNTIME_HELM_IMAGE_ARGS[@]}" \
     "${helm_post_renderer_args[@]}" \
     "$@" \
     --wait --timeout 5m
@@ -802,6 +799,14 @@ else
   IMAGE_TAG_VALUE="${IMAGE_TAG:-latest}"
 fi
 REGISTRY_VALUE="${REGISTRY_VALUE%/}"
+GATEWAY_IMAGE="$(e2e_resolve_image_reference "${GATEWAY_IMAGE:-${REGISTRY_VALUE}/gateway}" "${IMAGE_TAG_VALUE}")"
+SUPERVISOR_IMAGE="$(e2e_resolve_image_reference "${SUPERVISOR_IMAGE:-${REGISTRY_VALUE}/supervisor}" "${IMAGE_TAG_VALUE}")"
+SANDBOX_RUNTIME_IMAGE="$(e2e_resolve_image_reference "${SANDBOX_IMAGE:-${REGISTRY_VALUE}/sandbox}" "${IMAGE_TAG_VALUE}")"
+BUILD_GATEWAY_IMAGE="${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}"
+BUILD_SUPERVISOR_IMAGE="${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}"
+GATEWAY_HELM_IMAGE_ARGS=(--set-string "gateway.image.registry=$(e2e_image_reference_registry "${GATEWAY_IMAGE}")" --set-string "gateway.image.repository=$(e2e_image_reference_repository_path "${GATEWAY_IMAGE}")" --set-string "gateway.image.tag=$(e2e_image_reference_tag "${GATEWAY_IMAGE}")" --set-string "gateway.image.digest=$(e2e_image_reference_digest "${GATEWAY_IMAGE}")")
+SUPERVISOR_HELM_IMAGE_ARGS=(--set-string "supervisor.image.registry=$(e2e_image_reference_registry "${SUPERVISOR_IMAGE}")" --set-string "supervisor.image.repository=$(e2e_image_reference_repository_path "${SUPERVISOR_IMAGE}")" --set-string "supervisor.image.tag=$(e2e_image_reference_tag "${SUPERVISOR_IMAGE}")" --set-string "supervisor.image.digest=$(e2e_image_reference_digest "${SUPERVISOR_IMAGE}")")
+SANDBOX_RUNTIME_HELM_IMAGE_ARGS=(--set-string "sandboxRuntime.image.registry=$(e2e_image_reference_registry "${SANDBOX_RUNTIME_IMAGE}")" --set-string "sandboxRuntime.image.repository=$(e2e_image_reference_repository_path "${SANDBOX_RUNTIME_IMAGE}")" --set-string "sandboxRuntime.image.tag=$(e2e_image_reference_tag "${SANDBOX_RUNTIME_IMAGE}")" --set-string "sandboxRuntime.image.digest=$(e2e_image_reference_digest "${SANDBOX_RUNTIME_IMAGE}")")
 
 # Resolve a host-gateway IP that sandbox pods can dial to reach test fixtures
 # running on the developer/CI host (HTTP fixtures bound to 0.0.0.0 plus sibling
@@ -894,7 +899,7 @@ elif [[ "${KUBE_CONTEXT}" == k3d-* ]] && command -v k3d >/dev/null 2>&1; then
 fi
 if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
   require_cmd docker
-  echo "Building local Kubernetes e2e images (${REGISTRY_VALUE}/{gateway,sandbox,supervisor}:${IMAGE_TAG_VALUE})..."
+  echo "Building local Kubernetes e2e images (${BUILD_GATEWAY_IMAGE}, ${BUILD_SUPERVISOR_IMAGE})..."
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     if [ "$(uname -s)" != "Linux" ]; then
       echo "ERROR: external Kubernetes driver image composition currently requires a Linux build host." >&2
@@ -923,9 +928,9 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
     cp "${external_driver}" "${external_stage}/openshell-driver-kubernetes"
     docker build \
       --build-arg "TARGETARCH=${external_arch}" \
-      --build-arg "SUPERVISOR_IMAGE=${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}" \
+      --build-arg "SUPERVISOR_IMAGE=${BUILD_SUPERVISOR_IMAGE}" \
       --build-arg "SANDBOX_RUNTIME_IMAGE=${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}" \
-      --tag "${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}" \
+      --tag "${BUILD_GATEWAY_IMAGE}" \
       --file "${ROOT}/e2e/docker/Dockerfile.external-kubernetes-gateway" \
       "${ROOT}"
   else
@@ -933,7 +938,11 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
       bash "${ROOT}/tasks/scripts/docker-build-image.sh" gateway
   fi
   sandbox_image="${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}"
-  supervisor_image="${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}"
+  if [ "${GATEWAY_IMAGE}" != "${BUILD_GATEWAY_IMAGE}" ]; then
+    if e2e_image_reference_has_digest "${GATEWAY_IMAGE}"; then echo "ERROR: digest-pinned GATEWAY_IMAGE requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=0" >&2; exit 2; fi
+    docker tag "${BUILD_GATEWAY_IMAGE}" "${GATEWAY_IMAGE}"
+  fi
+  supervisor_image="${BUILD_SUPERVISOR_IMAGE}"
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" != "1" ] \
      || ! docker image inspect "${sandbox_image}" >/dev/null 2>&1; then
     CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
@@ -950,13 +959,18 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
     reuse_supervisor_image=1
     echo "Reusing existing supervisor image ${supervisor_image}"
   fi
+  if [ "${SUPERVISOR_IMAGE}" != "${BUILD_SUPERVISOR_IMAGE}" ]; then
+    if e2e_image_reference_has_digest "${SUPERVISOR_IMAGE}"; then echo "ERROR: digest-pinned SUPERVISOR_IMAGE requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=0" >&2; exit 2; fi
+    docker tag "${BUILD_SUPERVISOR_IMAGE}" "${SUPERVISOR_IMAGE}"
+  fi
 fi
 
 if [ -n "${import_cluster_name}" ]; then
   for image in \
-    "${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}" \
+    "${GATEWAY_IMAGE}" \
     "${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}" \
-    "${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}"; do
+    "${SUPERVISOR_IMAGE}" \
+    "${SANDBOX_RUNTIME_IMAGE}"; do
     if docker image inspect "${image}" >/dev/null 2>&1; then
       echo "Importing ${image} into k3d cluster ${import_cluster_name}..."
       k3d image import "${image}" --cluster "${import_cluster_name}" \
@@ -967,7 +981,7 @@ elif [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ] \
    && [[ "${KUBE_CONTEXT}" == kind-* ]] \
    && command -v kind >/dev/null 2>&1; then
   kind_cluster_name="${KUBE_CONTEXT#kind-}"
-  kind_images=("${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}")
+  kind_images=("${GATEWAY_IMAGE}")
   # The CI workflow loads its published sandbox archive before invoking this
   # wrapper. Only load a sandbox image here when this script rebuilt it.
   if [ "${reuse_sandbox_image}" != "1" ]; then
@@ -975,9 +989,11 @@ elif [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ] \
   fi
   # The CI workflow loads its published supervisor archive before invoking this
   # wrapper. Only load a supervisor image here when this script rebuilt it.
-  if [ "${reuse_supervisor_image}" != "1" ]; then
-    kind_images+=("${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}")
+  if [ "${reuse_supervisor_image}" != "1" ] \
+     || [ "${SUPERVISOR_IMAGE}" != "${BUILD_SUPERVISOR_IMAGE}" ]; then
+    kind_images+=("${SUPERVISOR_IMAGE}")
   fi
+  if docker image inspect "${SANDBOX_RUNTIME_IMAGE}" >/dev/null 2>&1; then kind_images+=("${SANDBOX_RUNTIME_IMAGE}"); fi
   for image in "${kind_images[@]}"; do
     echo "Loading ${image} into kind cluster ${kind_cluster_name}..."
     kind load docker-image "${image}" --name "${kind_cluster_name}"
@@ -1164,12 +1180,9 @@ else
     --namespace "${NAMESPACE}" --create-namespace \
     "${helm_values_args[@]}" \
     --set "fullnameOverride=openshell" \
-    --set "image.repository=${REGISTRY_VALUE}/gateway" \
-    --set "image.tag=${IMAGE_TAG_VALUE}" \
-    --set "sandboxRuntime.image.repository=${REGISTRY_VALUE}/sandbox" \
-    --set "sandboxRuntime.image.tag=${IMAGE_TAG_VALUE}" \
-    --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
-    --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    "${GATEWAY_HELM_IMAGE_ARGS[@]}" \
+    "${SUPERVISOR_HELM_IMAGE_ARGS[@]}" \
+    "${SANDBOX_RUNTIME_HELM_IMAGE_ARGS[@]}" \
     "${helm_extra_args[@]}" \
     "${helm_post_renderer_args[@]}" \
     --wait --timeout 5m

@@ -38,8 +38,9 @@ on local Docker Desktop, or via `--add-host ...:host-gateway` on local Linux.
 The generated policy uses `protocol: mcp`, inserts the conformance runner's spec revision into the endpoint allowlist, and sets `mcp.allow_all_known_mcp_methods: true` so omitted rule methods use the endpoint MCP method profile. OpenShell enforces that allowlist on each non-initialize request using `MCP-Protocol-Version`, with `2025-03-26` as the missing-header fallback. The conformance runner selects the revision used by its client and server; OpenShell's request-version check does not yet provide complete revision-specific message parsing or response validation. The policy keeps OpenShell deny-by-default at the network boundary while allowing the upstream scenarios to exercise MCP behavior. The policy body lives in `policy-template.yaml`; the wrapper renders its MCP revision, host, port, and path placeholders from the upstream server URL.
 
 For local runs, the wrapper builds `openshell/supervisor:dev` automatically
-when no supervisor image override is set. Set `OPENSHELL_DOCKER_SUPERVISOR_IMAGE`
-or `OPENSHELL_SUPERVISOR_IMAGE` to use a prebuilt pullable image instead.
+when no supervisor image override is set. Set `SUPERVISOR_IMAGE` to use a
+prebuilt pullable image instead. The legacy `OPENSHELL_DOCKER_SUPERVISOR_IMAGE`
+and `OPENSHELL_SUPERVISOR_IMAGE` overrides remain supported and take precedence.
 
 The pinned upstream checkout includes reference-client fixture drift that is
 tracked in `modelcontextprotocol/conformance#345`. The wrapper patches the
