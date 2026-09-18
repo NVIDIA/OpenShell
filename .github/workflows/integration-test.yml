@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Integration Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact-run-id:
+        description: Workflow run containing the candidate artifacts
+        required: false
+        type: string
+        default: ""
+      category:
+        description: Integration-test category, used for the job name and concurrency key
+        required: true
+        type: string
+        default: conformance
+      test-matrix:
+        description: JSON array of scenario and testsuite combinations
+        required: true
+        type: string
+        default: >-
+          [
+            {"scenario":"ubuntu-docker-rootful","testsuite":"conformance"},
+            {"scenario":"fedora-podman-rootful","testsuite":"conformance"},
+            {"scenario":"fedora-podman-rootless","testsuite":"conformance"}
+          ]
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+
+jobs:
+  prepare:
+    uses: ./.github/workflows/prepare-integration-inputs.yml
+    with:
+      artifact-run-id: ${{ inputs['artifact-run-id'] }}
+
+  integration:
+    needs: prepare
+    uses: ./.github/workflows/integration-runner.yml
+    with:
+      category: ${{ inputs.category }}
+      source-sha: ${{ needs.prepare.outputs.source_sha }}
+      integration-inputs-artifact-id: ${{ needs.prepare.outputs.integration_inputs_artifact_id }}
+      test-matrix: ${{ inputs.test-matrix }}
