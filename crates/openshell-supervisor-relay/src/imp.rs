@@ -38,8 +38,9 @@
 //! Usage: `openshell-supervisor-relay.exe <target-port>` -- `<target-port>`
 //! is the TCP port the launched command is expected to bind (an early
 //! liveness check, `wait_for_port_ready`: if the target never binds it
-//! within 60s, this process exits with an error instead of sitting around
-//! with a target that will never work). This binary uses no `share_dir` files
+//! within the bounded five-minute cold-start budget, this process exits with
+//! an error instead of sitting around with a target that will never work).
+//! This binary uses no `share_dir` files
 //! at all -- command/env and shutdown both travel over the control channel.
 //!
 //! Shutdown: driver sends a `"shutdown"` request over the control channel
@@ -164,7 +165,7 @@ pub async fn run() -> anyhow::Result<()> {
     // budget after a caller was told shutdown succeeded.
     let mut shutdown_rx = shutdown_rx;
     tokio::select! {
-        result = wait_for_port_ready(&mut child, port, Duration::from_mins(1)) => {
+        result = wait_for_port_ready(&mut child, port, PORT_READY_PER_TRY_TIMEOUT) => {
             result?;
         }
         _ = &mut shutdown_rx => {
@@ -715,8 +716,11 @@ where
 
 /// Number of full-budget tries `wait_for_port_ready` makes -- each try gets
 /// its own complete `per_try_timeout` window, not a slice of it. Worst case
-/// total wait is `max_tries * per_try_timeout` (3 * 60s = 180s today).
-const PORT_READY_MAX_TRIES: u32 = 3;
+/// total wait is `max_tries * per_try_timeout` (5 * 60s = 300s today). Keep
+/// this aligned with the MXC driver's 310-second target-ready timeout so a
+/// cold process remains actively probed for the full advertised budget.
+const PORT_READY_MAX_TRIES: u32 = 5;
+const PORT_READY_PER_TRY_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Poll for the target port accepting TCP connections, bailing out early
 /// (rather than waiting out all tries) if the child process exits first — a
@@ -1013,11 +1017,19 @@ async fn run_lifecycle(mut child: tokio::process::Child, shutdown_rx: oneshot::R
 
 #[cfg(test)]
 mod forward_connect_tests {
-    use super::connect_forward_target;
+    use super::{PORT_READY_MAX_TRIES, PORT_READY_PER_TRY_TIMEOUT, connect_forward_target};
     use std::io::{Error, ErrorKind};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn port_ready_budget_covers_five_minute_cold_start_contract() {
+        assert_eq!(
+            PORT_READY_PER_TRY_TIMEOUT * PORT_READY_MAX_TRIES,
+            Duration::from_mins(5),
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn forward_connect_returns_success_without_retry_delay() {
