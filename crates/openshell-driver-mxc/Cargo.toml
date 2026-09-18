@@ -58,6 +58,8 @@ openshell-policy = { path = "../openshell-policy" }
 base64 = { workspace = true }
 rustls = { workspace = true }
 serde_json = { workspace = true }
+# Parse the shipped gateway templates in cross-platform drift guards.
+toml = { workspace = true }
 # Used by the drift guard test (handled_fields_inventory) to parse YAML into a
 # generic serde_json::Value for key enumeration.
 serde_yml = { workspace = true }
