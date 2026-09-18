@@ -128,6 +128,10 @@ pub struct VmComputeConfig {
     pub provider_spiffe_workload_api_tcp_endpoint: Option<String>,
     #[serde(default)]
     pub provider_spiffe_allow_guest_tcp: bool,
+
+    /// Allow bind-mounting host directories into VM sandboxes.
+    #[serde(default)]
+    pub enable_bind_mounts: bool,
 }
 
 impl VmComputeConfig {
@@ -257,6 +261,7 @@ impl Default for VmComputeConfig {
             proxy_ca_bundle: None,
             provider_spiffe_workload_api_tcp_endpoint: None,
             provider_spiffe_allow_guest_tcp: false,
+            enable_bind_mounts: false,
         }
     }
 }
@@ -598,6 +603,9 @@ pub async fn spawn(
         command.arg("--guest-tls-key").arg(tls.key);
     }
     append_vm_proxy_and_spiffe_args(&mut command, vm_config);
+    if vm_config.enable_bind_mounts {
+        command.arg("--enable-bind-mounts");
+    }
 
     let mut child = command.spawn().map_err(|e| {
         Error::execution(format!(

@@ -1124,6 +1124,9 @@ overlay_disk_mib = 4096
 # the exposure; host-only sockets are never exposed automatically.
 # provider_spiffe_workload_api_tcp_endpoint = "tcp:192.0.2.10:8081"
 # provider_spiffe_allow_guest_tcp = true
+# Unsafe operator override. Host bind mounts expose gateway-host paths inside
+# VM sandboxes and can negate OpenShell isolation and filesystem controls.
+# enable_bind_mounts = false
 # Where the gateway stages rootfs tar archives for `--from ./rootfs.tar`.
 # Defaults to <state_dir>/rootfs-tar-staging. The gateway creates one
 # request-scoped subdirectory per staging slot and removes it after use.

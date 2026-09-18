@@ -15,6 +15,10 @@ CONFIG_VIRTIO_BLK=y
 CONFIG_EXT4_FS=y
 CONFIG_EXT4_USE_FOR_EXT2=y
 
+# Host-directory sharing via virtiofs (used for VM driver bind mounts).
+CONFIG_FUSE_FS=y
+CONFIG_VIRTIO_FS=y
+
 # Cgroups used for process supervision and resource limits.
 CONFIG_CGROUPS=y
 CONFIG_CGROUP_DEVICE=y
