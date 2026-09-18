@@ -112,7 +112,9 @@ health, metrics, or tunnel routes. The plaintext service router also rejects
 browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
 cross-origin or sibling-subdomain request.
 
-Public API fields follow one entity-reference convention. `name` identifies the
+The normative public contract rules live in the
+[protobuf API conventions](../proto/README.md). Public API fields follow one
+entity-reference convention. `name` identifies the
 primary resource targeted by an RPC. A role field such as `sandbox`, `provider`,
 `service`, or `workload_template` identifies an entity referenced while
 operating on another resource or relationship. Entity references never append

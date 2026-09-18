@@ -465,7 +465,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `python/`       | Python SDK and bindings                       |
 | `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
 | `sdk/typescript/` | TypeScript SDK (Connect client and generated protobuf bindings) |
-| `proto/`        | Protocol buffer definitions                   |
+| `proto/`        | Protocol buffer definitions and [public API conventions](proto/README.md) |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
 | `docs/`         | Published Fern docs source, navigation, and content assets |
@@ -478,6 +478,13 @@ These are the primary `mise` tasks for day-to-day development:
 ## RFCs
 
 New features always start as GitHub issues using the feature request template. For cross-cutting architectural decisions, API contract changes, or process proposals that need broad consensus, maintainers may ask for an RFC from the issue and assign an RFC number there. RFCs live in `rfc/`. See [rfc/README.md](rfc/README.md) for the full lifecycle and guidelines.
+
+## Public API conventions
+
+Follow [the protobuf API conventions](proto/README.md) when adding or changing
+gRPC contracts. The guide defines entity-reference naming, workspace selectors,
+field design, and schema-evolution rules. Run `mise run proto:conventions` to
+check the mechanically enforceable rules.
 
 ## Documentation
 

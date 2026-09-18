@@ -29,6 +29,10 @@ depends = ["sdk:ts:install"]
 run = "./sdk/typescript/node_modules/.bin/buf lint"
 run_windows = "sdk\\typescript\\node_modules\\.bin\\buf.cmd lint"
 
+["proto:conventions"]
+description = "Check OpenShell public protobuf API conventions"
+run = "uv run --frozen python tasks/scripts/check_proto_api_conventions.py"
+
 ["sdk:ts:typecheck"]
 description = "Type-check the TypeScript SDK"
 depends = ["sdk:ts:proto"]

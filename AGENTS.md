@@ -83,6 +83,13 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer, doc writer) |
 | `architecture/` | Architecture docs | Design decisions and component documentation |
 
+## Public API Conventions
+
+Follow [proto/README.md](proto/README.md) for public protobuf API design. It is
+the canonical source for entity-reference naming, workspace selectors, field
+design, and schema evolution. Run `mise run proto:conventions` after changing a
+public request contract.
+
 ## Vouch System
 
 - First-time external contributors must be vouched before their PRs are accepted. The `vouch-check` workflow auto-closes PRs from unvouched users.
