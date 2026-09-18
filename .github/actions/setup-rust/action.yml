@@ -52,7 +52,7 @@ runs:
       shell: bash
       env:
         SCCACHE_VERSION: ${{ inputs.sccache-key || inputs.cache-key }}-${{ steps.dev-shell.outputs.hash }}-${{ runner.os }}-${{ runner.arch }}
-      run: |
+      run: | # zizmor: ignore[github-env] values are literal or trusted repository/runner-derived cache identifiers
         echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
         echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
         echo "SCCACHE_GHA_VERSION=${SCCACHE_VERSION}" >> "$GITHUB_ENV"
