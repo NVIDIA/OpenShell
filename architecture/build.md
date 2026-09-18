@@ -275,7 +275,7 @@ includes, templates, inventory, and requirements. The digest uses sorted
 relative paths, file contents, and executable permissions; source symlinks
 are unsupported. Both keys also retain the ordered playbook paths and contents,
 their base disk contents, and whether Galaxy is enabled; install keys
-include named binary inputs. The top-level `.roles` directory is excluded:
+include named artifact inputs. The top-level `.roles` directory is excluded:
 Galaxy release pins in `requirements.yaml` are treated as immutable, including
 any transitive dependency pins. Cache misses with Galaxy enabled reinstall
 the required roles and their dependencies before running playbooks.
@@ -286,7 +286,11 @@ the gateway, sandbox, and supervisor as separate binaries for their respective
 Dockerfiles. The helpers stage binaries under `artifacts/binaries` so local and
 CI builds expose the same inputs to tmachine and image assembly. The Ubuntu
 Docker and Fedora Podman environments import both local runtime images and
-configure the gateway to use them.
+configure the gateway to use them. The Ubuntu `deb` installer consumes
+`artifacts/packages/openshell.deb`; the `binaries` installer remains available
+for direct executable installation on every environment. Release Dev and
+Release Tag run Ubuntu conformance through the Debian package, while Fedora
+continues using direct executable installation until RPM coverage is available.
 
 ## Python Wheel Packaging
 

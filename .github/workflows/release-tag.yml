@@ -130,12 +130,14 @@ jobs:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
 
   prepare-integration:
-    needs: [compute-versions, build-binaries, build-images]
+    needs: [compute-versions, build-binaries, build-deb, build-images]
     permissions:
       actions: read
       contents: read
       packages: read
     uses: ./.github/workflows/prepare-integration-inputs.yml
+    with:
+      deb-artifact-name: deb-linux-amd64
 
   conformance-integration:
     needs: prepare-integration

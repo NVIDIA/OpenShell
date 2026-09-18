@@ -84,6 +84,18 @@ let
           openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
         };
       }
+      {
+        name = "deb";
+        use_galaxy = false;
+        playbooks = [
+          "ansible/playbooks/openshell-deb.yaml"
+        ];
+        inputs = {
+          openshell_deb = "../artifacts/packages/openshell.deb";
+          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+        };
+      }
     ];
 
     testsuites = [
