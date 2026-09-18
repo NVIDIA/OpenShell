@@ -698,7 +698,11 @@ pub async fn sandbox_create(
         Err(status) => return Err(miette::miette!(status.to_string())),
     };
     let response = response.into_inner();
-    let service_urls = response.service_urls;
+    let service_urls = response
+        .service_urls
+        .into_iter()
+        .map(|(service, url)| (service, service_url_for_gateway(&url, &effective_server)))
+        .collect::<HashMap<_, _>>();
     let sandbox = response
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
