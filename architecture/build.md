@@ -289,7 +289,8 @@ Docker and Fedora Podman environments import both local runtime images and
 configure the gateway to use them. The Ubuntu `deb` installer consumes
 `artifacts/packages/openshell.deb`; the `binaries` installer remains available
 for direct executable installation on every environment. Release Dev and
-Release Tag run Ubuntu conformance through both installers.
+Release Tag run Ubuntu conformance through the Debian package, while Fedora
+continues using direct executable installation until RPM coverage is available.
 
 ## Python Wheel Packaging
 
