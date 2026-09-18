@@ -4279,6 +4279,7 @@ dependencies = [
 name = "openshell-driver-vm"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "base64",
  "bollard",
  "clap",
@@ -4297,6 +4298,7 @@ dependencies = [
  "openshell-otel-test-support",
  "openshell-policy",
  "openshell-sandbox-backend",
+ "openshell-server",
  "openshell-vfio",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -4313,6 +4315,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
  "tower-http",
  "tracing",
@@ -4344,25 +4347,17 @@ name = "openshell-gateway"
 version = "0.0.0"
 dependencies = [
  "async-trait",
- "hyper-util",
  "miette",
- "nix 0.29.0",
  "openshell-core",
  "openshell-driver-docker",
  "openshell-driver-kubernetes",
  "openshell-driver-mxc",
  "openshell-driver-podman",
+ "openshell-driver-vm",
  "openshell-otel",
- "openshell-policy",
  "openshell-server",
- "rustix 1.1.4",
- "serde",
  "tempfile",
  "tokio",
- "toml",
- "tonic",
- "tower",
- "tracing",
 ]
 
 [[package]]

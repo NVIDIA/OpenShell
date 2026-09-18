@@ -1,59 +1,31 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! VM compute driver plumbing.
+//! Managed VM compute driver launch support.
 //!
-//! This module owns everything needed to hand the gateway a `Channel` speaking
-//! the `openshell.compute.v1.ComputeDriver` RPC surface against an
-//! `openshell-driver-vm` subprocess over a Unix domain socket:
+//! This module owns the VM-specific configuration and process launch contract
+//! for an `openshell-driver-vm` subprocess:
 //!
-//! - [`VmComputeConfig`]: gateway-local configuration (state dir, driver binary,
+//! - [`VmComputeConfig`]: launch configuration (state dir, driver binary,
 //!   VM shape, guest TLS material).
-//! - [`spawn`]: spawn the driver subprocess, wait for its UDS to be ready,
-//!   and return a live gRPC channel plus a [`ManagedDriverProcess`] handle
-//!   that will reap the subprocess and clean up the socket on drop.
+//! - [`spawn_managed_vm_driver`]: spawn the driver subprocess and return its
+//!   child handle and Unix domain socket path.
 //! - Helpers to resolve the driver binary, compute the socket path, and
-//!   validate guest TLS material when the gateway runs an `https://` control
-//!   plane.
+//!   validate guest TLS material for an `https://` control-plane endpoint.
 //!
-//! The VM-driver fields deliberately live here rather than in
-//! [`openshell_core::Config`] so the shared core stays free of driver-specific
-//! plumbing.
-//!
-//! Process launch remains deliberately VM-specific at this binary composition
-//! boundary: it translates gateway configuration into the standalone driver's
-//! argv and then connects through the same public compute-driver RPC interface
-//! used by operator-managed external drivers.
+//! Socket readiness, RPC connection, process supervision, and cleanup remain
+//! generic server concerns.
 
-#[cfg(unix)]
-use hyper_util::rt::TokioIo;
-#[cfg(unix)]
-use openshell_core::proto::compute::v1::{
-    GetCapabilitiesRequest, compute_driver_client::ComputeDriverClient,
-};
 use openshell_core::{Error, Result, UpstreamProxyConfig};
-#[cfg(unix)]
-use openshell_otel::TraceContextInterceptor;
-use openshell_server::AcquiredRemoteDriverEndpoint;
-#[cfg(unix)]
-use openshell_server::ManagedDriverProcess;
-use openshell_server::config_file::OtlpConfig;
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(unix)]
-use std::{io::ErrorKind, process::Stdio, sync::Arc, time::Duration};
-#[cfg(unix)]
-use tokio::net::UnixStream;
+use std::{io::ErrorKind, process::Stdio};
 #[cfg(unix)]
 use tokio::process::Command;
-use tonic::transport::Channel;
-#[cfg(unix)]
-use tonic::transport::Endpoint;
-#[cfg(unix)]
-use tower::service_fn;
 
 const DRIVER_BIN_NAME: &str = "openshell-driver-vm";
 const COMPUTE_DRIVER_SOCKET_RUN_DIR: &str = "run";
@@ -533,16 +505,28 @@ pub fn compute_driver_guest_tls_paths(
     Ok(Some(VmGuestTlsPaths { ca, cert, key }))
 }
 
-/// Launch the VM compute-driver subprocess, wait for its UDS to come up,
-/// and return a gRPC `Channel` connected to it plus a process handle that
-/// kills the subprocess and removes the socket on drop.
+/// A launched VM compute-driver process and the socket it will listen on.
+pub struct ManagedVmDriverProcess {
+    child: tokio::process::Child,
+    socket_path: PathBuf,
+}
+
+impl ManagedVmDriverProcess {
+    /// Consume the launch result into the generic server-owned process parts.
+    #[must_use]
+    pub fn into_parts(self) -> (tokio::process::Child, PathBuf) {
+        (self.child, self.socket_path)
+    }
+}
+
+/// Launch the VM compute-driver subprocess.
 #[cfg(unix)]
-pub async fn spawn(
+pub fn spawn_managed_vm_driver(
     gateway_log_level: &str,
     gateway_name: &str,
     vm_config: &VmComputeConfig,
-    otlp_config: Option<&OtlpConfig>,
-) -> Result<AcquiredRemoteDriverEndpoint> {
+    otlp_endpoint: Option<&str>,
+) -> Result<ManagedVmDriverProcess> {
     vm_config.validate_configuration()?;
     let driver_bin = resolve_compute_driver_bin(vm_config)?;
     let socket_path = compute_driver_socket_path(vm_config);
@@ -559,7 +543,7 @@ pub async fn spawn(
         .arg("--expected-peer-pid")
         .arg(std::process::id().to_string());
     command.arg("--log-level").arg(gateway_log_level);
-    append_otlp_args(&mut command, otlp_config, gateway_name);
+    append_otlp_args(&mut command, otlp_endpoint, gateway_name);
     command.arg("--grpc-endpoint").arg(&vm_config.grpc_endpoint);
     command.arg("--state-dir").arg(&vm_config.state_dir);
     if !vm_config.default_image.trim().is_empty() {
@@ -587,17 +571,13 @@ pub async fn spawn(
     }
     append_vm_proxy_and_spiffe_args(&mut command, vm_config);
 
-    let mut child = command.spawn().map_err(|e| {
+    let child = command.spawn().map_err(|e| {
         Error::execution(format!(
             "failed to launch vm compute driver '{}': {e}",
             driver_bin.display()
         ))
     })?;
-    let channel = wait_for_compute_driver(&socket_path, &mut child).await?;
-    let process = Arc::new(ManagedDriverProcess::new(child, socket_path));
-    Ok(AcquiredRemoteDriverEndpoint::managed(
-        "vm", channel, process,
-    ))
+    Ok(ManagedVmDriverProcess { child, socket_path })
 }
 
 fn validate_vm_sandbox_identity(config: &VmComputeConfig) -> Result<()> {
@@ -670,91 +650,23 @@ fn append_vm_proxy_and_spiffe_args(command: &mut Command, config: &VmComputeConf
     }
 }
 
-fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>, gateway_name: &str) {
-    if let Some(config) = otlp_config {
-        command.arg("--otlp-endpoint").arg(&config.endpoint);
+fn append_otlp_args(command: &mut Command, otlp_endpoint: Option<&str>, gateway_name: &str) {
+    if let Some(endpoint) = otlp_endpoint {
+        command.arg("--otlp-endpoint").arg(endpoint);
         command.arg("--gateway-name").arg(gateway_name);
     }
 }
 
 #[cfg(not(unix))]
-pub async fn spawn(
+pub fn spawn_managed_vm_driver(
     _gateway_log_level: &str,
     _gateway_name: &str,
     _vm_config: &VmComputeConfig,
-    _otlp_config: Option<&OtlpConfig>,
-) -> Result<AcquiredRemoteDriverEndpoint> {
+    _otlp_endpoint: Option<&str>,
+) -> Result<ManagedVmDriverProcess> {
     Err(Error::config(
         "the vm compute driver requires unix domain socket support",
     ))
-}
-
-#[cfg(unix)]
-#[tracing::instrument(
-    name = "driver.wait_for_ready",
-    skip_all,
-    fields(
-        otel.name = "driver.wait_for_ready",
-        otel.status_code = tracing::field::Empty,
-        driver.name = "vm",
-    )
-)]
-async fn wait_for_compute_driver(
-    socket_path: &Path,
-    child: &mut tokio::process::Child,
-) -> Result<Channel> {
-    let mut last_error: Option<String> = None;
-    for _ in 0..100 {
-        let try_wait_result = child.try_wait().map_err(|e| {
-            Error::execution(format!("failed to poll vm compute driver process: {e}"))
-        })?;
-        if let Some(status) = try_wait_result {
-            return Err(Error::execution(format!(
-                "vm compute driver exited before becoming ready with status {status}"
-            )));
-        }
-
-        match connect_compute_driver(socket_path).await {
-            Ok(channel) => {
-                let mut client =
-                    ComputeDriverClient::with_interceptor(channel.clone(), TraceContextInterceptor);
-                match client
-                    .get_capabilities(tonic::Request::new(GetCapabilitiesRequest {}))
-                    .await
-                {
-                    Ok(_) => return Ok(channel),
-                    Err(status) => last_error = Some(status.to_string()),
-                }
-            }
-            Err(err) => last_error = Some(err.to_string()),
-        }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    Err(Error::execution(format!(
-        "timed out waiting for vm compute driver socket '{}': {}",
-        socket_path.display(),
-        last_error.unwrap_or_else(|| "unknown error".to_string())
-    )))
-}
-
-#[cfg(unix)]
-async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
-    let socket_path = socket_path.to_path_buf();
-    let display_path = socket_path.clone();
-    Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(service_fn(move |_: tonic::transport::Uri| {
-            let socket_path = socket_path.clone();
-            async move { UnixStream::connect(socket_path).await.map(TokioIo::new) }
-        }))
-        .await
-        .map_err(|e| {
-            Error::execution(format!(
-                "failed to connect to vm compute driver socket '{}': {e}",
-                display_path.display()
-            ))
-        })
 }
 
 #[cfg(all(test, unix))]
@@ -767,7 +679,6 @@ mod tests {
         validate_vm_sandbox_identity,
     };
     use openshell_core::UpstreamProxyConfig;
-    use openshell_server::config_file::OtlpConfig;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
@@ -786,10 +697,7 @@ mod tests {
         let mut command = tokio::process::Command::new("openshell-driver-vm");
         append_otlp_args(
             &mut command,
-            Some(&OtlpConfig {
-                endpoint: "http://collector.internal:4317".to_string(),
-                service_name: Some("custom-gateway".to_string()),
-            }),
+            Some("http://collector.internal:4317"),
             "production-us-west",
         );
 

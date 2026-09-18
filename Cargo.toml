@@ -13,6 +13,8 @@ license = "Apache-2.0"
 repository = "https://github.com/NVIDIA/OpenShell"
 
 [workspace.dependencies]
+openshell-managed-compute-driver = { package = "openshell-driver-vm", path = "crates/openshell-driver-vm", default-features = false }
+
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
 

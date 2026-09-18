@@ -23,17 +23,10 @@ miette = { workspace = true }
 tokio = { workspace = true }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
+openshell-managed-compute-driver = { workspace = true, features = ["gateway-integration"], optional = true }
 openshell-driver-docker = { path = "../openshell-driver-docker", optional = true }
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes", optional = true }
 openshell-driver-podman = { path = "../openshell-driver-podman", optional = true }
-openshell-policy = { path = "../openshell-policy", optional = true }
-hyper-util = { workspace = true, optional = true }
-nix = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
-rustix = { workspace = true, optional = true }
-tonic = { workspace = true, optional = true }
-tower = { workspace = true, optional = true }
-tracing = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 openshell-driver-mxc = { path = "../openshell-driver-mxc", optional = true }
@@ -43,25 +36,15 @@ default = ["telemetry", "in-tree-compute-drivers"]
 in-tree-compute-drivers = [
     "compute-driver-docker",
     "compute-driver-kubernetes",
+    "compute-driver-managed",
     "compute-driver-podman",
-    "compute-driver-vm",
     "compute-driver-mxc",
 ]
 compute-driver-mxc = ["dep:openshell-driver-mxc"]
 compute-driver-docker = ["dep:openshell-driver-docker", "dep:openshell-otel"]
 compute-driver-kubernetes = ["dep:openshell-driver-kubernetes", "dep:openshell-otel"]
+compute-driver-managed = ["dep:openshell-managed-compute-driver"]
 compute-driver-podman = ["dep:openshell-driver-podman", "dep:openshell-otel"]
-compute-driver-vm = [
-    "dep:openshell-policy",
-    "dep:openshell-otel",
-    "dep:hyper-util",
-    "dep:nix",
-    "dep:serde",
-    "dep:rustix",
-    "dep:tonic",
-    "dep:tower",
-    "dep:tracing",
-]
 telemetry = ["openshell-core/telemetry", "openshell-server/telemetry"]
 ## Convenience alias: every default feature except `telemetry`. Build a
 ## telemetry-free gateway with
@@ -79,4 +62,3 @@ workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-toml = { workspace = true }

@@ -17,12 +17,16 @@ pub mod driver;
 mod embedded_runtime;
 #[cfg(feature = "compute-driver")]
 mod ffi;
+#[cfg(all(not(target_os = "windows"), feature = "gateway-integration"))]
+mod gateway;
 #[cfg(feature = "compute-driver")]
 pub mod gpu;
 #[cfg(feature = "compute-driver")]
 mod isolation;
 #[cfg(feature = "compute-driver")]
 pub mod lifecycle;
+#[cfg(feature = "managed")]
+mod managed;
 #[cfg(feature = "compute-driver")]
 pub mod otel_tracing;
 #[cfg(feature = "compute-driver")]
@@ -34,12 +38,16 @@ mod runtime;
 
 #[cfg(feature = "compute-driver")]
 pub use driver::{VmDriver, VmDriverConfig};
+#[cfg(all(not(target_os = "windows"), feature = "gateway-integration"))]
+pub use gateway::gateway_registration;
 #[cfg(feature = "compute-driver")]
 pub use lifecycle::{
     BackendFeature, ExtensionCapabilities, ExtensionDescriptor, GuestInitDropin, LaunchAbortReason,
     LaunchPlan, LifecycleError, LifecycleExtension, LifecycleExtensionRegistry, LifecycleResult,
     RestoreContext,
 };
+#[cfg(feature = "managed")]
+pub use managed::{ManagedVmDriverProcess, VmComputeConfig, spawn_managed_vm_driver};
 #[cfg(feature = "compute-driver")]
 pub use runtime::{
     VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, VsockPortMap, configured_runtime_dir, run_vm,

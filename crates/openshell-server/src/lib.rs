@@ -1106,6 +1106,7 @@ async fn terminate_signal() {
 
 pub use compute::{
     AcquiredRemoteDriverEndpoint, DriverWatchStream, ManagedDriverProcess, SharedComputeDriver,
+    connect_managed_compute_driver,
 };
 
 /// Driver instance returned by a compiled compute-driver factory.

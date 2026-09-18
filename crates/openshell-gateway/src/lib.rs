@@ -16,9 +16,6 @@ compile_error!(
      build a telemetry-free gateway with `--no-default-features --features defaults-without-telemetry`"
 );
 
-#[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
-mod vm;
-
 #[cfg(any(
     all(target_os = "windows", feature = "compute-driver-mxc"),
     all(
@@ -26,8 +23,7 @@ mod vm;
         any(
             feature = "compute-driver-docker",
             feature = "compute-driver-kubernetes",
-            feature = "compute-driver-podman",
-            feature = "compute-driver-vm"
+            feature = "compute-driver-podman"
         )
     )
 ))]
@@ -36,8 +32,7 @@ use openshell_core::telemetry::TelemetryComputeDriver;
     target_os = "windows",
     feature = "compute-driver-docker",
     feature = "compute-driver-kubernetes",
-    feature = "compute-driver-podman",
-    feature = "compute-driver-vm"
+    feature = "compute-driver-podman"
 ))]
 use openshell_server::ComputeDriverRegistration;
 use openshell_server::ComputeDriverRegistry;
@@ -52,11 +47,17 @@ pub fn install_default_compute_drivers() -> ComputeDriverRegistry {
         any(
             feature = "compute-driver-docker",
             feature = "compute-driver-kubernetes",
-            feature = "compute-driver-podman",
-            feature = "compute-driver-vm"
+            feature = "compute-driver-podman"
         )
     ))]
     install_in_tree_compute_drivers(&mut registry);
+    #[cfg(all(not(target_os = "windows"), feature = "compute-driver-managed"))]
+    registry
+        .install(
+            openshell_managed_compute_driver::gateway_registration()
+                .expect("managed driver name is valid"),
+        )
+        .expect("first-party driver names are unique");
     #[cfg(all(target_os = "windows", feature = "compute-driver-mxc"))]
     install_mxc_compute_driver(&mut registry);
     #[cfg(target_os = "windows")]
@@ -84,8 +85,6 @@ fn install_unsupported_windows_compute_drivers(registry: &mut ComputeDriverRegis
         "kubernetes",
         #[cfg(feature = "compute-driver-podman")]
         "podman",
-        #[cfg(feature = "compute-driver-vm")]
-        "vm",
     ];
     for &name in names {
         let registration = ComputeDriverRegistration::new(
@@ -171,8 +170,7 @@ impl openshell_server::ComputeDriverFactory for MxcFactory {
     any(
         feature = "compute-driver-docker",
         feature = "compute-driver-kubernetes",
-        feature = "compute-driver-podman",
-        feature = "compute-driver-vm"
+        feature = "compute-driver-podman"
     )
 ))]
 fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
@@ -215,12 +213,6 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("docker"))
                 .with_local_singleplayer()
                 .with_in_process_tracing(openshell_driver_docker::otel_tracing::TRACING)
-        }),
-        #[cfg(feature = "compute-driver-vm")]
-        ComputeDriverRegistration::new("vm", u16::MAX, None, VmFactory).map(|registration| {
-            registration
-                .with_telemetry_category(TelemetryComputeDriver::anonymous_category("vm"))
-                .with_local_singleplayer()
         }),
     ] {
         registry
@@ -387,86 +379,9 @@ fn podman_config(
     Ok(config)
 }
 
-#[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
-#[derive(Clone, Copy)]
-struct VmFactory;
-
-#[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
-#[async_trait::async_trait]
-impl openshell_server::ComputeDriverFactory for VmFactory {
-    fn supports_config_preflight(&self) -> bool {
-        true
-    }
-
-    fn validate_config(
-        &self,
-        context: openshell_server::ComputeDriverConfigContext<'_>,
-    ) -> openshell_core::Result<()> {
-        let mut config = vm_config(context)?;
-        if config.grpc_endpoint.trim().is_empty() {
-            let scheme = if context.gateway_tls_enabled() {
-                "https"
-            } else {
-                "http"
-            };
-            config.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", context.gateway_port());
-        }
-        config.validate_configuration()
-    }
-
-    async fn build(
-        &self,
-        context: openshell_server::ComputeDriverBuildContext<'_>,
-    ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let mut config = vm_config(context.config_context())?;
-        require_guest_tls_for_local_driver(&context, "vm")?;
-        if config.grpc_endpoint.trim().is_empty()
-            && (!context.gateway_tls_enabled() || context.guest_tls_paths().is_some())
-        {
-            let scheme = if context.gateway_tls_enabled() {
-                "https"
-            } else {
-                "http"
-            };
-            config.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", context.gateway_port());
-        }
-        apply_guest_tls(
-            &mut config.guest_tls_ca,
-            &mut config.guest_tls_cert,
-            &mut config.guest_tls_key,
-            context.guest_tls_paths(),
-        );
-        let endpoint = vm::spawn(
-            context.gateway_log_level(),
-            context.gateway_name(),
-            &config,
-            context.otlp_config(),
-        )
-        .await?;
-        Ok(openshell_server::ComputeDriverInstance::ManagedRemote(
-            endpoint,
-        ))
-    }
-}
-
-#[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
-fn vm_config(
-    context: openshell_server::ComputeDriverConfigContext<'_>,
-) -> openshell_core::Result<vm::VmComputeConfig> {
-    let mut config: vm::VmComputeConfig = context.driver_config()?;
-    if config.state_dir.as_os_str().is_empty() {
-        config.state_dir = vm::VmComputeConfig::default_state_dir();
-    }
-    Ok(config)
-}
-
 #[cfg(all(
     not(target_os = "windows"),
-    any(
-        feature = "compute-driver-docker",
-        feature = "compute-driver-podman",
-        feature = "compute-driver-vm"
-    )
+    any(feature = "compute-driver-docker", feature = "compute-driver-podman")
 ))]
 fn require_guest_tls_for_local_driver(
     context: &openshell_server::ComputeDriverBuildContext<'_>,
@@ -481,11 +396,7 @@ fn require_guest_tls_for_local_driver(
 
 #[cfg(all(
     not(target_os = "windows"),
-    any(
-        feature = "compute-driver-docker",
-        feature = "compute-driver-podman",
-        feature = "compute-driver-vm"
-    )
+    any(feature = "compute-driver-docker", feature = "compute-driver-podman")
 ))]
 fn validate_local_driver_guest_tls(
     gateway_tls_enabled: bool,
@@ -502,11 +413,7 @@ fn validate_local_driver_guest_tls(
 
 #[cfg(all(
     not(target_os = "windows"),
-    any(
-        feature = "compute-driver-docker",
-        feature = "compute-driver-podman",
-        feature = "compute-driver-vm"
-    )
+    any(feature = "compute-driver-docker", feature = "compute-driver-podman")
 ))]
 fn apply_guest_tls(
     ca: &mut Option<std::path::PathBuf>,
@@ -528,11 +435,7 @@ fn apply_guest_tls(
 #[cfg(all(
     test,
     not(target_os = "windows"),
-    any(
-        feature = "compute-driver-docker",
-        feature = "compute-driver-podman",
-        feature = "compute-driver-vm"
-    )
+    any(feature = "compute-driver-docker", feature = "compute-driver-podman")
 ))]
 mod local_driver_tests {
     use super::{apply_guest_tls, validate_local_driver_guest_tls};
@@ -541,17 +444,16 @@ mod local_driver_tests {
     #[test]
     #[cfg(feature = "in-tree-compute-drivers")]
     fn linux_builtin_compute_driver_registry_has_expected_names() {
-        assert_eq!(
-            super::install_default_compute_drivers()
-                .installed_driver_names()
-                .collect::<Vec<_>>(),
-            ["docker", "kubernetes", "podman", "vm"]
-        );
+        let registry = super::install_default_compute_drivers();
+        assert_eq!(registry.installed_driver_names().count(), 4);
+        for name in ["docker", "kubernetes", "podman"] {
+            assert!(registry.installed_driver_names().any(|item| item == name));
+        }
     }
 
     #[test]
     fn tls_enabled_local_drivers_require_a_guest_bundle() {
-        for driver_name in ["docker", "podman", "vm"] {
+        for driver_name in ["docker", "podman"] {
             let error = validate_local_driver_guest_tls(true, false, driver_name)
                 .expect_err("TLS-enabled local driver must require guest TLS");
             let message = error.to_string();
@@ -620,14 +522,17 @@ mod tests {
             "mxc",
             #[cfg(feature = "compute-driver-podman")]
             "podman",
-            #[cfg(feature = "compute-driver-vm")]
-            "vm",
         ];
+        let registry = install_default_compute_drivers();
+        #[cfg(all(not(target_os = "windows"), feature = "compute-driver-managed"))]
         assert_eq!(
-            install_default_compute_drivers()
-                .installed_driver_names()
-                .collect::<Vec<_>>(),
-            expected
+            registry.installed_driver_names().count(),
+            expected.len() + 1
         );
+        #[cfg(not(all(not(target_os = "windows"), feature = "compute-driver-managed")))]
+        assert_eq!(registry.installed_driver_names().count(), expected.len());
+        for name in expected {
+            assert!(registry.installed_driver_names().any(|item| item == name));
+        }
     }
 }

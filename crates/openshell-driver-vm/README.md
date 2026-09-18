@@ -11,8 +11,8 @@ The driver embeds libkrun, libkrunfw, the guest OCI unpacker, the portable guest
 ```mermaid
 flowchart LR
     subgraph host["Host"]
-        gateway["openshell-gateway<br/>(vm::spawn)"]
-        driver["openshell-driver-vm<br/>libkrun"]
+        gateway["openshell-gateway<br/>(generic registry consumer)"]
+        driver["openshell-driver-vm<br/>driver-owned registry adapter + libkrun"]
         supervisor["openshell-supervisor<br/>host policy supervisor"]
         gateway <-->|"gRPC over UDS<br/>compute-driver.sock"| driver
         supervisor <-->|"authenticated gRPC<br/>policy + relay"| gateway
@@ -305,5 +305,6 @@ so driver choice remains automatic unless the user explicitly overrides it.
 
 ## TODOs
 
-- The gateway still configures the driver via CLI args; this will move to a gRPC bootstrap call so the driver interface is uniform across backends. See the `TODO(driver-abstraction)` note in `crates/openshell-gateway/src/vm.rs`.
+- Managed launch still configures the driver via CLI args; a future gRPC
+  bootstrap call can make configuration uniform across standalone backends.
 - macOS local builds are codesigned by `tasks/scripts/gateway-vm.sh`; the generated Homebrew formula signs the release tarball driver for local installs.

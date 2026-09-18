@@ -153,6 +153,14 @@ compose that gateway with Docker, Podman, Kubernetes, and VM driver executables
 over the public UDS gRPC contract so an in-tree driver cannot silently depend
 on a server-only API.
 
+Driver crates own their configuration defaults and backend-specific startup
+contract. The standalone VM driver exposes a lightweight `managed` feature for
+its configuration and subprocess arguments; this does not link libkrun or the
+VM runtime into the gateway. Its optional `gateway-integration` feature owns the
+`ComputeDriverFactory` adapter and exports an opaque registration; the gateway
+only installs that provider. The server owns the generic managed-child readiness
+probe, UDS connection, supervision, and socket cleanup.
+
 ## Stop and Start Lifecycle
 
 The gateway persists lifecycle intent before mutating compute:
@@ -328,10 +336,10 @@ can request a specific number of GPUs or the driver-specific default behaviour.
 For all in-tree drivers, this is equivalent to selecting a single GPU.
 
 VM runtime state paths are derived only from driver-validated sandbox IDs
-matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
-private `run/` directory plus Unix peer UID/PID checks. Standalone
-unauthenticated TCP mode is disabled unless explicitly enabled for local
-development.
+matching `[A-Za-z0-9._-]{1,128}`. The gateway-managed VM driver socket uses a
+driver-configured private `run/` directory plus Unix peer UID/PID checks.
+Standalone unauthenticated TCP mode is disabled unless explicitly enabled for
+local development.
 
 Runtime-specific implementation notes belong in the driver crate README:
 

@@ -451,6 +451,28 @@ async fn managed_driver_shutdown_sends_sigterm_before_forcing_exit() {
     assert_eq!(std::fs::read_to_string(terminated).unwrap(), "terminated");
 }
 
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn managed_driver_connection_reports_early_process_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("exit 7")
+        .spawn()
+        .unwrap();
+
+    let error =
+        connect_managed_compute_driver("test", dir.path().join("missing-driver.sock"), child)
+            .await
+            .expect_err("an exited driver must fail readiness");
+
+    assert!(
+        error
+            .to_string()
+            .contains("test compute driver exited before becoming ready")
+    );
+}
+
 #[derive(Debug)]
 pub struct AcquiredRemoteDriverEndpoint {
     pub(crate) name: String,
@@ -4237,6 +4259,96 @@ fn is_failed_main_process_result(sandbox: &Sandbox) -> bool {
         })
 }
 
+/// Connect to a compute driver subprocess owned by the gateway.
+///
+/// The caller owns driver-specific process construction. The server owns the
+/// generic readiness probe, process supervision, and socket cleanup after the
+/// child and socket path cross this boundary.
+#[cfg(unix)]
+#[tracing::instrument(
+    name = "driver.wait_for_ready",
+    skip_all,
+    fields(
+        otel.name = "driver.wait_for_ready",
+        otel.status_code = tracing::field::Empty,
+        driver.name = tracing::field::Empty,
+    )
+)]
+pub async fn connect_managed_compute_driver(
+    name: impl Into<String>,
+    socket_path: PathBuf,
+    mut child: tokio::process::Child,
+) -> Result<AcquiredRemoteDriverEndpoint, ComputeError> {
+    let name = name.into();
+    tracing::Span::current().record("driver.name", &name);
+    let mut last_error: Option<String> = None;
+
+    for _ in 0..100 {
+        let status = child.try_wait().map_err(|error| {
+            ComputeError::Message(format!(
+                "failed to poll {name} compute driver process: {error}"
+            ))
+        })?;
+        if let Some(status) = status {
+            return Err(ComputeError::Message(format!(
+                "{name} compute driver exited before becoming ready with status {status}"
+            )));
+        }
+
+        match connect_compute_driver_socket(&socket_path).await {
+            Ok(channel) => {
+                let mut client =
+                    ComputeDriverClient::with_interceptor(channel.clone(), TraceContextInterceptor);
+                match client
+                    .get_capabilities(Request::new(GetCapabilitiesRequest {}))
+                    .await
+                {
+                    Ok(_) => {
+                        let process = Arc::new(ManagedDriverProcess::new(child, socket_path));
+                        return Ok(AcquiredRemoteDriverEndpoint::managed(
+                            name, channel, process,
+                        ));
+                    }
+                    Err(status) => last_error = Some(status.to_string()),
+                }
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(ComputeError::Message(format!(
+        "timed out waiting for {name} compute driver socket '{}': {}",
+        socket_path.display(),
+        last_error.unwrap_or_else(|| "unknown error".to_string())
+    )))
+}
+
+#[cfg(not(unix))]
+pub async fn connect_managed_compute_driver(
+    _name: impl Into<String>,
+    _socket_path: PathBuf,
+    _child: tokio::process::Child,
+) -> Result<AcquiredRemoteDriverEndpoint, ComputeError> {
+    Err(ComputeError::Message(
+        "managed compute driver endpoints require unix domain socket support".to_string(),
+    ))
+}
+
+#[cfg(unix)]
+async fn connect_compute_driver_socket(
+    socket_path: &Path,
+) -> Result<Channel, tonic::transport::Error> {
+    let connector_path = socket_path.to_path_buf();
+    Endpoint::from_static("http://[::]:50051")
+        .connect_with_connector(service_fn(move |_: tonic::transport::Uri| {
+            let connector_path = connector_path.clone();
+            async move { UnixStream::connect(connector_path).await.map(TokioIo::new) }
+        }))
+        .await
+}
+
 /// Connect to an unmanaged remote compute driver that is already listening on
 /// `socket_path` and return the acquired endpoint.
 ///
@@ -4252,14 +4364,7 @@ pub async fn connect_remote_compute_driver(
     let socket_path = socket_path.to_path_buf();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let channel = loop {
-        let connector_path = socket_path.clone();
-        match Endpoint::from_static("http://[::]:50051")
-            .connect_with_connector(service_fn(move |_: tonic::transport::Uri| {
-                let connector_path = connector_path.clone();
-                async move { UnixStream::connect(connector_path).await.map(TokioIo::new) }
-            }))
-            .await
-        {
+        match connect_compute_driver_socket(&socket_path).await {
             Ok(channel) => break channel,
             Err(error) if tokio::time::Instant::now() < deadline => {
                 tracing::debug!(

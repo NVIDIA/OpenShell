@@ -31,7 +31,9 @@ openshell-otel = { path = "../openshell-otel", optional = true }
 openshell-policy = { path = "../openshell-policy", optional = true }
 openshell-driver-podman = { path = "../openshell-driver-podman", optional = true }
 openshell-vfio = { path = "../openshell-vfio", optional = true }
+openshell-server = { path = "../openshell-server", default-features = false, optional = true }
 
+async-trait = { version = "0.1", optional = true }
 base64 = { workspace = true, optional = true }
 bollard = { version = "0.20", features = ["ssh"], optional = true }
 tokio = { workspace = true }
@@ -65,8 +67,15 @@ zstd = { version = "0.13", optional = true }
 
 [features]
 default = ["compute-driver", "telemetry"]
+## Expose VM-specific managed launch configuration without linking the VM
+## runtime implementation into the gateway process.
+managed = ["dep:openshell-policy", "dep:rustix"]
+## Adapt the standalone driver to the standard gateway registry. The adapter
+## remains driver-owned and does not pull the VM runtime into the gateway.
+gateway-integration = ["managed", "dep:async-trait", "dep:openshell-server"]
 ## Build the standalone compute driver and its host runtime implementation.
 compute-driver = [
+    "managed",
     "dep:base64",
     "dep:bollard",
     "dep:clap",
@@ -78,7 +87,6 @@ compute-driver = [
     "dep:nix",
     "dep:oci-client",
     "dep:openshell-otel",
-    "dep:openshell-policy",
     "dep:openshell-driver-podman",
     "dep:openshell-vfio",
     "dep:opentelemetry",
@@ -87,7 +95,6 @@ compute-driver = [
     "dep:prost",
     "dep:prost-types",
     "dep:rand",
-    "dep:rustix",
     "dep:sha2",
     "dep:tar",
     "dep:tokio-stream",
@@ -117,6 +124,7 @@ defaults-without-telemetry = ["compute-driver"]
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 temp-env = "0.3"
 tempfile = "3"
+toml = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 # smol-rs/polling drives the BSD/macOS parent-death detection in
