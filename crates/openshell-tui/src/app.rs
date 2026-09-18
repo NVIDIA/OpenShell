@@ -657,6 +657,7 @@ pub struct App {
     pub sandbox_created: Vec<String>,
     pub sandbox_images: Vec<String>,
     pub sandbox_notes: Vec<String>,
+    pub sandbox_detail_notes: Vec<String>,
     /// Formatted labels for each sandbox (e.g., "env=prod,team=platform" or empty string).
     pub sandbox_labels: Vec<String>,
     /// Formatted annotations for each sandbox (e.g., "policy-signature=abc" or empty string).
@@ -1019,6 +1020,7 @@ impl App {
             sandbox_created: Vec::new(),
             sandbox_images: Vec::new(),
             sandbox_notes: Vec::new(),
+            sandbox_detail_notes: Vec::new(),
             sandbox_labels: Vec::new(),
             sandbox_annotations: Vec::new(),
             sandbox_workspaces: Vec::new(),
@@ -3528,6 +3530,7 @@ impl App {
         self.sandbox_created.clear();
         self.sandbox_images.clear();
         self.sandbox_notes.clear();
+        self.sandbox_detail_notes.clear();
         self.sandbox_labels.clear();
         self.sandbox_annotations.clear();
         self.sandbox_policy_versions.clear();

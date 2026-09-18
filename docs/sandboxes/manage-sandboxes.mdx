@@ -609,6 +609,8 @@ Use the terminal to spot blocked connections marked `action=deny` and provider-r
 
 The dashboard has three panels stacked vertically: Gateways, Providers (or Global Settings), and Sandboxes. Navigate within a panel with `Up`/`Down` or `j`/`k`. At a list boundary the cursor overflows into the adjacent panel, skipping empty panels. Use `Tab`/`Shift+Tab` to cycle panels directly. Press `h`/`l` or `Left`/`Right` in the middle panel to switch between the Providers and Global Settings tabs.
 
+The sandbox table’s NOTES column shows `Invalid config` when policy or provider configuration blocks provisioning. Open the sandbox detail view for the full rejection reason, or run `openshell sandbox get <name> -o json`. The note clears after the configuration is repaired; active port forwards remain listed.
+
 ## Port Forwarding
 
 Forward a local port to a running sandbox to access services inside it, such as a web server or database:
@@ -759,6 +761,39 @@ after it attempts every requested deletion if any entry failed.
 ## Sandbox Lifecycle
 
 Every sandbox moves through a defined set of phases:
+
+Before workload activation, OpenShell validates the effective policy and matching
+provider configuration. A rejection keeps the workload unstarted and exposes a
+`ConfigurationInvalid` condition in `Provisioning`. Use `openshell sandbox get`
+to inspect the diagnostic, then [repair the policy or provider configuration](/sandboxes/policies#validation-failures).
+Management operations remain available while startup is blocked. After repair,
+the supervisor completes startup without recreating the sandbox. Starting a
+stopped sandbox repeats configuration admission before launching its workload.
+
+The gateway enforces a 300-second provisioning repair window, independently of
+the CLI wait timeout. An effective policy, settings, provider, profile, or
+attachment change resets the window from its stored change time. The first
+failed configuration load for that change grants another full window. Repeated
+failures and reconnects do not extend it; reaching `Ready` clears it.
+
+When the window expires, the sandbox enters `Error` with reason
+`ProvisioningTimedOut`. The gateway stops its workload and supervisor compute,
+retaining the sandbox record, diagnostic, and restartable storage. Cleanup can
+remain pending if the backend is unavailable; the gateway retries it. Inspect
+`provisioning` in JSON output for the deadline, timeout, and cleanup timestamps.
+TUI NOTES distinguishes pending cleanup from reclaimed compute.
+
+Repair the configuration, wait for cleanup to complete, then explicitly restart:
+
+```shell
+openshell sandbox get my-sandbox --output json
+openshell sandbox start my-sandbox
+```
+
+Editing configuration after expiry does not restart compute. A retry gets a new
+300-second window, while static-policy restrictions from any previous activation
+remain in force. Timed-out records are retained even for ephemeral creates; use
+`sandbox delete` when you no longer need the diagnostic or stored state.
 
 | Phase        | Description                                                                                                                                                    |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |

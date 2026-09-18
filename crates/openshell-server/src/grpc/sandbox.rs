@@ -420,6 +420,13 @@ async fn handle_create_sandbox_inner(
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
+    super::provider::validate_provider_profiles_present(
+        state.store.as_ref(),
+        &provider_profile_catalog,
+        &workspace,
+        &spec.providers,
+    )
+    .await?;
     validate_provider_environment_keys_unique_with_catalog(
         state.store.as_ref(),
         &provider_profile_catalog,
@@ -483,6 +490,31 @@ async fn handle_create_sandbox_inner(
         created_from_workload_template,
     };
     sandbox.set_phase(SandboxPhase::Provisioning as i32);
+    sandbox
+        .status
+        .get_or_insert_with(Default::default)
+        .configuration_admission = Some(openshell_core::proto::SandboxConfigurationAdmission {
+        state: openshell_core::proto::ConfigurationAdmissionState::Pending.into(),
+        ..Default::default()
+    });
+    sandbox
+        .status
+        .as_mut()
+        .expect("status initialized")
+        .configuration_activated = Some(false);
+    sandbox
+        .status
+        .as_mut()
+        .expect("status initialized")
+        .provisioning = Some(crate::compute::provisioning_deadline::new_record(now_ms));
+    crate::compute::provisioning_deadline::refresh_configuration(
+        &state.store,
+        &mut sandbox,
+        now_ms,
+    )
+    .await
+    .map_err(Status::internal)?;
+    crate::compute::apply_configuration_readiness(&mut sandbox);
 
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
     super::validation::validate_object_metadata(sandbox.metadata.as_ref(), "sandbox")?;
@@ -1165,6 +1197,13 @@ pub(super) async fn handle_attach_sandbox_provider(
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
+    super::provider::validate_provider_profiles_present(
+        state.store.as_ref(),
+        &provider_profile_catalog,
+        &workspace,
+        &candidate_spec.providers,
+    )
+    .await?;
     validate_provider_environment_keys_unique_with_catalog(
         state.store.as_ref(),
         &provider_profile_catalog,
@@ -1215,6 +1254,10 @@ pub(super) async fn handle_attach_sandbox_provider(
                     spec.providers.push(provider_name.clone());
                     spec.provider_attachment_epoch.clone_from(&mutation_id);
                     attached_clone.store(true, Ordering::Relaxed);
+                    crate::compute::provisioning_deadline::attachments_changed(
+                        sandbox,
+                        current_time_ms(),
+                    );
                 }
             },
         )
@@ -1334,6 +1377,10 @@ pub(super) async fn handle_detach_sandbox_provider(
                     detached_clone.store(true, Ordering::Relaxed);
                     // Only dedupe after making a change
                     dedupe_provider_names(&mut spec.providers);
+                    crate::compute::provisioning_deadline::attachments_changed(
+                        sandbox,
+                        current_time_ms(),
+                    );
                 }
             },
         )
@@ -3273,33 +3320,8 @@ mod tests {
     use crate::grpc::test_support::{
         authed_request, test_server_state, test_server_state_with_driver,
     };
-    use crate::provider_profile_sources::ProviderProfileSources;
-    use openshell_core::GatewayProviderProfileSourceConfig;
     use openshell_core::proto::GpuResourceRequirements;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
-
-    async fn test_server_state_with_user_only_github_profile() -> Arc<ServerState> {
-        let mut state = test_server_state().await;
-        Arc::get_mut(&mut state)
-            .expect("test server state should be uniquely owned")
-            .provider_profile_sources =
-            ProviderProfileSources::from_config(&[GatewayProviderProfileSourceConfig::User], None)
-                .expect("user-only provider profile source configuration should be valid");
-
-        let github_profile = openshell_providers::builtin_profiles()
-            .iter()
-            .find(|profile| profile.id == "github")
-            .expect("github builtin profile")
-            .to_proto();
-        state
-            .store
-            .put_message(&crate::provider_profile_sources::stored_provider_profile(
-                github_profile,
-            ))
-            .await
-            .expect("store user-managed github profile");
-        state
-    }
 
     // ---- shell_escape ----
 
@@ -3665,6 +3687,26 @@ mod tests {
         }
     }
 
+    /// Import a minimal profile so a synthetic provider type resolves.
+    ///
+    /// Provider profiles are import-only: a provider whose type no profile
+    /// declares cannot compose a sandbox. Tests about limits, CAS or credential
+    /// collisions still need their placeholder types to exist.
+    async fn import_test_profile(state: &ServerState, id: &str) {
+        state
+            .store
+            .put_message(&crate::provider_profile_sources::stored_provider_profile(
+                openshell_core::proto::ProviderProfile {
+                    id: id.to_string(),
+                    display_name: id.to_string(),
+                    category: openshell_core::proto::ProviderProfileCategory::Other as i32,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("store test provider profile");
+    }
+
     fn test_provider(name: &str, provider_type: &str) -> Provider {
         test_provider_with_credential_key(name, provider_type, "TOKEN")
     }
@@ -3906,7 +3948,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_sandbox_provider_uses_configured_provider_profile_sources() {
-        let state = test_server_state_with_user_only_github_profile().await;
+        let state = test_server_state().await;
         state
             .store
             .put_message(&test_provider("work-github", "github"))
@@ -3929,7 +3971,7 @@ mod tests {
             }),
         )
         .await
-        .expect("user-only profile catalog should not include the builtin github profile")
+        .expect("an imported github profile should resolve from the user source")
         .into_inner();
 
         assert!(response.attached);
@@ -4313,6 +4355,8 @@ mod tests {
     #[tokio::test]
     async fn create_sandbox_rejects_provider_credential_key_collisions() {
         let state = test_server_state().await;
+        import_test_profile(&state, "outlook").await;
+        import_test_profile(&state, "google-drive").await;
         state
             .store
             .put_message(&test_provider("provider-a", "outlook"))
@@ -4351,7 +4395,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_sandbox_uses_configured_provider_profile_sources() {
-        let state = test_server_state_with_user_only_github_profile().await;
+        let state = test_server_state().await;
 
         let response = handle_create_sandbox(
             &state,
@@ -4367,12 +4411,86 @@ mod tests {
             }),
         )
         .await
-        .expect("user-only profile catalog should not include the builtin github profile")
+        .expect("an imported github profile should resolve from the user source")
         .into_inner();
 
         assert_eq!(
             response.sandbox.expect("created sandbox").object_name(),
             "user-catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_a_provider_whose_profile_is_absent() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("orphan", "never-imported"))
+            .await
+            .unwrap();
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                request_id: String::new(),
+                name: "orphan-sandbox".to_string(),
+                spec: Some(SandboxSpec {
+                    providers: vec!["orphan".to_string()],
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                await_main_process_attachment: false,
+                workload_template_name: String::new(),
+            }),
+        )
+        .await
+        .expect_err("a provider with no profile must not compose a sandbox");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let message = err.message();
+        assert!(message.contains("'orphan'"), "{message}");
+        assert!(message.contains("'never-imported'"), "{message}");
+        assert!(
+            message.contains("openshell provider profile import"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_sandbox_provider_rejects_a_provider_whose_profile_is_absent() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("orphan", "never-imported"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+
+        let err = handle_attach_sandbox_provider(
+            &state,
+            authed_request(AttachSandboxProviderRequest {
+                request_id: String::new(),
+                sandbox_name: "work".to_string(),
+                provider_name: "orphan".to_string(),
+                expected_resource_version: 0,
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        )
+        .await
+        .expect_err("a provider with no profile must not attach");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let message = err.message();
+        assert!(message.contains("'never-imported'"), "{message}");
+        assert!(
+            message.contains("openshell provider profile import"),
+            "{message}"
         );
     }
 
@@ -5934,6 +6052,8 @@ mod tests {
     #[tokio::test]
     async fn attach_sandbox_provider_rejects_credential_key_collisions() {
         let state = test_server_state().await;
+        import_test_profile(&state, "outlook").await;
+        import_test_profile(&state, "google-drive").await;
         state
             .store
             .put_message(&test_provider("provider-a", "outlook"))
@@ -5972,6 +6092,7 @@ mod tests {
     #[tokio::test]
     async fn attach_sandbox_provider_accepts_at_max_providers_limit() {
         let state = test_server_state().await;
+        import_test_profile(&state, "generic").await;
 
         // Create MAX_PROVIDERS (32) providers
         for i in 0..MAX_PROVIDERS {
@@ -6028,6 +6149,7 @@ mod tests {
     #[tokio::test]
     async fn attach_sandbox_provider_rejects_beyond_max_providers_limit() {
         let state = test_server_state().await;
+        import_test_profile(&state, "generic").await;
 
         // Create MAX_PROVIDERS + 1 providers
         for i in 0..=MAX_PROVIDERS {
@@ -6089,6 +6211,7 @@ mod tests {
 
         // Provider name that exceeds validation limits
         let long_name = "a".repeat(1000);
+        import_test_profile(&state, "generic").await;
         state
             .store
             .put_message(&test_provider(&long_name, "generic"))
@@ -6558,6 +6681,7 @@ mod tests {
         use std::sync::Arc;
 
         let state = Arc::new(test_server_state().await);
+        import_test_profile(&state, "generic").await;
 
         // Create multiple providers
         for i in 0..3 {

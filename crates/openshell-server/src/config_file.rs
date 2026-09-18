@@ -1090,7 +1090,6 @@ max_body_bytes = 262144
         let toml = r#"
 [openshell.gateway]
 provider_profile_sources = [
-  { type = "builtin" },
   { type = "user" },
   { type = "interceptor", name = "provider-governance" },
 ]
@@ -1100,12 +1099,30 @@ provider_profile_sources = [
         assert_eq!(
             file.openshell.gateway.provider_profile_sources,
             Some(vec![
-                GatewayProviderProfileSourceConfig::Builtin,
                 GatewayProviderProfileSourceConfig::User,
                 GatewayProviderProfileSourceConfig::Interceptor {
                     name: "provider-governance".to_string(),
                 },
             ])
+        );
+    }
+
+    #[test]
+    fn rejects_the_removed_builtin_provider_profile_source() {
+        let toml = r#"
+[openshell.gateway]
+provider_profile_sources = [
+  { type = "builtin" },
+  { type = "user" },
+]
+"#;
+        let tmp = write_tmp(toml);
+        let error = load(tmp.path()).expect_err("the builtin source was removed");
+        let message = error.to_string();
+        assert!(message.contains("import-only"), "{message}");
+        assert!(
+            message.contains("openshell provider profile import"),
+            "{message}"
         );
     }
 

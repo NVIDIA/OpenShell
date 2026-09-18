@@ -232,11 +232,12 @@ observation or evaluation failures outside binding policy emit warnings and the
 The gateway reconstructs the original response frames, including trailers and
 body errors, before evaluating the observer.
 
-Interceptor manifests can also vend provider profile catalogs. Gateway
-configuration selects the exact ordered source set from the in-tree built-in
-source, the stored user source, and named profile-capable interceptors. Omitting
-the setting selects `builtin + user`; selecting only an interceptor makes it
-authoritative by omission. Every selected source uses the same snapshot,
+Interceptor manifests can also vend provider profile catalogs. No profile is
+compiled into the gateway: configuration selects the exact ordered source set
+from the stored user source and named profile-capable interceptors. Omitting the
+setting selects the user source alone, so a gateway with nothing imported serves
+an empty catalog; selecting only an interceptor makes it authoritative by
+omission. Every selected source uses the same snapshot,
 semantic-validation, and duplicate-detection path. Duplicate normalized profile
 IDs fail instead of creating source precedence. The gateway treats configured
 interceptors as trusted sources and does not verify signature annotations in
@@ -387,6 +388,8 @@ Public RPC contracts and durable protobuf formats have separate ownership. The `
 
 `ReportEndpointStatus` is a sandbox-authenticated public gateway RPC. Its request, response, and `EndpointObservation` messages belong only to the public closure. `EndpointStatus` and `EndpointResult` also belong to the durable closure because `Sandbox.status.endpoint_statuses` persists them. The repeated status field uses a new wire tag; stored sandboxes without it decode with an empty endpoint list and retain their lifecycle fields. A fixed payload encoded with the earlier sandbox schema verifies that no database rewrite is required.
 
+Allow and deny append requests carry `L7RuleTarget` to declare the rule, endpoint, and complete affected scope. The removed `host` and `port` fields remain reserved by number and name, and requests without a target are rejected. These mutation requests are not persisted formats.
+
 `GetSandboxProviderStatus` and `ReportProviderReadiness` are unary public gateway RPCs. The first lets authorized users inspect a provider change; the second accepts installation reports only from the sandbox's current authenticated supervisor session.
 
 The removed `NetworkBinary.harness` field remains reserved by number and name,
@@ -432,6 +435,29 @@ after current authorization. The removed response booleans are reserved by name
 and number; this coordinated pre-1.0 API change does not alter durable schemas.
 The outcome alone does not provide request deduplication. Opted-in unary methods
 require a request UUID for the admission contract.
+
+Configuration admission adds `SandboxStatus.configuration_admission` at field
+11 and optional `configuration_activated` at field 12, extending the public and
+durable closures. New sandboxes explicitly store `false` until first acceptance;
+acceptance stores `true` permanently, including across restart. Legacy rows
+have neither field and conservatively retain static-policy restrictions. No
+database rewrite is required. A pre-admission byte fixture verifies that legacy
+phase and policy-version fields survive without fabricated admission or activation.
+`SandboxStatus.provisioning` uses field 13 for gateway-owned attempt timing and
+compute reclamation progress. Its timestamps survive supervisor reconnects and
+ordinary driver status updates. Older records decode with no provisioning
+record; timing must be adopted once and persisted, never reconstructed from the
+object's frequently changing update timestamp. The additive message requires
+no rewrite of existing payloads and leaves the frozen storage-v1 schema intact.
+Stored settings JSON also carries per-key change IDs and commit timestamps,
+including deletion tombstones. Legacy values acquire stable source identities
+on read; a subsequent write preserves them. These clocks distinguish effective
+edits from no-op writes without treating status updates as configuration edits.
+With timestamp types, deletion outcomes, and optional mutation request IDs, the
+admission contract brings the public closure to 298 messages and 21 enums, the
+durable closure to 92 messages and 16 enums, and their overlap to 80 messages
+and 16 enums. Mutation request IDs extend public request fields without adding
+messages to these closures or changing the durable protobuf schema.
 
 | Dual-purpose encoded root | Current decision |
 |---|---|

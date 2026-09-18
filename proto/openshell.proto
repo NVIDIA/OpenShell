@@ -503,6 +503,12 @@ service OpenShell {
     };
   }
 
+  // Register startup and acknowledge an exact validated runtime configuration.
+  rpc ReportSandboxConfiguration(ReportSandboxConfigurationRequest)
+      returns (ReportSandboxConfigurationResponse) {
+    option (openshell.options.v1.authorization) = { auth_mode: "sandbox" };
+  }
+
   // Get provider environment for a sandbox (called by sandbox supervisor at startup).
   rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
       returns (GetSandboxProviderEnvironmentResponse) {
@@ -1110,6 +1116,12 @@ message SandboxStatus {
   // Currently populated for MCP-over-HTTP endpoints. These passive results
   // remain separate from sandbox lifecycle conditions and readiness.
   repeated EndpointStatus endpoint_statuses = 10;
+  // Independent of infrastructure phase; retained across driver observations.
+  SandboxConfigurationAdmission configuration_admission = 11;
+  // Durable first-acceptance marker. Absent on legacy records; never reset by restart.
+  optional bool configuration_activated = 12;
+  // Gateway-owned repair window. Retained after timeout for inspection and retry.
+  SandboxProvisioning provisioning = 13;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -2659,16 +2671,32 @@ message RemoveNetworkRule {
   string rule_name = 1;
 }
 
+// Exact endpoint and complete authorization scope affected by an L7 append.
+// All ports and binaries must match the stored target; omitted scope is invalid.
+message L7RuleTarget {
+  string rule_name = 1;
+  string host = 2;
+  repeated uint32 ports = 3;
+  // An absent path requires a unique endpoint. An empty path selects an
+  // endpoint without a path selector. This is not the appended request path.
+  optional string path = 4;
+  // Declare either a nonempty binary list or any_binary, never both.
+  repeated openshell.sandbox.v1.NetworkBinary binaries = 5;
+  bool any_binary = 6;
+}
+
 message AddDenyRules {
-  string host = 1;
-  uint32 port = 2;
+  reserved 1, 2;
+  reserved "host", "port";
   repeated openshell.sandbox.v1.L7DenyRule deny_rules = 3;
+  L7RuleTarget target = 4;
 }
 
 message AddAllowRules {
-  string host = 1;
-  uint32 port = 2;
+  reserved 1, 2;
+  reserved "host", "port";
   repeated openshell.sandbox.v1.L7Rule rules = 3;
+  L7RuleTarget target = 4;
 }
 
 message RemoveNetworkBinary {
@@ -2755,6 +2783,32 @@ message ReportPolicyStatusRequest {
 
 // Report policy status response.
 message ReportPolicyStatusResponse {}
+
+enum ConfigurationAdmissionState {
+  CONFIGURATION_ADMISSION_STATE_UNSPECIFIED = 0;
+  CONFIGURATION_ADMISSION_STATE_PENDING = 1;
+  CONFIGURATION_ADMISSION_STATE_ACCEPTED = 2;
+  CONFIGURATION_ADMISSION_STATE_REJECTED = 3;
+}
+
+message SandboxConfigurationAdmission {
+  string instance_id = 1;
+  ConfigurationAdmissionState state = 2;
+  uint32 policy_version = 3;
+  string policy_hash = 4;
+  uint64 config_revision = 5;
+  uint64 provider_env_revision = 6;
+  string error = 7;
+}
+
+message ReportSandboxConfigurationRequest {
+  string sandbox_id = 1;
+  SandboxConfigurationAdmission admission = 2;
+  // Pending registration replaces only this previously observed instance.
+  string expected_instance_id = 3;
+}
+
+message ReportSandboxConfigurationResponse {}
 
 // A versioned policy revision with metadata.
 message SandboxPolicyRevision {
@@ -3628,4 +3682,24 @@ message EndpointStatus {
   // time: still-valid evidence can be reaccepted after a reset. Identical
   // same-sequence retries do not advance it. Absent until a result is reported.
   google.protobuf.Timestamp last_reported_time = 106;
+}
+
+// Durable provisioning attempt, independent of supervisor registration and polling.
+message SandboxProvisioning {
+  string attempt_id = 1;
+  string configuration_change_id = 2;
+  google.protobuf.Timestamp configuration_change_time = 3;
+  google.protobuf.Timestamp first_rejection_time = 4;
+  // Present only while the repair window is armed.
+  google.protobuf.Timestamp deadline = 5;
+  google.protobuf.Timestamp timeout_time = 6;
+  // Set only after both supervisor and workload compute have been reclaimed.
+  google.protobuf.Timestamp cleanup_completed_time = 7;
+  // A safe gateway-authored diagnostic; never a raw driver error.
+  string cleanup_error = 8;
+  // Durable backoff for interrupted or failed reclamation.
+  google.protobuf.Timestamp cleanup_retry_time = 9;
+  // Attachment edits have their own durable clock; status writes do not change it.
+  string attachment_change_id = 10;
+  google.protobuf.Timestamp attachment_change_time = 11;
 }

@@ -288,11 +288,7 @@ async fn loaded_policy_comparison_uses_one_provider_profile_snapshot() {
         .expect("store equivalent policy revision");
     let fetch_count = Arc::new(AtomicUsize::new(0));
     let mut state = Arc::into_inner(state).expect("uniquely owned test state");
-    let mut profile_a = openshell_providers::builtin_profiles()
-        .iter()
-        .find(|profile| profile.id == "github")
-        .expect("valid built-in provider profile")
-        .to_proto();
+    let mut profile_a = openshell_providers::example_profiles::load("github").to_proto();
     profile_a.id = "snapshot-provider".to_string();
     profile_a.display_name = "catalog-a".to_string();
     let mut profile_b = profile_a.clone();

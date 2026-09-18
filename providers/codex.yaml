@@ -1,6 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/codex.yaml
+#   openshell provider profile import -f providers/codex.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   codex.
+# Reference layout:  /usr/bin/codex or /usr/local/bin/codex, plus the npm global
+#                    install at /usr/lib/node_modules/@openai/**. The npm path is
+#                    an OpenShell Community image layout; check where `npm root
+#                    -g` points in your image.
+# Credential scope:  the CODEX_AUTH_* OAuth tokens and account id. They are
+#                    injected into the sandbox environment for the codex CLI to
+#                    read; only the endpoints below are reachable with them.
+# Endpoint access:   api.openai.com and chatgpt.com for inference,
+#                    auth.openai.com for token refresh, ab.chatgpt.com for the
+#                    CLI's experiment lookups.
+# Smoke test:        openshell sandbox create --provider <name> -- \
+#                      codex exec 'reply with OK'
+
 id: codex
 display_name: Codex
 description: OpenAI Codex CLI

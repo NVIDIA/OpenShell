@@ -118,11 +118,11 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "418130a28d1a5398d3d7f73f11b7f025d027c70f215be320dfe8e58371769f83";
+        "87be23fc0ac4eaf8ce5890a1c87e6a48279f65fc8fbcc0cea7d7cbe426f2cc46";
     const DURABLE_SCHEMA_SHA256: &str =
-        "557ca283c55fd46b213d5573b950ba8604cc3f4b31bad3e433eb9c5f9975138d";
+        "654649c8f65f44ac2ba04290f49c56de2f488271f99bc0fd4c6d025039c05128";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "f541c25bb3e1e5806865bc61470c66d10c16cca7399bf5909c77dc384d469171";
+        "376cc8ecbc8b9b995e2170ccb5c2f18ef82adf9b5f55f1683571410722dfd4cf";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -513,12 +513,12 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            101 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
+            102 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            75 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
+            76 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -526,7 +526,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            75 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            76 + PROVIDER_READINESS_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -570,9 +570,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (294, 20),
-                (90, 15),
-                (78, 15),
+                (299, 21),
+                (92, 16),
+                (80, 16),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -591,6 +591,25 @@ mod tests {
         assert_eq!(spec.providers, ["synthetic-provider"]);
         assert_eq!(spec.command, ["echo"]);
         assert!(spec.provider_attachment_epoch.is_empty());
+    }
+
+    #[test]
+    fn pre_admission_sandbox_bytes_preserve_legacy_status() {
+        use openshell_core::proto::{Sandbox, SandboxPhase};
+        // Synthetic Sandbox encoded with main 0357daee, before admission fields.
+        let bytes =
+            legacy_bytes("0a180a096c65676163792d6964120b6c65676163792d6e616d651a0430023807");
+        let sandbox = Sandbox::decode(bytes.as_slice()).unwrap();
+        let status = sandbox.status.as_ref().unwrap();
+        assert_eq!(status.phase, SandboxPhase::Ready as i32);
+        assert_eq!(status.current_policy_version, 7);
+        assert!(status.configuration_admission.is_none());
+        assert_eq!(status.configuration_activated, None);
+        assert!(status.provisioning.is_none());
+        assert!(!crate::policy_store::permits_initial_static_policy_repair(
+            &sandbox
+        ));
+        assert_eq!(sandbox.encode_to_vec(), bytes);
     }
 
     fn legacy_bytes(encoded: &str) -> Vec<u8> {

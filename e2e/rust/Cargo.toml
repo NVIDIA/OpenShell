@@ -39,6 +39,11 @@ e2e-provider-refresh-keycloak = []
 e2e-vm = ["e2e", "e2e-host-gateway"]
 
 [[test]]
+name = "policy_activation"
+path = "tests/policy_activation.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "oidc_pkce"
 path = "tests/oidc_pkce.rs"
 required-features = ["e2e-oidc-pkce"]

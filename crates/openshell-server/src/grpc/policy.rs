@@ -11,6 +11,8 @@
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
 mod endpoint_status;
+mod provisioning_clock;
+pub use provisioning_clock::configuration_change;
 
 pub(super) use endpoint_status::handle_report_endpoint_status;
 pub use endpoint_status::{
@@ -50,12 +52,13 @@ use openshell_core::proto::{
     GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
     GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
-    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, PolicyChunk, PolicyMergeOperation,
-    PolicySource, PolicyStatus, ProviderReadinessReason, PushSandboxLogsRequest,
-    PushSandboxLogsResponse, RejectDraftChunkRequest, RejectDraftChunkResponse,
-    ReportPolicyStatusRequest, ReportPolicyStatusResponse, SandboxLogLine, SandboxPolicyRevision,
-    SettingScope, SettingValue, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    L7RuleTarget as ProtoL7RuleTarget, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
+    PolicyChunk, PolicyMergeOperation, PolicySource, PolicyStatus, ProviderReadinessReason,
+    PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
+    RejectDraftChunkResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
+    SandboxLogLine, SandboxPolicyRevision, SettingScope, SettingValue, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, UndoDraftChunkRequest, UndoDraftChunkResponse,
+    UpdateConfigRequest, UpdateConfigResponse,
 };
 use openshell_core::proto::{
     L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
@@ -74,8 +77,9 @@ use openshell_ocsf::{
     ConfigStateChangeBuilder, EventContext, OCSF_TARGET, OcsfEvent, SeverityId, StateId, StatusId,
 };
 use openshell_policy::{
-    PolicyMergeOp, ProviderPolicyLayer, canonicalize_advisor_add_rule, compose_effective_policy,
-    merge_policy, policy_covers_rule, serialize_sandbox_policy, strip_provider_rule_names,
+    L7BinaryScope, L7RuleTarget, PolicyMergeOp, ProviderPolicyLayer, canonicalize_advisor_add_rule,
+    compose_effective_policy, merge_policy, policy_covers_rule, serialize_sandbox_policy,
+    strip_provider_rule_names,
 };
 use openshell_prover::{
     credentials::{Credential, CredentialSet},
@@ -368,20 +372,18 @@ fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
             |rule_name| format!("remove-endpoint {host}:{port} from rule {rule_name}"),
         ),
         PolicyMergeOp::RemoveRule { rule_name } => format!("remove-rule {rule_name}"),
-        PolicyMergeOp::AddDenyRules {
-            host,
-            port,
-            deny_rules,
-        } => format!(
-            "add-deny {host}:{port} [{}]",
+        PolicyMergeOp::AddDenyRules { target, deny_rules } => format!(
+            "add-deny {} [{}]",
+            summarize_l7_target(target),
             deny_rules
                 .iter()
                 .map(summarize_l7_deny_rule)
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        PolicyMergeOp::AddAllowRules { host, port, rules } => format!(
-            "add-allow {host}:{port} [{}]",
+        PolicyMergeOp::AddAllowRules { target, rules } => format!(
+            "add-allow {} [{}]",
+            summarize_l7_target(target),
             rules
                 .iter()
                 .map(summarize_l7_rule)
@@ -393,6 +395,29 @@ fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
             binary_path,
         } => format!("remove-binary {rule_name} {binary_path}"),
     }
+}
+
+fn summarize_l7_target(target: &L7RuleTarget) -> String {
+    let ports = target
+        .ports
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let binaries = match &target.binaries {
+        L7BinaryScope::Any => "any".to_string(),
+        L7BinaryScope::Restricted(binaries) => binaries
+            .iter()
+            .map(|binary| binary.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    // Preserve optional path presence in the audit trail: None means unique
+    // endpoint selection, while Some("") selects an endpoint with no path scope.
+    format!(
+        "{}:{ports} rule={} endpoint-path={:?} binaries=[{binaries}]",
+        target.host, target.rule_name, target.path,
+    )
 }
 
 fn ensure_chunk_belongs_to_sandbox(
@@ -1732,20 +1757,32 @@ async fn current_effective_policy_for_sandbox(
         .as_ref()
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
+    let records = super::provider::load_provider_environment_records(
+        state.store.as_ref(),
+        workspace,
+        &provider_names,
+    )
+    .await?;
+    current_effective_policy_from_records(state, catalog, sandbox, sandbox_id, &records).await
+}
+
+async fn current_effective_policy_from_records(
+    state: &ServerState,
+    catalog: &EffectiveProviderProfileCatalog,
+    sandbox: &Sandbox,
+    sandbox_id: &str,
+    records: &[super::provider::ProviderEnvironmentRecord],
+) -> Result<ProtoSandboxPolicy, Status> {
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     if let Some(global_policy) = decode_policy_from_global_settings(&global_settings)? {
         // A global policy is the complete effective policy. Dormant sandbox
         // history and specs may predate the current schema, but they must not
         // prevent the valid global policy from being served.
-        return apply_effective_policy_context(
-            state,
-            catalog,
-            workspace,
-            &provider_names,
+        return apply_captured_policy_context(
+            provider_policy_context_from_records(catalog, records),
             global_policy,
             PolicySource::Global,
-        )
-        .await;
+        );
     }
 
     let policy = if let Some(record) = state
@@ -1764,15 +1801,11 @@ async fn current_effective_policy_for_sandbox(
         }
     };
 
-    apply_effective_policy_context(
-        state,
-        catalog,
-        workspace,
-        &provider_names,
+    apply_captured_policy_context(
+        provider_policy_context_from_records(catalog, records),
         policy,
         PolicySource::Sandbox,
     )
-    .await
 }
 
 async fn effective_policy_for_source(
@@ -1807,17 +1840,25 @@ async fn apply_effective_policy_context(
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
-    mut policy: ProtoSandboxPolicy,
+    policy: ProtoSandboxPolicy,
     policy_source: PolicySource,
 ) -> Result<ProtoSandboxPolicy, Status> {
-    clear_provider_credentialed_markers(&mut policy);
-    let mut provider_context = provider_policy_context_with_catalog(
+    let provider_context = provider_policy_context_with_catalog(
         state.store.as_ref(),
         catalog,
         workspace,
         provider_names,
     )
     .await?;
+    apply_captured_policy_context(provider_context, policy, policy_source)
+}
+
+fn apply_captured_policy_context(
+    mut provider_context: ProviderPolicyContext,
+    mut policy: ProtoSandboxPolicy,
+    policy_source: PolicySource,
+) -> Result<ProtoSandboxPolicy, Status> {
+    clear_provider_credentialed_markers(&mut policy);
     if !matches!(policy_source, PolicySource::Global) && !provider_context.layers.is_empty() {
         policy = compose_effective_policy(&policy, &provider_context.layers);
     }
@@ -2432,9 +2473,11 @@ async fn persist_existing_policy_projection(
     let updated = state
         .store
         .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
+            let startup_blocked =
+                crate::policy_store::permits_initial_static_policy_repair(sandbox);
             if let Some(policy) = backfill_policy.as_ref()
                 && let Some(spec) = sandbox.spec.as_mut()
-                && spec.policy.is_none()
+                && (spec.policy.is_none() || startup_blocked)
             {
                 spec.policy = Some(policy.clone());
             }
@@ -2489,6 +2532,42 @@ async fn resolve_sandbox_by_name_for_principal(
 // ---------------------------------------------------------------------------
 
 pub(super) async fn handle_get_sandbox_config(
+    state: &Arc<ServerState>,
+    request: Request<GetSandboxConfigRequest>,
+) -> Result<Response<GetSandboxConfigResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let sandbox_id = request.get_ref().sandbox_id.clone();
+    let result = handle_get_sandbox_config_inner(state, request).await;
+    match result {
+        Err(error)
+            if matches!(principal, Principal::Sandbox(_))
+                && matches!(
+                    error.code(),
+                    tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument
+                ) =>
+        {
+            // A malformed stored candidate must not prevent a supervisor
+            // from registering its startup fence and waiting for repair.
+            // Do not expose parser payloads or copy malformed policy history.
+            let sandbox =
+                super::sandbox::fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
+            Ok(Response::new(GetSandboxConfigResponse {
+                configuration_admitted: false,
+                configuration_error: configuration_failure_diagnostic(&error).to_string(),
+                configuration_instance_id: sandbox
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.configuration_admission.as_ref())
+                    .map_or_else(String::new, |admission| admission.instance_id.clone()),
+                workspace: sandbox.object_workspace().to_string(),
+                ..Default::default()
+            }))
+        }
+        result => result,
+    }
+}
+
+async fn handle_get_sandbox_config_inner(
     state: &Arc<ServerState>,
     request: Request<GetSandboxConfigRequest>,
 ) -> Result<Response<GetSandboxConfigResponse>, Status> {
@@ -2618,13 +2697,14 @@ pub(super) async fn load_sandbox_config(
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let sandbox_settings =
         load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name()).await?;
-    let mut provider_policy_context = provider_policy_context_with_catalog(
+    let provider_records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
-        &provider_profile_catalog,
         &workspace,
         &sandbox_provider_names,
     )
     .await?;
+    let mut provider_policy_context =
+        provider_policy_context_from_records(&provider_profile_catalog, &provider_records);
 
     if matches!(policy_source, PolicySource::Global)
         && let Ok(Some(global_rev)) = state
@@ -2670,12 +2750,15 @@ pub(super) async fn load_sandbox_config(
         &policy_credential_bindings,
         &provider_policy_context.endpointless_provider_names,
     );
+    let mut configuration_error = String::new();
     if let Some(effective_policy) = policy.as_mut() {
         stamp_provider_credentialed_endpoints(
             effective_policy,
             &provider_policy_context.credentialed_scopes,
         );
-        report_uninspected_credentialed_endpoints(effective_policy, &sandbox_id);
+        if let Err(error) = validate_uninspected_credentialed_endpoints(effective_policy) {
+            configuration_error = bounded_configuration_diagnostic(error.message());
+        }
         policy_hash = deterministic_policy_hash(effective_policy);
     }
 
@@ -2702,25 +2785,27 @@ pub(super) async fn load_sandbox_config(
         state.sandbox_jwt_issuer.is_some(),
     );
     if let Some(policy) = policy.as_ref() {
-        validate_policy_credential_bindings_for_sandbox(
-            state.as_ref(),
+        validate_policy_credential_binding_context(
             &provider_profile_catalog,
-            &workspace,
-            &sandbox_provider_names,
+            &provider_records,
             policy,
-        )
-        .await?;
+            &policy_credential_bindings,
+        )?;
     }
-    let provider_env_revision = compute_provider_env_revision_with_catalog_and_policy_bindings(
-        state.store.as_ref(),
+    let provider_env_revision = compute_provider_env_revision_from_records_and_policy_bindings(
         &provider_profile_catalog,
-        &workspace,
-        &sandbox_provider_names,
+        &provider_records,
         &policy_credential_bindings,
-    )
-    .await?;
+    )?;
 
     Ok(GetSandboxConfigResponse {
+        configuration_instance_id: sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.configuration_admission.as_ref())
+            .map_or_else(String::new, |admission| admission.instance_id.clone()),
+        configuration_admitted: policy.is_some() && configuration_error.is_empty(),
+        configuration_error,
         policy,
         version,
         policy_hash,
@@ -3006,16 +3091,23 @@ async fn provider_policy_context_with_catalog(
     workspace: &str,
     provider_names: &[String],
 ) -> Result<ProviderPolicyContext, Status> {
+    let records =
+        super::provider::load_provider_environment_records(store, workspace, provider_names)
+            .await?;
+    Ok(provider_policy_context_from_records(catalog, &records))
+}
+
+fn provider_policy_context_from_records(
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[super::provider::ProviderEnvironmentRecord],
+) -> ProviderPolicyContext {
     let mut layers = Vec::new();
     let mut credentialed_scopes = Vec::new();
     let mut endpointless_provider_names = HashSet::new();
 
-    for name in provider_names {
-        let provider = store
-            .get_message_by_name::<Provider>(workspace, name)
-            .await
-            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
-            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
+    for record in records {
+        let name = &record.name;
+        let provider = &record.provider;
 
         let provider_type = provider.r#type.trim();
         let Some(profile) = super::provider::get_provider_type_profile_for_scope(
@@ -3031,7 +3123,7 @@ async fn provider_policy_context_with_catalog(
             continue;
         };
 
-        if !super::provider::provider_profile_endpoints_are_active(&profile, &provider) {
+        if !super::provider::provider_profile_endpoints_are_active(&profile, provider) {
             endpointless_provider_names.insert(name.clone());
             continue;
         }
@@ -3060,11 +3152,11 @@ async fn provider_policy_context_with_catalog(
         });
     }
 
-    Ok(ProviderPolicyContext {
+    ProviderPolicyContext {
         layers,
         credentialed_scopes,
         endpointless_provider_names,
-    })
+    }
 }
 
 fn endpoint_ports(endpoint: &NetworkEndpoint) -> Vec<u32> {
@@ -3217,22 +3309,6 @@ fn validate_uninspected_credentialed_endpoints(policy: &ProtoSandboxPolicy) -> R
     )))
 }
 
-/// Delivery-path reporting for an already-persisted policy. Sandbox config
-/// delivery must not fail closed here: refusing the config would crash-loop a
-/// running supervisor. The runtime backstop denies the traffic instead.
-fn report_uninspected_credentialed_endpoints(policy: &ProtoSandboxPolicy, sandbox_id: &str) {
-    if let Some(violation) = find_uninspected_credentialed_endpoint(policy) {
-        warn!(
-            sandbox_id,
-            rule_name = %violation.rule_name,
-            host = %violation.host,
-            port = violation.port,
-            mode = violation.mode,
-            "delivering credentialed endpoint without L7 inspection; the sandbox proxy will deny this traffic unless allow_uninspected_credentials is set"
-        );
-    }
-}
-
 pub(super) async fn handle_get_gateway_config(
     state: &Arc<ServerState>,
     _request: Request<GetGatewayConfigRequest>,
@@ -3292,12 +3368,12 @@ pub(super) async fn load_sandbox_provider_environment(
         &provider_names,
     )
     .await?;
-    let effective_policy = current_effective_policy_for_sandbox(
+    let effective_policy = current_effective_policy_from_records(
         state.as_ref(),
         &provider_profile_catalog,
-        &workspace,
         sandbox,
         &sandbox_id,
+        &provider_records,
     )
     .await?;
     let policy_credential_bindings =
@@ -3500,6 +3576,7 @@ async fn handle_update_config_inner(
             ));
         }
         let _settings_guard = state.settings_mutex.lock().await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
 
         if has_merge_ops {
             return Err(Status::invalid_argument(
@@ -3535,7 +3612,6 @@ async fn handle_update_config_inner(
             // Global policy determines the report's effective configuration.
             // Serialize its writes after validation so a report cannot commit
             // evidence derived from the policy this update has replaced.
-            let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
             let latest = state
                 .store
                 .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
@@ -3635,11 +3711,6 @@ async fn handle_update_config_inner(
 
         // Deleting global policy changes the report's effective configuration.
         // Keep settings -> sandbox lock order for all global policy mutations.
-        let _sandbox_sync_guard = if key == POLICY_SETTING_KEY && req.delete_setting {
-            Some(state.compute.sandbox_sync_guard().await)
-        } else {
-            None
-        };
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
         let provider_composition_was_enabled =
             provider_policy_composition_enabled_in(&global_settings)?;
@@ -3706,6 +3777,7 @@ async fn handle_update_config_inner(
 
     if has_setting {
         let _settings_guard = state.settings_mutex.lock().await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
 
         if key == POLICY_SETTING_KEY {
             return Err(Status::invalid_argument(
@@ -3800,6 +3872,7 @@ async fn handle_update_config_inner(
         ));
     }
 
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     if has_merge_ops {
         let global_settings = load_global_settings(state.store.as_ref()).await?;
         if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
@@ -3923,7 +3996,12 @@ async fn handle_update_config_inner(
         validate_no_reserved_provider_policy_keys(&new_policy)?;
     }
 
-    let should_backfill_policy = if let Some(baseline_policy) = spec.policy.as_ref() {
+    let startup_blocked = crate::policy_store::permits_initial_static_policy_repair(&sandbox);
+    let should_backfill_policy = if startup_blocked && !sandbox_caller {
+        // No child has consumed static restrictions yet. A complete replacement
+        // must be able to repair every field before the first activation.
+        true
+    } else if let Some(baseline_policy) = spec.policy.as_ref() {
         let comparable_baseline = baseline_policy.clone();
         validate_static_fields_unchanged(&comparable_baseline, &new_policy)?;
         false
@@ -3955,9 +4033,9 @@ async fn handle_update_config_inner(
         &effective_policy,
     )
     .await?;
-    // Sandbox-authored syncs replay a policy the supervisor already discovered
-    // on disk. Rejecting it here would crash-loop the sandbox instead of
-    // surfacing an operator decision, so only operator-authored updates gate.
+    // Image discovery persists the desired candidate for management repair.
+    // It never admits workload activation: GetSandboxConfig applies the complete
+    // composition gate and ReportSandboxConfiguration checks the exact result.
     if !sandbox_caller {
         validate_candidate_sandbox_credential_policy(
             state,
@@ -3967,12 +4045,6 @@ async fn handle_update_config_inner(
         )
         .await?;
     }
-
-    let _sandbox_sync_guard = if backfill_policy.is_some() {
-        Some(state.compute.sandbox_sync_guard().await)
-    } else {
-        None
-    };
 
     let payload = new_policy.encode_to_vec();
     let hash = deterministic_policy_hash(&new_policy);
@@ -4285,6 +4357,200 @@ pub(super) async fn handle_list_sandbox_policies(
         revisions,
         next_page_token,
     }))
+}
+
+fn bounded_configuration_diagnostic(message: &str) -> String {
+    message
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(512)
+        .collect()
+}
+
+fn configuration_failure_diagnostic(error: &Status) -> &'static str {
+    let message = error.message();
+    if message.contains("middleware") {
+        "Effective middleware configuration is invalid; repair the policy middleware bindings or registered services"
+    } else if message.contains("credential") || message.contains("provider") {
+        "Effective provider configuration is invalid; repair credential bindings, attached providers, or their policy layers"
+    } else {
+        "Stored policy structure or safety validation failed; submit a complete valid replacement policy"
+    }
+}
+
+fn configuration_generation_matches(
+    admission: &openshell_core::proto::SandboxConfigurationAdmission,
+    config: &GetSandboxConfigResponse,
+) -> bool {
+    (
+        admission.policy_version,
+        &admission.policy_hash,
+        admission.config_revision,
+        admission.provider_env_revision,
+    ) == (
+        config.version,
+        &config.policy_hash,
+        config.config_revision,
+        config.provider_env_revision,
+    )
+}
+
+pub(super) async fn handle_report_sandbox_configuration(
+    state: &Arc<ServerState>,
+    request: Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
+) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
+    use openshell_core::proto::ConfigurationAdmissionState;
+    let principal = super::extract_principal(&request)?;
+    let sandbox_id = request.get_ref().sandbox_id.clone();
+    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    let mut admission = request
+        .get_ref()
+        .admission
+        .clone()
+        .ok_or_else(|| Status::invalid_argument("admission is required"))?;
+    if uuid::Uuid::parse_str(&admission.instance_id).is_err() {
+        return Err(Status::invalid_argument("instance_id must be a UUID"));
+    }
+    let reported = ConfigurationAdmissionState::try_from(admission.state)
+        .map_err(|_| Status::invalid_argument("invalid admission state"))?;
+    if reported == ConfigurationAdmissionState::Unspecified {
+        return Err(Status::invalid_argument("admission state is required"));
+    }
+    let _guard = state.compute.sandbox_sync_guard().await;
+    let mut sandbox =
+        super::sandbox::fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
+    crate::compute::provisioning_deadline::refresh_configuration(
+        &state.store,
+        &mut sandbox,
+        current_time_ms(),
+    )
+    .await
+    .map_err(Status::internal)?;
+    if crate::compute::provisioning_deadline::timed_out(&sandbox) {
+        return Err(Status::failed_precondition(
+            "provisioning repair window expired; explicitly start the sandbox after cleanup",
+        ));
+    }
+    let current = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.configuration_admission.as_ref());
+    if reported == ConfigurationAdmissionState::Pending
+        && current.is_some_and(|current| current.instance_id != admission.instance_id)
+        && current.map_or("", |current| current.instance_id.as_str())
+            != request.get_ref().expected_instance_id
+    {
+        return Err(Status::failed_precondition(
+            "supervisor registration fence has changed",
+        ));
+    }
+    if reported != ConfigurationAdmissionState::Pending
+        && current.is_none_or(|current| current.instance_id != admission.instance_id)
+    {
+        return Err(Status::failed_precondition(
+            "supervisor configuration instance has changed",
+        ));
+    }
+    if reported == ConfigurationAdmissionState::Accepted {
+        let mut config_request = Request::new(GetSandboxConfigRequest {
+            sandbox_id: sandbox_id.clone(),
+        });
+        *config_request.extensions_mut() = request.extensions().clone();
+        let config = handle_get_sandbox_config(state, config_request)
+            .await?
+            .into_inner();
+        if !config.configuration_admitted || !configuration_generation_matches(&admission, &config)
+        {
+            return Err(Status::aborted(
+                "configuration changed or is not admitted; fetch and validate again",
+            ));
+        }
+        admission.error.clear();
+    } else if reported == ConfigurationAdmissionState::Rejected {
+        // Runtime error strings may contain parser payloads. Only gateway-authored
+        // diagnostics may be exposed verbatim through public sandbox status.
+        let mut config_request = Request::new(GetSandboxConfigRequest {
+            sandbox_id: sandbox_id.clone(),
+        });
+        *config_request.extensions_mut() = request.extensions().clone();
+        admission.error = match handle_get_sandbox_config(state, config_request).await {
+            Ok(config) if !configuration_generation_matches(&admission, config.get_ref()) => {
+                return Err(Status::aborted("rejected configuration generation has changed"));
+            }
+            Ok(config) if !config.get_ref().configuration_error.is_empty() => config.into_inner().configuration_error,
+            _ => "Effective configuration could not be activated; replace the policy or repair attached providers".to_string(),
+        };
+        if let Some(current) = current
+            && current.state == i32::from(ConfigurationAdmissionState::Accepted)
+        {
+            // A rejected desired update does not invalidate an accepted runtime.
+            let error = admission.error;
+            admission = current.clone();
+            admission.error = error;
+        }
+    } else {
+        admission.error.clear();
+        if let Some(current) = current
+            && current.instance_id == admission.instance_id
+        {
+            admission = current.clone();
+        }
+    }
+    let expected_version = sandbox
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version);
+    let now_ms = current_time_ms();
+    let mut provisioning = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.provisioning.clone());
+    if let Some(record) = provisioning.as_mut() {
+        if !crate::compute::provisioning_deadline::allows_admission(record, now_ms) {
+            state
+                .compute
+                .claim_provisioning_timeout(&sandbox, now_ms)
+                .await
+                .map_err(Status::internal)?;
+            return Err(Status::failed_precondition(
+                "provisioning repair window expired",
+            ));
+        }
+        if reported == ConfigurationAdmissionState::Rejected {
+            crate::compute::provisioning_deadline::record_rejection(record, now_ms)
+                .map_err(Status::internal)?;
+        }
+    }
+    let updated = state
+        .store
+        .update_message_cas::<Sandbox, _>(&sandbox_id, expected_version, |sandbox| {
+            sandbox
+                .status
+                .get_or_insert_with(Default::default)
+                .provisioning
+                .clone_from(&provisioning);
+            sandbox
+                .status
+                .get_or_insert_with(Default::default)
+                .configuration_admission = Some(admission.clone());
+            if reported == ConfigurationAdmissionState::Accepted {
+                sandbox
+                    .status
+                    .as_mut()
+                    .expect("status initialized")
+                    .configuration_activated = Some(true);
+            }
+            crate::compute::apply_configuration_readiness(sandbox);
+        })
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "report configuration admission")
+        })?;
+    state.sandbox_index.update_from_sandbox(&updated);
+    state.sandbox_watch_bus.notify(&sandbox_id);
+    Ok(Response::new(
+        openshell_core::proto::ReportSandboxConfigurationResponse {},
+    ))
 }
 
 pub(super) async fn handle_report_policy_status(
@@ -6471,18 +6737,14 @@ fn parse_proto_add_deny_rules(
     index: usize,
     add_deny_rules: &ProtoAddDenyRules,
 ) -> Result<PolicyMergeOp, Status> {
-    if add_deny_rules.host.trim().is_empty()
-        || add_deny_rules.port == 0
-        || add_deny_rules.deny_rules.is_empty()
-    {
+    if add_deny_rules.deny_rules.is_empty() {
         return Err(Status::invalid_argument(format!(
-            "merge_operations[{index}].add_deny_rules requires host, non-zero port, and at least one deny rule"
+            "merge_operations[{index}].add_deny_rules requires at least one deny rule"
         )));
     }
 
     Ok(PolicyMergeOp::AddDenyRules {
-        host: add_deny_rules.host.trim().to_string(),
-        port: add_deny_rules.port,
+        target: parse_proto_l7_target(index, add_deny_rules.target.as_ref())?,
         deny_rules: add_deny_rules.deny_rules.clone(),
     })
 }
@@ -6491,12 +6753,9 @@ fn parse_proto_add_allow_rules(
     index: usize,
     add_allow_rules: &ProtoAddAllowRules,
 ) -> Result<PolicyMergeOp, Status> {
-    if add_allow_rules.host.trim().is_empty()
-        || add_allow_rules.port == 0
-        || add_allow_rules.rules.is_empty()
-    {
+    if add_allow_rules.rules.is_empty() {
         return Err(Status::invalid_argument(format!(
-            "merge_operations[{index}].add_allow_rules requires host, non-zero port, and at least one allow rule"
+            "merge_operations[{index}].add_allow_rules requires at least one allow rule"
         )));
     }
     if add_allow_rules
@@ -6510,10 +6769,38 @@ fn parse_proto_add_allow_rules(
     }
 
     Ok(PolicyMergeOp::AddAllowRules {
-        host: add_allow_rules.host.trim().to_string(),
-        port: add_allow_rules.port,
+        target: parse_proto_l7_target(index, add_allow_rules.target.as_ref())?,
         rules: add_allow_rules.rules.clone(),
     })
+}
+
+fn parse_proto_l7_target(
+    index: usize,
+    target: Option<&ProtoL7RuleTarget>,
+) -> Result<L7RuleTarget, Status> {
+    let target = target.ok_or_else(|| {
+        Status::invalid_argument(format!("merge_operations[{index}] requires an L7 target"))
+    })?;
+    // An omitted binary declaration must never become any-binary authority.
+    // The wire format permits both fields, so enforce the exclusive choice here.
+    let binaries = match (target.any_binary, target.binaries.is_empty()) {
+        (true, true) => L7BinaryScope::Any,
+        (false, false) => L7BinaryScope::Restricted(target.binaries.clone()),
+        _ => {
+            return Err(Status::invalid_argument(format!(
+                "merge_operations[{index}].target requires exactly one of any_binary=true or nonempty binaries"
+            )));
+        }
+    };
+    let target = L7RuleTarget {
+        rule_name: target.rule_name.clone(),
+        host: target.host.clone(),
+        ports: target.ports.clone(),
+        path: target.path.clone(),
+        binaries,
+    };
+    target.validate(index).map_err(map_policy_merge_error)?;
+    Ok(target)
 }
 
 fn validate_merge_operations_for_server(operations: &[PolicyMergeOp]) -> Result<(), Status> {
@@ -6527,7 +6814,9 @@ fn validate_merge_operations_for_server(operations: &[PolicyMergeOp]) -> Result<
                 }
                 validate_rule_not_always_blocked(rule)?;
             }
-            PolicyMergeOp::AddAllowRules { host, .. } => validate_host_not_always_blocked(host)?,
+            PolicyMergeOp::AddAllowRules { target, .. } => {
+                validate_host_not_always_blocked(&target.host)?;
+            }
             _ => {}
         }
     }
@@ -6540,6 +6829,7 @@ fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
         | openshell_policy::PolicyMergeError::MissingRuleNameForAddRule
         | openshell_policy::PolicyMergeError::EmptyAddRuleEndpoints { .. }
         | openshell_policy::PolicyMergeError::InvalidEndpointReference { .. }
+        | openshell_policy::PolicyMergeError::InvalidL7Target { .. }
         | openshell_policy::PolicyMergeError::UnsupportedAccessPreset { .. } => {
             Status::invalid_argument(error.to_string())
         }
@@ -6551,7 +6841,9 @@ fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
         }
         | openshell_policy::PolicyMergeError::UndeclaredPortWouldChange { .. }
         | openshell_policy::PolicyMergeError::ConflictingInspectionContracts { .. }
-        | openshell_policy::PolicyMergeError::AmbiguousEndpointRule { .. }
+        | openshell_policy::PolicyMergeError::AmbiguousL7Target { .. }
+        | openshell_policy::PolicyMergeError::L7BinaryScopeMismatch { .. }
+        | openshell_policy::PolicyMergeError::L7PortScopeMismatch { .. }
         | openshell_policy::PolicyMergeError::CannotRemoveBinaryFromAnyBinaryScope { .. }
         | openshell_policy::PolicyMergeError::EndpointNotFound { .. }
         | openshell_policy::PolicyMergeError::EndpointHasNoL7Inspection { .. }
@@ -6561,6 +6853,9 @@ fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
         }
         openshell_policy::PolicyMergeError::InvalidMergedPolicy { .. } => {
             Status::internal(error.to_string())
+        }
+        openshell_policy::PolicyMergeError::L7TargetNotFound { .. } => {
+            Status::not_found(error.to_string())
         }
     }
 }
@@ -7101,6 +7396,15 @@ async fn load_settings_record(
         let mut settings = serde_json::from_slice::<StoredSettings>(&record.payload)
             .map_err(|e| Status::internal(format!("decode settings payload failed: {e}")))?;
         settings.resource_version = record.resource_version;
+        for key in settings.settings.keys() {
+            settings
+                .change_clocks
+                .entry(key.clone())
+                .or_insert_with(|| super::SettingChangeClock {
+                    id: format!("{}:{}:{key}", record.id, record.resource_version),
+                    committed_at_ms: record.updated_at_ms,
+                });
+        }
         Ok(settings)
     } else {
         Ok(StoredSettings::default())
@@ -7116,7 +7420,22 @@ async fn save_settings_record(
 ) -> Result<(), Status> {
     use crate::persistence::WriteCondition;
 
-    let payload = serde_json::to_vec(settings)
+    let previous = load_settings_record(store, object_type, workspace, name).await?;
+    let mut persisted = settings.clone();
+    persisted.change_clocks = previous.change_clocks.clone();
+    let now_ms = current_time_ms();
+    for key in previous.settings.keys().chain(settings.settings.keys()) {
+        if previous.settings.get(key) != settings.settings.get(key) {
+            persisted.change_clocks.insert(
+                key.clone(),
+                super::SettingChangeClock {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    committed_at_ms: now_ms,
+                },
+            );
+        }
+    }
+    let payload = serde_json::to_vec(&persisted)
         .map_err(|e| Status::internal(format!("encode settings payload failed: {e}")))?;
 
     let (id, condition) = if settings.resource_version == 0 {
@@ -7264,7 +7583,24 @@ mod tests {
         Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
     };
     use crate::grpc::test_support::{authed_request, test_server_state};
-    use crate::persistence::test_store;
+
+    /// An in-memory store with the example profiles imported at platform scope.
+    ///
+    /// Provider profiles are import-only, so a gateway resolves only what an
+    /// operator imported. Tests that expect `github`, `openai` or
+    /// `google-cloud` to resolve have to import them first.
+    async fn test_store() -> Store {
+        let store = crate::persistence::test_store().await;
+        for profile in openshell_providers::example_profiles::load_all() {
+            store
+                .put_message(&crate::provider_profile_sources::stored_provider_profile(
+                    profile.to_proto(),
+                ))
+                .await
+                .expect("store example provider profile");
+        }
+        store
+    }
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7483,6 +7819,312 @@ mod tests {
                 trust_domain: Some("openshell".to_string()),
             }));
         request
+    }
+
+    #[tokio::test]
+    async fn provisioning_timeout_rejects_supervisor_registration() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission, SandboxPhase, SandboxProvisioning,
+        };
+        let state = test_server_state().await;
+        let sandbox_id = "sb-timeout-registration";
+        let mut sandbox = test_sandbox(
+            sandbox_id,
+            "timeout-registration",
+            openshell_policy::restrictive_default_policy(),
+            Vec::new(),
+        );
+        sandbox.set_phase(SandboxPhase::Error.into());
+        sandbox.status.as_mut().unwrap().provisioning = Some(SandboxProvisioning {
+            timeout_time: openshell_core::time::timestamp_from_millis(300_000).ok(),
+            ..Default::default()
+        });
+        state.store.put_message(&sandbox).await.unwrap();
+        let error = handle_report_sandbox_configuration(
+            &state,
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.into(),
+                    admission: Some(SandboxConfigurationAdmission {
+                        instance_id: uuid::Uuid::new_v4().to_string(),
+                        state: ConfigurationAdmissionState::Pending.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("repair window expired"));
+    }
+
+    #[tokio::test]
+    async fn configuration_admission_rejects_stale_generation_and_instance() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState as Admission, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission,
+        };
+        let state = test_server_state().await;
+        let sandbox_id = "sb-admission";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "admission",
+                openshell_policy::restrictive_default_policy(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        let report = |admission| {
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    admission: Some(admission),
+                    expected_instance_id: String::new(),
+                }),
+                sandbox_id,
+            )
+        };
+        handle_report_sandbox_configuration(
+            &state,
+            report(SandboxConfigurationAdmission {
+                instance_id: instance_id.clone(),
+                state: Admission::Pending.into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let config = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(config.configuration_admitted);
+        let accepted = SandboxConfigurationAdmission {
+            instance_id: instance_id.clone(),
+            state: Admission::Accepted.into(),
+            policy_version: config.version,
+            policy_hash: config.policy_hash,
+            config_revision: config.config_revision,
+            provider_env_revision: config.provider_env_revision,
+            error: String::new(),
+        };
+        let mut outdated_admission = accepted.clone();
+        outdated_admission.provider_env_revision =
+            outdated_admission.provider_env_revision.wrapping_add(1);
+        assert_eq!(
+            handle_report_sandbox_configuration(&state, report(outdated_admission))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Aborted
+        );
+        handle_report_sandbox_configuration(&state, report(accepted.clone()))
+            .await
+            .unwrap();
+        let mut stale_rejection = accepted.clone();
+        stale_rejection.state = Admission::Rejected.into();
+        stale_rejection.policy_version += 1;
+        assert_eq!(
+            handle_report_sandbox_configuration(&state, report(stale_rejection))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Aborted,
+            "a delayed rejection must not mark the accepted current generation invalid"
+        );
+        let restart_instance = uuid::Uuid::new_v4().to_string();
+        let mut restart = report(SandboxConfigurationAdmission {
+            instance_id: restart_instance.clone(),
+            state: Admission::Pending.into(),
+            ..Default::default()
+        });
+        restart.get_mut().expected_instance_id = instance_id.clone();
+        handle_report_sandbox_configuration(&state, restart)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle_report_sandbox_configuration(
+                &state,
+                report(SandboxConfigurationAdmission {
+                    instance_id,
+                    state: Admission::Pending.into(),
+                    ..Default::default()
+                })
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            Code::FailedPrecondition,
+            "delayed old Pending must not reclaim registration"
+        );
+        assert_eq!(
+            handle_report_sandbox_configuration(&state, report(accepted.clone()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        for admission_state in [Admission::Pending, Admission::Rejected] {
+            if admission_state == Admission::Rejected {
+                let mut rejected = accepted.clone();
+                rejected.instance_id = restart_instance.clone();
+                rejected.state = Admission::Rejected.into();
+                handle_report_sandbox_configuration(&state, report(rejected))
+                    .await
+                    .unwrap();
+            }
+            let persisted = state
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                persisted.status.as_ref().unwrap().configuration_activated,
+                Some(true)
+            );
+            assert!(!crate::policy_store::permits_initial_static_policy_repair(
+                &persisted
+            ));
+            let mut replacement = persisted.spec.as_ref().unwrap().policy.clone().unwrap();
+            replacement.filesystem.as_mut().unwrap().read_only.clear();
+            let error = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    name: "admission".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    policy: Some(replacement),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), Code::InvalidArgument);
+            assert!(error.message().contains("filesystem"), "{error}");
+        }
+    }
+
+    #[test]
+    fn configuration_diagnostic_is_bounded_and_removes_control_characters() {
+        let diagnostic = bounded_configuration_diagnostic(&format!("rule\n{}", "é".repeat(1000)));
+        assert_eq!(diagnostic.chars().count(), 512);
+        assert!(!diagnostic.contains('\n'));
+    }
+
+    #[tokio::test]
+    async fn configuration_admission_retains_invalid_image_composition_for_repair() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState as Admission, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission,
+        };
+        let state = test_server_state().await;
+        let sandbox_id = "sb-image-admission";
+        let mut sandbox = test_sandbox(
+            sandbox_id,
+            "image-admission",
+            ProtoSandboxPolicy::default(),
+            vec!["work-github".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        sandbox.status.as_mut().unwrap().configuration_activated = Some(false);
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state.store.put_message(&sandbox).await.unwrap();
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        handle_report_sandbox_configuration(
+            &state,
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    expected_instance_id: String::new(),
+                    admission: Some(SandboxConfigurationAdmission {
+                        instance_id,
+                        state: Admission::Pending.into(),
+                        ..Default::default()
+                    }),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap();
+        let image = test_policy_with_rule("image_github", "api.github.com");
+        handle_update_config(
+            &state,
+            with_sandbox(
+                Request::new(UpdateConfigRequest {
+                    name: "image-admission".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    policy: Some(image),
+                    ..Default::default()
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .expect("image candidate remains available for repair");
+        let rejected = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!rejected.configuration_admitted);
+        assert!(rejected.configuration_error.contains("image_github"));
+        assert!(!rejected.configuration_error.contains("ghp-test"));
+        assert!(rejected.policy.is_some());
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "image-admission".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                policy: Some(openshell_policy::restrictive_default_policy()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("operator can replace static sections before first launch");
+        let repaired = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(
+            repaired.configuration_admitted,
+            "{}",
+            repaired.configuration_error
+        );
     }
 
     fn security_notes_for_host(host: &str) -> String {
@@ -7716,7 +8358,7 @@ mod tests {
                 .await
                 .expect("store legacy sandbox spec");
 
-            let error = handle_get_sandbox_config(
+            let error = handle_get_sandbox_config_inner(
                 &state,
                 with_sandbox(
                     Request::new(GetSandboxConfigRequest {
@@ -7963,7 +8605,7 @@ mod tests {
             .await
             .expect("store legacy invalid history");
 
-        let error = handle_get_sandbox_config(
+        let rejected = handle_get_sandbox_config(
             &state,
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
@@ -7973,10 +8615,12 @@ mod tests {
             ),
         )
         .await
-        .expect_err("invalid latest history must fail closed");
+        .expect("invalid latest history must remain repairable")
+        .into_inner();
 
-        assert_eq!(error.code(), Code::FailedPrecondition);
-        assert!(error.message().contains(STORED_POLICY_SOURCE_HISTORY));
+        assert!(!rejected.configuration_admitted);
+        assert!(rejected.policy.is_none());
+        assert!(!rejected.configuration_error.is_empty());
 
         let record = state
             .store
@@ -9361,6 +10005,408 @@ mod tests {
         assert!(err.message().contains("reserved '_provider_' prefix"));
     }
 
+    fn l7_scope_target() -> ProtoL7RuleTarget {
+        ProtoL7RuleTarget {
+            rule_name: "selected".to_string(),
+            host: "api.example.com".to_string(),
+            ports: vec![443, 8443],
+            path: Some(String::new()),
+            binaries: vec![
+                NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                },
+                NetworkBinary {
+                    path: "/usr/bin/python3".to_string(),
+                },
+            ],
+            any_binary: false,
+        }
+    }
+
+    fn l7_scope_operation(target: Option<ProtoL7RuleTarget>, deny: bool) -> PolicyMergeOperation {
+        let operation = if deny {
+            policy_merge_operation::Operation::AddDenyRules(ProtoAddDenyRules {
+                target,
+                deny_rules: vec![L7DenyRule {
+                    method: "POST".to_string(),
+                    path: "/admin".to_string(),
+                    ..Default::default()
+                }],
+            })
+        } else {
+            policy_merge_operation::Operation::AddAllowRules(ProtoAddAllowRules {
+                target,
+                rules: vec![L7Rule {
+                    allow: Some(openshell_core::proto::L7Allow {
+                        method: "POST".to_string(),
+                        path: "/admin".to_string(),
+                        ..Default::default()
+                    }),
+                }],
+            })
+        };
+        PolicyMergeOperation {
+            operation: Some(operation),
+        }
+    }
+
+    fn l7_scope_policy() -> ProtoSandboxPolicy {
+        let endpoint = NetworkEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            ports: vec![443, 8443],
+            protocol: "rest".to_string(),
+            tls: "terminate".to_string(),
+            access: "read-only".to_string(),
+            ..Default::default()
+        };
+        let selected = NetworkPolicyRule {
+            name: "selected".to_string(),
+            endpoints: vec![
+                endpoint.clone(),
+                NetworkEndpoint {
+                    path: "/v1/**".to_string(),
+                    ..endpoint.clone()
+                },
+            ],
+            binaries: l7_scope_target().binaries,
+        };
+        let sibling = NetworkPolicyRule {
+            name: "sibling".to_string(),
+            endpoints: vec![endpoint],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/wget".to_string(),
+            }],
+        };
+        validate_and_canonicalize_policy(ProtoSandboxPolicy {
+            network_policies: HashMap::from([
+                ("selected".to_string(), selected),
+                ("sibling".to_string(), sibling),
+            ]),
+            ..Default::default()
+        })
+        .expect("L7 scope fixture must be a valid policy")
+    }
+
+    #[test]
+    fn l7_target_scope_ingress_requires_target_and_exclusive_binary_declaration() {
+        for deny in [false, true] {
+            let missing = parse_merge_operations(&[l7_scope_operation(None, deny)]).unwrap_err();
+            assert_eq!(missing.code(), Code::InvalidArgument);
+
+            let mut omitted = l7_scope_target();
+            omitted.binaries.clear();
+            let mut contradictory = l7_scope_target();
+            contradictory.any_binary = true;
+            for target in [omitted, contradictory] {
+                let error = parse_merge_operations(&[l7_scope_operation(Some(target), deny)])
+                    .expect_err("binary scope must be explicit and exclusive");
+                assert_eq!(error.code(), Code::InvalidArgument);
+                assert!(error.message().contains("exactly one"));
+            }
+
+            let mut any = l7_scope_target();
+            any.any_binary = true;
+            any.binaries.clear();
+            let operations =
+                parse_merge_operations(&[l7_scope_operation(Some(any), deny)]).unwrap();
+            let (PolicyMergeOp::AddAllowRules { target, .. }
+            | PolicyMergeOp::AddDenyRules { target, .. }) = &operations[0]
+            else {
+                panic!("L7 operation expected");
+            };
+            assert_eq!(target.binaries, L7BinaryScope::Any);
+            assert_eq!(target.path.as_deref(), Some(""));
+        }
+    }
+
+    #[test]
+    fn l7_target_scope_ingress_rejects_malformed_targets() {
+        let mut invalid_targets = Vec::new();
+        let mut target = l7_scope_target();
+        target.rule_name.clear();
+        invalid_targets.push(target);
+        let mut target = l7_scope_target();
+        target.rule_name = "_provider_example".to_string();
+        invalid_targets.push(target);
+        let mut target = l7_scope_target();
+        target.host = "https://api.example.com".to_string();
+        invalid_targets.push(target);
+        for ports in [vec![], vec![0], vec![65536]] {
+            let mut target = l7_scope_target();
+            target.ports = ports;
+            invalid_targets.push(target);
+        }
+        let mut target = l7_scope_target();
+        target.binaries[0].path.clear();
+        invalid_targets.push(target);
+
+        for target in invalid_targets {
+            for deny in [false, true] {
+                let error =
+                    parse_merge_operations(&[l7_scope_operation(Some(target.clone()), deny)])
+                        .expect_err("malformed L7 target must fail at request ingress");
+                assert_eq!(error.code(), Code::InvalidArgument, "{target:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn l7_target_scope_ingress_preserves_existing_payload_guards() {
+        for operation in [
+            policy_merge_operation::Operation::AddAllowRules(ProtoAddAllowRules {
+                target: Some(l7_scope_target()),
+                rules: vec![],
+            }),
+            policy_merge_operation::Operation::AddDenyRules(ProtoAddDenyRules {
+                target: Some(l7_scope_target()),
+                deny_rules: vec![],
+            }),
+            policy_merge_operation::Operation::AddAllowRules(ProtoAddAllowRules {
+                target: Some(l7_scope_target()),
+                rules: vec![L7Rule { allow: None }],
+            }),
+        ] {
+            let error = parse_merge_operations(&[PolicyMergeOperation {
+                operation: Some(operation),
+            }])
+            .expect_err("target presence does not make an empty payload valid");
+            assert_eq!(error.code(), Code::InvalidArgument);
+        }
+    }
+
+    #[tokio::test]
+    async fn l7_target_scope_update_config_rejects_batch_without_persistence() {
+        let state = test_server_state().await;
+        let policy = l7_scope_policy();
+        let sandbox_id = "l7-scope-rejected";
+        let mut sandbox = test_sandbox(sandbox_id, sandbox_id, policy.clone(), Vec::new());
+        sandbox.metadata.as_mut().unwrap().annotations =
+            HashMap::from([("example.com/owner".to_string(), "original".to_string())]);
+        state.store.put_message(&sandbox).await.unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "l7-scope-seed",
+                sandbox_id,
+                "default",
+                1,
+                &policy.encode_to_vec(),
+                &deterministic_policy_hash(&policy),
+            )
+            .await
+            .unwrap();
+        let before = state
+            .store
+            .get_message_by_name::<Sandbox>("default", sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let before_revision = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut missing_binary = l7_scope_target();
+        missing_binary.binaries.pop();
+        let mut missing_port = l7_scope_target();
+        missing_port.ports = vec![443];
+        let mut ambiguous = l7_scope_target();
+        ambiguous.path = None;
+        let mut missing_rule = l7_scope_target();
+        missing_rule.rule_name = "absent".to_string();
+        let mut wrong_any = l7_scope_target();
+        wrong_any.binaries.clear();
+        wrong_any.any_binary = true;
+        let cases = [
+            (None, Code::InvalidArgument, "target"),
+            (
+                Some(missing_binary),
+                Code::FailedPrecondition,
+                "/usr/bin/python3",
+            ),
+            (Some(missing_port), Code::FailedPrecondition, "8443"),
+            (Some(ambiguous), Code::FailedPrecondition, "/v1/**"),
+            (Some(missing_rule), Code::NotFound, "absent"),
+            (Some(wrong_any), Code::FailedPrecondition, "/usr/bin/curl"),
+        ];
+
+        for (target, code, detail) in cases {
+            for deny in [false, true] {
+                // The first operation is valid and changes the private candidate.
+                // A failure in the second must roll back policy and metadata together.
+                let error = handle_update_config(
+                    &state,
+                    with_user(Request::new(UpdateConfigRequest {
+                        name: sandbox_id.to_string(),
+                        merge_operations: vec![
+                            l7_scope_operation(Some(l7_scope_target()), false),
+                            l7_scope_operation(target.clone(), deny),
+                        ],
+                        expected_resource_version: before
+                            .metadata
+                            .as_ref()
+                            .unwrap()
+                            .resource_version,
+                        annotations: HashMap::from([(
+                            "example.com/change".to_string(),
+                            "rejected".to_string(),
+                        )]),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                        ..Default::default()
+                    })),
+                )
+                .await
+                .expect_err("incomplete or ambiguous target must reject the batch");
+                assert_eq!(error.code(), code, "{detail}, deny={deny}: {error}");
+                assert!(error.message().contains(detail), "{error}");
+                let after = state
+                    .store
+                    .get_message_by_name::<Sandbox>("default", sandbox_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    after, before,
+                    "rejected batch must preserve all sandbox metadata and spec"
+                );
+                let revision = state
+                    .store
+                    .get_latest_policy(sandbox_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(revision.version, before_revision.version);
+                assert_eq!(revision.policy_hash, before_revision.policy_hash);
+                assert_eq!(revision.policy_payload, before_revision.policy_payload);
+                assert_eq!(
+                    state
+                        .store
+                        .list_policies(sandbox_id, 10, 0)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn l7_target_scope_update_config_changes_only_selected_endpoint() {
+        for deny in [false, true] {
+            let state = test_server_state().await;
+            let policy = l7_scope_policy();
+            let sandbox_id = "l7-scope-selected";
+            state
+                .store
+                .put_message(&test_sandbox(
+                    sandbox_id,
+                    sandbox_id,
+                    policy.clone(),
+                    Vec::new(),
+                ))
+                .await
+                .unwrap();
+            let initial_hash = deterministic_policy_hash(&policy);
+            state
+                .store
+                .put_policy_revision(
+                    "l7-scope-seed",
+                    sandbox_id,
+                    "default",
+                    1,
+                    &policy.encode_to_vec(),
+                    &initial_hash,
+                )
+                .await
+                .unwrap();
+            let before = state
+                .store
+                .get_message_by_name::<Sandbox>("default", sandbox_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut target = l7_scope_target();
+            target.host = "API.EXAMPLE.COM".to_string();
+            target.ports = vec![8443, 443, 8443];
+            target.binaries.reverse();
+            target.binaries.push(target.binaries[0].clone());
+            let response = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    name: sandbox_id.to_string(),
+                    merge_operations: vec![l7_scope_operation(Some(target), deny)],
+                    expected_resource_version: before.metadata.as_ref().unwrap().resource_version,
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect("complete explicit scope must resolve the selected endpoint")
+            .into_inner();
+            assert_eq!(response.version, 2);
+            assert_ne!(response.policy_hash, initial_hash);
+            let revision = state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let after = ProtoSandboxPolicy::decode(revision.policy_payload.as_slice()).unwrap();
+            assert_eq!(
+                after.network_policies["sibling"],
+                policy.network_policies["sibling"]
+            );
+            let before_rule = &policy.network_policies["selected"];
+            let after_rule = &after.network_policies["selected"];
+            assert_eq!(after_rule.binaries, before_rule.binaries);
+            assert_eq!(after_rule.endpoints.len(), before_rule.endpoints.len());
+            assert_eq!(
+                after_rule
+                    .endpoints
+                    .iter()
+                    .find(|endpoint| !endpoint.path.is_empty()),
+                before_rule
+                    .endpoints
+                    .iter()
+                    .find(|endpoint| !endpoint.path.is_empty()),
+            );
+            let endpoint = after_rule
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.path.is_empty())
+                .unwrap();
+            if deny {
+                assert!(
+                    endpoint
+                        .deny_rules
+                        .iter()
+                        .any(|rule| rule.method == "POST" && rule.path == "/admin")
+                );
+            } else {
+                assert!(endpoint.rules.iter().any(|rule| {
+                    rule.allow
+                        .as_ref()
+                        .is_some_and(|allow| allow.method == "POST" && allow.path == "/admin")
+                }));
+            }
+            assert_eq!(
+                state
+                    .store
+                    .list_policies(sandbox_id, 10, 0)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(revision.policy_hash, response.policy_hash);
+            assert_eq!(revision.policy_hash, deterministic_policy_hash(&after));
+        }
+    }
+
     #[test]
     fn policy_merge_error_mapping_distinguishes_request_shape_from_state_conflicts() {
         let invalid_operation =
@@ -9414,18 +10460,53 @@ mod tests {
         // detail must survive into the status message.
         assert!(existing_scope.message().contains("/usr/bin/other"));
 
-        // Both of these describe a well-formed request the current policy state
-        // forbids, so they are preconditions rather than argument errors.
-        let ambiguous =
-            map_policy_merge_error(openshell_policy::PolicyMergeError::AmbiguousEndpointRule {
+        let invalid_target =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::InvalidL7Target {
+                operation_index: 0,
+                reason: "ports are required".to_string(),
+            });
+        assert_eq!(invalid_target.code(), Code::InvalidArgument);
+
+        let missing =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::L7TargetNotFound {
+                rule_name: "missing".to_string(),
                 host: "api.example.com".to_string(),
-                port: 443,
-                targets: vec!["broad".to_string(), "narrow".to_string()],
+                ports: vec![443],
+                path: None,
+            });
+        assert_eq!(missing.code(), Code::NotFound);
+
+        // Ambiguous or incomplete declarations describe a well-formed request
+        // the current policy forbids, so they are preconditions.
+        let ambiguous =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::AmbiguousL7Target {
+                rule_name: "selected".to_string(),
+                host: "api.example.com".to_string(),
+                ports: vec![443],
+                paths: vec!["/v1/**".to_string(), "/v2/**".to_string()],
             });
         assert_eq!(ambiguous.code(), Code::FailedPrecondition);
-        // The operator has to know which rules collide to pick a way forward.
-        assert!(ambiguous.message().contains("broad"));
-        assert!(ambiguous.message().contains("narrow"));
+        assert!(ambiguous.message().contains("/v1/**"));
+        assert!(ambiguous.message().contains("/v2/**"));
+
+        let binary_scope =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::L7BinaryScopeMismatch {
+                rule_name: "selected".to_string(),
+                expected: vec!["/usr/bin/curl".to_string(), "/usr/bin/python3".to_string()],
+                declared: vec!["/usr/bin/curl".to_string()],
+            });
+        assert_eq!(binary_scope.code(), Code::FailedPrecondition);
+        assert!(binary_scope.message().contains("/usr/bin/python3"));
+
+        let port_scope =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::L7PortScopeMismatch {
+                rule_name: "selected".to_string(),
+                host: "api.example.com".to_string(),
+                expected: vec![443, 8443],
+                declared: vec![443],
+            });
+        assert_eq!(port_scope.code(), Code::FailedPrecondition);
+        assert!(port_scope.message().contains("8443"));
 
         let undeclared_port = map_policy_merge_error(
             openshell_policy::PolicyMergeError::UndeclaredPortWouldChange {
@@ -17839,8 +18920,15 @@ mod tests {
     #[test]
     fn summarize_cli_policy_merge_op_formats_rest_allow_rules() {
         let operation = PolicyMergeOp::AddAllowRules {
-            host: "api.github.com".to_string(),
-            port: 443,
+            target: L7RuleTarget {
+                rule_name: "github".to_string(),
+                host: "api.github.com".to_string(),
+                ports: vec![443],
+                path: Some(String::new()),
+                binaries: L7BinaryScope::Restricted(vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                }]),
+            },
             rules: vec![L7Rule {
                 allow: Some(openshell_core::proto::L7Allow {
                     method: "POST".to_string(),
@@ -17857,7 +18945,7 @@ mod tests {
 
         assert_eq!(
             summarize_cli_policy_merge_op(&operation),
-            "add-allow api.github.com:443 [POST /repos/*/issues]"
+            "add-allow api.github.com:443 rule=github endpoint-path=Some(\"\") binaries=[/usr/bin/curl] [POST /repos/*/issues]"
         );
     }
 
@@ -18234,8 +19322,13 @@ mod tests {
             .unwrap();
 
         let add_allow = [PolicyMergeOp::AddAllowRules {
-            host: "api.github.com".to_string(),
-            port: 443,
+            target: L7RuleTarget {
+                rule_name: "github".to_string(),
+                host: "api.github.com".to_string(),
+                ports: vec![443],
+                path: None,
+                binaries: L7BinaryScope::Any,
+            },
             rules: vec![L7Rule {
                 allow: Some(L7Allow {
                     method: "POST".to_string(),
@@ -18250,8 +19343,13 @@ mod tests {
             }],
         }];
         let add_deny = [PolicyMergeOp::AddDenyRules {
-            host: "api.github.com".to_string(),
-            port: 443,
+            target: L7RuleTarget {
+                rule_name: "github".to_string(),
+                host: "api.github.com".to_string(),
+                ports: vec![443],
+                path: None,
+                binaries: L7BinaryScope::Any,
+            },
             deny_rules: vec![L7DenyRule {
                 method: "POST".to_string(),
                 path: "/admin".to_string(),
@@ -18405,8 +19503,13 @@ mod tests {
     #[test]
     fn validate_merge_operations_rejects_add_allow_for_known_metadata_hostname() {
         let operation = PolicyMergeOp::AddAllowRules {
-            host: "metadata.google.internal".to_string(),
-            port: 80,
+            target: L7RuleTarget {
+                rule_name: "metadata".to_string(),
+                host: "metadata.google.internal".to_string(),
+                ports: vec![80],
+                path: None,
+                binaries: L7BinaryScope::Any,
+            },
             rules: vec![L7Rule {
                 allow: Some(openshell_core::proto::L7Allow {
                     method: "GET".to_string(),

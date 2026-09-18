@@ -165,9 +165,8 @@ grpc_rate_limit_requests       = 120
 grpc_rate_limit_window_seconds = 60
 
 # Optional exact provider-profile source composition. When omitted, the
-# gateway uses builtin + user.
+# gateway uses imported profiles only.
 provider_profile_sources = [
-  { type = "builtin" },
   { type = "user" },
 ]
 
@@ -267,7 +266,7 @@ The client-certificate handshake policy is derived and has no `require_client_au
 
 `[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
 
-`[openshell.gateway] policy_validation_failure_mode` controls what sandbox supervisors do when a complete candidate policy fails runtime validation. The default, `fail_closed`, deactivates the previous network policy, closes relays pinned to it, and denies new egress until a valid generation loads. `retain_last_valid` leaves the previous valid generation active. Both modes reject the candidate atomically; startup always fails closed when no previous valid generation exists. Gateway mutation paths that can preflight a known effective scope reject invalid candidates before persistence and leave the active policy unchanged regardless of this setting. Changing the value requires restarting the gateway so it can reload `gateway.toml` and distribute the new posture to sandbox supervisors.
+`[openshell.gateway] policy_validation_failure_mode` controls what sandbox supervisors do when a complete candidate policy fails runtime validation. The default, `fail_closed`, deactivates the previous network policy, closes relays pinned to it, and denies new egress until a valid generation loads. `retain_last_valid` leaves the previous valid generation active. Both modes reject the candidate atomically; startup keeps the workload unstarted until the effective policy and matching provider configuration pass admission. A rejected startup exposes `ConfigurationInvalid` and remains available for policy/provider repair in either mode. Gateway mutation paths that can preflight a known effective scope reject invalid candidates before persistence and leave the active policy unchanged regardless of this setting. Changing the value requires restarting the gateway so it can reload `gateway.toml` and distribute the new posture to sandbox supervisors.
 
 `[openshell.gateway.gateway_jwt] ttl_secs` controls gateway-minted sandbox JWT lifetime. Omit it for a non-expiring token: the token has no `exp` claim and the response omits `expiration_time`. Use this only for local single-player Docker, Podman, or VM gateways. Explicit `0` is invalid. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway omits the field.
 
@@ -398,7 +397,9 @@ Bindings under `allowlist` and `exact` require `rpc` or `service` plus `method`,
 
 Bindings that include `post_commit` must resolve to `failure_policy = "fail_open"`; the gateway rejects fail-closed post-commit configuration at startup. Post-commit evaluation is observational. If response observation or interceptor evaluation fails after a handler succeeds, the gateway logs and counts the failure but returns the committed response unchanged.
 
-`provider_profile_sources` selects the exact ordered provider-profile source set. Omit it to use the built-in and user-managed sources. Use `{ type = "builtin" }`, `{ type = "user" }`, and `{ type = "interceptor", name = "<configured-interceptor-name>" }` entries to compose a catalog. An interceptor entry must reference a configured service whose manifest advertises `provider_profiles = true`. Selecting only an interceptor makes that catalog authoritative; include local sources explicitly to compose them. Empty or duplicate source lists, unknown interceptor names, and duplicate normalized profile IDs fail closed. Source order controls collection and diagnostics, not override precedence.
+`provider_profile_sources` selects the exact ordered provider-profile source set. Omit it to use imported profiles only. Use `{ type = "user" }` and `{ type = "interceptor", name = "<configured-interceptor-name>" }` entries to compose a catalog. An interceptor entry must reference a configured service whose manifest advertises `provider_profiles = true`. Selecting only an interceptor makes that catalog authoritative; include `{ type = "user" }` explicitly to compose imported profiles with it. Empty or duplicate source lists, unknown interceptor names, and duplicate normalized profile IDs fail closed. Source order controls collection and diagnostics, not override precedence.
+
+OpenShell ships no profiles inside the gateway binary. A gateway with nothing imported reaches ready and serves an empty catalog; import the profiles it needs with `openshell provider profile import`. The `builtin` source type was removed and a configuration that still names it is rejected at startup.
 
 For an authoritative interceptor catalog, select only that interceptor:
 

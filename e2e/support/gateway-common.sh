@@ -146,6 +146,111 @@ EOF
   printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
 }
 
+# Import the example provider profiles at platform scope.
+#
+# OpenShell compiles no provider profile into a binary, so a freshly started
+# gateway serves an empty catalog. The e2e suites exercise providers built from
+# github, openai, nvidia and the rest, which means the lane has to import them
+# first — the same step the upgrade notes give operators.
+e2e_import_example_provider_profiles() {
+  local cli_bin=$1
+  local root=$2
+
+  echo "Importing example provider profiles from ${root}/providers..."
+  if ! "${cli_bin}" provider profile import --from "${root}/providers" --global; then
+    echo "ERROR: failed to import example provider profiles" >&2
+    return 1
+  fi
+}
+
+# Register an administrator OIDC session for a gateway, non-interactively.
+#
+# The browser PKCE flow the CLI normally uses cannot run unattended, so mint an
+# admin access token with Keycloak's password grant and write the same token
+# bundle `openshell gateway login` would have stored. Used only to establish a
+# setup identity; the tests themselves still authenticate however they choose.
+e2e_register_oidc_admin_session() {
+  local config_home=$1
+  local name=$2
+  local endpoint=$3
+  local port=$4
+  local issuer=$5
+  local username=$6
+  local password=$7
+  local pki_dir=$8
+  local cli_bin=$9
+  local client_id="${10:-openshell-cli}"
+  local gateway_config_dir="${config_home}/openshell/gateways/${name}"
+
+  # The OpenShell scopes are optional client scopes on openshell-cli, so
+  # Keycloak mints them only when they are asked for. Without an explicit
+  # scope the token carries the realm defaults alone and every authorized RPC
+  # fails with "scope '<name>' required".
+  local token
+  token=$(curl -sf -X POST "${issuer}/protocol/openid-connect/token" \
+    -d "grant_type=password" \
+    -d "client_id=${client_id}" \
+    -d "username=${username}" \
+    -d "password=${password}" \
+    --data-urlencode "scope=openid openshell:all" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' 2>/dev/null) || true
+
+  if [ -z "${token}" ]; then
+    echo "ERROR: could not obtain an admin OIDC token from ${issuer}" >&2
+    return 1
+  fi
+
+  mkdir -p "${gateway_config_dir}"
+
+  # Trust the gateway's self-signed serving certificate. Only the CA is
+  # installed: these lanes start the gateway without --tls-client-ca, and with
+  # no client cert/key on disk the CLI falls back to CA-only server
+  # verification and authenticates with the bearer token instead of an mTLS
+  # identity.
+  mkdir -p "${gateway_config_dir}/mtls"
+  cp "${pki_dir}/ca.crt" "${gateway_config_dir}/mtls/ca.crt"
+
+  # auth_mode must be "oidc": the CLI dispatches on this field alone when
+  # deciding to load a stored bearer token, so omitting it leaves
+  # oidc_token.json on disk and unread, and the request goes unauthenticated.
+  cat >"${gateway_config_dir}/metadata.json" <<EOF
+{
+  "name": "${name}",
+  "gateway_endpoint": "${endpoint}",
+  "is_remote": false,
+  "gateway_port": ${port},
+  "auth_mode": "oidc",
+  "oidc_issuer": "${issuer}",
+  "oidc_client_id": "${client_id}",
+  "oidc_scopes": "openid openshell:all"
+}
+EOF
+  cat >"${gateway_config_dir}/oidc_token.json" <<EOF
+{
+  "access_token": "${token}",
+  "issuer": "${issuer}",
+  "client_id": "${client_id}"
+}
+EOF
+  chmod 600 "${gateway_config_dir}/oidc_token.json"
+  printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
+
+  # Assert the CLI reaches the gateway as an authenticated administrator before
+  # anything depends on it. ListProviderProfiles is annotated
+  # auth_mode: "bearer", so it cannot succeed unless the stored token was
+  # loaded and accepted -- this fails here, with the cause named, rather than
+  # surfacing later as an opaque profile import error.
+  if ! "${cli_bin}" provider list-profiles --global --output json >/dev/null 2>&1; then
+    echo "ERROR: the CLI could not make an authenticated call as the OIDC administrator" >&2
+    echo "       gateway config: ${gateway_config_dir}" >&2
+    echo "       CLI output follows:" >&2
+    "${cli_bin}" provider list-profiles --global --output json >&2 || true
+    return 1
+  fi
+
+  echo "Established an authenticated OIDC administrator session for '${name}'."
+}
+
 e2e_toml_string() {
   local value="$1"
   value="${value//\\/\\\\}"

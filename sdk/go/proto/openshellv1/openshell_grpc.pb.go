@@ -73,6 +73,7 @@ const (
 	OpenShell_ReportPolicyStatus_FullMethodName            = "/openshell.v1.OpenShell/ReportPolicyStatus"
 	OpenShell_ReportEndpointStatus_FullMethodName          = "/openshell.v1.OpenShell/ReportEndpointStatus"
 	OpenShell_ReportProviderReadiness_FullMethodName       = "/openshell.v1.OpenShell/ReportProviderReadiness"
+	OpenShell_ReportSandboxConfiguration_FullMethodName    = "/openshell.v1.OpenShell/ReportSandboxConfiguration"
 	OpenShell_GetSandboxProviderEnvironment_FullMethodName = "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
 	OpenShell_ExchangeProviderSubjectToken_FullMethodName  = "/openshell.v1.OpenShell/ExchangeProviderSubjectToken"
 	OpenShell_GetSandboxLogs_FullMethodName                = "/openshell.v1.OpenShell/GetSandboxLogs"
@@ -231,6 +232,8 @@ type OpenShellClient interface {
 	// Report installed provider state for the current ConnectSupervisor session.
 	// Replacing or losing that session invalidates its observations.
 	ReportProviderReadiness(ctx context.Context, in *ReportProviderReadinessRequest, opts ...grpc.CallOption) (*ReportProviderReadinessResponse, error)
+	// Register startup and acknowledge an exact validated runtime configuration.
+	ReportSandboxConfiguration(ctx context.Context, in *ReportSandboxConfigurationRequest, opts ...grpc.CallOption) (*ReportSandboxConfigurationResponse, error)
 	// Get provider environment for a sandbox (called by sandbox supervisor at startup).
 	GetSandboxProviderEnvironment(ctx context.Context, in *GetSandboxProviderEnvironmentRequest, opts ...grpc.CallOption) (*GetSandboxProviderEnvironmentResponse, error)
 	// Exchange a stored provider subject token for an intermediate token scoped
@@ -841,6 +844,16 @@ func (c *openShellClient) ReportProviderReadiness(ctx context.Context, in *Repor
 	return out, nil
 }
 
+func (c *openShellClient) ReportSandboxConfiguration(ctx context.Context, in *ReportSandboxConfigurationRequest, opts ...grpc.CallOption) (*ReportSandboxConfigurationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportSandboxConfigurationResponse)
+	err := c.cc.Invoke(ctx, OpenShell_ReportSandboxConfiguration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *openShellClient) GetSandboxProviderEnvironment(ctx context.Context, in *GetSandboxProviderEnvironmentRequest, opts ...grpc.CallOption) (*GetSandboxProviderEnvironmentResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetSandboxProviderEnvironmentResponse)
@@ -1258,6 +1271,8 @@ type OpenShellServer interface {
 	// Report installed provider state for the current ConnectSupervisor session.
 	// Replacing or losing that session invalidates its observations.
 	ReportProviderReadiness(context.Context, *ReportProviderReadinessRequest) (*ReportProviderReadinessResponse, error)
+	// Register startup and acknowledge an exact validated runtime configuration.
+	ReportSandboxConfiguration(context.Context, *ReportSandboxConfigurationRequest) (*ReportSandboxConfigurationResponse, error)
 	// Get provider environment for a sandbox (called by sandbox supervisor at startup).
 	GetSandboxProviderEnvironment(context.Context, *GetSandboxProviderEnvironmentRequest) (*GetSandboxProviderEnvironmentResponse, error)
 	// Exchange a stored provider subject token for an intermediate token scoped
@@ -1502,6 +1517,9 @@ func (UnimplementedOpenShellServer) ReportEndpointStatus(context.Context, *Repor
 }
 func (UnimplementedOpenShellServer) ReportProviderReadiness(context.Context, *ReportProviderReadinessRequest) (*ReportProviderReadinessResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReportProviderReadiness not implemented")
+}
+func (UnimplementedOpenShellServer) ReportSandboxConfiguration(context.Context, *ReportSandboxConfigurationRequest) (*ReportSandboxConfigurationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportSandboxConfiguration not implemented")
 }
 func (UnimplementedOpenShellServer) GetSandboxProviderEnvironment(context.Context, *GetSandboxProviderEnvironmentRequest) (*GetSandboxProviderEnvironmentResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSandboxProviderEnvironment not implemented")
@@ -2476,6 +2494,24 @@ func _OpenShell_ReportProviderReadiness_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_ReportSandboxConfiguration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportSandboxConfigurationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).ReportSandboxConfiguration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_ReportSandboxConfiguration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).ReportSandboxConfiguration(ctx, req.(*ReportSandboxConfigurationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OpenShell_GetSandboxProviderEnvironment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetSandboxProviderEnvironmentRequest)
 	if err := dec(in); err != nil {
@@ -3116,6 +3152,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReportProviderReadiness",
 			Handler:    _OpenShell_ReportProviderReadiness_Handler,
+		},
+		{
+			MethodName: "ReportSandboxConfiguration",
+			Handler:    _OpenShell_ReportSandboxConfiguration_Handler,
 		},
 		{
 			MethodName: "GetSandboxProviderEnvironment",

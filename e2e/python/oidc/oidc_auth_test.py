@@ -54,7 +54,7 @@ class TestRbac:
             workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-admin-test"),
-                type="claude",
+                type="claude-code",
                 credentials={"ANTHROPIC_API_KEY": "test-value"},
             ),
         )
@@ -84,7 +84,7 @@ class TestRbac:
             workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-user-blocked"),
-                type="claude",
+                type="claude-code",
                 credentials={"ANTHROPIC_API_KEY": "test-value"},
             ),
         )

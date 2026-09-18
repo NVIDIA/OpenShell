@@ -148,7 +148,7 @@ journalctl -u <interceptor-service> --no-pager --lines=200
 journalctl -u openshell-gateway --no-pager --lines=200
 ```
 
-The gateway calls each interceptor's `Describe` RPC and validates its manifest at startup. Check for unreachable endpoints, invalid RPC/phase bindings, strict `allowlist` or `exact` mismatches, and `post_commit` bindings that resolve to `fail_closed`. If gateway JWT signing is enabled, authenticated network interceptors require HTTPS and a valid bearer token; check the private CA path, endpoint hostname, expected audience, issuer, `kid`, and interceptor logs for token rejection. `allow_insecure_transport = true` explicitly preserves unauthenticated plaintext behavior. If `provider_profile_sources` names an interceptor, that interceptor must advertise provider-profile capability and return a valid, duplicate-free catalog. A selected interceptor-only source is authoritative; include `builtin` or `user` sources explicitly when composition is intended.
+The gateway calls each interceptor's `Describe` RPC and validates its manifest at startup. Check for unreachable endpoints, invalid RPC/phase bindings, strict `allowlist` or `exact` mismatches, and `post_commit` bindings that resolve to `fail_closed`. If gateway JWT signing is enabled, authenticated network interceptors require HTTPS and a valid bearer token; check the private CA path, endpoint hostname, expected audience, issuer, `kid`, and interceptor logs for token rejection. `allow_insecure_transport = true` explicitly preserves unauthenticated plaintext behavior. If `provider_profile_sources` names an interceptor, that interceptor must advertise provider-profile capability and return a valid, duplicate-free catalog. A selected interceptor-only source is authoritative; include a `user` source explicitly when composition is intended. The `builtin` source type was removed: a config that still names it is rejected at startup.
 
 If the deployment uses supervisor middleware, follow the
 [supervisor middleware troubleshooting reference](references/supervisor-middleware.md)
@@ -184,6 +184,25 @@ diagnostics; `exec ... sh`, package installation and in-container shell scripts
 are unavailable. Workload shells belong to the separate sandbox image. Preserve
 the driver-selected UID and writable runtime/log mounts when reproducing a
 supervisor startup failure.
+
+A `ConfigurationInvalid` readiness condition means startup admission rejected
+the image/effective policy or provider configuration. The supervisor remains
+alive while the workload stays unstarted. Inspect `openshell sandbox get` and
+repair the desired configuration with a complete policy replacement or provider
+change; do not treat a healthy container as proof that the workload is ready.
+If the 300-second provisioning repair window expires, the gateway records
+`ProvisioningTimedOut` and stops workload and supervisor compute. Inspect
+`provisioning` in sandbox JSON and TUI NOTES to distinguish cleanup pending from
+complete. Repairing configuration after expiry does not restart compute: wait
+for cleanup, then explicitly use `sandbox start`. Repeated rejected reports do
+not refresh the deadline, and the CLI wait timeout does not control it.
+See [policy validation and repair](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md).
+The isolated supervisor requests image-policy discovery through the authenticated
+sandbox boundary before admission. The workload boundary can remain alive without
+launching the workload while configuration is repaired. An unavailable boundary
+fails discovery within its control-request deadline. Permanent
+gateway errors and exhausted transient retries terminate startup; inspect those
+errors as connectivity, authorization, or lifecycle failures.
 
 ### Step 4: Check Docker-Backed Gateways
 
@@ -646,11 +665,31 @@ a required unprivileged seccomp, task-memory, or Landlock operation. Do not add
 capabilities, gateway egress, or credentials to the workload Pod as a
 workaround.
 
-If a Sandbox remains in the `rolling-back` bootstrap phase, verify that the
+If a Sandbox remains in the `releasing` bootstrap phase, inspect the supervisor
+Pod first. The gateway keeps the workload running during this phase so the
+supervisor can release that sandbox's runtime-control relationship cleanly.
+Check the Pod's deletion timestamp, termination grace period, events, and
+finalizers, and verify that the gateway ServiceAccount can delete Pods in the
+sandbox namespace:
+
+```bash
+kubectl -n <sandbox-namespace> get pod \
+  -l openshell.ai/sandbox-id=<sandbox-id>,openshell.ai/boundary-role=supervisor \
+  -o yaml
+kubectl auth can-i delete pods \
+  --namespace <sandbox-namespace> \
+  --as system:serviceaccount:openshell:openshell
+```
+
+Do not suspend or delete the workload Pod manually. The driver advances to
+`suspending` only after runtime control has been released, and then suspends the
+workload.
+
+If a Sandbox remains in the `suspending` bootstrap phase, verify that the
 gateway ServiceAccount can create, list, and delete Secrets in the sandbox
 namespace. Recovery lists generation Secrets by sandbox and component labels
 even when none remain, then deletes stale entries with UID preconditions before
-clearing the rollback annotations:
+clearing the suspension annotations:
 
 ```bash
 for verb in create list delete; do
@@ -775,8 +814,12 @@ credential failures.
 | Edge or OIDC gateway returns `Unauthenticated` | Stored login expired, audience/scopes mismatch, or gateway auth configuration changed | `openshell gateway info`, `openshell gateway login <name>`, gateway auth logs |
 | Gateway exits during OIDC initialization | Issuer is not HTTPS, discovery redirected, metadata used a non-JSON media type or exceeded its size limit, or `jwks_uri` uses an untrusted origin | Use an HTTPS issuer; mount a private CA with `server.oidc.caConfigMapName`; keep JWKS on the issuer origin or explicitly add its HTTPS origin to `server.oidc.jwksAllowedOrigins`. Numeric-loopback HTTP is development-only and also requires `server.oidc.dangerouslyAllowInsecureHttp=true` |
 | Gateway fails before serving health after enabling an interceptor | Interceptor endpoint unavailable or manifest/binding validation failed | Gateway and interceptor logs; interceptor socket; `binding_policy`, phases, and failure policy |
-| Authenticated interceptor rejects gateway calls | Private CA or hostname mismatch, expected audience or issuer mismatch, stale/unknown `kid`, or malformed extension token | `tls_ca_cert_path`, registration `audience`, service verifier config and logs; fetch well-known metadata only through the already-trusted gateway TLS endpoint |
-| Provider profiles disappear after enabling an interceptor catalog | `provider_profile_sources` selected only an authoritative interceptor or returned invalid/duplicate IDs | Inspect source list and interceptor `Describe`/catalog logs; include `builtin` and `user` when intended |
+| Authenticated interceptor or middleware rejects gateway calls | Private CA or hostname mismatch, expected audience or issuer mismatch, stale/unknown `kid`, or malformed extension token | `tls_ca_cert_path`, registration `audience`, service verifier config and logs; fetch well-known metadata only through the already-trusted gateway TLS endpoint |
+| Provider profiles disappear after enabling an interceptor catalog | `provider_profile_sources` selected only an authoritative interceptor or returned invalid/duplicate IDs | Inspect source list and interceptor `Describe`/catalog logs; include `user` when composition with imported profiles is intended |
+| `provider list-profiles` is empty on a new gateway | Profiles are import-only and nothing has been imported | Import with `openshell provider profile import --from providers --global`; an empty catalog is a valid ready state, not a failure |
+| Sandbox create or provider attach fails naming a missing profile | The provider's profile was never imported, was deleted, or lives at another scope | Import it at the scope the provider uses; the error names the profile ID and the command |
+| Gateway fails after registering supervisor middleware | Service unavailable, invalid manifest, duplicate binding, reserved name, or invalid payload/timeout limit | Middleware service and gateway logs; `[[openshell.supervisor.middleware]]`; `Describe` response |
+| Policy update rejects `network_middlewares` | Unknown middleware name, implementation-owned config invalid, duplicate order, broad/invalid host selector, or fail-closed coverage of `tls: skip` | Policy error, gateway logs, middleware `ValidateConfig`, selector and order fields |
 | Policy mutation returns `FAILED_PRECONDITION` for endpoint ambiguity | Equally specific effective endpoint selectors disagree on connection or request-processing metadata | CLI error, base and provider-composed policy, affected profile attachments; confirm no new revision was stored |
 | Supervisor enters policy quarantine | A runtime candidate failed validation while `policy_validation_failure_mode = "fail_closed"` | Sandbox OCSF config/finding events, validation rationale, active generation, `previous_policy_active` |
 | Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or selected name does not match its endpoint/config key | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |

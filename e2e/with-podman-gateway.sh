@@ -919,5 +919,23 @@ if [ -n "${OPENSHELL_E2E_EXPECTED_CONFORMANCE_SHA256:-}" ]; then
   require_expected_sha256 "conformance CLI" "${OPENSHELL_CONFORMANCE_BIN}" \
     "${OPENSHELL_E2E_EXPECTED_CONFORMANCE_SHA256}"
 fi
+# Seed the example profiles the provider tests rely on. The mTLS lanes already
+# have a registered gateway identity; the OIDC lanes deliberately skip
+# registration and have no token yet, so establish an administrator session
+# first rather than importing unauthenticated.
+if [ "${OIDC_MODE}" = "1" ]; then
+  e2e_register_oidc_admin_session \
+    "${XDG_CONFIG_HOME}" \
+    "${GATEWAY_NAME}" \
+    "${CLI_GATEWAY_ENDPOINT}" \
+    "${HOST_PORT}" \
+    "${OIDC_ISSUER}" \
+    "${OPENSHELL_E2E_OIDC_USERNAME:-admin@test}" \
+    "${OPENSHELL_E2E_OIDC_PASSWORD:-admin}" \
+    "${PKI_DIR}" \
+    "${CLI_BIN}" || exit 1
+fi
+e2e_import_example_provider_profiles "${CLI_BIN}" "${ROOT}" || exit 1
+
 echo "Running e2e command against ${CLI_GATEWAY_ENDPOINT}: $*"
 "$@"

@@ -255,7 +255,7 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
                         metadata=datamodel_pb2.ObjectMeta(
                             name="authz-test", workspace=WS
                         ),
-                        type="claude",
+                        type="claude-code",
                         credentials={"ANTHROPIC_API_KEY": "v"},
                     ),
                 ),
@@ -290,7 +290,7 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
                         metadata=datamodel_pb2.ObjectMeta(
                             name="nonexistent", workspace=WS
                         ),
-                        type="claude",
+                        type="claude-code",
                         credentials={"ANTHROPIC_API_KEY": "v"},
                     ),
                 ),
@@ -676,7 +676,7 @@ class TestWorkspaceAuthorization:
                         metadata=datamodel_pb2.ObjectMeta(
                             name=prov_name, workspace=workspace
                         ),
-                        type="claude",
+                        type="claude-code",
                         credentials={"ANTHROPIC_API_KEY": "test"},
                     ),
                 ),
@@ -1015,7 +1015,7 @@ class TestWorkspaceAuthorization:
                             metadata=datamodel_pb2.ObjectMeta(
                                 name="user-blocked", workspace=WS
                             ),
-                            type="claude",
+                            type="claude-code",
                             credentials={"ANTHROPIC_API_KEY": "v"},
                         ),
                     ),
@@ -1084,7 +1084,7 @@ class TestWorkspaceAuthorization:
                     workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                     provider=datamodel_pb2.Provider(
                         metadata=datamodel_pb2.ObjectMeta(name=prov_name, workspace=WS),
-                        type="claude",
+                        type="claude-code",
                         credentials={"ANTHROPIC_API_KEY": "v"},
                     ),
                 ),

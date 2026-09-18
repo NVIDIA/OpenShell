@@ -115,22 +115,23 @@ func TestConverterCoversAllProtoFields_SandboxStartup(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 	handled := fieldSet{
-		"sandbox_name":           true,
-		"agent_pod":              true,
-		"agent_fd":               true,
-		"sandbox_fd":             true,
-		"phase":                  true,
-		"conditions":             true,
-		"endpoint_statuses":      true,
-		"current_policy_version": true,
-		"exit_code":              true,
+		"sandbox_name":            true,
+		"agent_pod":               true,
+		"agent_fd":                true,
+		"sandbox_fd":              true,
+		"phase":                   true,
+		"conditions":              true,
+		"endpoint_statuses":       true,
+		"current_policy_version":  true,
+		"exit_code":               true,
+		"configuration_admission": true,
 	}
-	// These fields coordinate internal gateway/supervisor lifecycle fencing
-	// and idempotent status reconciliation. They remain available only through
-	// the raw protobuf API.
-	skipped := fieldSet{
-		"main_process_instance_id": true,
-	}
+	// The instance ID coordinates internal gateway/supervisor lifecycle
+	// fencing. The first-activation marker governs static policy repair.
+	// Provisioning carries gateway-owned attempt, deadline, and cleanup state;
+	// the curated API exposes its outcome through phase and conditions. Detailed
+	// lifecycle bookkeeping remains available through the raw protobuf API.
+	skipped := fieldSet{"main_process_instance_id": true, "configuration_activated": true, "provisioning": true}
 
 	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, skipped)
 }

@@ -366,7 +366,7 @@ const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   $ openshell policy set my-sandbox --policy policy.yaml
   $ openshell policy update my-sandbox --add-endpoint api.github.com:443:read-only:rest:enforce
   $ openshell policy update my-sandbox --add-endpoint realtime.example.com:443:read-write:websocket:enforce:websocket-credential-rewrite,allowed-ip=10.0.0.0/8
-  $ openshell policy update my-sandbox --add-allow 'api.github.com:443:GET:/repos/**'
+  $ openshell policy update my-sandbox --rule-name github --binary /usr/bin/gh --add-allow 'api.github.com:443:GET:/repos/**'
   $ openshell policy set --global --policy policy.yaml
   $ openshell policy delete --global
   $ openshell policy list my-sandbox
@@ -1944,11 +1944,15 @@ enum PolicyCommands {
         #[arg(long = "remove-endpoint")]
         remove_endpoints: Vec<String>,
 
-        /// Add a REST or WebSocket method/path allow rule: `host:port:METHOD:path_glob`.
+        /// Append an allow rule: `host:port[,port...]:METHOD:path_glob`.
+        /// List every port on the target endpoint.
+        /// Requires --rule-name and the complete --binary list or --any-binary.
         #[arg(long = "add-allow")]
         add_allow: Vec<String>,
 
-        /// Add a REST or WebSocket method/path deny rule: `host:port:METHOD:path_glob`.
+        /// Append a deny rule: `host:port[,port...]:METHOD:path_glob`.
+        /// List every port on the target endpoint.
+        /// Requires --rule-name and the complete --binary list or --any-binary.
         #[arg(long = "add-deny")]
         add_deny: Vec<String>,
 
@@ -1956,13 +1960,22 @@ enum PolicyCommands {
         #[arg(long = "remove-rule")]
         remove_rules: Vec<String>,
 
-        /// Add binaries to each --add-endpoint rule.
+        /// Add a binary to --add-endpoint, or declare every binary of an L7 target rule.
         #[arg(long = "binary", value_hint = ValueHint::FilePath)]
         binaries: Vec<String>,
 
-        /// Override the generated rule name when exactly one --add-endpoint is provided.
+        /// Name the target rule for L7 appends, or override one --add-endpoint rule name.
         #[arg(long = "rule-name")]
         rule_name: Option<String>,
+
+        /// Explicitly declare that the target rule for L7 appends allows any binary.
+        #[arg(long, conflicts_with = "binaries")]
+        any_binary: bool,
+
+        /// Select an exact endpoint path for L7 appends; an empty value selects no path.
+        /// This is distinct from the appended method/path matcher.
+        #[arg(long)]
+        endpoint_path: Option<String>,
 
         /// Preview the merged policy without sending it to the gateway.
         #[arg(long)]
@@ -2839,6 +2852,8 @@ async fn run_async() -> Result<()> {
                     remove_rules,
                     binaries,
                     rule_name,
+                    any_binary,
+                    endpoint_path,
                     dry_run,
                     wait,
                     timeout,
@@ -2854,6 +2869,8 @@ async fn run_async() -> Result<()> {
                         &remove_rules,
                         &binaries,
                         rule_name.as_deref(),
+                        any_binary,
+                        endpoint_path.as_deref(),
                         dry_run,
                         wait,
                         timeout,
@@ -3159,7 +3176,6 @@ async fn run_async() -> Result<()> {
 
                     // Parse --env flags into a HashMap<String, String>.
                     let env_map = run::parse_env_pairs(&envs)?;
-                    run::warn_credential_env_vars(&env_map, no_credential_warnings);
 
                     // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
                     let upload_specs: Vec<(String, Option<String>, bool)> = upload
@@ -3214,6 +3230,7 @@ async fn run_async() -> Result<()> {
                             approval_mode: &approval_mode,
                             output: output.as_str(),
                             detach,
+                            suppress_credential_warnings: no_credential_warnings,
                         },
                         &cli.workspace,
                         &tls,
@@ -3478,7 +3495,6 @@ async fn run_async() -> Result<()> {
                                 let annotations =
                                     run::parse_key_value_pairs(&annotations, "--annotation")?;
                                 let environment = run::parse_env_pairs(&envs)?;
-                                run::warn_credential_env_vars(&environment, no_credential_warnings);
                                 let gpu_requirements: Option<GpuResourceRequirements> =
                                     gpu.map(Into::into);
                                 run::sandbox_template_create(
@@ -3497,6 +3513,7 @@ async fn run_async() -> Result<()> {
                                     output.as_str(),
                                     &cli.workspace,
                                     &tls,
+                                    no_credential_warnings,
                                 )
                                 .await?;
                             }
@@ -4013,6 +4030,98 @@ mod tests {
     };
     use std::ffi::OsString;
     use std::fs;
+
+    #[test]
+    fn policy_update_parses_explicit_l7_scope_and_endpoint_path() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "policy",
+            "update",
+            "sandbox-1",
+            "--rule-name",
+            "api",
+            "--binary",
+            "/usr/bin/curl",
+            "--binary",
+            "/usr/bin/python3",
+            "--endpoint-path",
+            "",
+            "--add-allow",
+            "api.example.com:443,8443:POST:/v1/a:b",
+        ])
+        .expect("explicit scope flags should parse");
+        let Some(Commands::Policy {
+            command:
+                Some(PolicyCommands::Update {
+                    rule_name,
+                    binaries,
+                    any_binary,
+                    endpoint_path,
+                    add_allow,
+                    ..
+                }),
+            ..
+        }) = cli.command
+        else {
+            panic!("expected policy update");
+        };
+        assert_eq!(rule_name.as_deref(), Some("api"));
+        assert_eq!(binaries, vec!["/usr/bin/curl", "/usr/bin/python3"]);
+        assert!(!any_binary);
+        assert_eq!(endpoint_path.as_deref(), Some(""));
+        assert_eq!(add_allow, vec!["api.example.com:443,8443:POST:/v1/a:b"]);
+    }
+
+    #[test]
+    fn policy_update_any_binary_is_explicit_and_conflicts_with_binary() {
+        let args = [
+            "openshell",
+            "policy",
+            "update",
+            "--rule-name",
+            "api",
+            "--any-binary",
+            "--add-deny",
+            "api.example.com:443:DELETE:/v1/**",
+        ];
+        let cli = Cli::try_parse_from(args).expect("explicit wildcard should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Policy {
+                command: Some(PolicyCommands::Update {
+                    any_binary: true,
+                    ..
+                }),
+                ..
+            })
+        ));
+        let conflicting = args.into_iter().chain(["--binary", "/usr/bin/curl"]);
+        assert!(Cli::try_parse_from(conflicting).is_err());
+    }
+
+    #[test]
+    fn policy_update_add_endpoint_keeps_scope_defaults() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "policy",
+            "update",
+            "--add-endpoint",
+            "api.example.com:443",
+        ])
+        .expect("endpoint creation retains its existing flags");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Policy {
+                command: Some(PolicyCommands::Update {
+                    any_binary: false,
+                    endpoint_path: None,
+                    rule_name: None,
+                    ..
+                }),
+                ..
+            })
+        ));
+    }
 
     // Tests below mutate the process-global XDG_CONFIG_HOME env var.
     // A static mutex serialises them so concurrent threads don't clobber

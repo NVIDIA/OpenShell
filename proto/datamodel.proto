@@ -108,7 +108,8 @@ message Provider {
   reserved "credential_expires_at_ms";
   // Kubernetes-style metadata (id, name, labels, timestamps, resource version).
   ObjectMeta metadata = 1;
-  // Canonical provider type slug (for example: "claude", "gitlab").
+  // ID of the provider profile this provider was created from, matched
+  // exactly (for example: "claude-code", "github").
   string type = 2;
   // Secret values used for authentication.
   map<string, string> credentials = 3 [(openshell.options.v1.secret) = true];

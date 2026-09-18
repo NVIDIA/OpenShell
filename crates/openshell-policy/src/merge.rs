@@ -139,6 +139,83 @@ pub fn canonicalize_advisor_add_rule(
     Ok((target_name, canonical))
 }
 
+/// Binary authorization affected by an incremental L7 rule append.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum L7BinaryScope {
+    /// Explicitly acknowledge a rule that authorizes every binary.
+    Any,
+    /// Declare every binary path on the target rule; the list must be nonempty.
+    Restricted(Vec<NetworkBinary>),
+}
+
+/// One endpoint and the complete authorization scope affected by an L7 append.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L7RuleTarget {
+    /// Exact key of the sandbox-owned network policy rule.
+    pub rule_name: String,
+    /// Endpoint host selector, compared literally without ASCII case sensitivity.
+    pub host: String,
+    /// Complete endpoint port set; duplicates and ordering do not change scope.
+    pub ports: Vec<u32>,
+    /// Exact endpoint path. Omission requires a unique endpoint; `Some("")`
+    /// selects only an endpoint without a path scope.
+    pub path: Option<String>,
+    /// Complete binary scope of the named rule.
+    pub binaries: L7BinaryScope,
+}
+
+impl L7RuleTarget {
+    /// Validate the target declaration without consulting or mutating a policy.
+    ///
+    /// # Errors
+    /// Returns [`PolicyMergeError::InvalidL7Target`] when identity, ports, or
+    /// binary scope is malformed, or the rule belongs to a provider.
+    pub fn validate(&self, operation_index: usize) -> Result<(), PolicyMergeError> {
+        let invalid = |reason: &str| PolicyMergeError::InvalidL7Target {
+            operation_index,
+            reason: reason.to_string(),
+        };
+        if self.rule_name.trim().is_empty()
+            || self.rule_name.trim() != self.rule_name
+            || self.rule_name.chars().any(char::is_control)
+        {
+            return Err(invalid("rule_name must name a sandbox-owned rule"));
+        }
+        // Provider rules are composed by the gateway and cannot be edited by
+        // sandbox policy operations, even if a composed policy reaches this API.
+        if is_provider_rule_name(&self.rule_name) {
+            return Err(invalid("provider-owned rules cannot receive L7 appends"));
+        }
+        if self.host.is_empty()
+            || self.host.chars().any(|character| {
+                character.is_whitespace()
+                    || character.is_control()
+                    || matches!(character, '/' | '?' | '#' | '@')
+            })
+            || crate::host_wildcard_shape_invalid(&self.host)
+        {
+            return Err(invalid("host must be a nonempty endpoint host selector"));
+        }
+        if self.ports.is_empty()
+            || self
+                .ports
+                .iter()
+                .any(|port| !(1..=u32::from(u16::MAX)).contains(port))
+        {
+            return Err(invalid("ports must declare a nonempty set in 1..=65535"));
+        }
+        if let L7BinaryScope::Restricted(binaries) = &self.binaries
+            && (binaries.is_empty() || binaries.iter().any(|binary| binary.path.trim().is_empty()))
+        {
+            return Err(invalid(
+                "restricted binary scope must contain nonempty binary paths; use Any for an any-binary rule",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// An atomic policy mutation applied in request order by [`merge_policy`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum PolicyMergeOp {
     AddRule {
@@ -154,13 +231,11 @@ pub enum PolicyMergeOp {
         rule_name: String,
     },
     AddDenyRules {
-        host: String,
-        port: u32,
+        target: L7RuleTarget,
         deny_rules: Vec<L7DenyRule>,
     },
     AddAllowRules {
-        host: String,
-        port: u32,
+        target: L7RuleTarget,
         rules: Vec<L7Rule>,
     },
     RemoveBinary {
@@ -364,14 +439,40 @@ pub enum PolicyMergeError {
         /// Rendered effective contracts found at this host and port, sorted.
         contracts: Vec<String>,
     },
-    /// Several rules carry the same endpoint, so an operation that identifies
-    /// its target by host and port alone cannot say which binary scope it means.
-    AmbiguousEndpointRule {
+    /// An L7 append did not provide a well-formed sandbox-owned target.
+    InvalidL7Target {
+        operation_index: usize,
+        reason: String,
+    },
+    /// No endpoint in the named rule matches the declared selector.
+    L7TargetNotFound {
+        rule_name: String,
         host: String,
-        port: u32,
-        /// Rendered rule, and path where one is set, for each endpoint the host
-        /// and port resolves to. Sorted.
-        targets: Vec<String>,
+        ports: Vec<u32>,
+        path: Option<String>,
+    },
+    /// More than one endpoint in the named rule matches the selector.
+    AmbiguousL7Target {
+        rule_name: String,
+        host: String,
+        ports: Vec<u32>,
+        /// Matching endpoint paths, sorted; an empty string is unscoped.
+        paths: Vec<String>,
+    },
+    /// The declared binary set differs from the rule's complete binary scope.
+    L7BinaryScopeMismatch {
+        rule_name: String,
+        /// Sorted binary paths or the single marker [`ANY_BINARY_SCOPE`].
+        expected: Vec<String>,
+        /// Sorted declared paths or the single marker [`ANY_BINARY_SCOPE`].
+        declared: Vec<String>,
+    },
+    /// The declared ports differ from the selected endpoint's complete port set.
+    L7PortScopeMismatch {
+        rule_name: String,
+        host: String,
+        expected: Vec<u32>,
+        declared: Vec<u32>,
     },
     /// A remove-binary operation targeted a rule that authorizes any binary,
     /// where there is no binary entry to remove.
@@ -483,14 +584,47 @@ impl std::fmt::Display for PolicyMergeError {
                 "{host}:{port} would carry more than one L7 inspection contract ({}); the sandbox resolves one contract per host and port, so these cannot coexist even in different rules or under different paths",
                 contracts.join(", ")
             ),
-            Self::AmbiguousEndpointRule {
-                host,
-                port,
-                targets,
+            Self::InvalidL7Target {
+                operation_index,
+                reason,
             } => write!(
                 f,
-                "endpoint {host}:{port} resolves to {}; this operation selects its target by host and port alone, so it cannot say which binary scope and L7 surface to widen. Replace the policy with the full YAML instead",
-                targets.join(", ")
+                "merge operation {operation_index} has an invalid L7 target: {reason}"
+            ),
+            Self::L7TargetNotFound {
+                rule_name,
+                host,
+                ports,
+                path,
+            } => write!(
+                f,
+                "L7 target in rule '{rule_name}' for {host} on ports {ports:?} with endpoint path {path:?} was not found"
+            ),
+            Self::AmbiguousL7Target {
+                rule_name,
+                host,
+                ports,
+                paths,
+            } => write!(
+                f,
+                "L7 target in rule '{rule_name}' for {host} on ports {ports:?} matches endpoint paths {paths:?}; declare the exact endpoint path"
+            ),
+            Self::L7BinaryScopeMismatch {
+                rule_name,
+                expected,
+                declared,
+            } => write!(
+                f,
+                "L7 target in rule '{rule_name}' declares binary scope {declared:?}, but the append affects {expected:?}; declare the complete binary scope"
+            ),
+            Self::L7PortScopeMismatch {
+                rule_name,
+                host,
+                expected,
+                declared,
+            } => write!(
+                f,
+                "L7 target in rule '{rule_name}' for {host} declares ports {declared:?}, but the append affects {expected:?}; declare the complete endpoint port set"
             ),
             Self::CannotRemoveBinaryFromAnyBinaryScope {
                 operation_index,
@@ -1062,6 +1196,11 @@ fn validate_operation(
             });
         }
     }
+    if let PolicyMergeOp::AddAllowRules { target, .. }
+    | PolicyMergeOp::AddDenyRules { target, .. } = operation
+    {
+        target.validate(operation_index)?;
+    }
     Ok(())
 }
 
@@ -1094,37 +1233,25 @@ fn apply_operation(
         PolicyMergeOp::RemoveRule { rule_name } => {
             policy.network_policies.remove(rule_name);
         }
-        PolicyMergeOp::AddDenyRules {
-            host,
-            port,
-            deny_rules,
-        } => {
-            ensure_endpoint_target_is_unambiguous(policy, host, *port)?;
-            let endpoint = find_endpoint_mut(policy, host, *port).ok_or_else(|| {
-                PolicyMergeError::EndpointNotFound {
-                    host: host.clone(),
-                    port: *port,
-                }
-            })?;
-            ensure_method_path_endpoint(endpoint, host, *port)?;
+        PolicyMergeOp::AddDenyRules { target, deny_rules } => {
+            let endpoint = resolve_l7_target_mut(policy, target)?;
+            // Target validation guarantees a nonempty port set. Use its first
+            // port for the existing single-port protocol and preset messages.
+            let port = target.ports.first().copied().unwrap_or_default();
+            ensure_method_path_endpoint(endpoint, &target.host, port)?;
             if endpoint.access.is_empty() && endpoint.rules.is_empty() {
                 return Err(PolicyMergeError::EndpointHasNoAllowBase {
-                    host: host.clone(),
-                    port: *port,
+                    host: target.host.clone(),
+                    port,
                 });
             }
             append_unique_deny_rules(&mut endpoint.deny_rules, deny_rules);
         }
-        PolicyMergeOp::AddAllowRules { host, port, rules } => {
-            ensure_endpoint_target_is_unambiguous(policy, host, *port)?;
-            let endpoint = find_endpoint_mut(policy, host, *port).ok_or_else(|| {
-                PolicyMergeError::EndpointNotFound {
-                    host: host.clone(),
-                    port: *port,
-                }
-            })?;
-            ensure_method_path_endpoint(endpoint, host, *port)?;
-            expand_existing_access(endpoint, host, *port, warnings)?;
+        PolicyMergeOp::AddAllowRules { target, rules } => {
+            let endpoint = resolve_l7_target_mut(policy, target)?;
+            let port = target.ports.first().copied().unwrap_or_default();
+            ensure_method_path_endpoint(endpoint, &target.host, port)?;
+            expand_existing_access(endpoint, &target.host, port, warnings)?;
             append_unique_l7_rules(&mut endpoint.rules, rules);
         }
         PolicyMergeOp::RemoveBinary {
@@ -1339,11 +1466,15 @@ fn is_authorization_inheritance_conflict(error: &PolicyMergeError) -> bool {
         | PolicyMergeError::EndpointHasNoAllowBase { .. }
         | PolicyMergeError::EndpointNotFound { .. }
         | PolicyMergeError::InvalidEndpointReference { .. }
-        | PolicyMergeError::AmbiguousEndpointRule { .. } => false,
+        | PolicyMergeError::L7TargetNotFound { .. }
+        | PolicyMergeError::AmbiguousL7Target { .. }
+        | PolicyMergeError::L7BinaryScopeMismatch { .. }
+        | PolicyMergeError::L7PortScopeMismatch { .. } => false,
 
         // Malformed operations, and operations `merge_rules` never produces.
         // Neither is answered by choosing a different rule to write to.
         PolicyMergeError::InvalidInputPolicy { .. }
+        | PolicyMergeError::InvalidL7Target { .. }
         | PolicyMergeError::InvalidOperationPolicy { .. }
         | PolicyMergeError::InvalidMergedPolicy { .. }
         | PolicyMergeError::MissingRuleNameForAddRule
@@ -1925,89 +2056,110 @@ fn find_matching_endpoint_mut<'a>(
         .find(|endpoint| endpoints_overlap(endpoint, target))
 }
 
-/// Every endpoint `host:port` resolves to, rendered with its owning rule.
-///
-/// `endpoint_matches_host_port` deliberately ignores `path`, and
-/// `endpoints_overlap` treats a different path as a different endpoint, so one
-/// rule can own several matching endpoints. Counting rules alone would miss
-/// that, so this counts endpoints.
-fn matching_endpoint_targets(policy: &SandboxPolicy, host: &str, port: u32) -> Vec<String> {
-    let mut targets: Vec<String> = policy
+/// Resolve one endpoint without changing it, then require the caller to
+/// acknowledge every binary and port that shares its L7 permissions.
+fn resolve_l7_target_mut<'a>(
+    policy: &'a mut SandboxPolicy,
+    target: &L7RuleTarget,
+) -> Result<&'a mut NetworkEndpoint, PolicyMergeError> {
+    let not_found = || PolicyMergeError::L7TargetNotFound {
+        rule_name: target.rule_name.clone(),
+        host: target.host.clone(),
+        ports: target.ports.clone(),
+        path: target.path.clone(),
+    };
+    let rule = policy
         .network_policies
-        .iter()
-        .filter(|(key, _)| !is_provider_rule_name(key))
-        .flat_map(|(key, rule)| {
-            rule.endpoints
-                .iter()
-                .filter(|endpoint| endpoint_matches_host_port(endpoint, host, port))
-                .map(move |endpoint| {
-                    if endpoint.path.is_empty() {
-                        key.clone()
-                    } else {
-                        format!("{key} (path '{}')", endpoint.path)
-                    }
-                })
-        })
-        .collect();
-    targets.sort();
-    targets
-}
+        .get_mut(&target.rule_name)
+        .ok_or_else(not_found)?;
 
-/// Fails closed when `host:port` resolves to more than one endpoint, because
-/// appending an L7 rule widens authorization for every binary on whichever
-/// endpoint is picked, and the operation cannot say which one it means.
-fn ensure_endpoint_target_is_unambiguous(
-    policy: &SandboxPolicy,
-    host: &str,
-    port: u32,
-) -> Result<(), PolicyMergeError> {
-    let targets = matching_endpoint_targets(policy, host, port);
-    if targets.len() > 1 {
-        return Err(PolicyMergeError::AmbiguousEndpointRule {
-            host: host.to_string(),
-            port,
-            targets,
+    // Port overlap selects candidates so an incomplete declaration reports the
+    // full affected port set instead of hiding the mismatch as a missing target.
+    // Host wildcards are literal selectors here, never destination matching.
+    let candidates = rule
+        .endpoints
+        .iter()
+        .enumerate()
+        .filter(|(_, endpoint)| {
+            endpoint.host.eq_ignore_ascii_case(&target.host)
+                && canonical_ports(endpoint)
+                    .iter()
+                    .any(|port| target.ports.contains(port))
+                && target
+                    .path
+                    .as_ref()
+                    .is_none_or(|path| endpoint.path == *path)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let [index] = candidates.as_slice() else {
+        if candidates.is_empty() {
+            return Err(not_found());
+        }
+        let mut paths = candidates
+            .iter()
+            .filter_map(|index| rule.endpoints.get(*index))
+            .map(|endpoint| endpoint.path.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+        return Err(PolicyMergeError::AmbiguousL7Target {
+            rule_name: target.rule_name.clone(),
+            host: target.host.clone(),
+            ports: target.ports.clone(),
+            paths,
+        });
+    };
+
+    // Compare binary paths as sets, while preserving the semantic distinction
+    // between any-binary and a restricted set. Diagnostic markers never decide
+    // scope equality, even if a declared path happens to match their text.
+    let mut expected_binaries = l7_binary_paths(&rule.binaries);
+    let mut declared_binaries = match &target.binaries {
+        L7BinaryScope::Any => Vec::new(),
+        L7BinaryScope::Restricted(binaries) => l7_binary_paths(binaries),
+    };
+    if rule.binaries.is_empty() != matches!(target.binaries, L7BinaryScope::Any)
+        || expected_binaries != declared_binaries
+    {
+        if expected_binaries.is_empty() {
+            expected_binaries.push(ANY_BINARY_SCOPE.to_string());
+        }
+        if matches!(target.binaries, L7BinaryScope::Any) {
+            declared_binaries.push(ANY_BINARY_SCOPE.to_string());
+        }
+        return Err(PolicyMergeError::L7BinaryScopeMismatch {
+            rule_name: target.rule_name.clone(),
+            expected: expected_binaries,
+            declared: declared_binaries,
         });
     }
-    Ok(())
+
+    let endpoint = rule.endpoints.get_mut(*index).ok_or_else(not_found)?;
+    let mut expected_ports = canonical_ports(endpoint);
+    expected_ports.sort_unstable();
+    expected_ports.dedup();
+    let mut declared_ports = target.ports.clone();
+    declared_ports.sort_unstable();
+    declared_ports.dedup();
+    if expected_ports != declared_ports {
+        return Err(PolicyMergeError::L7PortScopeMismatch {
+            rule_name: target.rule_name.clone(),
+            host: target.host.clone(),
+            expected: expected_ports,
+            declared: declared_ports,
+        });
+    }
+    Ok(endpoint)
 }
 
-fn find_endpoint_mut<'a>(
-    policy: &'a mut SandboxPolicy,
-    host: &str,
-    port: u32,
-) -> Option<&'a mut NetworkEndpoint> {
-    // `_provider_*` rules are excluded from this lookup for the same reason
-    // they're excluded from `add_rule`'s endpoint-overlap fallback: callers
-    // (`AddAllowRules`, `AddDenyRules`) must not mutate provider-injected
-    // rules in place. If the operation should target a provider rule, the
-    // caller should reference it by its exact name through the merge ops
-    // that take a `rule_name`. Defense-in-depth: even if a future caller
-    // accidentally passes a composed policy here, `AddAllowRules` would no
-    // longer be able to expand a provider rule's `access` shorthand into
-    // wildcard `path: "**"` rules (which would mask the prover's narrowness
-    // verdict on agent contributions).
-    let mut keys: Vec<_> = policy.network_policies.keys().cloned().collect();
-    keys.sort();
-    let target_key = keys
-        .into_iter()
-        .filter(|k| !is_provider_rule_name(k))
-        .find(|key| {
-            policy.network_policies.get(key).is_some_and(|rule| {
-                rule.endpoints
-                    .iter()
-                    .any(|endpoint| endpoint_matches_host_port(endpoint, host, port))
-            })
-        })?;
-
-    policy
-        .network_policies
-        .get_mut(&target_key)
-        .and_then(|rule| {
-            rule.endpoints
-                .iter_mut()
-                .find(|endpoint| endpoint_matches_host_port(endpoint, host, port))
-        })
+fn l7_binary_paths(binaries: &[NetworkBinary]) -> Vec<String> {
+    let mut paths = binaries
+        .iter()
+        .map(|binary| binary.path.clone())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn endpoint_matches_host_port(endpoint: &NetworkEndpoint, host: &str, port: u32) -> bool {
@@ -2221,9 +2373,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ANY_BINARY_SCOPE, DEFAULT_JSON_RPC_MAX_BODY_BYTES, PolicyMergeError, PolicyMergeOp,
-        PolicyMergeWarning, canonical_ports, canonicalize_advisor_add_rule, generated_rule_name,
-        merge_policy, policy_covers_rule,
+        ANY_BINARY_SCOPE, DEFAULT_JSON_RPC_MAX_BODY_BYTES, L7BinaryScope, L7RuleTarget,
+        PolicyMergeError, PolicyMergeOp, PolicyMergeWarning, canonical_ports,
+        canonicalize_advisor_add_rule, generated_rule_name, merge_policy, policy_covers_rule,
     };
     use crate::{restrictive_default_policy, validate_sandbox_policy};
     use openshell_core::{
@@ -2267,6 +2419,44 @@ mod tests {
                 params: HashMap::default(),
             }),
         }
+    }
+
+    fn l7_target(rule_name: &str, host: &str, ports: &[u32], binaries: &[&str]) -> L7RuleTarget {
+        L7RuleTarget {
+            rule_name: rule_name.to_string(),
+            host: host.to_string(),
+            ports: ports.to_vec(),
+            path: None,
+            binaries: if binaries.is_empty() {
+                L7BinaryScope::Any
+            } else {
+                L7BinaryScope::Restricted(
+                    binaries
+                        .iter()
+                        .map(|path| NetworkBinary {
+                            path: (*path).to_string(),
+                        })
+                        .collect(),
+                )
+            },
+        }
+    }
+
+    fn l7_operations(target: L7RuleTarget) -> [PolicyMergeOp; 2] {
+        [
+            PolicyMergeOp::AddAllowRules {
+                target: target.clone(),
+                rules: vec![rest_rule("POST", "/admin")],
+            },
+            PolicyMergeOp::AddDenyRules {
+                target,
+                deny_rules: vec![L7DenyRule {
+                    method: "POST".to_string(),
+                    path: "/admin".to_string(),
+                    ..Default::default()
+                }],
+            },
+        ]
     }
 
     #[test]
@@ -2715,8 +2905,7 @@ mod tests {
     fn merge_reports_the_first_failing_operation_in_request_order() {
         let operations = [
             PolicyMergeOp::AddAllowRules {
-                host: "missing.example.com".to_string(),
-                port: 443,
+                target: l7_target("missing", "missing.example.com", &[443], &[]),
                 rules: vec![rest_rule("GET", "/")],
             },
             PolicyMergeOp::AddRule {
@@ -2727,9 +2916,11 @@ mod tests {
 
         assert_eq!(
             merge_policy(restrictive_default_policy(), &operations),
-            Err(PolicyMergeError::EndpointNotFound {
+            Err(PolicyMergeError::L7TargetNotFound {
+                rule_name: "missing".to_string(),
                 host: "missing.example.com".to_string(),
-                port: 443,
+                ports: vec![443],
+                path: None,
             })
         );
     }
@@ -4060,8 +4251,7 @@ mod tests {
         let result = merge_policy(
             policy,
             &[PolicyMergeOp::AddAllowRules {
-                host: "api.github.com".to_string(),
-                port: 443,
+                target: l7_target("github", "api.github.com", &[443], &[]),
                 rules: vec![rest_rule("POST", "/repos/*/issues")],
             }],
         )
@@ -4098,8 +4288,7 @@ mod tests {
         let result = merge_policy(
             policy,
             &[PolicyMergeOp::AddAllowRules {
-                host: "realtime.example.com".to_string(),
-                port: 443,
+                target: l7_target("realtime", "realtime.example.com", &[443], &[]),
                 rules: vec![rest_rule("WEBSOCKET_TEXT", "/rooms/private/**")],
             }],
         )
@@ -4144,8 +4333,7 @@ mod tests {
         let result = merge_policy(
             policy,
             &[PolicyMergeOp::AddDenyRules {
-                host: "realtime.example.com".to_string(),
-                port: 443,
+                target: l7_target("realtime", "realtime.example.com", &[443], &[]),
                 deny_rules: vec![L7DenyRule {
                     method: "WEBSOCKET_TEXT".to_string(),
                     path: "/admin/**".to_string(),
@@ -4183,8 +4371,7 @@ mod tests {
         let error = merge_policy(
             policy,
             &[PolicyMergeOp::AddDenyRules {
-                host: "db.example.com".to_string(),
-                port: 5432,
+                target: l7_target("db", "db.example.com", &[5432], &[]),
                 deny_rules: vec![L7DenyRule {
                     method: "POST".to_string(),
                     path: "/admin".to_string(),
@@ -5429,12 +5616,10 @@ mod tests {
         ));
     }
 
-    /// `AddAllowRules` and `AddDenyRules` name their target by host and port
-    /// alone, so when two rules carry that endpoint they cannot say which binary
-    /// scope to widen. Picking one silently would add the rule to whichever key
-    /// sorts first.
+    /// Explicit rule identity selects one owner even when another rule carries
+    /// the same destination with a different binary scope.
     #[test]
-    fn l7_operations_reject_an_endpoint_carried_by_several_rules() {
+    fn l7_target_scope_selects_named_rule_among_shared_destinations() {
         let mut policy = policy_with_rule(
             "broad",
             rule_with_authorizations(
@@ -5460,28 +5645,22 @@ mod tests {
             ),
         );
 
-        for operation in [
-            PolicyMergeOp::AddAllowRules {
-                host: "api.example.com".to_string(),
-                port: 443,
-                rules: vec![rest_rule("POST", "/admin")],
-            },
-            PolicyMergeOp::AddDenyRules {
-                host: "api.example.com".to_string(),
-                port: 443,
-                deny_rules: Vec::new(),
-            },
-        ] {
-            let error = merge_policy(policy.clone(), &[operation])
-                .expect_err("two rules carry this endpoint, so the target is ambiguous");
-
-            assert!(
-                matches!(
-                    &error,
-                    PolicyMergeError::AmbiguousEndpointRule { targets, .. }
-                        if targets == &["broad".to_string(), "narrow".to_string()]
-                ),
-                "got {error:?}"
+        for operation in l7_operations(l7_target(
+            "narrow",
+            "api.example.com",
+            &[443],
+            &["/usr/bin/other"],
+        )) {
+            let result = merge_policy(policy.clone(), &[operation])
+                .expect("the explicit named rule and scope select the intended owner");
+            assert!(result.changed);
+            assert_eq!(
+                result.policy.network_policies["broad"],
+                policy.network_policies["broad"]
+            );
+            assert_ne!(
+                result.policy.network_policies["narrow"],
+                policy.network_policies["narrow"]
             );
         }
     }
@@ -5491,7 +5670,7 @@ mod tests {
     /// Counting owning rules would miss this and let the operation land on
     /// whichever endpoint happens to sit first in the vector.
     #[test]
-    fn l7_operations_reject_two_paths_on_one_host_and_port_within_a_rule() {
+    fn l7_target_scope_rejects_two_paths_without_exact_selection() {
         let policy = policy_with_rule(
             "versioned",
             rule_with_authorizations(
@@ -5517,8 +5696,12 @@ mod tests {
         let error = merge_policy(
             policy,
             &[PolicyMergeOp::AddAllowRules {
-                host: "api.example.com".to_string(),
-                port: 443,
+                target: l7_target(
+                    "versioned",
+                    "api.example.com",
+                    &[443],
+                    &["/usr/bin/trusted"],
+                ),
                 rules: vec![rest_rule("POST", "/admin")],
             }],
         )
@@ -5527,11 +5710,8 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                PolicyMergeError::AmbiguousEndpointRule { targets, .. }
-                    if targets == &[
-                        "versioned (path '/v1')".to_string(),
-                        "versioned (path '/v2')".to_string(),
-                    ]
+                PolicyMergeError::AmbiguousL7Target { paths, .. }
+                    if paths == &["/v1".to_string(), "/v2".to_string()]
             ),
             "got {error:?}"
         );
@@ -5557,8 +5737,7 @@ mod tests {
         let result = merge_policy(
             policy,
             &[PolicyMergeOp::AddAllowRules {
-                host: "api.example.com".to_string(),
-                port: 443,
+                target: l7_target("only", "api.example.com", &[443], &["/usr/bin/trusted"]),
                 rules: vec![rest_rule("POST", "/issues")],
             }],
         )
@@ -5570,6 +5749,407 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    fn l7_scope_policy(binaries: &[&str], ports: &[u32]) -> SandboxPolicy {
+        policy_with_rule(
+            "scoped",
+            rule_with_authorizations(
+                "display-name-is-not-the-rule-key",
+                vec![NetworkEndpoint {
+                    protocol: "rest".to_string(),
+                    rules: vec![rest_rule("GET", "/public")],
+                    ports: ports.to_vec(),
+                    ..endpoint("api.example.com", ports[0])
+                }],
+                binaries,
+            ),
+        )
+    }
+
+    #[test]
+    fn l7_target_scope_requires_all_binaries_independently_of_ports() {
+        let policy = l7_scope_policy(&["/usr/bin/trusted", "/usr/bin/limited"], &[443, 8443]);
+        for binaries in [
+            vec!["/usr/bin/trusted"],
+            vec!["/usr/bin/limited", "/usr/bin/trusted", "/usr/bin/extra"],
+            vec!["/usr/bin/trusted", "/usr/bin/other"],
+            Vec::new(),
+        ] {
+            for operation in l7_operations(l7_target(
+                "scoped",
+                "api.example.com",
+                &[443, 8443],
+                &binaries,
+            )) {
+                let error = merge_policy(policy.clone(), &[operation])
+                    .expect_err("every binary on the rule shares the appended permissions");
+                assert!(matches!(
+                    error,
+                    PolicyMergeError::L7BinaryScopeMismatch { expected, .. }
+                        if expected == ["/usr/bin/limited", "/usr/bin/trusted"]
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn l7_target_scope_requires_all_ports_independently_of_binaries() {
+        let policy = l7_scope_policy(&["/usr/bin/trusted"], &[443, 8443]);
+        for ports in [
+            vec![443],
+            vec![8443],
+            vec![443, 8443, 9443],
+            vec![443, 9443],
+        ] {
+            for operation in l7_operations(l7_target(
+                "scoped",
+                "api.example.com",
+                &ports,
+                &["/usr/bin/trusted"],
+            )) {
+                let error = merge_policy(policy.clone(), &[operation])
+                    .expect_err("all endpoint ports share the appended permissions");
+                assert_eq!(
+                    error,
+                    PolicyMergeError::L7PortScopeMismatch {
+                        rule_name: "scoped".to_string(),
+                        host: "api.example.com".to_string(),
+                        expected: vec![443, 8443],
+                        declared: ports.clone(),
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn l7_target_scope_complete_sets_apply_once_without_changing_siblings() {
+        let mut policy = l7_scope_policy(&["/usr/bin/trusted", "/usr/bin/limited"], &[443, 8443]);
+        let sibling = NetworkEndpoint {
+            protocol: "rest".to_string(),
+            rules: vec![rest_rule("GET", "/public")],
+            ..endpoint("other.example.com", 443)
+        };
+        policy
+            .network_policies
+            .get_mut("scoped")
+            .unwrap()
+            .endpoints
+            .push(sibling.clone());
+        for operation in l7_operations(l7_target(
+            "scoped",
+            "api.example.com",
+            &[443, 8443],
+            &["/usr/bin/trusted", "/usr/bin/limited"],
+        )) {
+            let result = merge_policy(policy.clone(), std::slice::from_ref(&operation))
+                .expect("complete affected scope authorizes the append");
+            let rule = &result.policy.network_policies["scoped"];
+            assert!(result.changed);
+            assert_eq!(rule.binaries, policy.network_policies["scoped"].binaries);
+            assert_eq!(canonical_ports(&rule.endpoints[0]), vec![443, 8443]);
+            assert_eq!(rule.endpoints[1], sibling);
+            match &operation {
+                PolicyMergeOp::AddAllowRules { rules, .. } => {
+                    assert!(rule.endpoints[0].rules.contains(&rules[0]));
+                }
+                PolicyMergeOp::AddDenyRules { deny_rules, .. } => {
+                    assert_eq!(rule.endpoints[0].deny_rules, *deny_rules);
+                }
+                _ => unreachable!("test fixture only emits L7 appends"),
+            }
+            let replay =
+                merge_policy(result.policy, &[operation]).expect("repeated append remains valid");
+            assert!(!replay.changed, "duplicate rules must remain idempotent");
+        }
+    }
+
+    #[test]
+    fn l7_target_scope_normalizes_case_and_duplicate_set_entries() {
+        let policy = l7_scope_policy(
+            &["/usr/bin/trusted", "/usr/bin/limited", "/usr/bin/trusted"],
+            &[8443, 443, 443],
+        );
+        for operation in l7_operations(l7_target(
+            "scoped",
+            "API.EXAMPLE.COM",
+            &[443, 8443, 8443],
+            &["/usr/bin/limited", "/usr/bin/trusted", "/usr/bin/limited"],
+        )) {
+            let result = merge_policy(policy.clone(), &[operation])
+                .expect("host case, ordering, and duplicated declarations do not change scope");
+            assert!(result.changed);
+        }
+    }
+
+    #[test]
+    fn l7_target_scope_any_binary_requires_explicit_any_declaration() {
+        let policy = l7_scope_policy(&[], &[443]);
+        for operation in l7_operations(l7_target("scoped", "api.example.com", &[443], &[])) {
+            assert!(
+                merge_policy(policy.clone(), &[operation])
+                    .expect("Any explicitly names wildcard scope")
+                    .changed
+            );
+        }
+        for binaries in [vec!["/usr/bin/trusted"], vec![ANY_BINARY_SCOPE]] {
+            for operation in
+                l7_operations(l7_target("scoped", "api.example.com", &[443], &binaries))
+            {
+                let error = merge_policy(policy.clone(), &[operation])
+                    .expect_err("concrete paths cannot acknowledge any-binary scope");
+                assert_eq!(
+                    error,
+                    PolicyMergeError::L7BinaryScopeMismatch {
+                        rule_name: "scoped".to_string(),
+                        expected: vec![ANY_BINARY_SCOPE.to_string()],
+                        declared: binaries.iter().map(|path| (*path).to_string()).collect(),
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn l7_target_scope_rejects_malformed_declarations_at_library_boundary() {
+        let valid = l7_target("scoped", "api.example.com", &[443], &["/usr/bin/trusted"]);
+        let invalid = [
+            L7RuleTarget {
+                rule_name: String::new(),
+                ..valid.clone()
+            },
+            L7RuleTarget {
+                rule_name: " scoped ".to_string(),
+                ..valid.clone()
+            },
+            L7RuleTarget {
+                host: " ".to_string(),
+                ..valid.clone()
+            },
+            L7RuleTarget {
+                host: "https://api.example.com".to_string(),
+                ..valid.clone()
+            },
+            L7RuleTarget {
+                host: "*".to_string(),
+                ..valid.clone()
+            },
+            L7RuleTarget {
+                ports: Vec::new(),
+                ..valid.clone()
+            },
+            L7RuleTarget {
+                ports: vec![0],
+                ..valid.clone()
+            },
+            L7RuleTarget {
+                ports: vec![65536],
+                ..valid.clone()
+            },
+            L7RuleTarget {
+                binaries: L7BinaryScope::Restricted(Vec::new()),
+                ..valid.clone()
+            },
+            L7RuleTarget {
+                binaries: L7BinaryScope::Restricted(vec![NetworkBinary {
+                    path: " ".to_string(),
+                }]),
+                ..valid
+            },
+        ];
+        let policy = l7_scope_policy(&["/usr/bin/trusted"], &[443]);
+        for target in invalid {
+            assert!(matches!(
+                target.validate(7),
+                Err(PolicyMergeError::InvalidL7Target {
+                    operation_index: 7,
+                    ..
+                })
+            ));
+            for operation in l7_operations(target) {
+                assert!(matches!(
+                    merge_policy(policy.clone(), &[operation]),
+                    Err(PolicyMergeError::InvalidL7Target {
+                        operation_index: 0,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn l7_target_scope_never_falls_back_from_missing_explicit_target() {
+        let valid = l7_target("scoped", "api.example.com", &[443], &["/usr/bin/trusted"]);
+        let missing = [
+            L7RuleTarget {
+                rule_name: "display-name-is-not-the-rule-key".to_string(),
+                ..valid.clone()
+            },
+            L7RuleTarget {
+                host: "other.example.com".to_string(),
+                ..valid.clone()
+            },
+            L7RuleTarget {
+                ports: vec![8443],
+                ..valid.clone()
+            },
+            L7RuleTarget {
+                path: Some("/missing".to_string()),
+                ..valid
+            },
+        ];
+        let policy = l7_scope_policy(&["/usr/bin/trusted"], &[443]);
+        for target in missing {
+            for operation in l7_operations(target.clone()) {
+                assert_eq!(
+                    merge_policy(policy.clone(), &[operation]),
+                    Err(PolicyMergeError::L7TargetNotFound {
+                        rule_name: target.rule_name.clone(),
+                        host: target.host.clone(),
+                        ports: target.ports.clone(),
+                        path: target.path.clone(),
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn l7_target_scope_selects_exact_path_including_unscoped_endpoint() {
+        let mut policy = l7_scope_policy(&["/usr/bin/trusted"], &[443]);
+        let rule = policy.network_policies.get_mut("scoped").unwrap();
+        let mut versioned = rule.endpoints[0].clone();
+        versioned.path = "/v1".to_string();
+        rule.endpoints.push(versioned);
+        let valid = l7_target("scoped", "api.example.com", &[443], &["/usr/bin/trusted"]);
+        for operation in l7_operations(valid.clone()) {
+            assert!(
+                matches!(merge_policy(policy.clone(), &[operation]), Err(PolicyMergeError::AmbiguousL7Target { paths, .. }) if paths == ["", "/v1"])
+            );
+        }
+        for (selected, path) in ["", "/v1"].iter().enumerate() {
+            let target = L7RuleTarget {
+                path: Some((*path).to_string()),
+                ..valid.clone()
+            };
+            for operation in l7_operations(target) {
+                let result = merge_policy(policy.clone(), &[operation])
+                    .expect("exact endpoint path selects one target");
+                let endpoints = &result.policy.network_policies["scoped"].endpoints;
+                assert_ne!(
+                    endpoints[selected],
+                    policy.network_policies["scoped"].endpoints[selected]
+                );
+                assert_eq!(
+                    endpoints[1 - selected],
+                    policy.network_policies["scoped"].endpoints[1 - selected]
+                );
+            }
+        }
+        for operation in l7_operations(L7RuleTarget {
+            path: Some("/V1".to_string()),
+            ..valid
+        }) {
+            assert!(matches!(
+                merge_policy(policy.clone(), &[operation]),
+                Err(PolicyMergeError::L7TargetNotFound { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn l7_target_scope_host_wildcards_are_literal_endpoint_selectors() {
+        let mut policy = l7_scope_policy(&["/usr/bin/trusted"], &[443]);
+        policy.network_policies.get_mut("scoped").unwrap().endpoints[0].host =
+            "*.example.com".to_string();
+        for operation in l7_operations(l7_target(
+            "scoped",
+            "api.example.com",
+            &[443],
+            &["/usr/bin/trusted"],
+        )) {
+            assert!(matches!(
+                merge_policy(policy.clone(), &[operation]),
+                Err(PolicyMergeError::L7TargetNotFound { .. })
+            ));
+        }
+        for operation in l7_operations(l7_target(
+            "scoped",
+            "*.EXAMPLE.COM",
+            &[443],
+            &["/usr/bin/trusted"],
+        )) {
+            assert!(
+                merge_policy(policy.clone(), &[operation])
+                    .expect("the complete wildcard selector is explicit")
+                    .changed
+            );
+        }
+    }
+
+    #[test]
+    fn l7_target_scope_provider_owned_rule_is_immutable() {
+        let mut policy = l7_scope_policy(&[], &[443]);
+        let provider = policy.network_policies.remove("scoped").unwrap();
+        policy
+            .network_policies
+            .insert("_provider_api".to_string(), provider);
+        for operation in l7_operations(l7_target("_provider_api", "api.example.com", &[443], &[])) {
+            assert!(matches!(
+                merge_policy(policy.clone(), &[operation]),
+                Err(PolicyMergeError::InvalidL7Target { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn l7_target_scope_rejects_duplicate_endpoint_candidates_even_with_exact_path() {
+        let mut policy = l7_scope_policy(&["/usr/bin/trusted"], &[443]);
+        let rule = policy.network_policies.get_mut("scoped").unwrap();
+        let mut overlapping = rule.endpoints[0].clone();
+        overlapping.ports = vec![443, 8443];
+        rule.endpoints.push(overlapping);
+        let mut target = l7_target(
+            "scoped",
+            "api.example.com",
+            &[443, 8443],
+            &["/usr/bin/trusted"],
+        );
+        target.path = Some(String::new());
+        for operation in l7_operations(target) {
+            assert!(
+                matches!(merge_policy(policy.clone(), &[operation]), Err(PolicyMergeError::AmbiguousL7Target { paths, .. }) if paths == ["", ""])
+            );
+        }
+    }
+
+    #[test]
+    fn l7_target_scope_batch_uses_scope_after_earlier_operations() {
+        let policy = l7_scope_policy(&["/usr/bin/trusted", "/usr/bin/limited"], &[443]);
+        for operation in l7_operations(l7_target(
+            "scoped",
+            "api.example.com",
+            &[443],
+            &["/usr/bin/trusted", "/usr/bin/limited"],
+        )) {
+            let error = merge_policy(
+                policy.clone(),
+                &[
+                    PolicyMergeOp::RemoveBinary {
+                        rule_name: "scoped".to_string(),
+                        binary_path: "/usr/bin/limited".to_string(),
+                    },
+                    operation,
+                ],
+            )
+            .expect_err("stale declarations reject the complete batch");
+            assert!(
+                matches!(error, PolicyMergeError::L7BinaryScopeMismatch { expected, declared, .. }
+                if expected == ["/usr/bin/trusted"] && declared == ["/usr/bin/limited", "/usr/bin/trusted"])
+            );
+        }
     }
 
     /// Removing a binary from an any-binary rule has no entry to drop, so

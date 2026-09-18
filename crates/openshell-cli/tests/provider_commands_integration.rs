@@ -676,7 +676,7 @@ impl OpenShell for TestOpenShell {
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
         if provider.credentials.is_empty() && provider.credential_handles.is_empty() {
-            let bootstrap_allowed = if let Some(profile) = openshell_providers::builtin_profiles()
+            let bootstrap_allowed = if let Some(profile) = helpers::example_profiles()
                 .iter()
                 .find(|p| p.id.eq_ignore_ascii_case(&provider.r#type))
             {
@@ -760,7 +760,7 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
-        let mut profiles = openshell_providers::builtin_profiles()
+        let mut profiles = helpers::example_profiles()
             .iter()
             .map(openshell_providers::ProviderTypeProfile::to_proto)
             .collect::<Vec<_>>();
@@ -803,7 +803,7 @@ impl OpenShell for TestOpenShell {
             .cloned();
         let profile = if let Some(profile) = scoped_profile {
             profile
-        } else if let Some(profile) = openshell_providers::builtin_profiles()
+        } else if let Some(profile) = helpers::example_profiles()
             .iter()
             .find(|profile| profile.id == id)
         {
@@ -1315,6 +1315,13 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ListSandboxPoliciesRequest>,
     ) -> Result<Response<openshell_core::proto::ListSandboxPoliciesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn report_sandbox_configuration(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -2173,7 +2180,7 @@ async fn provider_profile_permission_denial_preserves_safe_workspace_guidance() 
     seed_readiness_provider(&server).await;
     for (profile, failed_lookup, expected_lookups) in [
         ("openai", "openai", vec!["openai"]),
-        ("gh", "github", vec!["gh", "github"]),
+        ("github", "github", vec!["github"]),
     ] {
         server
             .state
@@ -2260,12 +2267,12 @@ async fn provider_profile_permission_denial_preserves_safe_workspace_guidance() 
 }
 
 #[tokio::test]
-async fn provider_readiness_update_redacts_exact_and_alias_profile_lookup_errors() {
+async fn provider_readiness_update_redacts_exact_profile_lookup_errors() {
     let server = run_server().await;
     seed_readiness_provider(&server).await;
     for (profile, failed_lookup, expected_lookups) in [
         ("openai", "openai", vec!["openai"]),
-        ("gh", "github", vec!["gh", "github"]),
+        ("github", "github", vec!["github"]),
     ] {
         server
             .state
@@ -3191,7 +3198,7 @@ async fn provider_update_preserves_stored_type_and_profile_workspace_when_readab
     run::provider_create(
         &ts.endpoint,
         "my-claude",
-        "claude",
+        "claude-code",
         false,
         &["API_KEY=abc".to_string()],
         false,
@@ -3293,7 +3300,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     run::provider_create(
         &ts.endpoint,
         "my-claude",
-        "claude",
+        "claude-code",
         false,
         &["API_KEY=abc".to_string()],
         false,
@@ -4642,7 +4649,7 @@ async fn provider_create_rejects_key_only_credentials_without_local_env_value() 
     let err = run::provider_create(
         &ts.endpoint,
         "bad-provider",
-        "claude",
+        "claude-code",
         false,
         &["INVALID_PAIR".to_string()],
         false,
@@ -4756,7 +4763,7 @@ async fn provider_create_rejects_combined_from_existing_and_credentials() {
     let err = run::provider_create(
         &ts.endpoint,
         "bad-provider",
-        "claude",
+        "claude-code",
         true,
         &["API_KEY=abc".to_string()],
         false,

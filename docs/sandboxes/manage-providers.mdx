@@ -37,7 +37,7 @@ The fastest way to create a provider is to let the CLI discover credentials from
 your shell environment:
 
 ```shell
-openshell provider create --name my-claude --type claude --from-existing
+openshell provider create --name my-claude --type claude-code --from-existing
 ```
 
 This reads `ANTHROPIC_API_KEY` or `CLAUDE_API_KEY` from your current environment
@@ -92,9 +92,9 @@ CLI refreshes it before storing the provider credential. It does not store the
 OIDC refresh token in the provider.
 
 `--from-existing` uses profile-backed discovery. The requested `--type` must
-have a built-in or imported provider profile with a `discovery` section. If no
-matching profile exists, the CLI returns an error instead of falling back to
-legacy discovery.
+name an imported provider profile with a `discovery` section. If no matching
+profile exists, the CLI returns an error instead of falling back to legacy
+discovery.
 
 Create a provider whose profile requires no static credentials without a
 credential source:
@@ -117,8 +117,8 @@ openshell provider profile update my-api -f my-api-profile.yaml
 ```
 
 Import remains create-only and fails if the profile ID already exists. Use
-`provider profile update <id>` for existing custom profiles. Built-in profiles are
-read-only. The target ID must match the profile ID in the file. Update accepts
+`provider profile update <id>` for existing profiles. Interceptor-managed
+profiles are read-only. The target ID must match the profile ID in the file. Update accepts
 one file at a time and rejects stale resource versions. Updated profile policy
 applies to all provider instances of that type on the next sandbox config sync.
 
@@ -133,7 +133,7 @@ failure and continues with the remaining IDs. The command exits with an error
 after it attempts every requested deletion if any entry failed.
 
 <Warning>
-Static credentials require a built-in or imported provider profile. Profiles
+Static credentials require an imported provider profile. Profiles
 normally define at least one endpoint. An endpointless profile requires an
 explicit `credential_binding.provider` on a sandbox policy endpoint. OpenShell
 does not activate static credentials from a profileless provider because it
@@ -342,20 +342,23 @@ and `openshell sandbox provider detach`. See
 
 ### Auto-Discovery Shortcut
 
-When the trailing command in `openshell sandbox create` maps to an available
-profile, the CLI auto-creates the required provider from local profile
-discovery if one does not already exist. You do not need to create the provider
-separately:
+Name a provider with `--provider`. If no provider by that name exists and the
+name matches an imported profile ID, the CLI creates one from local profile
+discovery, so you do not need to create it separately:
 
 ```shell
-openshell sandbox create -- claude
+openshell sandbox create --provider claude-code -- claude
 ```
 
-This detects `claude` as a known tool, finds your `ANTHROPIC_API_KEY`, creates
-a provider, attaches it to the sandbox, and launches Claude Code.
+This finds your `ANTHROPIC_API_KEY`, creates a `claude-code` provider, attaches
+it to the sandbox, and launches Claude Code. Add `--auto-providers` to skip the
+confirmation prompt, or `--no-auto-providers` to skip creation entirely.
 
-If the inferred type has no built-in or imported profile, creation fails. Import
-a custom profile first or pass an existing provider with `--provider <name>`.
+A provider is attached only when you name it. OpenShell does not derive one from
+the trailing command: a profile's `binaries` list authorizes a binary to reach
+that profile's endpoints, which is not a statement that running the binary asks
+for the provider. A sandbox with no providers is a normal, fully supported
+state.
 
 ## How Credential Injection Works
 
@@ -423,43 +426,36 @@ Export the profile used by a provider to inspect its credential boundary:
 openshell provider profile export github -o yaml
 ```
 
-For the built-in GitHub profile, `GITHUB_TOKEN` and `GH_TOKEN` can resolve for
+For the GitHub example profile, `GITHUB_TOKEN` and `GH_TOKEN` can resolve for
 the profile's `api.github.com:443` and `github.com:443` endpoints. Even if a
 sandbox policy allows `uploads.example.com:443`, sending either placeholder
 there returns `credential_endpoint_mismatch`.
 
-For a custom service, define the credential in a custom provider profile. Put
+For another service, define the credential in its own provider profile. Put
 stable endpoints in the profile, or leave the profile endpointless and bind
 each concrete provider instance from sandbox policy. Refer to
 [Profiles](/providers/profiles#provider-profiles) for the profile workflow
 and schema.
 
-## Supported Provider Types
+## Available Provider Types
 
-The following provider types are supported.
+The provider types available to `--type` are the IDs of the profiles you
+imported. List them:
 
-| Type | Environment Variables Injected | Typical Use |
-|---|---|---|
-| `anthropic` | `ANTHROPIC_API_KEY` | Anthropic API |
-| `aws-bedrock` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION` | Declarative Bedrock credential shape. The built-in profile does not grant a bridge or AWS endpoint; use an endpoint-bearing profile for direct access. |
-| `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` | Claude Code, Anthropic API |
-| `codex` | `OPENAI_API_KEY` | OpenAI Codex |
-| `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` | GitHub Copilot CLI |
-| `deepinfra` | `DEEPINFRA_API_KEY` | DeepInfra inference API |
-| `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API and `gh` CLI. Refer to [GitHub Sandbox](/get-started/tutorials/github-sandbox). |
-| `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
-| `openai` | `OPENAI_API_KEY` | Public OpenAI API. Use a custom endpoint-bearing profile for another OpenAI-compatible host. |
+```shell
+openshell provider list-profiles
+```
+
+The repository's
+[`providers/`](https://github.com/NVIDIA/OpenShell/tree/main/providers) directory
+ships example profiles for GitHub, PyPI, and the major inference and agent
+providers. Each file's header states the credential environment variables it
+declares, the binaries it authorizes, and the endpoints it grants. Read it,
+adjust the binary paths for your image, and import your copy.
 
 <Note>
 `ANTHROPIC_API_KEY` is an API key from [console.anthropic.com](https://console.anthropic.com), not a subscription token. Subscription users must generate a separate API key from the Anthropic Console.
 </Note>
-
-<Tip>
-For a service not listed above, import a custom provider profile that declares
-its credential environment variables and endpoints. Use the imported profile
-ID as the provider `--type`.
-
-</Tip>
 
 ## Inference Provider Access
 
@@ -467,7 +463,7 @@ Attach an inference provider to each sandbox that needs it and configure the
 workload to call the provider's native endpoint. The workload, not OpenShell,
 selects the model and request timeout.
 
-| Provider | Built-in profile | Native base URL | Credential variable |
+| Provider | Example profile | Native base URL | Credential variable |
 |---|---|---|---|
 | OpenAI | `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
 | Anthropic | `anthropic` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
@@ -475,10 +471,10 @@ selects the model and request timeout.
 | DeepInfra | `deepinfra` | `https://api.deepinfra.com/v1/openai` | `DEEPINFRA_API_KEY` |
 | Google Vertex AI | `google-vertex-ai` | Region and model dependent | `GOOGLE_VERTEX_AI_TOKEN` or `GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN` |
 
-An OpenAI-compatible protocol does not make the built-in `openai` profile safe
-for an arbitrary host. Baseten, Bitdeer, Groq, Ollama, LM Studio, self-hosted
-NIM, and other alternate endpoints need a custom profile that declares the
-actual host, port, credential, and allowed binaries. See
+An OpenAI-compatible protocol does not make the `openai` profile safe for an
+arbitrary host. Baseten, Bitdeer, Groq, Ollama, LM Studio, self-hosted NIM, and
+other alternate endpoints need their own profile declaring the actual host,
+port, credential, and allowed binaries. See
 [Provider-backed Inference](/sandboxes/inference-routing) for complete examples
 and migration guidance.
 

@@ -27,8 +27,20 @@ fn pending_draft_count(app: &App) -> usize {
     }
 }
 
+fn note_lines(app: &App, width: u16) -> Vec<String> {
+    let notes = app
+        .sandbox_detail_notes
+        .get(app.sandbox_selected)
+        .filter(|s| !s.is_empty())
+        .map_or("none", String::as_str);
+    super::sandbox_draft::wrap_value(
+        &format!("  Notes: {notes}"),
+        usize::from(width.saturating_sub(4).max(1)),
+    )
+}
+
 /// Return the rows needed to render every metadata line without clipping.
-pub(super) fn required_height(app: &App) -> u16 {
+pub(super) fn required_height(app: &App, width: u16) -> u16 {
     let policy_rows = u16::from(app.sandbox_policy_is_global);
     let action_rows = if app.confirm_delete {
         2 // spacer plus confirmation
@@ -36,7 +48,11 @@ pub(super) fn required_height(app: &App) -> u16 {
         u16::from(pending_draft_count(app) > 0)
     };
 
-    BASE_CONTENT_ROWS + policy_rows + action_rows + BORDER_ROWS
+    BASE_CONTENT_ROWS
+        + policy_rows
+        + action_rows
+        + BORDER_ROWS
+        + u16::try_from(note_lines(app, width).len().saturating_sub(1)).unwrap_or(u16::MAX - 16)
 }
 
 /// Draw a compact metadata pane for the currently selected sandbox.
@@ -130,18 +146,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled(providers_str, t.text),
     ]);
 
-    // Row 6: Forwarded Ports
-    let forwards_str = app
-        .sandbox_notes
-        .get(idx)
-        .filter(|s| !s.is_empty())
-        .map_or("none", String::as_str);
-    let row6 = Line::from(vec![
-        Span::styled("  Forwards: ", t.muted),
-        Span::styled(forwards_str, t.text),
-    ]);
-
-    let mut lines = vec![row1, row2, row3, row4, row5, row6];
+    let mut lines = vec![row1, row2, row3, row4, row5];
+    lines.extend(
+        note_lines(app, area.width)
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, t.text))),
+    );
 
     // Show global policy indicator when the sandbox's policy is managed at
     // gateway scope.
