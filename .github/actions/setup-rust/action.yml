@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Setup Rust
+description: Configure the Nix development shell and Rust caches
+
+inputs:
+  cache-key:
+    description: Rust target cache namespace
+    required: true
+  save-cache:
+    description: Whether this job writes the Rust target cache
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Hash Nix development shell
+      id: dev-shell
+      shell: bash
+      run: |
+        shell_drv=$(nix eval --raw --impure .#devShells --apply 'shells: shells.${builtins.currentSystem}.default.drvPath')
+        echo "hash=$(nix hash file --type sha256 --base16 "$shell_drv")" >> "$GITHUB_OUTPUT"
+
+    - name: Realize Nix development shell
+      shell: bash
+      run: nix develop -c true
+
+    - name: Cache Rust target and registry
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        shared-key: ${{ inputs.cache-key }}-${{ steps.dev-shell.outputs.hash }}
+        save-if: ${{ inputs.save-cache }}
+        cache-on-failure: ${{ inputs.save-cache }}
+        cache-bin: "false"
+        cmd-format: nix develop -c {0}

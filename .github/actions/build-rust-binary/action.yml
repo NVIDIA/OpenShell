@@ -32,21 +32,10 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Hash development shell
-      id: dev-shell
-      shell: bash
-      run: |
-        shell_drv=$(nix eval --raw --impure .#devShells --apply 'shells: shells.${builtins.currentSystem}.default.drvPath')
-        echo "hash=$(nix hash file --type sha256 --base16 "$shell_drv")" >> "$GITHUB_OUTPUT"
-
-    - name: Cache Rust artifacts
-      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+    - uses: ./.github/actions/setup-rust
       with:
-        shared-key: binaries-${{ inputs.binary }}-${{ inputs.triple }}-${{ steps.dev-shell.outputs.hash }}
-        cache-on-failure: "true"
-        cache-workspace-crates: "true"
-        cache-bin: "false"
-        cmd-format: nix develop -c {0}
+        cache-key: binaries-v2-${{ inputs.binary }}-${{ inputs.triple }}
+        save-cache: "true"
 
     - name: Set version
       shell: nix develop -c bash -euo pipefail {0}
