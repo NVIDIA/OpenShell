@@ -323,7 +323,7 @@ discovers it through `pkg-config`.
 
 ```bash
 # macOS
-brew install z3
+brew install z3 pkg-config
 
 # Ubuntu / Debian
 sudo apt install libz3-dev
