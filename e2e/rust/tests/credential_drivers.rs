@@ -182,8 +182,19 @@ async fn provider_identity(provider_name: &str) -> Result<ProviderIdentity, Stri
     if code != 0 {
         return Err(format!("provider list failed (exit {code}):\n{clean}"));
     }
-    let providers: Vec<serde_json::Value> = serde_json::from_str(&clean)
+    let listing: serde_json::Value = serde_json::from_str(&clean)
         .map_err(|err| format!("failed to parse provider list JSON: {err}\n{clean}"))?;
+    let next_page_token = listing["next_page_token"]
+        .as_str()
+        .ok_or_else(|| format!("provider list response omitted next_page_token:\n{clean}"))?;
+    if !next_page_token.is_empty() {
+        return Err(format!(
+            "provider list response was incomplete; received continuation token:\n{clean}"
+        ));
+    }
+    let providers = listing["providers"]
+        .as_array()
+        .ok_or_else(|| format!("provider list response omitted providers array:\n{clean}"))?;
     let provider = providers
         .iter()
         .find(|provider| provider["name"].as_str() == Some(provider_name))
