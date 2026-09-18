@@ -46,15 +46,11 @@ mod token_probe {
     use std::ffi::c_void;
     use std::ptr;
 
-    #[repr(C)]
-    struct SidIdentifierAuthority {
-        value: [u8; 6],
-    }
-
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentProcess() -> isize;
         fn CloseHandle(handle: isize) -> i32;
+        fn GetLastError() -> u32;
     }
 
     #[link(name = "advapi32")]
@@ -67,21 +63,8 @@ mod token_probe {
             len: u32,
             return_len: *mut u32,
         ) -> i32;
-        fn AllocateAndInitializeSid(
-            authority: *const SidIdentifierAuthority,
-            count: u8,
-            sub0: u32,
-            sub1: u32,
-            sub2: u32,
-            sub3: u32,
-            sub4: u32,
-            sub5: u32,
-            sub6: u32,
-            sub7: u32,
-            sid: *mut *mut c_void,
-        ) -> i32;
-        fn FreeSid(sid: *mut c_void) -> *mut c_void;
-        fn CheckTokenMembership(token: isize, sid: *const c_void, is_member: *mut i32) -> i32;
+        fn OpenSCManagerW(machine: *const u16, database: *const u16, access: u32) -> isize;
+        fn CloseServiceHandle(handle: isize) -> i32;
     }
 
     fn token_u32(token: isize, class: i32) -> Option<u32> {
@@ -114,33 +97,19 @@ mod token_probe {
         ok != 0 && !unsafe { ptr::read_unaligned(buf.as_ptr().cast::<*const c_void>()) }.is_null()
     }
 
-    fn effective_administrator() -> Option<bool> {
-        let authority = SidIdentifierAuthority {
-            value: [0, 0, 0, 0, 0, 5],
-        };
-        let mut sid = ptr::null_mut();
-        let allocated = unsafe {
-            AllocateAndInitializeSid(
-                &raw const authority,
-                2,
-                32,  // SECURITY_BUILTIN_DOMAIN_RID
-                544, // DOMAIN_ALIAS_RID_ADMINS
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                &raw mut sid,
+    fn service_manager_create_access() -> (bool, u32) {
+        let manager = unsafe {
+            OpenSCManagerW(
+                ptr::null(),
+                ptr::null(),
+                0x0002, // SC_MANAGER_CREATE_SERVICE
             )
         };
-        if allocated == 0 {
-            return None;
+        if manager == 0 {
+            return (false, unsafe { GetLastError() });
         }
-        let mut member = 0;
-        let checked = unsafe { CheckTokenMembership(0, sid, &raw mut member) };
-        unsafe { FreeSid(sid) };
-        (checked != 0).then_some(member != 0)
+        unsafe { CloseServiceHandle(manager) };
+        (true, 0)
     }
 
     pub fn snapshot() -> serde_json::Value {
@@ -148,10 +117,12 @@ mod token_probe {
         let opened = unsafe { OpenProcessToken(GetCurrentProcess(), 0x0008, &raw mut token) };
         assert_ne!(opened, 0, "OpenProcessToken failed");
 
+        let (can_create_service, create_service_error) = service_manager_create_access();
         let snapshot = serde_json::json!({
             "is_appcontainer": token_u32(token, 29), // TokenIsAppContainer
             "has_appcontainer_sid": has_appcontainer_sid(token),
-            "effective_administrator": effective_administrator(),
+            "can_create_service": can_create_service,
+            "create_service_error": create_service_error,
         });
         unsafe { CloseHandle(token) };
         snapshot
@@ -597,7 +568,7 @@ fn dryrun_accepts_split_policy_output() {
 // These skip on this box (processcontainer velocity keys not enabled;
 // isolation_session backend absent). They PASS where backends are live.
 
-/// Entrypoint used by `pc_oneshot_token_is_appcontainer_without_effective_admin`.
+/// Entrypoint used by `pc_oneshot_token_is_appcontainer_without_admin_access`.
 /// The parent test relaunches this integration-test binary inside MXC so the
 /// probe observes the workload token rather than the host test runner's token.
 #[test]
@@ -932,13 +903,13 @@ fn pc_oneshot_in_policy_write_succeeds() {
     );
 }
 
-/// Verify the default `ProcessContainer` token through the token APIs Windows
-/// uses for access checks. `whoami /all` is not sufficient for this assertion:
-/// the package SID is exposed through `TokenAppContainerSid`, and a group SID
-/// listed in the token is not an effective membership unless it is enabled.
+/// Verify the default `ProcessContainer` token and an administrator-gated
+/// access attempt. `whoami /all` is not sufficient for this assertion: the
+/// package SID is exposed through `TokenAppContainerSid`, and `AppContainer`
+/// access is the intersection of the user/group and package/capability grants.
 #[test]
 #[ignore = "requires real wxc-exec"]
-fn pc_oneshot_token_is_appcontainer_without_effective_admin() {
+fn pc_oneshot_token_is_appcontainer_without_admin_access() {
     let Some(wxc) = wxc_path() else {
         eprintln!("SKIP: wxc-exec not found");
         return;
@@ -1015,7 +986,8 @@ fn pc_oneshot_token_is_appcontainer_without_effective_admin() {
 
     assert_eq!(snapshot["is_appcontainer"], 1);
     assert_eq!(snapshot["has_appcontainer_sid"], true);
-    assert_eq!(snapshot["effective_administrator"], false);
+    assert_eq!(snapshot["can_create_service"], false);
+    assert_eq!(snapshot["create_service_error"], 5); // ERROR_ACCESS_DENIED
     drop(tempdir);
 }
 
