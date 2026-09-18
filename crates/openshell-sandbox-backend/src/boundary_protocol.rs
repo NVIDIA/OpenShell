@@ -26,7 +26,7 @@ use openshell_isolation_interface::contract::{
     BackendDescriptor, BackendError, BinaryIdentity, BoundaryExitStatus, BoundarySignal,
     DriverFenceEvidence, ExecSpec, ResolveError, SandboxConfirmEvidence,
 };
-use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -194,7 +194,7 @@ pub fn generate_sandbox_tls_material(
     session_id: SandboxSessionId,
 ) -> Result<SandboxTlsMaterial, BackendError> {
     let server_name = format!("sandbox.{session_id}.openshell.internal");
-    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ED25519)
+    let ca_key = openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_ED25519)
         .map_err(|error| BackendError::Descriptor(format!("generate sandbox CA key: {error}")))?;
     let mut ca_params = CertificateParams::default();
     ca_params.not_before = rcgen::date_time_ymd(1975, 1, 1);
@@ -204,13 +204,14 @@ pub fn generate_sandbox_tls_material(
         .distinguished_name
         .push(DnType::CommonName, "OpenShell sandbox session CA");
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca = ca_params.self_signed(&ca_key).map_err(|error| {
+    let ca = openshell_crypto::pki::self_signed(ca_params, &ca_key).map_err(|error| {
         BackendError::Descriptor(format!("generate sandbox CA certificate: {error}"))
     })?;
 
-    let sandbox_key = KeyPair::generate_for(&rcgen::PKCS_ED25519).map_err(|error| {
-        BackendError::Descriptor(format!("generate sandbox TLS server key: {error}"))
-    })?;
+    let sandbox_key =
+        openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_ED25519).map_err(|error| {
+            BackendError::Descriptor(format!("generate sandbox TLS server key: {error}"))
+        })?;
     let mut sandbox_params = CertificateParams::new(vec![server_name.clone()])
         .map_err(|error| BackendError::Descriptor(format!("build sandbox certificate: {error}")))?;
     sandbox_params.not_before = rcgen::date_time_ymd(1975, 1, 1);
@@ -219,8 +220,7 @@ pub fn generate_sandbox_tls_material(
         .distinguished_name
         .push(DnType::CommonName, "OpenShell sandbox runtime");
     sandbox_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let sandbox = sandbox_params
-        .signed_by(&sandbox_key, &ca, &ca_key)
+    let sandbox = openshell_crypto::pki::signed_by(sandbox_params, &sandbox_key, &ca, &ca_key)
         .map_err(|error| {
             BackendError::Descriptor(format!("sign sandbox TLS server certificate: {error}"))
         })?;
@@ -229,7 +229,9 @@ pub fn generate_sandbox_tls_material(
         server_name,
         trust_anchor_pem: ca.pem(),
         certificate_chain_pem: sandbox.pem(),
-        private_key_pem: sandbox_key.serialize_pem(),
+        private_key_pem: sandbox_key
+            .serialize_pem()
+            .map_err(|error| BackendError::Descriptor(format!("export sandbox key: {error}")))?,
     })
 }
 

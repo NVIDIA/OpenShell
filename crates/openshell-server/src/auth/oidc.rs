@@ -14,8 +14,9 @@ use super::authenticator::Authenticator;
 use super::identity::{Identity, IdentityProvider};
 use super::principal::{Principal, UserPrincipal};
 use async_trait::async_trait;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
 use openshell_core::OidcConfig;
+use openshell_crypto::jwt::decode;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -575,7 +576,7 @@ impl JwksCache {
     /// Create a new JWKS cache, discovering the JWKS URI and fetching the
     /// initial key set.
     pub async fn new(config: &OidcConfig) -> Result<Self, String> {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let http = Client::builder()
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
@@ -1002,30 +1003,30 @@ mod tests {
 
     #[tokio::test]
     async fn oidc_loads_discovery_and_jwks_from_tls_idp_with_rotated_local_ca() {
-        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use rcgen::{BasicConstraints, CertificateParams, IsCa};
         use rustls::pki_types::PrivateKeyDer;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut old_ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         old_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let old_ca_key = KeyPair::generate().unwrap();
-        let old_ca_cert = old_ca_params.self_signed(&old_ca_key).unwrap();
+        let old_ca_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let old_ca_cert = openshell_crypto::pki::self_signed(old_ca_params, &old_ca_key).unwrap();
 
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca_key = KeyPair::generate().unwrap();
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let ca_cert = openshell_crypto::pki::self_signed(ca_params, &ca_key).unwrap();
 
         let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        let server_key = KeyPair::generate().unwrap();
-        let server_cert = server_params
-            .signed_by(&server_key, &ca_cert, &ca_key)
-            .unwrap();
-        let server_config = rustls::ServerConfig::builder()
+        let server_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let server_cert =
+            openshell_crypto::pki::signed_by(server_params, &server_key, &ca_cert, &ca_key)
+                .unwrap();
+        let server_config = openshell_crypto::tls::server_builder()
             .with_no_client_auth()
             .with_single_cert(
                 vec![server_cert.der().clone()],
-                PrivateKeyDer::Pkcs8(server_key.serialize_der().into()),
+                PrivateKeyDer::Pkcs8(server_key.serialize_der().unwrap().into()),
             )
             .unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
@@ -1379,7 +1380,7 @@ mod tests {
         header.kid = Some(kid.to_owned());
         let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_KEY.private_pem.as_bytes())
             .expect("load RSA signing key");
-        jsonwebtoken::encode(&header, claims, &key).expect("sign RS256 token")
+        openshell_crypto::jwt::encode(&header, claims, &key).expect("sign RS256 token")
     }
 
     fn claims_for(issuer: &str, audience: &str, exp: i64) -> serde_json::Value {
@@ -1494,7 +1495,7 @@ mod tests {
         crate::install_jsonwebtoken_crypto_provider();
         let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_owned());
-        let token = jsonwebtoken::encode(
+        let token = openshell_crypto::jwt::encode(
             &header,
             &claims_for(&server.uri(), TEST_AUDIENCE, now_secs() + 3600),
             &jsonwebtoken::EncodingKey::from_rsa_pem(other.private_pem.as_bytes())
@@ -1577,9 +1578,10 @@ mod tests {
         use super::*;
         use base64::Engine;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use jsonwebtoken::{EncodingKey, Header, encode};
+        use jsonwebtoken::{EncodingKey, Header};
         use openshell_core::OidcConfig;
-        use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PKCS_ED25519};
+        use openshell_crypto::jwt::encode;
+        use rcgen::{PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PKCS_ED25519};
         use rsa::traits::PublicKeyParts;
         use std::time::{SystemTime, UNIX_EPOCH};
         use wiremock::matchers::{method, path};
@@ -1684,19 +1686,19 @@ mod tests {
         fn ec_test_key(kid: &str, curve: &str) -> TestSigningKey {
             let (key_pair, algorithm, coord_len) = match curve {
                 "P-256" => (
-                    KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap(),
+                    openshell_crypto::pki::generate_keypair_for(&PKCS_ECDSA_P256_SHA256).unwrap(),
                     Algorithm::ES256,
                     32,
                 ),
                 "P-384" => (
-                    KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap(),
+                    openshell_crypto::pki::generate_keypair_for(&PKCS_ECDSA_P384_SHA384).unwrap(),
                     Algorithm::ES384,
                     48,
                 ),
                 other => panic!("unsupported curve {other}"),
             };
             let encoding_key =
-                EncodingKey::from_ec_pem(key_pair.serialize_pem().as_bytes()).unwrap();
+                EncodingKey::from_ec_pem(key_pair.serialize_pem().unwrap().as_bytes()).unwrap();
             let (x, y) = ec_coords_from_spki(&key_pair.public_key_der(), coord_len);
             let jwk = serde_json::json!({
                 "kty": "EC",
@@ -1715,9 +1717,9 @@ mod tests {
         }
 
         fn ed25519_test_key(kid: &str) -> TestSigningKey {
-            let key_pair = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+            let key_pair = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519).unwrap();
             let encoding_key =
-                EncodingKey::from_ed_pem(key_pair.serialize_pem().as_bytes()).unwrap();
+                EncodingKey::from_ed_pem(key_pair.serialize_pem().unwrap().as_bytes()).unwrap();
             let spki = key_pair.public_key_der();
             let x = URL_SAFE_NO_PAD.encode(&spki[spki.len() - 32..]);
             let jwk = serde_json::json!({

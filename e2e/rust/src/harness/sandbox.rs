@@ -30,7 +30,7 @@ fn extract_sandbox_name(output: &str) -> Option<String> {
 /// from the content store on every boot (~250s for the 1GB sandbox
 /// base image), so 600s accommodates extraction + workspace-init + pod
 /// startup.
-const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(600);
+const SANDBOX_READY_TIMEOUT: Duration = Duration::from_mins(10);
 
 static NEXT_SANDBOX_NAME: AtomicU64 = AtomicU64::new(1);
 

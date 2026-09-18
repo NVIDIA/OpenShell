@@ -913,8 +913,9 @@ allow_unauthenticated_users = true
 
     #[test]
     fn parses_supervisor_middleware_registration() {
-        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-            .expect("test certificate");
+        let certificate =
+            openshell_crypto::pki::generate_simple_self_signed(vec!["localhost".to_string()])
+                .expect("test certificate");
         let mut ca = tempfile::Builder::new()
             .suffix(".pem")
             .tempfile()
@@ -1017,14 +1018,15 @@ timeout = "2s"
         use std::io::Write as _;
 
         let certificate =
-            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("test certificate");
+            openshell_crypto::pki::generate_simple_self_signed(vec!["localhost".into()])
+                .expect("test certificate");
         let mut ca = tempfile::Builder::new()
             .suffix(".pem")
             .tempfile()
             .expect("CA tempfile");
         ca.write_all(certificate.cert.pem().as_bytes())
             .expect("write certificate");
-        ca.write_all(certificate.key_pair.serialize_pem().as_bytes())
+        ca.write_all(certificate.key_pair.serialize_pem().unwrap().as_bytes())
             .expect("write private key");
         let config = MiddlewareServiceFileConfig {
             name: "local-guard".into(),

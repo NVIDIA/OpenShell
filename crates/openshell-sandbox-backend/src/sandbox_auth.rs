@@ -356,7 +356,7 @@ mod tests {
         SessionTokenProfile, SessionVerificationKey,
     };
     use openshell_core::sandbox_generation::SandboxGenerationId;
-    use rcgen::{KeyPair, PKCS_ED25519};
+    use rcgen::PKCS_ED25519;
 
     use super::*;
 
@@ -375,12 +375,12 @@ mod tests {
         SandboxProtocolAuthenticator,
         openshell_core::jwt::MintedSessionToken,
     ) {
-        let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate key");
+        let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519).expect("generate key");
         let public_key_pem = key.public_key_pem().into_bytes();
         let clock: Arc<dyn JwtClock> = Arc::new(FixedClock);
         let sandbox_id = SandboxId::parse("sandbox-a").expect("sandbox ID");
         let issuer = SessionJwtIssuer::from_ed25519_pem(
-            key.serialize_pem().as_bytes(),
+            key.serialize_pem().unwrap().as_bytes(),
             "current",
             "test",
             DEFAULT_SESSION_TOKEN_TTL,
