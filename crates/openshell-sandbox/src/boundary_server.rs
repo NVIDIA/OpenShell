@@ -4329,6 +4329,7 @@ mod linux {
                     task_memory_read: true,
                     task_memory_write: true,
                     cancellation: true,
+                    task_memory_writes_disabled: false,
                 },
                 landlock_abi: 6,
                 landlock_allow_deny: true,

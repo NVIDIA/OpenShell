@@ -205,9 +205,31 @@ The sandbox reserves `SIGUSR2` with a non-restarting no-op handler for these
 broker threads; startup rejects a conflicting handler. This signal disposition
 is process-global kernel state, while registrations and cancellation state are
 owned by the broker. Workload exec resets the caught handler to its default.
-This sandbox runtime requires Linux 6.2 or newer for Landlock ABI v3 and treats
-`SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` as mandatory so cancelled
-notifications cannot race task-memory writes.
+This sandbox runtime requires Landlock ABI v3 (Linux 6.2, or an equivalent
+vendor backport). The seccomp listener is installed in one of two cancellation
+modes, and the launch confirmation enforces the invariant
+`cancellation || task_memory_writes_disabled`:
+
+- **Killable** (`SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`, Linux 5.19+): the
+  notified workload thread waits kill-only, so a non-fatal signal cannot resume
+  a mediated syscall between notification validation and the broker's result
+  write. Full mediation, including task-memory output writes.
+- **LegacyReadOnly** (kernels < 5.19, e.g. RHEL 9.x / 5.14): the flag is
+  unavailable (`EINVAL`), so the listener falls back to a plain notifier and the
+  broker refuses every task-memory *output* write to stay cancellation-safe.
+  Concretely, in this mode `getpeername`, `accept`/`accept4` **with a non-null
+  peer-address argument**, and `sendmmsg` paths that write per-message lengths
+  fail closed with `EOPNOTSUPP`. `accept` with a null address, and socket
+  creation, `connect`, `bind`, `listen`, `sendto`, and `sendmsg` continue to
+  work — they use copied inputs, scalar responses, or atomic `ADDFD_SEND`, none
+  of which write into workload memory. Some server workloads whose accept
+  wrappers request the peer address will therefore not run until the kernel
+  provides `WAIT_KILLABLE_RECV` (a distribution backport); outbound-oriented
+  workloads are unaffected.
+
+Input mediation, DNS/TCP authorization, and outer-fence enforcement are
+identical in both modes. The selected mode is emitted in the sandbox
+qualification output (`seccomp_listener_mode`).
 
 DNS uses an exact sandbox-local resolver at `127.0.0.53:53`. The driver sets the
 nameserver and permits an unprivileged bind to port 53. UDP and TCP DNS requests

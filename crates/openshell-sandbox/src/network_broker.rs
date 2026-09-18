@@ -1325,8 +1325,8 @@ fn classify_send(
                 if let Some(length_address) = message.result_length_address {
                     let length = u32::try_from(message.data.len())
                         .map_err(|_| io::Error::from_raw_os_error(libc::EMSGSIZE))?;
-                    listener.validate_id(notification.id)?;
-                    task_memory::write_exact(
+                    listener.write_task_output(
+                        notification.id,
                         notification.tid,
                         length_address,
                         &length.to_ne_bytes(),
@@ -1679,6 +1679,15 @@ fn write_socket_addr(
     length_address: u64,
     value: SocketAddr,
 ) -> io::Result<()> {
+    // A LegacyReadOnly listener (kernels < 5.19) cannot safely write into
+    // workload memory: without WAIT_KILLABLE_RECV the notified accept/
+    // getpeername could resume and repurpose these buffers between validation
+    // and the broker write. Fail closed before reading or writing anything, so
+    // this address-writing path is inert in legacy mode. Callers that pass a
+    // null address argument (accept with a null peer address) never reach here.
+    if listener.writes_disabled() {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
     let mut supplied_length = [0_u8; size_of::<libc::socklen_t>()];
     task_memory::read_exact(tid, length_address, &mut supplied_length)?;
     let supplied_length = libc::socklen_t::from_ne_bytes(supplied_length);
@@ -1686,12 +1695,10 @@ fn write_socket_addr(
     let copied = usize::try_from(supplied_length)
         .unwrap_or(0)
         .min(bytes.len());
-    listener.validate_id(notification_id)?;
     if copied != 0 {
-        task_memory::write_exact(tid, address, &bytes[..copied])?;
+        listener.write_task_output(notification_id, tid, address, &bytes[..copied])?;
     }
-    listener.validate_id(notification_id)?;
-    task_memory::write_exact(tid, length_address, &actual_length.to_ne_bytes())
+    listener.write_task_output(notification_id, tid, length_address, &actual_length.to_ne_bytes())
 }
 
 fn sockaddr_bytes(address: SocketAddr) -> io::Result<(Vec<u8>, libc::socklen_t)> {
@@ -1760,6 +1767,7 @@ fn error_to_errno(error: &io::Error) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_isolation_interface::linux::seccomp_notify::ListenerMode;
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::{UnixListener, UnixStream};
 
@@ -1774,6 +1782,25 @@ mod tests {
         assert!(!retry_notification_receive(&io::Error::from_raw_os_error(
             libc::EBADF
         )));
+    }
+
+    #[test]
+    fn legacy_listener_rejects_socket_addr_write() {
+        // accept-with-address and getpeername both route through
+        // write_socket_addr; on a LegacyReadOnly listener the path must fail
+        // closed (EOPNOTSUPP) before any task-memory access.
+        // SAFETY: dup returns a new descriptor or a negative error.
+        let dup = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(dup >= 0, "dup stderr");
+        let listener = NotificationListener::from_fd_with_mode(
+            // SAFETY: successful dup returned a new owned descriptor.
+            unsafe { OwnedFd::from_raw_fd(dup) },
+            ListenerMode::LegacyReadOnly,
+        );
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let error = write_socket_addr(&listener, 1, 0, 0, 0, peer)
+            .expect_err("legacy listener must reject socket-address writes");
+        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
     }
 
     #[test]
