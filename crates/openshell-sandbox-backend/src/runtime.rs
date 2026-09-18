@@ -3058,6 +3058,7 @@ mod tests {
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
             provider_environment_generation: 50,
+            confirmation: test_confirmation(),
         };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
