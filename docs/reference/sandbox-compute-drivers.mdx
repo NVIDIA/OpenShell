@@ -471,15 +471,15 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `[openshell.drivers.kubernetes].service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the Kubernetes driver's TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
 | `[openshell.drivers.kubernetes].enable_user_namespaces` | `gatewayConfig.openshell.drivers.kubernetes.enable_user_namespaces` | Enable Kubernetes user namespaces for sandbox pods. |
 | `default_image` | `gatewayConfig.openshell.drivers.kubernetes.default_image` | Set the default sandbox image. |
-| `image_pull_policy` | `sandboxRuntime.image.pullPolicy` | Set the canonical isolated sandbox-runtime pull policy: `always`, `if_not_present`, or `never`. `newer` is Podman-only. Helm derives the runtime field. |
+| `image_pull_policy` | `gatewayConfig.openshell.drivers.kubernetes.image_pull_policy` | Set the canonical Kubernetes image pull policy: `always`, `if_not_present`, or `never`. `newer` is Podman-only. |
 | `image_pull_secrets` | `gatewayConfig.openshell.drivers.kubernetes.image_pull_secrets` | Attach Kubernetes image-pull Secrets to sandbox pods. Managed mode copies these explicitly named Secrets from the configured source namespace into each workspace namespace. In shared and operator modes, the Secrets must already exist in the sandbox namespace. |
 | `[managed_ssh_ingress]` | `networkPolicy.enabled` | In managed mode, create an SSH ingress policy in every workspace namespace. Helm configures the gateway namespace and pod selector automatically. Operator mode leaves namespace policy management to the platform operator. |
 | `grpc_endpoint` | `gatewayConfig.openshell.drivers.kubernetes.grpc_endpoint` | Set the gateway callback endpoint reachable from sandbox pods. Raw TOML and the standalone Kubernetes driver require an explicit endpoint because the sandbox namespace does not identify the gateway Service. Helm derives it from the release's gateway Service when the value is omitted. |
 | `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
-| `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Set the isolated supervisor image. Helm derives the runtime field. |
-| `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the canonical supervisor pull policy: `always`, `if_not_present`, or `never`. `newer` is Podman-only. Helm derives the runtime field. |
-| `sandbox_runtime` | `supervisor.sandboxRuntime` | Configure the isolated runtime's NetworkPolicy acknowledgement and boundary port. |
-| `https_proxy`, `no_proxy`, `proxy_auth_secret_name`, `proxy_auth_secret_key`, `proxy_auth_allow_insecure`, `proxy_connect_by_hostname` | `upstreamProxy` | Set the chart-owned corporate proxy URL, bypass list, credential Secret reference, cleartext-auth acknowledgement, and hostname CONNECT option. Helm derives all runtime fields. |
+| `supervisor_image` | `gatewayConfig.openshell.drivers.kubernetes.supervisor_image` | Set the isolated supervisor image. |
+| `supervisor_image_pull_policy` | `gatewayConfig.openshell.drivers.kubernetes.supervisor_image_pull_policy` | Set the canonical supervisor pull policy: `always`, `if_not_present`, or `never`. `newer` is Podman-only. |
+| `sandbox_runtime` | `gatewayConfig.openshell.drivers.kubernetes.sandbox_runtime` | Configure the isolated runtime's NetworkPolicy acknowledgement and boundary port. |
+| `https_proxy`, `no_proxy`, `proxy_auth_secret_name`, `proxy_auth_secret_key`, `proxy_auth_allow_insecure`, `proxy_connect_by_hostname` | `gatewayConfig.openshell.drivers.kubernetes` | Configure the corporate proxy URL, bypass list, credential Secret reference, cleartext-auth acknowledgement, and hostname CONNECT option. |
 | `workspace_default_storage_size` | `gatewayConfig.openshell.drivers.kubernetes.workspace_default_storage_size` | Set the default workspace PVC size for new sandboxes. |
 | `workspace_storage_class` | `gatewayConfig.openshell.drivers.kubernetes.workspace_storage_class` | Set the `StorageClass` for the workspace PVC. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Set this on clusters with no default `StorageClass`, otherwise the workspace PVC stays `Pending` and the sandbox never starts. |
 | `sa_token_ttl_secs` | `gatewayConfig.openshell.drivers.kubernetes.sa_token_ttl_secs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
@@ -495,7 +495,7 @@ RFC 0012 uses the Agent Sandbox controller to create a separate isolated
 workload and network supervisor. The former `combined` and `sidecar` topology
 knobs, supervisor sideload method, and Kubernetes AppArmor override no longer
 exist. Verify that the cluster CNI enforces NetworkPolicy before setting
-`supervisor.sandboxRuntime.networkPolicyEnforced: true`.
+`gatewayConfig.openshell.drivers.kubernetes.sandbox_runtime.network_policy_enforced: true`.
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
 

@@ -8,8 +8,8 @@ and mounts) remain chart values.
 ## Breaking upgrade
 
 Remove every application-only `server.*` setting before upgrading. There is no
-compatibility translation. Retain chart-owned `upstreamProxy.*` settings; Helm
-derives their runtime Kubernetes-driver fields. Kubernetes pull
+compatibility translation. Runtime images, proxy settings, and NetworkPolicy
+acknowledgement all live in `gatewayConfig`. Kubernetes pull
 policy spellings such as `Always` are not aliases: use `always`,
 `if_not_present`, or `never`. `gatewayConfig` is strictly a non-secret
 configuration contract: do not put passwords, tokens, private keys,
@@ -33,11 +33,11 @@ runtime counterparts.
 | `server.otlp.{endpoint,serviceName}` | `openshell.gateway.otlp.{endpoint,service_name}` |
 | `server.auth.allowUnauthenticatedUsers` | `openshell.gateway.auth.allow_unauthenticated_users` |
 | `server.oidc.*` | `openshell.gateway.oidc` with snake_case keys |
-| `server.sandboxImage*`, workspace storage/runtime and user namespace settings | `openshell.drivers.kubernetes`; isolated runtime images use `sandboxRuntime.image` and `supervisor.image`. Kubernetes AppArmor configuration is removed by RFC 0012. |
+| `server.sandboxImage*`, workspace storage/runtime and user namespace settings | `openshell.drivers.kubernetes`. Kubernetes AppArmor configuration is removed by RFC 0012. |
 | `server.drivers.kubernetes.*` | `openshell.drivers.kubernetes` |
 | `server.sandboxJwt.{gatewayId,ttlSecs,k8sSaTokenTtlSecs}` | `openshell.gateway.gateway_jwt` or `openshell.drivers.kubernetes.sa_token_ttl_secs` |
-| `supervisor.image.*` | Chart-owned `supervisor.image.*`, derived into the Kubernetes driver. `supervisor.topology` and `supervisor.sidecar.*` are removed by RFC 0012 with no replacement. |
-| `upstreamProxy.*` | Retained as chart-owned packaging input; Helm derives `openshell.drivers.kubernetes.{https_proxy,no_proxy,proxy_auth_*,proxy_connect_by_hostname}`. |
+| `supervisor.image.*`, `supervisor.sandboxRuntime.*` | `openshell.drivers.kubernetes.{supervisor_image,supervisor_image_pull_policy,sandbox_runtime}`. `supervisor.topology` and `supervisor.sidecar.*` are removed by RFC 0012 with no replacement. |
+| `upstreamProxy.*` | `openshell.drivers.kubernetes.{https_proxy,no_proxy,proxy_auth_*,proxy_connect_by_hostname}`. |
 | `server.credentialDrivers.{kubernetesSecrets,vault}.*` | `openshell.gateway.credential_drivers` and `openshell.credential_drivers.*` |
 | `server.providerTokenGrants.spiffe.{enabled,workloadApiSocketPath}` | `openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`; omit it to disable SPIFFE provider grants. |
 | `server.hostGatewayIP` | Retained as the chart-owned host-alias input; the chart derives `openshell.drivers.kubernetes.host_gateway_ip`. |
@@ -56,6 +56,9 @@ gatewayConfig:
   openshell.drivers.kubernetes:
     default_image: registry.example/sandbox:latest
     image_pull_policy: if_not_present
+    supervisor_image: registry.example/openshell-supervisor:latest
+    sandbox_runtime:
+      network_policy_enforced: true
     workspace_mode: managed
     grpc_rate_limit_requests: null
   openshell.gateway:
@@ -67,7 +70,7 @@ gatewayConfig:
 
 For Vault, set `openshell.gateway.credential_drivers: [vault]` and configure
 `openshell.credential_drivers.vault`; use `credentialDrivers.vault.caConfigMapName`
-for a private Vault CA. For a proxy, use chart-owned `upstreamProxy.url`,
-`noProxy`, and `authSecret` settings. TLS remains Secret-backed; set `server.disableTls: true` only for
+for a private Vault CA. For a proxy, use the Kubernetes-driver fields in
+`gatewayConfig`. TLS remains Secret-backed; set `server.disableTls: true` only for
 trusted external termination. A null map field omits it; null array elements
 are invalid. Strings evaluate Helm `tpl`; other values do not.

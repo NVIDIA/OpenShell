@@ -124,8 +124,7 @@ deploy:
         setValueTemplates:
           image.repository: '{{.IMAGE_REPO_openshell_gateway}}'
           image.tag: '{{.IMAGE_TAG_openshell_gateway}}'
-          supervisor.image.repository: '{{.IMAGE_REPO_openshell_supervisor}}'
-          supervisor.image.tag: '{{.IMAGE_TAG_openshell_supervisor}}'
+          gatewayConfig.openshell\.drivers\.kubernetes.supervisor_image: '{{.IMAGE_REPO_openshell_supervisor}}:{{.IMAGE_TAG_openshell_supervisor}}'
 profiles:
   - name: credential-driver-kubernetes-secrets
     patches:

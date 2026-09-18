@@ -9,7 +9,7 @@
 # Then layer this file on top of values.yaml when deploying:
 #   helm upgrade --install openshell . \
 #     -f values.yaml -f ci/values-skaffold.yaml -f ci/values-keycloak.yaml \
-#     --set supervisor.sandboxRuntime.networkPolicyEnforced=true
+#     --set 'gatewayConfig.openshell\.drivers\.kubernetes.sandbox_runtime.network_policy_enforced=true'
 #
 # Or add this file to skaffold.yaml valuesFiles for iterative dev.
 #
@@ -26,7 +26,6 @@ gatewayConfig:
   openshell.gateway.oidc:
     # Must match KC_HOSTNAME set by keycloak:k8s:setup (in-cluster service hostname).
     issuer: "https://keycloak.keycloak.svc.cluster.local:443/realms/openshell"
-    caConfigMapName: "openshell-keycloak-ca"
     # Must match the client ID in the imported realm (openshell-cli).
     audience: "openshell-cli"
     # Short TTL for dev so JWKS key rotation is picked up quickly.
@@ -37,3 +36,8 @@ gatewayConfig:
     # Leave both empty for authentication-only mode (any valid token is accepted).
     admin_role: "openshell-admin"
     user_role: "openshell-user"
+
+# The ConfigMap is a Kubernetes resource reference. Helm mounts it when the
+# OIDC issuer above is configured and derives the runtime file path.
+oidc:
+  caConfigMapName: "openshell-keycloak-ca"

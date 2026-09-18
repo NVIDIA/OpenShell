@@ -696,15 +696,15 @@ OpenShell chart rather than treating missing workload Pods as Pod failures.
 #### Corporate upstream proxy
 
 When the deployment routes sandbox egress through a corporate HTTP forward
-proxy, the operator-owned settings render under `[openshell.drivers.kubernetes]`
-from the Helm `upstreamProxy` values. Absent proxy configuration preserves
-direct-dial egress; any present-but-invalid value fails closed at gateway
+proxy, configure the settings under `[openshell.drivers.kubernetes]` in
+`gatewayConfig`. Absent proxy configuration preserves direct-dial egress; any
+present-but-invalid value fails closed at gateway
 startup (`validate_upstream_proxy_config`) rather than silently reverting to a
 direct connection. Confirm the rendered configuration first:
 
 ```bash
 kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E 'https_proxy|no_proxy|proxy_auth_secret_(name|key)|proxy_auth_allow_insecure|proxy_connect_by_hostname'
-helm -n openshell get values openshell | grep -A8 upstreamProxy
+helm -n openshell get values openshell | grep -A12 'openshell.drivers.kubernetes'
 ```
 
 Only `http://host:port` forward proxies are supported; `https://` proxy URLs and
