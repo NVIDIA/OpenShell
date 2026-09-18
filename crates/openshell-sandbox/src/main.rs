@@ -146,6 +146,11 @@ struct QualificationReport {
     tcp_allow_round_trip: bool,
     tcp_deny_round_trip: bool,
     wait_killable_recv: bool,
+    /// Selected seccomp listener cancellation mode: "killable" (>= 5.19) or
+    /// "legacy_read_only" (< 5.19, broker output writes disabled).
+    seccomp_listener_mode: &'static str,
+    /// Whether the broker disables task-memory output writes (legacy mode).
+    task_memory_writes_disabled: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -237,6 +242,12 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         tcp_allow_round_trip: true,
         tcp_deny_round_trip: true,
         wait_killable_recv: notification.wait_killable_recv,
+        seccomp_listener_mode: if notification.wait_killable_recv {
+            "killable"
+        } else {
+            "legacy_read_only"
+        },
+        task_memory_writes_disabled: !notification.wait_killable_recv,
     };
     let qualification = openshell_sandbox::RuntimeQualification {
         seccomp: openshell_isolation_interface::contract::SeccompEvidence {
@@ -249,6 +260,9 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
             task_memory_read: notification.task_memory_copy(),
             task_memory_write: notification.task_memory_copy(),
             cancellation: notification.wait_killable_recv,
+            // Legacy plain listener (< 5.19) disables broker output writes;
+            // satisfies the `cancellation || writes_disabled` launch invariant.
+            task_memory_writes_disabled: !notification.wait_killable_recv,
         },
         landlock_abi,
         landlock_allow_deny: true,

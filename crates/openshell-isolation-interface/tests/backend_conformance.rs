@@ -395,6 +395,7 @@ fn confirmation_evidence() -> SandboxConfirmEvidence {
             task_memory_read: true,
             task_memory_write: true,
             cancellation: true,
+            task_memory_writes_disabled: false,
         },
         landlock_abi: 3,
         landlock_allow_deny: true,
@@ -543,6 +544,37 @@ fn confirmation_constructor_rejects_incomplete_evidence() {
     // it reflects WAIT_KILLABLE_RECV (Linux 5.19+) and is unavailable on older
     // kernels, where the sandbox degrades to a plain listener.
     evidence.seccomp.new_listener = false;
+    let result = ConfirmedBoundary::try_new(
+        Box::new(MockReady::<Primary> { _k: PhantomData }),
+        evidence,
+        &workload_identity(),
+    );
+    assert!(matches!(result, Err(BackendError::Confirm(_))));
+}
+
+#[test]
+fn confirmation_accepts_legacy_read_only_listener() {
+    // Cancellation-safety invariant: cancellation OR writes-disabled. A legacy
+    // plain listener (< 5.19) has no cancellation but disables broker output
+    // writes, so it satisfies the invariant and must be accepted.
+    let mut evidence = confirmation_evidence();
+    evidence.seccomp.cancellation = false;
+    evidence.seccomp.task_memory_writes_disabled = true;
+    let result = ConfirmedBoundary::try_new(
+        Box::new(MockReady::<Primary> { _k: PhantomData }),
+        evidence,
+        &workload_identity(),
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn confirmation_rejects_plain_listener_with_writes_enabled() {
+    // The unsafe configuration this PR must never admit: no cancellation AND
+    // task-memory output writes still enabled (the cancellation race).
+    let mut evidence = confirmation_evidence();
+    evidence.seccomp.cancellation = false;
+    evidence.seccomp.task_memory_writes_disabled = false;
     let result = ConfirmedBoundary::try_new(
         Box::new(MockReady::<Primary> { _k: PhantomData }),
         evidence,
