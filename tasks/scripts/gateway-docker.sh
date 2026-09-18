@@ -26,6 +26,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=tasks/scripts/gateway-common.sh
+source "${ROOT}/tasks/scripts/gateway-common.sh"
 # shellcheck source=tasks/scripts/gateway-toml.sh
 source "${ROOT}/tasks/scripts/gateway-toml.sh"
 # shellcheck source=tasks/scripts/gateway-pull-policy.sh
@@ -41,85 +43,7 @@ SANDBOX_IMAGE_PULL_POLICY="$(normalize_image_pull_policy "${OPENSHELL_SANDBOX_IM
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
 
-port_is_in_use() {
-  local port=$1
-  if command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
-    return $?
-  fi
-  if command -v nc >/dev/null 2>&1; then
-    nc -z 127.0.0.1 "${port}" >/dev/null 2>&1
-    return $?
-  fi
-  (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
-}
-
-ensure_docker_runtime_image() {
-  local image=$1
-  local configured_image=$2
-  local build_target=$3
-  local role=$4
-
-  if [[ -n "${configured_image}" ]]; then
-    if docker image inspect "${image}" >/dev/null 2>&1; then
-      return
-    fi
-    echo "ERROR: ${role} image '${image}' not found locally." >&2
-    echo "       Build it with Docker or unset its image override to build the local :dev image." >&2
-    exit 1
-  fi
-
-  # Always run the build pipeline for default development images so source
-  # changes cannot leave a fixed :dev tag pointing at stale runtime code.
-  echo "Refreshing Docker ${role} image (${image})..."
-  CONTAINER_ENGINE=docker IMAGE_TAG=dev mise run "build:docker:${build_target}"
-
-  if ! docker image inspect "${image}" >/dev/null 2>&1; then
-    echo "ERROR: expected ${role} image '${image}' after build" >&2
-    exit 1
-  fi
-}
-
-append_local_otlp_config_if_available() {
-  local config_path=$1
-  if ! port_is_in_use 4317; then
-    echo "OTLP collector not detected on 127.0.0.1:4317; trace export disabled."
-    return
-  fi
-
-  cat >>"${config_path}" <<'EOF'
-
-[openshell.gateway.otlp]
-endpoint = "http://127.0.0.1:4317"
-EOF
-  echo "OTLP trace export enabled for http://127.0.0.1:4317."
-}
-
-register_gateway_metadata() {
-  local name=$1
-  local endpoint=$2
-  local port=$3
-  local config_home gateway_dir
-
-  config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
-  gateway_dir="${config_home}/openshell/gateways/${name}"
-
-  mkdir -p "${gateway_dir}"
-  cat >"${gateway_dir}/metadata.json" <<EOF
-{
-  "name": "${name}",
-  "gateway_endpoint": "${endpoint}",
-  "is_remote": false,
-  "gateway_port": ${port},
-  "auth_mode": "plaintext"
-}
-EOF
-}
-
-if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
-  echo "ERROR: OPENSHELL_DOCKER_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
-  exit 2
-fi
+validate_gateway_name "${GATEWAY_NAME}" OPENSHELL_DOCKER_GATEWAY_NAME
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "ERROR: docker CLI is required" >&2
@@ -135,12 +59,12 @@ if port_is_in_use "${PORT}"; then
   exit 2
 fi
 
-ensure_docker_runtime_image \
+ensure_container_runtime_image docker \
   "${SUPERVISOR_IMAGE}" \
   "${OPENSHELL_SUPERVISOR_IMAGE:-}" \
   supervisor \
   supervisor
-ensure_docker_runtime_image \
+ensure_container_runtime_image docker \
   "${SANDBOX_RUNTIME_IMAGE}" \
   "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" \
   sandbox \
@@ -221,7 +145,7 @@ fi
 append_local_otlp_config_if_available "${CONFIG_PATH}"
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
-register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"
+register_local_gateway "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"
 
 echo "Starting standalone Docker gateway..."
 echo "  gateway:   ${GATEWAY_NAME}"

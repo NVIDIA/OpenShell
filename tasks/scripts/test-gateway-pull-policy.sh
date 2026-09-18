@@ -37,7 +37,7 @@ if normalize_image_pull_policy sometimes >/dev/null 2>&1; then
   exit 1
 fi
 
-for script in gateway.sh gateway-docker.sh gateway-podman.sh; do
+for script in gateway-kubernetes.sh gateway-docker.sh gateway-podman.sh; do
   if ! grep -q 'normalize_image_pull_policy' "${ROOT}/tasks/scripts/${script}"; then
     echo "${script} does not normalize image pull policy" >&2
     exit 1

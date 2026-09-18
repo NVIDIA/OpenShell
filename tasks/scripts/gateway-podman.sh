@@ -23,6 +23,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=tasks/scripts/gateway-common.sh
+source "${ROOT}/tasks/scripts/gateway-common.sh"
 # shellcheck source=tasks/scripts/gateway-toml.sh
 source "${ROOT}/tasks/scripts/gateway-toml.sh"
 # shellcheck source=tasks/scripts/gateway-pull-policy.sh
@@ -38,17 +40,6 @@ LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 PRIMARY_BIND_IP="${OPENSHELL_BIND_ADDRESS:-127.0.0.1}"
 CLI_ENDPOINT_HOST="127.0.0.1"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
-
-command_available() {
-  command -v "$1" >/dev/null 2>&1
-}
-
-require_mise() {
-  if ! command_available mise; then
-    echo "ERROR: mise is required to build local gateway artifacts" >&2
-    exit 1
-  fi
-}
 
 podman_available() {
   command_available podman && podman info >/dev/null 2>&1
@@ -71,88 +62,7 @@ require_podman_service() {
   fi
 }
 
-ensure_podman_runtime_image() {
-  local image=$1
-  local configured_image=$2
-  local build_target=$3
-  local role=$4
-
-  if [[ -n "${configured_image}" ]]; then
-    if podman image exists "${image}" >/dev/null 2>&1; then
-      return
-    fi
-    echo "ERROR: ${role} image '${image}' not found locally." >&2
-    echo "       Build it with Podman or unset its image override to build the local :dev image." >&2
-    exit 1
-  fi
-
-  # Always run the build pipeline for the default development image so source
-  # changes cannot leave the fixed :dev tag pointing at a stale runtime.
-  # Cargo and BuildKit caches keep unchanged rebuilds incremental.
-  echo "Refreshing Podman ${role} image (${image})..."
-  require_mise
-  CONTAINER_ENGINE=podman IMAGE_TAG=dev mise run "build:docker:${build_target}"
-
-  if ! podman image exists "${image}" >/dev/null 2>&1; then
-    echo "ERROR: expected ${role} image '${image}' after build" >&2
-    exit 1
-  fi
-}
-
-port_is_in_use() {
-  local port=$1
-  if command_available lsof; then
-    lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
-    return $?
-  fi
-  if command_available nc; then
-    nc -z 127.0.0.1 "${port}" >/dev/null 2>&1
-    return $?
-  fi
-  (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
-}
-
-append_local_otlp_config_if_available() {
-  local config_path=$1
-  if ! port_is_in_use 4317; then
-    echo "OTLP collector not detected on 127.0.0.1:4317; trace export disabled."
-    return
-  fi
-
-  cat >>"${config_path}" <<'EOF'
-
-[openshell.gateway.otlp]
-endpoint = "http://127.0.0.1:4317"
-EOF
-  echo "OTLP trace export enabled for http://127.0.0.1:4317."
-}
-
-register_gateway_metadata() {
-  local name=$1
-  local endpoint=$2
-  local port=$3
-  local config_home gateway_dir
-
-  config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
-  gateway_dir="${config_home}/openshell/gateways/${name}"
-
-  mkdir -p "${gateway_dir}"
-  cat >"${gateway_dir}/metadata.json" <<EOF
-{
-  "name": "${name}",
-  "gateway_endpoint": "${endpoint}",
-  "is_remote": false,
-  "gateway_port": ${port},
-  "auth_mode": "plaintext"
-}
-EOF
-  printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
-}
-
-if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
-  echo "ERROR: OPENSHELL_PODMAN_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
-  exit 2
-fi
+validate_gateway_name "${GATEWAY_NAME}" OPENSHELL_PODMAN_GATEWAY_NAME
 
 require_podman_service
 
@@ -163,12 +73,12 @@ fi
 
 SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE:-openshell/supervisor:dev}"
 SANDBOX_RUNTIME_IMAGE="${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-openshell/sandbox:dev}"
-ensure_podman_runtime_image \
+ensure_container_runtime_image podman \
   "${SUPERVISOR_IMAGE}" \
   "${OPENSHELL_SUPERVISOR_IMAGE:-}" \
   supervisor \
   supervisor
-ensure_podman_runtime_image \
+ensure_container_runtime_image podman \
   "${SANDBOX_RUNTIME_IMAGE}" \
   "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" \
   sandbox \
@@ -271,7 +181,7 @@ fi
 append_local_otlp_config_if_available "${CONFIG_PATH}"
 
 GATEWAY_ENDPOINT="http://${CLI_ENDPOINT_HOST}:${PORT}"
-register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"
+register_local_gateway "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}" true
 
 echo "Starting standalone Podman gateway..."
 echo "  gateway:   ${GATEWAY_NAME}"

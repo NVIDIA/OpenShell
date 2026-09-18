@@ -33,6 +33,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=tasks/scripts/gateway-common.sh
+source "${ROOT}/tasks/scripts/gateway-common.sh"
 # shellcheck source=tasks/scripts/gateway-toml.sh
 source "${ROOT}/tasks/scripts/gateway-toml.sh"
 PORT="${OPENSHELL_SERVER_PORT:-18081}"
@@ -72,34 +74,6 @@ normalize_bool() {
       exit 2
       ;;
   esac
-}
-
-port_is_in_use() {
-  local port=$1
-  if command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
-    return $?
-  fi
-  if command -v nc >/dev/null 2>&1; then
-    nc -z 127.0.0.1 "${port}" >/dev/null 2>&1
-    return $?
-  fi
-  (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
-}
-
-append_local_otlp_config_if_available() {
-  local config_path=$1
-  if ! port_is_in_use 4317; then
-    echo "OTLP collector not detected on 127.0.0.1:4317; trace export disabled."
-    return
-  fi
-
-  cat >>"${config_path}" <<'EOF'
-
-[openshell.gateway.otlp]
-endpoint = "http://127.0.0.1:4317"
-EOF
-  echo "OTLP trace export enabled for http://127.0.0.1:4317."
 }
 
 invoking_user() {
@@ -268,10 +242,7 @@ else
   unset OPENSHELL_VM_GPU
 fi
 
-if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
-  echo "ERROR: OPENSHELL_VM_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
-  exit 2
-fi
+validate_gateway_name "${GATEWAY_NAME}" OPENSHELL_VM_GATEWAY_NAME
 
 if port_is_in_use "${PORT}"; then
   echo "ERROR: port ${PORT} is already in use; free it or set OPENSHELL_SERVER_PORT" >&2
