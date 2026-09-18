@@ -109,7 +109,7 @@ func (w *workspaceClient) AddMember(ctx context.Context, workspace, principalSub
 	}
 
 	resp, err := w.client.AddWorkspaceMember(ctx, &pb.AddWorkspaceMemberRequest{
-		Workspace:        workspace,
+		WorkspaceScope:   namedWorkspaceScope(workspace),
 		PrincipalSubject: principalSubject,
 		Role:             protoRole,
 	})
@@ -129,7 +129,7 @@ func (w *workspaceClient) RemoveMember(ctx context.Context, workspace, principal
 
 	resp, err := w.client.RemoveWorkspaceMember(ctx, &pb.RemoveWorkspaceMemberRequest{
 		AllowMissing:     allowMissing(opts),
-		Workspace:        workspace,
+		WorkspaceScope:   namedWorkspaceScope(workspace),
 		PrincipalSubject: principalSubject,
 	})
 	if err != nil {
@@ -152,7 +152,7 @@ func (w *workspaceClient) ListMembers(workspace string, opts ...ListOptions) (*P
 		pageToken = opts[0].PageToken
 	}
 	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*WorkspaceMember], error) {
-		req := &pb.ListWorkspaceMembersRequest{Workspace: workspace, PageSize: pageSize, PageToken: pageToken}
+		req := &pb.ListWorkspaceMembersRequest{WorkspaceScope: namedWorkspaceScope(workspace), PageSize: pageSize, PageToken: pageToken}
 		resp, err := w.client.ListWorkspaceMembers(ctx, req)
 		if err != nil {
 			return nil, converter.FromGRPCError(err)

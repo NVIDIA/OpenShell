@@ -188,7 +188,7 @@ impl VaultCredentialDriver {
             managed_secret_path(
                 &request.workspace,
                 &request.provider_id,
-                &request.provider_name,
+                &request.provider,
                 &request.credential_key,
                 &object_id,
             )
@@ -197,7 +197,7 @@ impl VaultCredentialDriver {
         validate_managed_secret_path(
             &request.workspace,
             &request.provider_id,
-            &request.provider_name,
+            &request.provider,
             &request.credential_key,
             &object_id,
             &logical_path,
@@ -231,7 +231,7 @@ impl VaultCredentialDriver {
         validate_managed_secret_path(
             &request.workspace,
             &request.provider_id,
-            &request.provider_name,
+            &request.provider,
             &request.credential_key,
             &object_id,
             &logical_path,
@@ -257,7 +257,7 @@ impl VaultCredentialDriver {
             validate_managed_secret_path(
                 &request.workspace,
                 &request.provider_id,
-                &request.provider_name,
+                &request.provider,
                 &request.credential_key,
                 &object_id,
                 &logical_path,
@@ -504,7 +504,7 @@ impl CredentialDriver for CredentialDriverService {
         _request: Request<GetCredentialDriverCapabilitiesRequest>,
     ) -> Result<Response<GetCredentialDriverCapabilitiesResponse>, Status> {
         Ok(Response::new(GetCredentialDriverCapabilitiesResponse {
-            driver_name: VaultCredentialDriver::NAME.to_string(),
+            name: VaultCredentialDriver::NAME.to_string(),
             driver_version: VERSION.to_string(),
             backend_kind: VaultCredentialDriver::NAME.to_string(),
             supports_list: false,
@@ -1536,7 +1536,7 @@ mod tests {
 
         let stored = driver
             .store_credential(StoreCredentialRequest {
-                provider_name: "nvidia-prod".to_string(),
+                provider: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 value: "nvapi-test".to_string(),
                 existing_handle: None,
@@ -1551,7 +1551,7 @@ mod tests {
         let resolved = driver
             .resolve_credentials(vec![ResolveCredentialRequest {
                 request_id: "credential-0".to_string(),
-                provider_name: "nvidia-prod".to_string(),
+                provider: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 handle: Some(stored),
                 workspace: "default".to_string(),
@@ -1593,7 +1593,7 @@ mod tests {
 
         let stored = driver
             .store_credential(StoreCredentialRequest {
-                provider_name: "nvidia-prod".to_string(),
+                provider: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 value: "updated-secret".to_string(),
                 existing_handle: Some(handle(&format!("v1:{logical_path}"))),
@@ -1636,7 +1636,7 @@ mod tests {
 
         driver
             .delete_credential(DeleteCredentialRequest {
-                provider_name: "nvidia-prod".to_string(),
+                provider: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 handle: Some(handle(&format!("v1:{logical_path}"))),
                 workspace: "default".to_string(),
@@ -1694,7 +1694,7 @@ mod tests {
         let resolved = driver
             .resolve_credentials(vec![ResolveCredentialRequest {
                 request_id: "credential-0".to_string(),
-                provider_name: "github-prod".to_string(),
+                provider: "github-prod".to_string(),
                 credential_key: "GITHUB_TOKEN".to_string(),
                 handle: Some(handle(&format!("v1:{logical_path}"))),
                 workspace: "test-workspace".to_string(),
@@ -1739,7 +1739,7 @@ mod tests {
         let err = driver
             .resolve_credentials(vec![ResolveCredentialRequest {
                 request_id: "credential-0".to_string(),
-                provider_name: "nvidia-prod".to_string(),
+                provider: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 handle: Some(handle(&format!("v1:{logical_path}"))),
                 workspace: "default".to_string(),
@@ -1781,7 +1781,7 @@ mod tests {
         let err = driver
             .resolve_credentials(vec![ResolveCredentialRequest {
                 request_id: "credential-0".to_string(),
-                provider_name: "nvidia-prod".to_string(),
+                provider: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 handle: Some(handle(&format!("v1:{logical_path}"))),
                 workspace: "default".to_string(),

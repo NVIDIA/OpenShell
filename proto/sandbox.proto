@@ -7,6 +7,7 @@ package openshell.sandbox.v1;
 
 import "google/protobuf/struct.proto";
 import "google/protobuf/duration.proto";
+import "datamodel.proto";
 
 // Sandbox-supervisor configuration and policy messages.
 //
@@ -352,8 +353,9 @@ message NetworkBinary {
 
 // Request to get sandbox settings by sandbox name.
 message GetSandboxConfigRequest {
-  string sandbox = 1;
-  string workspace = 3;
+  // Workspace scope. Select one named workspace; authenticated sandbox callers may omit it during bootstrap.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
+  string name = 1;
 }
 
 // Request to get gateway-global settings.

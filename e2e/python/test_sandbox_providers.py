@@ -487,7 +487,7 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                     openshell_pb2.AttachSandboxProviderRequest(
                         workspace="default",
                         sandbox=sb.sandbox.name,
-                        provider_name=provider_name,
+                        provider=provider_name,
                     )
                 )
                 wait_for_token(
@@ -499,7 +499,7 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                     openshell_pb2.DetachSandboxProviderRequest(
                         workspace="default",
                         sandbox=sb.sandbox.name,
-                        provider_name=provider_name,
+                        provider=provider_name,
                     )
                 )
                 wait_for_token(sb, "NOT_SET")
@@ -509,7 +509,7 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                         openshell_pb2.DetachSandboxProviderRequest(
                             workspace="default",
                             sandbox=sb.sandbox.name,
-                            provider_name=provider_name,
+                            provider=provider_name,
                         )
                     )
                 except grpc.RpcError as exc:
@@ -732,7 +732,7 @@ def test_credentials_not_in_persisted_spec_environment(
             fetched = sandbox_client._stub.GetSandbox(
                 openshell_pb2.GetSandboxRequest(
                     workspace="default",
-                    sandbox=sb.sandbox.name,
+                    name=sb.sandbox.name,
                 )
             )
             persisted_env = dict(fetched.sandbox.spec.environment)

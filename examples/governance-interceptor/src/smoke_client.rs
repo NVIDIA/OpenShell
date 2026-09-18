@@ -57,8 +57,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let before = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox: sandbox_name.clone(),
-            workspace: String::new(),
+            name: sandbox_name.clone(),
+            workspace_scope: None,
         })
         .await?
         .into_inner();
@@ -85,7 +85,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let policy_result = client
         .update_config(UpdateConfigRequest {
             sandbox: sandbox_name.clone(),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             policy: Some(widened_policy),
             ..Default::default()
         })
@@ -96,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .submit_policy_analysis(SubmitPolicyAnalysisRequest {
             name: sandbox_name.clone(),
             proposed_chunks: vec![PolicyChunk {
-                rule_name: "sandbox_added".to_string(),
+                rule: "sandbox_added".to_string(),
                 proposed_rule: Some(added_rule),
                 rationale: "authenticated governance bypass regression".to_string(),
                 ..Default::default()
@@ -122,8 +124,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let after = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox: sandbox_name,
-            workspace: String::new(),
+            name: sandbox_name,
+            workspace_scope: None,
         })
         .await?
         .into_inner();

@@ -1252,7 +1252,9 @@ async fn propagate_policy_to_running_sandboxes(
             let result = client
                 .update_config(UpdateConfigRequest {
                     sandbox: name.clone(),
-                    workspace: "default".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
                     policy: Some(policy_state.policy_proto.clone()),
                     annotations: policy_update_annotations(policy_state, &correlation_id),
                     expected_resource_version: resource_version,

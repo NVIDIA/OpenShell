@@ -233,22 +233,22 @@ func PolicyMergeOperationToProto(op *v1.PolicyMergeOperation) (*pb.PolicyMergeOp
 		rule := NetworkPolicyRuleToProto(&op.AddRule.Rule)
 		pmo.Operation = &pb.PolicyMergeOperation_AddRule{
 			AddRule: &pb.AddNetworkRule{
-				RuleName: op.AddRule.RuleName,
-				Rule:     rule,
+				Name: op.AddRule.Name,
+				Rule: rule,
 			},
 		}
 	case op.RemoveEndpoint != nil:
 		pmo.Operation = &pb.PolicyMergeOperation_RemoveEndpoint{
 			RemoveEndpoint: &pb.RemoveNetworkEndpoint{
-				RuleName: op.RemoveEndpoint.RuleName,
-				Host:     op.RemoveEndpoint.Host,
-				Port:     op.RemoveEndpoint.Port,
+				Rule: op.RemoveEndpoint.Rule,
+				Host: op.RemoveEndpoint.Host,
+				Port: op.RemoveEndpoint.Port,
 			},
 		}
 	case op.RemoveRule != nil:
 		pmo.Operation = &pb.PolicyMergeOperation_RemoveRule{
 			RemoveRule: &pb.RemoveNetworkRule{
-				RuleName: op.RemoveRule.RuleName,
+				Name: op.RemoveRule.Name,
 			},
 		}
 	case op.AddDenyRules != nil:
@@ -282,7 +282,7 @@ func PolicyMergeOperationToProto(op *v1.PolicyMergeOperation) (*pb.PolicyMergeOp
 	case op.RemoveBinary != nil:
 		pmo.Operation = &pb.PolicyMergeOperation_RemoveBinary{
 			RemoveBinary: &pb.RemoveNetworkBinary{
-				RuleName:   op.RemoveBinary.RuleName,
+				Rule:       op.RemoveBinary.Rule,
 				BinaryPath: op.RemoveBinary.BinaryPath,
 			},
 		}
@@ -297,7 +297,7 @@ func l7RuleTargetToProto(target *v1.L7RuleTarget) *pb.L7RuleTarget {
 		return nil
 	}
 	result := &pb.L7RuleTarget{
-		RuleName:  target.RuleName,
+		Rule:      target.Rule,
 		Host:      target.Host,
 		Ports:     slices.Clone(target.Ports),
 		AnyBinary: target.AnyBinary,

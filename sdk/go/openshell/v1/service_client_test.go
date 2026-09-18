@@ -53,19 +53,19 @@ func (s *mockServiceServer) ExposeService(_ context.Context, req *pb.ExposeServi
 	resp := &pb.ServiceEndpointResponse{
 		Endpoint: &pb.ServiceEndpoint{
 			Metadata: &dm.ObjectMeta{
-				Id: "ep-" + req.GetService(),
+				Id: "ep-" + req.GetName(),
 			},
-			Sandbox:     req.GetSandbox(),
-			ServiceName: req.GetService(),
-			TargetPort:  req.GetTargetPort(),
-			Domain:      req.GetDomain(),
+			Sandbox:    req.GetSandbox(),
+			Name:       req.GetName(),
+			TargetPort: req.GetTargetPort(),
+			Domain:     req.GetDomain(),
 		},
 	}
 	if req.GetDomain() {
-		resp.Url = "https://" + req.GetService() + ".example.com"
+		resp.Url = "https://" + req.GetName() + ".example.com"
 	}
 
-	s.endpoints[serviceKey(req.GetSandbox(), req.GetService())] = resp
+	s.endpoints[serviceKey(req.GetSandbox(), req.GetName())] = resp
 	return resp, nil
 }
 
@@ -77,9 +77,9 @@ func (s *mockServiceServer) GetService(_ context.Context, req *pb.GetServiceRequ
 	}
 
 	sandboxName := req.GetSandbox()
-	ep, ok := s.endpoints[serviceKey(sandboxName, req.GetService())]
+	ep, ok := s.endpoints[serviceKey(sandboxName, req.GetName())]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "service %q not found in sandbox %q", req.GetService(), sandboxName)
+		return nil, status.Errorf(codes.NotFound, "service %q not found in sandbox %q", req.GetName(), sandboxName)
 	}
 	return ep, nil
 }
@@ -111,10 +111,10 @@ func (s *mockServiceServer) DeleteService(_ context.Context, req *pb.DeleteServi
 	}
 
 	sandboxName := req.GetSandbox()
-	key := serviceKey(sandboxName, req.GetService())
+	key := serviceKey(sandboxName, req.GetName())
 	_, ok := s.endpoints[key]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "service %q not found in sandbox %q", req.GetService(), sandboxName)
+		return nil, status.Errorf(codes.NotFound, "service %q not found in sandbox %q", req.GetName(), sandboxName)
 	}
 	delete(s.endpoints, key)
 	return &pb.DeleteServiceResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED}, nil
@@ -156,7 +156,7 @@ func TestServiceExpose(t *testing.T) {
 	require.NotNil(t, ep)
 	assert.Equal(t, "ep-api", ep.ID)
 	assert.Equal(t, "web-app", ep.Sandbox)
-	assert.Equal(t, "api", ep.ServiceName)
+	assert.Equal(t, "api", ep.Name)
 	assert.Equal(t, uint32(8080), ep.TargetPort)
 	assert.True(t, ep.Domain)
 	assert.Equal(t, "https://api.example.com", ep.URL)
@@ -201,7 +201,7 @@ func TestServiceGet(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, ep)
-	assert.Equal(t, "api", ep.ServiceName)
+	assert.Equal(t, "api", ep.Name)
 	assert.Equal(t, "web-app", ep.Sandbox)
 }
 

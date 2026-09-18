@@ -359,7 +359,7 @@ mod tests {
             event: Some(web_socket_session_event::Event::Preflight(
                 WebSocketPreflight {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                    middleware_name: "operator-assigned-name".into(),
+                    middleware: "operator-assigned-name".into(),
                     config: Some(prost_types::Struct::default()),
                     ..Default::default()
                 },

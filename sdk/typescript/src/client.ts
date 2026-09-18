@@ -159,7 +159,7 @@ export interface SandboxFromTemplateSpec {
   name?: string;
   /** Workspace name. Omit for `default`; empty strings are invalid. */
   workspace?: string;
-  templateName: string;
+  workloadTemplate: string;
   labels?: Record<string, string>;
   providers?: string[];
   /** Exact canonical command. Empty selects the gateway scratch shell. */
@@ -558,7 +558,11 @@ function listWorkspaceScope(options?: WorkspaceListScope | null): MessageInitSha
 }
 
 function sandboxTarget(name: string, options?: SandboxWorkspaceOptions | null) {
-  return { sandbox: name, workspace: workspaceName(options) };
+  return { sandbox: name, workspaceScope: workspaceScope(options) };
+}
+
+function namedTarget(name: string, options?: SandboxWorkspaceOptions | null) {
+  return { name, workspaceScope: workspaceScope(options) };
 }
 
 function requestCallOptions(options?: SandboxCallOptions | null): CallOptions | undefined {
@@ -759,8 +763,8 @@ export class SandboxTemplateClient {
   ): Promise<SandboxWorkloadTemplate> {
     try {
       const resp = await this.grpc.createSandboxTemplate({
+        workspaceScope: workspaceScope(options),
         template,
-        workspace: workspaceName(options),
       });
       return sandboxTemplate(resp.template);
     } catch (e) {
@@ -772,8 +776,8 @@ export class SandboxTemplateClient {
     if (name.trim() === '') throw new SdkError('invalid_config', 'template name is required');
     try {
       const resp = await this.grpc.getSandboxTemplate({
+        workspaceScope: workspaceScope(options),
         name,
-        workspace: workspaceName(options),
       });
       return sandboxTemplate(resp.template);
     } catch (e) {
@@ -806,9 +810,9 @@ export class SandboxTemplateClient {
     if (name.trim() === '') throw new SdkError('invalid_config', 'template name is required');
     try {
       const resp = await this.grpc.deleteSandboxTemplate({
+        workspaceScope: workspaceScope(options),
         allowMissing: options?.allowMissing ?? false,
         name,
-        workspace: workspaceName(options),
       });
       return deletionResult(resp);
     } catch (e) {
@@ -869,9 +873,9 @@ export class SandboxClient {
       if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
 
       const resp = await this.grpc.createSandbox({
+        workspaceScope: workspaceScope(spec),
         name: spec.name ?? '',
         labels: spec.labels ?? {},
-        workspace: workspaceName(spec),
         spec: specInit,
       });
       return sandboxRef(resp.sandbox);
@@ -881,19 +885,19 @@ export class SandboxClient {
   }
 
   async createFromTemplate(spec: SandboxFromTemplateSpec): Promise<SandboxRef> {
-    if (spec.templateName.trim() === '') throw new SdkError('invalid_config', 'templateName is required');
+    if (spec.workloadTemplate.trim() === '') throw new SdkError('invalid_config', 'workloadTemplate is required');
     try {
       const resp = await this.grpc.createSandbox({
+        workspaceScope: workspaceScope(spec),
         name: spec.name ?? '',
         labels: spec.labels ?? {},
-        workspace: workspaceName(spec),
         spec: {
           providers: spec.providers ?? [],
           command: spec.command ?? [],
           tty: spec.tty ?? false,
           policy: spec.policy,
         },
-        workloadTemplateName: spec.templateName,
+        workloadTemplate: spec.workloadTemplate,
       });
       return sandboxRef(resp.sandbox);
     } catch (e) {
@@ -903,7 +907,7 @@ export class SandboxClient {
 
   async get(name: string, options?: SandboxCallOptions | null): Promise<SandboxRef> {
     try {
-      const resp = await this.grpc.getSandbox({ ...sandboxTarget(name, options) }, requestCallOptions(options));
+      const resp = await this.grpc.getSandbox({ ...namedTarget(name, options) }, requestCallOptions(options));
       return sandboxRef(resp.sandbox);
     } catch (e) {
       throw fromConnect(e);
@@ -937,7 +941,7 @@ export class SandboxClient {
   async delete(name: string, options?: DeleteOptions | null): Promise<DeletionResult> {
     try {
       const resp = await this.grpc.deleteSandbox({
-        ...sandboxTarget(name, options),
+        ...namedTarget(name, options),
         allowMissing: options?.allowMissing ?? false,
       });
       return deletionResult(resp);
@@ -1433,7 +1437,7 @@ export class SandboxClient {
     try {
       const resp = await this.grpc.attachSandboxProvider({
         ...sandboxTarget(name, options),
-        providerName: provider,
+        provider,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
       });
       return { sandbox: sandboxRef(resp.sandbox), changed: resp.attached };
@@ -1450,7 +1454,7 @@ export class SandboxClient {
     try {
       const resp = await this.grpc.detachSandboxProvider({
         ...sandboxTarget(name, options),
-        providerName: provider,
+        provider,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
       });
       return { sandbox: sandboxRef(resp.sandbox), changed: resp.detached };
@@ -1473,7 +1477,7 @@ export class SandboxClient {
   async getConfig(name: string, options?: SandboxCallOptions | null): Promise<SandboxConfig> {
     try {
       await this.get(name, options);
-      const resp = await this.grpc.getSandboxConfig({ ...sandboxTarget(name, options) }, requestCallOptions(options));
+      const resp = await this.grpc.getSandboxConfig({ ...namedTarget(name, options) }, requestCallOptions(options));
       return sandboxConfig(resp);
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);

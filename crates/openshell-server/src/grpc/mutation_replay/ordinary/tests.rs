@@ -45,8 +45,10 @@ pub(in crate::grpc::mutation_replay) async fn exercise_protected_backend(url: &s
     configure_key(&mut first, &directory);
     configure_key(&mut second, &directory);
     let req = DeleteSandboxRequest {
-        sandbox: "keyed-restart".into(),
-        workspace: "default".to_string(),
+        name: "keyed-restart".into(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         allow_missing: true,
         request_id: id(),
     };
@@ -72,7 +74,7 @@ pub(in crate::grpc::mutation_replay) async fn exercise_protected_backend(url: &s
     let mut restarted = state_for(Store::connect(url).await.unwrap()).await;
     configure_key(&mut restarted, &directory);
     let replacement = Sandbox {
-        metadata: Some(meta(&req.sandbox)),
+        metadata: Some(meta(&req.name)),
         ..Default::default()
     };
     restarted.store.put_message(&replacement).await.unwrap();
@@ -96,7 +98,9 @@ async fn ordinary_replay_reauthorizes_workspace_role() {
     Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".into();
     let req = DeleteProviderRequest {
         name: "missing".into(),
-        workspace: "default".to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         allow_missing: true,
         request_id: id(),
     };
@@ -115,7 +119,9 @@ async fn ordinary_replay_reauthorizes_workspace_role() {
     let principal = principal.clone();
     assert!(
         CreateSandboxRequest {
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string()
+            )),
             ..Default::default()
         }
         .authorize(&state, &principal)
@@ -129,10 +135,10 @@ async fn ordinary_replay_reauthorizes_workspace_role() {
     for global in [false, true] {
         let req = UpdateConfigRequest {
             global,
-            workspace: if global {
-                String::new()
+            workspace_scope: if global {
+                None
             } else {
-                "default".to_string()
+                Some(openshell_core::proto::workspace_selector("default"))
             },
             ..Default::default()
         };
@@ -213,8 +219,8 @@ async fn durable_sandbox_mutations_hide_unauthorized_workspaces() {
         let status = run(
             &state,
             non_member_request(DeleteSandboxRequest {
-                sandbox: "hidden".into(),
-                workspace: "default".into(),
+                name: "hidden".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 allow_missing: false,
                 request_id,
             }),
@@ -239,7 +245,9 @@ fn create_sandbox(name: &str) -> CreateSandboxRequest {
     CreateSandboxRequest {
         name: name.into(),
         request_id: id(),
-        workspace: "default".to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         spec: Some(SandboxSpec {
             environment: HashMap::from([("PRIVATE_VALUE".into(), "low-entropy-secret".into())]),
             ..Default::default()
@@ -318,8 +326,10 @@ async fn sandbox_replay_survives_status_churn_but_never_selects_replacement() {
 async fn keyed_fingerprints_fail_closed_on_missing_or_rotated_keys() {
     let missing = test_server_state().await;
     let req = DeleteSandboxRequest {
-        sandbox: "missing".into(),
-        workspace: "default".to_string(),
+        name: "missing".into(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         allow_missing: true,
         request_id: id(),
     };
@@ -365,13 +375,15 @@ async fn keyed_fingerprints_fail_closed_on_missing_or_rotated_keys() {
 async fn original_payload_is_identity_and_current_transformation_is_a_replay_guard() {
     let (_directory, state) = protected_state().await;
     let original = DeleteSandboxRequest {
-        sandbox: "original".into(),
-        workspace: "default".to_string(),
+        name: "original".into(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         allow_missing: true,
         request_id: id(),
     };
     let mut effective = original.clone();
-    effective.sandbox = "transformed".into();
+    effective.name = "transformed".into();
     let intercepted = |original: &DeleteSandboxRequest, effective: DeleteSandboxRequest| {
         let mut request = authed_request(effective);
         request
@@ -390,7 +402,7 @@ async fn original_payload_is_identity_and_current_transformation_is_a_replay_gua
             .contains_key("openshell-replayed")
     );
     let mut changed = original.clone();
-    changed.sandbox = "different-original".into();
+    changed.name = "different-original".into();
     assert_eq!(
         reason(
             &run(&state, intercepted(&changed, effective.clone()))
@@ -399,7 +411,7 @@ async fn original_payload_is_identity_and_current_transformation_is_a_replay_gua
         ),
         "REQUEST_ID_PAYLOAD_MISMATCH"
     );
-    effective.sandbox = "changed-transformation".into();
+    effective.name = "changed-transformation".into();
     assert_eq!(
         reason(
             &run(&state, intercepted(&original, effective))
@@ -450,9 +462,11 @@ async fn service_deletion_replays_without_parent_and_does_not_delete_replacement
     state.store.put_message(&sandbox).await.unwrap();
     let expose = ExposeServiceRequest {
         sandbox: "service-parent".into(),
-        service: "web".into(),
+        name: "web".into(),
         target_port: 8080,
-        workspace: "default".to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         request_id: id(),
         ..Default::default()
     };
@@ -463,8 +477,10 @@ async fn service_deletion_replays_without_parent_and_does_not_delete_replacement
     assert_eq!(replay(&state, expose.clone()).await, endpoint);
     let delete = DeleteServiceRequest {
         sandbox: "service-parent".into(),
-        service: "web".into(),
-        workspace: "default".to_string(),
+        name: "web".into(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         request_id: id(),
         ..Default::default()
     };
@@ -508,7 +524,7 @@ async fn provider_replay_preserves_receipts_after_attachment_changes() {
                 credentials: HashMap::from([("OPENAI_API_KEY".into(), "private-value".into())]),
                 ..Default::default()
             }),
-            workspace: "default".into(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             request_id: id(),
         }),
     )
@@ -523,8 +539,8 @@ async fn provider_replay_preserves_receipts_after_attachment_changes() {
     state.store.put_message(&sandbox).await.unwrap();
     let attach = AttachSandboxProviderRequest {
         sandbox: "receipt-sandbox".into(),
-        provider_name: "receipt-provider".into(),
-        workspace: "default".into(),
+        provider: "receipt-provider".into(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         request_id: id(),
         ..Default::default()
     };
@@ -540,7 +556,7 @@ async fn provider_replay_preserves_receipts_after_attachment_changes() {
     provider.credentials = HashMap::from([("OPENAI_API_KEY".into(), "replacement-value".into())]);
     let update = UpdateProviderRequest {
         provider: Some(provider),
-        workspace: "default".into(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         request_id: id(),
         ..Default::default()
     };
@@ -554,8 +570,8 @@ async fn provider_replay_preserves_receipts_after_attachment_changes() {
 
     let detach = DetachSandboxProviderRequest {
         sandbox: "receipt-sandbox".into(),
-        provider_name: "receipt-provider".into(),
-        workspace: "default".into(),
+        provider: "receipt-provider".into(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         request_id: id(),
         ..Default::default()
     };
@@ -621,7 +637,9 @@ async fn provider_replay_is_redacted_and_update_does_not_recheck_stale_version()
             credentials: HashMap::from([("OPENAI_API_KEY".into(), "provider-secret".into())]),
             ..Default::default()
         }),
-        workspace: "default".to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         request_id: id(),
     };
     let first = run(&state, authed_request(create.clone()))
@@ -633,7 +651,9 @@ async fn provider_replay_is_redacted_and_update_does_not_recheck_stale_version()
     provider.credentials = HashMap::from([("OPENAI_API_KEY".into(), "updated-secret".into())]);
     let update = UpdateProviderRequest {
         provider: Some(provider),
-        workspace: "default".to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         request_id: id(),
         ..Default::default()
     };
@@ -676,7 +696,7 @@ async fn profile_receipts_use_private_identity_and_preserve_diagnostics() {
             profile: Some(profile),
             source: "test.yaml".into(),
         }],
-        workspace: "default".into(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         request_id: id(),
     };
     let first = run(&state, authed_request(create.clone()))
@@ -693,7 +713,7 @@ async fn profile_receipts_use_private_identity_and_preserve_diagnostics() {
             profile: Some(profile),
             source: "update.yaml".into(),
         }),
-        workspace: "default".into(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         request_id: id(),
         ..Default::default()
     };
@@ -740,10 +760,10 @@ async fn config_and_clear_receipts_preserve_revision_and_parent_lifetime() {
             setting_value: Some(SettingValue {
                 value: Some(setting_value::Value::BoolValue(true)),
             }),
-            workspace: if global {
-                String::new()
+            workspace_scope: if global {
+                None
             } else {
-                "default".to_string()
+                Some(openshell_core::proto::workspace_selector("default"))
             },
             request_id: id(),
             ..Default::default()
@@ -756,7 +776,9 @@ async fn config_and_clear_receipts_preserve_revision_and_parent_lifetime() {
     }
     let clear = ClearDraftChunksRequest {
         sandbox: "policy-parent".into(),
-        workspace: "default".to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         request_id: id(),
     };
     let first = run(&state, authed_request(clear.clone()))
@@ -897,7 +919,7 @@ async fn configure_and_rotate_capture_actual_grant_without_repeating_token_excha
     let imported = run(
         &state,
         authed_request(ImportProviderProfilesRequest {
-            workspace: "default".into(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             profiles: vec![ProviderProfileImportItem {
                 profile: Some(profile),
                 source: "refresh.yaml".into(),
@@ -912,7 +934,9 @@ async fn configure_and_rotate_capture_actual_grant_without_repeating_token_excha
     run(
         &state,
         authed_request(CreateProviderRequest {
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             provider: Some(Provider {
                 metadata: Some(meta("refresh-provider")),
                 r#type: "refresh-profile".into(),
@@ -929,7 +953,9 @@ async fn configure_and_rotate_capture_actual_grant_without_repeating_token_excha
         provider: "refresh-provider".into(),
         credential_key: "ACCESS_TOKEN".into(),
         strategy: strategy.into(),
-        workspace: "default".to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         request_id: id(),
         material: HashMap::from([
             ("client_id".into(), "client".into()),
@@ -945,7 +971,9 @@ async fn configure_and_rotate_capture_actual_grant_without_repeating_token_excha
     let rotate = RotateProviderCredentialRequest {
         provider: "refresh-provider".into(),
         credential_key: "ACCESS_TOKEN".into(),
-        workspace: "default".to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         request_id: id(),
     };
     let rotated = run(&state, authed_request(rotate.clone()))
@@ -995,12 +1023,13 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
     let submitted = policy::handle_submit_policy_analysis(
         &state,
         authed_request(SubmitPolicyAnalysisRequest {
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             name: name.into(),
             analysis_mode: "agent_authored".into(),
             proposed_chunks: ["alpha", "beta", "gamma"]
                 .into_iter()
                 .map(|name| PolicyChunk {
-                    rule_name: name.into(),
+                    rule: name.into(),
                     proposed_rule: Some(rule(name)),
                     ..Default::default()
                 })
@@ -1021,7 +1050,9 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
         sandbox: name.into(),
         chunk_id: submitted.accepted_chunk_ids[0].clone(),
         proposed_rule: Some(rule("edited")),
-        workspace: "default".to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         request_id: id(),
     };
     run(&state, authed_request(edit.clone())).await.unwrap();
@@ -1029,7 +1060,9 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
         &state,
         authed_request(GetDraftPolicyRequest {
             sandbox: name.into(),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             ..Default::default()
         }),
     )
@@ -1049,7 +1082,9 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
         sandbox: name.into(),
         chunk_id: edit.chunk_id.clone(),
         review_token: token(&edit.chunk_id),
-        workspace: "default".to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         request_id: id(),
     };
     let approved = run(&state, authed_request(approve.clone()))
@@ -1061,7 +1096,9 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
     let undo = UndoDraftChunkRequest {
         sandbox: name.into(),
         chunk_id: approve.chunk_id.clone(),
-        workspace: "default".to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         request_id: id(),
     };
     let undone = run(&state, authed_request(undo.clone()))
@@ -1074,7 +1111,9 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
         sandbox: name.into(),
         chunk_id: submitted.accepted_chunk_ids[1].clone(),
         reason: "not needed".into(),
-        workspace: "default".to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         request_id: id(),
     };
     run(&state, authed_request(reject.clone())).await.unwrap();
@@ -1083,7 +1122,9 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
         &state,
         authed_request(GetDraftPolicyRequest {
             sandbox: name.into(),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             ..Default::default()
         }),
     )
@@ -1101,7 +1142,9 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
             chunk_id: chunk.id.clone(),
             review_token: chunk.review_token.clone(),
         }],
-        workspace: "default".to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        )),
         request_id: id(),
         ..Default::default()
     };

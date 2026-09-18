@@ -11,6 +11,13 @@ func namedWorkspaceScope(workspace string) *dm.WorkspaceSelector {
 	}
 }
 
+func profileWorkspaceScope(workspace string) *dm.WorkspaceSelector {
+	if workspace == "" {
+		return nil
+	}
+	return namedWorkspaceScope(workspace)
+}
+
 func allWorkspacesScope() *dm.WorkspaceSelector {
 	return &dm.WorkspaceSelector{
 		Selection: &dm.WorkspaceSelector_AllWorkspaces{AllWorkspaces: &dm.AllWorkspaces{}},

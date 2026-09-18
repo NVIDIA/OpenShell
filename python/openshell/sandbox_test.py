@@ -46,8 +46,6 @@ from openshell.sandbox import (
 
 
 def _request_workspace(request: Any) -> str | None:
-    if hasattr(request, "workspace"):
-        return cast("str", request.workspace) or None
     scope = request.workspace_scope
     if scope.WhichOneof("selection") == "workspace":
         return cast("str", scope.workspace)
@@ -59,6 +57,9 @@ def _request_selects_all_workspaces(request: Any) -> bool:
 
 
 def _request_sandbox(request: Any) -> str:
+    name = getattr(request, "name", "")
+    if name:
+        return cast("str", name)
     return cast("str", request.sandbox)
 
 
@@ -2164,14 +2165,14 @@ class _RecordingHighLevelClient:
         self,
         *,
         workspace: str,
-        template_name: str,
+        workload_template: str,
         spec: Any = None,
         name: str | None = None,
         labels: Any = None,
     ) -> Any:
         self.create_template_kwargs = {
             "workspace": workspace,
-            "template_name": template_name,
+            "workload_template": workload_template,
             "spec": spec,
             "name": name,
             "labels": labels,
@@ -2204,7 +2205,7 @@ def test_create_forwards_name_and_labels() -> None:
     assert dict(ref.labels) == {"aiq": "deep-research"}
 
 
-def test_create_from_template_forwards_workload_template_name() -> None:
+def test_create_from_template_forwards_workload_template() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
     spec = openshell_pb2.SandboxSpec(
@@ -2215,7 +2216,7 @@ def test_create_from_template_forwards_workload_template_name() -> None:
 
     ref = client.create_from_template(
         workspace="default",
-        template_name="gpu-kata",
+        workload_template="gpu-kata",
         spec=spec,
         name="job-1",
         labels={"team": "runtime"},
@@ -2223,7 +2224,7 @@ def test_create_from_template_forwards_workload_template_name() -> None:
 
     assert stub.create_request is not None
     assert stub.create_request.name == "job-1"
-    assert stub.create_request.workload_template_name == "gpu-kata"
+    assert stub.create_request.workload_template == "gpu-kata"
     assert dict(stub.create_request.labels) == {"team": "runtime"}
     assert list(stub.create_request.spec.providers) == ["github"]
     assert list(stub.create_request.spec.command) == ["/opt/worker", "--serve"]
@@ -2231,12 +2232,12 @@ def test_create_from_template_forwards_workload_template_name() -> None:
     assert dict(ref.labels) == {"team": "runtime"}
 
 
-def test_create_from_template_rejects_empty_template_name() -> None:
+def test_create_from_template_rejects_empty_workload_template() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
     with pytest.raises(SandboxError):
-        client.create_from_template(workspace="default", template_name=" ")
+        client.create_from_template(workspace="default", workload_template=" ")
 
     assert stub.create_request is None
 
@@ -2747,7 +2748,7 @@ def test_high_level_creation_forwards_name_and_labels(
     }
 
 
-def test_high_level_template_creation_forwards_template_name(
+def test_high_level_template_creation_forwards_workload_template(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     recording = _RecordingHighLevelClient()
@@ -2764,7 +2765,7 @@ def test_high_level_template_creation_forwards_template_name(
     )
     sandbox = Sandbox(
         workspace="staging",
-        template_name="gpu-kata",
+        workload_template="gpu-kata",
         spec=spec,
         name="job-1",
         labels={"team": "runtime"},
@@ -2774,7 +2775,7 @@ def test_high_level_template_creation_forwards_template_name(
 
     assert recording.create_template_kwargs == {
         "workspace": "staging",
-        "template_name": "gpu-kata",
+        "workload_template": "gpu-kata",
         "spec": spec,
         "name": "job-1",
         "labels": {"team": "runtime"},
@@ -2805,9 +2806,9 @@ def test_high_level_attach_rejects_labels() -> None:
         sandbox.__enter__()
 
 
-def test_high_level_attach_rejects_template_name() -> None:
+def test_high_level_attach_rejects_workload_template() -> None:
     sandbox = Sandbox(
-        workspace="default", sandbox="existing-sandbox", template_name="gpu-kata"
+        workspace="default", sandbox="existing-sandbox", workload_template="gpu-kata"
     )
 
     with pytest.raises(SandboxError):

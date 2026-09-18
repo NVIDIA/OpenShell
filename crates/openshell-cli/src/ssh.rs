@@ -92,8 +92,10 @@ async fn ssh_session_config(
     // Resolve the sandbox and retain its ID for local lifecycle tracking.
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
-            sandbox: name.to_string(),
-            workspace: (workspace).to_string(),
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                (workspace).to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -107,7 +109,9 @@ async fn ssh_session_config(
         match client
             .create_ssh_session(CreateSshSessionRequest {
                 sandbox: name.to_string(),
-                workspace: (workspace).to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (workspace).to_string(),
+                )),
             })
             .await
         {

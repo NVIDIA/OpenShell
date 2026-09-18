@@ -14,7 +14,7 @@ import (
 )
 
 func newTestSandboxTemplateClient() *fakeSandboxTemplateClient {
-	store := newobjectStore(sandboxWorkloadTemplateName, copySandboxWorkloadTemplate)
+	store := newobjectStore(sandboxWorkloadTemplate, copySandboxWorkloadTemplate)
 	return newFakeSandboxTemplateClient(store, func() bool { return false })
 }
 
@@ -459,7 +459,7 @@ func TestSandboxTemplate_CreateRejectsInvalidTemplate(t *testing.T) {
 }
 
 func TestSandboxTemplate_ClosedReturnsUnavailable(t *testing.T) {
-	store := newobjectStore(sandboxWorkloadTemplateName, copySandboxWorkloadTemplate)
+	store := newobjectStore(sandboxWorkloadTemplate, copySandboxWorkloadTemplate)
 	tc := newFakeSandboxTemplateClient(store, func() bool { return true })
 	ctx := context.Background()
 

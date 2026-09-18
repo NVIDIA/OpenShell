@@ -76,7 +76,7 @@ func RefreshStatusFromProto(s *pb.ProviderCredentialRefreshStatus) *types.Refres
 		return nil
 	}
 	return &types.RefreshStatus{
-		ProviderName:         s.GetProviderName(),
+		Provider:             s.GetProvider(),
 		ProviderID:           s.GetProviderId(),
 		CredentialKey:        s.GetCredentialKey(),
 		Strategy:             RefreshStrategyFromProto(s.GetStrategy()),

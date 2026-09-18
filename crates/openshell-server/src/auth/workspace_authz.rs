@@ -97,7 +97,7 @@ pub fn selected_workspace_name(selector: Option<&WorkspaceSelector>) -> Result<&
     match selected_workspace(selector)? {
         WorkspaceSelection::Workspace(workspace) => Ok(workspace),
         WorkspaceSelection::AllWorkspaces(_) => Err(openshell_core::rpc_error::invalid_argument(
-            "workspace_scope",
+            "workspace",
             "all_workspaces is not supported by this request",
         )),
     }
@@ -108,10 +108,7 @@ fn selected_workspace(selector: Option<&WorkspaceSelector>) -> Result<&Workspace
     let selection = selector
         .and_then(|selector| selector.selection.as_ref())
         .ok_or_else(|| {
-            openshell_core::rpc_error::invalid_argument(
-                "workspace_scope",
-                "workspace_scope is required",
-            )
+            openshell_core::rpc_error::invalid_argument("workspace", "workspace is required")
         })?;
 
     if let WorkspaceSelection::Workspace(workspace) = selection {
@@ -478,11 +475,11 @@ mod tests {
     fn missing_and_unset_selectors_are_rejected() {
         let missing = selected_workspace_name(None).unwrap_err();
         assert_eq!(missing.code(), tonic::Code::InvalidArgument);
-        assert_eq!(missing.message(), "workspace_scope is required");
+        assert_eq!(missing.message(), "workspace is required");
 
         let unset = selected_workspace_name(Some(&WorkspaceSelector::default())).unwrap_err();
         assert_eq!(unset.code(), tonic::Code::InvalidArgument);
-        assert_eq!(unset.message(), "workspace_scope is required");
+        assert_eq!(unset.message(), "workspace is required");
     }
 
     #[test]

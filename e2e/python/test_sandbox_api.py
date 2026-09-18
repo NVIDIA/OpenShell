@@ -40,7 +40,7 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
         sandbox_client.wait_ready(name, workspace="default", timeout_seconds=300)
         assert replay(stub.CreateSandbox, create).sandbox.metadata.id == original
         stop = openshell_pb2.StopSandboxRequest(
-            sandbox=name,
+            name=name,
             workspace=scope,
             request_id=str(uuid.uuid4()),
         )
@@ -48,7 +48,7 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
         sandbox_client.wait_stopped(name, workspace="default", timeout_seconds=120)
         assert replay(stub.StopSandbox, stop).sandbox.metadata.id == original
         start = openshell_pb2.StartSandboxRequest(
-            sandbox=name,
+            name=name,
             workspace=scope,
             request_id=str(uuid.uuid4()),
         )
@@ -65,7 +65,7 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
         updated = stub.UpdateConfig(update, timeout=30)
         assert replay(stub.UpdateConfig, update) == updated
         delete = openshell_pb2.DeleteSandboxRequest(
-            sandbox=name,
+            name=name,
             workspace=scope,
             request_id=str(uuid.uuid4()),
         )

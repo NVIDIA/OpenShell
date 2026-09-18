@@ -1012,7 +1012,7 @@ impl DockerComputeDriver {
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
-            driver_name: "docker".to_string(),
+            name: "docker".to_string(),
             driver_version: self.config.daemon_version.clone(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
@@ -3120,10 +3120,10 @@ impl ComputeDriver for DockerComputeDriver {
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
         let request = request.into_inner();
-        require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
+        require_sandbox_identifier(&request.sandbox_id, &request.name)?;
 
         let sandbox = self
-            .get_sandbox_snapshot(&request.sandbox_id, &request.sandbox_name)
+            .get_sandbox_snapshot(&request.sandbox_id, &request.name)
             .await?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
@@ -3177,7 +3177,7 @@ impl ComputeDriver for DockerComputeDriver {
             otel.name = "docker.stop_sandbox",
             otel.status_code = tracing::field::Empty,
             sandbox.id = %request.get_ref().sandbox_id,
-            sandbox.name = %request.get_ref().sandbox_name,
+            sandbox.name = %request.get_ref().name,
         )
     )]
     async fn stop_sandbox(
@@ -3186,24 +3186,24 @@ impl ComputeDriver for DockerComputeDriver {
     ) -> Result<Response<StopSandboxResponse>, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let request = request.into_inner();
-        require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
+        require_sandbox_identifier(&request.sandbox_id, &request.name)?;
 
         self.lifecycle_event_fences
-            .request_stop(&request.sandbox_id, &request.sandbox_name);
+            .request_stop(&request.sandbox_id, &request.name);
         if let Err(error) = self
-            .stop_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
+            .stop_sandbox_inner(&request.sandbox_id, &request.name)
             .await
         {
             self.lifecycle_event_fences
-                .clear_stop(&request.sandbox_id, &request.sandbox_name);
+                .clear_stop(&request.sandbox_id, &request.name);
             return Err(error);
         }
         if let Err(error) = self
-            .publish_container_snapshot(&request.sandbox_id, &request.sandbox_name)
+            .publish_container_snapshot(&request.sandbox_id, &request.name)
             .await
         {
             self.lifecycle_event_fences
-                .clear_stop(&request.sandbox_id, &request.sandbox_name);
+                .clear_stop(&request.sandbox_id, &request.name);
             return Err(error);
         }
         span_status.finish(Ok(Response::new(StopSandboxResponse {})))
@@ -3217,7 +3217,7 @@ impl ComputeDriver for DockerComputeDriver {
         if !Box::pin(Self::start_sandbox(
             self,
             &request.sandbox_id,
-            &request.sandbox_name,
+            &request.name,
             &request.generation_id,
             &request.launch_authentication,
         ))
@@ -3225,7 +3225,7 @@ impl ComputeDriver for DockerComputeDriver {
         {
             return Err(Status::not_found("sandbox not found"));
         }
-        self.publish_container_snapshot(&request.sandbox_id, &request.sandbox_name)
+        self.publish_container_snapshot(&request.sandbox_id, &request.name)
             .await?;
         Ok(Response::new(StartSandboxResponse {}))
     }
@@ -3237,7 +3237,7 @@ impl ComputeDriver for DockerComputeDriver {
             otel.name = "docker.delete_sandbox",
             otel.status_code = tracing::field::Empty,
             sandbox.id = %request.get_ref().sandbox_id,
-            sandbox.name = %request.get_ref().sandbox_name,
+            sandbox.name = %request.get_ref().name,
         )
     )]
     async fn delete_sandbox(
@@ -3246,14 +3246,14 @@ impl ComputeDriver for DockerComputeDriver {
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let request = request.into_inner();
-        require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
+        require_sandbox_identifier(&request.sandbox_id, &request.name)?;
 
         let event_sandbox_id = request.sandbox_id.clone();
         let deleted = self
-            .delete_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
+            .delete_sandbox_inner(&request.sandbox_id, &request.name)
             .await?;
         self.lifecycle_event_fences
-            .remove(&event_sandbox_id, &request.sandbox_name);
+            .remove(&event_sandbox_id, &request.name);
         if deleted && !event_sandbox_id.is_empty() {
             let _ = self.events.send(WatchSandboxesEvent {
                 payload: Some(watch_sandboxes_event::Payload::Deleted(
@@ -3361,7 +3361,7 @@ fn pending_sandbox_snapshot(
         namespace: namespace.to_string(),
         spec: None,
         status: Some(DriverSandboxStatus {
-            sandbox_name: sandbox.name.clone(),
+            name: sandbox.name.clone(),
             instance_id: String::new(),
             agent_fd: String::new(),
             sandbox_fd: String::new(),
@@ -6134,7 +6134,7 @@ fn driver_status_from_summary(
     let (ready, reason, message, deleting) = container_ready_condition(state);
 
     DriverSandboxStatus {
-        sandbox_name: summary_container_name(summary).unwrap_or_else(|| sandbox_name.to_string()),
+        name: summary_container_name(summary).unwrap_or_else(|| sandbox_name.to_string()),
         instance_id: summary.id.clone().unwrap_or_default(),
         agent_fd: String::new(),
         sandbox_fd: String::new(),

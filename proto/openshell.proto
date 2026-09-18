@@ -806,7 +806,7 @@ message IssueSandboxTokenResponse {
 message RefreshSandboxTokenRequest {
   // Operator registration names for extension services selected by the
   // sandbox's effective policy.
-  repeated string extension_service_names = 1;
+  repeated string extension_services = 1;
 }
 
 // RefreshSandboxToken response. The new token replaces the supervisor's
@@ -893,7 +893,7 @@ message ComputeDriverInfo {
 // Public compute driver capability snapshot.
 message ComputeDriverCapabilities {
   // Driver-reported human-readable name from the startup capability snapshot.
-  string driver_name = 1;
+  string name = 1;
 
   // Driver-reported implementation version from the startup capability snapshot.
   string driver_version = 2;
@@ -1005,7 +1005,7 @@ message SandboxTemplate {
   // Fully-qualified OCI image reference used to boot the sandbox.
   string image = 1;
   // Optional runtime class name requested from the compute platform.
-  string runtime_class_name = 2;
+  string runtime_class = 2;
   // Optional agent socket path exposed to the workload.
   string agent_socket = 3;
   // Labels applied to compute-platform resources for this sandbox.
@@ -1176,6 +1176,8 @@ message PlatformEvent {
 
 // Create sandbox request.
 message CreateSandboxRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 7;
   SandboxSpec spec = 1;
   // Optional user-supplied sandbox name. When empty the server generates one.
   string name = 2;
@@ -1188,30 +1190,30 @@ message CreateSandboxRequest {
   // alive until that attachment connects and closes naturally.
   bool await_main_process_attachment = 5;
   // Workspace-scoped SandboxWorkloadTemplate name to resolve at creation time.
-  string workload_template_name = 6;
-  // Explicit workspace for the sandbox. The all-workspaces selection is invalid.
-  string workspace = 7;
+  string workload_template = 6;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 8;
 }
 
 message CreateSandboxTemplateRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   SandboxWorkloadTemplate template = 1;
-  // Explicit workspace for the template. The all-workspaces selection is invalid.
-  string workspace = 2;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 3;
 }
 
 message GetSandboxTemplateRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   string name = 1;
-  // Canonical workspace name.
-  string workspace = 2;
 }
 
 message ListSandboxTemplatesRequest {
+  // Workspace scope. Named and all-workspaces selections are accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   // The maximum number of templates to return. Zero uses 100. Values above
   // 1000 are coerced to 1000; negative values are invalid.
   int32 page_size = 1;
@@ -1220,14 +1222,12 @@ message ListSandboxTemplatesRequest {
   string page_token = 2;
   // Optional label selector in key=value comma-separated form.
   string label_selector = 3;
-  // Explicit named or all-workspaces scope.
-  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
 }
 
 message DeleteSandboxTemplateRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   string name = 1;
-  // Canonical workspace name.
-  string workspace = 2;
   // Succeed with ALREADY_ABSENT if the target is missing. Authorization and
   // parent-workspace checks still apply.
   bool allow_missing = 3;
@@ -1253,15 +1253,14 @@ message DeleteSandboxTemplateResponse {
 
 // Request a gateway-owned staging slot for a local rootfs tar archive.
 message BeginRootfsTarStagingRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   // Base file name of the local archive. The gateway uses it only to name the
   // staged file; path separators and traversal components are rejected.
   string file_name = 1;
   // Size of the local archive in bytes, checked against the driver limit
   // before the gateway allocates a slot.
   uint64 size_bytes = 2;
-  // Explicit workspace that will own the sandbox created from this archive.
-  // The all-workspaces selection is invalid.
-  string workspace = 3;
 }
 
 // Gateway-issued staging slot.
@@ -1282,12 +1281,15 @@ message BeginRootfsTarStagingResponse {
 
 // Get sandbox request.
 message GetSandboxRequest {
-  string sandbox = 1;
-  string workspace = 2;
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+  string name = 1;
 }
 
 // List sandboxes request.
 message ListSandboxesRequest {
+  // Workspace scope. Named and all-workspaces selections are accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   // The maximum number of sandboxes to return. Zero uses 100. Values above
   // 1000 are coerced to 1000; negative values are invalid.
   int32 page_size = 1;
@@ -1296,27 +1298,27 @@ message ListSandboxesRequest {
   string page_token = 2;
   // Optional label selector for filtering (format: "key1=value1,key2=value2").
   string label_selector = 3;
-  // Explicit named or all-workspaces scope.
-  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
 }
 
 // List providers attached to a sandbox request.
 message ListSandboxProvidersRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   string sandbox = 1;
-  string workspace = 2;
 }
 
 // Attach provider to sandbox request.
 message AttachSandboxProviderRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   string sandbox = 1;
   // Provider name to attach.
-  string provider_name = 2;
+  string provider = 2;
   // Expected resource version for optimistic concurrency control.
   // If 0, the server uses the current version (backward compatibility).
   // If non-zero, the server validates that the sandbox's current resource_version
   // matches this value before applying the mutation, returning ABORTED on mismatch.
   uint64 expected_resource_version = 3;
-  string workspace = 4;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 5;
@@ -1324,15 +1326,16 @@ message AttachSandboxProviderRequest {
 
 // Detach provider from sandbox request.
 message DetachSandboxProviderRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   string sandbox = 1;
   // Provider name to detach.
-  string provider_name = 2;
+  string provider = 2;
   // Expected resource version for optimistic concurrency control.
   // If 0, the server uses the current version (backward compatibility).
   // If non-zero, the server validates that the sandbox's current resource_version
   // matches this value before applying the mutation, returning ABORTED on mismatch.
   uint64 expected_resource_version = 3;
-  string workspace = 4;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 5;
@@ -1340,9 +1343,10 @@ message DetachSandboxProviderRequest {
 
 // Delete sandbox request.
 message DeleteSandboxRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   // Canonical sandbox name.
-  string sandbox = 1;
-  string workspace = 2;
+  string name = 1;
   // Succeed with ALREADY_ABSENT if the target is missing. Does not wait for
   // asynchronous cleanup and does not suppress authorization or parent errors.
   bool allow_missing = 3;
@@ -1353,8 +1357,9 @@ message DeleteSandboxRequest {
 
 // Stop sandbox request.
 message StopSandboxRequest {
-  string sandbox = 1;
-  string workspace = 2;
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+  string name = 1;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 3;
@@ -1362,8 +1367,9 @@ message StopSandboxRequest {
 
 // Start sandbox request.
 message StartSandboxRequest {
-  string sandbox = 1;
-  string workspace = 2;
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+  string name = 1;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 3;
@@ -1537,7 +1543,7 @@ message ProviderMutationReceipt {
   string receipt_id = 1;
   // Shared by all sandbox receipts from one provider update.
   string mutation_id = 2;
-  string provider_name = 3;
+  string provider = 3;
   string workspace = 4;
   ProviderMutationKind kind = 5;
   ProviderDesiredIdentity desired = 6;
@@ -1584,10 +1590,11 @@ message ProviderReadinessStatus {
 // Query an immutable receipt, or reconstruct the current desired state when
 // receipt_id is empty. The sandbox identity must match the receipt.
 message GetSandboxProviderStatusRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   string sandbox = 1;
-  string provider_name = 2;
+  string provider = 2;
   string receipt_id = 3;
-  string workspace = 4;
 }
 
 message GetSandboxProviderStatusResponse {
@@ -1623,8 +1630,9 @@ message DeleteSandboxResponse {
 
 // Create SSH session request.
 message CreateSshSessionRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   string sandbox = 1;
-  string workspace = 3;
 }
 
 // Create SSH session response.
@@ -1665,14 +1673,15 @@ message CreateSshSessionResponse {
 
 // Request to expose an HTTP service running inside a sandbox.
 message ExposeServiceRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
   // Service name within the sandbox.
-  string service = 2;
+  string name = 2;
   // Loopback TCP port inside the sandbox.
   uint32 target_port = 3;
   // Whether to print/use the browser-facing service URL.
   bool domain = 4;
   string sandbox = 1;
-  string workspace = 5;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 6;
@@ -1680,22 +1689,23 @@ message ExposeServiceRequest {
 
 // Request to fetch an exposed sandbox service endpoint.
 message GetServiceRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   // Service name within the sandbox. Empty selects the unnamed endpoint.
-  string service = 2;
+  string name = 2;
   string sandbox = 1;
-  string workspace = 3;
 }
 
 // Request to list exposed sandbox service endpoints.
 message ListServicesRequest {
+  // Workspace scope. Named and all-workspaces selections are accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   // The maximum number of services to return. Zero uses 100. Values above
   // 1000 are coerced to 1000; negative values are invalid.
   int32 page_size = 2;
   // Token from a previous ListServices response. All other request parameters
   // except page_size must match the request that produced it.
   string page_token = 3;
-  // Explicit named or all-workspaces scope.
-  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   // Optional sandbox name. Empty lists endpoints for all sandboxes.
   string sandbox = 1;
 }
@@ -1709,11 +1719,11 @@ message ListServicesResponse {
 
 // Request to delete an exposed sandbox service endpoint.
 message DeleteServiceRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   // Service name within the sandbox. Empty selects the unnamed endpoint.
-  string service = 2;
+  string name = 2;
   string sandbox = 1;
-  // Canonical workspace name.
-  string workspace = 3;
   bool allow_missing = 4;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
@@ -1736,7 +1746,7 @@ message ServiceEndpoint {
   // Sandbox name.
   string sandbox = 3;
   // Service name within the sandbox.
-  string service_name = 4;
+  string name = 4;
   // Loopback TCP port inside the sandbox.
   uint32 target_port = 5;
   // Whether browser-facing service routing is enabled for this endpoint.
@@ -1767,6 +1777,8 @@ message RevokeSshSessionResponse {
 
 // Execute command request.
 message ExecSandboxRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 12;
   reserved 5;
   reserved "timeout_seconds";
   // Canonical sandbox name.
@@ -1801,7 +1813,6 @@ message ExecSandboxRequest {
   // sourced by them) are applied. When true, the command runs without those
   // files (`bash -c`), for automation that needs predictable startup behavior.
   bool no_login_shell = 10;
-  string workspace = 12;
 }
 
 // One stdout chunk from a sandbox exec.
@@ -1893,6 +1904,8 @@ message SshSession {
 
 // Watch sandbox request.
 message WatchSandboxRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 11;
   reserved 8;
   reserved "log_since_ms";
   // Canonical sandbox name.
@@ -1926,7 +1939,6 @@ message WatchSandboxRequest {
 
   // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
   string log_min_level = 10;
-  string workspace = 11;
 }
 
 // One event in a sandbox watch stream.
@@ -1967,9 +1979,9 @@ message SandboxStreamWarning {
 
 // Create provider request.
 message CreateProviderRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   openshell.datamodel.v1.Provider provider = 1;
-  // Explicit workspace for the provider. The all-workspaces selection is invalid.
-  string workspace = 2;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 3;
@@ -1977,25 +1989,27 @@ message CreateProviderRequest {
 
 // Get provider request.
 message GetProviderRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   string name = 1;
-  // Canonical workspace name.
-  string workspace = 2;
 }
 
 // List providers request.
 message ListProvidersRequest {
+  // Workspace scope. Named and all-workspaces selections are accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   // The maximum number of providers to return. Zero uses 100. Values above
   // 1000 are coerced to 1000; negative values are invalid.
   int32 page_size = 1;
   // Token from a previous ListProviders response. All other request parameters
   // except page_size must match the request that produced it.
   string page_token = 2;
-  // Explicit named or all-workspaces scope.
-  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 
 // Update provider request.
 message UpdateProviderRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   reserved 2;
   reserved "credential_expires_at_ms";
   openshell.datamodel.v1.Provider provider = 1;
@@ -2005,8 +2019,6 @@ message UpdateProviderRequest {
   map<string, google.protobuf.Timestamp> credential_expiration_times = 102;
   // Credential keys whose existing expiry should be removed.
   repeated string clear_credential_expiration_keys = 103;
-  // Canonical workspace name.
-  string workspace = 3;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 4;
@@ -2014,9 +2026,9 @@ message UpdateProviderRequest {
 
 // Delete provider request.
 message DeleteProviderRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   string name = 1;
-  // Canonical workspace name.
-  string workspace = 3;
   bool allow_missing = 4;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
@@ -2042,24 +2054,21 @@ message ListProvidersResponse {
 
 // List provider type profiles request.
 message ListProviderProfilesRequest {
+  // Workspace scope. Omit for platform profiles; otherwise select one named workspace.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   // The maximum number of profiles to return. Zero uses 100. Values above
   // 1000 are coerced to 1000; negative values are invalid.
   int32 page_size = 1;
   // Token from a previous ListProviderProfiles response. All other request
   // parameters except page_size must match the request that produced it.
   string page_token = 2;
-  // Workspace scope. When set, returns workspace-scoped + built-in profiles.
-  // When empty, returns platform-scoped + built-in only.
-  string workspace = 3;
 }
 
 // Fetch provider type profile request.
 message GetProviderProfileRequest {
+  // Workspace scope. Omit for platform profiles; otherwise select one named workspace.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   string id = 1;
-  // Workspace scope for two-tier profile resolution. When set, checks
-  // workspace-scoped profiles first, then platform-scoped, then built-in.
-  // When empty, checks platform-scoped then built-in only.
-  string workspace = 2;
 }
 
 // Provider profile payload with optional source metadata for diagnostics.
@@ -2209,7 +2218,7 @@ message ProviderCredentialRefresh {
 message ProviderCredentialRefreshStatus {
   reserved 6, 7, 8, 13;
   reserved "expires_at_ms", "next_refresh_at_ms", "last_refresh_at_ms", "last_error_at_ms";
-  string provider_name = 1;
+  string provider = 1;
   string provider_id = 2;
   string credential_key = 3;
   ProviderCredentialRefreshStrategy strategy = 4;
@@ -2239,10 +2248,10 @@ message ProviderProfileDiscovery {
 }
 
 message GetProviderRefreshStatusRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   string provider = 1;
   string credential_key = 2;
-  // Canonical workspace name.
-  string workspace = 3;
 }
 
 message GetProviderRefreshStatusResponse {
@@ -2250,6 +2259,8 @@ message GetProviderRefreshStatusResponse {
 }
 
 message ConfigureProviderRefreshRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 7;
   reserved 6;
   reserved "expires_at_ms";
   string provider = 1;
@@ -2261,8 +2272,6 @@ message ConfigureProviderRefreshRequest {
   // the authoritative provider profile and refresh strategy.
   repeated string secret_material_keys = 5;
   google.protobuf.Timestamp expiration_time = 106;
-  // Canonical workspace name.
-  string workspace = 7;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 8;
@@ -2273,10 +2282,10 @@ message ConfigureProviderRefreshResponse {
 }
 
 message RotateProviderCredentialRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   string provider = 1;
   string credential_key = 2;
-  // Canonical workspace name.
-  string workspace = 3;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 4;
@@ -2287,10 +2296,10 @@ message RotateProviderCredentialResponse {
 }
 
 message DeleteProviderRefreshRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   string provider = 1;
   string credential_key = 2;
-  // Canonical workspace name.
-  string workspace = 4;
   bool allow_missing = 5;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
@@ -2354,10 +2363,9 @@ message ListProviderProfilesResponse {
 
 // Import custom provider profiles request.
 message ImportProviderProfilesRequest {
+  // Workspace scope. Omit for platform profiles; otherwise select one named workspace.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   repeated ProviderProfileImportItem profiles = 1;
-  // Workspace scope. When set, profiles are workspace-scoped (Workspace Admin).
-  // When empty, profiles are platform-scoped (Platform Admin).
-  string workspace = 2;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 3;
@@ -2372,6 +2380,8 @@ message ImportProviderProfilesResponse {
 
 // Update one custom provider profile request.
 message UpdateProviderProfilesRequest {
+  // Workspace scope. Omit for platform profiles; otherwise select one named workspace.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   ProviderProfileImportItem profile = 1;
   // Expected storage resource version for optimistic concurrency control.
   // If 0, the server uses the resource_version embedded in profile.profile.
@@ -2380,9 +2390,6 @@ message UpdateProviderProfilesRequest {
   uint64 expected_resource_version = 2;
   // Existing custom provider profile ID to update. The payload ID must match.
   string id = 3;
-  // Workspace scope. When set, targets workspace-scoped profile. When empty,
-  // targets platform-scoped profile.
-  string workspace = 4;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 5;
@@ -2397,10 +2404,9 @@ message UpdateProviderProfilesResponse {
 
 // Lint provider profiles request.
 message LintProviderProfilesRequest {
+  // Workspace scope. Omit for platform profiles; otherwise select one named workspace.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   repeated ProviderProfileImportItem profiles = 1;
-  // Workspace scope. Used to check for conflicts against existing profiles
-  // in the target workspace.
-  string workspace = 2;
 }
 
 // Lint provider profiles response.
@@ -2418,10 +2424,9 @@ message DeleteProviderResponse {
 
 // Delete custom provider profile request.
 message DeleteProviderProfileRequest {
+  // Workspace scope. Omit for platform profiles; otherwise select one named workspace.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   string id = 1;
-  // Workspace scope. When set, targets workspace-scoped profile. When empty,
-  // targets platform-scoped profile.
-  string workspace = 2;
   bool allow_missing = 3;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
@@ -2526,6 +2531,8 @@ message ExchangeProviderSubjectTokenResponse {
 
 // Update sandbox policy request.
 message UpdateConfigRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 10;
   // The new policy to apply.
   //
   // Sandbox scope (`global=false`):
@@ -2561,7 +2568,6 @@ message UpdateConfigRequest {
   map<string, string> annotations = 9;
   // Required for sandbox-scoped updates and empty for global updates.
   string sandbox = 1;
-  string workspace = 10;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 11;
@@ -2579,24 +2585,24 @@ message PolicyMergeOperation {
 }
 
 message AddNetworkRule {
-  string rule_name = 1;
+  string name = 1;
   openshell.sandbox.v1.NetworkPolicyRule rule = 2;
 }
 
 message RemoveNetworkEndpoint {
-  string rule_name = 1;
+  string rule = 1;
   string host = 2;
   uint32 port = 3;
 }
 
 message RemoveNetworkRule {
-  string rule_name = 1;
+  string name = 1;
 }
 
 // Exact endpoint and complete authorization scope affected by an L7 append.
 // All ports and binaries must match the stored target; omitted scope is invalid.
 message L7RuleTarget {
-  string rule_name = 1;
+  string rule = 1;
   string host = 2;
   repeated uint32 ports = 3;
   // An absent path requires a unique endpoint. An empty path selects an
@@ -2622,7 +2628,7 @@ message AddAllowRules {
 }
 
 message RemoveNetworkBinary {
-  string rule_name = 1;
+  string rule = 1;
   string binary_path = 2;
 }
 
@@ -2642,12 +2648,13 @@ message UpdateConfigResponse {
 
 // Get sandbox policy status request.
 message GetSandboxPolicyStatusRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   // The specific policy version to query. 0 means latest.
   uint32 version = 2;
   // Query global policy revisions instead of a sandbox-scoped one.
   bool global = 3;
   string sandbox = 1;
-  string workspace = 4;
 }
 
 // Get sandbox policy status response.
@@ -2660,6 +2667,8 @@ message GetSandboxPolicyStatusResponse {
 
 // List sandbox policies request.
 message ListSandboxPoliciesRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
   // The maximum number of revisions to return. Zero uses 100. Values above
   // 1000 are coerced to 1000; negative values are invalid.
   int32 page_size = 2;
@@ -2669,7 +2678,6 @@ message ListSandboxPoliciesRequest {
   // List global policy revisions instead of sandbox-scoped ones.
   bool global = 4;
   string sandbox = 1;
-  string workspace = 5;
 }
 
 // List sandbox policies response.
@@ -2770,6 +2778,8 @@ enum PolicyStatus {
 
 // Get sandbox logs request (one-shot fetch).
 message GetSandboxLogsRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 6;
   reserved 3;
   reserved "since_ms";
   // Canonical sandbox name.
@@ -2782,7 +2792,6 @@ message GetSandboxLogsRequest {
   repeated string sources = 4;
   // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
   string min_level = 5;
-  string workspace = 6;
 }
 
 // Batch of log lines pushed from sandbox to server.
@@ -3042,7 +3051,7 @@ message PolicyChunk {
   // Approval status: "pending", "approved", "rejected".
   string status = 2;
   // Proposed network_policies map key.
-  string rule_name = 3;
+  string rule = 3;
   // The proposed network policy rule.
   openshell.sandbox.v1.NetworkPolicyRule proposed_rule = 4;
   // Human-readable explanation of why this rule is proposed.
@@ -3108,6 +3117,8 @@ message DraftPolicyUpdate {
 
 // Submit analysis results from sandbox to gateway.
 message SubmitPolicyAnalysisRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 6;
   // Aggregated denial summaries.
   repeated DenialSummary summaries = 1;
   // Proposed policy chunks (validated by sandbox OPA engine).
@@ -3125,9 +3136,6 @@ message SubmitPolicyAnalysisRequest {
   string name = 4;
   // Anonymous network activity counters.
   repeated NetworkActivitySummary network_activity_summaries = 5;
-  // Internal callback workspace. The gateway validates it against the
-  // authenticated sandbox principal.
-  string workspace = 6;
 }
 
 message SubmitPolicyAnalysisResponse {
@@ -3145,10 +3153,11 @@ message SubmitPolicyAnalysisResponse {
 
 // Get draft policy for a sandbox.
 message GetDraftPolicyRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   // Optional status filter: "pending", "approved", "rejected", or "" for all.
   string status_filter = 2;
   string sandbox = 1;
-  string workspace = 3;
 }
 
 message GetDraftPolicyResponse {
@@ -3166,13 +3175,14 @@ message GetDraftPolicyResponse {
 
 // Approve a single draft chunk.
 message ApproveDraftChunkRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   // Chunk ID to approve.
   string chunk_id = 2;
   // Token returned with the reviewed PolicyChunk. Approval fails with
   // FAILED_PRECONDITION if live decision inputs no longer match it.
   string review_token = 4;
   string sandbox = 1;
-  string workspace = 3;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 5;
@@ -3187,12 +3197,13 @@ message ApproveDraftChunkResponse {
 
 // Reject a single draft chunk.
 message RejectDraftChunkRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   // Chunk ID to reject.
   string chunk_id = 2;
   // Optional reason for rejection (fed to LLM context in future analysis).
   string reason = 3;
   string sandbox = 1;
-  string workspace = 4;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 5;
@@ -3207,13 +3218,14 @@ message DraftChunkApproval {
 }
 
 message ApproveAllDraftChunksRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   // Include chunks with security_notes (default false: skips them).
   bool include_security_flagged = 2;
   // Exact reviewed chunks and tokens. The server validates them against one
   // live snapshot, stages compatible operations in order, and writes once.
   repeated DraftChunkApproval approvals = 3;
   string sandbox = 1;
-  string workspace = 4;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 5;
@@ -3233,12 +3245,13 @@ message ApproveAllDraftChunksResponse {
 
 // Edit a pending chunk in-place.
 message EditDraftChunkRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   // Chunk ID to edit.
   string chunk_id = 2;
   // The modified rule (replaces existing proposed_rule).
   openshell.sandbox.v1.NetworkPolicyRule proposed_rule = 3;
   string sandbox = 1;
-  string workspace = 4;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 5;
@@ -3248,10 +3261,11 @@ message EditDraftChunkResponse {}
 
 // Reverse an approval (remove merged rule from active policy).
 message UndoDraftChunkRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   // Chunk ID to undo.
   string chunk_id = 2;
   string sandbox = 1;
-  string workspace = 3;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 4;
@@ -3266,8 +3280,9 @@ message UndoDraftChunkResponse {
 
 // Clear all pending draft chunks for a sandbox.
 message ClearDraftChunksRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   string sandbox = 1;
-  string workspace = 2;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 3;
@@ -3280,8 +3295,9 @@ message ClearDraftChunksResponse {
 
 // Get decision history for a sandbox's draft policy.
 message GetDraftHistoryRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   string sandbox = 1;
-  string workspace = 2;
 }
 
 message DraftHistoryEntry {
@@ -3402,8 +3418,8 @@ message WorkspaceMember {
 
 // Add workspace member request.
 message AddWorkspaceMemberRequest {
-  // Workspace name.
-  string workspace = 1;
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
   // OIDC subject claim identifying the principal.
   string principal_subject = 2;
   // Role to assign.
@@ -3419,8 +3435,8 @@ message AddWorkspaceMemberResponse {
 
 // Remove workspace member request.
 message RemoveWorkspaceMemberRequest {
-  // Workspace name.
-  string workspace = 1;
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
   // OIDC subject claim identifying the principal to remove.
   string principal_subject = 2;
   bool allow_missing = 3;
@@ -3455,8 +3471,8 @@ enum DeletionOutcome {
 
 // List workspace members request.
 message ListWorkspaceMembersRequest {
-  // Workspace name.
-  string workspace = 1;
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
   // The maximum number of members to return. Zero uses 100. Values above
   // 1000 are coerced to 1000; negative values are invalid.
   int32 page_size = 2;
@@ -3480,7 +3496,7 @@ message ExtensionServiceCredential {
   reserved "expires_at_ms";
   // Operator registration name used to correlate the credential with the
   // stable service registration delivered by GetSandboxConfig.
-  string service_name = 1;
+  string service = 1;
   // Gateway-minted JWT with an audience derived from the registration.
   string token = 2 [(openshell.options.v1.secret) = true];
   // Absolute expiry of the token.

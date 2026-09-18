@@ -684,12 +684,12 @@ impl ComputeRuntime {
             .into_inner();
         info!(
             configured_driver = %driver_name,
-            advertised_driver = %capabilities.driver_name,
+            advertised_driver = %capabilities.name,
             "Compute driver connected"
         );
         let driver_info = ComputeDriverInfoSnapshot {
             name: driver_name.clone(),
-            driver_name: capabilities.driver_name,
+            driver_name: capabilities.name,
             driver_version: capabilities.driver_version,
             gateway_manages_lifecycle: capabilities.gateway_manages_lifecycle,
             supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
@@ -1211,7 +1211,7 @@ impl ComputeRuntime {
                         driver
                             .stop_sandbox(Request::new(StopSandboxRequest {
                                 sandbox_id,
-                                sandbox_name,
+                                name: sandbox_name,
                             }))
                             .await
                     }
@@ -1441,7 +1441,7 @@ impl ComputeRuntime {
                             driver
                                 .start_sandbox(Request::new(StartSandboxRequest {
                                     sandbox_id,
-                                    sandbox_name,
+                                    name: sandbox_name,
                                     launch_authentication,
                                     generation_id,
                                 }))
@@ -1808,7 +1808,7 @@ impl ComputeRuntime {
                         driver
                             .delete_sandbox(Request::new(DeleteSandboxRequest {
                                 sandbox_id,
-                                sandbox_name,
+                                name: sandbox_name,
                             }))
                             .await
                     }
@@ -2397,7 +2397,7 @@ impl ComputeRuntime {
                                 driver
                                     .stop_sandbox(Request::new(StopSandboxRequest {
                                         sandbox_id,
-                                        sandbox_name,
+                                        name: sandbox_name,
                                     }))
                                     .await
                             }
@@ -2572,7 +2572,7 @@ impl ComputeRuntime {
                                 driver
                                     .start_sandbox(Request::new(StartSandboxRequest {
                                         sandbox_id,
-                                        sandbox_name,
+                                        name: sandbox_name,
                                         launch_authentication,
                                         generation_id,
                                     }))
@@ -2709,7 +2709,7 @@ impl ComputeRuntime {
                                 driver
                                     .stop_sandbox(Request::new(StopSandboxRequest {
                                         sandbox_id: driver_sandbox_id,
-                                        sandbox_name,
+                                        name: sandbox_name,
                                     }))
                                     .await
                             },
@@ -2763,7 +2763,7 @@ impl ComputeRuntime {
                                 driver
                                     .start_sandbox(Request::new(StartSandboxRequest {
                                         sandbox_id: driver_sandbox_id,
-                                        sandbox_name,
+                                        name: sandbox_name,
                                         launch_authentication: Vec::new(),
                                         generation_id,
                                     }))
@@ -3766,7 +3766,7 @@ impl ComputeRuntime {
                         driver
                             .delete_sandbox(Request::new(DeleteSandboxRequest {
                                 sandbox_id,
-                                sandbox_name,
+                                name: sandbox_name,
                             }))
                             .await
                     }
@@ -4105,7 +4105,7 @@ impl ComputeRuntime {
                         driver
                             .get_sandbox(Request::new(GetSandboxRequest {
                                 sandbox_id,
-                                sandbox_name,
+                                name: sandbox_name,
                             }))
                             .await
                     }
@@ -4494,11 +4494,11 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
 
     let mut fields = std::collections::BTreeMap::new();
 
-    if !template.runtime_class_name.is_empty() {
+    if !template.runtime_class.is_empty() {
         fields.insert(
             "runtime_class_name".to_string(),
             Value {
-                kind: Some(Kind::StringValue(template.runtime_class_name.clone())),
+                kind: Some(Kind::StringValue(template.runtime_class.clone())),
             },
         );
     }
@@ -4599,7 +4599,7 @@ fn build_platform_resources_config(
 
 fn driver_status_from_public(status: &SandboxStatus, sandbox_name: &str) -> DriverSandboxStatus {
     DriverSandboxStatus {
-        sandbox_name: sandbox_name.to_string(),
+        name: sandbox_name.to_string(),
         instance_id: status.agent_pod.clone(),
         agent_fd: status.agent_fd.clone(),
         sandbox_fd: status.sandbox_fd.clone(),
@@ -5287,7 +5287,7 @@ impl ComputeDriver for NoopTestDriver {
     {
         Ok(tonic::Response::new(
             openshell_core::proto::compute::v1::GetCapabilitiesResponse {
-                driver_name: "noop-test-driver".to_string(),
+                name: "noop-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
@@ -5847,7 +5847,7 @@ mod tests {
             _request: Request<GetCapabilitiesRequest>,
         ) -> Result<tonic::Response<GetCapabilitiesResponse>, Status> {
             Ok(tonic::Response::new(GetCapabilitiesResponse {
-                driver_name: "test-driver".to_string(),
+                name: "test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
@@ -5888,7 +5888,7 @@ mod tests {
             let sandbox = current
                 .iter()
                 .find(|sandbox| {
-                    sandbox.name == request.sandbox_name
+                    sandbox.name == request.name
                         && (request.sandbox_id.is_empty() || sandbox.id == request.sandbox_id)
                 })
                 .cloned()
@@ -6200,7 +6200,7 @@ mod tests {
             _request: Request<GetCapabilitiesRequest>,
         ) -> Result<tonic::Response<GetCapabilitiesResponse>, Status> {
             Ok(tonic::Response::new(GetCapabilitiesResponse {
-                driver_name: "controlled-test-driver".to_string(),
+                name: "controlled-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
@@ -6285,7 +6285,7 @@ mod tests {
             self.stop_requests
                 .lock()
                 .expect("stop requests lock poisoned")
-                .push((request.sandbox_id, request.sandbox_name));
+                .push((request.sandbox_id, request.name));
             self.stop_calls.fetch_add(1, Ordering::SeqCst);
             self.stop_started.notify_one();
             if self.stop_blocked.load(Ordering::SeqCst) {
@@ -6316,7 +6316,7 @@ mod tests {
             self.start_requests
                 .lock()
                 .expect("start requests lock poisoned")
-                .push((request.sandbox_id, request.sandbox_name));
+                .push((request.sandbox_id, request.name));
             self.start_authentications
                 .lock()
                 .expect("start authentications lock poisoned")
@@ -6351,7 +6351,7 @@ mod tests {
             self.delete_requests
                 .lock()
                 .expect("delete requests lock poisoned")
-                .push((request.sandbox_id, request.sandbox_name));
+                .push((request.sandbox_id, request.name));
             self.delete_calls.fetch_add(1, Ordering::SeqCst);
             self.delete_started.notify_one();
             if self.delete_blocked.load(Ordering::SeqCst) {
@@ -6875,7 +6875,7 @@ mod tests {
             }),
             sandbox_id: sandbox.object_id().to_string(),
             sandbox: sandbox.object_name().to_string(),
-            service_name: "web".to_string(),
+            name: "web".to_string(),
             target_port: 8080,
             domain: true,
         }
@@ -7010,7 +7010,7 @@ mod tests {
 
     fn make_driver_status(condition: DriverCondition) -> DriverSandboxStatus {
         DriverSandboxStatus {
-            sandbox_name: "test".to_string(),
+            name: "test".to_string(),
             instance_id: "test-pod".to_string(),
             agent_fd: String::new(),
             sandbox_fd: String::new(),
@@ -7028,7 +7028,7 @@ mod tests {
             workspace: "default".to_string(),
             spec: None,
             status: Some(DriverSandboxStatus {
-                sandbox_name: name.to_string(),
+                name: name.to_string(),
                 instance_id: format!("{name}-pod"),
                 agent_fd: String::new(),
                 sandbox_fd: String::new(),
@@ -8283,7 +8283,7 @@ mod tests {
         );
         let mut progressing = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
         progressing.status = Some(DriverSandboxStatus {
-            sandbox_name: sandbox.object_name().to_string(),
+            name: sandbox.object_name().to_string(),
             instance_id: format!("{}-pod", sandbox.object_name()),
             conditions: vec![
                 DriverCondition {
@@ -8656,7 +8656,7 @@ mod tests {
 
         let mut resumed = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
         resumed.status = Some(DriverSandboxStatus {
-            sandbox_name: sandbox.object_name().to_string(),
+            name: sandbox.object_name().to_string(),
             instance_id: format!("{}-pod", sandbox.object_name()),
             conditions: vec![
                 DriverCondition {
@@ -8860,7 +8860,7 @@ mod tests {
                 namespace: "default".to_string(),
                 spec: None,
                 status: Some(DriverSandboxStatus {
-                    sandbox_name: "sandbox-a".to_string(),
+                    name: "sandbox-a".to_string(),
                     instance_id: "agent-pod".to_string(),
                     agent_fd: String::new(),
                     sandbox_fd: String::new(),
@@ -10533,7 +10533,7 @@ mod tests {
 
     fn make_ready_driver_status() -> DriverSandboxStatus {
         DriverSandboxStatus {
-            sandbox_name: "test".to_string(),
+            name: "test".to_string(),
             instance_id: "test-pod".to_string(),
             agent_fd: String::new(),
             sandbox_fd: String::new(),
@@ -10551,7 +10551,7 @@ mod tests {
 
     fn make_deleting_driver_status() -> DriverSandboxStatus {
         DriverSandboxStatus {
-            sandbox_name: "test".to_string(),
+            name: "test".to_string(),
             instance_id: "test-pod".to_string(),
             agent_fd: String::new(),
             sandbox_fd: String::new(),
@@ -10829,7 +10829,7 @@ mod tests {
                 namespace: "default".to_string(),
                 spec: None,
                 status: Some(DriverSandboxStatus {
-                    sandbox_name: "sandbox-a".to_string(),
+                    name: "sandbox-a".to_string(),
                     instance_id: "agent-pod".to_string(),
                     agent_fd: String::new(),
                     sandbox_fd: String::new(),
@@ -10851,7 +10851,7 @@ mod tests {
                 namespace: "default".to_string(),
                 spec: None,
                 status: Some(DriverSandboxStatus {
-                    sandbox_name: "sandbox-a".to_string(),
+                    name: "sandbox-a".to_string(),
                     instance_id: "agent-pod".to_string(),
                     agent_fd: String::new(),
                     sandbox_fd: String::new(),
@@ -11065,7 +11065,7 @@ mod tests {
                 namespace: "default".to_string(),
                 spec: None,
                 status: Some(DriverSandboxStatus {
-                    sandbox_name: "sandbox-a".to_string(),
+                    name: "sandbox-a".to_string(),
                     instance_id: "agent-pod".to_string(),
                     agent_fd: String::new(),
                     sandbox_fd: String::new(),
@@ -11923,7 +11923,7 @@ mod tests {
             remote
                 .get_sandbox(Request::new(GetSandboxRequest {
                     sandbox_id: sandbox.id.clone(),
-                    sandbox_name: String::new(),
+                    name: String::new(),
                 }))
                 .await
                 .unwrap();
@@ -11934,7 +11934,7 @@ mod tests {
             remote
                 .stop_sandbox(Request::new(StopSandboxRequest {
                     sandbox_id: sandbox.id.clone(),
-                    sandbox_name: String::new(),
+                    name: String::new(),
                 }))
                 .await
                 .unwrap();
@@ -11945,7 +11945,7 @@ mod tests {
             remote
                 .delete_sandbox(Request::new(DeleteSandboxRequest {
                     sandbox_id: sandbox.id,
-                    sandbox_name: String::new(),
+                    name: String::new(),
                 }))
                 .await
                 .unwrap();

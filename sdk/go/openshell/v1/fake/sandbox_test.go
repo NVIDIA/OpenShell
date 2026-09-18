@@ -20,7 +20,7 @@ import (
 // helper to build a minimal fake sandbox client for testing.
 func newTestSandboxClient() *fakeSandboxClient {
 	store := newobjectStore(sandboxName, copySandbox)
-	templateStore := newobjectStore(sandboxWorkloadTemplateName, copySandboxWorkloadTemplate)
+	templateStore := newobjectStore(sandboxWorkloadTemplate, copySandboxWorkloadTemplate)
 	broadcaster := newWatchBroadcaster[*types.Sandbox]()
 	return newFakeSandboxClient(store, templateStore, broadcaster, func() bool { return false })
 }
@@ -960,7 +960,7 @@ func TestSandbox_GetLogs_ReturnsUnimplemented(t *testing.T) {
 
 func TestSandbox_GetLogs_ClosedReturnsUnavailable(t *testing.T) {
 	store := newobjectStore(sandboxName, copySandbox)
-	templateStore := newobjectStore(sandboxWorkloadTemplateName, copySandboxWorkloadTemplate)
+	templateStore := newobjectStore(sandboxWorkloadTemplate, copySandboxWorkloadTemplate)
 	broadcaster := newWatchBroadcaster[*types.Sandbox]()
 	sc := newFakeSandboxClient(store, templateStore, broadcaster, func() bool { return true })
 	_, err := sc.GetLogs(context.Background(), "default", "sb-1")

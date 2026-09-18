@@ -109,7 +109,7 @@ class TestRbac:
         try:
             user_stub.ListSandboxes(
                 openshell_pb2.ListSandboxesRequest(
-                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+                    workspace=datamodel_pb2.WorkspaceSelector(workspace="default")
                 ),
                 metadata=user_md,
             )
@@ -128,7 +128,7 @@ class TestRbac:
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.ListSandboxes(
                 openshell_pb2.ListSandboxesRequest(
-                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+                    workspace=datamodel_pb2.WorkspaceSelector(workspace="default")
                 )
             )
         assert exc_info.value.code() in (
@@ -165,7 +165,7 @@ class TestScopes:
         stub, metadata = stub_with_token(token)
         stub.ListSandboxes(
             openshell_pb2.ListSandboxesRequest(
-                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+                workspace=datamodel_pb2.WorkspaceSelector(workspace="default")
             ),
             metadata=metadata,
         )
@@ -178,7 +178,7 @@ class TestScopes:
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.ListProviders(
                 openshell_pb2.ListProvidersRequest(
-                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+                    workspace=datamodel_pb2.WorkspaceSelector(workspace="default")
                 ),
                 metadata=metadata,
             )
@@ -190,13 +190,13 @@ class TestScopes:
         stub, metadata = stub_with_token(token)
         stub.ListSandboxes(
             openshell_pb2.ListSandboxesRequest(
-                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+                workspace=datamodel_pb2.WorkspaceSelector(workspace="default")
             ),
             metadata=metadata,
         )
         stub.ListProviders(
             openshell_pb2.ListProvidersRequest(
-                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+                workspace=datamodel_pb2.WorkspaceSelector(workspace="default")
             ),
             metadata=metadata,
         )
@@ -207,7 +207,7 @@ class TestScopes:
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.ListSandboxes(
                 openshell_pb2.ListSandboxesRequest(
-                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+                    workspace=datamodel_pb2.WorkspaceSelector(workspace="default")
                 ),
                 metadata=metadata,
             )

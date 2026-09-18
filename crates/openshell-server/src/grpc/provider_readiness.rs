@@ -180,7 +180,7 @@ pub(super) async fn record_provider_mutation(
     let receipt = ProviderMutationReceipt {
         receipt_id: Uuid::new_v4().to_string(),
         mutation_id: mutation_id.to_string(),
-        provider_name: provider_name.to_string(),
+        provider: provider_name.to_string(),
         workspace: sandbox.object_workspace().to_string(),
         kind: kind.into(),
         desired: Some(desired),
@@ -303,21 +303,19 @@ pub(super) async fn handle_get_sandbox_provider_status(
         state,
         &principal,
         &request.sandbox,
-        &request.workspace,
+        crate::auth::workspace_authz::selected_workspace_name(request.workspace_scope.as_ref())?,
         MinWorkspaceRole::User,
     )
     .await?;
     let workspace = sandbox.object_workspace().to_string();
     // Validate the selector before it can contribute to a durable observation.
-    if request.provider_name.len() > super::MAX_NAME_LEN {
-        return Err(Status::invalid_argument(
-            "provider_name exceeds maximum length",
-        ));
+    if request.provider.len() > super::MAX_NAME_LEN {
+        return Err(Status::invalid_argument("provider exceeds maximum length"));
     }
     let receipt_id = if request.receipt_id.is_empty() {
-        if request.provider_name.is_empty() {
+        if request.provider.is_empty() {
             return Err(Status::invalid_argument(
-                "provider_name or receipt_id is required",
+                "provider or receipt_id is required",
             ));
         }
         // Only existing workspace providers can create observation operations.
@@ -325,11 +323,11 @@ pub(super) async fn handle_get_sandbox_provider_status(
         // historical receipts remain queryable after the provider is deleted.
         state
             .store
-            .get_by_name(Provider::object_type(), &workspace, &request.provider_name)
+            .get_by_name(Provider::object_type(), &workspace, &request.provider)
             .await
             .map_err(|_| registry_unavailable())?
             .ok_or_else(|| Status::not_found("provider not found"))?;
-        let current = current_target_identity(state, &sandbox, &request.provider_name).await?;
+        let current = current_target_identity(state, &sandbox, &request.provider).await?;
         let provider = (!current.provider_id.is_empty()).then_some((
             current.provider_id.as_str(),
             current.provider_resource_version,
@@ -337,7 +335,7 @@ pub(super) async fn handle_get_sandbox_provider_status(
         record_provider_mutation(
             state,
             &sandbox,
-            &request.provider_name,
+            &request.provider,
             ProviderMutationKind::Observe,
             provider,
             &Uuid::new_v4().to_string(),
@@ -360,27 +358,25 @@ pub(super) async fn handle_get_sandbox_provider_status(
             .desired
             .as_ref()
             .is_none_or(|desired| desired.sandbox_id != sandbox.object_id())
-        || (!request.provider_name.is_empty() && receipt.provider_name != request.provider_name)
+        || (!request.provider.is_empty() && receipt.provider != request.provider)
     {
         return Err(Status::not_found("provider receipt not found"));
     }
-    let current_authority =
-        current_target_identity(state, &sandbox, &receipt.provider_name).await?;
-    let (current, current_reason) = if let Ok(snapshot) =
-        load_current_snapshot(state, &sandbox, &receipt.provider_name).await
-    {
-        snapshot
-    } else {
-        // A temporarily unreadable config cannot prove supersession or
-        // completion. Metadata changes remain comparable independently.
-        let mut fallback = current_authority;
-        if let Some(desired) = receipt.desired.as_ref() {
-            fallback.provider_env_revision = desired.provider_env_revision;
-            fallback.config_revision = desired.config_revision;
-            fallback.policy_hash.clone_from(&desired.policy_hash);
-        }
-        (fallback, ProviderReadinessReason::CredentialsWithheld)
-    };
+    let current_authority = current_target_identity(state, &sandbox, &receipt.provider).await?;
+    let (current, current_reason) =
+        if let Ok(snapshot) = load_current_snapshot(state, &sandbox, &receipt.provider).await {
+            snapshot
+        } else {
+            // A temporarily unreadable config cannot prove supersession or
+            // completion. Metadata changes remain comparable independently.
+            let mut fallback = current_authority;
+            if let Some(desired) = receipt.desired.as_ref() {
+                fallback.provider_env_revision = desired.provider_env_revision;
+                fallback.config_revision = desired.config_revision;
+                fallback.policy_hash.clone_from(&desired.policy_hash);
+            }
+            (fallback, ProviderReadinessReason::CredentialsWithheld)
+        };
     // Refresh lifecycle identity after configuration reads. Another gateway
     // replica may have accepted a new supervisor while this replica retained
     // the predecessor's local connection and installation evidence.

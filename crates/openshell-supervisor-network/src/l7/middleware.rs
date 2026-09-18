@@ -90,7 +90,7 @@ impl HttpMiddlewareExchange {
             request_context: openshell_core::proto::RequestContext {
                 request_id: self.request_id.clone(),
                 sandbox_id: sandbox.sandbox_id.clone(),
-                sandbox_name: sandbox.sandbox_name.clone(),
+                sandbox: sandbox.sandbox_name.clone(),
                 workspace: ctx.workspace.clone(),
                 originating_process: None,
             },

@@ -315,7 +315,7 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
     // String fields.
     for (field, value) in [
         ("spec.template.image", &tmpl.image),
-        ("spec.template.runtime_class_name", &tmpl.runtime_class_name),
+        ("spec.template.runtime_class", &tmpl.runtime_class),
         ("spec.template.agent_socket", &tmpl.agent_socket),
     ] {
         if value.len() > MAX_TEMPLATE_STRING_LEN {
@@ -1428,7 +1428,7 @@ mod tests {
             environment: std::iter::once(("KEY".to_string(), "val".to_string())).collect(),
             template: Some(SandboxTemplate {
                 image: "nvcr.io/test:latest".to_string(),
-                runtime_class_name: "kata".to_string(),
+                runtime_class: "kata".to_string(),
                 labels: std::iter::once(("app".to_string(), "test".to_string())).collect(),
                 ..Default::default()
             }),
@@ -1477,7 +1477,7 @@ mod tests {
     fn validate_exec_request_rejects_reserved_env_key() {
         let req = ExecSandboxRequest {
             sandbox: "id".to_string(),
-            workspace: String::new(),
+            workspace_scope: None,
             command: vec!["echo".to_string()],
             environment: std::iter::once(("OPENSHELL_SANDBOX_ID".to_string(), "evil".to_string()))
                 .collect(),
@@ -1495,7 +1495,7 @@ mod tests {
     fn validate_exec_request_allows_pyfunc_helper_key() {
         let req = ExecSandboxRequest {
             sandbox: "id".to_string(),
-            workspace: String::new(),
+            workspace_scope: None,
             command: vec!["python".to_string()],
             environment: std::iter::once(("OPENSHELL_PYFUNC_B64".to_string(), "data".to_string()))
                 .collect(),
@@ -2402,7 +2402,7 @@ mod tests {
     fn validate_exec_allows_newlines_in_command_args() {
         let req = ExecSandboxRequest {
             sandbox: "test".to_string(),
-            workspace: String::new(),
+            workspace_scope: None,
             command: vec![
                 "python3".to_string(),
                 "-c".to_string(),
@@ -2417,7 +2417,7 @@ mod tests {
     fn validate_exec_still_rejects_null_bytes_in_command_args() {
         let req = ExecSandboxRequest {
             sandbox: "test".to_string(),
-            workspace: String::new(),
+            workspace_scope: None,
             command: vec!["echo".to_string(), "hello\x00world".to_string()],
             ..Default::default()
         };
@@ -2429,7 +2429,7 @@ mod tests {
     fn validate_exec_still_rejects_newlines_in_workdir() {
         let req = ExecSandboxRequest {
             sandbox: "test".to_string(),
-            workspace: String::new(),
+            workspace_scope: None,
             command: vec!["ls".to_string()],
             workdir: "/tmp\nmalicious".to_string(),
             ..Default::default()
@@ -2442,7 +2442,7 @@ mod tests {
     fn validate_exec_still_rejects_newlines_in_env_values() {
         let req = ExecSandboxRequest {
             sandbox: "test".to_string(),
-            workspace: String::new(),
+            workspace_scope: None,
             command: vec!["ls".to_string()],
             environment: std::iter::once(("VAR".to_string(), "val\nmalicious".to_string()))
                 .collect(),

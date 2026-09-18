@@ -316,7 +316,7 @@ impl CredentialRuntime {
                     .cloned();
                 let mut handle = driver
                     .store_credential(StoreCredentialRequest {
-                        provider_name: provider_name.to_string(),
+                        provider: provider_name.to_string(),
                         credential_key: credential_key.clone(),
                         value: value.clone(),
                         existing_handle,
@@ -589,7 +589,7 @@ impl CredentialRuntime {
         let driver = self.connected_driver(&driver_name)?;
         driver
             .delete_credential(DeleteCredentialRequest {
-                provider_name: provider_name.to_string(),
+                provider: provider_name.to_string(),
                 credential_key: credential_key.to_string(),
                 handle: Some(handle),
                 workspace: workspace.to_string(),
@@ -639,7 +639,7 @@ impl CredentialRuntime {
                 .or_default()
                 .push(ResolveCredentialRequest {
                     request_id,
-                    provider_name: provider_name.clone(),
+                    provider: provider_name.clone(),
                     credential_key: credential_key.clone(),
                     handle: Some(selected_handle),
                     workspace: workspace.clone(),
@@ -1789,7 +1789,7 @@ impl CredentialDriver for TestStaticCredentialDriver {
             .unwrap_or_else(|| {
                 format!(
                     "{}:{}:{}",
-                    request.provider_name, request.credential_key, request.object_id
+                    request.provider, request.credential_key, request.object_id
                 )
             });
         self.values

@@ -26,6 +26,7 @@ use openshell_core::proto::{
     ServiceEndpointResponse, StartSandboxRequest, StopSandboxRequest, UndoDraftChunkRequest,
     UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
+    WorkspaceSelector,
 };
 use openshell_core::{GetResourceVersion, ObjectId};
 use prost::Message;
@@ -37,7 +38,9 @@ use super::{
     storage_error, uncertain,
 };
 use crate::auth::principal::Principal;
-use crate::auth::workspace_authz::{MinWorkspaceRole, authorize_workspace};
+use crate::auth::workspace_authz::{
+    MinWorkspaceRole, authorize_workspace, selected_workspace_name,
+};
 use crate::grpc::{policy, provider, sandbox, service};
 use crate::persistence::{ObjectType, SetResourceVersion, Store};
 use crate::storage_proto::{
@@ -283,9 +286,10 @@ async fn live<T: Message + Default + ObjectType + SetResourceVersion>(
 async fn selected_scope(
     state: &ServerState,
     principal: &Principal,
-    workspace: &str,
+    workspace_scope: Option<&WorkspaceSelector>,
     role: MinWorkspaceRole,
 ) -> Result<Scope, Status> {
+    let workspace = selected_workspace_name(workspace_scope)?;
     let authz =
         authorize_workspace(&state.store, &state.admin_role, principal, workspace, role).await?;
     named_scope(state, &authz.workspace).await
@@ -294,10 +298,10 @@ async fn selected_scope(
 async fn sandbox_scope(
     state: &ServerState,
     principal: &Principal,
-    workspace: &str,
+    workspace_scope: Option<&WorkspaceSelector>,
     role: MinWorkspaceRole,
 ) -> Result<Scope, Status> {
-    selected_scope(state, principal, workspace, role)
+    selected_scope(state, principal, workspace_scope, role)
         .await
         .map_err(|status| {
             if status.code() == tonic::Code::PermissionDenied {
@@ -311,11 +315,12 @@ async fn sandbox_scope(
 async fn profile_scope(
     state: &ServerState,
     principal: &Principal,
-    workspace: &str,
+    workspace_scope: Option<&WorkspaceSelector>,
 ) -> Result<Scope, Status> {
-    if workspace.is_empty() {
+    let Some(workspace_scope) = workspace_scope else {
         return global_scope(state, principal);
-    }
+    };
+    let workspace = selected_workspace_name(Some(workspace_scope))?;
     let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
@@ -368,7 +373,13 @@ macro_rules! scoped_mutation {
             $method,
             $handler,
             async |req: &$req, state: &ServerState, principal: &Principal| {
-                selected_scope(state, principal, &req.workspace, MinWorkspaceRole::$role).await
+                selected_scope(
+                    state,
+                    principal,
+                    req.workspace_scope.as_ref(),
+                    MinWorkspaceRole::$role,
+                )
+                .await
             },
             $capture,
             $restore
@@ -384,7 +395,13 @@ macro_rules! sandbox_scoped_mutation {
             $method,
             $handler,
             async |req: &$req, state: &ServerState, principal: &Principal| {
-                sandbox_scope(state, principal, &req.workspace, MinWorkspaceRole::$role).await
+                sandbox_scope(
+                    state,
+                    principal,
+                    req.workspace_scope.as_ref(),
+                    MinWorkspaceRole::$role,
+                )
+                .await
             },
             $capture,
             $restore
@@ -660,7 +677,13 @@ ordinary_deletion!(
     "DeleteService",
     service::handle_delete_service,
     async |req: &DeleteServiceRequest, state: &ServerState, principal: &Principal| {
-        sandbox_scope(state, principal, &req.workspace, MinWorkspaceRole::User).await
+        sandbox_scope(
+            state,
+            principal,
+            req.workspace_scope.as_ref(),
+            MinWorkspaceRole::User,
+        )
+        .await
     }
 );
 ordinary_deletion!(
@@ -669,7 +692,13 @@ ordinary_deletion!(
     "DeleteProvider",
     provider::handle_delete_provider,
     async |req: &DeleteProviderRequest, state: &ServerState, principal: &Principal| {
-        selected_scope(state, principal, &req.workspace, MinWorkspaceRole::Admin).await
+        selected_scope(
+            state,
+            principal,
+            req.workspace_scope.as_ref(),
+            MinWorkspaceRole::Admin,
+        )
+        .await
     }
 );
 ordinary_deletion!(
@@ -678,7 +707,13 @@ ordinary_deletion!(
     "DeleteProviderRefresh",
     provider::handle_delete_provider_refresh,
     async |req: &DeleteProviderRefreshRequest, state: &ServerState, principal: &Principal| {
-        selected_scope(state, principal, &req.workspace, MinWorkspaceRole::Admin).await
+        selected_scope(
+            state,
+            principal,
+            req.workspace_scope.as_ref(),
+            MinWorkspaceRole::Admin,
+        )
+        .await
     }
 );
 ordinary_deletion!(
@@ -687,7 +722,7 @@ ordinary_deletion!(
     "DeleteProviderProfile",
     provider::handle_delete_provider_profile,
     async |req: &DeleteProviderProfileRequest, state: &ServerState, principal: &Principal| {
-        profile_scope(state, principal, &req.workspace).await
+        profile_scope(state, principal, req.workspace_scope.as_ref()).await
     }
 );
 
@@ -712,7 +747,7 @@ mutation!(
     "ImportProviderProfiles",
     provider::handle_import_provider_profiles,
     async |req: &ImportProviderProfilesRequest, state: &ServerState, principal: &Principal| {
-        profile_scope(state, principal, &req.workspace).await
+        profile_scope(state, principal, req.workspace_scope.as_ref()).await
     },
     |response: &Response<ImportProviderProfilesResponse>| {
         let value = response.get_ref();
@@ -749,7 +784,7 @@ mutation!(
     "UpdateProviderProfiles",
     provider::handle_update_provider_profiles,
     async |req: &UpdateProviderProfilesRequest, state: &ServerState, principal: &Principal| {
-        profile_scope(state, principal, &req.workspace).await
+        profile_scope(state, principal, req.workspace_scope.as_ref()).await
     },
     |response: &Response<UpdateProviderProfilesResponse>| {
         let value = response.get_ref();
@@ -836,14 +871,20 @@ mutation!(
     policy::handle_update_config,
     async |req: &UpdateConfigRequest, state: &ServerState, principal: &Principal| {
         if req.global {
-            if !req.workspace.is_empty() {
+            if req.workspace_scope.is_some() {
                 return Err(Status::invalid_argument(
                     "workspace must be omitted when global is true",
                 ));
             }
             global_scope(state, principal)
         } else {
-            sandbox_scope(state, principal, &req.workspace, MinWorkspaceRole::Admin).await
+            sandbox_scope(
+                state,
+                principal,
+                req.workspace_scope.as_ref(),
+                MinWorkspaceRole::Admin,
+            )
+            .await
         }
     },
     |response: &Response<UpdateConfigResponse>| {

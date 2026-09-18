@@ -272,7 +272,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<proto::GetSandboxTemplateRequest>,
     ) -> Result<Response<proto::SandboxTemplateResponse>, Status> {
         let request = request.into_inner();
-        let workspace = &request.workspace;
+        let workspace = selected_workspace(&request.workspace_scope).unwrap_or_default();
         let template = workload_template_proto(&request.name, workspace);
         *self.state.last_template_get.lock().await = Some(request);
         Ok(Response::new(proto::SandboxTemplateResponse {
@@ -311,9 +311,9 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<proto::SandboxResponse>, Status> {
         let request = request.into_inner();
         let sandbox = sandbox_with_phase_ws(
-            request.sandbox.as_str(),
+            request.name.as_str(),
             proto::SandboxPhase::Stopped,
-            &request.workspace,
+            selected_workspace(&request.workspace_scope).unwrap_or_default(),
         );
         *self.state.last_stop.lock().await = Some(request);
         Ok(Response::new(proto::SandboxResponse {
@@ -327,9 +327,9 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<proto::SandboxResponse>, Status> {
         let request = request.into_inner();
         let sandbox = sandbox_with_phase_ws(
-            request.sandbox.as_str(),
+            request.name.as_str(),
             proto::SandboxPhase::Starting,
-            &request.workspace,
+            selected_workspace(&request.workspace_scope).unwrap_or_default(),
         );
         *self.state.last_start.lock().await = Some(request);
         Ok(Response::new(proto::SandboxResponse {
@@ -342,9 +342,10 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<proto::GetSandboxRequest>,
     ) -> Result<Response<proto::SandboxResponse>, Status> {
         let req = request.into_inner();
-        let name = req.sandbox.clone();
+        let name = req.name.clone();
         *self.state.last_get_name.lock().await = Some(name.clone());
-        *self.state.last_get_workspace.lock().await = Some(req.workspace.clone());
+        *self.state.last_get_workspace.lock().await =
+            selected_workspace(&req.workspace_scope).map(ToString::to_string);
         let count = self.state.get_calls.fetch_add(1, Ordering::SeqCst);
 
         if let Some(error) = &self.state.get_error {
@@ -443,8 +444,9 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<proto::DeleteSandboxRequest>,
     ) -> Result<Response<proto::DeleteSandboxResponse>, Status> {
         let req = request.into_inner();
-        *self.state.last_delete_name.lock().await = Some(req.sandbox.clone());
-        *self.state.last_delete_workspace.lock().await = Some(req.workspace.clone());
+        *self.state.last_delete_name.lock().await = Some(req.name.clone());
+        *self.state.last_delete_workspace.lock().await =
+            selected_workspace(&req.workspace_scope).map(ToString::to_string);
         if let Some(response) = &self.state.delete_response {
             return Ok(Response::new(response.clone()));
         }
@@ -1031,7 +1033,7 @@ async fn create_sandbox_from_template_passes_template_name() {
 
     let observed = state.last_create.lock().await.clone().unwrap();
     assert_eq!(observed.name, "from-template");
-    assert_eq!(observed.workload_template_name, "python");
+    assert_eq!(observed.workload_template, "python");
     let observed_spec = observed.spec.unwrap();
     assert_eq!(observed_spec.providers, vec!["openai".to_string()]);
     assert_eq!(observed_spec.command, vec!["python", "-m", "agent"]);
@@ -1052,7 +1054,10 @@ async fn sandbox_template_crud_uses_default_workspace() {
     assert_eq!(created.metadata.as_ref().unwrap().name, "python");
 
     let observed_create = state.last_template_create.lock().await.clone().unwrap();
-    assert_eq!(Some(observed_create.workspace.as_str()), Some("default"));
+    assert_eq!(
+        selected_workspace(&observed_create.workspace_scope),
+        Some("default")
+    );
     assert_eq!(
         observed_create
             .template
@@ -1067,7 +1072,10 @@ async fn sandbox_template_crud_uses_default_workspace() {
     assert_eq!(fetched.metadata.as_ref().unwrap().name, "python");
     let observed_get = state.last_template_get.lock().await.clone().unwrap();
     assert_eq!(observed_get.name, "python");
-    assert_eq!(Some(observed_get.workspace.as_str()), Some("default"));
+    assert_eq!(
+        selected_workspace(&observed_get.workspace_scope),
+        Some("default")
+    );
 
     let listed = client
         .list_all_sandbox_templates_all_workspaces(SandboxTemplateListOptions {
@@ -1090,7 +1098,10 @@ async fn sandbox_template_crud_uses_default_workspace() {
     assert_eq!(deleted.outcome, openshell_sdk::DeletionOutcome::Completed);
     let observed_delete = state.last_template_delete.lock().await.clone().unwrap();
     assert_eq!(observed_delete.name, "python");
-    assert_eq!(Some(observed_delete.workspace.as_str()), Some("default"));
+    assert_eq!(
+        selected_workspace(&observed_delete.workspace_scope),
+        Some("default")
+    );
 }
 
 #[tokio::test]
@@ -1229,8 +1240,8 @@ async fn stop_and_start_map_requests_and_phases() {
     let stopped = client.stop_sandbox("sleepy").await.unwrap();
     assert_eq!(stopped.phase, SandboxPhase::Stopped);
     let stop = state.last_stop.lock().await.clone().unwrap();
-    assert_eq!(Some(stop.sandbox.as_str()), Some("sleepy"));
-    assert_eq!(Some(stop.workspace.as_str()), Some("default"));
+    assert_eq!(Some(stop.name.as_str()), Some("sleepy"));
+    assert_eq!(selected_workspace(&stop.workspace_scope), Some("default"));
 
     let started = client
         .workspace("team-a")
@@ -1239,8 +1250,8 @@ async fn stop_and_start_map_requests_and_phases() {
         .unwrap();
     assert_eq!(started.phase, SandboxPhase::Starting);
     let start = state.last_start.lock().await.clone().unwrap();
-    assert_eq!(Some(start.sandbox.as_str()), Some("sleepy"));
-    assert_eq!(Some(start.workspace.as_str()), Some("team-a"));
+    assert_eq!(Some(start.name.as_str()), Some("sleepy"));
+    assert_eq!(selected_workspace(&start.workspace_scope), Some("team-a"));
 }
 
 #[tokio::test]
@@ -1624,7 +1635,10 @@ async fn workspace_scoped_create_passes_workspace() {
     assert_eq!(result.name, "my-box");
 
     let observed = state.last_create.lock().await.clone().unwrap();
-    assert_eq!(Some(observed.workspace.as_str()), Some("staging"));
+    assert_eq!(
+        selected_workspace(&observed.workspace_scope),
+        Some("staging")
+    );
 }
 
 #[tokio::test]
@@ -1649,8 +1663,11 @@ async fn workspace_scoped_create_from_template_passes_workspace() {
     assert_eq!(sandbox.name, "from-template");
 
     let observed = state.last_create.lock().await.clone().unwrap();
-    assert_eq!(Some(observed.workspace.as_str()), Some("staging"));
-    assert_eq!(observed.workload_template_name, "python");
+    assert_eq!(
+        selected_workspace(&observed.workspace_scope),
+        Some("staging")
+    );
+    assert_eq!(observed.workload_template, "python");
     assert_eq!(observed.spec.unwrap().policy.unwrap().version, 2);
 }
 
@@ -1696,12 +1713,18 @@ async fn workspace_scoped_sandbox_template_crud_passes_workspace() {
         .await
         .unwrap();
     let observed_create = state.last_template_create.lock().await.clone().unwrap();
-    assert_eq!(Some(observed_create.workspace.as_str()), Some("staging"));
+    assert_eq!(
+        selected_workspace(&observed_create.workspace_scope),
+        Some("staging")
+    );
 
     ws.get_sandbox_template("python").await.unwrap();
     let observed_get = state.last_template_get.lock().await.clone().unwrap();
     assert_eq!(observed_get.name, "python");
-    assert_eq!(Some(observed_get.workspace.as_str()), Some("staging"));
+    assert_eq!(
+        selected_workspace(&observed_get.workspace_scope),
+        Some("staging")
+    );
 
     let listed = ws
         .list_all_sandbox_templates(SandboxTemplateListOptions::default())
@@ -1728,7 +1751,10 @@ async fn workspace_scoped_sandbox_template_crud_passes_workspace() {
     assert_eq!(deleted.outcome, openshell_sdk::DeletionOutcome::Completed);
     let observed_delete = state.last_template_delete.lock().await.clone().unwrap();
     assert_eq!(observed_delete.name, "python");
-    assert_eq!(Some(observed_delete.workspace.as_str()), Some("staging"));
+    assert_eq!(
+        selected_workspace(&observed_delete.workspace_scope),
+        Some("staging")
+    );
 }
 
 #[tokio::test]

@@ -197,7 +197,7 @@ const template: SandboxWorkloadTemplate = await client.sandboxTemplates.create(
 )
 
 const sandbox = await client.sandbox.createFromTemplate({
-  templateName: template.metadata!.name,
+  workloadTemplate: template.metadata!.name,
   workspace: 'default',
   providers: ['github'],
   policy: { version: 1, networkPolicies: {} },

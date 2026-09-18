@@ -93,7 +93,7 @@ fn observation_id(
     // component concatenation ambiguities across workspaces and provider names.
     for component in [
         receipt.workspace.as_bytes(),
-        receipt.provider_name.as_bytes(),
+        receipt.provider.as_bytes(),
         target_bytes.as_slice(),
     ] {
         let length = u64::try_from(component.len()).map_err(|_| invalid_record())?;
@@ -198,7 +198,7 @@ pub async fn record_provider_operation(
             let existing =
                 get_provider_operation(store, &receipt.receipt_id, &receipt.workspace).await?;
             if existing.receipt.kind != receipt.kind
-                || existing.receipt.provider_name != receipt.provider_name
+                || existing.receipt.provider != receipt.provider
                 || existing.receipt.desired != receipt.desired
                 || existing.snapshot_reason != snapshot_reason
             {
@@ -427,7 +427,7 @@ mod tests {
         ProviderMutationReceipt {
             receipt_id: Uuid::new_v4().to_string(),
             mutation_id: Uuid::new_v4().to_string(),
-            provider_name: "provider".to_string(),
+            provider: "provider".to_string(),
             workspace: "default".to_string(),
             kind: ProviderMutationKind::Update.into(),
             desired: Some(ProviderDesiredIdentity {

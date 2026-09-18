@@ -165,7 +165,7 @@ func TestGetGatewayInfo_Success(t *testing.T) {
 			{
 				Name: "k8s",
 				Capabilities: &pb.ComputeDriverCapabilities{
-					DriverName:    "kubernetes",
+					Name:          "kubernetes",
 					DriverVersion: "2.1.0",
 				},
 			},
@@ -183,7 +183,7 @@ func TestGetGatewayInfo_Success(t *testing.T) {
 	assert.Equal(t, "1.5.0", info.Version)
 	require.Len(t, info.ComputeDrivers, 1)
 	assert.Equal(t, "k8s", info.ComputeDrivers[0].Name)
-	assert.Equal(t, "kubernetes", info.ComputeDrivers[0].DriverName)
+	assert.Equal(t, "kubernetes", info.ComputeDrivers[0].Driver)
 	assert.Equal(t, "2.1.0", info.ComputeDrivers[0].DriverVersion)
 }
 

@@ -41,7 +41,7 @@ pub(super) async fn handle_expose_service(
         state,
         &principal,
         &req.sandbox,
-        &req.workspace,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
         MinWorkspaceRole::User,
     )
     .await?;
@@ -50,13 +50,13 @@ pub(super) async fn handle_expose_service(
             .await?
             .ensure_active()?;
     let sandbox_name = sandbox.object_name();
-    validate_optional_endpoint_name("service", &req.service, MAX_SERVICE_NAME_LEN)?;
+    validate_optional_endpoint_name("service", &req.name, MAX_SERVICE_NAME_LEN)?;
     if req.target_port == 0 || req.target_port > u32::from(u16::MAX) {
         return Err(Status::invalid_argument("target_port must be in 1..=65535"));
     }
 
     let now = crate::persistence::current_time_ms();
-    let key = service_routing::endpoint_key(sandbox_name, &req.service);
+    let key = service_routing::endpoint_key(sandbox_name, &req.name);
 
     // Fetch existing endpoint to determine create vs. update path
     let existing = state
@@ -111,7 +111,7 @@ pub(super) async fn handle_expose_service(
         }),
         sandbox_id: sandbox.object_id().to_string(),
         sandbox: sandbox_name.to_string(),
-        service_name: req.service.clone(),
+        name: req.name.clone(),
         target_port: req.target_port,
         domain: true,
     };
@@ -136,7 +136,7 @@ pub(super) async fn handle_expose_service(
         meta.resource_version = result.resource_version;
     }
 
-    let url = service_routing::endpoint_url(&state.config, &workspace, sandbox_name, &req.service)
+    let url = service_routing::endpoint_url(&state.config, &workspace, sandbox_name, &req.name)
         .unwrap_or_default();
     service_routing::emit_service_endpoint_config_event(&endpoint, &url, created);
 
@@ -156,15 +156,15 @@ pub(super) async fn handle_get_service(
         state,
         &principal,
         &req.sandbox,
-        &req.workspace,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
         MinWorkspaceRole::User,
     )
     .await?;
     let workspace = sandbox.object_workspace();
     let sandbox_name = sandbox.object_name();
-    validate_optional_endpoint_name("service", &req.service, MAX_SERVICE_NAME_LEN)?;
+    validate_optional_endpoint_name("service", &req.name, MAX_SERVICE_NAME_LEN)?;
 
-    let endpoint = get_service_endpoint(state, workspace, sandbox_name, &req.service)
+    let endpoint = get_service_endpoint(state, workspace, sandbox_name, &req.name)
         .await?
         .ok_or_else(|| Status::not_found("service endpoint not found"))?;
 
@@ -268,15 +268,15 @@ pub(super) async fn handle_delete_service(
         state,
         &principal,
         &req.sandbox,
-        &req.workspace,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
         MinWorkspaceRole::User,
     )
     .await?;
     let workspace = sandbox.object_workspace();
     let sandbox_name = sandbox.object_name();
-    validate_optional_endpoint_name("service", &req.service, MAX_SERVICE_NAME_LEN)?;
+    validate_optional_endpoint_name("service", &req.name, MAX_SERVICE_NAME_LEN)?;
 
-    let endpoint = get_service_endpoint(state, workspace, sandbox_name, &req.service).await?;
+    let endpoint = get_service_endpoint(state, workspace, sandbox_name, &req.name).await?;
     let Some(endpoint) = endpoint else {
         return Ok(Response::new(DeleteServiceResponse {
             outcome: super::deletion_outcome(false, req.allow_missing, "service endpoint")?,
@@ -329,13 +329,9 @@ fn service_endpoint_response(
     endpoint: ServiceEndpoint,
 ) -> ServiceEndpointResponse {
     let workspace = endpoint.object_workspace();
-    let url = service_routing::endpoint_url(
-        &state.config,
-        workspace,
-        &endpoint.sandbox,
-        &endpoint.service_name,
-    )
-    .unwrap_or_default();
+    let url =
+        service_routing::endpoint_url(&state.config, workspace, &endpoint.sandbox, &endpoint.name)
+            .unwrap_or_default();
     ServiceEndpointResponse {
         endpoint: Some(endpoint),
         url,
@@ -452,8 +448,10 @@ mod tests {
             authed_request(ExposeServiceRequest {
                 request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
-                workspace: "default".to_string(),
-                service: "web".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                name: "web".to_string(),
                 target_port: 8080,
                 domain: true,
             }),
@@ -478,17 +476,16 @@ mod tests {
         .unwrap()
         .into_inner();
         assert_eq!(listed.services.len(), 1);
-        assert_eq!(
-            listed.services[0].endpoint.as_ref().unwrap().service_name,
-            "web"
-        );
+        assert_eq!(listed.services[0].endpoint.as_ref().unwrap().name, "web");
 
         let fetched = handle_get_service(
             &state,
             authed_request(GetServiceRequest {
                 sandbox: "my-sandbox".to_string(),
-                workspace: "default".to_string(),
-                service: "web".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                name: "web".to_string(),
             }),
         )
         .await
@@ -502,8 +499,10 @@ mod tests {
                 request_id: String::new(),
                 allow_missing: false,
                 sandbox: "my-sandbox".to_string(),
-                workspace: "default".to_string(),
-                service: "web".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                name: "web".to_string(),
             }),
         )
         .await
@@ -518,8 +517,10 @@ mod tests {
             &state,
             authed_request(GetServiceRequest {
                 sandbox: "my-sandbox".to_string(),
-                workspace: "default".to_string(),
-                service: "web".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                name: "web".to_string(),
             }),
         )
         .await
@@ -552,8 +553,8 @@ mod tests {
             &state,
             authed_request(ExposeServiceRequest {
                 sandbox: "my-sandbox".into(),
-                workspace: "default".into(),
-                service: "web".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "web".into(),
                 target_port: 8080,
                 ..Default::default()
             }),
@@ -567,8 +568,8 @@ mod tests {
         let probe = Arc::new(DeleteServiceProbe::default());
         let mut request = authed_request(DeleteServiceRequest {
             sandbox: "my-sandbox".into(),
-            workspace: "default".into(),
-            service: "web".into(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            name: "web".into(),
             allow_missing: true,
             ..Default::default()
         });
@@ -618,8 +619,10 @@ mod tests {
                 authed_request(ExposeServiceRequest {
                     request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
-                    workspace: "default".to_string(),
-                    service: "web".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    name: "web".to_string(),
                     target_port: 8080,
                     domain: true,
                 }),
@@ -634,8 +637,10 @@ mod tests {
                 authed_request(ExposeServiceRequest {
                     request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
-                    workspace: "default".to_string(),
-                    service: "web".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    name: "web".to_string(),
                     target_port: 9090,
                     domain: true,
                 }),
@@ -684,8 +689,10 @@ mod tests {
             authed_request(ExposeServiceRequest {
                 request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
-                workspace: "default".to_string(),
-                service: "web".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                name: "web".to_string(),
                 target_port: 7070,
                 domain: true,
             }),
@@ -701,8 +708,10 @@ mod tests {
                 authed_request(ExposeServiceRequest {
                     request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
-                    workspace: "default".to_string(),
-                    service: "web".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    name: "web".to_string(),
                     target_port: 8080,
                     domain: true,
                 }),
@@ -717,8 +726,10 @@ mod tests {
                 authed_request(ExposeServiceRequest {
                     request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
-                    workspace: "default".to_string(),
-                    service: "web".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    name: "web".to_string(),
                     target_port: 9090,
                     domain: true,
                 }),
@@ -742,8 +753,10 @@ mod tests {
             &state,
             authed_request(GetServiceRequest {
                 sandbox: "my-sandbox".to_string(),
-                workspace: "default".to_string(),
-                service: "web".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                name: "web".to_string(),
             }),
         )
         .await
@@ -803,8 +816,10 @@ mod tests {
             authed_request(ExposeServiceRequest {
                 request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
-                workspace: "default".to_string(),
-                service: "web".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                name: "web".to_string(),
                 target_port: 8080,
                 domain: true,
             }),
@@ -817,8 +832,10 @@ mod tests {
             authed_request(ExposeServiceRequest {
                 request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
-                workspace: "beta".to_string(),
-                service: "web".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "beta".to_string(),
+                )),
+                name: "web".to_string(),
                 target_port: 9090,
                 domain: true,
             }),
@@ -831,8 +848,10 @@ mod tests {
             &state,
             authed_request(GetServiceRequest {
                 sandbox: "my-sandbox".to_string(),
-                workspace: "default".to_string(),
-                service: "web".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                name: "web".to_string(),
             }),
         )
         .await
@@ -845,8 +864,10 @@ mod tests {
             &state,
             authed_request(GetServiceRequest {
                 sandbox: "my-sandbox".to_string(),
-                workspace: "beta".to_string(),
-                service: "web".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "beta".to_string(),
+                )),
+                name: "web".to_string(),
             }),
         )
         .await
@@ -902,8 +923,10 @@ mod tests {
                 request_id: String::new(),
                 allow_missing: false,
                 sandbox: "my-sandbox".to_string(),
-                workspace: "default".to_string(),
-                service: "web".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                name: "web".to_string(),
             }),
         )
         .await
@@ -934,8 +957,10 @@ mod tests {
             &state,
             authed_request(GetServiceRequest {
                 sandbox: "my-sandbox".to_string(),
-                workspace: "beta".to_string(),
-                service: "web".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "beta".to_string(),
+                )),
+                name: "web".to_string(),
             }),
         )
         .await
@@ -950,8 +975,10 @@ mod tests {
             authed_request(ExposeServiceRequest {
                 request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
-                workspace: "default".to_string(),
-                service: "api".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                name: "api".to_string(),
                 target_port: 3000,
                 domain: true,
             }),
@@ -1003,7 +1030,9 @@ mod tests {
             &state,
             non_member_request(ExposeServiceRequest {
                 sandbox: ("any").to_string(),
-                workspace: "no-such-ws".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "no-such-ws".to_string(),
+                )),
                 ..Default::default()
             }),
         )
@@ -1020,7 +1049,9 @@ mod tests {
             &state,
             non_member_request(GetServiceRequest {
                 sandbox: ("any").to_string(),
-                workspace: "no-such-ws".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "no-such-ws".to_string(),
+                )),
                 ..Default::default()
             }),
         )
@@ -1055,7 +1086,9 @@ mod tests {
             non_member_request(DeleteServiceRequest {
                 allow_missing: false,
                 sandbox: ("any").to_string(),
-                workspace: "no-such-ws".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "no-such-ws".to_string(),
+                )),
                 ..Default::default()
             }),
         )

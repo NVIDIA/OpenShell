@@ -331,7 +331,7 @@ func TestAddMember_Success(t *testing.T) {
 	require.NotNil(t, m)
 	assert.Equal(t, "user@example.com", m.PrincipalSubject)
 	assert.Equal(t, WorkspaceRoleAdmin, m.Role)
-	assert.Equal(t, "test-ws", mock.lastAddMemberReq.GetWorkspace())
+	assert.Equal(t, "test-ws", mock.lastAddMemberReq.GetWorkspaceScope().GetWorkspace())
 	assert.Equal(t, "user@example.com", mock.lastAddMemberReq.GetPrincipalSubject())
 }
 

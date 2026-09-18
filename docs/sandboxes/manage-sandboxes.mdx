@@ -434,7 +434,7 @@ with SandboxClient.from_active_cluster() as client:
         image="ghcr.io/nvidia/openshell-community/sandboxes/python:latest",
     )
 
-    sandbox = client.create_from_template(workspace="default", template_name="python")
+    sandbox = client.create_from_template(workspace="default", workload_template="python")
 ```
 
 For non-interactive automation, pass a renewable client-credentials provider.

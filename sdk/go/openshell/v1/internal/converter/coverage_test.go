@@ -43,15 +43,15 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxTemplate(t *testing.T) {
 	handled := fieldSet{
-		"image":              true,
-		"runtime_class_name": true,
-		"agent_socket":       true,
-		"labels":             true,
-		"annotations":        true,
-		"environment":        true,
-		"resources":          true,
-		"user_namespaces":    true,
-		"driver_config":      true,
+		"image":           true,
+		"runtime_class":   true,
+		"agent_socket":    true,
+		"labels":          true,
+		"annotations":     true,
+		"environment":     true,
+		"resources":       true,
+		"user_namespaces": true,
+		"driver_config":   true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxTemplate{}).ProtoReflect().Descriptor(), handled, nil)

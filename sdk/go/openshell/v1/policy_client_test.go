@@ -208,7 +208,7 @@ func TestPolicyGetDraft(t *testing.T) {
 			{
 				Id:               "chunk-1",
 				Status:           "pending",
-				RuleName:         "allow-dns",
+				Rule:             "allow-dns",
 				Rationale:        "DNS access needed",
 				Confidence:       0.95,
 				DenialSummaryIds: []string{"ds-1", "ds-2"},
@@ -221,9 +221,9 @@ func TestPolicyGetDraft(t *testing.T) {
 				},
 			},
 			{
-				Id:       "chunk-2",
-				Status:   "approved",
-				RuleName: "allow-https",
+				Id:     "chunk-2",
+				Status: "approved",
+				Rule:   "allow-https",
 			},
 		},
 		RollingSummary:   "Two rules proposed",
@@ -255,7 +255,7 @@ func TestPolicyGetDraft(t *testing.T) {
 	c1 := draft.Chunks[0]
 	assert.Equal(t, "chunk-1", c1.ID)
 	assert.Equal(t, "pending", c1.Status)
-	assert.Equal(t, "allow-dns", c1.RuleName)
+	assert.Equal(t, "allow-dns", c1.Rule)
 	assert.Equal(t, "DNS access needed", c1.Rationale)
 	assert.InDelta(t, float32(0.95), c1.Confidence, 0.001)
 	assert.Equal(t, []string{"ds-1", "ds-2"}, c1.DenialSummaryIDs)
@@ -735,7 +735,7 @@ func TestPolicyGetStatus_WithoutGlobal_PreservesExistingBehavior(t *testing.T) {
 	// Verify global flag is false by default.
 	mock.mu.Lock()
 	assert.False(t, mock.lastStatusReq.GetGlobal())
-	assert.Equal(t, "default", mock.lastStatusReq.GetWorkspace())
+	assert.Equal(t, "default", mock.lastStatusReq.GetWorkspaceScope().GetWorkspace())
 	assert.Equal(t, "my-sandbox", mock.lastStatusReq.GetSandbox())
 	mock.mu.Unlock()
 }
@@ -785,7 +785,7 @@ func TestPolicyList(t *testing.T) {
 	// Verify request was forwarded (no pagination options).
 	mock.mu.Lock()
 	assert.Equal(t, "my-sandbox", mock.lastListReq.GetSandbox())
-	assert.Equal(t, "default", mock.lastListReq.GetWorkspace())
+	assert.Equal(t, "default", mock.lastListReq.GetWorkspaceScope().GetWorkspace())
 	assert.Equal(t, int32(0), mock.lastListReq.GetPageSize())
 	assert.Empty(t, mock.lastListReq.GetPageToken())
 	mock.mu.Unlock()
@@ -933,7 +933,7 @@ func TestPolicyList_WithoutGlobal_PreservesExistingBehavior(t *testing.T) {
 	mock.mu.Lock()
 	assert.False(t, mock.lastListReq.GetGlobal())
 	assert.Equal(t, "my-sandbox", mock.lastListReq.GetSandbox())
-	assert.Equal(t, "default", mock.lastListReq.GetWorkspace())
+	assert.Equal(t, "default", mock.lastListReq.GetWorkspaceScope().GetWorkspace())
 	mock.mu.Unlock()
 }
 

@@ -163,27 +163,28 @@ openshell provider list --all-workspaces
 openshell service list --all-workspaces
 ```
 
-Single-workspace public requests use a non-empty string `workspace`, including
-the literal `default`. Only the sandbox, sandbox template, provider, and service
-collection list requests use the `WorkspaceSelector` oneof because those APIs
-also accept `all_workspaces`. The all-workspaces selection requires Platform
-Admin access. For services, choose either a sandbox name or `--all-workspaces`;
-the options are mutually exclusive.
+Workspace-scoped public requests use the `workspace_scope` field with a
+`WorkspaceSelector`. Single-workspace requests select a non-empty canonical
+name, including the literal `default`. Only sandbox, sandbox template,
+provider, and service collection list requests also accept `all_workspaces`.
+The all-workspaces selection requires Platform Admin access. For services,
+choose either a sandbox name or `--all-workspaces`; the options are mutually
+exclusive.
 
 Every sandbox-scoped RPC identifies the sandbox by its human-readable name and
 keeps workspace selection in a separate field:
 
 ```json
 {
-  "sandbox": "agent",
-  "workspace": "team-ml"
+  "workspaceScope": { "workspace": "team-ml" },
+  "name": "agent"
 }
 ```
 
 Public requests do not accept canonical sandbox IDs as references. This is a
 breaking API change: regenerate protobuf clients and replace stored ID
 references with sandbox names before calling the public API. The four collection
-list RPCs use the request-level `workspace_scope` selector.
+list RPCs use the request-level `workspace` selector.
 
 The Rust and Python SDKs expose separate all-workspaces list methods. The Go
 SDK passes `AllWorkspaces: true` in `ListOptions` to `ListAll`, and the

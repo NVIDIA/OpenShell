@@ -13,7 +13,7 @@ import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 )
 
-func sandboxWorkloadTemplateName(template *types.SandboxWorkloadTemplate) string {
+func sandboxWorkloadTemplate(template *types.SandboxWorkloadTemplate) string {
 	return template.Name
 }
 

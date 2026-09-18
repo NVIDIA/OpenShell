@@ -21,11 +21,11 @@ func newServiceClient(conn grpc.ClientConnInterface) *serviceClient {
 
 func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serviceName string, targetPort uint32, domain bool) (*ServiceEndpoint, error) {
 	resp, err := s.client.ExposeService(ctx, &pb.ExposeServiceRequest{
-		Sandbox:    sandboxName,
-		Workspace:  workspace,
-		Service:    serviceName,
-		TargetPort: targetPort,
-		Domain:     domain,
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+		Name:           serviceName,
+		TargetPort:     targetPort,
+		Domain:         domain,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -35,9 +35,9 @@ func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serv
 
 func (s *serviceClient) Get(ctx context.Context, workspace, sandboxName, serviceName string) (*ServiceEndpoint, error) {
 	resp, err := s.client.GetService(ctx, &pb.GetServiceRequest{
-		Sandbox:   sandboxName,
-		Workspace: workspace,
-		Service:   serviceName,
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+		Name:           serviceName,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -87,10 +87,10 @@ func (s *serviceClient) ListAll(ctx context.Context, workspace, sandboxName stri
 
 func (s *serviceClient) Delete(ctx context.Context, workspace, sandboxName, serviceName string, opts ...DeleteOptions) (*DeletionResult, error) {
 	resp, err := s.client.DeleteService(ctx, &pb.DeleteServiceRequest{
-		AllowMissing: allowMissing(opts),
-		Sandbox:      sandboxName,
-		Workspace:    workspace,
-		Service:      serviceName,
+		AllowMissing:   allowMissing(opts),
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+		Name:           serviceName,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)

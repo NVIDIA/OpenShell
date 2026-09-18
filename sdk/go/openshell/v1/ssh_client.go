@@ -32,8 +32,8 @@ func newSSHClient(conn grpc.ClientConnInterface, sandboxes SandboxInterface) *ss
 
 func (s *sshClient) CreateSession(ctx context.Context, workspace, sandboxName string) (*SSHSession, error) {
 	resp, err := s.client.CreateSshSession(ctx, &pb.CreateSshSessionRequest{
-		Sandbox:   sandboxName,
-		Workspace: workspace,
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)

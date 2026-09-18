@@ -78,7 +78,7 @@ func TestRefreshStrategyToProto(t *testing.T) {
 
 func TestRefreshStatusFromProto(t *testing.T) {
 	proto := &pb.ProviderCredentialRefreshStatus{
-		ProviderName:         "anthropic",
+		Provider:             "anthropic",
 		ProviderId:           "prov-1",
 		CredentialKey:        "API_KEY",
 		Strategy:             pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN,
@@ -96,7 +96,7 @@ func TestRefreshStatusFromProto(t *testing.T) {
 	status := RefreshStatusFromProto(proto)
 
 	require.NotNil(t, status)
-	assert.Equal(t, "anthropic", status.ProviderName)
+	assert.Equal(t, "anthropic", status.Provider)
 	assert.Equal(t, "prov-1", status.ProviderID)
 	assert.Equal(t, "API_KEY", status.CredentialKey)
 	assert.Equal(t, v1.RefreshStrategyOAuth2RefreshToken, status.Strategy)
@@ -118,7 +118,7 @@ func TestRefreshStatusFromProto_Nil(t *testing.T) {
 
 func TestRefreshStatusFromProto_ZeroTimestamps(t *testing.T) {
 	proto := &pb.ProviderCredentialRefreshStatus{
-		ProviderName:  "test",
+		Provider:      "test",
 		CredentialKey: "KEY",
 		Strategy:      pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_STATIC,
 	}
@@ -136,7 +136,7 @@ func TestRefreshStatusFromProto_ZeroTimestamps(t *testing.T) {
 
 func TestRefreshStatusFromProto_ParkedRefreshHasNoNextTime(t *testing.T) {
 	proto := &pb.ProviderCredentialRefreshStatus{
-		ProviderName:    "test",
+		Provider:        "test",
 		CredentialKey:   "KEY",
 		NextRefreshTime: nil,
 		RecoveryAction:  pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE,

@@ -73,7 +73,7 @@ impl GrpcMiddlewareService {
         self.service
             .validate_config(Request::new(ValidateConfigRequest {
                 config: Some(config.clone()),
-                middleware_name: middleware_name.to_string(),
+                middleware: middleware_name.to_string(),
             }))
             .await
     }
@@ -91,7 +91,7 @@ impl GrpcMiddlewareService {
                 target: Some(request.target().clone()),
                 headers: request.headers().to_vec(),
                 body: request.body().to_vec(),
-                middleware_name: request.middleware_name().to_string(),
+                middleware: request.middleware_name().to_string(),
             }))
             .await
     }

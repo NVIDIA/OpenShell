@@ -3124,7 +3124,7 @@ fn pending_sandbox_snapshot_uses_docker_namespace_and_starting_condition() {
 
     let status = snapshot.status.expect("status");
     assert!(!status.deleting);
-    assert_eq!(status.sandbox_name, "demo");
+    assert_eq!(status.name, "demo");
     assert_eq!(status.conditions.len(), 1);
     assert_eq!(status.conditions[0].r#type, "Ready");
     assert_eq!(status.conditions[0].status, "False");
@@ -3476,7 +3476,7 @@ fn exited_sandbox_with_ready_reason(reason: &str) -> DriverSandbox {
         namespace: String::new(),
         spec: None,
         status: Some(DriverSandboxStatus {
-            sandbox_name: "demo".to_string(),
+            name: "demo".to_string(),
             instance_id: "container-1".to_string(),
             agent_fd: String::new(),
             sandbox_fd: String::new(),

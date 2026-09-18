@@ -70,8 +70,10 @@ async fn every_delete_requires_explicit_allow_missing() {
     check!(
         sandbox::handle_delete_sandbox,
         DeleteSandboxRequest {
-            sandbox: "missing".into(),
-            workspace: "default".to_string(),
+            name: "missing".into(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string()
+            )),
             ..Default::default()
         }
     );
@@ -79,7 +81,9 @@ async fn every_delete_requires_explicit_allow_missing() {
         sandbox::handle_delete_sandbox_template,
         DeleteSandboxTemplateRequest {
             name: "missing".into(),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string()
+            )),
             ..Default::default()
         }
     );
@@ -87,7 +91,9 @@ async fn every_delete_requires_explicit_allow_missing() {
         provider::handle_delete_provider,
         DeleteProviderRequest {
             name: "missing".into(),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string()
+            )),
             ..Default::default()
         }
     );
@@ -103,7 +109,9 @@ async fn every_delete_requires_explicit_allow_missing() {
         DeleteProviderRefreshRequest {
             provider: "parent-provider".into(),
             credential_key: "API_KEY".into(),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string()
+            )),
             ..Default::default()
         }
     );
@@ -111,8 +119,10 @@ async fn every_delete_requires_explicit_allow_missing() {
         service::handle_delete_service,
         DeleteServiceRequest {
             sandbox: "parent-sandbox".into(),
-            service: "missing".into(),
-            workspace: "default".to_string(),
+            name: "missing".into(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string()
+            )),
             ..Default::default()
         }
     );
@@ -127,7 +137,7 @@ async fn every_delete_requires_explicit_allow_missing() {
         workspace::handle_remove_workspace_member,
         RemoveWorkspaceMemberRequest {
             principal_subject: "missing".into(),
-            workspace: "default".into(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             ..Default::default()
         }
     );
@@ -148,7 +158,9 @@ async fn allow_missing_does_not_hide_missing_parents_or_invalid_requests() {
         authed_request(DeleteServiceRequest {
             sandbox: "missing-parent".into(),
             allow_missing: true,
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             ..Default::default()
         }),
     )
@@ -162,7 +174,9 @@ async fn allow_missing_does_not_hide_missing_parents_or_invalid_requests() {
             provider: "missing-parent".into(),
             credential_key: "API_KEY".into(),
             allow_missing: true,
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
         }),
     )
     .await
@@ -172,7 +186,7 @@ async fn allow_missing_does_not_hide_missing_parents_or_invalid_requests() {
         &state,
         authed_request(RemoveWorkspaceMemberRequest {
             request_id: String::new(),
-            workspace: "missing-parent".into(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("missing-parent")),
             principal_subject: "missing".into(),
             allow_missing: true,
         }),

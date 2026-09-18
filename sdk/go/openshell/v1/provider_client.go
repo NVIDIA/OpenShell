@@ -36,8 +36,8 @@ func (p *providerClient) Refresh() RefreshInterface {
 
 func (p *providerClient) Create(ctx context.Context, workspace string, provider *Provider) (*Provider, error) {
 	resp, err := p.client.CreateProvider(ctx, &pb.CreateProviderRequest{
-		Provider:  converter.ProviderToProto(provider),
-		Workspace: workspace,
+		Provider:       converter.ProviderToProto(provider),
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -47,8 +47,8 @@ func (p *providerClient) Create(ctx context.Context, workspace string, provider 
 
 func (p *providerClient) Get(ctx context.Context, workspace, name string) (*Provider, error) {
 	resp, err := p.client.GetProvider(ctx, &pb.GetProviderRequest{
-		Name:      name,
-		Workspace: workspace,
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -96,8 +96,8 @@ func (p *providerClient) ListAll(ctx context.Context, workspace string, opts ...
 func (p *providerClient) Update(ctx context.Context, workspace string, provider *Provider) (*Provider, error) {
 	proto := converter.ProviderToProto(provider)
 	req := &pb.UpdateProviderRequest{
-		Provider:  proto,
-		Workspace: workspace,
+		Provider:       proto,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	}
 	if proto != nil {
 		req.CredentialExpirationTimes = proto.CredentialExpirationTimes
@@ -118,9 +118,9 @@ func (p *providerClient) Update(ctx context.Context, workspace string, provider 
 
 func (p *providerClient) Delete(ctx context.Context, workspace, name string, opts ...DeleteOptions) (*DeletionResult, error) {
 	resp, err := p.client.DeleteProvider(ctx, &pb.DeleteProviderRequest{
-		AllowMissing: allowMissing(opts),
-		Name:         name,
-		Workspace:    workspace,
+		AllowMissing:   allowMissing(opts),
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)

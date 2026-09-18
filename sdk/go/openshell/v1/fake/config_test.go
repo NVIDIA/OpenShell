@@ -69,7 +69,7 @@ func TestFakeConfig_Update_MergeOperationsAccepted(t *testing.T) {
 	c := newFakeConfigClient(func() bool { return false })
 	_, err := c.Update(context.Background(), "default", &types.ConfigUpdate{
 		Name:            "sandbox-1",
-		MergeOperations: []types.PolicyMergeOperation{{RemoveRule: &types.RemoveNetworkRule{RuleName: "test"}}},
+		MergeOperations: []types.PolicyMergeOperation{{RemoveRule: &types.RemoveNetworkRule{Name: "test"}}},
 	})
 	require.Error(t, err)
 	// Should return Unimplemented (not InvalidArgument) — MergeOperations are now accepted

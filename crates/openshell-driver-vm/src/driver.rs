@@ -978,7 +978,7 @@ impl VmDriver {
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
-            driver_name: DRIVER_NAME.to_string(),
+            name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
@@ -4280,14 +4280,14 @@ impl ComputeDriver for VmDriver {
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
         let request = request.into_inner();
-        if request.sandbox_id.is_empty() && request.sandbox_name.is_empty() {
+        if request.sandbox_id.is_empty() && request.name.is_empty() {
             return Err(Status::invalid_argument(
                 "sandbox_id or sandbox_name is required",
             ));
         }
 
         let sandbox = self
-            .get_sandbox(&request.sandbox_id, &request.sandbox_name)
+            .get_sandbox(&request.sandbox_id, &request.name)
             .await?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
@@ -4316,7 +4316,7 @@ impl ComputeDriver for VmDriver {
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
         let request = request.into_inner();
-        self.stop_sandbox(&request.sandbox_id, &request.sandbox_name)
+        self.stop_sandbox(&request.sandbox_id, &request.name)
             .await?;
         Ok(Response::new(StopSandboxResponse {}))
     }
@@ -4328,7 +4328,7 @@ impl ComputeDriver for VmDriver {
         let request = request.into_inner();
         self.start_sandbox(
             &request.sandbox_id,
-            &request.sandbox_name,
+            &request.name,
             &request.generation_id,
             request.launch_authentication,
         )
@@ -4342,7 +4342,7 @@ impl ComputeDriver for VmDriver {
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let request = request.into_inner();
         let response = self
-            .delete_sandbox(&request.sandbox_id, &request.sandbox_name)
+            .delete_sandbox(&request.sandbox_id, &request.name)
             .await?;
         Ok(Response::new(response))
     }
@@ -6724,7 +6724,7 @@ fn sandbox_snapshot(sandbox: &Sandbox, condition: SandboxCondition, deleting: bo
         namespace: sandbox.namespace.clone(),
         workspace: sandbox.workspace.clone(),
         status: Some(SandboxStatus {
-            sandbox_name: sandbox.name.clone(),
+            name: sandbox.name.clone(),
             instance_id: String::new(),
             agent_fd: String::new(),
             sandbox_fd: String::new(),
@@ -6742,7 +6742,7 @@ fn status_with_condition(
     deleting: bool,
 ) -> SandboxStatus {
     SandboxStatus {
-        sandbox_name: snapshot.name.clone(),
+        name: snapshot.name.clone(),
         instance_id: String::new(),
         agent_fd: String::new(),
         sandbox_fd: String::new(),
@@ -7196,7 +7196,7 @@ mod tests {
             client
                 .get_sandbox(request_with_traceparent(GetSandboxRequest {
                     sandbox_id: String::new(),
-                    sandbox_name: String::new(),
+                    name: String::new(),
                 }))
                 .await
                 .is_err()
@@ -7209,7 +7209,7 @@ mod tests {
             client
                 .stop_sandbox(request_with_traceparent(StopSandboxRequest {
                     sandbox_id: String::new(),
-                    sandbox_name: String::new(),
+                    name: String::new(),
                 }))
                 .await
                 .is_err()
@@ -7217,7 +7217,7 @@ mod tests {
         client
             .delete_sandbox(request_with_traceparent(DeleteSandboxRequest {
                 sandbox_id: String::new(),
-                sandbox_name: String::new(),
+                name: String::new(),
             }))
             .await
             .unwrap();

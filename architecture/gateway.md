@@ -112,22 +112,32 @@ health, metrics, or tunnel routes. The plaintext service router also rejects
 browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
 cross-origin or sibling-subdomain request.
 
-Public workspace-scoped RPCs carry a typed `WorkspaceSelector`. A request must
-select one non-empty workspace explicitly; `default` is an ordinary explicit
-name, not an omitted-value fallback. Every public sandbox-scoped RPC identifies
-the sandbox with a string `sandbox` and carries its canonical workspace name in
-a separate string `workspace` field. Canonical sandbox IDs remain internal metadata used
-at authentication, persistence, and compute-driver boundaries; public callers
-do not use them as sandbox references. The gateway resolves the name to the
-persisted sandbox record only after authorizing the selected workspace. A
+Public API fields follow one entity-reference convention. `name` identifies the
+primary resource targeted by an RPC. A role field such as `sandbox`, `provider`,
+`service`, or `workload_template` identifies an entity referenced while
+operating on another resource or relationship. Entity references never append
+`_name`; their string value is already the canonical name.
+
+Public workspace-scoped RPCs declare `workspace_scope` first and use the typed
+`WorkspaceSelector`. A request that targets one workspace selects a non-empty
+canonical workspace name; `default` is an ordinary explicit name, not an
+omitted-value fallback. Only sandbox, sandbox template, provider, and service
+collection list RPCs accept `all_workspaces`, after Platform Admin
+authorization. Provider-profile requests may omit the selector to address the
+platform profile scope. The authenticated sandbox bootstrap request may also
+omit it because the gateway resolves the immutable sandbox identity before the
+supervisor has learned its workspace. Canonical sandbox
+IDs remain internal metadata used at authentication, persistence, and
+compute-driver boundaries; public callers do not use them as sandbox
+references. The gateway resolves the name to the persisted sandbox record only
+after authorizing the selected workspace. A
 sandbox principal is instead resolved by the immutable ID in its authenticated
 identity, then checked against the requested name and workspace. Missing and
 unauthorized references use the same response within each principal class so
 the resolver does not expose an object-existence oracle. Sandbox, sandbox
-template, provider, and service collection list RPCs use `workspace_scope` so
-they can also accept an all-workspaces marker after Platform Admin
-authorization. Platform-global policy operations require `sandbox` and
-`workspace` to be empty, while sandbox policy operations require both.
+template, provider, and service collection list RPCs use the same field with an
+all-workspaces marker. Platform-global policy operations omit both `sandbox`
+and `workspace_scope`, while sandbox policy operations require both.
 
 Docker and Podman report the local address through which their sandboxes can
 reach the gateway. When the primary listener covers that address, the gateway

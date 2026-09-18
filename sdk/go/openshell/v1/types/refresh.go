@@ -55,7 +55,7 @@ func (a RefreshRecoveryAction) String() string {
 // RefreshStatus reports the current state of credential refresh for a specific
 // provider credential.
 type RefreshStatus struct {
-	ProviderName  string
+	Provider      string
 	ProviderID    string
 	CredentialKey string
 	Strategy      RefreshStrategy

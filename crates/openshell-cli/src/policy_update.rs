@@ -119,7 +119,7 @@ pub fn build_policy_update_plan(
         };
         merge_operations.push(PolicyMergeOperation {
             operation: Some(policy_merge_operation::Operation::AddRule(AddNetworkRule {
-                rule_name: target_rule_name.clone(),
+                name: target_rule_name.clone(),
                 rule: Some(rule.clone()),
             })),
         });
@@ -134,7 +134,7 @@ pub fn build_policy_update_plan(
         merge_operations.push(PolicyMergeOperation {
             operation: Some(policy_merge_operation::Operation::RemoveEndpoint(
                 RemoveNetworkEndpoint {
-                    rule_name: String::new(),
+                    rule: String::new(),
                     host: host.clone(),
                     port,
                 },
@@ -155,7 +155,7 @@ pub fn build_policy_update_plan(
         merge_operations.push(PolicyMergeOperation {
             operation: Some(policy_merge_operation::Operation::RemoveRule(
                 RemoveNetworkRule {
-                    rule_name: rule_name.to_string(),
+                    name: rule_name.to_string(),
                 },
             )),
         });
@@ -230,7 +230,7 @@ fn build_l7_target(
     operation_index: usize,
 ) -> Result<L7RuleTarget> {
     let target = L7RuleTarget {
-        rule_name: rule_name.unwrap_or_default().trim().to_string(),
+        rule: rule_name.unwrap_or_default().trim().to_string(),
         host,
         ports,
         // An explicit empty string selects the unscoped endpoint; None leaves
@@ -259,7 +259,7 @@ fn l7_target_to_proto(target: &L7RuleTarget) -> ProtoL7RuleTarget {
         L7BinaryScope::Restricted(binaries) => (binaries.clone(), false),
     };
     ProtoL7RuleTarget {
-        rule_name: target.rule_name.clone(),
+        rule: target.rule.clone(),
         host: target.host.clone(),
         ports: target.ports.clone(),
         path: target.path.clone(),
@@ -1270,7 +1270,7 @@ mod tests {
                 }
                 _ => panic!("preview and wire operation kinds must agree"),
             };
-            assert_eq!(target.rule_name, "api");
+            assert_eq!(target.rule, "api");
             assert_eq!(target.host, "api.example.com");
             assert_eq!(target.ports, vec![443, 8443]);
             assert_eq!(target.path.as_deref(), Some("/v1/**"));
@@ -1280,7 +1280,7 @@ mod tests {
             assert_eq!(binaries.len(), 2);
             assert_eq!(binaries[0].path, "/usr/bin/curl");
             assert_eq!(binaries[1].path, "/usr/bin/python3");
-            assert_eq!(wire_target.rule_name, target.rule_name);
+            assert_eq!(wire_target.rule, target.rule);
             assert_eq!(wire_target.host, target.host);
             assert_eq!(wire_target.ports, target.ports);
             assert_eq!(wire_target.path, target.path);
@@ -1318,7 +1318,7 @@ mod tests {
                 };
                 assert_eq!(target.path.as_deref(), endpoint_path);
                 assert!(matches!(target.binaries, L7BinaryScope::Any));
-                assert_eq!(wire_target.rule_name, target.rule_name);
+                assert_eq!(wire_target.rule, target.rule);
                 assert_eq!(wire_target.host, target.host);
                 assert_eq!(wire_target.ports, target.ports);
                 assert_eq!(wire_target.path, target.path);

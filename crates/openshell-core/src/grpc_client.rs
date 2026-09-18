@@ -445,7 +445,7 @@ async fn refresh_token_loop(
         tokio::time::sleep(sleep).await;
         match client
             .refresh_sandbox_token(RefreshSandboxTokenRequest {
-                extension_service_names: Vec::new(),
+                extension_services: Vec::new(),
             })
             .await
         {
@@ -567,7 +567,7 @@ async fn refresh_extension_credentials_with_client(
 
     let response = client
         .refresh_sandbox_token(RefreshSandboxTokenRequest {
-            extension_service_names: names.clone(),
+            extension_services: names.clone(),
         })
         .await
         .into_diagnostic()
@@ -588,8 +588,8 @@ async fn refresh_extension_credentials_with_client(
         .collect::<std::collections::HashSet<_>>();
     let mut validated = HashMap::with_capacity(response.extension_credentials.len());
     for credential in response.extension_credentials {
-        if !expected.contains(credential.service_name.as_str())
-            || validated.contains_key(&credential.service_name)
+        if !expected.contains(credential.service.as_str())
+            || validated.contains_key(&credential.service)
         {
             return Err(miette::miette!(
                 "gateway returned an unexpected or duplicate extension credential"
@@ -599,7 +599,7 @@ async fn refresh_extension_credentials_with_client(
             miette::miette!("gateway returned an extension credential without an expiration time")
         })?;
         let expires_at_ms = timestamp_to_millis(expiration_time).into_diagnostic()?;
-        validated.insert(credential.service_name, (credential.token, expires_at_ms));
+        validated.insert(credential.service, (credential.token, expires_at_ms));
     }
     if validated.len() != expected.len() {
         return Err(miette::miette!(
@@ -930,8 +930,8 @@ async fn fetch_settings_snapshot_with_client(
 ) -> Result<SettingsPollResult> {
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox: sandbox_name.to_string(),
-            workspace: workspace.unwrap_or_default().to_string(),
+            workspace_scope: workspace.map(crate::proto::workspace_selector),
+            name: sandbox_name.to_string(),
         })
         .await
         .map_err(grpc_status_error)?;
@@ -966,7 +966,7 @@ async fn sync_policy_with_client(
     client
         .update_config(UpdateConfigRequest {
             sandbox: sandbox.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(crate::proto::workspace_selector(workspace)),
             policy: Some(policy.clone()),
             ..Default::default()
         })
@@ -1414,8 +1414,8 @@ impl CachedOpenShellClient {
             .client
             .clone()
             .get_sandbox_config(GetSandboxConfigRequest {
-                sandbox: sandbox_name.to_string(),
-                workspace: workspace.clone(),
+                workspace_scope: Some(crate::proto::workspace_selector(workspace.clone())),
+                name: sandbox_name.to_string(),
             })
             .await
             .into_diagnostic()?;
@@ -1520,7 +1520,7 @@ impl CachedOpenShellClient {
                 proposed_chunks,
                 network_activity_summaries,
                 analysis_mode: analysis_mode.to_string(),
-                workspace: self.workspace(),
+                workspace_scope: Some(crate::proto::workspace_selector(self.workspace())),
             })
             .await
             .into_diagnostic()?;
@@ -1543,7 +1543,7 @@ impl CachedOpenShellClient {
             .get_draft_policy(GetDraftPolicyRequest {
                 status_filter: status_filter.to_string(),
                 sandbox: sandbox_name.to_string(),
-                workspace: self.workspace().clone(),
+                workspace_scope: Some(crate::proto::workspace_selector(self.workspace())),
             })
             .await
             .into_diagnostic()?;

@@ -666,7 +666,7 @@ mod tests {
             &service,
             Request::new(DeleteSandboxRequest {
                 sandbox_id: String::new(),
-                sandbox_name: "demo".to_string(),
+                name: "demo".to_string(),
             }),
         )
         .await
@@ -697,7 +697,7 @@ mod tests {
             &service,
             Request::new(DeleteSandboxRequest {
                 sandbox_id: sandbox_id.to_string(),
-                sandbox_name: "demo".to_string(),
+                name: "demo".to_string(),
             }),
         )
         .await

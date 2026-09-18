@@ -20,14 +20,14 @@ func TestGatewayInfoFromProto(t *testing.T) {
 			{
 				Name: "k8s",
 				Capabilities: &pb.ComputeDriverCapabilities{
-					DriverName:    "kubernetes",
+					Name:          "kubernetes",
 					DriverVersion: "2.1.0",
 				},
 			},
 			{
 				Name: "docker",
 				Capabilities: &pb.ComputeDriverCapabilities{
-					DriverName:    "docker-engine",
+					Name:          "docker-engine",
 					DriverVersion: "24.0.0",
 				},
 			},
@@ -41,10 +41,10 @@ func TestGatewayInfoFromProto(t *testing.T) {
 	assert.Equal(t, "1.5.0", info.Version)
 	require.Len(t, info.ComputeDrivers, 2)
 	assert.Equal(t, "k8s", info.ComputeDrivers[0].Name)
-	assert.Equal(t, "kubernetes", info.ComputeDrivers[0].DriverName)
+	assert.Equal(t, "kubernetes", info.ComputeDrivers[0].Driver)
 	assert.Equal(t, "2.1.0", info.ComputeDrivers[0].DriverVersion)
 	assert.Equal(t, "docker", info.ComputeDrivers[1].Name)
-	assert.Equal(t, "docker-engine", info.ComputeDrivers[1].DriverName)
+	assert.Equal(t, "docker-engine", info.ComputeDrivers[1].Driver)
 }
 
 func TestGatewayInfoFromProto_NoDrivers(t *testing.T) {
@@ -70,7 +70,7 @@ func TestGatewayInfoFromProto_DeepCopy(t *testing.T) {
 		Status:         pb.ServiceStatus_SERVICE_STATUS_HEALTHY,
 		GatewayVersion: "1.0.0",
 		ComputeDrivers: []*pb.ComputeDriverInfo{
-			{Name: "k8s", Capabilities: &pb.ComputeDriverCapabilities{DriverName: "kubernetes"}},
+			{Name: "k8s", Capabilities: &pb.ComputeDriverCapabilities{Name: "kubernetes"}},
 		},
 	}
 
@@ -105,7 +105,7 @@ func TestComputeDriverInfoFromProto_NilCapabilities(t *testing.T) {
 	info := ComputeDriverInfoFromProto(proto)
 
 	assert.Equal(t, "bare-metal", info.Name)
-	assert.Empty(t, info.DriverName)
+	assert.Empty(t, info.Driver)
 	assert.Empty(t, info.DriverVersion)
 }
 

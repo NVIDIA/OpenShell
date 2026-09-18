@@ -957,7 +957,7 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
         context: Some(RequestContext {
             request_id: input.request_id,
             sandbox_id: input.sandbox_id,
-            sandbox_name: input.sandbox_name,
+            sandbox: input.sandbox_name,
             workspace: input.workspace,
             originating_process: None,
         }),
@@ -970,7 +970,7 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
             query: String::new(),
         }),
         requested_subprotocols: input.requested_subprotocols,
-        middleware_name: entry.entry.implementation.clone(),
+        middleware: entry.entry.implementation.clone(),
         config: Some(entry.entry.config.clone()),
     };
     if validate_preflight_envelope(&preflight).is_err() {

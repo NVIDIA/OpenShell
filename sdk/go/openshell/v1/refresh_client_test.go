@@ -76,7 +76,7 @@ func (s *mockRefreshServer) ConfigureProviderRefresh(_ context.Context, req *pb.
 	}
 
 	st := &pb.ProviderCredentialRefreshStatus{
-		ProviderName:   req.GetProvider(),
+		Provider:       req.GetProvider(),
 		ProviderId:     "prov-id-" + req.GetProvider(),
 		CredentialKey:  req.GetCredentialKey(),
 		Strategy:       req.GetStrategy(),
@@ -168,7 +168,7 @@ func TestRefreshGetStatus(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Len(t, statuses, 1)
-	assert.Equal(t, "openai", statuses[0].ProviderName)
+	assert.Equal(t, "openai", statuses[0].Provider)
 	assert.Equal(t, "api-key", statuses[0].CredentialKey)
 	assert.Equal(t, RefreshStrategyOAuth2RefreshToken, statuses[0].Strategy)
 	assert.Equal(t, "active", statuses[0].Status)
@@ -244,7 +244,7 @@ func TestRefreshConfigure(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	assert.Equal(t, "openai", result.ProviderName)
+	assert.Equal(t, "openai", result.Provider)
 	assert.Equal(t, "prov-id-openai", result.ProviderID)
 	assert.Equal(t, "api-key", result.CredentialKey)
 	assert.Equal(t, RefreshStrategyOAuth2ClientCredentials, result.Strategy)
@@ -266,7 +266,7 @@ func TestRefreshConfigure_MinimalConfig(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	assert.Equal(t, "anthropic", result.ProviderName)
+	assert.Equal(t, "anthropic", result.Provider)
 	assert.Equal(t, RefreshStrategyStatic, result.Strategy)
 }
 

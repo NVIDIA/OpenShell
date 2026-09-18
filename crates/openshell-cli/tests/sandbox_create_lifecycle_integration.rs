@@ -187,7 +187,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         let request = request.into_inner();
-        let name = request.sandbox;
+        let name = request.name;
         let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("id-{name}"),
@@ -235,7 +235,9 @@ impl OpenShell for TestOpenShell {
                 .unwrap_or_default(),
             resource_version: 1,
             annotations: HashMap::new(),
-            workspace: request.workspace.clone(),
+            workspace: selected_workspace(&request.workspace_scope)
+                .unwrap_or_default()
+                .to_string(),
             deletion_time: None,
         });
         self.state
@@ -267,7 +269,9 @@ impl OpenShell for TestOpenShell {
                     labels: HashMap::new(),
                     resource_version: 1,
                     annotations: HashMap::new(),
-                    workspace: request.workspace.clone(),
+                    workspace: selected_workspace(&request.workspace_scope)
+                        .unwrap_or_default()
+                        .to_string(),
                     deletion_time: None,
                 }),
                 spec: None,
@@ -336,7 +340,7 @@ impl OpenShell for TestOpenShell {
             .deleted_names
             .lock()
             .await
-            .push(vec![request.sandbox.clone()]);
+            .push(vec![request.name.clone()]);
         let delete_failure = self.state.fail_delete_sandbox_message.lock().await.take();
         if let Some(message) = delete_failure {
             return Err(Status::internal(message));
@@ -1922,7 +1926,7 @@ async fn sandbox_create_with_template_sends_workload_template_name() {
 
     let requests = create_requests(&server).await;
     let request = requests.first().expect("create request should be recorded");
-    assert_eq!(request.workload_template_name, "gpu-kata");
+    assert_eq!(request.workload_template, "gpu-kata");
     let spec = request
         .spec
         .as_ref()
@@ -1966,7 +1970,7 @@ async fn sandbox_template_create_sends_non_default_workspace_in_scope_and_metada
     let request = requests
         .first()
         .expect("template create request should be recorded");
-    assert_eq!(request.workspace, "team-a");
+    assert_eq!(selected_workspace(&request.workspace_scope), Some("team-a"));
     let template = request.template.as_ref().expect("template should be sent");
     let metadata = template.metadata.as_ref().expect("metadata should be sent");
     assert_eq!(metadata.name, "gpu-kata");
@@ -2049,7 +2053,10 @@ async fn sandbox_template_list_and_delete_send_workspace_requests() {
         .first()
         .expect("template delete request should be recorded");
     assert_eq!(delete_request.name, "gpu-kata");
-    assert_eq!(delete_request.workspace, "default");
+    assert_eq!(
+        selected_workspace(&delete_request.workspace_scope),
+        Some("default")
+    );
 }
 
 #[tokio::test]

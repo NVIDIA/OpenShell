@@ -314,7 +314,7 @@ pub fn refresh_status_from_state(
     state: &StoredProviderCredentialRefreshState,
 ) -> ProviderCredentialRefreshStatus {
     ProviderCredentialRefreshStatus {
-        provider_name: state.provider_name.clone(),
+        provider: state.provider_name.clone(),
         provider_id: state.provider_id.clone(),
         credential_key: state.credential_key.clone(),
         strategy: state.strategy,

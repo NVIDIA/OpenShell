@@ -114,7 +114,7 @@
 //	    log.Fatal(err)
 //	}
 //	for _, ep := range endpoints {
-//	    fmt.Printf("  %s → port %d (URL: %s)\n", ep.ServiceName, ep.TargetPort, ep.URL)
+//	    fmt.Printf("  %s → port %d (URL: %s)\n", ep.Name, ep.TargetPort, ep.URL)
 //	}
 //
 // # Provider Profiles
@@ -418,7 +418,7 @@
 //	}
 //	fmt.Printf("Gateway %s (status: %s)\n", info.Version, info.Status)
 //	for _, d := range info.ComputeDrivers {
-//	    fmt.Printf("  Driver: %s %s\n", d.DriverName, d.DriverVersion)
+//	    fmt.Printf("  Driver: %s %s\n", d.Driver, d.DriverVersion)
 //	}
 //
 // # Current User

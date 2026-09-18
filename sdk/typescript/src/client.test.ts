@@ -79,19 +79,18 @@ describe('deletion outcomes', () => {
 });
 
 type ScopedRequest = {
+  name?: string;
   sandbox?: string;
-  workspace?: string;
   workspaceScope?: { selection?: { case?: string; value?: unknown } };
 };
 
 function selectedWorkspace(req: ScopedRequest): string | undefined {
-  if (req.workspace) return req.workspace;
   const selection = req.workspaceScope?.selection;
   return selection?.case === 'workspace' && typeof selection.value === 'string' ? selection.value : undefined;
 }
 
 function requestSandbox(req: ScopedRequest): string | undefined {
-  return req.sandbox;
+  return req.name ?? req.sandbox;
 }
 
 function selectsAllWorkspaces(req: ScopedRequest): boolean {
@@ -335,7 +334,7 @@ describe('create', () => {
 
   it('createFromTemplate sends the workload template name with governance fields only', async () => {
     let created: {
-      workloadTemplateName?: string;
+      workloadTemplate?: string;
       name?: string;
       workspace?: string;
       labels?: Record<string, string>;
@@ -356,7 +355,7 @@ describe('create', () => {
     const ref = await sandbox.createFromTemplate({
       name: 'job-1',
       workspace: 'staging',
-      templateName: 'gpu-kata',
+      workloadTemplate: 'gpu-kata',
       labels: { team: 'runtime' },
       providers: ['github'],
       command: ['/opt/worker', '--serve'],
@@ -364,7 +363,7 @@ describe('create', () => {
       policy: { version: 1, networkPolicies: {} },
     });
 
-    expect(created.workloadTemplateName).toBe('gpu-kata');
+    expect(created.workloadTemplate).toBe('gpu-kata');
     expect(created.name).toBe('job-1');
     expect(selectedWorkspace(created)).toBe('staging');
     expect(created.labels).toEqual({ team: 'runtime' });
@@ -589,7 +588,7 @@ describe('create', () => {
 
   it('createFromTemplate rejects an empty template name locally', async () => {
     const sandbox = client({});
-    await expect(sandbox.createFromTemplate({ templateName: ' ' })).rejects.toMatchObject({
+    await expect(sandbox.createFromTemplate({ workloadTemplate: ' ' })).rejects.toMatchObject({
       code: 'invalid_config',
     });
   });
@@ -1039,7 +1038,7 @@ describe('providers', () => {
     let attachReq: {
       sandbox?: string;
       workspace?: string;
-      providerName?: string;
+      provider?: string;
       expectedResourceVersion?: bigint;
     } = {};
     let detachReq: { expectedResourceVersion?: bigint } = {};
@@ -1059,7 +1058,7 @@ describe('providers', () => {
 
     const attach = await sandbox.attachProvider('sb', 'claude');
     expect(requestSandbox(attachReq)).toBe('sb');
-    expect(attachReq.providerName).toBe('claude');
+    expect(attachReq.provider).toBe('claude');
     expect(attachReq.expectedResourceVersion).toBe(0n);
     expect(attach.changed).toBe(true);
     expect(attach.sandbox.resourceVersion).toBe('7');
@@ -1643,14 +1642,14 @@ describe('raw escape hatch', () => {
     });
     await sandbox.raw.updateConfig({
       sandbox: 'sb',
-      workspace: 'default',
+      workspaceScope: { selection: { case: 'workspace', value: 'default' } },
       mergeOperations: [
         {
           operation: {
             case: 'addAllowRules',
             value: {
               target: {
-                ruleName: 'internal_api',
+                rule: 'internal_api',
                 host: 'api.example.com',
                 ports: [443, 8443],
                 path: '',
@@ -1664,7 +1663,7 @@ describe('raw escape hatch', () => {
           operation: {
             case: 'addDenyRules',
             value: {
-              target: { ruleName: 'public_api', host: 'api.example.com', ports: [443], anyBinary: true },
+              target: { rule: 'public_api', host: 'api.example.com', ports: [443], anyBinary: true },
               denyRules: [{ method: 'POST', path: '/admin/private' }],
             },
           },
@@ -1678,7 +1677,7 @@ describe('raw escape hatch', () => {
     expect(deny?.case).toBe('addDenyRules');
     if (allow?.case !== 'addAllowRules' || deny?.case !== 'addDenyRules') throw new Error('wrong operations');
     expect(allow.value.target).toMatchObject({
-      ruleName: 'internal_api',
+      rule: 'internal_api',
       host: 'api.example.com',
       ports: [443, 8443],
       path: '',
@@ -1703,8 +1702,8 @@ describe('raw escape hatch', () => {
     // raw returns the full generated message: the enum stays numeric, where the
     // curated get() would lowercase status.phase to 'ready'.
     const resp = await sandbox.raw.getSandbox({
-      sandbox: 'sb',
-      workspace: 'default',
+      name: 'sb',
+      workspaceScope: { selection: { case: 'workspace', value: 'default' } },
     });
     expect(resp.sandbox?.status?.phase).toBe(SandboxPhase.READY);
     expect(resp.sandbox?.metadata?.name).toBe('sb');

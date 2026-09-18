@@ -78,7 +78,7 @@ message GetCapabilitiesResponse {
   reserved "supports_gpu", "gpu_count";
 
   // Human-readable driver name.
-  string driver_name = 1;
+  string name = 1;
   // Driver implementation version string.
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
@@ -324,7 +324,7 @@ message DriverResourceRequirements {
 // conditions plus `deleting`.
 message DriverSandboxStatus {
   // Compute-platform sandbox object name.
-  string sandbox_name = 1;
+  string name = 1;
   // Platform-assigned instance identifier for the compute unit running the
   // sandbox agent (e.g. Kubernetes pod name, VM instance ID, hostname).
   // The gateway uses this to correlate incoming connections back to a sandbox.
@@ -390,7 +390,7 @@ message GetSandboxRequest {
   // Stable sandbox ID stored by the gateway.
   string sandbox_id = 1;
   // Compute-runtime name used by the driver.
-  string sandbox_name = 2;
+  string name = 2;
 }
 
 message GetSandboxResponse {
@@ -416,7 +416,7 @@ message StopSandboxRequest {
   // Stable sandbox ID stored by the gateway.
   string sandbox_id = 1;
   // Compute-runtime name used by the driver.
-  string sandbox_name = 2;
+  string name = 2;
 }
 
 message StopSandboxResponse {}
@@ -425,7 +425,7 @@ message StartSandboxRequest {
   // Stable sandbox ID stored by the gateway.
   string sandbox_id = 1;
   // Compute-runtime name used by the driver.
-  string sandbox_name = 2;
+  string name = 2;
   // Fresh launch credentials for start-from-stopped. Empty only for drivers
   // that do not implement the OpenShell Sandbox Protocol.
   bytes launch_authentication = 3 [(openshell.options.v1.secret) = true];
@@ -440,7 +440,7 @@ message DeleteSandboxRequest {
   // Stable sandbox ID stored by the gateway.
   string sandbox_id = 1;
   // Compute-runtime name used by the driver.
-  string sandbox_name = 2;
+  string name = 2;
 }
 
 message DeleteSandboxResponse {

@@ -74,7 +74,7 @@ func WithCurrentUser(user *types.CurrentUser) ClientOption {
 func NewClient(opts ...ClientOption) *Client {
 	fc := &Client{
 		sandboxStore:       newobjectStore(sandboxName, copySandbox),
-		templateStore:      newobjectStore(sandboxWorkloadTemplateName, copySandboxWorkloadTemplate),
+		templateStore:      newobjectStore(sandboxWorkloadTemplate, copySandboxWorkloadTemplate),
 		providerStore:      newobjectStore(providerName, copyProvider),
 		workspaceStore:     newobjectStore(workspaceName, copyWorkspace),
 		memberStore:        newobjectStore(memberName, copyMember),

@@ -76,8 +76,8 @@ async fn run_get_sandbox_config(args: &[String]) -> Result<i32> {
     let mut client = open_client().await?;
     let resp = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox: sandbox_name.to_string(),
-            workspace: String::new(),
+            name: sandbox_name.to_string(),
+            workspace_scope: None,
         })
         .await;
     match resp {
@@ -107,7 +107,7 @@ async fn run_refresh() -> Result<i32> {
     let mut client = open_client().await?;
     let resp = client
         .refresh_sandbox_token(RefreshSandboxTokenRequest {
-            extension_service_names: Vec::new(),
+            extension_services: Vec::new(),
         })
         .await;
     match resp {

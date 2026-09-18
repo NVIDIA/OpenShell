@@ -358,7 +358,7 @@ impl KubernetesSandboxDriverConfig {
 #[serde(default, deny_unknown_fields)]
 struct KubernetesPodDriverConfig {
     node_selector: BTreeMap<String, String>,
-    runtime_class_name: String,
+    runtime_class: String,
     tolerations: Vec<serde_json::Value>,
     priority_class_name: String,
 }
@@ -747,7 +747,7 @@ impl KubernetesComputeDriver {
 
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
         Ok(GetCapabilitiesResponse {
-            driver_name: "kubernetes".to_string(),
+            name: "kubernetes".to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: false,
@@ -5920,8 +5920,8 @@ fn sandbox_template_to_k8s_with_validated_config(
     let mut spec = serde_json::Map::new();
     let runtime_class_name = platform_config_string(template, "runtime_class_name")
         .or_else(|| {
-            (!driver_config.pod.runtime_class_name.is_empty())
-                .then(|| driver_config.pod.runtime_class_name.clone())
+            (!driver_config.pod.runtime_class.is_empty())
+                .then(|| driver_config.pod.runtime_class.clone())
         })
         .or_else(|| {
             (!params.default_runtime_class_name.is_empty())
@@ -6334,7 +6334,7 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
         .unwrap_or_default();
 
     Some(SandboxStatus {
-        sandbox_name: status_obj
+        name: status_obj
             .get("sandboxName")
             .and_then(|val| val.as_str())
             .unwrap_or_default()

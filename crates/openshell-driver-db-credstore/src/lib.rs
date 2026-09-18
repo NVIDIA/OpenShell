@@ -164,7 +164,7 @@ impl DbCredstoreCredentialDriver {
         )?
         .to_string();
         let provider_name =
-            EncryptedGatewayCredentialStoreCrypto::validate_provider_name(&request.provider_name)?
+            EncryptedGatewayCredentialStoreCrypto::validate_provider_name(&request.provider)?
                 .to_string();
 
         if let Some(existing_handle) = request.existing_handle.as_ref() {
@@ -230,7 +230,7 @@ impl DbCredstoreCredentialDriver {
             EncryptedGatewayCredentialStoreCrypto::handle_from_request("delete", request.handle)?;
         let id = EncryptedGatewayCredentialStoreCrypto::id_from_handle(&handle)?;
         let provider_name =
-            EncryptedGatewayCredentialStoreCrypto::validate_provider_name(&request.provider_name)?;
+            EncryptedGatewayCredentialStoreCrypto::validate_provider_name(&request.provider)?;
         let credential_key = EncryptedGatewayCredentialStoreCrypto::validate_credential_key(
             &request.credential_key,
         )?;
@@ -293,9 +293,7 @@ impl DbCredstoreCredentialDriver {
             EncryptedGatewayCredentialStoreCrypto::ensure_envelope_owner(
                 &envelope,
                 &id,
-                EncryptedGatewayCredentialStoreCrypto::validate_provider_name(
-                    &request.provider_name,
-                )?,
+                EncryptedGatewayCredentialStoreCrypto::validate_provider_name(&request.provider)?,
                 EncryptedGatewayCredentialStoreCrypto::validate_credential_key(
                     &request.credential_key,
                 )?,
@@ -1069,7 +1067,7 @@ mod tests {
         existing_handle: Option<CredentialHandle>,
     ) -> StoreCredentialRequest {
         StoreCredentialRequest {
-            provider_name: provider_name.to_string(),
+            provider: provider_name.to_string(),
             credential_key: credential_key.to_string(),
             value: value.to_string(),
             existing_handle,
@@ -1087,7 +1085,7 @@ mod tests {
     ) -> ResolveCredentialRequest {
         ResolveCredentialRequest {
             request_id: request_id.to_string(),
-            provider_name: provider_name.to_string(),
+            provider: provider_name.to_string(),
             credential_key: credential_key.to_string(),
             handle: Some(handle),
             workspace: "test-workspace".to_string(),
@@ -1161,7 +1159,7 @@ mod tests {
 
         driver
             .delete_credential(DeleteCredentialRequest {
-                provider_name: "openai-local".to_string(),
+                provider: "openai-local".to_string(),
                 credential_key: "OPENAI_API_KEY".to_string(),
                 handle: Some(updated.clone()),
                 workspace: "test-workspace".to_string(),

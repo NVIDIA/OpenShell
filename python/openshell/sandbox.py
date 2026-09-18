@@ -768,10 +768,10 @@ class SandboxClient:
         request_spec = spec if spec is not None else _default_spec()
         response = self._stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
+                workspace_scope=_workspace_scope(workspace),
                 spec=request_spec,
                 name=name or "",
                 labels=dict(labels) if labels else {},
-                workspace=workspace,
             ),
             timeout=self._timeout,
         )
@@ -784,21 +784,21 @@ class SandboxClient:
         self,
         *,
         workspace: str,
-        template_name: str,
+        workload_template: str,
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
     ) -> SandboxRef:
-        if not template_name.strip():
-            raise SandboxError("template_name is required")
+        if not workload_template.strip():
+            raise SandboxError("workload_template is required")
         request_spec = spec if spec is not None else openshell_pb2.SandboxSpec()
         response = self._stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
+                workspace_scope=_workspace_scope(workspace),
                 spec=request_spec,
                 name=name or "",
                 labels=dict(labels) if labels else {},
-                workspace=workspace,
-                workload_template_name=template_name,
+                workload_template=workload_template,
             ),
             timeout=self._timeout,
         )
@@ -823,7 +823,7 @@ class SandboxClient:
         self,
         *,
         workspace: str,
-        template_name: str,
+        workload_template: str,
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
@@ -832,7 +832,7 @@ class SandboxClient:
             self,
             self.create_from_template(
                 workspace=workspace,
-                template_name=template_name,
+                workload_template=workload_template,
                 spec=spec,
                 name=name,
                 labels=labels,
@@ -842,18 +842,18 @@ class SandboxClient:
     def sandbox_templates(self) -> SandboxTemplateClient:
         return SandboxTemplateClient(self._channel, timeout=self._timeout)
 
-    def get(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+    def get(self, name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(
             openshell_pb2.GetSandboxRequest(
-                sandbox=sandbox_name,
-                workspace=workspace,
+                workspace_scope=_workspace_scope(workspace),
+                name=name,
             ),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
 
-    def get_session(self, sandbox_name: str, *, workspace: str) -> SandboxSession:
-        return SandboxSession(self, self.get(sandbox_name, workspace=workspace))
+    def get_session(self, name: str, *, workspace: str) -> SandboxSession:
+        return SandboxSession(self, self.get(name, workspace=workspace))
 
     def list(
         self,
@@ -963,12 +963,12 @@ class SandboxClient:
         ]
 
     def delete(
-        self, sandbox_name: str, *, workspace: str, allow_missing: bool = False
+        self, name: str, *, workspace: str, allow_missing: bool = False
     ) -> DeletionResult:
         response = self._stub.DeleteSandbox(
             openshell_pb2.DeleteSandboxRequest(
-                sandbox=sandbox_name,
-                workspace=workspace,
+                workspace_scope=_workspace_scope(workspace),
+                name=name,
                 allow_missing=allow_missing,
             ),
             timeout=self._timeout,
@@ -977,21 +977,21 @@ class SandboxClient:
             DeletionOutcome(response.outcome), response.sandbox_id or None
         )
 
-    def stop(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+    def stop(self, name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StopSandbox(
             openshell_pb2.StopSandboxRequest(
-                sandbox=sandbox_name,
-                workspace=workspace,
+                workspace_scope=_workspace_scope(workspace),
+                name=name,
             ),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
 
-    def start(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+    def start(self, name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StartSandbox(
             openshell_pb2.StartSandboxRequest(
-                sandbox=sandbox_name,
-                workspace=workspace,
+                workspace_scope=_workspace_scope(workspace),
+                name=name,
             ),
             timeout=self._timeout,
         )
@@ -999,7 +999,7 @@ class SandboxClient:
 
     def wait_deleted(
         self,
-        sandbox_name: str,
+        name: str,
         *,
         workspace: str,
         timeout_seconds: float = 60.0,
@@ -1008,7 +1008,7 @@ class SandboxClient:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             try:
-                current = self.get(sandbox_name, workspace=workspace)
+                current = self.get(name, workspace=workspace)
                 if (
                     expected_sandbox_id is not None
                     and current.id != expected_sandbox_id
@@ -1019,13 +1019,13 @@ class SandboxClient:
                     return
                 raise
             time.sleep(1)
-        raise SandboxError(f"sandbox {sandbox_name} was not deleted within timeout")
+        raise SandboxError(f"sandbox {name} was not deleted within timeout")
 
     def wait_ready(
-        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 300.0
+        self, name: str, *, workspace: str, timeout_seconds: float = 300.0
     ) -> SandboxRef:
         return self._wait_for_phase(
-            sandbox_name,
+            name,
             workspace=workspace,
             target_phase=openshell_pb2.SANDBOX_PHASE_READY,
             target_name="ready",
@@ -1033,10 +1033,10 @@ class SandboxClient:
         )
 
     def wait_stopped(
-        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 300.0
+        self, name: str, *, workspace: str, timeout_seconds: float = 300.0
     ) -> SandboxRef:
         return self._wait_for_phase(
-            sandbox_name,
+            name,
             workspace=workspace,
             target_phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
             target_name="stopped",
@@ -1045,7 +1045,7 @@ class SandboxClient:
 
     def _wait_for_phase(
         self,
-        sandbox_name: str,
+        name: str,
         *,
         workspace: str,
         target_phase: int,
@@ -1054,7 +1054,7 @@ class SandboxClient:
     ) -> SandboxRef:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
-            sandbox = self.get(sandbox_name, workspace=workspace)
+            sandbox = self.get(name, workspace=workspace)
             if sandbox.status.phase == target_phase:
                 return sandbox
             if (
@@ -1066,19 +1066,15 @@ class SandboxClient:
                 target_phase == openshell_pb2.SANDBOX_PHASE_READY
                 and sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
             ):
-                raise SandboxError(
-                    f"sandbox {sandbox_name} stopped before becoming ready"
-                )
+                raise SandboxError(f"sandbox {name} stopped before becoming ready")
             if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
-                raise SandboxError(f"sandbox {sandbox_name} entered error phase")
+                raise SandboxError(f"sandbox {name} entered error phase")
             time.sleep(1)
-        raise SandboxError(
-            f"sandbox {sandbox_name} was not {target_name} within timeout"
-        )
+        raise SandboxError(f"sandbox {name} was not {target_name} within timeout")
 
     def exec_stream(
         self,
-        sandbox_name: str,
+        sandbox: str,
         command: Sequence[str],
         *,
         workspace: str,
@@ -1092,8 +1088,8 @@ class SandboxClient:
             raise SandboxError("command must not be empty")
 
         request = openshell_pb2.ExecSandboxRequest(
-            sandbox=sandbox_name,
-            workspace=workspace,
+            workspace_scope=_workspace_scope(workspace),
+            sandbox=sandbox,
             command=list(command),
             workdir=workdir or "",
             environment=dict(env or {}),
@@ -1137,7 +1133,7 @@ class SandboxClient:
 
     def exec(
         self,
-        sandbox_name: str,
+        sandbox: str,
         command: Sequence[str],
         *,
         workspace: str,
@@ -1150,7 +1146,7 @@ class SandboxClient:
     ) -> ExecResult:
         result: ExecResult | None = None
         for item in self.exec_stream(
-            sandbox_name,
+            sandbox,
             command,
             workspace=workspace,
             workdir=workdir,
@@ -1174,7 +1170,7 @@ class SandboxClient:
 
     def exec_python(
         self,
-        sandbox_name: str,
+        sandbox: str,
         function: Callable[..., object],
         *,
         workspace: str,
@@ -1192,7 +1188,7 @@ class SandboxClient:
             kwargs=kwargs,
         )
         return self.exec(
-            sandbox_name,
+            sandbox,
             [_SANDBOX_PYTHON_BIN, "-c", _PYTHON_CLOUDPICKLE_BOOTSTRAP],
             workspace=workspace,
             stream_output=stream_output,
@@ -1258,7 +1254,7 @@ class SandboxTemplateClient:
 
         response = self._stub.CreateSandboxTemplate(
             openshell_pb2.CreateSandboxTemplateRequest(
-                workspace=workspace,
+                workspace_scope=_workspace_scope(workspace),
                 template=template,
             ),
             timeout=self._timeout,
@@ -1272,7 +1268,9 @@ class SandboxTemplateClient:
         workspace: str,
     ) -> openshell_pb2.SandboxWorkloadTemplate:
         response = self._stub.GetSandboxTemplate(
-            openshell_pb2.GetSandboxTemplateRequest(name=name, workspace=workspace),
+            openshell_pb2.GetSandboxTemplateRequest(
+                workspace_scope=_workspace_scope(workspace), name=name
+            ),
             timeout=self._timeout,
         )
         return response.template
@@ -1359,8 +1357,8 @@ class SandboxTemplateClient:
     ) -> DeletionResult:
         response = self._stub.DeleteSandboxTemplate(
             openshell_pb2.DeleteSandboxTemplateRequest(
+                workspace_scope=_workspace_scope(workspace),
                 name=name,
-                workspace=workspace,
                 allow_missing=allow_missing,
             ),
             timeout=self._timeout,
@@ -1476,7 +1474,7 @@ class Sandbox:
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
-        template_name: str | None = None,
+        workload_template: str | None = None,
         timeout: float = 30.0,
         ready_timeout_seconds: float = 120.0,
         auto_refresh: bool = True,
@@ -1502,7 +1500,7 @@ class Sandbox:
         self._name = name
         # Copy so later caller mutation cannot change what gets sent on enter.
         self._labels = dict(labels) if labels is not None else None
-        self._template_name = template_name
+        self._workload_template = workload_template
         self._timeout = timeout
         self._ready_timeout_seconds = ready_timeout_seconds
         self._auto_refresh = auto_refresh
@@ -1530,10 +1528,10 @@ class Sandbox:
         if self._sandbox_input is not None and (
             self._name is not None
             or self._labels is not None
-            or self._template_name is not None
+            or self._workload_template is not None
         ):
             raise SandboxError(
-                "name, labels, and template_name cannot be set when attaching to an existing sandbox"
+                "name, labels, and workload_template cannot be set when attaching to an existing sandbox"
             )
 
         client = SandboxClient.from_active_cluster(
@@ -1546,10 +1544,10 @@ class Sandbox:
         )
         self._client = client
 
-        if self._sandbox_input is None and self._template_name is not None:
+        if self._sandbox_input is None and self._workload_template is not None:
             self._session = client.create_session_from_template(
                 workspace=self._workspace,
-                template_name=self._template_name,
+                workload_template=self._workload_template,
                 spec=self._spec,
                 name=self._name,
                 labels=self._labels,

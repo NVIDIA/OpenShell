@@ -5,12 +5,12 @@ package types
 
 // ServiceEndpoint represents an exposed HTTP service on a sandbox.
 type ServiceEndpoint struct {
-	ID          string
-	SandboxID   string
-	Sandbox     string
-	ServiceName string
-	TargetPort  uint32
-	Domain      bool
-	URL         string
-	Workspace   string
+	ID         string
+	SandboxID  string
+	Sandbox    string
+	Name       string
+	TargetPort uint32
+	Domain     bool
+	URL        string
+	Workspace  string
 }

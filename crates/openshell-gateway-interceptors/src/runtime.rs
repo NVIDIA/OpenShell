@@ -314,7 +314,7 @@ async fn evaluate_plan(
         None
     };
     let request = InterceptorEvaluation {
-        interceptor_name: plan.interceptor_name.clone(),
+        interceptor: plan.interceptor_name.clone(),
         binding_id: plan.binding_id.clone(),
         service: plan.selector.service.clone(),
         method: plan.selector.method.clone(),
@@ -765,7 +765,9 @@ mod tests {
                 config: HashMap::from([("region".to_string(), "old".to_string())]),
                 ..Provider::default()
             }),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
         };
         let json = codec
             .decode_message_to_json("openshell.v1.CreateProviderRequest", &request)
@@ -1012,7 +1014,9 @@ mod tests {
         let request = UpdateConfigRequest {
             request_id: String::new(),
             sandbox: "demo".to_string(),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             expected_resource_version: u64::MAX - 1,
             annotations: HashMap::from([
                 ("policy-hash".to_string(), "sha256:v2:abc".to_string()),
@@ -1078,9 +1082,11 @@ mod tests {
             name: "demo".to_string(),
             labels: HashMap::new(),
             annotations: HashMap::new(),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             await_main_process_attachment: false,
-            workload_template_name: String::new(),
+            workload_template: String::new(),
         };
 
         let bytes = request.encode_to_vec();

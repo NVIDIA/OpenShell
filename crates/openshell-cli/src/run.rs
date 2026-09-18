@@ -667,9 +667,11 @@ pub async fn sandbox_create(
         name: name.unwrap_or_default().to_string(),
         labels,
         annotations,
-        workspace: workspace.to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            workspace.to_string(),
+        )),
         await_main_process_attachment,
-        workload_template_name: template.unwrap_or_default().to_string(),
+        workload_template: template.unwrap_or_default().to_string(),
     };
 
     let response = match client.create_sandbox(request).await {
@@ -711,7 +713,9 @@ pub async fn sandbox_create(
         match client
             .update_config(UpdateConfigRequest {
                 sandbox: sandbox_name.clone(),
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
                 setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
                 setting_value: Some(setting),
                 ..Default::default()
@@ -774,7 +778,9 @@ pub async fn sandbox_create(
     let mut stream = client
         .watch_sandbox(WatchSandboxRequest {
             sandbox: sandbox_name.clone(),
-            workspace: sandbox_workspace.clone(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                sandbox_workspace.clone(),
+            )),
             follow_status: true,
             follow_logs: true,
             follow_events: true,
@@ -1343,7 +1349,9 @@ async fn stage_rootfs_tar(
     // archive over its configured limit, before allocating anything.
     let slot = client
         .begin_rootfs_tar_staging(BeginRootfsTarStagingRequest {
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             file_name,
             size_bytes: source_meta.len(),
         })
@@ -1563,8 +1571,10 @@ where
 
     let response = client
         .get_sandbox(GetSandboxRequest {
-            sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?;
@@ -1575,8 +1585,10 @@ where
 
     let config_result = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await;
     let config = match config_result {
@@ -1779,8 +1791,10 @@ pub async fn sandbox_exec_grpc(
     // Resolve sandbox name to id.
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
-            sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -1849,7 +1863,9 @@ pub async fn sandbox_exec_grpc(
     let mut stream = client
         .exec_sandbox(ExecSandboxRequest {
             sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             command: command.to_vec(),
             workdir: workdir.unwrap_or_default().to_string(),
             environment: environment.clone(),
@@ -2009,7 +2025,9 @@ async fn create_forward_session_token(
     let response = client
         .create_ssh_session(CreateSshSessionRequest {
             sandbox: sandbox_name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .map_err(ForwardTcpConnectionError::from_status)?;
@@ -2023,8 +2041,10 @@ async fn fetch_ready_sandbox_for_forward(
 ) -> Result<Sandbox> {
     let response = match client
         .get_sandbox(GetSandboxRequest {
-            sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
     {
@@ -2246,7 +2266,9 @@ async fn sandbox_exec_interactive_grpc(
         .send(ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
                 sandbox: sandbox.object_name().to_string(),
-                workspace: (sandbox.object_workspace()).to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (sandbox.object_workspace()).to_string(),
+                )),
                 command: command.to_vec(),
                 workdir: workdir.unwrap_or_default().to_string(),
                 environment: environment.clone(),
@@ -2815,7 +2837,9 @@ pub async fn sandbox_template_create(
                     desired_service_level,
                 }),
             }),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?;
@@ -2880,7 +2904,9 @@ pub async fn sandbox_template_get(
     let response = client
         .get_sandbox_template(GetSandboxTemplateRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?;
@@ -2984,7 +3010,9 @@ pub async fn sandbox_template_delete(
                 request_id: String::new(),
                 allow_missing: true,
                 name: name.clone(),
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
             })
             .await
             .into_diagnostic()?;
@@ -3412,8 +3440,10 @@ pub async fn sandbox_delete(
             .delete_sandbox(DeleteSandboxRequest {
                 request_id: String::new(),
                 allow_missing: true,
-                sandbox: name.clone(),
-                workspace: workspace.to_string(),
+                name: name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
             })
             .await
         {
@@ -3472,8 +3502,10 @@ pub async fn sandbox_stop(
     let sandbox = client
         .stop_sandbox(StopSandboxRequest {
             request_id: String::new(),
-            sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -3496,8 +3528,10 @@ pub async fn sandbox_start(
     let sandbox = client
         .start_sandbox(StartSandboxRequest {
             request_id: String::new(),
-            sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -3535,7 +3569,7 @@ async fn wait_for_lifecycle_phase(
     let mut stream = client
         .watch_sandbox(WatchSandboxRequest {
             sandbox: sandbox_name,
-            workspace: workspace.clone(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
             follow_status: true,
             follow_logs: false,
             follow_events: false,
@@ -3598,8 +3632,10 @@ pub async fn service_expose(
         .expose_service(ExposeServiceRequest {
             request_id: String::new(),
             sandbox: (sandbox).to_string(),
-            workspace: workspace.to_string(),
-            service: service.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+            name: service.to_string(),
             target_port: u32::from(target_port),
             domain: true,
         })
@@ -3702,8 +3738,10 @@ pub async fn service_get(
     let response = client
         .get_service(GetServiceRequest {
             sandbox: (sandbox).to_string(),
-            workspace: workspace.to_string(),
-            service: service.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+            name: service.to_string(),
         })
         .await
         .map_err(|status| service_status_error("get service", "sandbox:read", status))?
@@ -3726,8 +3764,10 @@ pub async fn service_delete(
             request_id: String::new(),
             allow_missing: false,
             sandbox: sandbox.to_string(),
-            service: service.to_string(),
-            workspace: workspace.to_string(),
+            name: service.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .map_err(|status| service_status_error("delete service", "sandbox:write", status))?
@@ -3787,7 +3827,7 @@ fn print_service_endpoint_table(
                 .metadata
                 .as_ref()
                 .map_or("", |m| m.workspace.as_str());
-            let service = service_display_name(&endpoint.service_name).to_string();
+            let service = service_display_name(&endpoint.name).to_string();
             let target = format!("127.0.0.1:{}", endpoint.target_port);
             let url = if response.url.is_empty() {
                 String::new()
@@ -3886,7 +3926,7 @@ fn service_endpoint_to_json(
     Some(serde_json::json!({
         "workspace": workspace,
         "sandbox": endpoint.sandbox,
-        "service": endpoint.service_name,
+        "service": endpoint.name,
         "target_port": endpoint.target_port,
         "url": url,
     }))
@@ -4138,7 +4178,9 @@ pub async fn workspace_member_add(
     let response = client
         .add_workspace_member(AddWorkspaceMemberRequest {
             request_id: String::new(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             principal_subject: subject.to_string(),
             role: role_val.into(),
         })
@@ -4174,7 +4216,9 @@ pub async fn workspace_member_remove(
         .remove_workspace_member(RemoveWorkspaceMemberRequest {
             request_id: String::new(),
             allow_missing: true,
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             principal_subject: subject.to_string(),
         })
         .await
@@ -4212,7 +4256,9 @@ pub async fn workspace_member_list(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .list_workspace_members(ListWorkspaceMembersRequest {
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             page_size,
             page_token: page_token.to_string(),
         })
@@ -4579,8 +4625,10 @@ pub async fn sandbox_settings_get(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -4770,7 +4818,9 @@ pub async fn sandbox_setting_set(
     let response = client
         .update_config(UpdateConfigRequest {
             sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             setting_key: key.to_string(),
             setting_value: Some(setting_value),
             ..Default::default()
@@ -4835,7 +4885,9 @@ pub async fn sandbox_setting_delete(
     let response = client
         .update_config(UpdateConfigRequest {
             sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             setting_key: key.to_string(),
             delete_setting: true,
             ..Default::default()
@@ -4881,7 +4933,9 @@ pub async fn sandbox_policy_set(
     let current_version = client
         .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
             sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             version: 0,
             global: false,
         })
@@ -4893,7 +4947,9 @@ pub async fn sandbox_policy_set(
     let response = client
         .update_config(UpdateConfigRequest {
             sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             policy: Some(policy),
             ..Default::default()
         })
@@ -4940,7 +4996,9 @@ pub async fn sandbox_policy_set(
         let status_resp = client
             .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
                 sandbox: name.to_string(),
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
                 version: resp.version,
                 global: false,
             })
@@ -5023,8 +5081,10 @@ pub async fn sandbox_policy_update(
     let mut client = grpc_client(server, tls).await?;
     let current = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -5058,7 +5118,9 @@ pub async fn sandbox_policy_update(
     let response = client
         .update_config(UpdateConfigRequest {
             sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             merge_operations: plan.merge_operations,
             ..Default::default()
         })
@@ -5105,7 +5167,9 @@ pub async fn sandbox_policy_update(
         let status_resp = client
             .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
                 sandbox: name.to_string(),
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
                 version: response.version,
                 global: false,
             })
@@ -5213,7 +5277,9 @@ where
     let status_resp = client
         .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
             sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             version,
             global: false,
         })
@@ -5306,8 +5372,10 @@ where
 
     let config = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -5405,7 +5473,7 @@ pub async fn sandbox_policy_get_global(
             version,
             global: true,
             sandbox: String::new(),
-            workspace: String::new(),
+            workspace_scope: None,
         })
         .await
         .into_diagnostic()?;
@@ -5549,7 +5617,9 @@ pub async fn sandbox_policy_list(
             sandbox: name.to_string(),
             page_size,
             page_token: page_token.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             global: false,
         })
         .await
@@ -5595,7 +5665,7 @@ pub async fn sandbox_policy_list_global(
             page_token: page_token.to_string(),
             global: true,
             sandbox: String::new(),
-            workspace: String::new(),
+            workspace_scope: None,
         })
         .await
         .into_diagnostic()?;
@@ -5718,7 +5788,9 @@ pub async fn sandbox_logs(
         let mut stream = client
             .watch_sandbox(WatchSandboxRequest {
                 sandbox: name.to_string(),
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
                 follow_status: false,
                 follow_logs: true,
                 follow_events: false,
@@ -5747,7 +5819,9 @@ pub async fn sandbox_logs(
         let resp = client
             .get_sandbox_logs(GetSandboxLogsRequest {
                 sandbox: name.to_string(),
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
                 lines,
                 since_time: openshell_core::time::optional_timestamp_from_legacy_millis(since_ms)
                     .into_diagnostic()?,
@@ -5828,7 +5902,9 @@ pub async fn sandbox_draft_get(
     let response = client
         .get_draft_policy(GetDraftPolicyRequest {
             sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             status_filter: status_filter.unwrap_or("").to_string(),
         })
         .await
@@ -5860,7 +5936,7 @@ pub async fn sandbox_draft_get(
 
         println!("  {} {}", "Chunk:".dimmed(), chunk.id);
         println!("  {} {}", "Status:".dimmed(), status_colored);
-        println!("  {} {}", "Rule:".dimmed(), chunk.rule_name);
+        println!("  {} {}", "Rule:".dimmed(), chunk.rule);
         if !chunk.binary.is_empty() {
             println!("  {} {}", "Binary:".dimmed(), chunk.binary);
         }
@@ -5936,7 +6012,9 @@ pub async fn sandbox_draft_approve(
     let review_token = client
         .get_draft_policy(GetDraftPolicyRequest {
             sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             status_filter: String::new(),
         })
         .await
@@ -5952,7 +6030,9 @@ pub async fn sandbox_draft_approve(
         .approve_draft_chunk(ApproveDraftChunkRequest {
             request_id: String::new(),
             sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             chunk_id: chunk_id.to_string(),
             review_token,
         })
@@ -5985,7 +6065,9 @@ pub async fn sandbox_draft_reject(
         .reject_draft_chunk(RejectDraftChunkRequest {
             request_id: String::new(),
             sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             chunk_id: chunk_id.to_string(),
             reason: reason.to_string(),
         })
@@ -6009,7 +6091,9 @@ pub async fn sandbox_draft_approve_all(
     let approvals = client
         .get_draft_policy(GetDraftPolicyRequest {
             sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             status_filter: "pending".to_string(),
         })
         .await
@@ -6027,7 +6111,9 @@ pub async fn sandbox_draft_approve_all(
         .approve_all_draft_chunks(ApproveAllDraftChunksRequest {
             request_id: String::new(),
             sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             include_security_flagged,
             approvals,
         })
@@ -6059,7 +6145,9 @@ pub async fn sandbox_draft_clear(
         .clear_draft_chunks(ClearDraftChunksRequest {
             request_id: String::new(),
             sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?;
@@ -6086,7 +6174,9 @@ pub async fn sandbox_draft_history(
     let response = client
         .get_draft_history(GetDraftHistoryRequest {
             sandbox: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?;
@@ -6312,7 +6402,7 @@ mod tests {
                     ..Default::default()
                 }),
                 sandbox: "api".to_string(),
-                service_name: String::new(),
+                name: String::new(),
                 target_port: 8080,
                 ..Default::default()
             }),

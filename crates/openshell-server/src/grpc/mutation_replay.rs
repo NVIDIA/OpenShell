@@ -16,7 +16,7 @@ use openshell_core::proto::{
     CreateWorkspaceRequest, CreateWorkspaceResponse, DeleteSandboxTemplateRequest,
     DeleteSandboxTemplateResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
     RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, SandboxTemplateResponse,
-    Workspace,
+    Workspace, WorkspaceSelector,
 };
 use openshell_core::{GetResourceVersion, ObjectId, rpc_error};
 use prost::Message;
@@ -30,7 +30,9 @@ use super::{sandbox, workspace};
 use crate::ServerState;
 use crate::auth::identity::IdentityProvider;
 use crate::auth::principal::Principal;
-use crate::auth::workspace_authz::{MinWorkspaceRole, authorize_workspace, require_platform_admin};
+use crate::auth::workspace_authz::{
+    MinWorkspaceRole, authorize_workspace, require_platform_admin, selected_workspace_name,
+};
 use crate::persistence::{
     ObjectType, PersistenceError, SetResourceVersion, Store, WriteCondition, current_time_ms,
 };
@@ -504,8 +506,9 @@ fn global_scope(state: &ServerState, principal: &Principal) -> Result<Scope, Sta
 async fn template_scope(
     state: &ServerState,
     principal: &Principal,
-    workspace: &str,
+    workspace_scope: Option<&WorkspaceSelector>,
 ) -> Result<Scope, Status> {
+    let workspace = selected_workspace_name(workspace_scope)?;
     let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
@@ -668,7 +671,7 @@ resource_mutation!(
     sandbox::handle_create_sandbox_template,
     template,
     async |req: &CreateSandboxTemplateRequest, state: &ServerState, principal: &Principal| {
-        template_scope(state, principal, &req.workspace).await
+        template_scope(state, principal, req.workspace_scope.as_ref()).await
     }
 );
 deletion_mutation!(
@@ -677,7 +680,7 @@ deletion_mutation!(
     "DeleteSandboxTemplate",
     sandbox::handle_delete_sandbox_template,
     async |req: &DeleteSandboxTemplateRequest, state: &ServerState, principal: &Principal| {
-        template_scope(state, principal, &req.workspace).await
+        template_scope(state, principal, req.workspace_scope.as_ref()).await
     }
 );
 resource_mutation!(
@@ -687,7 +690,13 @@ resource_mutation!(
     workspace::handle_add_workspace_member,
     member,
     async |req: &AddWorkspaceMemberRequest, state: &ServerState, principal: &Principal| {
-        member_scope(state, principal, &req.workspace, Some(req.role)).await
+        member_scope(
+            state,
+            principal,
+            selected_workspace_name(req.workspace_scope.as_ref())?,
+            Some(req.role),
+        )
+        .await
     }
 );
 deletion_mutation!(
@@ -696,7 +705,13 @@ deletion_mutation!(
     "RemoveWorkspaceMember",
     workspace::handle_remove_workspace_member,
     async |req: &RemoveWorkspaceMemberRequest, state: &ServerState, principal: &Principal| {
-        member_scope(state, principal, &req.workspace, None).await
+        member_scope(
+            state,
+            principal,
+            selected_workspace_name(req.workspace_scope.as_ref())?,
+            None,
+        )
+        .await
     }
 );
 

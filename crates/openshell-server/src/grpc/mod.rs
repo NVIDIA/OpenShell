@@ -257,7 +257,7 @@ impl OpenShell for OpenShellService {
             .map(|driver| ComputeDriverInfo {
                 name: driver.name.clone(),
                 capabilities: Some(ComputeDriverCapabilities {
-                    driver_name: driver.driver_name.clone(),
+                    name: driver.driver_name.clone(),
                     driver_version: driver.driver_version.clone(),
                     resource_capabilities: driver
                         .resource_capabilities

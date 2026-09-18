@@ -34,7 +34,7 @@ func (e *execClient) Run(ctx context.Context, workspace, sandboxName string, com
 		opt = &opts[0]
 	}
 	req := converter.ExecRequestToProto(sandboxName, command, opt)
-	req.Workspace = workspace
+	req.WorkspaceScope = namedWorkspaceScope(workspace)
 
 	stream, err := e.client.ExecSandbox(ctx, req)
 	if err != nil {
@@ -68,7 +68,7 @@ func (e *execClient) Stream(ctx context.Context, workspace, sandboxName string, 
 		opt = &opts[0]
 	}
 	req := converter.ExecRequestToProto(sandboxName, command, opt)
-	req.Workspace = workspace
+	req.WorkspaceScope = namedWorkspaceScope(workspace)
 
 	streamCtx, cancel := context.WithCancel(ctx)
 	stream, err := e.client.ExecSandbox(streamCtx, req)
@@ -100,7 +100,7 @@ func (e *execClient) Interactive(ctx context.Context, workspace, sandboxName str
 	}
 
 	startReq := converter.ExecInteractiveRequestToProto(sandboxName, command, cols, rows, opt)
-	startReq.Workspace = workspace
+	startReq.WorkspaceScope = namedWorkspaceScope(workspace)
 	if sendErr := stream.Send(&pb.ExecSandboxInput{
 		Payload: &pb.ExecSandboxInput_Start{Start: startReq},
 	}); sendErr != nil {

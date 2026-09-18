@@ -316,9 +316,11 @@ mod tests {
             name: "demo".to_string(),
             labels: HashMap::from([("team".to_string(), "agent".to_string())]),
             annotations: HashMap::new(),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             await_main_process_attachment: false,
-            workload_template_name: String::new(),
+            workload_template: String::new(),
         };
         let bytes = request.encode_to_vec();
         let json = codec
@@ -347,7 +349,9 @@ mod tests {
                 config: HashMap::from([("region".to_string(), "us-west".to_string())]),
                 ..Provider::default()
             }),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
         };
         let encoded = request.encode_to_vec();
 
@@ -403,7 +407,9 @@ mod tests {
                 environment: HashMap::from([("FEATURE_FLAG".to_string(), "on".to_string())]),
                 ..SandboxSpec::default()
             }),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             ..CreateSandboxRequest::default()
         };
 
@@ -454,7 +460,9 @@ mod tests {
             ProtoJsonCodec::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
         let request = UpdateConfigRequest {
             sandbox: "demo".to_string(),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             annotations: HashMap::from([(
                 "openshell.nvidia.com/policy-signature".to_string(),
                 "signed".to_string(),

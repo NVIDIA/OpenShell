@@ -61,8 +61,10 @@ async fn public_status(state: &Arc<ServerState>, sandbox_id: &str) -> SandboxSta
     crate::grpc::sandbox::handle_get_sandbox(
         state,
         authed_request(GetSandboxRequest {
-            sandbox: sandbox_id.to_string(),
-            workspace: "default".to_string(),
+            name: sandbox_id.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
         }),
     )
     .await
@@ -232,7 +234,9 @@ async fn unchanged_policy_revision_preserves_endpoint_evidence() {
             sandbox: sandbox_id.to_string(),
             policy: sandbox.spec.expect("sandbox spec").policy,
             annotations: HashMap::from([("audit".to_string(), "v2".to_string())]),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             ..Default::default()
         }),
     )
@@ -344,7 +348,9 @@ async fn loaded_policy_hash_cycle_resets_endpoint_evidence() {
             authed_request(UpdateConfigRequest {
                 sandbox: sandbox_id.to_string(),
                 policy: Some(policy),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 ..Default::default()
             }),
         )
@@ -516,8 +522,8 @@ async fn report_endpoint_status_rejects_stale_configuration_epoch() {
         &state,
         with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                sandbox: sandbox_id.to_string(),
-                workspace: String::new(),
+                name: sandbox_id.to_string(),
+                workspace_scope: None,
             }),
             sandbox_id,
         ),
@@ -859,8 +865,8 @@ async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
         &state,
         with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                sandbox: sandbox_id.to_string(),
-                workspace: String::new(),
+                name: sandbox_id.to_string(),
+                workspace_scope: None,
             }),
             sandbox_id,
         ),

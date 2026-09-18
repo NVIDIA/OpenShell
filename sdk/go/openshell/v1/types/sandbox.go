@@ -38,15 +38,15 @@ type SandboxSpec struct {
 
 // SandboxTemplate defines the container template for a sandbox.
 type SandboxTemplate struct {
-	Image            string
-	RuntimeClassName string
-	AgentSocket      string
-	Labels           map[string]string
-	Annotations      map[string]string
-	Environment      map[string]string
-	UserNamespaces   *bool
-	Resources        map[string]any
-	DriverConfig     map[string]any
+	Image          string
+	RuntimeClass   string
+	AgentSocket    string
+	Labels         map[string]string
+	Annotations    map[string]string
+	Environment    map[string]string
+	UserNamespaces *bool
+	Resources      map[string]any
+	DriverConfig   map[string]any
 }
 
 // SandboxWorkloadTemplate is a reusable workspace-scoped sandbox template resource.

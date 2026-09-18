@@ -87,7 +87,7 @@ func (s *mockSandboxServer) GetSandbox(_ context.Context, req *pb.GetSandboxRequ
 	if s.getErr != nil {
 		return nil, s.getErr
 	}
-	name := req.GetSandbox()
+	name := req.GetName()
 	sb, ok := s.sandboxes[name]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
@@ -142,7 +142,7 @@ func (s *mockSandboxServer) DeleteSandbox(_ context.Context, req *pb.DeleteSandb
 	if s.deleteErr != nil {
 		return nil, s.deleteErr
 	}
-	name := req.GetSandbox()
+	name := req.GetName()
 	_, ok := s.sandboxes[name]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
@@ -154,7 +154,7 @@ func (s *mockSandboxServer) DeleteSandbox(_ context.Context, req *pb.DeleteSandb
 func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRequest) (*pb.SandboxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	name := req.GetSandbox()
+	name := req.GetName()
 	sb, ok := s.sandboxes[name]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
@@ -166,7 +166,7 @@ func (s *mockSandboxServer) StopSandbox(_ context.Context, req *pb.StopSandboxRe
 func (s *mockSandboxServer) StartSandbox(_ context.Context, req *pb.StartSandboxRequest) (*pb.SandboxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	name := req.GetSandbox()
+	name := req.GetName()
 	sb, ok := s.sandboxes[name]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
@@ -186,7 +186,7 @@ func (s *mockSandboxServer) AttachSandboxProvider(_ context.Context, req *pb.Att
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", name)
 	}
-	sb.Spec.Providers = append(sb.Spec.Providers, req.GetProviderName())
+	sb.Spec.Providers = append(sb.Spec.Providers, req.GetProvider())
 	return &pb.AttachSandboxProviderResponse{Sandbox: sb, Attached: true}, nil
 }
 
@@ -370,7 +370,7 @@ func TestSandboxCreateFromTemplateSendsCommandAndTTY(t *testing.T) {
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
 	require.NotNil(t, mock.createRequest)
-	assert.Equal(t, "gpu-kata", mock.createRequest.GetWorkloadTemplateName())
+	assert.Equal(t, "gpu-kata", mock.createRequest.GetWorkloadTemplate())
 	require.NotNil(t, mock.createRequest.GetSpec())
 	assert.Equal(t, []string{"/opt/worker", "--serve"}, mock.createRequest.GetSpec().GetCommand())
 	assert.True(t, mock.createRequest.GetSpec().GetTty())

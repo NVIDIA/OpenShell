@@ -182,7 +182,7 @@ impl KubernetesSecretsCredentialDriver {
         let owner_id = credential_owner_id(
             &request.workspace,
             &request.provider_id,
-            &request.provider_name,
+            &request.provider,
             &request.credential_key,
         );
         let object_id = if let Some(existing_handle) = request.existing_handle.as_ref() {
@@ -195,7 +195,7 @@ impl KubernetesSecretsCredentialDriver {
             validate_expected_secret_name(
                 &request.workspace,
                 &request.provider_id,
-                &request.provider_name,
+                &request.provider,
                 &request.credential_key,
                 &object_id,
                 &reference.secret_name,
@@ -207,7 +207,7 @@ impl KubernetesSecretsCredentialDriver {
                 secret_name: managed_secret_name(
                     &request.workspace,
                     &request.provider_id,
-                    &request.provider_name,
+                    &request.provider,
                     &request.credential_key,
                     &object_id,
                 ),
@@ -247,7 +247,7 @@ impl KubernetesSecretsCredentialDriver {
         validate_expected_secret_name(
             &request.workspace,
             &request.provider_id,
-            &request.provider_name,
+            &request.provider,
             &request.credential_key,
             &object_id,
             &reference.secret_name,
@@ -255,7 +255,7 @@ impl KubernetesSecretsCredentialDriver {
         let owner_id = credential_owner_id(
             &request.workspace,
             &request.provider_id,
-            &request.provider_name,
+            &request.provider,
             &request.credential_key,
         );
         let api: Api<Secret> = Api::namespaced(self.client.clone(), &reference.namespace);
@@ -314,7 +314,7 @@ impl KubernetesSecretsCredentialDriver {
             validate_expected_secret_name(
                 &request.workspace,
                 &request.provider_id,
-                &request.provider_name,
+                &request.provider,
                 &request.credential_key,
                 &object_id,
                 &reference.secret_name,
@@ -322,7 +322,7 @@ impl KubernetesSecretsCredentialDriver {
             let owner_id = credential_owner_id(
                 &request.workspace,
                 &request.provider_id,
-                &request.provider_name,
+                &request.provider,
                 &request.credential_key,
             );
             let value = self.resolve_secret_value(&reference, &owner_id).await?;
@@ -464,7 +464,7 @@ impl CredentialDriver for CredentialDriverService {
         _request: Request<GetCredentialDriverCapabilitiesRequest>,
     ) -> Result<Response<GetCredentialDriverCapabilitiesResponse>, Status> {
         Ok(Response::new(GetCredentialDriverCapabilitiesResponse {
-            driver_name: KubernetesSecretsCredentialDriver::NAME.to_string(),
+            name: KubernetesSecretsCredentialDriver::NAME.to_string(),
             driver_version: VERSION.to_string(),
             backend_kind: KubernetesSecretsCredentialDriver::NAME.to_string(),
             supports_list: false,

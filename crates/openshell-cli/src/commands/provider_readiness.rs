@@ -118,7 +118,7 @@ fn validate_mutation_receipts(
         // Otherwise a substituted receipt can redirect a wait to another scope.
         if receipt.mutation_id != mutation_id
             || receipt.workspace != expected.workspace
-            || receipt.provider_name != expected.provider_name
+            || receipt.provider != expected.provider_name
             || receipt.kind != i32::from(expected.kind)
             || !receipt_ids.insert(receipt.receipt_id.as_str())
             || !sandbox_ids.insert(desired.sandbox_id.as_str())
@@ -275,9 +275,11 @@ pub async fn sandbox_provider_status(
             &mut client,
             GetSandboxProviderStatusRequest {
                 sandbox: name.to_string(),
-                provider_name: provider.to_string(),
+                provider: provider.to_string(),
                 receipt_id: receipt_id.to_string(),
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
             },
         ),
     )
@@ -360,7 +362,7 @@ fn receipt_json(receipt: &ProviderMutationReceipt) -> serde_json::Value {
     serde_json::json!({
         "receipt_id": receipt.receipt_id,
         "mutation_id": receipt.mutation_id,
-        "provider_name": receipt.provider_name,
+        "provider_name": receipt.provider,
         "workspace": receipt.workspace,
         "kind": receipt.kind().as_str_name().trim_start_matches("PROVIDER_MUTATION_KIND_").to_ascii_lowercase(),
         "desired": desired,
@@ -419,7 +421,7 @@ fn print_statuses(mutation_id: &str, results: &[DisplayStatus], output: &str) ->
         println!(
             "{} / {}: {} ({})",
             sandbox,
-            receipt.provider_name,
+            receipt.provider,
             state_label(result.status.state),
             reason_label(result.status.reason)
         );
@@ -480,7 +482,7 @@ mod tests {
         let receipt = ProviderMutationReceipt {
             receipt_id: "receipt".to_string(),
             mutation_id: "mutation".to_string(),
-            provider_name: "provider".to_string(),
+            provider: "provider".to_string(),
             workspace: "default".to_string(),
             kind: ProviderMutationKind::Update.into(),
             persisted_time: Some(openshell_core::time::timestamp_from_millis(1).unwrap()),

@@ -694,7 +694,7 @@ fn sanitize_reason_for_audit(raw: &str) -> String {
 /// JSON.
 fn summarize_chunk_for_audit(chunk: &PolicyChunk) -> String {
     let Some(rule) = chunk.proposed_rule.as_ref() else {
-        return format!("rule_name:{}", chunk.rule_name);
+        return format!("rule_name:{}", chunk.rule);
     };
     let endpoint = rule.endpoints.first().map_or_else(
         || "unknown".to_string(),
@@ -838,7 +838,7 @@ fn chunk_state_payload(
     let mut payload = serde_json::json!({
         "chunk_id": chunk.id,
         "status": chunk.status,
-        "rule_name": chunk.rule_name,
+        "rule_name": chunk.rule,
         "binary": chunk.binary,
         "rejection_reason": chunk.rejection_reason,
         "validation_result": chunk.validation_result,
@@ -1071,7 +1071,7 @@ fn policy_chunk_from_add_rule(
     Ok(PolicyChunk {
         id: String::new(),
         status: "pending".to_string(),
-        rule_name,
+        rule: rule_name,
         proposed_rule: Some(rule),
         rationale: intent_summary.to_string(),
         security_notes: String::new(),
@@ -1455,7 +1455,7 @@ mod tests {
         let chunks = proposal_chunks_from_body(body).unwrap();
 
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].rule_name, "github_api_repo_create");
+        assert_eq!(chunks[0].rule, "github_api_repo_create");
         assert_eq!(chunks[0].rationale, "Allow gh to create one repo.");
         assert_eq!(chunks[0].binary, "/usr/bin/gh");
         let rule = chunks[0].proposed_rule.as_ref().unwrap();
@@ -1866,7 +1866,7 @@ mod tests {
         let chunk = PolicyChunk {
             id: "chunk-x".to_string(),
             status: "rejected".to_string(),
-            rule_name: "allow_example".to_string(),
+            rule: "allow_example".to_string(),
             binary: "/usr/bin/curl".to_string(),
             rejection_reason: "scope too broad".to_string(),
             validation_result: "no exfil paths".to_string(),
@@ -1904,7 +1904,7 @@ mod tests {
         let chunk = PolicyChunk {
             id: "chunk-y".to_string(),
             status: "approved".to_string(),
-            rule_name: "allow_github".to_string(),
+            rule: "allow_github".to_string(),
             binary: "/usr/bin/curl".to_string(),
             ..Default::default()
         };
@@ -1995,7 +1995,7 @@ mod tests {
     fn summarize_chunk_for_audit_includes_endpoint_l7_path_and_binary() {
         let chunk = PolicyChunk {
             id: "ignored".to_string(),
-            rule_name: "github_write".to_string(),
+            rule: "github_write".to_string(),
             binary: "/usr/bin/curl".to_string(),
             proposed_rule: Some(NetworkPolicyRule {
                 name: "github_write".to_string(),
@@ -2302,7 +2302,7 @@ mod tests {
     #[test]
     fn summarize_chunk_for_audit_falls_back_to_rule_name_without_rule() {
         let chunk = PolicyChunk {
-            rule_name: "fallback".to_string(),
+            rule: "fallback".to_string(),
             proposed_rule: None,
             ..Default::default()
         };

@@ -96,7 +96,9 @@ async fn policy_only_preserves_all_process_identity_combinations_through_gateway
                     policy: Some(policy),
                     ..Default::default()
                 }),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 ..Default::default()
             })
             .await

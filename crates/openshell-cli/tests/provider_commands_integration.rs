@@ -62,6 +62,17 @@ const SYNTHETIC_PROFILE_BACKEND_ERROR: &str = "TESTLEAK";
 const SYNTHETIC_MUTATION_ERROR_METADATA: &str = "fixture-mutation-error-metadata";
 const STORAGE_UNCERTAIN_REASON: &str = "CONFIG_OPERATION_STORAGE_UNCERTAIN";
 
+fn selected_workspace(scope: &Option<openshell_core::proto::WorkspaceSelector>) -> Option<&str> {
+    scope
+        .as_ref()
+        .and_then(|scope| match scope.selection.as_ref() {
+            Some(openshell_core::proto::workspace_selector::Selection::Workspace(name)) => {
+                Some(name.as_str())
+            }
+            _ => None,
+        })
+}
+
 #[derive(Clone, Default)]
 struct ProviderState {
     providers: Arc<Mutex<HashMap<String, Provider>>>,
@@ -96,22 +107,22 @@ struct ProviderState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProviderRefreshRequestLog {
     Status {
-        provider_name: String,
+        provider: String,
         credential_key: String,
     },
     Configure {
-        provider_name: String,
+        provider: String,
         credential_key: String,
         material: HashMap<String, String>,
         secret_material_keys: Vec<String>,
         expires_at_ms: Option<i64>,
     },
     Rotate {
-        provider_name: String,
+        provider: String,
         credential_key: String,
     },
     Delete {
-        provider_name: String,
+        provider: String,
         credential_key: String,
     },
 }
@@ -123,11 +134,11 @@ enum SandboxProviderRequestLog {
     },
     Attach {
         sandbox_name: String,
-        provider_name: String,
+        provider: String,
     },
     Detach {
         sandbox_name: String,
-        provider_name: String,
+        provider: String,
     },
 }
 
@@ -164,7 +175,7 @@ impl TestOpenShell {
         let mut receipt = ProviderMutationReceipt {
             receipt_id: format!("receipt-{sequence}"),
             mutation_id: mutation_id.map_or_else(|| format!("mutation-{sequence}"), str::to_string),
-            provider_name: provider_name.to_string(),
+            provider: provider_name.to_string(),
             workspace: workspace.to_string(),
             kind: kind.into(),
             desired: Some(ProviderDesiredIdentity {
@@ -293,7 +304,7 @@ impl OpenShell for TestOpenShell {
             return Err(Status::internal(SYNTHETIC_READINESS_BACKEND_ERROR));
         }
         let request = request.into_inner();
-        let name = request.sandbox;
+        let name = request.name;
         // Return a minimal sandbox with metadata for CAS operations
         Ok(Response::new(SandboxResponse {
             sandbox: Some(Sandbox {
@@ -357,7 +368,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<AttachSandboxProviderRequest>,
     ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
         let request = request.into_inner();
-        let workspace = request.workspace.as_str();
+        let workspace = selected_workspace(&request.workspace_scope).unwrap_or_default();
         let sandbox_name = request.sandbox.clone();
         self.state
             .sandbox_provider_requests
@@ -365,23 +376,23 @@ impl OpenShell for TestOpenShell {
             .await
             .push(SandboxProviderRequestLog::Attach {
                 sandbox_name: sandbox_name.clone(),
-                provider_name: request.provider_name.clone(),
+                provider: request.provider.clone(),
             });
         if !self
             .state
             .providers
             .lock()
             .await
-            .contains_key(&request.provider_name)
+            .contains_key(&request.provider)
         {
             return Err(Status::failed_precondition("provider not found"));
         }
         let mut sandbox_providers = self.state.sandbox_providers.lock().await;
         let providers = sandbox_providers.entry(sandbox_name.clone()).or_default();
-        let attached = if providers.contains(&request.provider_name) {
+        let attached = if providers.contains(&request.provider) {
             false
         } else {
-            providers.push(request.provider_name.clone());
+            providers.push(request.provider.clone());
             true
         };
         let provider_names = providers.clone();
@@ -390,7 +401,7 @@ impl OpenShell for TestOpenShell {
         let receipt = self
             .provider_receipt(
                 &sandbox_name,
-                &request.provider_name,
+                &request.provider,
                 workspace,
                 ProviderMutationKind::Attach,
                 None,
@@ -419,7 +430,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<DetachSandboxProviderRequest>,
     ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
         let request = request.into_inner();
-        let workspace = request.workspace.as_str();
+        let workspace = selected_workspace(&request.workspace_scope).unwrap_or_default();
         let sandbox_name = request.sandbox.clone();
         self.state
             .sandbox_provider_requests
@@ -427,12 +438,12 @@ impl OpenShell for TestOpenShell {
             .await
             .push(SandboxProviderRequestLog::Detach {
                 sandbox_name: sandbox_name.clone(),
-                provider_name: request.provider_name.clone(),
+                provider: request.provider.clone(),
             });
         let mut sandbox_providers = self.state.sandbox_providers.lock().await;
         let providers = sandbox_providers.entry(sandbox_name.clone()).or_default();
         let before_len = providers.len();
-        providers.retain(|name| name != &request.provider_name);
+        providers.retain(|name| name != &request.provider);
         let detached = providers.len() != before_len;
         let provider_names = providers.clone();
         drop(sandbox_providers);
@@ -440,7 +451,7 @@ impl OpenShell for TestOpenShell {
         let receipt = self
             .provider_receipt(
                 &sandbox_name,
-                &request.provider_name,
+                &request.provider,
                 workspace,
                 ProviderMutationKind::Detach,
                 None,
@@ -505,7 +516,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<GetSandboxProviderStatusRequest>,
     ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
         let request = request.into_inner();
-        let workspace = request.workspace.as_str();
+        let workspace = selected_workspace(&request.workspace_scope).unwrap_or_default();
         self.state
             .readiness_requests
             .lock()
@@ -517,7 +528,7 @@ impl OpenShell for TestOpenShell {
                 .values()
                 .filter(|receipt| {
                     receipt.workspace == workspace
-                        && receipt.provider_name == request.provider_name
+                        && receipt.provider == request.provider
                         && receipt
                             .desired
                             .as_ref()
@@ -780,7 +791,12 @@ impl OpenShell for TestOpenShell {
             .scoped_profiles
             .lock()
             .await
-            .get(&(request.workspace, id.clone()))
+            .get(&(
+                selected_workspace(&request.workspace_scope)
+                    .unwrap_or_default()
+                    .to_string(),
+                id.clone(),
+            ))
             .cloned();
         let profile = if let Some(profile) = scoped_profile {
             profile
@@ -915,7 +931,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<UpdateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
         let request = request.into_inner();
-        let workspace = request.workspace.as_str();
+        let workspace = selected_workspace(&request.workspace_scope).unwrap_or_default();
         let provider = request
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
@@ -1029,14 +1045,14 @@ impl OpenShell for TestOpenShell {
             .lock()
             .await
             .push(ProviderRefreshRequestLog::Status {
-                provider_name: request.provider.clone(),
+                provider: request.provider.clone(),
                 credential_key: request.credential_key.clone(),
             });
         let refresh_statuses = self.state.refresh_statuses.lock().await;
         let credentials = if request.credential_key.is_empty() {
             refresh_statuses
                 .values()
-                .filter(|status| status.provider_name == request.provider)
+                .filter(|status| status.provider == request.provider)
                 .cloned()
                 .collect()
         } else {
@@ -1061,7 +1077,7 @@ impl OpenShell for TestOpenShell {
             .lock()
             .await
             .push(ProviderRefreshRequestLog::Configure {
-                provider_name: request.provider.clone(),
+                provider: request.provider.clone(),
                 credential_key: request.credential_key.clone(),
                 material: request.material.clone(),
                 secret_material_keys: request.secret_material_keys.clone(),
@@ -1084,7 +1100,7 @@ impl OpenShell for TestOpenShell {
             .get(&request.provider)
             .ok_or_else(|| Status::not_found("provider not found"))?;
         let status = ProviderCredentialRefreshStatus {
-            provider_name: request.provider.clone(),
+            provider: request.provider.clone(),
             provider_id: provider.object_id().to_string(),
             credential_key: request.credential_key.clone(),
             strategy: request.strategy,
@@ -1123,7 +1139,7 @@ impl OpenShell for TestOpenShell {
             .lock()
             .await
             .push(ProviderRefreshRequestLog::Rotate {
-                provider_name: provider_name.clone(),
+                provider: provider_name.clone(),
                 credential_key: credential_key.clone(),
             });
         let rotate_failure = self.state.fail_rotate_refresh_message.lock().await.take();
@@ -1166,7 +1182,7 @@ impl OpenShell for TestOpenShell {
             .lock()
             .await
             .push(ProviderRefreshRequestLog::Delete {
-                provider_name: request.provider.clone(),
+                provider: request.provider.clone(),
                 credential_key: request.credential_key.clone(),
             });
         let deleted = self
@@ -1792,12 +1808,12 @@ async fn run_saved_provider_mutation_error(
         let expected_request = if action == "attach" {
             SandboxProviderRequestLog::Attach {
                 sandbox_name: sandbox_name.to_string(),
-                provider_name: READINESS_PROVIDER.to_string(),
+                provider: READINESS_PROVIDER.to_string(),
             }
         } else {
             SandboxProviderRequestLog::Detach {
                 sandbox_name: sandbox_name.to_string(),
-                provider_name: READINESS_PROVIDER.to_string(),
+                provider: READINESS_PROVIDER.to_string(),
             }
         };
         assert_eq!(
@@ -1966,7 +1982,7 @@ async fn provider_readiness_mutations_reject_unbound_receipts_before_output_or_p
             receipt.workspace = "other".to_string();
         }),
         ("provider", |receipt| {
-            receipt.provider_name = "other".to_string();
+            receipt.provider = "other".to_string();
         }),
         ("kind", |receipt| {
             receipt.kind = ProviderMutationKind::Observe.into();
@@ -2068,7 +2084,7 @@ async fn provider_readiness_update_rejects_unbound_batch_identity() {
             receipt.workspace = "other".to_string();
         }),
         ("provider_name", |receipt| {
-            receipt.provider_name = "other".to_string();
+            receipt.provider = "other".to_string();
         }),
         ("kind", |receipt| {
             receipt.kind = ProviderMutationKind::Observe.into();
@@ -2381,8 +2397,11 @@ async fn assert_later_readiness_targets_are_polled(
                     .as_str()
                     .expect("receipt ID")
             );
-            assert_eq!(request.provider_name, READINESS_PROVIDER);
-            assert_eq!(request.workspace, "default");
+            assert_eq!(request.provider, READINESS_PROVIDER);
+            assert_eq!(
+                selected_workspace(&request.workspace_scope),
+                Some("default")
+            );
         }
     }
 }
@@ -2531,7 +2550,7 @@ async fn provider_readiness_attach_wait_observes_pending_then_ready() {
     assert!(
         requests
             .iter()
-            .all(|request| request.workspace == "default")
+            .all(|request| selected_workspace(&request.workspace_scope) == Some("default"))
     );
 }
 
@@ -3039,7 +3058,7 @@ async fn provider_readiness_detach_wait_requires_revoked() {
     assert!(
         requests
             .iter()
-            .all(|request| request.workspace == "default")
+            .all(|request| selected_workspace(&request.workspace_scope) == Some("default"))
     );
 }
 
@@ -3132,7 +3151,7 @@ async fn provider_readiness_update_reports_every_target_failure() {
     assert!(
         requests
             .iter()
-            .all(|request| request.workspace == "default")
+            .all(|request| selected_workspace(&request.workspace_scope) == Some("default"))
     );
 }
 
@@ -3509,22 +3528,22 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
         requests,
         vec![
             ProviderRefreshRequestLog::Configure {
-                provider_name: "my-graph".to_string(),
+                provider: "my-graph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 material: HashMap::from([("tenant_id".to_string(), "tenant".to_string())]),
                 secret_material_keys: vec!["client_secret".to_string()],
                 expires_at_ms: Some(1_767_225_600_000),
             },
             ProviderRefreshRequestLog::Status {
-                provider_name: "my-graph".to_string(),
+                provider: "my-graph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
             },
             ProviderRefreshRequestLog::Rotate {
-                provider_name: "my-graph".to_string(),
+                provider: "my-graph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
             },
             ProviderRefreshRequestLog::Delete {
-                provider_name: "my-graph".to_string(),
+                provider: "my-graph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
             },
         ]
@@ -3574,7 +3593,7 @@ async fn provider_refresh_configure_reads_secret_material_from_env_off_argv() {
     assert_eq!(
         requests,
         vec![ProviderRefreshRequestLog::Configure {
-            provider_name: "gc-bridge".to_string(),
+            provider: "gc-bridge".to_string(),
             credential_key: "GOOGLE_CHAT_ACCESS_TOKEN".to_string(),
             material: HashMap::from([
                 (
@@ -3831,22 +3850,22 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
         vec![
             SandboxProviderRequestLog::Attach {
                 sandbox_name: "dev-sandbox".to_string(),
-                provider_name: "work-github".to_string(),
+                provider: "work-github".to_string(),
             },
             SandboxProviderRequestLog::Attach {
                 sandbox_name: "dev-sandbox".to_string(),
-                provider_name: "work-github".to_string(),
+                provider: "work-github".to_string(),
             },
             SandboxProviderRequestLog::List {
                 sandbox_name: "dev-sandbox".to_string(),
             },
             SandboxProviderRequestLog::Detach {
                 sandbox_name: "dev-sandbox".to_string(),
-                provider_name: "work-github".to_string(),
+                provider: "work-github".to_string(),
             },
             SandboxProviderRequestLog::Detach {
                 sandbox_name: "dev-sandbox".to_string(),
-                provider_name: "work-github".to_string(),
+                provider: "work-github".to_string(),
             },
         ]
     );
@@ -3875,7 +3894,7 @@ async fn sandbox_provider_attach_cli_surfaces_server_errors() {
         ts.state.sandbox_provider_requests.lock().await.as_slice(),
         [SandboxProviderRequestLog::Attach {
             sandbox_name: "dev-sandbox".to_string(),
-            provider_name: "missing-provider".to_string(),
+            provider: "missing-provider".to_string(),
         }]
     );
 }
@@ -4532,7 +4551,7 @@ binaries:
     let profile = client
         .get_provider_profile(openshell_core::proto::GetProviderProfileRequest {
             id: "advanced-api".to_string(),
-            workspace: String::new(),
+            workspace_scope: None,
         })
         .await
         .expect("get provider profile")
@@ -4854,7 +4873,9 @@ async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
     let response = client
         .get_provider(GetProviderRequest {
             name: "my-nvidia".to_string(),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
         })
         .await
         .expect("get provider should succeed")
@@ -4928,16 +4949,16 @@ async fn provider_create_from_gcloud_adc_happy_path() {
     assert!(matches!(
         &requests[0],
         ProviderRefreshRequestLog::Configure {
-            provider_name,
+            provider,
             credential_key,
             expires_at_ms: None,
             ..
-        } if provider_name == "my-vertex" && credential_key == "GOOGLE_VERTEX_AI_TOKEN"
+        } if provider == "my-vertex" && credential_key == "GOOGLE_VERTEX_AI_TOKEN"
     ));
     assert_eq!(
         requests[1],
         ProviderRefreshRequestLog::Rotate {
-            provider_name: "my-vertex".to_string(),
+            provider: "my-vertex".to_string(),
             credential_key: "GOOGLE_VERTEX_AI_TOKEN".to_string(),
         }
     );
@@ -5316,16 +5337,16 @@ async fn provider_create_from_gcloud_adc_with_config_keys() {
     assert!(matches!(
         &refresh_requests[0],
         ProviderRefreshRequestLog::Configure {
-            provider_name,
+            provider,
             credential_key,
             expires_at_ms: None,
             ..
-        } if provider_name == "vertex-with-config" && credential_key == "GOOGLE_VERTEX_AI_TOKEN"
+        } if provider == "vertex-with-config" && credential_key == "GOOGLE_VERTEX_AI_TOKEN"
     ));
     assert_eq!(
         refresh_requests[1],
         ProviderRefreshRequestLog::Rotate {
-            provider_name: "vertex-with-config".to_string(),
+            provider: "vertex-with-config".to_string(),
             credential_key: "GOOGLE_VERTEX_AI_TOKEN".to_string(),
         }
     );

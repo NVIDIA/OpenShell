@@ -585,7 +585,7 @@ impl super::ComputeRuntime {
                         driver
                             .stop_sandbox(tonic::Request::new(StopSandboxRequest {
                                 sandbox_id,
-                                sandbox_name,
+                                name: sandbox_name,
                             }))
                             .await
                     }

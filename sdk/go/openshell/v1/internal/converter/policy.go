@@ -56,7 +56,7 @@ func PolicyChunkFromProto(c *pb.PolicyChunk) *types.PolicyChunk {
 	return &types.PolicyChunk{
 		ID:                           c.GetId(),
 		Status:                       c.GetStatus(),
-		RuleName:                     c.GetRuleName(),
+		Rule:                         c.GetRule(),
 		ProposedRule:                 NetworkPolicyRuleFromProto(c.GetProposedRule()),
 		Rationale:                    c.GetRationale(),
 		SecurityNotes:                c.GetSecurityNotes(),

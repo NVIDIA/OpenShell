@@ -30,7 +30,7 @@ type GatewayInfo struct {
 // ComputeDriverInfo describes a compute backend available on the gateway.
 type ComputeDriverInfo struct {
 	Name          string
-	DriverName    string
+	Driver        string
 	DriverVersion string
 }
 

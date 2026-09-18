@@ -420,7 +420,7 @@ fn build_driver_sandbox(
         namespace: String::new(),
         spec: None,
         status: Some(DriverSandboxStatus {
-            sandbox_name: instance_name,
+            name: instance_name,
             instance_id,
             agent_fd: String::new(),
             sandbox_fd: String::new(),
@@ -890,7 +890,7 @@ mod tests {
             namespace: String::new(),
             spec: None,
             status: Some(DriverSandboxStatus {
-                sandbox_name: String::new(),
+                name: String::new(),
                 instance_id: short_id("container-id-full"),
                 agent_fd: String::new(),
                 sandbox_fd: String::new(),

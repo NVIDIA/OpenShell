@@ -170,7 +170,7 @@ def test_create_sandbox_materializes_default_mcp_version(
     try:
         stored = sandbox_client._stub.GetSandbox(
             openshell_pb2.GetSandboxRequest(
-                sandbox=created.name,
+                name=created.name,
                 workspace="default",
             )
         )

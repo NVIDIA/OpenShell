@@ -46,7 +46,7 @@ func ComputeDriverInfoFromProto(d *pb.ComputeDriverInfo) types.ComputeDriverInfo
 		Name: d.GetName(),
 	}
 	if caps := d.GetCapabilities(); caps != nil {
-		result.DriverName = caps.GetDriverName()
+		result.Driver = caps.GetName()
 		result.DriverVersion = caps.GetDriverVersion()
 	}
 	return result

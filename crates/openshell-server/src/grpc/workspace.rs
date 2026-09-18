@@ -480,7 +480,7 @@ pub(super) async fn handle_add_workspace_member(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
         MinWorkspaceRole::Admin,
     )
     .await?;
@@ -576,7 +576,7 @@ pub(super) async fn handle_remove_workspace_member(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
         MinWorkspaceRole::Admin,
     )
     .await?;
@@ -614,7 +614,7 @@ pub(super) async fn handle_list_workspace_members(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
         MinWorkspaceRole::User,
     )
     .await?;
@@ -626,7 +626,7 @@ pub(super) async fn handle_list_workspace_members(
         req.page_size,
         &req.page_token,
         "ListWorkspaceMembers",
-        &[&req.workspace],
+        &[&workspace],
     )?;
     let after = pagination.object_cursor()?;
     let page = state
@@ -1082,7 +1082,9 @@ mod tests {
             &state,
             authed_request(AddWorkspaceMemberRequest {
                 request_id: String::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 principal_subject: "alice@example.com".to_string(),
                 role: WorkspaceRole::Admin.into(),
             }),
@@ -1099,7 +1101,9 @@ mod tests {
             &state,
             authed_request(AddWorkspaceMemberRequest {
                 request_id: String::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 principal_subject: "bob@example.com".to_string(),
                 role: WorkspaceRole::User.into(),
             }),
@@ -1110,7 +1114,9 @@ mod tests {
         let list = handle_list_workspace_members(
             &state,
             authed_request(ListWorkspaceMembersRequest {
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 page_size: 100,
                 page_token: String::new(),
             }),
@@ -1130,7 +1136,9 @@ mod tests {
             &state,
             authed_request(AddWorkspaceMemberRequest {
                 request_id: String::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 principal_subject: "charlie@example.com".to_string(),
                 role: WorkspaceRole::User.into(),
             }),
@@ -1143,7 +1151,9 @@ mod tests {
             authed_request(RemoveWorkspaceMemberRequest {
                 request_id: String::new(),
                 allow_missing: false,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 principal_subject: "charlie@example.com".to_string(),
             }),
         )
@@ -1158,7 +1168,9 @@ mod tests {
         let list = handle_list_workspace_members(
             &state,
             authed_request(ListWorkspaceMembersRequest {
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 page_size: 100,
                 page_token: String::new(),
             }),
@@ -1178,7 +1190,9 @@ mod tests {
             &state,
             authed_request(AddWorkspaceMemberRequest {
                 request_id: String::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 principal_subject: "dave@example.com".to_string(),
                 role: WorkspaceRole::User.into(),
             }),
@@ -1190,7 +1204,9 @@ mod tests {
             &state,
             authed_request(AddWorkspaceMemberRequest {
                 request_id: String::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 principal_subject: "dave@example.com".to_string(),
                 role: WorkspaceRole::Admin.into(),
             }),
@@ -1220,7 +1236,9 @@ mod tests {
             &state,
             authed_request(AddWorkspaceMemberRequest {
                 request_id: String::new(),
-                workspace: "cleanup-test".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "cleanup-test".to_string(),
+                )),
                 principal_subject: "alice@example.com".to_string(),
                 role: WorkspaceRole::Admin.into(),
             }),
@@ -1232,7 +1250,9 @@ mod tests {
             &state,
             authed_request(AddWorkspaceMemberRequest {
                 request_id: String::new(),
-                workspace: "cleanup-test".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "cleanup-test".to_string(),
+                )),
                 principal_subject: "bob@example.com".to_string(),
                 role: WorkspaceRole::User.into(),
             }),
@@ -1243,7 +1263,9 @@ mod tests {
         let list = handle_list_workspace_members(
             &state,
             authed_request(ListWorkspaceMembersRequest {
-                workspace: "cleanup-test".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "cleanup-test".to_string(),
+                )),
                 page_size: 100,
                 page_token: String::new(),
             }),
@@ -1660,7 +1682,7 @@ mod tests {
         let err = handle_add_workspace_member(
             &state,
             non_member_request(AddWorkspaceMemberRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -1677,7 +1699,7 @@ mod tests {
             &state,
             non_member_request(RemoveWorkspaceMemberRequest {
                 allow_missing: false,
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -1693,7 +1715,7 @@ mod tests {
         let err = handle_list_workspace_members(
             &state,
             non_member_request(ListWorkspaceMembersRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )

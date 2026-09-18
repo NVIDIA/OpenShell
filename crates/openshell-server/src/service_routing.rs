@@ -637,7 +637,7 @@ fn build_service_endpoint_config_event(
     url: &str,
     created: bool,
 ) -> OcsfEvent {
-    let service_label = service_display_name(&endpoint.sandbox, &endpoint.service_name);
+    let service_label = service_display_name(&endpoint.sandbox, &endpoint.name);
     let state_label = if created {
         "service_endpoint_created"
     } else {
@@ -653,7 +653,7 @@ fn build_service_endpoint_config_event(
             endpoint.target_port
         ))
         .unmapped("endpoint_name", endpoint_name(endpoint))
-        .unmapped("service_name", endpoint.service_name.clone())
+        .unmapped("service_name", endpoint.name.clone())
         .unmapped("target_port", u64::from(endpoint.target_port));
 
     if !url.is_empty() {
@@ -664,14 +664,14 @@ fn build_service_endpoint_config_event(
 }
 
 fn build_service_endpoint_delete_event(endpoint: &ServiceEndpoint) -> OcsfEvent {
-    let service_label = service_display_name(&endpoint.sandbox, &endpoint.service_name);
+    let service_label = service_display_name(&endpoint.sandbox, &endpoint.name);
     ConfigStateChangeBuilder::new(&gateway_ocsf_ctx(&endpoint.sandbox_id, &endpoint.sandbox))
         .state(StateId::Disabled, "service_endpoint_deleted")
         .severity(SeverityId::Informational)
         .status(StatusId::Success)
         .message(format!("Service endpoint deleted {service_label}"))
         .unmapped("endpoint_name", endpoint_name(endpoint))
-        .unmapped("service_name", endpoint.service_name.clone())
+        .unmapped("service_name", endpoint.name.clone())
         .unmapped("target_port", u64::from(endpoint.target_port))
         .build()
 }
@@ -738,10 +738,10 @@ fn build_service_relay_failure_event(
         .status_detail(reason)
         .message(format!(
             "Service endpoint is not reachable: {}",
-            service_display_name(&endpoint.sandbox, &endpoint.service_name)
+            service_display_name(&endpoint.sandbox, &endpoint.name)
         ))
         .unmapped("endpoint_name", endpoint_name(endpoint))
-        .unmapped("service_name", endpoint.service_name.clone())
+        .unmapped("service_name", endpoint.name.clone())
         .build()
 }
 
@@ -768,7 +768,7 @@ fn gateway_ocsf_ctx(sandbox_id: &str, sandbox_name: &str) -> EventContext {
 
 fn endpoint_name(endpoint: &ServiceEndpoint) -> String {
     endpoint.metadata.as_ref().map_or_else(
-        || endpoint_key(&endpoint.sandbox, &endpoint.service_name),
+        || endpoint_key(&endpoint.sandbox, &endpoint.name),
         |metadata| metadata.name.clone(),
     )
 }
@@ -828,7 +828,7 @@ mod tests {
             }),
             sandbox_id: "sandbox-id".to_string(),
             sandbox: "my-sandbox".to_string(),
-            service_name: "web".to_string(),
+            name: "web".to_string(),
             target_port: 8080,
             domain: true,
         }
@@ -1213,7 +1213,7 @@ mod tests {
             }),
             sandbox_id: "sandbox-1".to_string(),
             sandbox: "my-sandbox".to_string(),
-            service_name: "web".to_string(),
+            name: "web".to_string(),
             target_port: 8080,
             domain: true,
         };

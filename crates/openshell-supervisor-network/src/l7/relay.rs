@@ -539,7 +539,7 @@ pub(crate) fn http_response_middleware_relay<'a>(
         request_context: openshell_core::proto::RequestContext {
             request_id: request_id.to_string(),
             sandbox_id: sandbox.sandbox_id.clone(),
-            sandbox_name: sandbox.sandbox_name.clone(),
+            sandbox: sandbox.sandbox_name.clone(),
             workspace: ctx.workspace.clone(),
             originating_process: None,
         },
