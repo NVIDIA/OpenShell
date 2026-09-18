@@ -39,6 +39,15 @@
           - conformance_archive.stat.isreg | default(false)
         fail_msg: OpenShell conformance test bundle did not contain tests.tar.zst
 
+    - name: Resolve installed OpenShell CLI
+      ansible.builtin.command:
+        argv:
+          - /bin/sh
+          - -c
+          - command -v openshell
+      register: openshell_cli
+      changed_when: false
+
     - name: Run OpenShell conformance archive
       ansible.builtin.command:
         argv:
@@ -51,7 +60,7 @@
           - /var/lib/openshell-conformance/tests
           - --no-capture
       environment:
-        OPENSHELL_BIN: /usr/local/bin/openshell
+        OPENSHELL_BIN: "{{ openshell_cli.stdout }}"
       register: conformance_result
       changed_when: false
       failed_when: false
