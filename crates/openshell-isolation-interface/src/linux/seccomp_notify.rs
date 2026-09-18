@@ -177,6 +177,34 @@ impl NotificationProbeReport {
     }
 }
 
+/// Cancellation posture a listener was installed with.
+///
+/// `WAIT_KILLABLE_RECV` (Linux 5.19+) keeps the notified workload thread in a
+/// kill-only wait so a non-fatal signal cannot resume the mediated syscall
+/// after the broker has validated the notification. A plain listener has no
+/// such guarantee, so it runs read-only: the broker must refuse every
+/// task-memory *output* write to stay cancellation-safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenerMode {
+    /// Modern kernel: `WAIT_KILLABLE_RECV` active; full mediation including
+    /// task-memory output writes.
+    Killable,
+    /// Legacy kernel (< 5.19): plain listener; task-memory output writes are
+    /// disabled so a resumed syscall cannot race a broker write.
+    LegacyReadOnly,
+}
+
+impl ListenerMode {
+    /// Stable identifier for qualification output and diagnostics.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Killable => "killable",
+            Self::LegacyReadOnly => "legacy_read_only",
+        }
+    }
+}
+
 /// Owned listener returned by `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
 pub struct NotificationListener {
     fd: OwnedFd,
@@ -184,6 +212,17 @@ pub struct NotificationListener {
 }
 
 impl NotificationListener {
+    /// Construct a listener from an already-owned notification descriptor in a
+    /// specific mode. Intended for tests that must exercise the legacy
+    /// read-only fail-closed paths without a `< 5.19` kernel.
+    #[must_use]
+    pub fn from_fd_with_mode(fd: OwnedFd, mode: ListenerMode) -> Self {
+        Self {
+            fd,
+            wait_killable_recv: matches!(mode, ListenerMode::Killable),
+        }
+    }
+
     /// Raw listener descriptor for readiness integration and diagnostics.
     #[must_use]
     pub fn as_raw_fd(&self) -> RawFd {
@@ -194,6 +233,23 @@ impl NotificationListener {
     #[must_use]
     pub fn wait_killable_recv(&self) -> bool {
         self.wait_killable_recv
+    }
+
+    /// The cancellation mode this listener was installed with.
+    #[must_use]
+    pub fn mode(&self) -> ListenerMode {
+        if self.wait_killable_recv {
+            ListenerMode::Killable
+        } else {
+            ListenerMode::LegacyReadOnly
+        }
+    }
+
+    /// Whether broker task-memory output writes are disabled for this listener.
+    /// True exactly in `LegacyReadOnly` mode (no `WAIT_KILLABLE_RECV`).
+    #[must_use]
+    pub fn writes_disabled(&self) -> bool {
+        matches!(self.mode(), ListenerMode::LegacyReadOnly)
     }
 
     /// Receive the next kernel notification.
@@ -221,6 +277,34 @@ impl NotificationListener {
             std::ptr::addr_of_mut!(id).cast(),
         )?;
         Ok(())
+    }
+
+    /// Write broker-produced output into the notified task's memory, closing
+    /// the validation-to-write race that a plain listener cannot.
+    ///
+    /// In `Killable` mode `WAIT_KILLABLE_RECV` keeps the notified workload
+    /// thread in a kill-only wait, so a non-fatal signal cannot resume the
+    /// mediated syscall between `validate_id` and this write. In
+    /// `LegacyReadOnly` mode (kernels < 5.19) there is no such guarantee: a
+    /// resumed syscall could repurpose the target buffer while the privileged
+    /// broker writes through the captured tid and pointer — via `/proc/<tid>/mem`
+    /// even into pages the workload has since made read-only. There is no way to
+    /// close that window without the flag, so this fails closed (`EOPNOTSUPP`)
+    /// rather than racing. Callers must route every task-memory *output* write
+    /// through this method; input reads never write workload memory and are
+    /// unaffected.
+    pub fn write_task_output(
+        &self,
+        id: u64,
+        tid: u32,
+        address: u64,
+        data: &[u8],
+    ) -> io::Result<()> {
+        if self.writes_disabled() {
+            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        }
+        self.validate_id(id)?;
+        crate::linux::task_memory::write_exact(tid, address, data)
     }
 
     /// Return a successful scalar result to the notifying syscall.
@@ -330,16 +414,22 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
     verify_notification_sizes()?;
     set_no_new_privileges()?;
 
-    install_listener_with_flags(syscalls, true).map_err(|error| {
-        if error.raw_os_error() == Some(libc::EINVAL) {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "seccomp WAIT_KILLABLE_RECV is required (Linux 5.19 or newer)",
-            )
-        } else {
-            error
+    // WAIT_KILLABLE_RECV (Linux 5.19+) keeps the *notified workload thread* in
+    // a kill-only wait while the broker services its syscall, so a non-fatal
+    // signal cannot resume the syscall and repurpose its buffers underneath a
+    // pending broker write. Kernels older than 5.19 (for example RHEL 9.x /
+    // 5.14 nodes) reject the flag with EINVAL. Rather than refusing to start
+    // there, fall back to a plain listener so the sandbox boots; the resulting
+    // listener records `wait_killable_recv = false`, and the broker then fails
+    // closed on every task-memory output write (see `write_task_output`)
+    // instead of racing them. Input mediation is unaffected.
+    match install_listener_with_flags(syscalls, true) {
+        Ok(listener) => Ok(listener),
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+            install_listener_with_flags(syscalls, false)
         }
-    })
+        Err(error) => Err(error),
+    }
 }
 
 /// Install the capability-free workload networking listener on the calling
@@ -934,5 +1024,53 @@ mod tests {
             .respond_errno(1, 0)
             .expect_err("zero errno must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn plain_listener_fails_closed_on_output_write() {
+        // A LegacyReadOnly listener (kernels < 5.19) must refuse every
+        // task-memory output write rather than race a resumed syscall. The
+        // guard short-circuits before touching the descriptor or workload
+        // memory, so a dup of stderr is a sufficient stand-in.
+        // SAFETY: dup takes one valid descriptor and returns a new descriptor
+        // or a negative error without modifying memory.
+        let duplicated = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(duplicated >= 0, "duplicate stderr for validation test");
+        // SAFETY: successful dup returned a new owned descriptor.
+        let listener = NotificationListener::from_fd_with_mode(
+            unsafe { OwnedFd::from_raw_fd(duplicated) },
+            ListenerMode::LegacyReadOnly,
+        );
+        assert!(listener.writes_disabled());
+        assert_eq!(listener.mode(), ListenerMode::LegacyReadOnly);
+        let error = listener
+            .write_task_output(1, 0, 0, &[0_u8; 4])
+            .expect_err("plain listener must reject output writes");
+        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+    }
+
+    #[test]
+    fn real_plain_listener_disables_output_writes() {
+        // Deliberately install a plain NEW_LISTENER (no WAIT_KILLABLE_RECV)
+        // even on a modern CI kernel and prove the broker write path fails
+        // closed on the real listener object.
+        set_no_new_privileges().expect("no_new_privs for listener install");
+        let listener = install_listener_with_flags(&[libc::SYS_getppid], false)
+            .expect("install plain listener");
+        assert_eq!(listener.mode(), ListenerMode::LegacyReadOnly);
+        assert!(listener.writes_disabled());
+        let error = listener
+            .write_task_output(1, 0, 0, &[0_u8; 4])
+            .expect_err("plain listener must reject output writes");
+        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+    }
+
+    #[test]
+    fn killable_listener_enables_output_writes() {
+        set_no_new_privileges().expect("no_new_privs for listener install");
+        let listener = install_listener_with_flags(&[libc::SYS_getppid], true)
+            .expect("install killable listener");
+        assert_eq!(listener.mode(), ListenerMode::Killable);
+        assert!(!listener.writes_disabled());
     }
 }
