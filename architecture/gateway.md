@@ -332,6 +332,11 @@ deadline. Each retry re-reads the owner record, so a supervisor reconnect or
 heartbeat can surface a new owner; if no fresh reachable owner appears before
 the deadline, the client operation fails rather than electing an owner itself.
 
+Nothing redistributes established sessions, so after a rolling restart the last
+surviving replica holds most sessions and a new replica serves none until
+sandboxes reconnect. That skew decays only as sandboxes churn. Client traffic
+stays correct throughout because a non-owner relays to the owner.
+
 File upload and download use tar-over-SSH through the same relay path. A gateway
 pod termination drops the active SSH proxy byte stream, so the CLI retries the
 whole sync operation with a fresh SSH session instead of attempting mid-stream
@@ -346,10 +351,12 @@ also trust the chart CA, present the chart-generated client certificate for
 mTLS, and verify the stable gateway Service DNS name even when connecting to a
 Deployment pod IP.
 
-`WatchSandbox` uses the local update bus for same-replica writes. One shared
-poller per gateway observes resource-version changes made by other replicas and
-feeds that bus for all local watchers, avoiding a database poll per client
-stream.
+`WatchSandbox` uses the local update bus for same-replica writes. On
+multi-replica backends one shared poller per gateway observes resource-version
+changes made by other replicas and feeds that bus for all local watchers,
+avoiding a database poll per client stream. SQLite deployments do not run the
+poller because they are single-replica and the local bus already sees every
+write.
 
 Mutations whose invariants span sandbox, provider-profile, policy, or provider
 records take a process-local mutex and a shared PostgreSQL advisory lock. The

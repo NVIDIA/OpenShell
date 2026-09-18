@@ -13,6 +13,10 @@ use tonic::Status;
 use crate::persistence::Store;
 use openshell_core::proto::Sandbox;
 
+/// How often [`spawn_store_poller`] rechecks watched sandboxes for writes made
+/// by other gateway replicas.
+pub const DEFAULT_STORE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Broadcast bus of sandbox updates keyed by sandbox id.
 ///
 /// Producers call [`SandboxWatchBus::notify`] whenever the persisted sandbox record changes.

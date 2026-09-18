@@ -100,8 +100,14 @@ impl ServiceUpstreamPool {
         let mut inner = self.inner.lock().unwrap();
         let entries = inner.idle.get_mut(key)?;
         entries.retain(|entry| is_reusable(entry, now));
-        let index = entries.iter().position(|entry| entry.sender.is_ready())?;
-        Some(entries.swap_remove(index).sender)
+        let taken = entries
+            .iter()
+            .position(|entry| entry.sender.is_ready())
+            .map(|index| entries.swap_remove(index).sender);
+        if entries.is_empty() {
+            inner.idle.remove(key);
+        }
+        taken
     }
 
     fn put(&self, key: &str, sender: UpstreamSender) {
@@ -435,19 +441,34 @@ async fn proxy_to_endpoint(
         state.service_upstreams.take(&pool_key)
     };
 
+    let reused = pooled.is_some();
     let mut sender = match pooled {
         Some(sender) => sender,
         None => open_upstream(&state, &sandbox, &endpoint, target_port, websocket_upgrade).await?,
     };
 
     let upstream = build_upstream_request(req, target_port, websocket_upgrade)?;
-    let mut response = sender.send_request(upstream).await.map_err(|err| {
-        warn!(error = %err, "sandbox service routing: upstream HTTP request failed");
-        state.service_upstreams.evict(&pool_key);
-        let route_err = ServiceRouteError::service_unreachable();
-        emit_service_relay_failure(&endpoint, target_port, route_err.reason);
-        route_err
-    })?;
+    let replay = reused.then(|| replayable_request(&upstream)).flatten();
+    let mut response = match sender.send_request(upstream).await {
+        Ok(response) => response,
+        Err(err) => {
+            warn!(error = %err, "sandbox service routing: upstream HTTP request failed");
+            state.service_upstreams.evict(&pool_key);
+            let Some(replay) = replay else {
+                let route_err = ServiceRouteError::service_unreachable();
+                emit_service_relay_failure(&endpoint, target_port, route_err.reason);
+                return Err(route_err);
+            };
+            sender =
+                open_upstream(&state, &sandbox, &endpoint, target_port, websocket_upgrade).await?;
+            sender.send_request(replay).await.map_err(|err| {
+                warn!(error = %err, "sandbox service routing: upstream HTTP retry failed");
+                let route_err = ServiceRouteError::service_unreachable();
+                emit_service_relay_failure(&endpoint, target_port, route_err.reason);
+                route_err
+            })?
+        }
+    };
 
     if !websocket_upgrade {
         state.service_upstreams.put(&pool_key, sender);
@@ -572,6 +593,23 @@ async fn load_endpoint(
             ServiceRouteError::internal_error()
         })?
         .ok_or_else(ServiceRouteError::endpoint_not_found)
+}
+
+/// Copies a request that can be sent again on a fresh connection.
+///
+/// A pooled connection can be closed by the sandbox between the liveness check
+/// and the send. Only bodyless methods are replayable, because the original
+/// body is consumed by the failed attempt.
+fn replayable_request(request: &Request<Body>) -> Option<Request<Body>> {
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        return None;
+    }
+    let mut replay = Request::new(Body::empty());
+    *replay.method_mut() = request.method().clone();
+    *replay.uri_mut() = request.uri().clone();
+    *replay.version_mut() = request.version();
+    *replay.headers_mut() = request.headers().clone();
+    Some(replay)
 }
 
 fn build_upstream_request(
@@ -1406,6 +1444,44 @@ mod tests {
         assert!(
             pool.take("ep-a|8080").is_none(),
             "an upstream in use must not be handed out twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_removes_an_endpoint_left_with_no_upstreams() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, _sandbox) = test_upstream().await;
+        pool.put("ep-a|8080", sender);
+
+        assert!(pool.take("ep-a|8080").is_some());
+        assert!(
+            !pool.inner.lock().unwrap().idle.contains_key("ep-a|8080"),
+            "an emptied endpoint must not linger until the next sweep"
+        );
+    }
+
+    #[test]
+    fn only_bodyless_requests_are_replayable() {
+        for method in [Method::GET, Method::HEAD] {
+            let mut request = Request::new(Body::empty());
+            *request.method_mut() = method.clone();
+            *request.uri_mut() = "/health".parse().unwrap();
+            request
+                .headers_mut()
+                .insert(header::HOST, HeaderValue::from_static("svc"));
+
+            let replay =
+                replayable_request(&request).expect("bodyless method should be replayable");
+            assert_eq!(*replay.method(), method);
+            assert_eq!(replay.uri().path(), "/health");
+            assert_eq!(replay.headers().get(header::HOST).unwrap(), "svc");
+        }
+
+        let mut post = Request::new(Body::empty());
+        *post.method_mut() = Method::POST;
+        assert!(
+            replayable_request(&post).is_none(),
+            "a request with a body cannot be replayed"
         );
     }
 

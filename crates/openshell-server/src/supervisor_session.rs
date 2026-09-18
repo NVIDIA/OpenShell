@@ -50,7 +50,13 @@ const PEER_TLS_KEY_FILE_ENV: &str = "OPENSHELL_PEER_TLS_KEY_FILE";
 const PEER_TLS_SERVER_NAME_ENV: &str = "OPENSHELL_PEER_TLS_SERVER_NAME";
 /// How long a resolved owner record is reused before rereading the store.
 /// Well below `OWNER_TTL` so a cache hit can never outlive the record itself.
+/// Marks an owner record written by a gateway that advertises no peer endpoint.
+/// Only that gateway can serve such a session, so no peer should dial it.
+const LOCAL_OWNER_ENDPOINT_SCHEME: &str = "local://";
 const OWNER_CACHE_TTL: Duration = Duration::from_secs(3);
+/// How often the owner cache reclaims expired entries. Rate-limited so an
+/// insert never scans the whole map.
+const OWNER_CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// How long the projected peer `ServiceAccount` token is held in memory.
 /// The kubelet rotates the file hourly, so this only bounds staleness.
 const PEER_TOKEN_CACHE_TTL: Duration = Duration::from_mins(5);
@@ -133,7 +139,13 @@ fn nonempty_env(name: &str) -> Option<String> {
 pub struct PeerRouteCache {
     channels: Mutex<HashMap<String, Channel>>,
     token: Mutex<Option<CachedPeerToken>>,
-    owners: Mutex<HashMap<String, CachedOwner>>,
+    owners: Mutex<OwnerCache>,
+}
+
+#[derive(Default)]
+struct OwnerCache {
+    entries: HashMap<String, CachedOwner>,
+    last_sweep: Option<Instant>,
 }
 
 /// Hand-written so the cached `ServiceAccount` token is never formatted.
@@ -212,9 +224,9 @@ impl PeerRouteCache {
     fn cached_owner(&self, sandbox_id: &str) -> Option<crate::supervisor_owner::OwnerRecord> {
         let now = Instant::now();
         let mut owners = self.owners.lock().unwrap();
-        let entry = owners.get(sandbox_id)?;
+        let entry = owners.entries.get(sandbox_id)?;
         if entry.expires_at <= now {
-            owners.remove(sandbox_id);
+            owners.entries.remove(sandbox_id);
             return None;
         }
         Some(entry.record.clone())
@@ -223,8 +235,16 @@ impl PeerRouteCache {
     fn store_owner(&self, sandbox_id: &str, record: &crate::supervisor_owner::OwnerRecord) {
         let now = Instant::now();
         let mut owners = self.owners.lock().unwrap();
-        owners.retain(|_, entry| entry.expires_at > now);
-        owners.insert(
+        // Expiry is enforced per entry on read, so the full scan only needs to
+        // reclaim memory. Rate-limit it to keep inserts off an O(n) path.
+        if owners
+            .last_sweep
+            .is_none_or(|last| now.duration_since(last) >= OWNER_CACHE_SWEEP_INTERVAL)
+        {
+            owners.last_sweep = Some(now);
+            owners.entries.retain(|_, entry| entry.expires_at > now);
+        }
+        owners.entries.insert(
             sandbox_id.to_string(),
             CachedOwner {
                 record: record.clone(),
@@ -234,7 +254,7 @@ impl PeerRouteCache {
     }
 
     fn evict_owner(&self, sandbox_id: &str) {
-        self.owners.lock().unwrap().remove(sandbox_id);
+        self.owners.lock().unwrap().entries.remove(sandbox_id);
     }
 }
 
@@ -1193,6 +1213,13 @@ pub async fn open_routed_relay_with_message(
                 backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
                 continue;
             }
+            if owner_endpoint_is_local_only(&owner.owner_peer_endpoint) {
+                return Err(Status::failed_precondition(format!(
+                    "sandbox is owned by gateway replica {} which advertises no peer endpoint; \
+                     set OPENSHELL_PEER_ENDPOINT on every replica to route across replicas",
+                    owner.owner_replica_id
+                )));
+            }
             match open_peer_relay(
                 state,
                 owner.owner_peer_endpoint.clone(),
@@ -1246,9 +1273,17 @@ async fn resolve_owner(
 }
 
 fn owner_is_fresh(owner: &crate::supervisor_owner::OwnerRecord) -> bool {
-    let age_ms = openshell_core::time::now_ms() - owner.updated_at_ms;
-    let ttl_ms = i64::try_from(OWNER_TTL.as_millis()).unwrap_or(i64::MAX);
-    age_ms < ttl_ms
+    owner.is_fresh(OWNER_TTL)
+}
+
+/// Endpoint recorded when this replica advertises none.
+fn local_owner_endpoint(replica_id: &str) -> String {
+    format!("{LOCAL_OWNER_ENDPOINT_SCHEME}{replica_id}")
+}
+
+/// True when an owner record names a gateway that no peer can dial.
+fn owner_endpoint_is_local_only(endpoint: &str) -> bool {
+    endpoint.starts_with(LOCAL_OWNER_ENDPOINT_SCHEME)
 }
 
 async fn open_peer_relay(
@@ -1540,17 +1575,10 @@ pub async fn handle_connect_supervisor(
     require_persisted_sandbox(&state.store, &sandbox_id).await?;
 
     let session_id = Uuid::new_v4().to_string();
-    let owner_peer_endpoint = state.peer_endpoint.clone().unwrap_or_default();
-    if !state.store.is_single_replica() && owner_peer_endpoint.is_empty() {
-        return Err(Status::failed_precondition(
-            "gateway peer endpoint is required for multi-replica supervisor ownership",
-        ));
-    }
-    let owner_peer_endpoint = if owner_peer_endpoint.is_empty() {
-        format!("local://{}", state.replica_id)
-    } else {
-        owner_peer_endpoint
-    };
+    let owner_peer_endpoint = state.peer_endpoint.as_deref().map_or_else(
+        || local_owner_endpoint(&state.replica_id),
+        ToString::to_string,
+    );
     let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
     let owner_guard = owner_index
         .publish(
@@ -1862,14 +1890,39 @@ async fn handle_supervisor_message(
     match msg.payload {
         Some(supervisor_message::Payload::Heartbeat(_)) => {
             let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
-            if let Err(err) = owner_index.renew(owner_guard).await {
-                warn!(
+            match owner_index.renew(owner_guard).await {
+                Ok(()) => {}
+                // Only a real ownership change ends the session. A store error
+                // means the database did not answer, and closing on that would
+                // drop every session heartbeating during the outage.
+                Err(err) if err.is_ownership_lost() => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        session_id = %session_id,
+                        error = %err,
+                        "supervisor session: ownership lost; closing session"
+                    );
+                    return false;
+                }
+                // Past the TTL our record is stale, so another replica may
+                // already have superseded it. Close rather than serve a
+                // session we can no longer claim.
+                Err(err) if owner_guard.claim_expired(OWNER_TTL) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        session_id = %session_id,
+                        error = %err,
+                        "supervisor session: owner renewal failed past the ownership TTL; \
+                         closing session"
+                    );
+                    return false;
+                }
+                Err(err) => warn!(
                     sandbox_id = %sandbox_id,
                     session_id = %session_id,
                     error = %err,
-                    "supervisor session: owner renewal failed; closing session"
-                );
-                return false;
+                    "supervisor session: owner renewal failed; retrying on next heartbeat"
+                ),
             }
         }
         Some(supervisor_message::Payload::RelayOpenResult(result)) => {
@@ -2772,6 +2825,19 @@ mod tests {
     }
 
     #[test]
+    fn a_gateway_without_a_peer_endpoint_still_records_ownership() {
+        let endpoint = local_owner_endpoint("gw-0");
+        assert_eq!(endpoint, "local://gw-0");
+        assert!(owner_endpoint_is_local_only(&endpoint));
+    }
+
+    #[test]
+    fn a_dialable_owner_endpoint_is_not_local_only() {
+        assert!(!owner_endpoint_is_local_only("https://10.0.0.1:8080"));
+        assert!(!owner_endpoint_is_local_only("http://10.0.0.1:8080"));
+    }
+
+    #[test]
     fn owner_cache_returns_stored_record() {
         let cache = PeerRouteCache::default();
         cache.store_owner("sbx-a", &owner_record("replica-a"));
@@ -2802,7 +2868,7 @@ mod tests {
     #[test]
     fn owner_cache_drops_entries_past_their_ttl() {
         let cache = PeerRouteCache::default();
-        cache.owners.lock().unwrap().insert(
+        cache.owners.lock().unwrap().entries.insert(
             "sbx-a".to_string(),
             CachedOwner {
                 record: owner_record("replica-a"),
@@ -2811,7 +2877,7 @@ mod tests {
         );
 
         assert!(cache.cached_owner("sbx-a").is_none());
-        assert!(!cache.owners.lock().unwrap().contains_key("sbx-a"));
+        assert!(!cache.owners.lock().unwrap().entries.contains_key("sbx-a"));
     }
 
     #[test]

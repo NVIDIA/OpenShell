@@ -504,6 +504,26 @@ args = [
 ]
 ```
 
+## Gateway Peer Routing
+
+Multi-replica gateways relay session-bound traffic to the replica that owns a sandbox supervisor. The Helm chart sets these variables; set them manually only outside the chart.
+
+| Variable | Purpose |
+|---|---|
+| `OPENSHELL_PEER_ENDPOINT` | Address other replicas use to reach this one. Derived from the pod DNS name when unset. |
+| `OPENSHELL_PEER_SERVICE_NAME` | Peer Service used to derive the endpoint. |
+| `OPENSHELL_POD_NAME` / `OPENSHELL_POD_NAMESPACE` | Pod identity used for endpoint derivation and peer verification. |
+| `OPENSHELL_SERVICE_ACCOUNT_NAME` | ServiceAccount that peer tokens must present. |
+| `OPENSHELL_PEER_SERVICE_ACCOUNT_TOKEN_FILE` | Projected peer token path. Defaults to `/var/run/secrets/openshell-peer/token`. |
+| `OPENSHELL_PEER_TOKEN_AUDIENCE` | Required token audience. Defaults to `openshell-gateway-peer`. |
+| `OPENSHELL_PEER_POD_LABELS` | Comma-separated labels a calling pod must carry. |
+| `OPENSHELL_PEER_TOKEN_CACHE_TTL_SECS` | How long a verified peer identity is cached. Defaults to `60`. |
+| `OPENSHELL_PEER_TLS_CA_FILE` | CA bundle for peer connections. Falls back to the platform trust store. |
+| `OPENSHELL_PEER_TLS_CERT_FILE` / `OPENSHELL_PEER_TLS_KEY_FILE` | Client certificate and key for peer mTLS. Set both or neither. |
+| `OPENSHELL_PEER_TLS_SERVER_NAME` | Name verified on peer certificates. |
+
+The gateway refuses to start when a peer endpoint is configured on a multi-replica backend and peer authentication is unavailable, because the replica could not serve relays from its peers. That happens when the pod identity variables are missing, when the in-cluster Kubernetes client cannot be built, or when the gateway is not running in a cluster. A plaintext `http://` peer endpoint is also rejected when the gateway serves TLS; use it only when the gateway itself serves plaintext.
+
 ## Driver References
 
 Each example is a complete TOML file for one compute driver. The examples repeat `[openshell]` and `[openshell.gateway]` so they stay copyable, and the driver tables list the accepted driver-specific keys. Drivers receive only their own tables, and the gateway rejects unknown gateway and driver fields.

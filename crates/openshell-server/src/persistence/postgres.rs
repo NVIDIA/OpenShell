@@ -40,6 +40,11 @@ pub struct PostgresStore {
 // 64-bit advisory-lock key space.
 const CROSS_OBJECT_ADVISORY_LOCK_KEY: i64 = 0x4f50_454e_5348_4c4c;
 
+// Bounds the wait for the cross-object lock. The holder only validates and
+// writes, so a wait this long means a stuck replica; failing beats blocking
+// every sandbox and provider mutation in the fleet indefinitely.
+const CROSS_OBJECT_ADVISORY_LOCK_TIMEOUT: &str = "10s";
+
 pub(super) struct PostgresAdvisoryLockGuard {
     // `close_on_drop` is set before this guard is constructed. Closing the
     // dedicated session releases the session-level advisory lock even when a
@@ -114,6 +119,11 @@ impl PostgresStore {
     ) -> PersistenceResult<PostgresAdvisoryLockGuard> {
         let mut connection = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
         connection.close_on_drop();
+        sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+            .bind(CROSS_OBJECT_ADVISORY_LOCK_TIMEOUT)
+            .execute(&mut *connection)
+            .await
+            .map_err(|e| map_db_error(&e))?;
         sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(CROSS_OBJECT_ADVISORY_LOCK_KEY)
             .execute(&mut *connection)
