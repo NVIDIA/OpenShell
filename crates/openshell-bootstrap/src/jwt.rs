@@ -40,7 +40,7 @@ pub fn generate_jwt_key() -> Result<JwtKeyMaterial> {
     let keypair = openshell_crypto::pki::generate_jwt_keypair()
         .into_diagnostic()
         .wrap_err("failed to generate Ed25519 JWT signing key")?;
-    let signing_key_pem = keypair.serialize_pem();
+    let signing_key_pem = keypair.serialize_pem().into_diagnostic()?;
     let public_key_pem = keypair.public_key_pem();
     let kid = kid_from_public_key_der(&keypair.public_key_der())?;
     Ok(JwtKeyMaterial {

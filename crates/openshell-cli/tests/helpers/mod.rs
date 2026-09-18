@@ -111,9 +111,9 @@ macro_rules! unimplemented_sandbox_template_rpcs {
     };
 }
 
-use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-};
+use openshell_crypto::pki::Certificate;
+use openshell_crypto::pki::KeyPair;
+use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa};
 
 // ── EnvVarGuard ──────────────────────────────────────────────────────────────
 
@@ -180,7 +180,7 @@ pub fn build_ca() -> (Certificate, KeyPair) {
     let key_pair = openshell_crypto::pki::generate_keypair().unwrap();
     let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let cert = params.self_signed(&key_pair).unwrap();
+    let cert = openshell_crypto::pki::self_signed(params, &key_pair).unwrap();
     (cert, key_pair)
 }
 
@@ -192,8 +192,8 @@ pub fn build_server_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String)
     let key_pair = openshell_crypto::pki::generate_keypair().unwrap();
     let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    (cert.pem(), key_pair.serialize_pem())
+    let cert = openshell_crypto::pki::signed_by(params, &key_pair, ca, ca_key).unwrap();
+    (cert.pem(), key_pair.serialize_pem().unwrap())
 }
 
 /// Generate a client authentication certificate signed by `ca`.
@@ -204,6 +204,6 @@ pub fn build_client_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String)
     let key_pair = openshell_crypto::pki::generate_keypair().unwrap();
     let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    (cert.pem(), key_pair.serialize_pem())
+    let cert = openshell_crypto::pki::signed_by(params, &key_pair, ca, ca_key).unwrap();
+    (cert.pem(), key_pair.serialize_pem().unwrap())
 }

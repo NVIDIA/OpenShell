@@ -295,19 +295,20 @@ mod tests {
         let ca_key = openshell_crypto::pki::generate_keypair().unwrap();
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let ca = openshell_crypto::pki::self_signed(ca_params, &ca_key).unwrap();
 
         let server_key = openshell_crypto::pki::generate_keypair().unwrap();
         let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        let server_cert = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
+        let server_cert =
+            openshell_crypto::pki::signed_by(server_params, &server_key, &ca, &ca_key).unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let incoming = TcpListenerStream::new(listener);
         let tls = ServerTlsConfig::new().identity(Identity::from_pem(
             server_cert.pem(),
-            server_key.serialize_pem(),
+            server_key.serialize_pem().unwrap(),
         ));
         tokio::spawn(async move {
             Server::builder()
@@ -334,7 +335,7 @@ mod tests {
         let rogue_key = openshell_crypto::pki::generate_keypair().unwrap();
         let mut rogue_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         rogue_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let rogue_ca = rogue_params.self_signed(&rogue_key).unwrap();
+        let rogue_ca = openshell_crypto::pki::self_signed(rogue_params, &rogue_key).unwrap();
         let wrong_ca = ExtensionChannelConfig::new(format!("https://localhost:{}", address.port()))
             .with_custom_ca_pem(rogue_ca.pem());
         assert!(matches!(

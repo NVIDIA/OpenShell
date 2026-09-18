@@ -359,7 +359,7 @@ pub fn generate_sandbox_tls_material(
         .distinguished_name
         .push(DnType::CommonName, "OpenShell sandbox session CA");
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca = ca_params.self_signed(&ca_key).map_err(|error| {
+    let ca = openshell_crypto::pki::self_signed(ca_params, &ca_key).map_err(|error| {
         BackendError::Descriptor(format!("generate sandbox CA certificate: {error}"))
     })?;
 
@@ -375,8 +375,7 @@ pub fn generate_sandbox_tls_material(
         .distinguished_name
         .push(DnType::CommonName, "OpenShell sandbox runtime");
     sandbox_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let sandbox = sandbox_params
-        .signed_by(&sandbox_key, &ca, &ca_key)
+    let sandbox = openshell_crypto::pki::signed_by(sandbox_params, &sandbox_key, &ca, &ca_key)
         .map_err(|error| {
             BackendError::Descriptor(format!("sign sandbox TLS server certificate: {error}"))
         })?;
@@ -385,7 +384,9 @@ pub fn generate_sandbox_tls_material(
         server_name,
         trust_anchor_pem: ca.pem(),
         certificate_chain_pem: sandbox.pem(),
-        private_key_pem: sandbox_key.serialize_pem(),
+        private_key_pem: sandbox_key
+            .serialize_pem()
+            .map_err(|error| BackendError::Descriptor(format!("export sandbox key: {error}")))?,
     })
 }
 

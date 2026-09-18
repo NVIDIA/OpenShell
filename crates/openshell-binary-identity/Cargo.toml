@@ -12,7 +12,7 @@ repository.workspace = true
 
 [dependencies]
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
-sha2 = { workspace = true }
+openshell-crypto = { workspace = true }
 
 [lints]
 workspace = true
