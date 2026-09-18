@@ -36,7 +36,7 @@ where Helm cannot discover cluster APIs.
 
 ```shell
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
+  --set 'gatewayConfig.openshell\.drivers\.kubernetes.sandbox_runtime.network_policy_enforced=true'
 ```
 
 ## Install on OpenShift
@@ -49,7 +49,7 @@ oc create ns openshell
 
 # Deploy with the required NetworkPolicy enforcement acknowledgement.
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
+  --set 'gatewayConfig.openshell\.drivers\.kubernetes.sandbox_runtime.network_policy_enforced=true'
 ```
 
 On OpenShift 4.22+, end-to-end TLS is supported via `BackendTLSPolicy`. See the
@@ -107,6 +107,7 @@ Then install the chart pointing at that Secret:
 ```bash
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
   -n openshell \
+  --set 'gatewayConfig.openshell\.drivers\.kubernetes.sandbox_runtime.network_policy_enforced=true' \
   --set workload.kind=deployment \
   --set server.externalDbSecret=my-pg-credentials
 ```

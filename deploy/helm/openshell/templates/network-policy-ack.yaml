@@ -1,5 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-{{- if not .Values.supervisor.sandboxRuntime.networkPolicyEnforced }}
-{{- fail "supervisor.sandboxRuntime.networkPolicyEnforced must be true after you verify that the cluster CNI enforces ingress and egress NetworkPolicy in every sandbox namespace" }}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- $kubernetesConfig := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
+{{- $sandboxRuntime := get $kubernetesConfig "sandbox_runtime" | default dict -}}
+{{- if not (get $sandboxRuntime "network_policy_enforced") }}
+{{- fail "gatewayConfig.openshell.drivers.kubernetes.sandbox_runtime.network_policy_enforced must be true after you verify that the cluster CNI enforces ingress and egress NetworkPolicy in every sandbox namespace" }}
 {{- end }}

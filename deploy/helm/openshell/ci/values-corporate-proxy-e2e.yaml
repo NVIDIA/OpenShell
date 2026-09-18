@@ -3,11 +3,11 @@
 
 # The Kubernetes corporate-proxy e2e wrapper supplies the generated proxy URL
 # and creates `openshell-e2e-proxy-auth` before Helm installs the gateway.
-upstreamProxy:
-  # The e2e wrapper replaces this endpoint with its dynamically allocated port.
-  # Keep the overlay valid when rendered independently as well.
-  url: http://host.openshell.internal:8080
-  authSecret:
-    name: openshell-e2e-proxy-auth
-    key: proxy-auth
-  authAllowInsecure: true
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    # The e2e wrapper replaces this endpoint with its dynamically allocated
+    # port. Keep the overlay valid when rendered independently as well.
+    https_proxy: http://host.openshell.internal:8080
+    proxy_auth_secret_name: openshell-e2e-proxy-auth
+    proxy_auth_secret_key: proxy-auth
+    proxy_auth_allow_insecure: true

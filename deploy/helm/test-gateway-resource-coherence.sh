@@ -16,7 +16,7 @@ render() {
   helm template resource-coherence "${chart}" \
     --namespace resource-namespace \
     --set agentSandbox.preflight.enabled=false \
-    --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
+    --set gatewayConfig.openshell\\.drivers\\.kubernetes.sandbox_runtime.network_policy_enforced=true \
     "$@" >"${work_dir}/${name}.yaml"
 
   if ! awk 'BEGIN { RS="---" }

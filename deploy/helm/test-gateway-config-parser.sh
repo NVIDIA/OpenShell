@@ -22,6 +22,7 @@ render() {
   helm template parser-validation "${chart}" \
     --namespace parser-namespace \
     --set agentSandbox.preflight.enabled=false \
+    --set gatewayConfig.openshell\\.drivers\\.kubernetes.sandbox_runtime.network_policy_enforced=true \
     "$@" >"${output}"
 }
 
@@ -43,7 +44,7 @@ if helm template parser-validation "${chart}" --namespace parser-namespace \
   echo "the chart must require explicit NetworkPolicy enforcement acknowledgement" >&2
   exit 1
 fi
-grep -F 'supervisor.sandboxRuntime.networkPolicyEnforced must be true' "${work_dir}/unacknowledged-default.err" >/dev/null
+grep -F 'gatewayConfig.openshell.drivers.kubernetes.sandbox_runtime.network_policy_enforced must be true' "${work_dir}/unacknowledged-default.err" >/dev/null
 
 # The runtime default is valid after the required infrastructure acknowledgement.
 render "${work_dir}/default.yaml"
@@ -55,7 +56,7 @@ preflight "${work_dir}/default.toml"
 render "${work_dir}/shapes.yaml" --values "${fixture}"
 extract_toml "${work_dir}/shapes.yaml" "${work_dir}/shapes.toml"
 preflight "${work_dir}/shapes.toml"
-grep -F 'name = "parser-namespace/parser-validation' "${work_dir}/shapes.toml" >/dev/null
+grep -F 'rendered_name = "parser-namespace/parser-validation' "${work_dir}/shapes.toml" >/dev/null
 grep -F 'empty_value = ""' "${work_dir}/shapes.toml" >/dev/null
 if grep -Fq 'omitted_value' "${work_dir}/shapes.toml"; then
   echo "null gatewayConfig values must be omitted from gateway.toml" >&2

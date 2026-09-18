@@ -36,7 +36,7 @@ where Helm cannot discover cluster APIs.
 
 ```shell
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
+  --set 'gatewayConfig.openshell\.drivers\.kubernetes.sandbox_runtime.network_policy_enforced=true'
 ```
 
 ## Install on OpenShift
@@ -44,15 +44,12 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
 See the full [OpenShift install guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) for details. Quick start:
 
 ```shell
-# Precreate the openshell namespace
+# Precreate the namespace before installation.
 oc create ns openshell
 
-# Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
+# Deploy with the required NetworkPolicy enforcement acknowledgement.
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
-  --set server.disableTls=true \
-  --set podSecurityContext.fsGroup=null \
-  --set securityContext.runAsUser=null
+  --set 'gatewayConfig.openshell\.drivers\.kubernetes.sandbox_runtime.network_policy_enforced=true'
 ```
 
 On OpenShift 4.22+, end-to-end TLS is supported via `BackendTLSPolicy`. See the
@@ -110,7 +107,7 @@ Then install the chart pointing at that Secret:
 ```bash
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
   -n openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
+  --set 'gatewayConfig.openshell\.drivers\.kubernetes.sandbox_runtime.network_policy_enforced=true' \
   --set workload.kind=deployment \
   --set server.externalDbSecret=my-pg-credentials
 ```
@@ -165,32 +162,9 @@ namespace to limit access to OpenShell-managed Secrets.
 Append these flags to any of the PostgreSQL commands above for OpenShift:
 
 ```
---set server.disableTls=true \
 --set podSecurityContext.fsGroup=null \
 --set securityContext.runAsUser=null
 ```
-
-### High availability
-
-Set `replicaCount` above `1` only with `server.externalDbSecret`; the default
-SQLite database is per pod and cannot coordinate multiple gateway replicas.
-The chart creates a headless peer Service for gateway-to-gateway relay traffic.
-StatefulSet pods use stable pod DNS names through that headless Service.
-Deployment pods advertise their pod IP with `OPENSHELL_PEER_ENDPOINT`, because
-Kubernetes does not assign stable per-pod DNS names to Deployment replicas.
-
-Gateway peer traffic uses Kubernetes ServiceAccount identity. Each gateway pod
-mounts a projected, pod-bound ServiceAccount token with audience
-`openshell-gateway-peer`; receiving replicas validate that token with the
-Kubernetes TokenReview API, verify the live pod UID and Helm selector labels,
-and authorize only the internal `PeerRelay` RPC. The chart does not create or
-accept a shared gateway peer Secret.
-
-With gateway TLS enabled, peer calls use the chart CA and client TLS Secret for
-server verification and mTLS. The client verifies the stable gateway Service
-DNS name while connecting directly to the owning pod. Custom TLS Secrets must
-include that Service DNS name in the server certificate and provide the CA and
-client credentials configured by `server.tls`.
 
 ## Secret bootstrap
 
@@ -208,12 +182,16 @@ JWT signing Secret.
 
 ## SPIFFE/SPIRE provider token grants
 
-Set `server.providerTokenGrants.spiffe.enabled=true` to let the gateway and
-sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token grants. The
-chart keeps supervisor-to-gateway authentication on gateway-minted sandbox JWTs,
-mounts the SPIFFE CSI socket into the gateway pod, exports
-`OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`, and passes the socket path to
-the Kubernetes driver so sandbox pods can mount the same socket.
+Set `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
+to let sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token
+grants. The chart keeps supervisor-to-gateway authentication on gateway-minted
+sandbox JWTs and passes the configured socket path to the Kubernetes driver.
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+```
 
 For local development, uncomment the SPIRE Helm releases in `skaffold.yaml` and
 add `ci/values-spire.yaml` to the OpenShell release values files.
@@ -236,7 +214,9 @@ discovery endpoint or its TLS CA.
 | certManager.serverDnsNames | list | `["openshell","openshell.openshell.svc","openshell.openshell.svc.cluster.local","localhost","openshell.localhost","*.openshell.localhost","host.docker.internal"]` | DNS SANs on the cert-manager-issued server certificate. |
 | certManager.serverIpAddresses | list | `["127.0.0.1"]` | IP SANs on the cert-manager-issued server certificate. |
 | certManager.serverIssuerRef | object | `{"group":"","kind":"","name":""}` | Override the issuerRef for the external server Certificate (e.g. a real LetsEncrypt/ACME ClusterIssuer for a publicly-trusted cert on an external hostname). When set, the chart creates a second server certificate from this issuer with only the hostnames in serverDnsNames; the internal server certificate is always signed by the chart's own CA. Leave name empty to use the chart CA for all server certificates (default). Requires certManager.enabled=true. |
+| credentialDrivers.vault.caConfigMapName | string | `""` | ConfigMap containing the private Vault/OpenBao CA certificate under the ca.crt key. Helm mounts it only when the Vault driver is selected. |
 | fullnameOverride | string | `""` | Override the full generated resource name. |
+| gatewayConfig | object | `{"openshell":{"version":2},"openshell.drivers.kubernetes":{"client_tls_secret_name":"{{ .Values.server.tls.clientTlsSecretName }}","default_image":"ghcr.io/nvidia/openshell-community/sandboxes/base:latest","gateway_id":"{{ include \"openshell.fullname\" . }}","grpc_endpoint":"{{ include \"openshell.grpcEndpoint\" . }}","namespace":"{{ include \"openshell.sandboxNamespace\" . }}","sa_token_ttl_secs":3600,"sandbox_runtime":{"boundary_port":5500,"network_policy_enforced":false},"sandbox_runtime_image":"ghcr.io/nvidia/openshell/sandbox:{{ .Chart.AppVersion }}","service_account_name":"{{ include \"openshell.sandboxServiceAccountName\" . }}","supervisor_image":"ghcr.io/nvidia/openshell/supervisor:{{ .Chart.AppVersion }}","workspace_mode":"shared"},"openshell.drivers.kubernetes.managed_ssh_ingress":{"enabled":true,"gateway_namespace":"{{ .Release.Namespace }}","gateway_pod_selector":{"app.kubernetes.io/instance":"{{ .Release.Name }}","app.kubernetes.io/name":"{{ include \"openshell.name\" . }}"}},"openshell.gateway":{"bind_address":"0.0.0.0:{{ .Values.service.port }}","compute_driver":"kubernetes","enable_loopback_service_http":true,"health_bind_address":"0.0.0.0:{{ .Values.service.healthPort }}","log_level":"info","metrics_bind_address":"0.0.0.0:{{ .Values.service.metricsPort }}","name":"{{ include \"openshell.fullname\" . }}","policy_validation_failure_mode":"fail_closed"},"openshell.gateway.credential_storage":{"key_encryption_key_env":"{{ include \"openshell.credentialStorageKeyEncryptionKeyEnvName\" . }}"},"openshell.gateway.gateway_jwt":{"gateway_id":"{{ include \"openshell.fullname\" . }}","kid_path":"/etc/openshell-jwt/kid","public_key_path":"/etc/openshell-jwt/public.pem","signing_key_path":"/etc/openshell-jwt/signing.pem","ttl_secs":3600},"openshell.gateway.tls":{"cert_path":"/etc/openshell-tls/server/tls.crt","client_ca_path":"/etc/openshell-tls/client-ca/ca.crt","key_path":"/etc/openshell-tls/server/tls.key"}}` | Non-secret gateway application configuration. Top-level keys name TOML tables and are rendered into the mounted gateway.toml file. Kubernetes resource inputs remain outside this map; template expressions derive the corresponding runtime values from their resource owner. |
 | grpcRoute.backendTLSPolicy.caCertificateConfigMapName | string | `""` | Name of the ConfigMap containing the CA certificate (key: ca.crt) used to validate the gateway pod's TLS certificate. Defaults to `<fullname>-backend-ca` when empty. The certgen hook auto-creates this: with pkiInitJob (default), immediately on install/upgrade; with cert-manager, the hook polls for pkiInitJob.timeoutSeconds seconds waiting for cert-manager to issue the server certificate, then creates the ConfigMap. A single install usually succeeds; if cert-manager takes longer, increase pkiInitJob.timeoutSeconds. By default (pkiInitJob.failOnTimeout=true), the install fails if the timeout is reached; set failOnTimeout=false to allow the install to succeed and run `helm upgrade` after the certificate is issued. |
 | grpcRoute.backendTLSPolicy.enabled | bool | `false` | Create a BackendTLSPolicy resource for end-to-end TLS between the Gateway proxy and the OpenShell gateway pod. The traffic flow is: client → HTTPS → Gateway (terminate) → TLS (re-encrypt) → gateway pod. Requires server.disableTls=false and server.tls.enableMtls=false. The certgen hook auto-creates the backend CA ConfigMap. |
 | grpcRoute.backendTLSPolicy.hostname | string | `""` | Hostname the Gateway proxy validates against the backend's TLS certificate SAN. Defaults to the service FQDN (`<fullname>.<namespace>.svc.cluster.local`) when empty, which matches the SAN included by both cert-manager and the pkiInitJob. |
@@ -257,6 +237,7 @@ discovery endpoint or its TLS CA.
 | nameOverride | string | `"openshell"` | Override the chart name used in generated resource names. |
 | networkPolicy.enabled | bool | `true` | Restrict SSH ingress on sandbox pods to the gateway. In managed mode, the driver applies the equivalent policy to each workspace namespace. |
 | nodeSelector | object | `{}` | Node selector for the gateway pod. |
+| oidc.caConfigMapName | string | `""` |  |
 | openshiftRoute.annotations | object | `{}` | Extra annotations on the Route (e.g. haproxy.router.openshift.io/*). |
 | openshiftRoute.enabled | bool | `false` | Create an OpenShift Route with TLS passthrough. |
 | openshiftRoute.host | string | `""` | Hostname for the Route. Must match a SAN on the gateway's server cert. |
@@ -282,9 +263,6 @@ discovery endpoint or its TLS CA.
 | probes.startup.timeoutSeconds | int | `1` | Startup probe timeout, in seconds. |
 | replicaCount | int | `1` | Number of OpenShell gateway replicas. Values greater than 1 require server.externalDbSecret because the default SQLite backend is per pod. |
 | resources | object | `{}` | Gateway pod resource requests and limits. |
-| sandboxRuntime.image.pullPolicy | string | `""` | Sandbox runtime image pull policy. Defaults to the gateway image pull policy when empty. |
-| sandboxRuntime.image.repository | string | `"ghcr.io/nvidia/openshell/sandbox"` | Sandbox runtime image repository. Changing it uses the effective gateway image tag unless tag is also set. |
-| sandboxRuntime.image.tag | string | `""` | Sandbox runtime image tag override. Empty uses the version pinned into the gateway unless repository is changed. |
 | sandboxServiceAccount.annotations | object | `{}` | Annotations to add to the generated sandbox service account. |
 | sandboxServiceAccount.create | bool | `true` | Create a service account for sandbox pods. |
 | sandboxServiceAccount.name | string | `""` | Existing service account name for sandbox pods when sandboxServiceAccount.create is false. |
@@ -292,72 +270,19 @@ discovery endpoint or its TLS CA.
 | securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the gateway container. |
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
 | securityContext.runAsUser | int | `1000` | UID assigned to the gateway container. |
-| server.auth.allowUnauthenticatedUsers | bool | `false` | UNSAFE: accept unauthenticated CLI/user requests as a local developer principal. Intended only for trusted local Skaffold/k3d development or a fully trusted fronting proxy. Leave false for shared or production clusters. |
-| server.credentialDrivers.kubernetesSecrets.allowReferenceNamespace | bool | `false` | Deprecated compatibility field. Credential storage no longer supports user-authored namespace references. |
-| server.credentialDrivers.kubernetesSecrets.enabled | bool | `false` | Enable the in-tree Kubernetes Secret credential driver. WARNING: The RBAC Role grants read/write access to ALL Secrets in the configured namespace. Use a dedicated namespace to limit blast radius. |
-| server.credentialDrivers.kubernetesSecrets.namespace | string | `""` | Namespace where OpenShell-managed provider Secret objects are stored. Empty = Helm release namespace. A dedicated namespace is RECOMMENDED to isolate OpenShell-managed Secrets from other workloads. |
-| server.credentialDrivers.kubernetesSecrets.rbac.create | bool | `true` | Create a Role/RoleBinding granting the gateway ServiceAccount read/write access to managed provider Secrets. |
-| server.credentialDrivers.vault.address | string | `""` | Vault service base URL. Non-loopback endpoints must use HTTPS, for example https://vault.vault.svc.cluster.local:8200. |
-| server.credentialDrivers.vault.authMethod | string | `"kubernetes"` | Authentication method. Use "kubernetes" in-cluster or "token_file" for local/dev validation. |
-| server.credentialDrivers.vault.caConfigMapName | string | `""` | ConfigMap containing the private Vault CA certificate bundle in the ca.crt key. Leave empty to use platform trust roots. |
-| server.credentialDrivers.vault.enabled | bool | `false` | Enable the in-tree Vault credential driver. |
-| server.credentialDrivers.vault.kubernetesAuthMount | string | `"kubernetes"` | Vault Kubernetes auth mount. |
-| server.credentialDrivers.vault.kvVersion | string | `"2"` | Default KV engine version. Use "1" or "2". |
-| server.credentialDrivers.vault.mount | string | `"secret"` | Default KV mount name. |
-| server.credentialDrivers.vault.role | string | `""` | Vault Kubernetes auth role when authMethod is kubernetes. |
-| server.credentialDrivers.vault.serviceAccountTokenPath | string | `"/var/run/secrets/kubernetes.io/serviceaccount/token"` | ServiceAccount token path used for Kubernetes auth. |
-| server.credentialDrivers.vault.timeoutSecs | string | `""` | HTTP request timeout in seconds. Empty = driver default. |
-| server.credentialDrivers.vault.tokenPath | string | `""` | Mounted token file path when authMethod is token_file. |
 | server.credentialStorage.existingSecret | string | `""` | Name of a pre-existing Secret containing the key-encryption key. When set, the chart does NOT generate a new Secret; it references this one instead. The Secret must contain a key named "key-encryption-key" with a base64-encoded 32-byte value. Required for GitOps workflows that render manifests with `helm template` (where `lookup` is unavailable). |
 | server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL (used for the default SQLite backend). |
-| server.defaultRuntimeClassName | string | `""` | Default Kubernetes runtimeClassName for sandbox pods. Applied when a CreateSandbox request does not specify one. Empty (default) = omit the field, using the cluster's default RuntimeClass. Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it to all sandboxes that don't explicitly override it. |
 | server.disableTls | bool | `false` | Disable TLS entirely - the server listens on plaintext HTTP. Set to true when a reverse proxy / tunnel terminates TLS at the edge. |
-| server.drivers.kubernetes.allowDriverConfig | bool | `false` | Allow caller driver JSON; external resources still require approval. |
-| server.drivers.kubernetes.operatorNamespaceFile | string | `""` | Path to a JSON file containing an array of namespace names allowed in operator mode. Hot-reloaded on change. |
-| server.drivers.kubernetes.operatorNamespaceLabel | string | `""` | K8s label selector for namespace discovery in operator mode. The driver watches namespaces matching this label. |
-| server.drivers.kubernetes.resourceAdmission.enabled | bool | `true` | Require operator approval labels on external sandbox attachments (GPU attachments exempt). |
-| server.drivers.kubernetes.resourceAdmission.requiredLabels | string | `nil` | Replacement label map; null uses the built-in admission labels. Empty map is invalid when enabled. |
-| server.drivers.kubernetes.workspaceMode | string | `"shared"` | How workspaces map to Kubernetes namespaces. "shared" (default): all sandboxes in a single namespace. "managed": auto-creates per-workspace namespaces. "operator": uses pre-provisioned namespaces. |
-| server.enableLoopbackServiceHttp | bool | `true` | Enable plaintext HTTP routing for loopback sandbox service URLs on TLS-enabled gateways. |
-| server.enableUserNamespaces | bool | `false` | Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox pods. Requires Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), plus a supporting container runtime and Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host UID and capabilities become namespaced. |
 | server.externalDbSecret | string | `""` | Name of a pre-existing Opaque Secret containing a PostgreSQL connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL from this Secret instead of using dbUrl. The Secret must contain a `uri` key, e.g. postgresql://user:pass@host:5432/dbname. |
-| server.grpcEndpoint | string | `""` | gRPC endpoint sandboxes call back into the gateway. Leave empty to derive it from the chart fullname, release namespace, service port, and disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080. Override only when sandboxes must reach the gateway via a different hostname (e.g. an external ingress or a host alias). |
-| server.grpcRateLimit.requests | int | `0` | Maximum gRPC requests allowed per window. Must be positive (alongside windowSeconds) to enable rate limiting; 0 (default) disables it. |
-| server.grpcRateLimit.windowSeconds | int | `0` | gRPC rate-limit window length in seconds. Must be positive (alongside requests) to enable rate limiting; 0 (default) disables it. |
 | server.hostGatewayIP | string | `""` | Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get hostAliases entries mapping host.docker.internal and host.openshell.internal to this IP, allowing them to reach services running on the Docker host. Auto-detected by the cluster entrypoint script. |
-| server.logLevel | string | `"info"` | Gateway log level. |
-| server.name | string | `""` | Operator-facing gateway name. Defaults to the chart fullname so all replicas in one installation share an identity. Set explicitly when one telemetry collector receives spans from multiple namespaces or clusters. |
-| server.oidc.adminRole | string | `""` | Role name for admin access. Leave empty (with userRole also empty) for authentication-only mode. Both must be set or both empty. |
-| server.oidc.audience | string | `"openshell-cli"` | Expected audience claim for the API resource server. This should match the server's --oidc-audience, NOT the CLI client ID. |
-| server.oidc.caConfigMapName | string | `""` | Name of a ConfigMap containing a CA certificate bundle (key: ca.crt) for verifying the OIDC issuer's TLS certificate. Required when the issuer uses a non-public CA (e.g. OpenShift ingress, private PKI). |
-| server.oidc.dangerouslyAllowInsecureHttp | bool | `false` | Development only: permit cleartext OIDC requests to numeric loopback addresses. This never permits HTTP to hostnames or non-loopback addresses. |
-| server.oidc.issuer | string | `""` | OIDC issuer URL (e.g. https://keycloak.example.com/realms/openshell). |
-| server.oidc.jwksAllowedOrigins | list | `[]` | Additional trusted HTTPS origins allowed to serve JWKS. The issuer origin is always allowed. Entries must not include a path or query. |
-| server.oidc.jwksTtl | int | `3600` | JWKS key cache TTL in seconds. Must be greater than zero. |
-| server.oidc.rolesClaim | string | `""` | Dot-separated path to the roles array in the JWT claims. Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups". |
-| server.oidc.scopesClaim | string | `""` | Dot-separated path to the scopes array in the JWT claims. |
-| server.oidc.userRole | string | `""` | Role name for standard user access. |
-| server.otlp.endpoint | string | `""` | OTLP/gRPC collector endpoint, conventionally using port 4317. |
-| server.otlp.serviceName | string | `""` | Gateway OpenTelemetry service name. Empty uses openshell-gateway. |
-| server.policyValidationFailureMode | string | `"fail_closed"` | Posture when a candidate sandbox policy fails validation. `fail_closed` deactivates the previous policy; `retain_last_valid` keeps it active. |
-| server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into gateway and sandbox pods for dynamic provider token grants. |
-| server.providerTokenGrants.spiffe.workloadApiSocketPath | string | `"/spiffe-workload-api/spire-agent.sock"` | Path to the SPIFFE Workload API socket mounted into gateway and sandbox pods. |
-| server.sandboxImage | string | `"nvcr.io/nvidia/base/ubuntu:24.04"` | Default sandbox image used when requests do not specify one. |
-| server.sandboxImagePullPolicy | string | `nil` | Pull policy for sandbox pods. Leave unset to use the Kubernetes image default (Always for :latest, IfNotPresent otherwise). Prefer always, if_not_present, or never; the chart also accepts legacy Kubernetes spellings Always, IfNotPresent, and Never. |
-| server.sandboxImagePullSecrets | list | `[]` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
-| server.sandboxJwt.gatewayId | string | `""` | Stable gateway identity embedded in iss/aud of every minted token. Defaults to the release name so HA replicas share identity. |
-| server.sandboxJwt.k8sSaTokenTtlSecs | int | `3600` | Lifetime (seconds) of the projected ServiceAccount token kubelet writes into each sandbox pod for the IssueSandboxToken bootstrap exchange. Kubelet enforces a minimum of 600s; the driver clamps values outside [600, 86400]. Default 3600 — generous, since the supervisor consumes the token within seconds of pod start. |
 | server.sandboxJwt.secretDefaultMode | string | `""` | File mode for the mounted JWT signing key Secret. Default 0400 (owner-read only). Override to 0440 or 0444 if the container UID does not match the volume file owner. |
 | server.sandboxJwt.signingSecretName | string | `""` | Name of the Opaque Secret holding the signing key material. Empty falls back to the chart fullname with "-jwt-keys" appended. |
-| server.sandboxJwt.ttlSecs | int | `3600` | Token TTL in seconds. Defaults to 3600 (1h). |
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
 | server.telemetryEnabled | bool | `true` | Enable anonymous OpenShell telemetry from the gateway and the sandbox supervisors it launches. |
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
 | server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Only used when enableMtls is true. Set to "" to disable client certificate verification for HTTPS-only mode. |
 | server.tls.clientTlsSecretName | string | `"openshell-client-tls"` | K8s secret mounted into sandbox pods for mTLS to the server. |
 | server.tls.enableMtls | bool | `true` | Enable mTLS client certificate authentication. When false, the gateway runs HTTPS-only without requiring client certificates (use OIDC for auth instead). Must be false when using BackendTLSPolicy because ingress proxies cannot present client certificates to the backend. |
-| server.workspaceDefaultStorageSize | string | `""` | Default storage size for the workspace PVC in sandbox pods. Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi"). Empty = built-in default (2Gi). |
-| server.workspaceStorageClass | string | `""` | Kubernetes StorageClass for the workspace PVC in sandbox pods. Empty (default) = omit storageClassName, using the cluster's default StorageClass. Set this on clusters with no default StorageClass, otherwise the workspace PVC stays Pending and the sandbox never starts. |
 | service.healthPort | int | `8081` | Gateway health service port. |
 | service.metricsPort | int | `9090` | Gateway metrics service port. |
 | service.port | int | `8080` | Gateway gRPC/HTTP service port. |
@@ -365,21 +290,7 @@ discovery endpoint or its TLS CA.
 | serviceAccount.annotations | object | `{}` | Annotations to add to the generated service account. |
 | serviceAccount.create | bool | `true` | Create a service account for the gateway. |
 | serviceAccount.name | string | `""` | Existing service account name to use when serviceAccount.create is false. |
-| supervisor.image.pullPolicy | string | `nil` | Sandbox supervisor pull policy. Leave unset to use the Kubernetes image default. Prefer always, if_not_present, or never; the chart also accepts legacy Kubernetes spellings Always, IfNotPresent, and Never. |
-| supervisor.image.repository | string | `"ghcr.io/nvidia/openshell/supervisor"` | Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set. |
-| supervisor.image.tag | string | `""` | Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed. |
-| supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
-| supervisor.sandboxRuntime.networkPolicyEnforced | bool | `false` | Required operator acknowledgement that the cluster CNI enforces NetworkPolicy. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
-| upstreamProxy | object | `{"authAllowInsecure":false,"authSecret":{"key":"","name":""},"caBundle":{"configMapName":"","key":"ca.crt"},"connectByHostname":false,"noProxy":"","url":""}` | Operator-owned corporate forward proxy for policy-approved TLS egress from Kubernetes sandboxes. The workload cannot select or override it. |
-| upstreamProxy.authAllowInsecure | bool | `false` | Required when authSecret is configured because Basic auth to an HTTP proxy is cleartext. |
-| upstreamProxy.authSecret.key | string | `""` | Secret key containing the proxy credential. |
-| upstreamProxy.authSecret.name | string | `""` | Existing Secret in the sandbox namespace containing a user:pass value. |
-| upstreamProxy.caBundle.configMapName | string | `""` | ConfigMap in the release namespace holding the corporate proxy CA bundle. Required for an https:// proxy with a private CA, and for a TLS-intercepting proxy that re-signs upstream certificates. The gateway reads it and stages it into each sandbox's immutable supervisor bootstrap Secret, so the anchor stays in the gateway's trust domain rather than the workload namespace. Supply only the CA that signs your proxy's certificate, or that the proxy re-signs intercepted upstream certificates with. Public roots already come from the supervisor image and its TLS stack, so a full merged trust bundle (for example an OpenShift config.openshift.io/inject-trusted-cabundle ConfigMap) adds hundreds of kilobytes of duplicated roots and can exceed the sandbox boundary's control-frame budget. |
-| upstreamProxy.caBundle.key | string | `"ca.crt"` | Key inside that ConfigMap. Change this only to reuse an existing ConfigMap whose key is not ca.crt. |
-| upstreamProxy.connectByHostname | bool | `false` | Last-resort option for hostname-filtering proxy ACLs. It lets the proxy resolve CONNECT targets. |
-| upstreamProxy.noProxy | string | `""` | Comma-separated destinations that bypass only the corporate proxy. |
-| upstreamProxy.url | string | `""` | Proxy URL in http://host:port or https://host:port form. An https:// proxy whose certificate is not publicly trusted also needs caBundle below. |
 | workload.allowMultiReplicaStatefulSet | bool | `false` | Allow replicaCount > 1 while rendering a StatefulSet. Prefer workload.kind=deployment for external database-backed multi-replica gateways; this override exists for operators who explicitly require StatefulSet identity or storage semantics. |
 | workload.kind | string | `"statefulset"` | Gateway workload controller kind. Use `statefulset` for the default SQLite database, or `deployment` when server.externalDbSecret points at an external database. |
 | workspaceResources.enabled | bool | `true` | Create the sandbox ServiceAccount, Role, RoleBinding, and NetworkPolicy from this chart. Disable for a gateway-only release. |
