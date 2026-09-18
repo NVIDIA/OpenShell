@@ -1,10 +1,102 @@
 # CI
 
-This document describes how OpenShell's continuous integration works for pull requests, with a focus on what contributors need to do to get their PR tested.
+This document describes the current OpenShell continuous integration system,
+with a focus on what contributors need to do to get a pull request tested. It
+documents implemented workflow behavior rather than the complete desired test
+architecture.
 
-For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CONTRIBUTING.md](CONTRIBUTING.md).
+For the target testing model and canonical local entry points, see
+[TESTING.md](TESTING.md). For pull request conventions, see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Overview
+
+CI implements the testing layers defined in `TESTING.md` through separate
+workflow families:
+
+| Testing responsibility | Current CI implementation |
+|---|---|
+| Static, build, unit, component, and SDK checks | `Branch Checks` across Linux x86_64, Linux ARM64, and macOS ARM64, with additional language-specific jobs |
+| Runtime and cross-component validation | Label-selected `Branch E2E Checks` for Docker, Podman, Kubernetes, VM, GPU, MCP, Python, and managed or standalone drivers |
+| Nix and `tmachine` validation | Release Dev builds exact-revision artifacts and test archives, then runs CLI conformance in disposable Ubuntu/Docker and Fedora/Podman guests |
+| Windows compatibility | Opt-in Windows MSVC x64 and ARM64 jobs; main and manual runs also build release binaries |
+| Integrated revision validation | Required statuses on merge-group SHAs before `main` advances |
+| Published artifact validation | Release workflows and post-publish release canaries |
+| Security analysis | Required dependency and deployment gates plus informational reports described below |
+
+This is not yet the full target state. The project is migrating integration and
+Linux installation testing from `mise` tasks and workflow-local shell harnesses
+to Nix-built artifacts and `tmachine` wherever the runner can represent the
+environment. Today that path is limited to release conformance. `TESTING.md`
+defines the desired gates, matrices, migration phases, and deferred decisions.
+This document should describe a migration step as complete only after the
+workflow enforces it.
+
+### Nix and tmachine migration
+
+The desired CI path builds candidate artifacts through the flake, installs them
+into a scenario declared in `tests/config.nix`, and runs a reusable testsuite
+from `tests/suites` through `nix run .#tmachine`. GitHub Actions explicitly
+lists scenario and testsuite pairs so it can run them in parallel, but it must
+not recreate machine setup or installation behavior in workflow steps.
+
+`.github/workflows/conformance.yml` is the first implementation of this model.
+It downloads exact-revision binaries and OCI image artifacts, uses
+`nix run .#build-artifacts-test-archives` to package the test suite, and fans out
+`nix run .#tmachine -- test <scenario> <testsuite>` on KVM-enabled runners. The
+workflow caches prepared disks, while `tmachine` gives each test a fresh writable
+overlay. Release Dev currently calls the reusable workflow for these pairs:
+
+| Scenario | Testsuite |
+|---|---|
+| `ubuntu-docker-rootful` | `conformance` |
+| `fedora-podman-rootful` | `conformance` |
+| `fedora-podman-rootless` | `conformance` |
+
+The desired green-change gate has these parts:
+
+- always-required Rust formatting, linting, unit tests, conditional-compilation
+  checks, dependency policy, and repository security checks in Nix environments;
+- Rust source validation on Linux x86_64, Linux ARM64, and macOS ARM64;
+- conditional SDK validation, with shared protobuf changes selecting every
+  affected SDK;
+- conditional package validation, with transitive inputs selecting every
+  affected package format;
+- conformance on Fedora/rootful Podman, Fedora/rootless Podman, Ubuntu/Docker,
+  one Kubernetes environment, and the VM driver;
+- every feature-specific and driver-specific suite on at least one
+  representative compatible environment; and
+- one representative external-driver compatibility scenario.
+
+GPU and Windows suites remain opt-in through labels. The Kubernetes distribution
+and representative external-driver environment are not yet selected.
+
+Migration should proceed in this order:
+
+1. Express the candidate build or archive as a Nix output in
+   `tests/artifacts.nix`.
+2. Add reusable assertions under `tests/suites` and installation behavior under
+   `tests/ansible`.
+3. Add or extend a machine scenario in `tests/config.nix`; do not duplicate its
+   setup in a workflow matrix or shell script.
+4. Verify that the `tmachine` path provides the same behavior coverage as the
+   legacy path. Parallel execution is optional rather than a migration
+   requirement.
+5. Make the `tmachine` pair the required PR and merge-queue path, then remove the
+   redundant workflow steps, shell harness, and `mise` task.
+
+Release validation should install candidate RPM, DEB, Snap, and Helm artifacts
+through tmachine and run conformance before publication. It should reuse the
+same representative environment model without creating a full cross-product.
+The existing native Homebrew path remains in place while candidate-artifact
+Homebrew validation is deferred.
+
+Direct workflows remain appropriate for native Windows or macOS behavior, GPU
+hardware, external Kubernetes topologies, and virtualization combinations that
+`tmachine` cannot faithfully expose. Such jobs should consume Nix-built
+exact-revision artifacts where possible, publish the same evidence, and state
+the capability that prevents migration. Adding a new host-managed system test
+requires that justification.
 
 PR CI that runs on NVIDIA self-hosted runners uses NVIDIA's copy-pr-bot. The bot mirrors trusted PR commits to internal `pull-request/<N>` branches in this repository. The gated workflows trigger on pushes to those branches, not on the original PR.
 
