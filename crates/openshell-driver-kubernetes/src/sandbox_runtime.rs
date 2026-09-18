@@ -32,6 +32,10 @@ pub const BOUNDARY_PRIVATE_KEY: &str = "tls.key";
 pub const SUPERVISOR_AUTH_BUNDLE_KEY: &str = "auth.json";
 pub const PROXY_CA_CERTIFICATE_KEY: &str = "proxy-ca.crt";
 pub const PROXY_CA_PRIVATE_KEY: &str = "proxy-ca.key";
+/// Optional bootstrap-Secret key holding the operator's corporate proxy CA
+/// bundle (`proxy_ca_bundle`). Distinct from [`PROXY_CA_CERTIFICATE_KEY`],
+/// which is the sandbox's own generated TLS-interception CA.
+pub const UPSTREAM_PROXY_CA_BUNDLE_KEY: &str = "upstream-proxy-ca.pem";
 pub const SANDBOX_BOOTSTRAP_INPUT_PATH: &str = "/.openshell/bootstrap-input";
 pub const BOUNDARY_CONFIG_PATH: &str = "/.openshell/state/bootstrap/boundary.json";
 pub const BOUNDARY_CERTIFICATE_PATH: &str = "/.openshell/state/bootstrap/tls.crt";
@@ -40,6 +44,12 @@ pub const BACKEND_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descri
 pub const SUPERVISOR_AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
 pub const PROXY_CA_CERTIFICATE_PATH: &str = "/.openshell/supervisor/proxy-ca.crt";
 pub const PROXY_CA_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/proxy-ca.key";
+/// Where [`UPSTREAM_PROXY_CA_BUNDLE_KEY`] lands in the supervisor container.
+///
+/// The `bootstrap` volume mounts the whole Secret read-only at
+/// `/.openshell/supervisor` with no `items` filter, so the key appears here
+/// without a dedicated volume or mount.
+pub const UPSTREAM_PROXY_CA_BUNDLE_PATH: &str = "/.openshell/supervisor/upstream-proxy-ca.pem";
 pub const CONTROL_HEALTH_SOCKET_PATH: &str = "/run/openshell/health.sock";
 pub const NAMESPACE_WORKLOAD_POLICY_NAME: &str = "openshell-sandbox-workloads";
 pub const NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME: &str = "openshell-sandbox-supervisors";
@@ -185,6 +195,7 @@ pub fn supervisor_pod(
     proxy_auth_secret: Option<(&str, &str)>,
     proxy_auth_allow_insecure: bool,
     proxy_connect_by_hostname: bool,
+    upstream_proxy_ca_bundle_staged: bool,
     provider_spiffe_socket_path: Option<&str>,
     owner: OwnerReference,
 ) -> Result<Pod, String> {
@@ -296,6 +307,14 @@ pub fn supervisor_pod(
     }
     if proxy_connect_by_hostname {
         command.push("--upstream-proxy-connect-by-hostname".to_string());
+    }
+    // The bundle rides in the bootstrap Secret already mounted at
+    // /.openshell/supervisor, so this needs no volume of its own.
+    if upstream_proxy_ca_bundle_staged {
+        command.extend([
+            "--upstream-proxy-ca-bundle".to_string(),
+            UPSTREAM_PROXY_CA_BUNDLE_PATH.to_string(),
+        ]);
     }
     if let Some((secret_name, secret_key)) = proxy_auth_secret {
         let auth_path = Path::new(openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH);
@@ -466,8 +485,32 @@ pub fn supervisor_bootstrap_secret(
     supervisor_auth_bundle: Vec<u8>,
     proxy_ca_certificate: Vec<u8>,
     proxy_ca_private_key: Vec<u8>,
+    upstream_proxy_ca_bundle: Option<Vec<u8>>,
     owner: OwnerReference,
 ) -> Secret {
+    let mut data = BTreeMap::from([
+        (
+            BACKEND_DESCRIPTOR_KEY.to_string(),
+            ByteString(backend_descriptor),
+        ),
+        (
+            SUPERVISOR_AUTH_BUNDLE_KEY.to_string(),
+            ByteString(supervisor_auth_bundle),
+        ),
+        (
+            PROXY_CA_CERTIFICATE_KEY.to_string(),
+            ByteString(proxy_ca_certificate),
+        ),
+        (
+            PROXY_CA_PRIVATE_KEY.to_string(),
+            ByteString(proxy_ca_private_key),
+        ),
+    ]);
+    // Staged only when the operator configured `proxy_ca_bundle`; the
+    // supervisor keys its behavior off the argument, not the file's presence.
+    if let Some(bundle) = upstream_proxy_ca_bundle {
+        data.insert(UPSTREAM_PROXY_CA_BUNDLE_KEY.to_string(), ByteString(bundle));
+    }
     Secret {
         metadata: ObjectMeta {
             name: Some(names.supervisor_secret.clone()),
@@ -476,24 +519,7 @@ pub fn supervisor_bootstrap_secret(
             labels: Some(common_labels(sandbox_id, SUPERVISOR_SECRET_COMPONENT)),
             ..Default::default()
         },
-        data: Some(BTreeMap::from([
-            (
-                BACKEND_DESCRIPTOR_KEY.to_string(),
-                ByteString(backend_descriptor),
-            ),
-            (
-                SUPERVISOR_AUTH_BUNDLE_KEY.to_string(),
-                ByteString(supervisor_auth_bundle),
-            ),
-            (
-                PROXY_CA_CERTIFICATE_KEY.to_string(),
-                ByteString(proxy_ca_certificate),
-            ),
-            (
-                PROXY_CA_PRIVATE_KEY.to_string(),
-                ByteString(proxy_ca_private_key),
-            ),
-        ])),
+        data: Some(data),
         immutable: Some(true),
         type_: Some("Opaque".to_string()),
         ..Default::default()
@@ -639,6 +665,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
             false,
             None,
@@ -792,6 +819,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
             owner(),
         );
         assert_eq!(
@@ -812,6 +840,133 @@ mod tests {
                 SUPERVISOR_AUTH_BUNDLE_KEY.to_string(),
                 BACKEND_DESCRIPTOR_KEY.to_string(),
             ])
+        );
+
+        // With `proxy_ca_bundle` configured the operator bundle rides along in
+        // the same immutable Secret, so kubelet cannot live-update the trust
+        // anchor underneath a running sandbox.
+        let staged = supervisor_bootstrap_secret(
+            "sandbox",
+            &names,
+            "pair",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(b"-----BEGIN CERTIFICATE-----\n".to_vec()),
+            owner(),
+        );
+        assert_eq!(staged.immutable, Some(true));
+        let staged_data = staged.data.expect("Secret data");
+        assert_eq!(
+            staged_data
+                .get(UPSTREAM_PROXY_CA_BUNDLE_KEY)
+                .map(|value| value.0.clone()),
+            Some(b"-----BEGIN CERTIFICATE-----\n".to_vec())
+        );
+        // The generated interception CA is a separate key and must not be
+        // overwritten by the operator bundle.
+        assert!(staged_data.contains_key(PROXY_CA_CERTIFICATE_KEY));
+    }
+
+    /// Render a supervisor Pod configured for an `https://` corporate proxy,
+    /// varying only whether the operator CA bundle was staged.
+    fn supervisor_pod_with_staged_proxy_ca(staged: bool) -> Pod {
+        let names = SandboxRuntimeNames::new("pair");
+        supervisor_pod(
+            "sandbox",
+            &names,
+            "pair",
+            "demo",
+            "gateway",
+            "supervisor:latest",
+            None,
+            "sandbox-sa",
+            1000,
+            1000,
+            &[],
+            "https://gateway:8080",
+            "client-tls",
+            "{}",
+            "info",
+            600,
+            Some("https://proxy.corp.example:3130"),
+            None,
+            None,
+            false,
+            false,
+            staged,
+            None,
+            owner(),
+        )
+        .expect("render supervisor Pod")
+    }
+
+    #[test]
+    fn supervisor_pod_passes_upstream_proxy_ca_bundle_argument() {
+        let pod = supervisor_pod_with_staged_proxy_ca(true);
+        let spec = pod.spec.as_ref().expect("Pod spec");
+        let container = &spec.containers[0];
+        let command = container.command.as_ref().expect("supervisor command");
+        assert!(
+            command
+                .windows(2)
+                .any(|args| args == ["--upstream-proxy-ca-bundle", UPSTREAM_PROXY_CA_BUNDLE_PATH]),
+            "{command:?}"
+        );
+    }
+
+    #[test]
+    fn supervisor_pod_omits_the_ca_bundle_argument_when_unstaged() {
+        // The supervisor keys its behavior off the argument, so an unstaged
+        // bundle must not leave a dangling path on the argv.
+        let pod = supervisor_pod_with_staged_proxy_ca(false);
+        let spec = pod.spec.as_ref().expect("Pod spec");
+        let command = spec.containers[0]
+            .command
+            .as_ref()
+            .expect("supervisor command");
+        assert!(
+            !command
+                .iter()
+                .any(|arg| arg == "--upstream-proxy-ca-bundle"),
+            "{command:?}"
+        );
+    }
+
+    #[test]
+    fn staging_the_ca_bundle_adds_no_volume_or_mount() {
+        // The bundle rides in the bootstrap Secret, whose volume already
+        // mounts every key at /.openshell/supervisor. A new volume here would
+        // mean the Secret is being projected with an `items` filter that would
+        // silently drop the new key.
+        let staged = supervisor_pod_with_staged_proxy_ca(true);
+        let bare = supervisor_pod_with_staged_proxy_ca(false);
+        let volume_names = |pod: &Pod| {
+            pod.spec
+                .as_ref()
+                .expect("Pod spec")
+                .volumes
+                .as_ref()
+                .expect("volumes")
+                .iter()
+                .map(|volume| volume.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let mount_paths = |pod: &Pod| {
+            pod.spec.as_ref().expect("Pod spec").containers[0]
+                .volume_mounts
+                .as_ref()
+                .expect("volume mounts")
+                .iter()
+                .map(|mount| mount.mount_path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(volume_names(&staged), volume_names(&bare));
+        assert_eq!(mount_paths(&staged), mount_paths(&bare));
+        assert!(
+            UPSTREAM_PROXY_CA_BUNDLE_PATH.starts_with("/.openshell/supervisor/"),
+            "the bundle must land inside the bootstrap mount"
         );
     }
 
