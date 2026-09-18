@@ -2544,13 +2544,12 @@ pub(super) async fn handle_get_sandbox_config(
 ) -> Result<Response<GetSandboxConfigResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let sandbox_name = request.get_ref().name.clone();
-    let workspace = request
-        .get_ref()
-        .workspace_scope
-        .as_ref()
-        .and_then(|scope| crate::auth::workspace_authz::selected_workspace_name(Some(scope)).ok())
-        .unwrap_or_default()
-        .to_string();
+    let workspace = match (&principal, request.get_ref().workspace_scope.as_ref()) {
+        (Principal::Sandbox(_), None) => String::new(),
+        (_, selector) => {
+            crate::auth::workspace_authz::selected_workspace_name(selector)?.to_string()
+        }
+    };
     let result = handle_get_sandbox_config_inner(state, request).await;
     match result {
         Err(error)
@@ -10609,6 +10608,27 @@ mod tests {
         handle_get_sandbox_config(&state, req)
             .await
             .expect("matching principal must be allowed");
+    }
+
+    #[tokio::test]
+    async fn sandbox_get_sandbox_config_rejects_all_workspaces_selector() {
+        let state = test_server_state().await;
+        let req = with_sandbox(
+            Request::new(GetSandboxConfigRequest {
+                name: "self".to_string(),
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+            }),
+            "sb-self",
+        );
+
+        let err = handle_get_sandbox_config(&state, req)
+            .await
+            .expect_err("single-sandbox bootstrap must reject all_workspaces");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "all_workspaces is not supported by this request"
+        );
     }
 
     #[tokio::test]

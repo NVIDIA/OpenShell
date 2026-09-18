@@ -184,7 +184,7 @@ keeps workspace selection in a separate field:
 Public requests do not accept canonical sandbox IDs as references. This is a
 breaking API change: regenerate protobuf clients and replace stored ID
 references with sandbox names before calling the public API. The four collection
-list RPCs use the request-level `workspace` selector.
+list RPCs use the request-level `workspace_scope` selector.
 
 The Rust and Python SDKs expose separate all-workspaces list methods. The Go
 SDK passes `AllWorkspaces: true` in `ListOptions` to `ListAll`, and the

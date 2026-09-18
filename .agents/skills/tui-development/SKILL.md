@@ -479,11 +479,12 @@ use openshell_core::proto::{
 
 ### Proto field gotchas
 
-- `DeleteSandboxRequest` uses the canonical sandbox name and an explicit workspace:
+- `DeleteSandboxRequest` uses `name` for the primary sandbox and an explicit
+  workspace selector:
   ```rust
   let req = openshell_core::proto::DeleteSandboxRequest {
-      sandbox: sandbox_name,
-      workspace: workspace.to_string(),
+      name: sandbox_name,
+      workspace_scope: Some(workspace_selector(workspace)),
       allow_missing: true,
       ..Default::default()
   };
@@ -499,18 +500,18 @@ use openshell_core::proto::{
       follow_logs: true,
       follow_events: false,
       log_tail_lines: 0,
-      workspace: workspace.to_string(),
+      workspace_scope: Some(workspace_selector(workspace)),
       ..Default::default()
   };
   ```
 - `SandboxLogLine` proto fields: `sandbox_id`, `event_time` (`Option<prost_types::Timestamp>`), `level`, `target`, `message`, `source`, `fields` (`HashMap<String, String>`).
-- Single-resource requests use a `workspace: String` field with the canonical
-  workspace name. Collection list requests use
-  `workspace_scope: Option<WorkspaceSelector>` so callers can select one
-  workspace with `Some(workspace_selector(name))` or, where authorized,
-  `Some(all_workspaces_selector())`.
+- Workspace-scoped requests use
+  `workspace_scope: Option<WorkspaceSelector>`. Select one workspace with
+  `Some(workspace_selector(name))`. Collection list requests that explicitly
+  support cross-workspace access also accept
+  `Some(all_workspaces_selector())`; do not use that marker on other requests.
 - `GetSandboxLogsRequest` fields: `sandbox`, `lines` (u32), `since_time` (`Option<prost_types::Timestamp>`),
-  `sources` (Vec<String>), `min_level` (String), `workspace`.
+  `sources` (Vec<String>), `min_level` (String), `workspace_scope`.
 - `ListSandboxesRequest` fields: `page_size` (i32), `page_token` (String),
   `label_selector` (String), `workspace_scope`.
 - `ListProvidersRequest` fields: `page_size` (i32), `page_token` (String),
@@ -522,10 +523,11 @@ use openshell_core::proto::{
   scope invalidates the token.
 - `UpdateConfigRequest` fields include `sandbox` (String, canonical sandbox name),
   `setting_key`, `setting_value`, `delete_setting` (bool), `global` (bool), and
-  `workspace`. Sandbox-scoped updates require canonical `sandbox` and `workspace`
-  names; gateway-global updates leave both fields empty.
-- Most single-resource requests require an explicit canonical `workspace` name,
-  including the `default` workspace. An empty value is not an implicit default.
+  `workspace_scope`. Sandbox-scoped updates require canonical `sandbox` and a
+  named selector; gateway-global updates leave `sandbox` empty and
+  `workspace_scope` as `None`.
+- Most workspace-scoped requests require an explicit named selector, including
+  the `default` workspace. An omitted selector is not an implicit default.
 
 ### gRPC timeouts
 
