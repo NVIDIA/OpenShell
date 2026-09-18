@@ -2670,12 +2670,7 @@ fn prepare_startup_configuration(
             "Effective configuration admission rejected"
         ));
     }
-    if !matches!(
-        provider.readiness_reason,
-        ProviderReadinessReason::Unspecified
-            | ProviderReadinessReason::CredentialsWithheld
-            | ProviderReadinessReason::CredentialExpired
-    ) {
+    if !provider_environment_is_installable(provider.readiness_reason) {
         return Err(miette::miette!(
             "Provider credentials are not ready for installation"
         ));
@@ -2689,6 +2684,18 @@ fn prepare_startup_configuration(
     let process_policy = SandboxPolicy::try_from(policy.clone())?;
     let credentials = prepare_provider_environment(provider)?;
     Ok((engine, process_policy, credentials))
+}
+
+/// Whether the provider response contains a complete environment snapshot that
+/// can be installed. Withheld and expired credentials are intentionally absent,
+/// so those responses remain valid fail-closed snapshots.
+fn provider_environment_is_installable(reason: ProviderReadinessReason) -> bool {
+    matches!(
+        reason,
+        ProviderReadinessReason::Unspecified
+            | ProviderReadinessReason::CredentialsWithheld
+            | ProviderReadinessReason::CredentialExpired
+    )
 }
 
 fn prepare_provider_environment(
@@ -4301,7 +4308,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             {
                 Ok(provider)
                     if EnvironmentIdentity::from_environment(&provider) == desired_identity
-                        && provider.readiness_reason == ProviderReadinessReason::Unspecified =>
+                        && provider_environment_is_installable(provider.readiness_reason) =>
                 {
                     provider
                 }
@@ -6197,6 +6204,69 @@ network_policies:
         assert_eq!(observed.provider_env_revision, 6);
         assert_eq!(observed.config_revision, 200);
         assert_eq!(observed.policy_hash, "hash-v2");
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn provider_poll_installs_fail_closed_environment_and_acknowledges_policy() {
+        let policy = proto_policy_fixture();
+        let initial = settings_poll_result(
+            Some(policy.clone()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let engine = Arc::new(OpaEngine::from_proto(&policy).unwrap());
+        let ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let credentials = ctx.provider_credentials.clone();
+        let (policy_gateway, polls, mut reports) = scripted_policy_gateway();
+        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+        polls.send(initial).unwrap();
+        let task = tokio::spawn(run_policy_poll_loop_with_client(
+            ctx,
+            ScriptedProviderGateway {
+                policy: policy_gateway,
+                requests,
+            },
+        ));
+        expect_policy_report(&mut reports, 1).await;
+
+        let mut changed = settings_poll_result(
+            Some(policy),
+            2,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        changed.provider_env_revision = 1;
+        polls.send(changed).unwrap();
+        let response = timeout(Duration::from_secs(1), received.recv())
+            .await
+            .expect("provider refresh requested")
+            .expect("poll loop active");
+        let mut withheld = static_provider_environment(1, None);
+        withheld.policy_hash = "hash-v2".to_string();
+        withheld.readiness_reason = ProviderReadinessReason::CredentialsWithheld;
+        withheld
+            .environment
+            .insert("PROJECT_ID".to_string(), "example-project".to_string());
+        withheld
+            .non_secret_environment_keys
+            .push("PROJECT_ID".to_string());
+        assert!(response.send(Ok(withheld)).is_ok());
+
+        expect_policy_report(&mut reports, 2).await;
+        assert_eq!(credentials.revision(), 1);
+        assert!(
+            credentials.snapshot().child_env.contains_key("PROJECT_ID"),
+            "the reduced snapshot retains non-secret provider configuration"
+        );
+
         task.abort();
         let _ = task.await;
     }
