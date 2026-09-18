@@ -823,25 +823,36 @@ REST rules can also constrain query parameter values:
 
 ### MCP and JSON-RPC matching
 
-MCP endpoints use `protocol: mcp`. The proxy parses sandbox-to-server MCP Streamable HTTP request bodies, validates known MCP request and notification params, can evaluate the MCP method against rule `method`, and can match tool calls with the `tool` alias. Unknown extension methods stay addressable as literal method strings. You may omit the entire `mcp` stanza when using its defaults, or omit only `mcp.versions` when setting another MCP option. OpenShell immediately resolves either form to the exact `["2025-11-25"]` allowlist and stores the materialized list in canonical policy data. Adding another supported revision therefore never widens a normalized policy. Defaulting requires the `mcp` or `mcp.versions` key to be absent; explicit `mcp: null`, `versions: null`, and `versions: []` values are invalid. Use an explicit nonempty allowlist only for intentional compatibility or downgrade control. Supported revisions are `2025-03-26`, `2025-06-18`, and `2025-11-25`; the exact support floor is `2025-03-26`, and this is a closed set rather than a date range. Explicit values must be unique and contain no extra whitespace; OpenShell stores them in semantic order. Moving aliases such as `draft` or `latest` are rejected because they could change policy meaning without a policy edit; omission never means all known versions. The sessionless `2026-07-28` revision is not accepted until OpenShell supports its distinct per-request contract. A version identifies a core MCP revision only; there is no policy syntax for separately named SEP overlays. For every MCP HTTP request except a valid standalone `initialize`, OpenShell selects the revision from one `MCP-Protocol-Version` header or, when the header is absent, the MCP specification's `2025-03-26` compatibility fallback. The selected revision must appear in the allowlist. Duplicate, empty, and unsupported header values receive `400 Bad Request`; a supported revision outside the allowlist receives `403 Forbidden`. OpenShell checks the request again after middleware changes it and before forwarding. Generic JSON-RPC endpoints do not use this header and continue to evaluate only `method`. `mcp.allow_all_known_mcp_methods` defaults to `false`, so endpoints require explicit MCP method rules. Set it to `true` to enable the endpoint method profile; in that mode, rules can omit `method`, and tool selectors are normalized to `tools/call` internally. By default, MCP `tools/call` tool names must match `^[A-Za-z0-9_.-]{1,128}$`; set `mcp.strict_tool_names: false` on that endpoint only when a server intentionally uses names outside the MCP-recommended pattern. Wildcard `tool` matchers require `mcp.strict_tool_names` to remain enabled.
+MCP endpoints use `protocol: mcp`. The proxy inspects MCP Streamable HTTP requests sent by a sandboxed process, validates known methods and params against the selected revision, and applies `method` and optional `tool` rules. Unknown extension methods require an exact literal method rule; method globs and `mcp.allow_all_known_mcp_methods` do not cover them.
 
-The current registry declares these profile facts for later runtime enforcement:
+Supported revisions are `2025-03-26`, `2025-06-18`, `2025-11-25`, and `2026-07-28`. Omitting the `mcp` stanza or its `versions` key resolves to the exact allowlist `["2025-11-25"]`. OpenShell stores this explicit list, so adding support for another revision does not change an existing policy. To use `2026-07-28`, add it to `mcp.versions` explicitly. The list must be nonempty, contain unique exact revisions, and contain no extra whitespace. Explicit `mcp: null`, `versions: null`, and `versions: []` values are invalid. Moving aliases such as `draft` or `latest` are rejected.
 
-- `2025-03-26` permits nonempty same-side top-level JSON-RPC batches; OpenShell's planned enforcement caps them at 64 members.
+For the 2025 revisions, the client starts with a valid standalone `initialize`. Each subsequent HTTP request selects its revision through one `MCP-Protocol-Version` header. If that header is absent, the transport fallback is `2025-03-26`, which must appear in the policy allowlist. The fallback does not select the `2025-11-25` policy default. Duplicate, empty, and unsupported version headers receive `400 Bad Request`; a supported revision outside the allowlist receives `403 Forbidden`.
+
+The sessionless `2026-07-28` revision replaces initialization with metadata on every request. Clients send a single JSON-RPC request using HTTP POST, with the protocol version and client capabilities in `params._meta`. `MCP-Protocol-Version` must match the body version, and `Mcp-Method` must match the JSON-RPC method. `Mcp-Name` must match `params.name` for `tools/call` and `prompts/get`, or `params.uri` for `resources/read`; OpenShell decodes the standard base64 header encoding before comparing it. Missing or mismatched required metadata or headers receive `400 Bad Request`, including on extension requests. See the [policy schema](/reference/policy-schema#mcp-allow-and-deny-rules-protocol-mcp) for the exact metadata keys.
+
+Extension notifications may also be sent, one per HTTP POST, with an exact method allow rule and `MCP-Protocol-Version: 2026-07-28` to select this profile. They do not require the request metadata or method/name headers described above because this revision defines no metadata-header contract for notification POSTs. Deny rules still apply.
+
+A `2026-07-28` client may call `server/discover` first, then use methods such as `tools/list` and `tools/call`. It does not send `initialize` or `notifications/initialized`. `subscriptions/listen` receives notifications on its POST response stream; standalone GET streams, DELETE session operations, client JSON-RPC response frames, and the stdio-only `notifications/cancelled` method are rejected.
+
+The runtime enforces these profile facts:
+
+- `2025-03-26` permits nonempty same-side top-level JSON-RPC batches capped at 64 members.
 - `2025-06-18` prohibits top-level JSON-RPC arrays.
 - `2025-11-25` prohibits top-level JSON-RPC arrays.
+- `2026-07-28` prohibits top-level JSON-RPC arrays and requires the sessionless POST request contract described above.
 
-OpenShell uses the per-request header only to enforce the allowlist; the current parser does not yet apply these version-specific batch rules. OpenShell does not treat the client's `initialize.params.protocolVersion` as the selected revision, inspect the server's initialization response, or bind `MCP-Session-Id`. The version check is stateless and applies independently to each later request, including GET and DELETE.
+OpenShell uses `tower-mcp-types` pinned to `0.22.2` for JSON-RPC structure and MCP method, direction, message-kind, parameter, and metadata type checks. These checks follow Tower's accepted types and do not provide complete JSON-schema validation. OpenShell enforces the revision allowlist, matching HTTP headers, body limits, duplicate-key rejection, tool-name rules, and method authorization. It checks each request before policy evaluation and again after middleware changes it and before forwarding. It does not store session state, treat a legacy `initialize.params.protocolVersion` proposal as the selected revision, inspect the initialization response, or bind `MCP-Session-Id`.
 
 MCP endpoints must declare a concrete destination with `host` and `port` or `ports`. A policy entry that only sets `protocol: mcp` is invalid and is not treated as a wildcard MCP authorization. Use `path: /mcp` when the server's MCP endpoint is path-scoped; omitting `path` matches every HTTP path on that host and port.
 
-Existing versionless inspected MCP policies remain valid and normalize to the exact `2025-11-25` default; they do not need a migration edit. This is a pinned default, not a moving latest or all-known selection. For an unsupported revision, omit `protocol` and the `mcp` stanza to authorize deliberate, uninspected TCP passthrough only when that weaker L4 boundary is acceptable; OpenShell does not silently downgrade to an older inspected profile.
+Existing versionless inspected MCP policies remain valid and normalize to the exact `2025-11-25` default. For an unsupported revision, omit `protocol` and the `mcp` stanza to authorize deliberate, uninspected TCP passthrough only when that weaker L4 boundary is acceptable; OpenShell does not silently downgrade to an older inspected profile.
 
-MCP policy enforcement is directional. It applies to HTTP request bodies sent by the sandboxed process to the configured endpoint. JSON-RPC responses and server-to-client MCP messages carried on response bodies or SSE streams are relayed but are not currently parsed for policy enforcement.
+MCP policy enforcement applies to requests sent by the sandboxed process. Responses and server-to-client MCP messages on response bodies or SSE streams, including multi-round tool result payloads, are relayed without policy parsing. OpenShell also forwards custom headers without matching `Mcp-Param-*` fields against tool schemas. Selecting a core revision does not claim conformance for separately named protocol extensions.
 
 MCP and JSON-RPC endpoint policies currently require full policy YAML applied with `openshell policy set`; the incremental `openshell policy update --add-endpoint` parser does not accept `mcp` or `json-rpc` as protocols.
 
-An MCP client first sends `initialize`. After the server returns a successful response, the client sends `notifications/initialized`. After initialization completes and the server advertises the `tools` capability, the client can call an advertised tool. The response does not need an allow rule because these rules inspect messages sent from the client to the server. This example adds both client initialization messages to the existing tool rules. It omits `tools/list` because it assumes the client already knows the tool names; add that method when the client performs discovery.
+For the default `2025-11-25` revision, a client first sends `initialize`, then `notifications/initialized` after the server returns a successful response. Once the server advertises the `tools` capability, the client can call an advertised tool. This example allows the client initialization messages and selected tool calls. It omits `tools/list` because it assumes the client already knows the tool names; add that method when the client performs discovery.
 
 ```yaml showLineNumbers={false}
   mcp_server:
@@ -878,7 +889,36 @@ The example omits the entire `mcp` stanza, so OpenShell uses the exact `2025-11-
           versions: ["2025-03-26", "2025-11-25"]
 ```
 
-OpenShell canonicalizes this list in semantic order. Later runtime negotiation selects one allowed revision and applies only that profile; it does not combine the two profiles. `mcp.max_body_bytes` controls how many MCP-over-HTTP request body bytes OpenShell buffers for inspection and defaults to `65536`. `mcp.strict_tool_names` defaults to `true` for each MCP endpoint. `mcp.allow_all_known_mcp_methods` defaults to `false`; when it is unset or `false`, the endpoint must define explicit MCP method rules. If an MCP endpoint sets `mcp.allow_all_known_mcp_methods: true` and omits `rules`, OpenShell allows all MCP-family methods and all tools, then applies any `deny_rules`. A broad allow or deny rule whose method matcher includes `tools/call` cannot be combined with tool-specific allow rules because it would bypass or erase the tool filter; add `tool` or `params.name` to scope `tools/call`, or remove the tool-specific rules.
+OpenShell canonicalizes this list in semantic order. Each request selects one allowed revision and is inspected with only that profile.
+
+To use a `2026-07-28` server, set an explicit revision and allow the methods your client needs. This example allows server and tool discovery, followed by calls to `read_status`. It has no initialization rules because the client sends its protocol version and capabilities with every request.
+
+```yaml showLineNumbers={false}
+  mcp_server:
+    name: mcp_server
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          versions: ["2026-07-28"]
+        rules:
+          - allow:
+              method: server/discover
+          - allow:
+              method: tools/list
+          - allow:
+              method: tools/call
+              tool: read_status
+    binaries:
+      - { path: /usr/bin/python3 }
+```
+
+`mcp.max_body_bytes` controls how many MCP-over-HTTP request body bytes OpenShell buffers for inspection and defaults to `65536`. `mcp.strict_tool_names` defaults to `true` and requires `tools/call` names to match `^[A-Za-z0-9_.-]{1,128}$`. Set it to `false` only for a server that intentionally uses names outside that pattern; wildcard `tool` matchers require it to remain enabled.
+
+`mcp.allow_all_known_mcp_methods` defaults to `false`, which requires explicit method rules. When set to `true`, rules may omit `method`, and tool selectors are normalized to `tools/call` internally. Omitting `rules` with this option allows methods available in the selected core revision and all tools before applying `deny_rules`; unknown extensions still require exact literal method rules. A broad allow or deny rule whose method matcher includes `tools/call` cannot be combined with tool-specific allow rules because it would bypass or erase the tool filter; add `tool` or `params.name` to scope `tools/call`, or remove the tool-specific rules.
 
 Use `protocol: json-rpc` and `method` when you need generic JSON-RPC 2.0 matching for a non-MCP server. Generic JSON-RPC method rules accept exact method names, or `method: "*"` as the all-method sentinel; other wildcard or glob patterns are rejected. `json_rpc.max_body_bytes` controls the generic JSON-RPC inspection buffer.
 

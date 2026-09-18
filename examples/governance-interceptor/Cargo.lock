@@ -1142,6 +1142,7 @@ dependencies = [
  "noyalib",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
