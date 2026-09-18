@@ -62,12 +62,13 @@ pub fn generate_proxy_ca_material() -> Result<ProxyCaMaterial, String> {
         .distinguished_name
         .push(DnType::OrganizationName, "OpenShell");
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let certificate = params
-        .self_signed(&key)
+    let certificate = openshell_crypto::pki::self_signed(params, &key)
         .map_err(|error| format!("generate proxy CA certificate: {error}"))?;
     Ok(ProxyCaMaterial {
         certificate_pem: certificate.pem(),
-        private_key_pem: key.serialize_pem(),
+        private_key_pem: key
+            .serialize_pem()
+            .map_err(|error| format!("export proxy CA key: {error}"))?,
     })
 }
 

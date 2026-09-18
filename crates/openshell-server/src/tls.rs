@@ -406,7 +406,10 @@ fn build_server_config(
                 .map_err(|e| Error::tls(format!("failed to add CA certificate: {e}")))?;
         }
 
-        let verifier_builder = WebPkiClientVerifier::builder(Arc::new(root_store));
+        let verifier_builder = WebPkiClientVerifier::builder_with_provider(
+            Arc::new(root_store),
+            openshell_crypto::tls::configuration_provider(),
+        );
         let verifier = if require_client_auth {
             verifier_builder
         } else {
@@ -415,7 +418,7 @@ fn build_server_config(
         .build()
         .map_err(|e| Error::tls(format!("failed to build client verifier: {e}")))?;
 
-        let builder = ServerConfig::builder().with_client_cert_verifier(verifier);
+        let builder = openshell_crypto::tls::server_builder().with_client_cert_verifier(verifier);
         if let Some(resolver) = resolver {
             builder.with_cert_resolver(resolver)
         } else {
@@ -424,7 +427,7 @@ fn build_server_config(
                 .map_err(|e| Error::tls(format!("failed to create TLS config: {e}")))?
         }
     } else {
-        let builder = ServerConfig::builder().with_no_client_auth();
+        let builder = openshell_crypto::tls::server_builder().with_no_client_auth();
         if let Some(resolver) = resolver {
             builder.with_cert_resolver(resolver)
         } else {
@@ -496,22 +499,31 @@ fn tls_ocsf_ctx() -> EventContext {
 mod tests {
     use super::*;
     use crate::tls_test_utils::{generate_test_certs_with_ca, write_test_file};
-    use rcgen::{CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+    use openshell_crypto::pki::KeyPair;
+    use rcgen::{CertificateParams, IsCa, KeyUsagePurpose};
     use tokio::net::{TcpListener, TcpStream};
 
     /// Generate a new server cert + key in `dir`, signed by the given CA.
     /// Overwrites `server-cert.pem` and `server-key.pem`.
-    fn generate_server_cert(ca_cert: &rcgen::Certificate, ca_key: &KeyPair, dir: &Path) {
+    fn generate_server_cert(
+        ca_cert: &openshell_crypto::pki::Certificate,
+        ca_key: &KeyPair,
+        dir: &Path,
+    ) {
         let server_params = CertificateParams::new(vec!["localhost".to_string()])
             .expect("failed to create server params");
         let server_key =
             openshell_crypto::pki::generate_keypair().expect("failed to generate server key");
-        let server_cert = server_params
-            .signed_by(&server_key, ca_cert, ca_key)
-            .expect("failed to sign server cert");
+        let server_cert =
+            openshell_crypto::pki::signed_by(server_params, &server_key, ca_cert, ca_key)
+                .expect("failed to sign server cert");
 
         write_test_file(dir, "server-cert.pem", server_cert.pem().as_bytes());
-        write_test_file(dir, "server-key.pem", server_key.serialize_pem().as_bytes());
+        write_test_file(
+            dir,
+            "server-key.pem",
+            server_key.serialize_pem().unwrap().as_bytes(),
+        );
     }
 
     fn build_test_client_config(ca_path: &Path) -> Arc<rustls::ClientConfig> {
@@ -523,7 +535,7 @@ mod tests {
                 .expect("failed to add CA to root store");
         }
         Arc::new(
-            rustls::ClientConfig::builder()
+            openshell_crypto::tls::client_builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth(),
         )
@@ -920,8 +932,7 @@ mod tests {
             .push(rcgen::DnType::CommonName, "new-ca");
         let new_ca_key =
             openshell_crypto::pki::generate_keypair().expect("failed to generate new CA key");
-        let new_ca_cert = new_ca_params
-            .self_signed(&new_ca_key)
+        let new_ca_cert = openshell_crypto::pki::self_signed(new_ca_params, &new_ca_key)
             .expect("failed to sign new CA cert");
         std::fs::write(dir.path().join("ca.pem"), new_ca_cert.pem().as_bytes())
             .expect("failed to write new CA");
@@ -944,17 +955,20 @@ mod tests {
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,
         ];
-        let client_cert = client_params
-            .signed_by(&client_key, &new_ca_cert, &new_ca_key)
-            .expect("failed to sign client cert");
+        let client_cert =
+            openshell_crypto::pki::signed_by(client_params, &client_key, &new_ca_cert, &new_ca_key)
+                .expect("failed to sign client cert");
 
         // Write client cert + key as PEM files and load via load_certs/load_key
         let client_cert_path = dir.path().join("client-cert.pem");
         let client_key_path = dir.path().join("client-key.pem");
         std::fs::write(&client_cert_path, client_cert.pem().as_bytes())
             .expect("failed to write client cert");
-        std::fs::write(&client_key_path, client_key.serialize_pem().as_bytes())
-            .expect("failed to write client key");
+        std::fs::write(
+            &client_key_path,
+            client_key.serialize_pem().unwrap().as_bytes(),
+        )
+        .expect("failed to write client key");
 
         let client_cert_chain = load_certs(&client_cert_path).expect("failed to load client cert");
         let client_private_key = load_key(&client_key_path).expect("failed to load client key");
@@ -964,7 +978,7 @@ mod tests {
             .add(CertificateDer::from(new_ca_cert.der().to_vec()))
             .expect("failed to add new CA to root store");
         let new_ca_client_config = Arc::new(
-            rustls::ClientConfig::builder()
+            openshell_crypto::tls::client_builder()
                 .with_root_certificates(root_store)
                 .with_client_auth_cert(client_cert_chain, client_private_key)
                 .expect("failed to set client auth cert"),
@@ -1012,16 +1026,23 @@ mod tests {
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,
         ];
-        let old_client_cert = old_client_params
-            .signed_by(&old_client_key, &initial_ca_cert, &initial_ca_key)
-            .expect("failed to sign old client cert");
+        let old_client_cert = openshell_crypto::pki::signed_by(
+            old_client_params,
+            &old_client_key,
+            &initial_ca_cert,
+            &initial_ca_key,
+        )
+        .expect("failed to sign old client cert");
 
         let old_cert_path = dir.path().join("old-client-cert.pem");
         let old_key_path = dir.path().join("old-client-key.pem");
         std::fs::write(&old_cert_path, old_client_cert.pem().as_bytes())
             .expect("failed to write old client cert");
-        std::fs::write(&old_key_path, old_client_key.serialize_pem().as_bytes())
-            .expect("failed to write old client key");
+        std::fs::write(
+            &old_key_path,
+            old_client_key.serialize_pem().unwrap().as_bytes(),
+        )
+        .expect("failed to write old client key");
 
         let old_cert_chain = load_certs(&old_cert_path).expect("failed to load old client cert");
         let old_key_der = load_key(&old_key_path).expect("failed to load old client key");
@@ -1031,7 +1052,7 @@ mod tests {
             .add(CertificateDer::from(new_ca_cert.der().to_vec()))
             .expect("failed to add new CA to root store");
         let old_ca_client_config = Arc::new(
-            rustls::ClientConfig::builder()
+            openshell_crypto::tls::client_builder()
                 .with_root_certificates(old_root_store)
                 .with_client_auth_cert(old_cert_chain, old_key_der)
                 .expect("failed to set old client auth cert"),
@@ -1068,7 +1089,7 @@ mod tests {
     /// Generate a cert+key pair with given SANs, signed by the provided CA,
     /// and write them to the specified files in `dir`.
     fn generate_named_cert(
-        ca_cert: &rcgen::Certificate,
+        ca_cert: &openshell_crypto::pki::Certificate,
         ca_key: &KeyPair,
         dir: &Path,
         cert_file: &str,
@@ -1078,11 +1099,10 @@ mod tests {
         let params =
             CertificateParams::new(vec![san.to_string()]).expect("failed to create cert params");
         let key = openshell_crypto::pki::generate_keypair().expect("failed to generate key");
-        let cert = params
-            .signed_by(&key, ca_cert, ca_key)
+        let cert = openshell_crypto::pki::signed_by(params, &key, ca_cert, ca_key)
             .expect("failed to sign cert");
         write_test_file(dir, cert_file, cert.pem().as_bytes());
-        write_test_file(dir, key_file, key.serialize_pem().as_bytes());
+        write_test_file(dir, key_file, key.serialize_pem().unwrap().as_bytes());
     }
 
     #[test]

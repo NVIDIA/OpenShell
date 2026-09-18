@@ -40,7 +40,7 @@ fn https_client_mtls(
             .expect("no private key found")
     };
 
-    let tls_config = rustls::ClientConfig::builder()
+    let tls_config = openshell_crypto::tls::client_builder()
         .with_root_certificates(roots)
         .with_client_auth_cert(client_certs, client_key)
         .expect("failed to build client TLS config with client cert");

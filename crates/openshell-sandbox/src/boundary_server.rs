@@ -3301,11 +3301,12 @@ mod linux {
                     "boundary TLS private-key file contains no private key",
                 )
             })?;
-        let mut config =
-            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .with_no_client_auth()
-                .with_single_cert(certificates, private_key)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let mut config = openshell_crypto::tls::server_builder_with_protocol_versions(&[
+            &rustls::version::TLS13,
+        ])
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         config.alpn_protocols = vec![b"h2".to_vec()];
         for path in [&tls.certificate_chain_path, &tls.private_key_path] {
             std::fs::remove_file(path)?;
@@ -3608,7 +3609,7 @@ mod linux {
                 public_key_pem: key.public_key_pem(),
             };
             let issuer = SessionJwtIssuer::from_ed25519_pem(
-                key.serialize_pem().as_bytes(),
+                key.serialize_pem().unwrap().as_bytes(),
                 "test-key",
                 "test-gateway",
                 DEFAULT_SESSION_TOKEN_TTL,
@@ -3681,7 +3682,7 @@ mod linux {
                     .add(certificate.expect("parse test CA"))
                     .expect("add test CA");
             }
-            let mut config = rustls::ClientConfig::builder()
+            let mut config = openshell_crypto::tls::client_builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             config.alpn_protocols = vec![b"h2".to_vec()];

@@ -1010,23 +1010,23 @@ mod tests {
         let mut old_ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         old_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let old_ca_key = openshell_crypto::pki::generate_keypair().unwrap();
-        let old_ca_cert = old_ca_params.self_signed(&old_ca_key).unwrap();
+        let old_ca_cert = openshell_crypto::pki::self_signed(old_ca_params, &old_ca_key).unwrap();
 
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let ca_key = openshell_crypto::pki::generate_keypair().unwrap();
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_cert = openshell_crypto::pki::self_signed(ca_params, &ca_key).unwrap();
 
         let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let server_key = openshell_crypto::pki::generate_keypair().unwrap();
-        let server_cert = server_params
-            .signed_by(&server_key, &ca_cert, &ca_key)
-            .unwrap();
-        let server_config = rustls::ServerConfig::builder()
+        let server_cert =
+            openshell_crypto::pki::signed_by(server_params, &server_key, &ca_cert, &ca_key)
+                .unwrap();
+        let server_config = openshell_crypto::tls::server_builder()
             .with_no_client_auth()
             .with_single_cert(
                 vec![server_cert.der().clone()],
-                PrivateKeyDer::Pkcs8(server_key.serialize_der().into()),
+                PrivateKeyDer::Pkcs8(server_key.serialize_der().unwrap().into()),
             )
             .unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
@@ -1698,7 +1698,7 @@ mod tests {
                 other => panic!("unsupported curve {other}"),
             };
             let encoding_key =
-                EncodingKey::from_ec_pem(key_pair.serialize_pem().as_bytes()).unwrap();
+                EncodingKey::from_ec_pem(key_pair.serialize_pem().unwrap().as_bytes()).unwrap();
             let (x, y) = ec_coords_from_spki(&key_pair.public_key_der(), coord_len);
             let jwk = serde_json::json!({
                 "kty": "EC",
@@ -1719,7 +1719,7 @@ mod tests {
         fn ed25519_test_key(kid: &str) -> TestSigningKey {
             let key_pair = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519).unwrap();
             let encoding_key =
-                EncodingKey::from_ed_pem(key_pair.serialize_pem().as_bytes()).unwrap();
+                EncodingKey::from_ed_pem(key_pair.serialize_pem().unwrap().as_bytes()).unwrap();
             let spki = key_pair.public_key_der();
             let x = URL_SAFE_NO_PAD.encode(&spki[spki.len() - 32..]);
             let jwk = serde_json::json!({

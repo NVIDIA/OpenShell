@@ -971,11 +971,12 @@ fn extract_secret_value(
 
 #[cfg(test)]
 mod tests {
+    use openshell_crypto::pki::KeyPair;
     use std::net::SocketAddr;
     use std::sync::Arc;
 
     use openshell_core::proto::CredentialHandle;
-    use rcgen::{CertificateParams, IsCa, KeyPair};
+    use rcgen::{CertificateParams, IsCa};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tonic::Code;
     use wiremock::matchers::{body_string_contains, header, method, path};
@@ -1004,26 +1005,30 @@ mod tests {
         file
     }
 
-    fn test_ca() -> (rcgen::Certificate, KeyPair) {
+    fn test_ca() -> (openshell_crypto::pki::Certificate, KeyPair) {
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let key = openshell_crypto::pki::generate_keypair().unwrap();
-        let certificate = params.self_signed(&key).unwrap();
+        let certificate = openshell_crypto::pki::self_signed(params, &key).unwrap();
         (certificate, key)
     }
 
     async fn start_tls_server(response: String) -> (SocketAddr, String) {
         let (ca_certificate, ca_key) = test_ca();
         let server_key = openshell_crypto::pki::generate_keypair().unwrap();
-        let server_certificate = CertificateParams::new(vec!["localhost".to_string()])
-            .unwrap()
-            .signed_by(&server_key, &ca_certificate, &ca_key)
-            .unwrap();
-        let server_config = rustls::ServerConfig::builder()
+        let server_certificate = openshell_crypto::pki::signed_by(
+            CertificateParams::new(vec!["localhost".to_string()]).unwrap(),
+            &server_key,
+            &ca_certificate,
+            &ca_key,
+        )
+        .unwrap();
+        let server_config = openshell_crypto::tls::server_builder()
             .with_no_client_auth()
             .with_single_cert(
                 vec![server_certificate.der().clone()],
-                rustls::pki_types::PrivateKeyDer::try_from(server_key.serialize_der()).unwrap(),
+                rustls::pki_types::PrivateKeyDer::try_from(server_key.serialize_der().unwrap())
+                    .unwrap(),
             )
             .unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));

@@ -922,7 +922,7 @@ mod tests {
             let public_key_pem = key.public_key_pem().into_bytes();
             let clock: Arc<dyn JwtClock> = Arc::new(FixedClock(1_900_000_000));
             let issuer = SessionJwtIssuer::from_ed25519_pem(
-                key.serialize_pem().as_bytes(),
+                key.serialize_pem().unwrap().as_bytes(),
                 "current",
                 "test",
                 DEFAULT_SESSION_TOKEN_TTL,
@@ -1067,7 +1067,8 @@ mod tests {
             let token = encode(
                 &header,
                 &claims,
-                &EncodingKey::from_ed_pem(key.serialize_pem().as_bytes()).expect("encoding key"),
+                &EncodingKey::from_ed_pem(key.serialize_pem().unwrap().as_bytes())
+                    .expect("encoding key"),
             )
             .expect("token");
             assert_eq!(verifier.verify(&token), Err(SessionJwtError::InvalidToken));

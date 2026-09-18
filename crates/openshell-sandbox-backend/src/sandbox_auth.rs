@@ -380,7 +380,7 @@ mod tests {
         let clock: Arc<dyn JwtClock> = Arc::new(FixedClock);
         let sandbox_id = SandboxId::parse("sandbox-a").expect("sandbox ID");
         let issuer = SessionJwtIssuer::from_ed25519_pem(
-            key.serialize_pem().as_bytes(),
+            key.serialize_pem().unwrap().as_bytes(),
             "current",
             "test",
             DEFAULT_SESSION_TOKEN_TTL,
