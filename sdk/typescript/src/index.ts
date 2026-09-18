@@ -12,6 +12,7 @@ export type {
   ExecExitEvent,
   ExecInteractiveOptions,
   ExecInteractiveSession,
+  ExecInteractiveSessionControl,
   ExecOptions,
   ExecResult,
   ExecStreamChunk,

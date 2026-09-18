@@ -278,6 +278,18 @@ consumers import a single package. See the [Architecture](https://ro14nd.de/open
 
 ## Features
 
+Use `CloseInteractiveInput(session)` to close stdin and resize input while keeping
+output readable. SDK sessions implement the optional `InteractiveSessionControl`
+interface (`CloseWrite()` and `Cancel()`); the original `InteractiveSession`
+interface remains unchanged for existing mocks and wrappers. Input closure returns
+`ErrorUnimplemented` for sessions without that capability and leaves them open.
+`CancelInteractive(session)` uses `Cancel()` when available and otherwise calls
+`Close()`. SDK close/cancel operations are idempotent; writes and resizes after
+input closure return `io.ErrClosedPipe`. Drain `Read` concurrently with waiting for `ExitCode()`.
+`ExitCode()` waits for final gRPC status and returns any observed process exit code
+alongside a later stream error. An exit event alone does not establish successful
+stream completion.
+
 | Feature | Interface | Docs |
 |---------|-----------|------|
 | Sandbox lifecycle (create, get, list, delete, watch, wait) | `SandboxInterface` | [Sandboxes](https://ro14nd.de/openshell-sdk-go/api/sandboxes.html) |
