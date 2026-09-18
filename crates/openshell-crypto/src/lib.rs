@@ -5,9 +5,12 @@
 //!
 //! AWS-LC is the only production implementation in this first stage. This crate
 //! does not enable FIPS mode, change algorithms, or attest dependency-owned crypto.
-//! See the crate README for initialization and extension boundaries.
+//! The extension target is a system-OpenSSL backend for regulated deployments
+//! (<https://github.com/NVIDIA/OpenShell/issues/900>). See the crate README for
+//! initialization, key ownership, and dependency coverage boundaries.
 
 pub mod aead;
+#[cfg(feature = "aws-lc")]
 mod aws_lc;
 pub mod jwt;
 pub mod pki;
@@ -99,7 +102,7 @@ pub trait CryptoBackend: Send + Sync {
 /// Adapters for the protocol libraries currently used by `OpenShell`.
 ///
 /// A follow-up backend must implement these as well as the primitive contract.
-/// Returning rcgen/rustls/jsonwebtoken types does not expose AWS-LC types.
+/// Keys retain backend ownership; protocol parameters do not expose AWS-LC types.
 pub trait ProtocolBackend: CryptoBackend {
     /// Construct the full TLS provider, including certificate verification.
     fn tls_provider(&self) -> rustls::crypto::CryptoProvider;
@@ -107,7 +110,11 @@ pub trait ProtocolBackend: CryptoBackend {
     fn generate_keypair(
         &self,
         algorithm: &'static rcgen::SignatureAlgorithm,
-    ) -> Result<rcgen::KeyPair, rcgen::Error>;
+    ) -> Result<pki::KeyPair, rcgen::Error>;
+    /// Import a persisted PEM private key using this backend.
+    fn import_keypair_pem(&self, pem: &str) -> Result<pki::KeyPair, rcgen::Error>;
+    /// Import a persisted PKCS#8 DER private key using this backend.
+    fn import_keypair_der(&self, der: &[u8]) -> Result<pki::KeyPair, rcgen::Error>;
     /// JWT signing, verification, and JWK operations; claims validation stays in jsonwebtoken.
     fn jwt_provider(&self) -> &'static jsonwebtoken::crypto::CryptoProvider;
 }
@@ -145,29 +152,59 @@ impl CryptoContext {
     }
 }
 
+#[cfg(feature = "aws-lc")]
 impl Default for CryptoContext {
     fn default() -> Self {
         Self::new(Box::new(aws_lc::AwsLc))
     }
 }
 
-static DEFAULT: OnceLock<CryptoContext> = OnceLock::new();
+struct DefaultContext {
+    context: CryptoContext,
+    explicit: bool,
+}
+static DEFAULT: OnceLock<DefaultContext> = OnceLock::new();
+
+pub(crate) fn explicitly_selected() -> bool {
+    DEFAULT.get().is_some_and(|selected| selected.explicit)
+}
 
 /// Application default, initialized lazily to AWS-LC unless selected before first use.
 #[must_use]
 pub fn default_context() -> &'static CryptoContext {
-    DEFAULT.get_or_init(CryptoContext::default)
+    #[cfg(feature = "aws-lc")]
+    {
+        &DEFAULT
+            .get_or_init(|| DefaultContext {
+                context: CryptoContext::default(),
+                explicit: false,
+            })
+            .context
+    }
+    #[cfg(not(feature = "aws-lc"))]
+    {
+        &DEFAULT
+            .get()
+            .expect("install a crypto context before use when no default backend is built")
+            .context
+    }
 }
 
 /// Select a context before the first application crypto operation.
 ///
 /// Reinstalling a clone of the same context is idempotent. A different context
 /// fails even if it reports the same backend name. This does not replace existing
-/// Rustls or JWT globals: embedders must select before initializing those libraries.
+/// Rustls or JWT globals. Select before facade use and before JWT initialization;
+/// explicit TLS builders can override an already initialized Rustls global.
 pub fn install_default_context(context: CryptoContext) -> Result<(), CryptoError> {
-    match DEFAULT.set(context) {
+    match DEFAULT.set(DefaultContext {
+        context,
+        explicit: true,
+    }) {
         Ok(()) => Ok(()),
-        Err(context) if Arc::ptr_eq(&default_context().backend, &context.backend) => Ok(()),
+        Err(selected) if Arc::ptr_eq(&default_context().backend, &selected.context.backend) => {
+            Ok(())
+        }
         Err(_) => Err(CryptoError::ProviderConflict),
     }
 }
@@ -209,7 +246,7 @@ pub fn install_jwt_provider() -> bool {
         .is_ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "aws-lc"))]
 mod tests {
     use super::*;
 
@@ -269,10 +306,12 @@ mod tests {
 
     #[test]
     fn jwt_preserves_eddsa_and_claim_validation() {
+        use jsonwebtoken::errors::ErrorKind;
         let key = pki::generate_jwt_keypair().unwrap();
         assert_eq!(key.algorithm(), &rcgen::PKCS_ED25519);
         let signing =
-            jsonwebtoken::EncodingKey::from_ed_pem(key.serialize_pem().as_bytes()).unwrap();
+            jsonwebtoken::EncodingKey::from_ed_pem(key.serialize_pem().unwrap().as_bytes())
+                .unwrap();
         let verifying =
             jsonwebtoken::DecodingKey::from_ed_pem(key.public_key_pem().as_bytes()).unwrap();
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
@@ -283,10 +322,61 @@ mod tests {
         let decoded = jwt::decode::<serde_json::Value>(&token, &verifying, &validation).unwrap();
         assert_eq!(decoded.claims, claims);
         validation.set_issuer(&["different"]);
-        assert!(jwt::decode::<serde_json::Value>(&token, &verifying, &validation).is_err());
-        let expired = jwt::encode(&header, &serde_json::json!({"exp":1}), &signing).unwrap();
-        assert!(jwt::decode::<serde_json::Value>(&expired, &verifying, &validation).is_err());
-        assert!(jwt::encode(&jsonwebtoken::Header::default(), &claims, &signing).is_err());
+        assert_eq!(
+            jwt::decode::<serde_json::Value>(&token, &verifying, &validation)
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::InvalidIssuer
+        );
+        validation.set_issuer(&["gateway"]);
+        let expired = jwt::encode(
+            &header,
+            &serde_json::json!({"iss":"gateway", "exp":1}),
+            &signing,
+        )
+        .unwrap();
+        assert_eq!(
+            jwt::decode::<serde_json::Value>(&expired, &verifying, &validation)
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::ExpiredSignature
+        );
+        assert_eq!(
+            jwt::encode(&jsonwebtoken::Header::default(), &claims, &signing)
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::InvalidAlgorithm
+        );
+        let wrong_algorithm = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        assert_eq!(
+            jwt::decode::<serde_json::Value>(&token, &verifying, &wrong_algorithm)
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::InvalidAlgorithm
+        );
+        let audience_token = jwt::encode(
+            &header,
+            &serde_json::json!({"iss":"gateway", "aud":"other", "exp":4_000_000_000_u64}),
+            &signing,
+        )
+        .unwrap();
+        validation.set_audience(&["sandbox"]);
+        assert_eq!(
+            jwt::decode::<serde_json::Value>(&audience_token, &verifying, &validation)
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::InvalidAudience
+        );
+        let (message, signature) = token.rsplit_once('.').unwrap();
+        let mut signature = signature.as_bytes().to_vec();
+        signature[0] = if signature[0] == b'A' { b'B' } else { b'A' };
+        let tampered = format!("{message}.{}", String::from_utf8(signature).unwrap());
+        assert_eq!(
+            jwt::decode::<serde_json::Value>(&tampered, &verifying, &validation)
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::InvalidSignature
+        );
     }
 
     struct NoEntropy;
@@ -323,7 +413,13 @@ mod tests {
         fn generate_keypair(
             &self,
             _: &'static rcgen::SignatureAlgorithm,
-        ) -> Result<rcgen::KeyPair, rcgen::Error> {
+        ) -> Result<pki::KeyPair, rcgen::Error> {
+            Err(rcgen::Error::KeyGenerationUnavailable)
+        }
+        fn import_keypair_pem(&self, _: &str) -> Result<pki::KeyPair, rcgen::Error> {
+            Err(rcgen::Error::KeyGenerationUnavailable)
+        }
+        fn import_keypair_der(&self, _: &[u8]) -> Result<pki::KeyPair, rcgen::Error> {
             Err(rcgen::Error::KeyGenerationUnavailable)
         }
         fn jwt_provider(&self) -> &'static jsonwebtoken::crypto::CryptoProvider {

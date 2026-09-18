@@ -13,6 +13,8 @@ license = "Apache-2.0"
 repository = "https://github.com/NVIDIA/OpenShell"
 
 [workspace.dependencies]
+# Product backend selection. Consumer crates inherit this choice.
+openshell-crypto = { path = "crates/openshell-crypto", default-features = false, features = ["aws-lc"] }
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
 
@@ -40,7 +42,7 @@ h2 = "0.4"
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12"] }
 rustls-pemfile = "2"
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "x509-parser"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["pem"] }
 webpki-roots = "1"
 rustls-native-certs = "0.8"
 

@@ -2260,17 +2260,18 @@ mod tests {
     ) -> (SocketAddr, tokio::task::JoinHandle<String>, String) {
         openshell_crypto::tls::ensure_default_provider();
         let key = openshell_crypto::pki::generate_keypair().unwrap();
-        let cert = rcgen::CertificateParams::new(vec![tls_identity.to_string()])
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
+        let cert = openshell_crypto::pki::self_signed(
+            rcgen::CertificateParams::new(vec![tls_identity.to_string()]).unwrap(),
+            &key,
+        )
+        .unwrap();
         let cert_pem = cert.pem();
 
-        let server_config = rustls::ServerConfig::builder()
+        let server_config = openshell_crypto::tls::server_builder()
             .with_no_client_auth()
             .with_single_cert(
                 vec![cert.der().clone()],
-                rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+                rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der().unwrap()).unwrap(),
             )
             .unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));

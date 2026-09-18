@@ -35,7 +35,6 @@ use prost_types::{Struct, Value as ProtoValue, value::Kind};
 use proto_json::{decode_message_to_json, encode_json_to_message};
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value, json};
-use sha2::{Digest, Sha256};
 use tonic::Code;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
@@ -101,13 +100,15 @@ impl PolicySigner {
     fn generate() -> Result<Self, String> {
         let keypair = openshell_crypto::pki::generate_jwt_keypair()
             .map_err(|err| format!("failed to generate policy signing key: {err}"))?;
-        let signing_key_pem = keypair.serialize_pem();
+        let signing_key_pem = keypair
+            .serialize_pem()
+            .map_err(|error| format!("export signing key: {error}"))?;
         let public_key_pem = keypair.public_key_pem();
         let encoding_key = EncodingKey::from_ed_pem(signing_key_pem.as_bytes())
             .map_err(|err| format!("failed to parse policy signing key: {err}"))?;
         let decoding_key = DecodingKey::from_ed_pem(public_key_pem.as_bytes())
             .map_err(|err| format!("failed to parse policy verification key: {err}"))?;
-        let kid = kid_from_public_key_der(&keypair.public_key_der());
+        let kid = kid_from_public_key_der(&keypair.public_key_der())?;
         Ok(Self {
             encoding_key,
             decoding_key,
@@ -1057,9 +1058,9 @@ fn normalize_for_struct(value: Value) -> Result<Value, String> {
     json_to_proto_value(&value).map(|value| proto_value_to_json(&value))
 }
 
-fn kid_from_public_key_der(public_key_der: &[u8]) -> String {
-    let digest = Sha256::digest(public_key_der);
-    hex_encode_prefix(&digest, 16)
+fn kid_from_public_key_der(public_key_der: &[u8]) -> Result<String, String> {
+    let digest = openshell_crypto::sha256(public_key_der).map_err(|error| error.to_string())?;
+    Ok(hex_encode_prefix(&digest, 16))
 }
 
 fn hex_encode_prefix(bytes: &[u8], n: usize) -> String {

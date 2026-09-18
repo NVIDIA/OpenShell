@@ -1235,8 +1235,10 @@ mod tests {
     fn ca_bundle_file_accepts_a_real_certificate() {
         // The positive case that pins host acceptance to guest acceptance:
         // what the driver stages is exactly what rustls will trust.
-        let cert = rcgen::generate_simple_self_signed(vec!["proxy.corp.example".to_string()])
-            .expect("test CA");
+        let cert = openshell_crypto::pki::generate_simple_self_signed(vec![
+            "proxy.corp.example".to_string(),
+        ])
+        .expect("test CA");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy-ca.pem");
         std::fs::write(&path, cert.cert.pem()).unwrap();
