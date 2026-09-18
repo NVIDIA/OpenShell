@@ -3234,10 +3234,14 @@ async fn sandbox_create_json_stdout_is_parseable() {
     let stdout = String::from_utf8(result.stdout).expect("stdout should be UTF-8");
     let value = serde_json::from_str::<serde_json::Value>(&stdout)
         .unwrap_or_else(|err| panic!("stdout should contain only JSON: {err}\n{stdout}"));
+    let gateway_port = url::Url::parse(&server.endpoint)
+        .expect("test gateway endpoint should be a URL")
+        .port()
+        .expect("test gateway endpoint should include a port");
     assert_eq!(
         value["service_urls"],
         serde_json::json!({
-            "": "https://default--sandbox.openshell.localhost:17670/"
+            "": format!("https://default--sandbox.openshell.localhost:{gateway_port}/")
         })
     );
 }
