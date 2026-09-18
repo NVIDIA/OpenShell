@@ -12073,6 +12073,9 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+
+        // Wait for SQLx's SQLite worker threads to stop before the test process exits;
+        state.store.close_for_test().await;
     }
 
     #[tokio::test]
@@ -14833,6 +14836,9 @@ mod tests {
                 .status,
             "approved"
         );
+
+        // Wait for SQLx's SQLite worker threads to stop before the test process exits;
+        state.store.close_for_test().await;
     }
 
     #[tokio::test]
@@ -18670,6 +18676,9 @@ mod tests {
             "undo must clear stale rejection_reason; got: {:?}",
             restored.rejection_reason
         );
+
+        // Wait for SQLx's SQLite worker threads to stop before the test process exits;
+        state.store.close_for_test().await;
     }
 
     #[tokio::test]
@@ -18853,6 +18862,9 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(undo_err.code(), Code::NotFound);
+
+        // Wait for SQLx's SQLite worker threads to stop before the test process exits;
+        state.store.close_for_test().await;
     }
 
     #[test]
