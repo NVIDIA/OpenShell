@@ -463,6 +463,31 @@ the agent. One namespace-wide, empty-egress `NetworkPolicy` is the mandatory
 outer fence for all OpenShell workload Pods. It permits supervisor Pods to
 reach sandbox listeners; TLS and JWT identity enforce the exact pairing.
 
+Set the effective Kubernetes `runtimeClassName` to `gvisor` to select the
+gVisor adapter inside the same OpenShell sandbox backend:
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"gvisor"}}}' \
+  --name gvisor-agent
+```
+
+The gVisor adapter omits the Pod seccomp profile and custom unprivileged-port
+sysctl because GKE Sandbox rejects those settings. It replaces nested Landlock
+and seccomp-notify setup with gVisor sentry qualification. The mandatory empty-
+egress `NetworkPolicy` remains the direct-egress fence. OpenShell injects
+`HTTP_PROXY` and `HTTPS_PROXY` for the workload, accepts proxy traffic on
+`127.0.0.1:3128`, and reverse-tunnels it over the authenticated sandbox channel
+to the existing supervisor proxy.
+
+This adapter provides endpoint-only network policy. It does not provide
+per-binary network attribution, transparent TCP interception, Landlock path
+allowlists, or OpenShell's nested child seccomp filter. Applications must honor
+the HTTP proxy environment and use HTTP or CONNECT-compatible transports;
+direct DNS and non-proxy TCP remain blocked by the workload `NetworkPolicy`.
+The adapter fails confirmation unless it detects gVisor, observes a healthy
+proxy tunnel, and verifies the zero-rule Kubernetes egress fence.
+
 The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
 
 Stop patches the existing resource rather than deleting it. For `v1beta1`,

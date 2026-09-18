@@ -63,6 +63,16 @@ default seccomp profile. The sandbox installs a nested seccomp user-notification
 filter without requesting a capability in the Pod spec. Startup fails closed
 when the runtime blocks the required seccomp or Landlock operations.
 
+An effective `pod.runtime_class_name` of `gvisor` selects the gVisor adapter in
+the same sandbox backend. The workload Pod keeps the non-root, drop-all-
+capabilities posture but omits the Kubernetes seccomp profile and custom sysctl
+that GKE Sandbox does not support. The sandbox qualifies the gVisor sentry,
+starts an explicit proxy on `127.0.0.1:3128`, and reverse-tunnels proxy streams
+to the supervisor over the authenticated boundary protocol. The empty-egress
+`NetworkPolicy` blocks direct workload connections. This mode applies endpoint-
+only network policy and does not apply Landlock path rules, the nested child
+seccomp filter, transparent TCP, or per-binary network attribution.
+
 The supervisor Pod has a direct, non-controller owner reference to the Sandbox
 resource. This links its garbage-collection lifecycle to the sandbox without
 competing with the Agent Sandbox controller for workload-Pod ownership.

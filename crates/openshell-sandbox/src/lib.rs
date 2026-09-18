@@ -34,6 +34,8 @@ pub mod sandbox;
     reason = "qualification preserves independently exercised security results"
 )]
 pub struct RuntimeQualification {
+    pub adapter: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeAdapter,
+    pub gvisor_sentry_detected: bool,
     pub seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence,
     pub landlock_abi: u32,
     pub landlock_allow_deny: bool,

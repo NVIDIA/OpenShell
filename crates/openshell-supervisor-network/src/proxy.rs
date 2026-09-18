@@ -32,7 +32,8 @@ use openshell_core::provider_credentials::{ProviderCredentialSnapshot, ProviderC
 use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
 use openshell_isolation_interface::contract::{
     BinaryIdentity as ContractBinaryIdentity, BoundaryDuplexStream, MediationTiming,
-    NetworkMediationSource, PendingTcpOpen, ResolveError, TcpOpenDecision, TcpOpenDenial,
+    NetworkMediationMode, NetworkMediationSource, PendingTcpOpen, ResolveError, TcpOpenDecision,
+    TcpOpenDenial,
 };
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, HttpResponse,
@@ -348,13 +349,28 @@ impl ProxyHandle {
                 }
             }
 
-            let mut network_accepts = network_mediation_source.as_ref().map(|source| {
-                let accepts = FuturesUnordered::new();
-                for _ in 0..MEDIATION_ACCEPT_WINDOW {
-                    let source = source.clone();
-                    accepts.push(async move { source.accept_tcp().await }.boxed());
-                }
-                accepts
+            let mediation_mode = network_mediation_source
+                .as_ref()
+                .map(|source| source.mode());
+            let mut network_accepts = network_mediation_source.as_ref().and_then(|source| {
+                (source.mode() == NetworkMediationMode::TransparentTcp).then(|| {
+                    let accepts = FuturesUnordered::new();
+                    for _ in 0..MEDIATION_ACCEPT_WINDOW {
+                        let source = source.clone();
+                        accepts.push(async move { source.accept_tcp().await }.boxed());
+                    }
+                    accepts
+                })
+            });
+            let mut explicit_accepts = network_mediation_source.as_ref().and_then(|source| {
+                (source.mode() == NetworkMediationMode::ExplicitProxy).then(|| {
+                    let accepts = FuturesUnordered::new();
+                    for _ in 0..MEDIATION_ACCEPT_WINDOW {
+                        let source = source.clone();
+                        accepts.push(async move { source.accept_explicit_proxy().await }.boxed());
+                    }
+                    accepts
+                })
             });
             // Transparent opens require policy evaluation and destination
             // validation before the sandbox may complete connect(2). Keep
@@ -368,40 +384,52 @@ impl ProxyHandle {
             let mut consecutive_unknown_errors: u32 = 0;
             loop {
                 let accepted = if let Some(source) = network_mediation_source.as_ref() {
-                    let accepts = network_accepts
-                        .as_mut()
-                        .expect("mediation source has an accept window");
-                    tokio::select! {
-                        pending = accepts.next() => {
-                            let pending = pending.expect("accept window is never empty");
-                            let source = source.clone();
-                            accepts.push(async move { source.accept_tcp().await }.boxed());
-                            match pending {
-                                Ok(connection) => {
-                                    let tx = preauthorized_tx.clone();
-                                    let dns_store = policy_dns_store.clone();
-                                    let opa = opa_engine.clone();
-                                    let backend_gateway = *backend_host_gateway;
-                                    let trusted_gateway = *trusted_host_gateway;
-                                    tokio::spawn(async move {
-                                        if let Some(connection) = preauthorize_transparent_open(
-                                            connection,
-                                            dns_store.as_ref(),
-                                            &opa,
-                                            backend_gateway,
-                                            trusted_gateway,
-                                        )
-                                        .await
-                                        {
-                                            let _ = tx.send(connection).await;
-                                        }
-                                    });
-                                    continue;
+                    if mediation_mode == Some(NetworkMediationMode::ExplicitProxy) {
+                        let accepts = explicit_accepts
+                            .as_mut()
+                            .expect("explicit mediation source has an accept window");
+                        let pending = accepts.next().await.expect("accept window is never empty");
+                        let source = source.clone();
+                        accepts.push(async move { source.accept_explicit_proxy().await }.boxed());
+                        pending
+                            .map(|stream| (stream, None, None, None))
+                            .map_err(ProxyAcceptError::Source)
+                    } else {
+                        let accepts = network_accepts
+                            .as_mut()
+                            .expect("transparent mediation source has an accept window");
+                        tokio::select! {
+                            pending = accepts.next() => {
+                                let pending = pending.expect("accept window is never empty");
+                                let source = source.clone();
+                                accepts.push(async move { source.accept_tcp().await }.boxed());
+                                match pending {
+                                    Ok(connection) => {
+                                        let tx = preauthorized_tx.clone();
+                                        let dns_store = policy_dns_store.clone();
+                                        let opa = opa_engine.clone();
+                                        let backend_gateway = *backend_host_gateway;
+                                        let trusted_gateway = *trusted_host_gateway;
+                                        tokio::spawn(async move {
+                                            if let Some(connection) = preauthorize_transparent_open(
+                                                connection,
+                                                dns_store.as_ref(),
+                                                &opa,
+                                                backend_gateway,
+                                                trusted_gateway,
+                                            )
+                                            .await
+                                            {
+                                                let _ = tx.send(connection).await;
+                                            }
+                                        });
+                                        continue;
+                                    }
+                                    Err(error) => Err(ProxyAcceptError::Source(error)),
                                 }
-                                Err(error) => Err(ProxyAcceptError::Source(error)),
                             }
+                            Some(connection) = preauthorized_rx.recv() => Ok(connection),
                         }
-                        Some(connection) = preauthorized_rx.recv() => Ok(connection),
                     }
                 } else {
                     let listener = listener

@@ -637,6 +637,15 @@ pub async fn run_sandbox(
     } else {
         ImagePolicyDiscovery::Missing
     };
+    let selected_runtime_adapter = runtime_descriptor.adapter;
+    let local_policy_identity = match selected_runtime_adapter {
+        openshell_sandbox_backend::boundary_protocol::SandboxRuntimeAdapter::NativeLinux => {
+            LocalPolicyIdentity::Required
+        }
+        openshell_sandbox_backend::boundary_protocol::SandboxRuntimeAdapter::Gvisor => {
+            LocalPolicyIdentity::EndpointOnly
+        }
+    };
 
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
@@ -657,7 +666,7 @@ pub async fn run_sandbox(
         policy_rules,
         policy_data,
         &extension_credentials,
-        LocalPolicyIdentity::Required,
+        local_policy_identity,
         Some(image_discovery),
         &RemoteStartupGateway {
             endpoint: openshell_endpoint.clone().unwrap_or_default(),
@@ -792,8 +801,11 @@ pub async fn run_sandbox(
     info!(backend = %admitted_backend_name, "Isolation boundary attached");
     let remote_boundary = (bound, admitted_backend_name, ca_file_paths);
 
-    let transparent_tcp_capable = true;
-    let transparent_tcp_substrate_ready = true;
+    let transparent_tcp_capable = matches!(
+        selected_runtime_adapter,
+        openshell_sandbox_backend::boundary_protocol::SandboxRuntimeAdapter::NativeLinux
+    );
+    let transparent_tcp_substrate_ready = transparent_tcp_capable;
     // The denial channel is owned by the orchestrator: the proxy (in the
     // networking leaf) and the bypass monitor (in the process leaf) both
     // produce DenialEvents that the denial aggregator (orchestrator-side)

@@ -636,8 +636,10 @@ supervisor Pods to reach sandbox TLS listeners. The driver then creates a
 per-sandbox Service, split immutable bootstrap Secrets, and a gated supervisor
 Pod before releasing either Pod. The supervisor Pod runs
 `/openshell-supervisor`. Both Pods use the
-same resolved non-root identity, request no capabilities, drop `ALL`, disable
-privilege escalation, and use `RuntimeDefault` seccomp. The supervisor reaches
+same resolved non-root identity, request no capabilities, drop `ALL`, and disable
+privilege escalation. Native workload Pods use `RuntimeDefault` seccomp. An
+effective `runtimeClassName: gvisor` selects the gVisor adapter and deliberately
+omits the Pod seccomp profile and custom sysctl that GKE Sandbox rejects. The supervisor reaches
 the sandbox over per-sandbox TLS with server-certificate verification plus
 bootstrap-token client authentication, and owns gateway policy, provider
 credentials, DNS, and mediated upstream connections.
@@ -701,6 +703,14 @@ done
 
 Any `no` result can strand recovery before workload Pod creation. Upgrade the
 OpenShell chart rather than treating missing workload Pods as Pod failures.
+
+For a gVisor workload, confirmation instead requires `/proc/version` to report
+gVisor, a healthy workload-local proxy on `127.0.0.1:3128`, and the observed
+zero-rule workload egress fence. Verify the workload environment contains
+`HTTP_PROXY` and `HTTPS_PROXY` with that loopback address. Direct DNS and raw
+TCP are expected to fail: the adapter supports HTTP/CONNECT-aware applications
+and endpoint-only policy, not native transparent interception or per-binary
+network rules.
 
 #### Corporate upstream proxy
 

@@ -38,7 +38,7 @@ use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::ProxyHandle;
 use openshell_core::endpoint_status::EndpointObservationSender;
-use openshell_isolation_interface::contract::NetworkMediationSource;
+use openshell_isolation_interface::contract::{NetworkMediationMode, NetworkMediationSource};
 
 #[cfg(target_os = "linux")]
 pub struct TransparentRuntimeSetup {
@@ -436,7 +436,10 @@ pub async fn run_networking(
         (None, None)
     };
 
-    let mediated_policy_dns = if let Some(source) = network_mediation_source.clone() {
+    let mediated_policy_dns = if let Some(source) = network_mediation_source
+        .clone()
+        .filter(|source| source.mode() == NetworkMediationMode::TransparentTcp)
+    {
         let engine = opa_engine
             .cloned()
             .ok_or_else(|| miette::miette!("Mediated DNS requires an OPA engine"))?;

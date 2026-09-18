@@ -8,7 +8,7 @@ use std::mem::size_of;
 use std::path::Path;
 
 use clap::Parser;
-use miette::{IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result, WrapErr as _};
 #[cfg(target_os = "linux")]
 use openshell_ocsf::OcsfShorthandLayer;
 #[cfg(target_os = "linux")]
@@ -239,6 +239,8 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         wait_killable_recv: notification.wait_killable_recv,
     };
     let qualification = openshell_sandbox::RuntimeQualification {
+        adapter: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeAdapter::NativeLinux,
+        gvisor_sentry_detected: false,
         seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {
             new_listener: notification.notification_round_trip(),
             notification_round_trip: notification.notification_round_trip(),
@@ -1847,7 +1849,50 @@ fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
                 .with_filter(console_filter),
         )
         .try_init();
-    let (qualification, _) = qualify_runtime()?;
+    let config_bytes = std::fs::read(bootstrap)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("read boundary config {}", bootstrap.display()))?;
+    let config: openshell_sandbox_backend::boundary_protocol::BoundaryConfig =
+        serde_json::from_slice(&config_bytes)
+            .into_diagnostic()
+            .wrap_err("decode boundary config for runtime adapter selection")?;
+    let qualification = match config.adapter {
+        openshell_sandbox_backend::boundary_protocol::SandboxRuntimeAdapter::NativeLinux => {
+            qualify_runtime()?.0
+        }
+        openshell_sandbox_backend::boundary_protocol::SandboxRuntimeAdapter::Gvisor => {
+            let version = std::fs::read_to_string("/proc/version")
+                .into_diagnostic()
+                .wrap_err("read /proc/version for gVisor qualification")?;
+            let sentry_detected = version.to_ascii_lowercase().contains("gvisor");
+            if !sentry_detected {
+                return Err(miette::miette!(
+                    "gVisor runtime adapter selected but the gVisor sentry was not detected"
+                ));
+            }
+            openshell_sandbox::RuntimeQualification {
+                adapter: config.adapter,
+                gvisor_sentry_detected: true,
+                seccomp: openshell_sandbox_backend::boundary_protocol::SeccompEvidence {
+                    new_listener: false,
+                    notification_round_trip: false,
+                    id_validation: false,
+                    addfd_send: false,
+                    retained_socket_operation: false,
+                    proc_fd_identity: false,
+                    task_memory_read: false,
+                    task_memory_write: false,
+                    cancellation: false,
+                },
+                landlock_abi: 0,
+                landlock_allow_deny: false,
+                udp_dns_round_trip: false,
+                tcp_dns_round_trip: false,
+                tcp_allow_round_trip: false,
+                tcp_deny_round_trip: false,
+            }
+        }
+    };
     openshell_sandbox::run(bootstrap, qualification)
 }
 

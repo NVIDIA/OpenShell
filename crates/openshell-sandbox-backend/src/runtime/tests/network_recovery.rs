@@ -299,7 +299,10 @@ impl Fixture {
         .await
         .expect("fixture must attach and confirm");
         Self {
-            source: RemoteNetworkMediation { client },
+            source: RemoteNetworkMediation {
+                client,
+                adapter: SandboxRuntimeAdapter::default(),
+            },
             state,
             server,
         }
@@ -378,6 +381,7 @@ async fn concurrent_tcp_accepts_recover_a_lost_tls_connection() {
     for _ in 0..ACCEPTS {
         let source = RemoteNetworkMediation {
             client: fixture.source.client.clone(),
+            adapter: SandboxRuntimeAdapter::default(),
         };
         accepts.spawn(async move { verify_connection(source.accept_tcp().await.unwrap()).await });
     }
@@ -428,6 +432,7 @@ async fn tcp_accept_has_no_idle_operation_timeout() {
     let fixture = Fixture::new(Reply::Idle).await;
     let source = RemoteNetworkMediation {
         client: fixture.source.client.clone(),
+        adapter: SandboxRuntimeAdapter::default(),
     };
     let pending = tokio::spawn(async move { source.accept_tcp().await });
     tokio::time::timeout(Duration::from_secs(3), fixture.state.accepting.notified())

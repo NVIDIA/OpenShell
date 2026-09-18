@@ -306,12 +306,15 @@ sandbox and can negate OpenShell workspace isolation and filesystem-policy
 controls. Driver-owned supervisor, token, and TLS bind mounts stay reserved.
 
 Network features follow the driver/substrate split. Drivers own only the outer
-fence and protected channel. The sandbox owns seccomp notification, local DNS,
-socket virtualization, process observation, and binary identity. The supervisor
-owns DNS eligibility, policy authorization, destination filtering, upstream
-dials, relay behavior, credential rewriting, and OCSF decisions. No supported
-path requires nftables, a workload network namespace, proxy environment
-variables, added capabilities, or an unconfined AppArmor profile.
+fence and protected channel. The native Linux adapter owns seccomp notification,
+local DNS, socket virtualization, process observation, and binary identity. The
+Kubernetes gVisor adapter instead combines the sentry and zero-rule workload
+`NetworkPolicy` with a workload-local explicit proxy whose streams cross the
+protected channel. The supervisor owns DNS eligibility, policy authorization,
+destination filtering, upstream dials, relay behavior, credential rewriting,
+and OCSF decisions. Native mode does not require proxy environment variables;
+gVisor mode injects loopback HTTP proxy variables and applies endpoint-only
+policy without added capabilities or an unconfined AppArmor profile.
 
 The Kubernetes deployment packaging has two ownership boundaries. The gateway
 chart owns the gateway workload, configuration, Services, PKI, and

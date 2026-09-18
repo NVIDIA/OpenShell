@@ -11,8 +11,8 @@ Each sandbox has three trust levels:
 | Component | Role |
 |---|---|
 | Supervisor | Owns gateway credentials, admitted policy, L7 proxying, SSH, and gateway relays. It never executes inside the agent workload. |
-| Sandbox | Runs as the same non-root identity as the agent, installs the workload seccomp listener, applies the Landlock baseline, owns child processes, and mediates the protected supervisor channel. |
-| Agent child | Inherits the sandbox network listener and runs with zero capabilities, `no_new_privs`, Landlock, and the final syscall filter. |
+| Sandbox | Runs as the same non-root identity as the agent, owns child processes, mediates the protected supervisor channel, and instantiates the driver-selected native Linux or gVisor adapter. |
+| Agent child | Runs with zero capabilities behind the selected adapter. Native Linux children inherit seccomp mediation, `no_new_privs`, Landlock, and the final syscall filter; gVisor children rely on the sentry, OCI mounts, and the outer network fence. |
 
 The runtime grants neither trusted component nor agent child any Linux
 capability inside the workload. Drivers resolve one exact non-root UID, GID,
@@ -72,8 +72,8 @@ replacement from granting authority.
    run untrusted code yet.
 3. `openshell-supervisor` loads policy and runtime settings from the gateway,
    attaches to the sandbox, and verifies the driver's generation and evidence.
-4. The sandbox installs its seccomp notification broker and Landlock baseline,
-   validates its mechanism-specific audit evidence, and reports backend-neutral
+4. The sandbox starts the selected runtime adapter, validates its mechanism-
+   specific audit evidence, and reports backend-neutral
    enforcement properties. The supervisor must accept those properties and
    their immutable session and resource binding before it sends the launch
    permit. Other isolation backends may establish the same properties with
@@ -134,6 +134,16 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 | Seccomp notification | Virtualizes supported INET sockets and sends DNS/TCP decisions to the supervisor without nftables or proxy environment variables. |
 | Outer network fence | The component that owns network enforcement prevents any missed or unsupported kernel path from escaping. Current examples are Docker `network_mode=none`, a NIC-less VM, and Kubernetes NetworkPolicy. |
 | Policy proxy | Evaluates destination, binary identity, TLS/L7 rules, SSRF checks, and inference interception. |
+
+The Kubernetes gVisor adapter uses the same authenticated lifecycle and process
+backend with different enforcement mechanisms. The gVisor sentry and OCI mounts
+provide the workload boundary. A zero-rule Kubernetes egress `NetworkPolicy`
+blocks direct connections, while a workload-local HTTP/CONNECT listener reverse-
+tunnels streams to the existing supervisor proxy. The supervisor loads policy
+in endpoint-only mode because the tunnel authenticates the sandbox generation,
+not an individual executable. This adapter intentionally does not claim native
+Landlock path policy, nested child seccomp, transparent TCP, or per-binary
+network attribution.
 
 The supervisor may enrich baseline filesystem allowances for runtime-required
 paths, such as proxy support files or GPU device paths when a GPU is present.

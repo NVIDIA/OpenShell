@@ -74,7 +74,9 @@ pub async fn spawn_workload(
             .ok()
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default();
-    user_environment.retain(|key, _value| !crate::process::is_proxy_env_var(key));
+    if launcher.uses_native_linux_isolation() {
+        user_environment.retain(|key, _value| !crate::process::is_proxy_env_var(key));
+    }
     let loopback_connector: Arc<dyn BoundaryLoopbackConnector> = Arc::new(
         crate::boundary_io::LocalLoopbackConnector::new(Some(boundary_runtime.clone())),
     );

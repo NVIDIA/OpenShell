@@ -92,7 +92,9 @@ impl LocalBoundaryExec {
                 command.env(key, value);
             }
         }
-        crate::process::strip_proxy_env_std(&mut command);
+        if self.launcher.uses_native_linux_isolation() {
+            crate::process::strip_proxy_env_std(&mut command);
+        }
         for (key, value) in &spec.env {
             if !key.starts_with("OPENSHELL_") {
                 command.env(key, value);
@@ -109,6 +111,9 @@ impl LocalBoundaryExec {
         &self,
         workdir: Option<&str>,
     ) -> Result<Option<crate::sandbox::linux::PreparedSandbox>, BackendError> {
+        if !self.launcher.uses_native_linux_isolation() {
+            return Ok(None);
+        }
         crate::sandbox::linux::log_sandbox_readiness(&self.policy, workdir);
         let runtime_read_only =
             crate::process::ca_runtime_read_only_paths(self.ca_file_paths.as_deref());
@@ -127,9 +132,14 @@ impl LocalBoundaryExec {
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
         #[cfg(target_os = "linux")]
-        let child_hardening =
-            openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
-                .map_err(|error| BackendError::Process(error.to_string()))?;
+        let child_hardening = self
+            .launcher
+            .uses_native_linux_isolation()
+            .then(|| {
+                openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
+            })
+            .transpose()
+            .map_err(|error| BackendError::Process(error.to_string()))?;
         crate::pty::install_dedicated_process_group(&mut command);
         crate::pty::install_pre_exec_no_pty(
             &mut command,
@@ -238,9 +248,14 @@ impl LocalBoundaryExec {
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
         #[cfg(target_os = "linux")]
-        let child_hardening =
-            openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
-                .map_err(|error| BackendError::Process(error.to_string()))?;
+        let child_hardening = self
+            .launcher
+            .uses_native_linux_isolation()
+            .then(|| {
+                openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
+            })
+            .transpose()
+            .map_err(|error| BackendError::Process(error.to_string()))?;
         crate::pty::install_pre_exec(
             &mut command,
             self.policy.clone(),

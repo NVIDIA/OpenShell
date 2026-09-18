@@ -26,6 +26,7 @@ type LaunchJob = Box<dyn FnOnce() + Send + 'static>;
 pub struct WorkloadLauncher {
     jobs: mpsc::SyncSender<LaunchJob>,
     alive: Arc<AtomicBool>,
+    native_linux_isolation: bool,
 }
 
 impl WorkloadLauncher {
@@ -62,6 +63,12 @@ impl WorkloadLauncher {
     #[must_use]
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    /// Whether children need the native Landlock and seccomp launch prelude.
+    #[must_use]
+    pub const fn uses_native_linux_isolation(&self) -> bool {
+        self.native_linux_isolation
     }
 }
 
@@ -108,9 +115,33 @@ pub fn start() -> io::Result<(WorkloadLauncher, NotificationListener)> {
         WorkloadLauncher {
             jobs: jobs_tx,
             alive,
+            native_linux_isolation: true,
         },
         listener,
     ))
+}
+
+/// Start a serialized launcher without installing a host-kernel seccomp
+/// listener. This is used inside gVisor, where the sentry and the driver's
+/// network fence provide the isolation boundary.
+pub fn start_unfiltered() -> io::Result<WorkloadLauncher> {
+    let (jobs_tx, jobs_rx) = mpsc::sync_channel::<LaunchJob>(64);
+    let alive = Arc::new(AtomicBool::new(true));
+    let thread_alive = alive.clone();
+    thread::Builder::new()
+        .name("openshell-workload-launcher".to_string())
+        .spawn(move || {
+            while let Ok(job) = jobs_rx.recv() {
+                job();
+            }
+            thread_alive.store(false, Ordering::Release);
+        })
+        .map_err(|error| io::Error::other(format!("start workload launcher thread: {error}")))?;
+    Ok(WorkloadLauncher {
+        jobs: jobs_tx,
+        alive,
+        native_linux_isolation: false,
+    })
 }
 
 #[cfg(test)]
@@ -120,6 +151,14 @@ mod tests {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
     use super::*;
+
+    #[test]
+    fn unfiltered_launcher_serializes_work_without_native_controls() {
+        let launcher = start_unfiltered().expect("start unfiltered launcher");
+        assert!(!launcher.uses_native_linux_isolation());
+        assert_eq!(launcher.execute(|| 42).expect("execute launch job"), 42);
+        assert!(launcher.is_alive());
+    }
 
     #[test]
     fn one_listener_mediates_launcher_and_inherited_child() {

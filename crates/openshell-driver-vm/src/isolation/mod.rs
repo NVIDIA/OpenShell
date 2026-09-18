@@ -12,8 +12,8 @@ use openshell_isolation_interface::contract::{
     BackendError, OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
 };
 use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
-    SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
+    BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeAdapter,
+    SandboxRuntimeDescriptor, SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -114,6 +114,7 @@ impl VmBoundarySpec {
                 resource_claims: resource_claims.clone(),
                 resource_claim_files: BTreeMap::new(),
                 workload_identity: workload_identity.clone(),
+                adapter: SandboxRuntimeAdapter::default(),
                 outer_fence: outer_fence.clone(),
                 child_env: self.child_env,
             },
@@ -122,6 +123,7 @@ impl VmBoundarySpec {
                 generation: self.generation,
                 session_id: self.session_id,
                 workload_identity,
+                adapter: SandboxRuntimeAdapter::default(),
                 transport: self.transport,
                 tls: self.supervisor_tls,
                 // The host-side control process is the network broker, so

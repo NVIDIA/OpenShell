@@ -202,10 +202,12 @@ struct NotificationQueues {
 /// Live broker handle retained by the sandbox boundary.
 #[derive(Clone)]
 pub struct NetworkBroker {
-    _accept_monitor: Arc<crate::accept_interrupt::AcceptMonitor>,
+    _accept_monitor: Option<Arc<crate::accept_interrupt::AcceptMonitor>>,
     pending: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingTcpOpen>>>,
     pending_dns: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingDnsQuery>>>,
+    pending_proxy: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<TcpStream>>>>,
     dns_address: SocketAddr,
+    proxy_address: Option<SocketAddr>,
     healthy: Arc<AtomicBool>,
 }
 
@@ -307,12 +309,66 @@ impl NetworkBroker {
             })
             .map_err(|error| io::Error::other(format!("start network broker: {error}")))?;
         Ok(Self {
-            _accept_monitor: accept_monitor,
+            _accept_monitor: Some(accept_monitor),
             pending: Arc::new(tokio::sync::Mutex::new(pending_rx)),
             pending_dns: Arc::new(tokio::sync::Mutex::new(pending_dns_rx)),
+            pending_proxy: None,
             dns_address,
+            proxy_address: None,
             healthy,
         })
+    }
+
+    /// Start the workload-local HTTP/CONNECT listener used by the gVisor
+    /// adapter. Accepted byte streams are reverse-tunnelled to the existing
+    /// supervisor proxy over authenticated Sandbox Protocol connections.
+    pub(crate) fn start_explicit_proxy() -> io::Result<Self> {
+        Self::start_explicit_proxy_at(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3128))
+    }
+
+    fn start_explicit_proxy_at(address: SocketAddr) -> io::Result<Self> {
+        let listener = TcpListener::bind(address)?;
+        let proxy_address = listener.local_addr()?;
+        let (_pending_tx, pending_rx) = mpsc::channel(1);
+        let (_dns_tx, pending_dns_rx) = mpsc::channel(1);
+        let (proxy_tx, proxy_rx) = mpsc::channel(OPEN_QUEUE_CAPACITY);
+        let healthy = Arc::new(AtomicBool::new(true));
+        let broker_healthy = healthy.clone();
+        std::thread::Builder::new()
+            .name("openshell-explicit-proxy".to_string())
+            .spawn(move || {
+                for accepted in listener.incoming() {
+                    match accepted {
+                        Ok(stream) => {
+                            let _ = stream.set_nodelay(true);
+                            if proxy_tx.blocking_send(stream).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                        Err(error) => {
+                            tracing::error!(%error, "sandbox explicit proxy listener failed");
+                            break;
+                        }
+                    }
+                }
+                broker_healthy.store(false, Ordering::Release);
+            })
+            .map_err(|error| io::Error::other(format!("start explicit proxy listener: {error}")))?;
+        Ok(Self {
+            _accept_monitor: None,
+            pending: Arc::new(tokio::sync::Mutex::new(pending_rx)),
+            pending_dns: Arc::new(tokio::sync::Mutex::new(pending_dns_rx)),
+            pending_proxy: Some(Arc::new(tokio::sync::Mutex::new(proxy_rx))),
+            dns_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            proxy_address: Some(proxy_address),
+            healthy,
+        })
+    }
+
+    #[cfg(test)]
+    fn start_explicit_proxy_for_test() -> io::Result<Self> {
+        Self::start_explicit_proxy_at(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
     }
 
     pub(crate) async fn accept(&self) -> io::Result<PendingTcpOpen> {
@@ -333,13 +389,30 @@ impl NetworkBroker {
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "DNS broker queue closed"))
     }
 
+    pub(crate) async fn accept_explicit_proxy(&self) -> io::Result<TcpStream> {
+        let pending = self.pending_proxy.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "network broker is not in explicit-proxy mode",
+            )
+        })?;
+        pending
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "explicit proxy queue closed"))
+    }
+
     #[cfg(test)]
     pub(crate) fn dns_address(&self) -> SocketAddr {
         self.dns_address
     }
 
     pub(crate) fn confirm_healthy(&self) -> io::Result<()> {
-        if self.healthy.load(Ordering::Acquire) && self.dns_address.port() != 0 {
+        if self.healthy.load(Ordering::Acquire)
+            && (self.dns_address.port() != 0 || self.proxy_address.is_some())
+        {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -347,6 +420,16 @@ impl NetworkBroker {
                 "network broker is not running",
             ))
         }
+    }
+
+    #[must_use]
+    pub(crate) const fn is_explicit_proxy(&self) -> bool {
+        self.proxy_address.is_some()
+    }
+
+    #[cfg(test)]
+    fn explicit_proxy_address(&self) -> Option<SocketAddr> {
+        self.proxy_address
     }
 }
 
@@ -1762,6 +1845,30 @@ mod tests {
     use super::*;
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::{UnixListener, UnixStream};
+
+    #[tokio::test]
+    async fn explicit_proxy_accepts_raw_client_streams() {
+        let broker =
+            NetworkBroker::start_explicit_proxy_for_test().expect("start explicit proxy listener");
+        let address = broker
+            .explicit_proxy_address()
+            .expect("explicit proxy address");
+        let client = tokio::task::spawn_blocking(move || {
+            let mut stream = TcpStream::connect(address).expect("connect explicit proxy");
+            stream
+                .write_all(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
+                .expect("write proxy request");
+        });
+        let mut accepted = broker
+            .accept_explicit_proxy()
+            .await
+            .expect("accept explicit proxy stream");
+        let mut request = [0_u8; 44];
+        let length = accepted.read(&mut request).expect("read proxy request");
+        assert!(request[..length].starts_with(b"CONNECT example.com:443"));
+        client.await.expect("proxy client task");
+        broker.confirm_healthy().expect("healthy explicit proxy");
+    }
 
     #[test]
     fn notification_receive_retries_interrupted_and_disappeared_targets() {

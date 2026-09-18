@@ -57,8 +57,9 @@ pub fn install_pre_exec(
     _workdir: Option<String>,
     slave_fd: RawFd,
     #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
-    #[cfg(target_os = "linux")]
-    child_hardening: openshell_isolation_interface::linux::child_seccomp::ChildHardeningProgram,
+    #[cfg(target_os = "linux")] child_hardening: Option<
+        openshell_isolation_interface::linux::child_seccomp::ChildHardeningProgram,
+    >,
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     let mut prepared = prepared;
@@ -75,7 +76,7 @@ pub fn install_pre_exec(
                 #[cfg(target_os = "linux")]
                 prepared.take(),
                 #[cfg(target_os = "linux")]
-                &mut child_hardening,
+                child_hardening.as_mut(),
             )
         });
     }
@@ -92,8 +93,9 @@ pub fn install_pre_exec_no_pty(
     policy: SandboxPolicy,
     _workdir: Option<String>,
     #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
-    #[cfg(target_os = "linux")]
-    child_hardening: openshell_isolation_interface::linux::child_seccomp::ChildHardeningProgram,
+    #[cfg(target_os = "linux")] child_hardening: Option<
+        openshell_isolation_interface::linux::child_seccomp::ChildHardeningProgram,
+    >,
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     let mut prepared = prepared;
@@ -111,7 +113,7 @@ pub fn install_pre_exec_no_pty(
                 #[cfg(target_os = "linux")]
                 prepared.take(),
                 #[cfg(target_os = "linux")]
-                &mut child_hardening,
+                child_hardening.as_mut(),
             )
         });
     }
@@ -121,14 +123,14 @@ pub fn install_pre_exec_no_pty(
 fn enter_sandbox(
     policy: &SandboxPolicy,
     #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
-    #[cfg(target_os = "linux")]
-    child_hardening: &mut openshell_isolation_interface::linux::child_seccomp::ChildHardeningProgram,
+    #[cfg(target_os = "linux")] child_hardening: Option<
+        &mut openshell_isolation_interface::linux::child_seccomp::ChildHardeningProgram,
+    >,
 ) -> std::io::Result<()> {
-    crate::process::harden_child_process()
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-
     #[cfg(target_os = "linux")]
-    if let Some(prepared) = prepared {
+    if let (Some(prepared), Some(child_hardening)) = (prepared, child_hardening) {
+        crate::process::harden_child_process()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         crate::sandbox::linux::enforce_capability_free(prepared, child_hardening)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
     }

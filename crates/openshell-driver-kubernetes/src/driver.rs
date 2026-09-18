@@ -1966,6 +1966,7 @@ impl KubernetesComputeDriver {
             return Err(fail("pair labels changed"));
         }
         let spec = pod.spec.as_ref().ok_or_else(|| fail("missing Pod spec"))?;
+        let gvisor = spec.runtime_class_name.as_deref() == Some("gvisor");
         if spec.host_network == Some(true)
             || spec.host_pid == Some(true)
             || spec.host_ipc == Some(true)
@@ -2017,10 +2018,12 @@ impl KubernetesComputeDriver {
                 .supplemental_groups
                 .as_deref()
                 .is_some_and(|groups| !groups.is_empty())
-            || security
-                .seccomp_profile
-                .as_ref()
-                .is_none_or(|profile| profile.type_ != "RuntimeDefault")
+            || (!gvisor
+                && security
+                    .seccomp_profile
+                    .as_ref()
+                    .is_none_or(|profile| profile.type_ != "RuntimeDefault"))
+            || (gvisor && security.seccomp_profile.is_some())
         {
             return Err(fail("numeric identity, groups, or seccomp profile changed"));
         }
@@ -2050,8 +2053,16 @@ impl KubernetesComputeDriver {
                         && sysctl.get("value").and_then(serde_json::Value::as_str) == Some("0")
                 })
             });
-        if !unprivileged_port_sysctl {
+        if !gvisor && !unprivileged_port_sysctl {
             return Err(fail("safe unprivileged-port sysctl changed"));
+        }
+        if gvisor
+            && pod_json
+                .pointer("/spec/securityContext/sysctls")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|sysctls| !sysctls.is_empty())
+        {
+            return Err(fail("gVisor workload must not request custom sysctls"));
         }
         let check_container = |container: &k8s_openapi::api::core::v1::Container,
                                name: &str|
@@ -2269,6 +2280,16 @@ impl KubernetesComputeDriver {
             agent_gid,
             &names.sandbox_secret,
         )?;
+        let runtime_adapter = if workload_pod
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.runtime_class_name.as_deref())
+            == Some("gvisor")
+        {
+            openshell_sandbox_backend::boundary_protocol::SandboxRuntimeAdapter::Gvisor
+        } else {
+            openshell_sandbox_backend::boundary_protocol::SandboxRuntimeAdapter::NativeLinux
+        };
         let workload_pod_uid =
             workload_pod.metadata.uid.clone().ok_or_else(|| {
                 KubernetesDriverError::Message("workload Pod has no UID".to_string())
@@ -2312,6 +2333,22 @@ impl KubernetesComputeDriver {
             child_env.extend(spec.environment.clone());
         }
         child_env.retain(|name, _| !name.starts_with("OPENSHELL_"));
+        if matches!(
+            runtime_adapter,
+            openshell_sandbox_backend::boundary_protocol::SandboxRuntimeAdapter::Gvisor
+        ) {
+            for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                child_env.insert(name.to_string(), "http://127.0.0.1:3128".to_string());
+            }
+            child_env.insert(
+                "NO_PROXY".to_string(),
+                "localhost,127.0.0.1,::1".to_string(),
+            );
+            child_env.insert(
+                "no_proxy".to_string(),
+                "localhost,127.0.0.1,::1".to_string(),
+            );
+        }
         let host_gateway_ip = self.config.host_gateway_ip.parse().ok();
         let session_id = launch_authentication.supervisor.session_id;
         let tls = generate_sandbox_tls_material(session_id)
@@ -2372,6 +2409,7 @@ impl KubernetesComputeDriver {
             },
             host_gateway_ip,
             workload_identity,
+            adapter: runtime_adapter,
             child_env,
         }
         .provision()
@@ -2475,7 +2513,7 @@ impl KubernetesComputeDriver {
         supervisor_uid: &str,
         agent_uid: u32,
         agent_gid: u32,
-        child_env: std::collections::HashMap<String, String>,
+        mut child_env: std::collections::HashMap<String, String>,
         launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
     ) -> Result<(), KubernetesDriverError> {
         let namespace_uid = Api::<Namespace>::all(self.client.clone())
@@ -2530,6 +2568,32 @@ impl KubernetesComputeDriver {
             agent_gid,
             &names.sandbox_secret,
         )?;
+        let runtime_adapter = if workload_pod
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.runtime_class_name.as_deref())
+            == Some("gvisor")
+        {
+            openshell_sandbox_backend::boundary_protocol::SandboxRuntimeAdapter::Gvisor
+        } else {
+            openshell_sandbox_backend::boundary_protocol::SandboxRuntimeAdapter::NativeLinux
+        };
+        if matches!(
+            runtime_adapter,
+            openshell_sandbox_backend::boundary_protocol::SandboxRuntimeAdapter::Gvisor
+        ) {
+            for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                child_env.insert(name.to_string(), "http://127.0.0.1:3128".to_string());
+            }
+            child_env.insert(
+                "NO_PROXY".to_string(),
+                "localhost,127.0.0.1,::1".to_string(),
+            );
+            child_env.insert(
+                "no_proxy".to_string(),
+                "localhost,127.0.0.1,::1".to_string(),
+            );
+        }
         let workload_pod_uid =
             workload_pod.metadata.uid.clone().ok_or_else(|| {
                 KubernetesDriverError::Message("workload Pod has no UID".to_string())
@@ -2611,6 +2675,7 @@ impl KubernetesComputeDriver {
             },
             host_gateway_ip: self.config.host_gateway_ip.parse().ok(),
             workload_identity,
+            adapter: runtime_adapter,
             child_env,
         }
         .provision()
@@ -5334,6 +5399,10 @@ fn apply_supervisor_sandbox_runtime_boundary(
     else {
         return;
     };
+    let gvisor = spec
+        .get("runtimeClassName")
+        .and_then(serde_json::Value::as_str)
+        == Some("gvisor");
     spec.insert("hostNetwork".to_string(), serde_json::json!(false));
     spec.insert("hostPID".to_string(), serde_json::json!(false));
     spec.insert("hostIPC".to_string(), serde_json::json!(false));
@@ -5357,20 +5426,22 @@ fn apply_supervisor_sandbox_runtime_boundary(
             ]
         }),
     );
-    spec.insert(
-        "securityContext".to_string(),
-        serde_json::json!({
-            "runAsUser": params.sandbox_uid,
-            "runAsGroup": params.sandbox_gid,
-            "runAsNonRoot": true,
-            "fsGroup": params.sandbox_gid,
-            "fsGroupChangePolicy": "OnRootMismatch",
-            "supplementalGroups": [],
-            "supplementalGroupsPolicy": "Strict",
-            "seccompProfile": {"type": "RuntimeDefault"},
-            "sysctls": [{"name": "net.ipv4.ip_unprivileged_port_start", "value": "0"}]
-        }),
-    );
+    let mut pod_security = serde_json::json!({
+        "runAsUser": params.sandbox_uid,
+        "runAsGroup": params.sandbox_gid,
+        "runAsNonRoot": true,
+        "fsGroup": params.sandbox_gid,
+        "fsGroupChangePolicy": "OnRootMismatch",
+        "supplementalGroups": [],
+        "supplementalGroupsPolicy": "Strict"
+    });
+    if !gvisor {
+        pod_security["seccompProfile"] = serde_json::json!({"type": "RuntimeDefault"});
+        pod_security["sysctls"] = serde_json::json!([
+            {"name": "net.ipv4.ip_unprivileged_port_start", "value": "0"}
+        ]);
+    }
+    spec.insert("securityContext".to_string(), pod_security);
     let volumes = spec
         .entry("volumes")
         .or_insert_with(|| serde_json::json!([]))
@@ -8914,6 +8985,40 @@ mod tests {
         assert_eq!(
             pod_template["spec"]["runtimeClassName"],
             serde_json::json!("kata-containers")
+        );
+    }
+
+    #[test]
+    fn gvisor_runtime_omits_incompatible_kernel_security_context() {
+        let pod_template = {
+            let params = SandboxPodParams {
+                default_runtime_class_name: "gvisor",
+                ..SandboxPodParams::default()
+            };
+            sandbox_template_to_k8s(
+                &SandboxTemplate::default(),
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("gvisor")
+        );
+        assert!(
+            pod_template["spec"]["securityContext"]["seccompProfile"].is_null(),
+            "GKE Sandbox rejects Kubernetes seccomp profiles"
+        );
+        assert!(
+            pod_template["spec"]["securityContext"]["sysctls"].is_null(),
+            "GKE Sandbox rejects custom sysctls"
+        );
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["drop"],
+            serde_json::json!(["ALL"])
         );
     }
 

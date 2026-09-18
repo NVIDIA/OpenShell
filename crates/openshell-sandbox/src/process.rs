@@ -578,7 +578,9 @@ impl ProcessHandle {
             cmd.current_dir(dir);
         }
 
-        strip_proxy_env(&mut cmd);
+        if launcher.uses_native_linux_isolation() {
+            strip_proxy_env(&mut cmd);
+        }
 
         // Set TLS trust store env vars so sandbox processes trust the ephemeral CA
         if let Some((ca_cert_path, combined_bundle_path)) = ca_paths {
@@ -591,20 +593,31 @@ impl ProcessHandle {
         // process where the tracing subscriber is functional. The child's
         // pre_exec context cannot reliably emit structured logs.
         #[cfg(target_os = "linux")]
-        sandbox::linux::log_sandbox_readiness(policy, workspace.root());
+        if launcher.uses_native_linux_isolation() {
+            sandbox::linux::log_sandbox_readiness(policy, workspace.root());
+        }
 
         // Prepare the Landlock ruleset as the workload UID. Inaccessible paths
         // are already unavailable to the child and remain omitted.
         #[cfg(target_os = "linux")]
         let runtime_read_only = ca_runtime_read_only_paths(ca_paths);
-        let prepared_sandbox = prepare_child_sandbox(policy, workspace.root(), &runtime_read_only)
-            .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
+        let prepared_sandbox = if launcher.uses_native_linux_isolation() {
+            prepare_child_sandbox(policy, workspace.root(), &runtime_read_only)
+                .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?
+        } else {
+            None
+        };
         #[cfg(target_os = "linux")]
-        let mut child_hardening =
-            openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
-                .map_err(|error| {
-                    miette::miette!("prepare child self-protection filter: {error}")
-                })?;
+        let mut child_hardening = if launcher.uses_native_linux_isolation() {
+            Some(
+                openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
+                    .map_err(|error| {
+                        miette::miette!("prepare child self-protection filter: {error}")
+                    })?,
+            )
+        } else {
+            None
+        };
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
@@ -627,14 +640,16 @@ impl ProcessHandle {
                         return Err(std::io::Error::last_os_error());
                     }
 
-                    harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
-
                     // Phase 2 (as unprivileged user): Enforce the prepared
                     // Landlock ruleset via restrict_self() + apply seccomp.
                     // restrict_self() does not require root.
                     #[cfg(target_os = "linux")]
-                    if let Some(prepared) = prepared_sandbox.take() {
-                        sandbox::linux::enforce_capability_free(prepared, &mut child_hardening)
+                    if let (Some(prepared), Some(child_hardening)) =
+                        (prepared_sandbox.take(), child_hardening.as_mut())
+                    {
+                        harden_child_process()
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                        sandbox::linux::enforce_capability_free(prepared, child_hardening)
                             .map_err(|err| std::io::Error::other(err.to_string()))?;
                     }
 

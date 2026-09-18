@@ -1005,11 +1005,32 @@ pub struct PendingTcpOpen {
 /// An `Err` means that mediation lane is unusable and fails closed.
 #[async_trait]
 pub trait NetworkMediationSource: Send + Sync {
+    /// Shape of the workload-side stream exposed by this backend.
+    fn mode(&self) -> NetworkMediationMode {
+        NetworkMediationMode::TransparentTcp
+    }
+
     /// Await the next staged workload TCP open.
     async fn accept_tcp(&self) -> Result<PendingTcpOpen, BackendError>;
 
+    /// Await a raw HTTP/CONNECT proxy client stream. Backends using this mode
+    /// authenticate the boundary and enforce direct-egress denial externally;
+    /// the supervisor proxy performs endpoint-only authorization.
+    async fn accept_explicit_proxy(&self) -> Result<BoundaryDuplexStream, BackendError> {
+        Err(BackendError::Unsupported(
+            "explicit proxy streams are not supported by this backend".to_string(),
+        ))
+    }
+
     /// Await the next workload DNS query.
     async fn accept_dns(&self) -> Result<PendingDnsQuery, BackendError>;
+}
+
+/// Network stream shape exposed by an isolation backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkMediationMode {
+    TransparentTcp,
+    ExplicitProxy,
 }
 
 /// DNS transport used by one workload exchange.
