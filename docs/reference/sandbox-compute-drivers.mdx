@@ -437,15 +437,36 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the Kubernetes image pull policy for the supervisor image. |
 | `sandbox_runtime.network_policy_enforced` | `supervisor.sandboxRuntime.networkPolicyEnforced` | Acknowledge that the cluster CNI enforces ingress and egress `NetworkPolicy` in sandbox namespaces. This must be `true`. |
 | `sandbox_runtime.boundary_port` | `supervisor.sandboxRuntime.boundaryPort` | Set the non-privileged TLS port used between the paired supervisor and sandbox Pods. |
-| `https_proxy` | `upstreamProxy.url` | Set the operator-owned `http://host:port` corporate forward proxy used for policy-approved TLS CONNECT egress. |
+| `https_proxy` | `upstreamProxy.url` | Set the operator-owned `http://host:port` or `https://host:port` corporate forward proxy used for policy-approved TLS CONNECT egress. |
 | `no_proxy` | `upstreamProxy.noProxy` | Set destinations that bypass only the corporate proxy. OpenShell policy evaluation still applies. |
 | `proxy_auth_secret_name` | `upstreamProxy.authSecret.name` | Set the existing Secret name in the sandbox namespace that contains the proxy credential. The Secret mounts only in the supervisor Pod. |
 | `proxy_auth_secret_key` | `upstreamProxy.authSecret.key` | Set the Secret key containing the `user:pass` credential. |
-| `proxy_auth_allow_insecure` | `upstreamProxy.authAllowInsecure` | Set `true` to acknowledge that Basic authentication to an HTTP proxy is cleartext. Required with a proxy credential Secret. |
+| `proxy_auth_allow_insecure` | `upstreamProxy.authAllowInsecure` | Set `true` to acknowledge that Basic authentication to an HTTP proxy is cleartext. Required with a proxy credential Secret and an `http://` proxy; an `https://` proxy carries the credential inside the verified TLS session and needs no acknowledgement. |
 | `proxy_connect_by_hostname` | `upstreamProxy.connectByHostname` | Send hostnames rather than validated IPs in CONNECT requests. Use only when proxy ACLs require hostname targets. |
+| `proxy_ca_bundle` | `upstreamProxy.caBundle.configMapName` / `upstreamProxy.caBundle.key` | Trust a PEM CA bundle for the corporate proxy. Required for an `https://` proxy with a private CA, and for a TLS-intercepting proxy that re-signs upstream certificates. Helm mounts the ConfigMap into the gateway Pod; the gateway stages the bundle into each sandbox's immutable supervisor bootstrap Secret. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `workspace_storage_class` | `server.workspaceStorageClass` | Set the `StorageClass` for the workspace PVC. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Set this on clusters with no default `StorageClass`, otherwise the workspace PVC stays `Pending` and the sandbox never starts. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
+
+`proxy_ca_bundle` needs only the CA that signs the proxy's certificate, or that
+a TLS-intercepting proxy re-signs upstream certificates with. Public roots
+already come from the supervisor image and its TLS stack, so supplying a full
+merged trust bundle adds hundreds of kilobytes of duplicated roots for no
+benefit.
+
+On OpenShift, copy the cluster proxy's trusted-CA ConfigMap into the gateway's
+release namespace rather than pointing at an injected trusted-CA bundle. A copy
+is required in any case, because ConfigMaps cannot be referenced across
+namespaces:
+
+```shell
+CORP_CA=$(oc get proxy/cluster -o jsonpath='{.spec.trustedCA.name}')
+oc -n openshift-config get cm "$CORP_CA" -o jsonpath='{.data.ca-bundle\.crt}' > corp-ca.pem
+oc -n openshell create configmap corporate-proxy-ca --from-file=ca.crt=corp-ca.pem
+```
+
+Then set `upstreamProxy.caBundle.configMapName` to `corporate-proxy-ca` and
+leave `upstreamProxy.caBundle.key` at its `ca.crt` default.
 
 Managed-mode Secret copying requires the gateway ServiceAccount to create
 Secrets. Kubernetes RBAC cannot restrict Secret `create` by resource name, so

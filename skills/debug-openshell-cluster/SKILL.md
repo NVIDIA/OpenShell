@@ -757,15 +757,32 @@ startup (`validate_upstream_proxy_config`) rather than silently reverting to a
 direct connection. Confirm the rendered configuration first:
 
 ```bash
-kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E 'https_proxy|no_proxy|proxy_auth_secret_(name|key)|proxy_auth_allow_insecure|proxy_connect_by_hostname'
-helm -n openshell get values openshell | grep -A8 upstreamProxy
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E 'https_proxy|no_proxy|proxy_auth_secret_(name|key)|proxy_auth_allow_insecure|proxy_connect_by_hostname|proxy_ca_bundle'
+helm -n openshell get values openshell | grep -A12 upstreamProxy
 ```
 
-Only `http://host:port` forward proxies are supported; `https://` proxy URLs and
-plain-HTTP egress are out of scope and rejected. The credential Secret named by
-`proxy_auth_secret_name` must exist in the sandbox namespace with the key named
-by `proxy_auth_secret_key`, and Kubernetes will not create keys longer than 253
-bytes or named `.`/`..`.
+Both `http://host:port` and `https://host:port` forward proxies are supported;
+plain-HTTP egress is out of scope and always dials directly. The credential
+Secret named by `proxy_auth_secret_name` must exist in the sandbox namespace
+with the key named by `proxy_auth_secret_key`, and Kubernetes will not create
+keys longer than 253 bytes or named `.`/`..`.
+
+An `https://` proxy with a private CA, or a TLS-intercepting proxy, also needs
+`upstreamProxy.caBundle.configMapName`. That ConfigMap lives in the **gateway's**
+release namespace, not the sandbox namespace, and the gateway reads it and
+stages the bundle into each sandbox's supervisor bootstrap Secret. A missing
+ConfigMap leaves the gateway Pod in `ContainerCreating`, like `oidc-ca` and
+`vault-ca`:
+
+```bash
+kubectl -n openshell get configmap <proxy-ca-configmap> -o jsonpath='{.data}' >/dev/null && echo "CA ConfigMap present"
+kubectl -n openshell describe pod -l app.kubernetes.io/name=openshell | grep -A5 'ContainerCreating\|MountVolume'
+kubectl -n <sandbox-namespace> get secret <supervisor-bootstrap-secret> -o jsonpath='{.data.upstream-proxy-ca\.pem}' | head -c 20
+```
+
+An empty last command with `proxy_ca_bundle` set in the rendered TOML means the
+bundle never reached the sandbox; check the gateway logs for a `proxy_ca_bundle`
+error, which fails closed at startup rather than falling back to direct egress.
 
 The proxy arguments and credential mount belong only to the separate supervisor
 Pod. The workload Pod must never receive them. The credential is projected
@@ -776,6 +793,7 @@ appear in environment variables, annotations, or command arguments.
 ```bash
 kubectl -n <sandbox-namespace> get secret <proxy-auth-secret> -o jsonpath='{.data}' >/dev/null && echo "secret present"
 kubectl -n <sandbox-namespace> get pod <supervisor-pod> -o jsonpath='{.spec.containers[0].command}' | grep -- '--upstream-'
+kubectl -n <sandbox-namespace> get pod <supervisor-pod> -o jsonpath='{.spec.containers[0].command}' | grep -- '--upstream-proxy-ca-bundle'
 kubectl -n <sandbox-namespace> get pod <supervisor-pod> -o jsonpath='{.spec.containers[0].volumeMounts}' | grep upstream-proxy-auth
 kubectl -n <sandbox-namespace> get events --sort-by=.lastTimestamp | grep -Ei 'secret|MountVolume' | tail -n 20
 ```

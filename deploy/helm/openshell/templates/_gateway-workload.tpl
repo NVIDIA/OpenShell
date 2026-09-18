@@ -174,6 +174,11 @@ spec:
           mountPath: /etc/openshell-tls/vault-ca
           readOnly: true
         {{- end }}
+        {{- if .Values.upstreamProxy.caBundle.configMapName }}
+        - name: upstream-proxy-ca
+          mountPath: /etc/openshell-tls/proxy-ca
+          readOnly: true
+        {{- end }}
         {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
         - name: spiffe-workload-api
           mountPath: {{ dir .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
@@ -268,6 +273,16 @@ spec:
         name: {{ .Values.server.credentialDrivers.vault.caConfigMapName }}
         items:
           - key: ca.crt
+            path: ca.crt
+    {{- end }}
+    {{- if .Values.upstreamProxy.caBundle.configMapName }}
+    - name: upstream-proxy-ca
+      configMap:
+        name: {{ .Values.upstreamProxy.caBundle.configMapName }}
+        items:
+          # The mounted filename stays fixed so the rendered proxy_ca_bundle
+          # path does not depend on the operator's ConfigMap key.
+          - key: {{ .Values.upstreamProxy.caBundle.key | default "ca.crt" }}
             path: ca.crt
     {{- end }}
     {{- if .Values.server.providerTokenGrants.spiffe.enabled }}

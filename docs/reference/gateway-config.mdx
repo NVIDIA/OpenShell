@@ -583,10 +583,11 @@ sandbox_runtime_image_pull_policy = "if_not_present"
 # supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "if_not_present"
 
-# Optional corporate HTTP forward proxy for policy-approved TLS egress. The
-# sandbox workload cannot select or override these settings. Only http:// proxy
-# endpoints and TLS CONNECT traffic are supported; plain HTTP egress remains
-# direct. `no_proxy` bypasses only the corporate proxy, never OpenShell policy.
+# Optional corporate forward proxy for policy-approved TLS egress. The sandbox
+# workload cannot select or override these settings. http:// and https:// proxy
+# endpoints are supported, for TLS CONNECT traffic only; plain HTTP egress
+# remains direct. `no_proxy` bypasses only the corporate proxy, never OpenShell
+# policy.
 # https_proxy                  = "http://proxy.corp.example:8080"
 # no_proxy                     = ".svc,.svc.cluster.local,10.96.0.0/12,10.244.0.0/16"
 # Proxy credentials must be an existing Secret in the sandbox namespace. The
@@ -601,12 +602,25 @@ supervisor_image_pull_policy   = "if_not_present"
 # content is validated fail-closed by the supervisor at startup and never
 # falls back to direct egress.
 # Proxy credentials mount only in the separately scheduled supervisor Pod.
-# Required with a credential Secret: Basic authentication to an http:// proxy
-# is cleartext on the connection to that proxy.
+# Required with a credential Secret when the proxy URL is http://, because
+# Basic authentication is then cleartext on the connection to that proxy. An
+# https:// proxy carries the credential inside the verified TLS session and
+# needs no acknowledgement.
 # proxy_auth_allow_insecure    = true
 # Last resort for hostname-filtering proxy ACLs. The proxy resolves the target,
 # so its ACL becomes part of the egress boundary for proxied connections.
 # proxy_connect_by_hostname    = true
+# CA bundle trusted for the corporate proxy, as a path on the gateway Pod's
+# filesystem. Needed for an https:// proxy whose certificate is not publicly
+# trusted, and for a TLS-intercepting proxy that re-signs upstream
+# certificates. The gateway reads the file and stages it into each sandbox's
+# immutable supervisor bootstrap Secret, so the anchor stays in the gateway's
+# trust domain and cannot change underneath a running sandbox. Helm mounts it
+# from `upstreamProxy.caBundle.configMapName` and renders this path. Supply
+# only the proxy's own CA: public roots already come from the supervisor image
+# and its TLS stack, so a full merged trust bundle wastes the sandbox
+# boundary's control-frame budget on duplicated roots.
+# proxy_ca_bundle              = "/etc/openshell-tls/proxy-ca/ca.crt"
 # Required in raw gateway TOML because `namespace` identifies sandbox
 # placement, not the gateway Service. Helm renders this from the release's
 # gateway Service name and namespace.

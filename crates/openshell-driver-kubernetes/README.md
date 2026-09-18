@@ -80,7 +80,10 @@ CNI enforces ingress and egress `NetworkPolicy` for sandbox namespaces.
 Each sandbox generation uses two immutable bootstrap Secrets. A trusted init
 container stages the sandbox bootstrap into memory, and the sandbox removes it
 before starting untrusted code. The other Secret is mounted only by the
-supervisor. The TLS channel binds the namespace, Sandbox CR, workload Pod,
+supervisor; when `proxy_ca_bundle` is configured it also carries the operator's
+corporate proxy CA bundle, which the gateway reads from its own filesystem so
+the anchor stays in the gateway's trust domain rather than the sandbox
+namespace. The TLS channel binds the namespace, Sandbox CR, workload Pod,
 supervisor Pod, and shared network-policy identities. Stop deletes the workload
 and supervisor Pods. Start rotates both Secrets and creates a new supervisor
 Pod before releasing a new workload Pod. The shared network fence remains for

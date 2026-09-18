@@ -184,6 +184,9 @@ data:
     {{- if .Values.upstreamProxy.connectByHostname }}
     proxy_connect_by_hostname    = true
     {{- end }}
+    {{- if .Values.upstreamProxy.caBundle.configMapName }}
+    proxy_ca_bundle              = "/etc/openshell-tls/proxy-ca/ca.crt"
+    {{- end }}
     {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
     provider_spiffe_workload_api_socket_path = {{ .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
     {{- end }}

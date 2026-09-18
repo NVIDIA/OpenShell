@@ -282,6 +282,25 @@ tests:
           path: data["gateway.toml"]
           pattern: 'proxy_connect_by_hostname\s*=\s*true'
 
+  - it: renders proxy_ca_bundle when a corporate CA ConfigMap is configured
+    template: templates/gateway-config.yaml
+    set:
+      upstreamProxy.url: https://proxy.corp.example:3130
+      upstreamProxy.caBundle.configMapName: corporate-proxy-ca
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?proxy_ca_bundle\s*=\s*"/etc/openshell-tls/proxy-ca/ca\.crt"'
+
+  - it: omits proxy_ca_bundle when no corporate CA ConfigMap is configured
+    template: templates/gateway-config.yaml
+    set:
+      upstreamProxy.url: http://proxy.corp.example:8080
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_ca_bundle\s*='
+
   - it: uses the gateway built-in supervisor image by default
     template: templates/gateway-config.yaml
     asserts:

@@ -159,6 +159,13 @@ struct Args {
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME", action = ArgAction::SetTrue)]
     proxy_connect_by_hostname: bool,
 
+    /// Path to a PEM CA bundle trusted for the corporate proxy. Required for
+    /// an `https://` proxy with a private CA, and for a TLS-intercepting proxy
+    /// that re-signs upstream certificates. Read by this process and staged
+    /// into each sandbox's supervisor bootstrap Secret.
+    #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_CA_BUNDLE")]
+    proxy_ca_bundle: Option<String>,
+
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
@@ -263,6 +270,7 @@ async fn main() -> Result<()> {
             proxy_auth_secret_key: args.proxy_auth_secret_key,
             proxy_auth_allow_insecure: args.proxy_auth_allow_insecure.then_some(true),
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
+            proxy_ca_bundle: args.proxy_ca_bundle,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
             ssh_socket_path: args.sandbox_ssh_socket_path,
             client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),

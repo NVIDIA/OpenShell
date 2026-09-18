@@ -117,6 +117,8 @@ VAULT_DNS_ALIAS="${VAULT_RELEASE_NAME}-0"
 VAULT_CA_FILE="${WORKDIR}/openbao-ca.crt"
 CORPORATE_PROXY_FIXTURE_DEPLOYED=0
 CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
+CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP="openshell-e2e-proxy-ca"
+CORPORATE_PROXY_CA_FIXTURE_DEPLOYED=0
 OPENSHIFT_DETECTED=0
 OPENSHIFT_SANDBOX_SCC_GRANTED=0
 OPENSHIFT_POSTGRES_SCC_GRANTED=0
@@ -517,6 +519,11 @@ cleanup() {
 
   if [ "${CORPORATE_PROXY_FIXTURE_DEPLOYED}" = "1" ]; then
     kctl -n "${NAMESPACE}" delete secret "${CORPORATE_PROXY_FIXTURE_SECRET}" \
+      --ignore-not-found >/dev/null 2>&1 || true
+  fi
+
+  if [ "${CORPORATE_PROXY_CA_FIXTURE_DEPLOYED}" = "1" ]; then
+    kctl -n "${NAMESPACE}" delete configmap "${CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP}" \
       --ignore-not-found >/dev/null 2>&1 || true
   fi
 
@@ -1196,9 +1203,15 @@ if [ "${OPENSHELL_E2E_KUBE_CORPORATE_PROXY:-0}" = "1" ]; then
     export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-45}"
   fi
   CORPORATE_PROXY_VALUES="${WORKDIR}/corporate-proxy-values.yaml"
+  # `https-ca` terminates TLS on the proxy listener itself, so the supervisor
+  # must trust the operator CA bundle before it can even issue CONNECT.
+  CORPORATE_PROXY_SCHEME="http"
+  if [ "${CORPORATE_PROXY_MODE}" = "https-ca" ]; then
+    CORPORATE_PROXY_SCHEME="https"
+  fi
   cat >"${CORPORATE_PROXY_VALUES}" <<EOF
 upstreamProxy:
-  url: http://host.openshell.internal:${CORPORATE_PROXY_PORT}
+  url: ${CORPORATE_PROXY_SCHEME}://host.openshell.internal:${CORPORATE_PROXY_PORT}
 EOF
   if [ "${CORPORATE_PROXY_MODE}" = "no-proxy" ]; then
     CORPORATE_PROXY_UPSTREAM_PORT="$(e2e_pick_port)"
@@ -1218,6 +1231,55 @@ EOF
       kctl -n "${NAMESPACE}" create secret generic "${CORPORATE_PROXY_FIXTURE_SECRET}" \
         --from-literal=proxy-auth=malformed --dry-run=client -o yaml | kctl apply -f -
       CORPORATE_PROXY_FIXTURE_DEPLOYED=1
+      ;;
+    https-ca)
+      kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+      kctl -n "${NAMESPACE}" create secret generic "${CORPORATE_PROXY_FIXTURE_SECRET}" \
+        --from-literal=proxy-auth=proxyuser:proxypass --dry-run=client -o yaml | kctl apply -f -
+      CORPORATE_PROXY_FIXTURE_DEPLOYED=1
+
+      # Mint a private CA and a listener leaf for the proxy. The leaf must be
+      # CA:FALSE with a serverAuth EKU, or rustls rejects it regardless of
+      # whether the issuing CA is trusted.
+      CORPORATE_PROXY_TLS_DIR="${WORKDIR}/corporate-proxy-tls"
+      mkdir -p "${CORPORATE_PROXY_TLS_DIR}"
+      openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+        -keyout "${CORPORATE_PROXY_TLS_DIR}/ca.key" \
+        -out "${CORPORATE_PROXY_TLS_DIR}/ca.crt" \
+        -subj "/CN=OpenShell E2E Corporate Proxy CA" >/dev/null 2>&1
+      openssl req -newkey rsa:2048 -nodes \
+        -keyout "${CORPORATE_PROXY_TLS_DIR}/proxy.key" \
+        -out "${CORPORATE_PROXY_TLS_DIR}/proxy.csr" \
+        -subj "/CN=host.openshell.internal" >/dev/null 2>&1
+      cat >"${CORPORATE_PROXY_TLS_DIR}/leaf.ext" <<EXT
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:host.openshell.internal
+EXT
+      openssl x509 -req -days 1 \
+        -in "${CORPORATE_PROXY_TLS_DIR}/proxy.csr" \
+        -CA "${CORPORATE_PROXY_TLS_DIR}/ca.crt" \
+        -CAkey "${CORPORATE_PROXY_TLS_DIR}/ca.key" \
+        -CAcreateserial \
+        -extfile "${CORPORATE_PROXY_TLS_DIR}/leaf.ext" \
+        -out "${CORPORATE_PROXY_TLS_DIR}/proxy.crt" >/dev/null 2>&1
+
+      # The CA ConfigMap belongs to the gateway release namespace: the gateway
+      # reads it and stages the bundle per sandbox, so it is never sourced
+      # from a workload namespace.
+      kctl -n "${NAMESPACE}" create configmap "${CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP}" \
+        --from-file=ca.crt="${CORPORATE_PROXY_TLS_DIR}/ca.crt" \
+        --dry-run=client -o yaml | kctl apply -f -
+      CORPORATE_PROXY_CA_FIXTURE_DEPLOYED=1
+      cat >>"${CORPORATE_PROXY_VALUES}" <<EOF
+  caBundle:
+    configMapName: ${CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP}
+EOF
+      OPENSHELL_E2E_CORPORATE_PROXY_TLS_CERT="$(cat "${CORPORATE_PROXY_TLS_DIR}/proxy.crt")"
+      OPENSHELL_E2E_CORPORATE_PROXY_TLS_KEY="$(cat "${CORPORATE_PROXY_TLS_DIR}/proxy.key")"
+      export OPENSHELL_E2E_CORPORATE_PROXY_TLS_CERT
+      export OPENSHELL_E2E_CORPORATE_PROXY_TLS_KEY
       ;;
     missing-secret) ;;
     *) echo "ERROR: unknown corporate proxy e2e mode '${CORPORATE_PROXY_MODE}'" >&2; exit 2 ;;

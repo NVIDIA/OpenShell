@@ -461,6 +461,15 @@ every intercepted upstream connection failing. The bundle is valid with either
 an `http://` or `https://` proxy (an intercepting proxy can be reached over
 plain HTTP) and is fail-closed: an unreadable or certificate-free file is fatal.
 
+How the bundle reaches the supervisor is driver-specific. Drivers that run the
+supervisor locally bind-mount the operator's file. The Kubernetes driver cannot:
+the supervisor Pod is scheduled remotely, and a trust anchor for every upstream
+the sandbox reaches must not be sourced from the workload namespace, where it
+would widen to anyone holding write access there. The gateway instead reads the
+PEM from its own filesystem and stages it into the per-generation supervisor
+bootstrap Secret, which is immutable, so the anchor cannot change underneath a
+running sandbox.
+
 Proxy credentials are never embedded in the URL: an inline `user:pass@` is
 rejected because it would be stored in `gateway.toml` and exposed in container
 metadata. Operators supply credentials via `proxy_auth_file`; the driver

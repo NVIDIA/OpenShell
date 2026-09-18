@@ -171,6 +171,45 @@ impl KubernetesDriverError {
     }
 }
 
+/// Read and validate the operator's corporate proxy CA bundle, if configured.
+///
+/// Returns the PEM bytes to stage into the supervisor bootstrap Secret, or
+/// `None` when `proxy_ca_bundle` is unset. Fail-closed: a path that cannot be
+/// read, is not a regular file, or holds no usable trust anchor is an error
+/// naming the operator setting, never a silent fall-back to the built-in
+/// roots.
+///
+/// The read is bounded twice. The shared reader applies
+/// `MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES`, which is exactly the apiserver's own
+/// Secret limit; this driver then applies the tighter
+/// [`MAX_STAGED_PROXY_CA_BUNDLE_BYTES`] so a bundle between the two cannot
+/// turn into an opaque `data: Too long` apiserver error on every create.
+async fn read_staged_upstream_proxy_ca_bundle(
+    path: Option<&str>,
+) -> Result<Option<Vec<u8>>, KubernetesDriverError> {
+    let Some(path) = path.map(str::to_string) else {
+        return Ok(None);
+    };
+    let pem = tokio::task::spawn_blocking(move || {
+        openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(&path, "proxy_ca_bundle")
+    })
+    .await
+    .map_err(|error| {
+        KubernetesDriverError::Message(format!("proxy_ca_bundle read task failed: {error}"))
+    })?
+    .map_err(KubernetesDriverError::InvalidArgument)?;
+
+    if pem.len() > crate::config::MAX_STAGED_PROXY_CA_BUNDLE_BYTES {
+        return Err(KubernetesDriverError::InvalidArgument(format!(
+            "proxy_ca_bundle is {} bytes, exceeding the {}-byte limit for a bundle staged into a \
+             Kubernetes Secret",
+            pem.len(),
+            crate::config::MAX_STAGED_PROXY_CA_BUNDLE_BYTES
+        )));
+    }
+    Ok(Some(pem.into_bytes()))
+}
+
 fn is_kube_resource_version_conflict(error: &KubeError) -> bool {
     matches!(error, KubeError::Api(api) if api.code == 409 && api.reason == "Conflict")
 }
@@ -688,6 +727,13 @@ impl KubernetesComputeDriver {
         config
             .validate_upstream_proxy_config()
             .map_err(KubernetesDriverError::Precondition)?;
+        // Read the bundle once at startup so an unreadable path or a
+        // certificate-free file fails the gateway here, rather than as a
+        // repeated sandbox-create failure. The authoritative read still
+        // happens per sandbox, so rotating the file needs no restart.
+        read_staged_upstream_proxy_ca_bundle(config.proxy_ca_bundle.as_deref())
+            .await
+            .map_err(|error| KubernetesDriverError::Precondition(error.to_string()))?;
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
             Err(_) => kube::Config::infer()
@@ -2168,6 +2214,11 @@ impl KubernetesComputeDriver {
         main_process_spec: &str,
         log_level: &str,
     ) -> Result<String, KubernetesDriverError> {
+        // Read once per call so the whole generation stages, mounts, and
+        // references the same bytes, and so a bundle that became unreadable
+        // fails before any Service, Pod, or Secret is created.
+        let upstream_proxy_ca_bundle =
+            read_staged_upstream_proxy_ca_bundle(self.config.proxy_ca_bundle.as_deref()).await?;
         let cr_uid = sandbox_cr.metadata.uid.as_deref().ok_or_else(|| {
             KubernetesDriverError::Message("created Sandbox CR has no UID".to_string())
         })?;
@@ -2243,6 +2294,7 @@ impl KubernetesComputeDriver {
                         .zip(self.config.proxy_auth_secret_key.as_deref()),
                     self.config.proxy_auth_allow_insecure == Some(true),
                     self.config.proxy_connect_by_hostname == Some(true),
+                    upstream_proxy_ca_bundle.is_some(),
                     self.config.provider_spiffe_enabled().then_some(
                         self.config
                             .provider_spiffe_workload_api_socket_path
@@ -2432,6 +2484,7 @@ impl KubernetesComputeDriver {
             })?,
             proxy_ca.certificate_pem.into_bytes(),
             proxy_ca.private_key_pem.into_bytes(),
+            upstream_proxy_ca_bundle.clone(),
             OwnerReference {
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),
@@ -2505,6 +2558,11 @@ impl KubernetesComputeDriver {
         child_env: std::collections::HashMap<String, String>,
         launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
     ) -> Result<(), KubernetesDriverError> {
+        // Read once per call so the whole generation stages, mounts, and
+        // references the same bytes, and so a bundle that became unreadable
+        // fails before any Service, Pod, or Secret is created.
+        let upstream_proxy_ca_bundle =
+            read_staged_upstream_proxy_ca_bundle(self.config.proxy_ca_bundle.as_deref()).await?;
         let namespace_uid = Api::<Namespace>::all(self.client.clone())
             .get(namespace)
             .await
@@ -2675,6 +2733,7 @@ impl KubernetesComputeDriver {
             })?,
             proxy_ca.certificate_pem.into_bytes(),
             proxy_ca.private_key_pem.into_bytes(),
+            upstream_proxy_ca_bundle.clone(),
             OwnerReference {
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),
@@ -2846,6 +2905,11 @@ impl KubernetesComputeDriver {
         encoded_authentication: &[u8],
         encoded_expected_runtime_identity: &str,
     ) -> Result<String, KubernetesDriverError> {
+        // Read once per call so the whole generation stages, mounts, and
+        // references the same bytes, and so a bundle that became unreadable
+        // fails before any Service, Pod, or Secret is created.
+        let upstream_proxy_ca_bundle =
+            read_staged_upstream_proxy_ca_bundle(self.config.proxy_ca_bundle.as_deref()).await?;
         let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
             encoded_generation.to_string(),
         )
@@ -3002,6 +3066,7 @@ impl KubernetesComputeDriver {
                         .zip(self.config.proxy_auth_secret_key.as_deref()),
                     self.config.proxy_auth_allow_insecure == Some(true),
                     self.config.proxy_connect_by_hostname == Some(true),
+                    upstream_proxy_ca_bundle.is_some(),
                     self.config.provider_spiffe_enabled().then_some(
                         self.config
                             .provider_spiffe_workload_api_socket_path
@@ -7063,6 +7128,84 @@ mod tests {
     use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
     use prost_types::{Struct, Value, value::Kind};
     use std::collections::{BTreeSet, VecDeque};
+
+    /// Write `contents` to a uniquely named temp file and return its path.
+    /// The caller removes it.
+    fn write_temp_pem(tag: &str, contents: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "openshell-proxy-ca-{tag}-{}-{unique}.pem",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).expect("write temp PEM");
+        path
+    }
+
+    #[tokio::test]
+    async fn staged_proxy_ca_bundle_is_absent_when_unconfigured() {
+        assert!(
+            read_staged_upstream_proxy_ca_bundle(None)
+                .await
+                .expect("an unset bundle is not an error")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_proxy_ca_bundle_reads_a_valid_bundle() {
+        let material = generate_proxy_ca_material().expect("generate a CA certificate");
+        let path = write_temp_pem("valid", &material.certificate_pem);
+        let staged = read_staged_upstream_proxy_ca_bundle(path.to_str())
+            .await
+            .expect("a CA certificate is a usable trust anchor")
+            .expect("bundle staged");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(staged, material.certificate_pem.into_bytes());
+    }
+
+    #[tokio::test]
+    async fn staged_proxy_ca_bundle_fails_closed_and_names_the_setting() {
+        // Fail-closed: a bundle the operator pointed at must never silently
+        // degrade to the built-in roots. Every error names `proxy_ca_bundle`
+        // so the operator can find the setting.
+        let missing = std::env::temp_dir().join("openshell-proxy-ca-does-not-exist.pem");
+        let err = read_staged_upstream_proxy_ca_bundle(missing.to_str())
+            .await
+            .expect_err("an unreadable path is fatal");
+        assert!(err.to_string().contains("proxy_ca_bundle"), "{err}");
+
+        let empty = write_temp_pem("certificate-free", "not a certificate\n");
+        let err = read_staged_upstream_proxy_ca_bundle(empty.to_str())
+            .await
+            .expect_err("a certificate-free bundle is fatal");
+        std::fs::remove_file(&empty).ok();
+        assert!(err.to_string().contains("proxy_ca_bundle"), "{err}");
+
+        let directory = std::env::temp_dir();
+        let err = read_staged_upstream_proxy_ca_bundle(directory.to_str())
+            .await
+            .expect_err("a non-regular file is fatal");
+        assert!(err.to_string().contains("proxy_ca_bundle"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn staged_proxy_ca_bundle_rejects_a_bundle_too_large_for_a_secret() {
+        // Between this bound and the shared 1 MiB reader lies the apiserver's
+        // own Secret limit, where the failure would otherwise be an opaque
+        // `data: Too long` on every sandbox create.
+        let material = generate_proxy_ca_material().expect("generate a CA certificate");
+        let repeats =
+            crate::config::MAX_STAGED_PROXY_CA_BUNDLE_BYTES / material.certificate_pem.len() + 2;
+        let path = write_temp_pem("oversized", &material.certificate_pem.repeat(repeats));
+        let err = read_staged_upstream_proxy_ca_bundle(path.to_str())
+            .await
+            .expect_err("an oversized bundle would fail at the apiserver");
+        std::fs::remove_file(&path).ok();
+        let err = err.to_string();
+        assert!(err.contains("proxy_ca_bundle"), "{err}");
+        assert!(err.contains("Secret"), "{err}");
+    }
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
