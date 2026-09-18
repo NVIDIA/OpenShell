@@ -8,10 +8,6 @@ inputs:
   cache-key:
     description: Rust target cache namespace
     required: true
-  sccache-key:
-    description: Compiler cache namespace; defaults to cache-key
-    required: false
-    default: ""
   save-cache:
     description: Whether this job writes the Rust target cache
     required: false
@@ -27,34 +23,15 @@ runs:
         shell_drv=$(nix eval --raw --impure .#devShells --apply 'shells: shells.${builtins.currentSystem}.default.drvPath')
         echo "hash=$(nix hash file --type sha256 --base16 "$shell_drv")" >> "$GITHUB_OUTPUT"
 
-    - name: Configure GHA sccache backend
-      uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-      env:
-        SCCACHE_GHA_ENABLED: "true"
-        SCCACHE_GHA_VERSION: ${{ inputs.sccache-key || inputs.cache-key }}-${{ steps.dev-shell.outputs.hash }}-${{ runner.os }}-${{ runner.arch }}
-
     - name: Realize Nix development shell
       shell: bash
       run: nix develop -c true
 
     - name: Cache Rust target and registry
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      env:
-        RUSTC_WRAPPER: ""
       with:
         shared-key: ${{ inputs.cache-key }}-${{ steps.dev-shell.outputs.hash }}
         save-if: ${{ inputs.save-cache }}
         cache-on-failure: ${{ inputs.save-cache }}
         cache-bin: "false"
         cmd-format: nix develop -c {0}
-
-    - name: Enable sccache
-      shell: bash
-      env:
-        SCCACHE_VERSION: ${{ inputs.sccache-key || inputs.cache-key }}-${{ steps.dev-shell.outputs.hash }}-${{ runner.os }}-${{ runner.arch }}
-      run: | # zizmor: ignore[github-env] values are literal or trusted repository/runner-derived cache identifiers
-        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-        echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-        echo "SCCACHE_GHA_VERSION=${SCCACHE_VERSION}" >> "$GITHUB_ENV"
-        echo "SCCACHE_CLIENT_SIDE=1" >> "$GITHUB_ENV"
-        echo "SCCACHE_BASEDIRS=${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"

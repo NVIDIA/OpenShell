@@ -35,7 +35,6 @@ runs:
     - uses: ./.github/actions/setup-rust
       with:
         cache-key: binaries-v2-${{ inputs.binary }}-${{ inputs.triple }}
-        sccache-key: binaries-v2-${{ inputs.triple }}
         save-cache: "true"
 
     - name: Set version
