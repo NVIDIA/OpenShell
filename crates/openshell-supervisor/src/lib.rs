@@ -2670,7 +2670,12 @@ fn prepare_startup_configuration(
             "Effective configuration admission rejected"
         ));
     }
-    if provider.readiness_reason != ProviderReadinessReason::Unspecified {
+    if !matches!(
+        provider.readiness_reason,
+        ProviderReadinessReason::Unspecified
+            | ProviderReadinessReason::CredentialsWithheld
+            | ProviderReadinessReason::CredentialExpired
+    ) {
         return Err(miette::miette!(
             "Provider credentials are not ready for installation"
         ));
@@ -5560,6 +5565,49 @@ network_policies:
             prepare_startup_configuration(&snapshot, &policy, &startup_provider(10))
                 .expect("matching generation is admitted");
         assert_eq!(credentials.revision(), 10);
+    }
+
+    #[test]
+    fn startup_configuration_accepts_fail_closed_provider_environment() {
+        let policy = proto_policy_fixture();
+        let mut snapshot = settings_poll_result(
+            Some(policy.clone()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        snapshot.provider_env_revision = 10;
+
+        for reason in [
+            ProviderReadinessReason::CredentialsWithheld,
+            ProviderReadinessReason::CredentialExpired,
+        ] {
+            let mut provider = startup_provider(10);
+            provider.readiness_reason = reason;
+            provider
+                .environment
+                .insert("PROJECT_ID".to_string(), "example-project".to_string());
+            provider
+                .non_secret_environment_keys
+                .push("PROJECT_ID".to_string());
+            let (_, _, credentials) = prepare_startup_configuration(&snapshot, &policy, &provider)
+                .expect("withheld credentials preserve fail-closed startup");
+            assert_eq!(credentials.revision(), 10);
+            assert!(credentials.snapshot().child_env.contains_key("PROJECT_ID"));
+        }
+    }
+
+    #[test]
+    fn startup_configuration_rejects_provider_installation_failure() {
+        let policy = proto_policy_fixture();
+        let snapshot = settings_poll_result(
+            Some(policy.clone()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let mut provider = startup_provider(0);
+        provider.readiness_reason = ProviderReadinessReason::CredentialInstallFailed;
+
+        assert!(prepare_startup_configuration(&snapshot, &policy, &provider).is_err());
     }
 
     #[test]
