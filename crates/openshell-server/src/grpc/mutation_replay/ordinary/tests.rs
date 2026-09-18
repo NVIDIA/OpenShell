@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::auth::identity::{Identity, IdentityProvider};
+use crate::auth::principal::UserPrincipal;
 use crate::grpc::mutation_replay::tests::reason;
 use crate::grpc::mutation_replay::{Admission, OBJECT_TYPE, OriginalMutation, fingerprint, run};
 use crate::grpc::test_support::{authed_request, test_server_state};
@@ -185,6 +187,45 @@ async fn oversized_public_diagnostics_leave_a_bounded_unresolved_claim() {
 fn id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+
+fn non_member_request<T>(inner: T) -> Request<T> {
+    let mut request = Request::new(inner);
+    request
+        .extensions_mut()
+        .insert(Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: "non-member".into(),
+                display_name: None,
+                roles: Vec::new(),
+                scopes: Vec::new(),
+                provider: IdentityProvider::Oidc,
+            },
+        }));
+    request
+}
+
+#[tokio::test]
+async fn durable_sandbox_mutations_hide_unauthorized_workspaces() {
+    let (_directory, mut state) = protected_state().await;
+    Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".into();
+
+    for request_id in [String::new(), id()] {
+        let status = run(
+            &state,
+            non_member_request(DeleteSandboxRequest {
+                sandbox: "hidden".into(),
+                workspace: "default".into(),
+                allow_missing: false,
+                request_id,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status.code(), Code::NotFound);
+        assert_eq!(status.message(), "sandbox not found");
+    }
+}
+
 fn meta(name: &str) -> ObjectMeta {
     ObjectMeta {
         id: id(),

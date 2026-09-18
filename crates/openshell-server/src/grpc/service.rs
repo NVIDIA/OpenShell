@@ -9,7 +9,7 @@ use openshell_core::proto::{
     DeleteServiceRequest, DeleteServiceResponse, ExposeServiceRequest, GetServiceRequest,
     ListServicesRequest, ListServicesResponse, ServiceEndpoint, ServiceEndpointResponse,
 };
-use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
+use openshell_core::{GetResourceVersion, ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message as _;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -23,6 +23,13 @@ use crate::persistence::{ObjectListQuery, ObjectType, WriteCondition};
 use crate::service_routing;
 
 const MAX_SERVICE_NAME_LEN: usize = super::MAX_ROUTABLE_NAME_LEN;
+
+#[cfg(test)]
+#[derive(Default)]
+struct DeleteServiceProbe {
+    resolved: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
 
 pub(super) async fn handle_expose_service(
     state: &Arc<ServerState>,
@@ -251,6 +258,11 @@ pub(super) async fn handle_delete_service(
     request: Request<DeleteServiceRequest>,
 ) -> Result<Response<DeleteServiceResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    #[cfg(test)]
+    let probe = request
+        .extensions()
+        .get::<Arc<DeleteServiceProbe>>()
+        .cloned();
     let req = request.into_inner();
     let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
         state,
@@ -271,19 +283,30 @@ pub(super) async fn handle_delete_service(
         }));
     };
 
-    let key = service_routing::endpoint_key(sandbox_name, &req.service);
+    #[cfg(test)]
+    if let Some(probe) = probe {
+        probe.resolved.notify_one();
+        probe.resume.notified().await;
+    }
+
+    let endpoint_id = endpoint.object_id().to_string();
+    let endpoint_version = endpoint.get_resource_version();
     let deleted = state
         .store
-        .delete_by_name(ServiceEndpoint::object_type(), workspace, &key)
+        .delete_if(
+            ServiceEndpoint::object_type(),
+            &endpoint_id,
+            endpoint_version,
+        )
         .await
-        .map_err(|e| Status::internal(format!("delete endpoint failed: {e}")))?;
+        .map_err(|e| super::persistence_error_to_status(e, "delete endpoint"))?;
 
     if deleted {
         service_routing::emit_service_endpoint_delete_event(&endpoint);
     }
 
     Ok(Response::new(DeleteServiceResponse {
-        outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+        outcome: super::deletion_outcome(deleted, req.allow_missing, "service endpoint")?,
     }))
 }
 
@@ -518,6 +541,68 @@ mod tests {
         .unwrap()
         .into_inner();
         assert!(listed.services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_service_does_not_delete_concurrent_replacement() {
+        let state = test_server_state().await;
+        seed_sandbox(&state, "my-sandbox").await;
+
+        let original = handle_expose_service(
+            &state,
+            authed_request(ExposeServiceRequest {
+                sandbox: "my-sandbox".into(),
+                workspace: "default".into(),
+                service: "web".into(),
+                target_port: 8080,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .endpoint
+        .unwrap();
+
+        let probe = Arc::new(DeleteServiceProbe::default());
+        let mut request = authed_request(DeleteServiceRequest {
+            sandbox: "my-sandbox".into(),
+            workspace: "default".into(),
+            service: "web".into(),
+            allow_missing: true,
+            ..Default::default()
+        });
+        request.extensions_mut().insert(probe.clone());
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move { handle_delete_service(&state, request).await }
+        });
+
+        probe.resolved.notified().await;
+        state
+            .store
+            .delete(ServiceEndpoint::object_type(), original.object_id())
+            .await
+            .unwrap();
+        let mut replacement = original.clone();
+        let metadata = replacement.metadata.as_mut().unwrap();
+        metadata.id = "replacement-endpoint".into();
+        metadata.resource_version = 0;
+        replacement.target_port = 9090;
+        state.store.put_message(&replacement).await.unwrap();
+        probe.resume.notify_one();
+
+        let response = task.await.unwrap().unwrap().into_inner();
+        assert_eq!(
+            response.outcome(),
+            openshell_core::proto::DeletionOutcome::AlreadyAbsent
+        );
+        let current = get_service_endpoint(&state, "default", "my-sandbox", "web")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.object_id(), replacement.object_id());
+        assert_eq!(current.target_port, 9090);
     }
 
     #[tokio::test]

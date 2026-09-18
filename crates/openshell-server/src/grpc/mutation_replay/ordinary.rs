@@ -291,6 +291,23 @@ async fn selected_scope(
     named_scope(state, &authz.workspace).await
 }
 
+async fn sandbox_scope(
+    state: &ServerState,
+    principal: &Principal,
+    workspace: &str,
+    role: MinWorkspaceRole,
+) -> Result<Scope, Status> {
+    selected_scope(state, principal, workspace, role)
+        .await
+        .map_err(|status| {
+            if status.code() == tonic::Code::PermissionDenied {
+                Status::not_found("sandbox not found")
+            } else {
+                status
+            }
+        })
+}
+
 async fn profile_scope(
     state: &ServerState,
     principal: &Principal,
@@ -359,6 +376,22 @@ macro_rules! scoped_mutation {
     };
 }
 
+macro_rules! sandbox_scoped_mutation {
+    ($req:ty, $resp:ty, $method:literal, $handler:path, $role:ident, $capture:expr, $restore:expr) => {
+        mutation!(
+            $req,
+            $resp,
+            $method,
+            $handler,
+            async |req: &$req, state: &ServerState, principal: &Principal| {
+                sandbox_scope(state, principal, &req.workspace, MinWorkspaceRole::$role).await
+            },
+            $capture,
+            $restore
+        );
+    };
+}
+
 fn sandbox_receipt(sandbox: Option<&Sandbox>, changed: bool) -> Result<Outcome, Status> {
     Ok(Outcome::Sandbox {
         id: sandbox.ok_or_else(uncertain)?.object_id().into(),
@@ -368,7 +401,7 @@ fn sandbox_receipt(sandbox: Option<&Sandbox>, changed: bool) -> Result<Outcome, 
 
 macro_rules! sandbox_mutation {
     ($req:ty, $method:literal, $handler:path) => {
-        scoped_mutation!(
+        sandbox_scoped_mutation!(
             $req,
             SandboxResponse,
             $method,
@@ -389,10 +422,24 @@ macro_rules! sandbox_mutation {
         );
     };
 }
-sandbox_mutation!(
+scoped_mutation!(
     CreateSandboxRequest,
+    SandboxResponse,
     "CreateSandbox",
-    sandbox::handle_create_sandbox
+    sandbox::handle_create_sandbox,
+    User,
+    |response: &Response<SandboxResponse>| sandbox_receipt(
+        response.get_ref().sandbox.as_ref(),
+        false
+    ),
+    async |store: &Store, outcome: Outcome| {
+        let Outcome::Sandbox { id, .. } = outcome else {
+            return Err(replay_unavailable());
+        };
+        Ok(SandboxResponse {
+            sandbox: Some(live(store, &id).await?),
+        })
+    }
 );
 sandbox_mutation!(
     StartSandboxRequest,
@@ -407,7 +454,7 @@ sandbox_mutation!(
 
 macro_rules! attachment_mutation {
     ($req:ty, $resp:ident, $method:literal, $handler:path, $field:ident) => {
-        scoped_mutation!(
+        sandbox_scoped_mutation!(
             $req,
             $resp,
             $method,
@@ -461,7 +508,7 @@ attachment_mutation!(
     detached
 );
 
-scoped_mutation!(
+sandbox_scoped_mutation!(
     DeleteSandboxRequest,
     DeleteSandboxResponse,
     "DeleteSandbox",
@@ -482,7 +529,7 @@ scoped_mutation!(
     }
 );
 
-scoped_mutation!(
+sandbox_scoped_mutation!(
     ExposeServiceRequest,
     ServiceEndpointResponse,
     "ExposeService",
@@ -613,7 +660,7 @@ ordinary_deletion!(
     "DeleteService",
     service::handle_delete_service,
     async |req: &DeleteServiceRequest, state: &ServerState, principal: &Principal| {
-        selected_scope(state, principal, &req.workspace, MinWorkspaceRole::User).await
+        sandbox_scope(state, principal, &req.workspace, MinWorkspaceRole::User).await
     }
 );
 ordinary_deletion!(
@@ -796,7 +843,7 @@ mutation!(
             }
             global_scope(state, principal)
         } else {
-            selected_scope(state, principal, &req.workspace, MinWorkspaceRole::Admin).await
+            sandbox_scope(state, principal, &req.workspace, MinWorkspaceRole::Admin).await
         }
     },
     |response: &Response<UpdateConfigResponse>| {
@@ -842,7 +889,7 @@ mutation!(
 
 macro_rules! policy_mutation {
     ($req:ty, $resp:ty, $method:literal, $handler:path, $values:expr, $restore:expr) => {
-        scoped_mutation!(
+        sandbox_scoped_mutation!(
             $req,
             $resp,
             $method,
