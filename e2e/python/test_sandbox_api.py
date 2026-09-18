@@ -9,6 +9,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 from google.protobuf import duration_pb2
+
 from openshell._proto import datamodel_pb2, openshell_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
@@ -26,7 +27,7 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
     create = openshell_pb2.CreateSandboxRequest(
         name=name,
         spec=openshell_pb2.SandboxSpec(),
-        workspace=scope,
+        workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),
         request_id=str(uuid.uuid4()),
     )
 
@@ -41,7 +42,7 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
         assert replay(stub.CreateSandbox, create).sandbox.metadata.id == original
         stop = openshell_pb2.StopSandboxRequest(
             name=name,
-            workspace=scope,
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),
             request_id=str(uuid.uuid4()),
         )
         stub.StopSandbox(stop, timeout=60)
@@ -49,7 +50,7 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
         assert replay(stub.StopSandbox, stop).sandbox.metadata.id == original
         start = openshell_pb2.StartSandboxRequest(
             name=name,
-            workspace=scope,
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),
             request_id=str(uuid.uuid4()),
         )
         stub.StartSandbox(start, timeout=60)
@@ -57,7 +58,7 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
         assert replay(stub.StartSandbox, start).sandbox.metadata.id == original
         update = openshell_pb2.UpdateConfigRequest(
             sandbox=name,
-            workspace=scope,
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),
             setting_key="ocsf_json_enabled",
             setting_value=sandbox_pb2.SettingValue(bool_value=True),
             request_id=str(uuid.uuid4()),
@@ -66,7 +67,7 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
         assert replay(stub.UpdateConfig, update) == updated
         delete = openshell_pb2.DeleteSandboxRequest(
             name=name,
-            workspace=scope,
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),
             request_id=str(uuid.uuid4()),
         )
         deleted = stub.DeleteSandbox(delete, timeout=60)
@@ -143,7 +144,7 @@ def test_sandbox_interactive_exec_honors_tty(
         request = openshell_pb2.ExecSandboxInput(
             start=openshell_pb2.ExecSandboxRequest(
                 sandbox=sandbox_name,
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 command=[
                     "/bin/sh",
                     "-c",

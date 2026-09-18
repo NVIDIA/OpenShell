@@ -71,7 +71,7 @@ def test_create_sandbox_rejects_root_user(
     with pytest.raises(grpc.RpcError) as exc_info:
         stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 name="",
                 spec=spec,
             )
@@ -101,7 +101,7 @@ def test_create_sandbox_rejects_path_traversal(
     with pytest.raises(grpc.RpcError) as exc_info:
         stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 name="",
                 spec=spec,
             )
@@ -131,7 +131,7 @@ def test_create_sandbox_rejects_overly_broad_paths(
     with pytest.raises(grpc.RpcError) as exc_info:
         stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 name="",
                 spec=spec,
             )
@@ -171,7 +171,7 @@ def test_create_sandbox_materializes_default_mcp_version(
         stored = sandbox_client._stub.GetSandbox(
             openshell_pb2.GetSandboxRequest(
                 name=created.name,
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             )
         )
         stored_endpoint = stored.sandbox.spec.policy.network_policies[
@@ -183,8 +183,8 @@ def test_create_sandbox_materializes_default_mcp_version(
 
         config = sandbox_client._stub.GetSandboxConfig(
             sandbox_pb2.GetSandboxConfigRequest(
-                sandbox=created.name,
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name=created.name,
             )
         )
         endpoint = config.policy.network_policies["mcp_default"].endpoints[0]
@@ -231,7 +231,9 @@ def test_update_policy_rejects_immutable_fields(
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.UpdateConfig(
                 openshell_pb2.UpdateConfigRequest(
-                    workspace="default",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
                     sandbox=sandbox_name,
                     policy=unsafe_policy,
                 )

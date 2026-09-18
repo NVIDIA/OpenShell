@@ -51,7 +51,7 @@ class TestRbac:
         token = get_token("admin@test", "admin", scopes="openid openshell:all")
         stub, metadata = stub_with_token(token)
         req = openshell_pb2.CreateProviderRequest(
-            workspace="default",
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-admin-test"),
                 type="claude-code",
@@ -69,7 +69,9 @@ class TestRbac:
             with contextlib.suppress(grpc.RpcError):
                 stub.DeleteProvider(
                     openshell_pb2.DeleteProviderRequest(
-                        workspace="default",
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
                         name="e2e-oidc-admin-test",
                     ),
                     metadata=metadata,
@@ -79,7 +81,7 @@ class TestRbac:
         token = get_token("user@test", "user", scopes="openid openshell:all")
         stub, metadata = stub_with_token(token)
         req = openshell_pb2.CreateProviderRequest(
-            workspace="default",
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-user-blocked"),
                 type="claude-code",
@@ -100,7 +102,9 @@ class TestRbac:
         with contextlib.suppress(grpc.RpcError):
             admin_stub.AddWorkspaceMember(
                 openshell_pb2.AddWorkspaceMemberRequest(
-                    workspace="default",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
                     principal_subject=user_sub,
                     role=openshell_pb2.WORKSPACE_ROLE_USER,
                 ),
@@ -109,7 +113,7 @@ class TestRbac:
         try:
             user_stub.ListSandboxes(
                 openshell_pb2.ListSandboxesRequest(
-                    workspace=datamodel_pb2.WorkspaceSelector(workspace="default")
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
                 ),
                 metadata=user_md,
             )
@@ -117,7 +121,10 @@ class TestRbac:
             with contextlib.suppress(grpc.RpcError):
                 admin_stub.RemoveWorkspaceMember(
                     openshell_pb2.RemoveWorkspaceMemberRequest(
-                        workspace="default", principal_subject=user_sub
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
+                        principal_subject=user_sub,
                     ),
                     metadata=admin_md,
                 )
@@ -128,7 +135,7 @@ class TestRbac:
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.ListSandboxes(
                 openshell_pb2.ListSandboxesRequest(
-                    workspace=datamodel_pb2.WorkspaceSelector(workspace="default")
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
                 )
             )
         assert exc_info.value.code() in (
@@ -165,7 +172,7 @@ class TestScopes:
         stub, metadata = stub_with_token(token)
         stub.ListSandboxes(
             openshell_pb2.ListSandboxesRequest(
-                workspace=datamodel_pb2.WorkspaceSelector(workspace="default")
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
             ),
             metadata=metadata,
         )
@@ -178,7 +185,7 @@ class TestScopes:
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.ListProviders(
                 openshell_pb2.ListProvidersRequest(
-                    workspace=datamodel_pb2.WorkspaceSelector(workspace="default")
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
                 ),
                 metadata=metadata,
             )
@@ -190,13 +197,13 @@ class TestScopes:
         stub, metadata = stub_with_token(token)
         stub.ListSandboxes(
             openshell_pb2.ListSandboxesRequest(
-                workspace=datamodel_pb2.WorkspaceSelector(workspace="default")
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
             ),
             metadata=metadata,
         )
         stub.ListProviders(
             openshell_pb2.ListProvidersRequest(
-                workspace=datamodel_pb2.WorkspaceSelector(workspace="default")
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
             ),
             metadata=metadata,
         )
@@ -207,7 +214,7 @@ class TestScopes:
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.ListSandboxes(
                 openshell_pb2.ListSandboxesRequest(
-                    workspace=datamodel_pb2.WorkspaceSelector(workspace="default")
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
                 ),
                 metadata=metadata,
             )
@@ -249,7 +256,9 @@ class TestClientCredentials:
         with contextlib.suppress(grpc.RpcError):
             admin_stub.AddWorkspaceMember(
                 openshell_pb2.AddWorkspaceMemberRequest(
-                    workspace="default",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
                     principal_subject=ci_sub,
                     role=openshell_pb2.WORKSPACE_ROLE_USER,
                 ),
@@ -262,7 +271,10 @@ class TestClientCredentials:
             with contextlib.suppress(grpc.RpcError):
                 admin_stub.RemoveWorkspaceMember(
                     openshell_pb2.RemoveWorkspaceMemberRequest(
-                        workspace="default", principal_subject=ci_sub
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
+                        principal_subject=ci_sub,
                     ),
                     metadata=admin_md,
                 )

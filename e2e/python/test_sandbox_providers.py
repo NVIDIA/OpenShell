@@ -81,7 +81,7 @@ def provider(
     _delete_provider(stub, name)
     stub.CreateProvider(
         openshell_pb2.CreateProviderRequest(
-            workspace="default",
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name=name),
                 type=provider_type,
@@ -101,7 +101,7 @@ def _delete_provider(stub: object, name: str) -> None:
     try:
         stub.DeleteProvider(
             openshell_pb2.DeleteProviderRequest(
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 name=name,
             )
         )
@@ -118,7 +118,7 @@ def _delete_provider_profile(stub: object, profile_id: str) -> None:
         stub.DeleteProviderProfile(
             openshell_pb2.DeleteProviderProfileRequest(
                 id=profile_id,
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             )
         )
     except grpc.RpcError as exc:
@@ -145,7 +145,7 @@ def imported_provider_profile(
                     source=source,
                 )
             ],
-            workspace="default",
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
         )
     )
     assert response.imported, f"profile import failed: {response.diagnostics!r}"
@@ -325,7 +325,7 @@ def test_profileless_provider_creation_is_rejected(
     with pytest.raises(grpc.RpcError) as exc_info:
         sandbox_client._stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(
                         name="e2e-test-profileless-provider"
@@ -485,7 +485,9 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
             try:
                 stub.AttachSandboxProvider(
                     openshell_pb2.AttachSandboxProviderRequest(
-                        workspace="default",
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
                         sandbox=sb.sandbox.name,
                         provider=provider_name,
                     )
@@ -497,7 +499,9 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
 
                 stub.DetachSandboxProvider(
                     openshell_pb2.DetachSandboxProviderRequest(
-                        workspace="default",
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
                         sandbox=sb.sandbox.name,
                         provider=provider_name,
                     )
@@ -507,7 +511,9 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                 try:
                     stub.DetachSandboxProvider(
                         openshell_pb2.DetachSandboxProviderRequest(
-                            workspace="default",
+                            workspace_scope=datamodel_pb2.WorkspaceSelector(
+                                workspace="default"
+                            ),
                             sandbox=sb.sandbox.name,
                             provider=provider_name,
                         )
@@ -692,6 +698,7 @@ def test_imported_anthropic_profile_allows_native_endpoint_with_attached_provide
                     assert payload["x_api_key"] == secret
                     assert body["model"] == "fixture-anthropic-model"
 
+
 # ===========================================================================
 # Tests: security & edge cases
 # ===========================================================================
@@ -731,7 +738,9 @@ def test_credentials_not_in_persisted_spec_environment(
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             fetched = sandbox_client._stub.GetSandbox(
                 openshell_pb2.GetSandboxRequest(
-                    workspace="default",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
                     name=sb.sandbox.name,
                 )
             )
@@ -757,7 +766,7 @@ def test_update_provider_preserves_unset_credentials_and_config(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="codex",
@@ -773,7 +782,7 @@ def test_update_provider_preserves_unset_credentials_and_config(
 
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
@@ -784,7 +793,7 @@ def test_update_provider_preserves_unset_credentials_and_config(
 
         got = stub.GetProvider(
             openshell_pb2.GetProviderRequest(
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 name=name,
             )
         )
@@ -813,7 +822,7 @@ def test_update_provider_empty_maps_preserves_all(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="openai",
@@ -825,7 +834,7 @@ def test_update_provider_empty_maps_preserves_all(
 
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
@@ -835,7 +844,7 @@ def test_update_provider_empty_maps_preserves_all(
 
         got = stub.GetProvider(
             openshell_pb2.GetProviderRequest(
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 name=name,
             )
         )
@@ -862,7 +871,7 @@ def test_update_provider_merges_config_preserves_credentials(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="openai",
@@ -874,7 +883,7 @@ def test_update_provider_merges_config_preserves_credentials(
 
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
@@ -885,7 +894,7 @@ def test_update_provider_merges_config_preserves_credentials(
 
         got = stub.GetProvider(
             openshell_pb2.GetProviderRequest(
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 name=name,
             )
         )
@@ -912,7 +921,7 @@ def test_update_provider_rejects_type_change(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="openai",
@@ -924,7 +933,9 @@ def test_update_provider_rejects_type_change(
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.UpdateProvider(
                 openshell_pb2.UpdateProviderRequest(
-                    workspace="default",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
                     provider=datamodel_pb2.Provider(
                         metadata=datamodel_pb2.ObjectMeta(name=name),
                         type="nvidia",
@@ -1026,9 +1037,10 @@ def test_provider_profile_platform_vs_workspace_isolation(
     def _cleanup() -> None:
         for pid, ws in [(platform_id, ""), (workspace_id, "default")]:
             try:
-                stub.DeleteProviderProfile(
-                    openshell_pb2.DeleteProviderProfileRequest(id=pid, workspace=ws)
-                )
+                request = openshell_pb2.DeleteProviderProfileRequest(id=pid)
+                if ws:
+                    request.workspace_scope.workspace = ws
+                stub.DeleteProviderProfile(request)
             except grpc.RpcError:
                 pass
 
@@ -1037,7 +1049,6 @@ def test_provider_profile_platform_vs_workspace_isolation(
         resp = stub.ImportProviderProfiles(
             openshell_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile(platform_id)],
-                workspace="",
             )
         )
         assert resp.imported, "platform-scoped import should succeed"
@@ -1045,13 +1056,13 @@ def test_provider_profile_platform_vs_workspace_isolation(
         resp = stub.ImportProviderProfiles(
             openshell_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile(workspace_id)],
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             )
         )
         assert resp.imported, "workspace-scoped import should succeed"
 
         platform_list = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(page_size=200, workspace="")
+            openshell_pb2.ListProviderProfilesRequest(page_size=200)
         )
         platform_ids = [p.id for p in platform_list.profiles]
         assert platform_id in platform_ids, (
@@ -1063,7 +1074,8 @@ def test_provider_profile_platform_vs_workspace_isolation(
 
         workspace_list = stub.ListProviderProfiles(
             openshell_pb2.ListProviderProfilesRequest(
-                page_size=200, workspace="default"
+                page_size=200,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             )
         )
         workspace_ids = [p.id for p in workspace_list.profiles]
@@ -1106,7 +1118,7 @@ def test_cross_workspace_profile_ids_do_not_collide(
         resp_a = stub.ImportProviderProfiles(
             openshell_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile()],
-                workspace=ws_a,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_a),
             )
         )
         assert resp_a.imported, "import into ws-a should succeed"
@@ -1114,20 +1126,26 @@ def test_cross_workspace_profile_ids_do_not_collide(
         resp_b = stub.ImportProviderProfiles(
             openshell_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile()],
-                workspace=ws_b,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_b),
             )
         )
         assert resp_b.imported, "import into ws-b should succeed"
 
         list_a = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(page_size=200, workspace=ws_a)
+            openshell_pb2.ListProviderProfilesRequest(
+                page_size=200,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_a),
+            )
         )
         assert any(p.id == profile_id for p in list_a.profiles), (
             "profile should appear in ws-a"
         )
 
         list_b = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(page_size=200, workspace=ws_b)
+            openshell_pb2.ListProviderProfilesRequest(
+                page_size=200,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_b),
+            )
         )
         assert any(p.id == profile_id for p in list_b.profiles), (
             "profile should appear in ws-b"
@@ -1137,7 +1155,8 @@ def test_cross_workspace_profile_ids_do_not_collide(
             with contextlib.suppress(Exception):
                 stub.DeleteProviderProfile(
                     openshell_pb2.DeleteProviderProfileRequest(
-                        id=profile_id, workspace=ws
+                        id=profile_id,
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws),
                     )
                 )
             with contextlib.suppress(Exception):
