@@ -37,19 +37,28 @@ once. The sandbox receives opaque handles for only the access token and account
 ID; it never receives the refresh token. Run this command once per gateway.
 
 ```shell
-openshell provider create \
-  --name codex \
-  --type codex \
-  --credential "CODEX_AUTH_ACCESS_TOKEN=$(jq -er '.tokens.access_token' "$HOME/.codex/auth.json")" \
-  --credential "CODEX_AUTH_ACCOUNT_ID=$(jq -er '.tokens.account_id' "$HOME/.codex/auth.json")" && \
-env "CODEX_REFRESH_TOKEN=$(jq -er '.tokens.refresh_token' "$HOME/.codex/auth.json")" \
+(
+  set -e
+
+  export CODEX_AUTH_ACCESS_TOKEN="$(jq -er '.tokens.access_token' "$HOME/.codex/auth.json")"
+  export CODEX_AUTH_ACCOUNT_ID="$(jq -er '.tokens.account_id' "$HOME/.codex/auth.json")"
+  export CODEX_AUTH_REFRESH_TOKEN="$(jq -er '.tokens.refresh_token' "$HOME/.codex/auth.json")"
+
+  openshell provider create \
+    --name codex \
+    --type codex \
+    --credential CODEX_AUTH_ACCESS_TOKEN \
+    --credential CODEX_AUTH_ACCOUNT_ID
+
   openshell provider refresh configure codex \
     --credential-key CODEX_AUTH_ACCESS_TOKEN \
     --strategy oauth2-refresh-token \
     --material client_id=app_EMoamEEZ73f0CkXaXp7hrann \
-    --secret-material-env refresh_token=CODEX_REFRESH_TOKEN && \
-openshell provider refresh rotate codex \
-  --credential-key CODEX_AUTH_ACCESS_TOKEN
+    --secret-material-env refresh_token=CODEX_AUTH_REFRESH_TOKEN
+
+  openshell provider refresh rotate codex \
+    --credential-key CODEX_AUTH_ACCESS_TOKEN
+)
 ```
 
 ## 3. Launch the sandbox
