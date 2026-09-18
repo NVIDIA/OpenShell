@@ -29,6 +29,7 @@ pub struct LocalBoundaryExec {
     ca_file_paths: Option<Arc<(std::path::PathBuf, std::path::PathBuf)>>,
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
+    repair_standard_sbin: bool,
     runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
     #[cfg(target_os = "linux")]
     launcher: openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
@@ -53,22 +54,36 @@ impl LocalBoundaryExec {
             ca_file_paths,
             provider_credentials,
             user_environment,
+            repair_standard_sbin: false,
             runtime,
             #[cfg(target_os = "linux")]
             launcher,
         }
     }
 
+    /// Configure whether workload paths should include the standard sbin directories.
+    #[must_use]
+    pub fn with_standard_sbin_path_repair(mut self, enabled: bool) -> Self {
+        self.repair_standard_sbin = enabled;
+        self
+    }
+
     fn command(&self, spec: &ExecSpec) -> Result<Command, BackendError> {
         if spec.program.is_empty() {
             return Err(BackendError::Process("exec program is empty".to_string()));
         }
+        let repair_standard_sbin = self.repair_standard_sbin;
+        let args = crate::process::process_args_with_standard_sbin_paths(
+            &spec.program,
+            &spec.args,
+            repair_standard_sbin,
+        );
         let mut command = Command::new(&spec.program);
-        command.args(&spec.args);
+        command.args(args);
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         let (session_user, session_home) =
             crate::process::session_user_and_home(&self.policy, effective_workdir);
-        let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
+        let path = crate::child_env::child_path_from_env(repair_standard_sbin);
         command
             .env_clear()
             .env(openshell_core::sandbox_env::SANDBOX, "1")
@@ -79,7 +94,17 @@ impl LocalBoundaryExec {
             .env("TERM", if spec.pty { "xterm-256color" } else { "dumb" });
         for (key, value) in &self.user_environment {
             if !key.starts_with("OPENSHELL_") {
-                command.env(key, value);
+                if key == "PATH" {
+                    command.env(
+                        key,
+                        crate::child_env::maybe_path_with_standard_sbin_paths(
+                            value,
+                            repair_standard_sbin,
+                        ),
+                    );
+                } else {
+                    command.env(key, value);
+                }
             }
         }
         if let Some((ca_cert_path, combined_bundle_path)) = self.ca_file_paths.as_deref() {
@@ -89,13 +114,33 @@ impl LocalBoundaryExec {
         }
         for (key, value) in self.provider_credentials.child_env_with_gcp_resolved() {
             if !crate::process::is_supervisor_only_env_var(&key) {
-                command.env(key, value);
+                if key == "PATH" {
+                    command.env(
+                        key,
+                        crate::child_env::maybe_path_with_standard_sbin_paths(
+                            &value,
+                            repair_standard_sbin,
+                        ),
+                    );
+                } else {
+                    command.env(key, value);
+                }
             }
         }
         crate::process::strip_proxy_env_std(&mut command);
         for (key, value) in &spec.env {
             if !key.starts_with("OPENSHELL_") {
-                command.env(key, value);
+                if key == "PATH" {
+                    command.env(
+                        key,
+                        crate::child_env::maybe_path_with_standard_sbin_paths(
+                            value,
+                            repair_standard_sbin,
+                        ),
+                    );
+                } else {
+                    command.env(key, value);
+                }
             }
         }
         if let Some(workdir) = spec.workdir.as_deref().or(self.base_workdir.as_deref()) {
