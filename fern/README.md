@@ -13,7 +13,7 @@ OpenShell uses [Fern](https://buildwithfern.com/) to validate, preview, and publ
 | `fern/assets/` | Logos and other shared assets. |
 | `fern/main.css` | Site-wide styles. |
 
-In a normal source checkout, `fern/docs.yml` points the `latest` version at `docs/index.yml`. Release automation builds the multi-version configuration on the generated `docs-website` branch.
+In a normal source checkout, `fern/docs.yml` points the `dev` version at `docs/index.yml`. Release automation builds the multi-version configuration on the generated `docs-website` branch and maps the source documentation to the channel being published.
 
 ## Local development
 

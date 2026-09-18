@@ -247,9 +247,9 @@ def test_source_version_announcement_maps_single_source_version_to_channel(
             {
                 "versions": [
                     {
-                        "display-name": "Latest",
+                        "display-name": "Dev",
                         "path": "../docs/index.yml",
-                        "slug": "latest",
+                        "slug": "dev",
                         "announcement": {"message": "Snapshot announcement."},
                     }
                 ]
@@ -377,9 +377,9 @@ def test_sync_docs_scopes_version_announcements_to_updated_channel(
             {
                 "versions": [
                     {
-                        "display-name": "Latest",
+                        "display-name": "Dev",
                         "path": "../docs/index.yml",
-                        "slug": "latest",
+                        "slug": "dev",
                         "announcement": {"message": "OpenShell 0.1.0 is coming soon."},
                     }
                 ]
@@ -433,9 +433,9 @@ def test_sync_docs_scopes_version_announcements_to_updated_channel(
             {
                 "versions": [
                     {
-                        "display-name": "Latest",
+                        "display-name": "Dev",
                         "path": "../docs/index.yml",
-                        "slug": "latest",
+                        "slug": "dev",
                         "announcement": {"message": "OpenShell 0.1.0 is released."},
                     }
                 ]
