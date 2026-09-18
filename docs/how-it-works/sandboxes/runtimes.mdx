@@ -103,6 +103,17 @@ Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint
 
 Docker Desktop must have host networking enabled, and it cannot use Enhanced Container Isolation. Set `grpc_endpoint` when sandboxes cannot reach the gateway on host loopback. For GPU sandboxes, configure Docker CDI before starting the gateway.
 
+For Docker GPU/CDI sandboxes, OpenShell uses Docker's selected CDI device IDs
+and daemon-reported CDI spec directories to build a workload CDI context. The
+driver embeds the context in the protected boundary configuration and
+bind-mounts the spec directories read-only into the workload. If context
+creation fails, the driver removes the created state. If workload or supervisor
+startup fails, it also removes the runtime resources before reporting the
+failure. The sandbox runtime derives filesystem and supplemental group
+requirements from CDI specs before launching agent processes. Non-GPU Docker
+sandboxes do not receive the CDI context, spec mounts, or CDI-derived policy
+changes.
+
 ### Docker Corporate Proxy Egress
 
 For proxy-required networks, the Docker driver accepts `https_proxy`,
