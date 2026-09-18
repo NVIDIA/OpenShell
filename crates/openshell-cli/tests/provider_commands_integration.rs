@@ -95,6 +95,7 @@ struct ProviderState {
     fail_delete_provider_profile_message: Arc<Mutex<Option<String>>>,
     sandbox_providers: Arc<Mutex<HashMap<String, Vec<String>>>>,
     sandbox_provider_requests: Arc<Mutex<Vec<SandboxProviderRequestLog>>>,
+    sandbox_provider_next_page_token: Arc<Mutex<String>>,
     readiness_receipts: Arc<Mutex<HashMap<String, ProviderMutationReceipt>>>,
     readiness_scripts: Arc<Mutex<ReadinessScript>>,
     readiness_requests: Arc<Mutex<Vec<GetSandboxProviderStatusRequest>>>,
@@ -131,6 +132,8 @@ enum ProviderRefreshRequestLog {
 enum SandboxProviderRequestLog {
     List {
         sandbox_name: String,
+        page_size: i32,
+        page_token: String,
     },
     Attach {
         sandbox_name: String,
@@ -346,6 +349,8 @@ impl OpenShell for TestOpenShell {
             .await
             .push(SandboxProviderRequestLog::List {
                 sandbox_name: sandbox_name.clone(),
+                page_size: request.page_size,
+                page_token: request.page_token,
             });
         let provider_names = self
             .state
@@ -362,7 +367,12 @@ impl OpenShell for TestOpenShell {
             .collect();
         Ok(Response::new(ListSandboxProvidersResponse {
             providers,
-            next_page_token: String::new(),
+            next_page_token: self
+                .state
+                .sandbox_provider_next_page_token
+                .lock()
+                .await
+                .clone(),
         }))
     }
 
@@ -3823,9 +3833,17 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
     )
     .await
     .expect("sandbox provider attach is idempotent");
-    run::sandbox_provider_list(&ts.endpoint, "dev-sandbox", "table", "default", &ts.tls)
-        .await
-        .expect("sandbox provider list");
+    run::sandbox_provider_list(
+        &ts.endpoint,
+        "dev-sandbox",
+        100,
+        "",
+        "table",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox provider list");
     run::sandbox_provider_detach(
         &ts.endpoint,
         "dev-sandbox",
@@ -3861,6 +3879,8 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
             },
             SandboxProviderRequestLog::List {
                 sandbox_name: "dev-sandbox".to_string(),
+                page_size: 100,
+                page_token: String::new(),
             },
             SandboxProviderRequestLog::Detach {
                 sandbox_name: "dev-sandbox".to_string(),
@@ -3875,6 +3895,85 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
 
     let providers = ts.state.sandbox_providers.lock().await;
     assert!(providers.get("dev-sandbox").is_none_or(Vec::is_empty));
+}
+
+#[tokio::test]
+async fn sandbox_provider_list_cli_forwards_pagination_and_emits_envelopes() {
+    let ts = run_server().await;
+    ts.state.providers.lock().await.insert(
+        "work-github".to_string(),
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "provider-work-github".to_string(),
+                name: "work-github".to_string(),
+                workspace: "default".to_string(),
+                resource_version: 1,
+                ..Default::default()
+            }),
+            r#type: "github".to_string(),
+            ..Default::default()
+        },
+    );
+    ts.state
+        .sandbox_providers
+        .lock()
+        .await
+        .insert("dev-sandbox".to_string(), vec!["work-github".to_string()]);
+    *ts.state.sandbox_provider_next_page_token.lock().await = "next-page".to_string();
+
+    for format in ["json", "yaml"] {
+        let output = run_readiness_cli(
+            &ts,
+            &[
+                "sandbox",
+                "provider",
+                "list",
+                "dev-sandbox",
+                "--page-size",
+                "1",
+                "--page-token",
+                "prior-page",
+                "--output",
+                format,
+            ],
+        )
+        .await;
+        assert!(
+            output.status.success(),
+            "sandbox provider list {format} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "structured output wrote to stderr"
+        );
+
+        let value: serde_json::Value = match format {
+            "json" => serde_json::from_slice(&output.stdout).expect("parse JSON envelope"),
+            "yaml" => serde_yml::from_slice(&output.stdout).expect("parse YAML envelope"),
+            _ => unreachable!(),
+        };
+        assert_eq!(value["next_page_token"], "next-page");
+        assert_eq!(value["providers"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["providers"][0]["name"], "work-github");
+    }
+
+    let requests = ts.state.sandbox_provider_requests.lock().await.clone();
+    assert_eq!(
+        requests,
+        vec![
+            SandboxProviderRequestLog::List {
+                sandbox_name: "dev-sandbox".to_string(),
+                page_size: 1,
+                page_token: "prior-page".to_string(),
+            },
+            SandboxProviderRequestLog::List {
+                sandbox_name: "dev-sandbox".to_string(),
+                page_size: 1,
+                page_token: "prior-page".to_string(),
+            },
+        ]
+    );
 }
 
 #[tokio::test]
