@@ -362,7 +362,7 @@ fn receipt_json(receipt: &ProviderMutationReceipt) -> serde_json::Value {
     serde_json::json!({
         "receipt_id": receipt.receipt_id,
         "mutation_id": receipt.mutation_id,
-        "provider_name": receipt.provider,
+        "provider": receipt.provider,
         "workspace": receipt.workspace,
         "kind": receipt.kind().as_str_name().trim_start_matches("PROVIDER_MUTATION_KIND_").to_ascii_lowercase(),
         "desired": desired,
@@ -558,6 +558,24 @@ mod tests {
         assert!(value["receipt"]["persisted_time"].is_null());
         assert!(value["observed_time"].is_null());
         assert!(value["evaluated_time"].is_null());
+    }
+
+    #[test]
+    fn receipt_json_uses_canonical_entity_reference_names() {
+        let receipt = ProviderMutationReceipt {
+            provider: "provider".to_string(),
+            desired: Some(ProviderDesiredIdentity {
+                sandbox: "sandbox".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let value = receipt_json(&receipt);
+        assert_eq!(value["provider"], "provider");
+        assert_eq!(value["desired"]["sandbox"], "sandbox");
+        assert!(value.get("provider_name").is_none());
+        assert!(value["desired"].get("sandbox_name").is_none());
     }
 
     #[test]
