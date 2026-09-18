@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Install OpenShell Debian package
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Copy OpenShell Debian package
+      become: true
+      ansible.builtin.copy:
+        src: "{{ openshell_deb }}"
+        dest: /var/tmp/openshell.deb
+        mode: "0644"
+
+    - name: Install OpenShell Debian package
+      become: true
+      ansible.builtin.apt:
+        deb: /var/tmp/openshell.deb
