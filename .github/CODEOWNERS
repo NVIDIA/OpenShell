@@ -1,5 +1,35 @@
-# Broad ownership — core team reviews everything
+## Broad ownership — core team reviews everything
 * @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 
-# Vouch list — maintainers only (bot commits bypass, but manual edits need review)
+## Vouch list — maintainers only (bot commits bypass, but manual edits need review)
 .github/VOUCHED.td @NVIDIA/openshell-codeowners
+
+## Merge enforcement — these paths decide who can merge, so they notify the full
+# list of maintainers to raise scrutiny on changes here.
+# 
+# PR checks run local to the branch, so unless the check specifically avoids
+# using branch-local files, a PR could change its own gates and appear to pass
+# them. Covering the required checks here closes that gap.
+#
+# The whole workflows directory is covered, not just the approval gate, because
+# any workflow can claim a required check context or ask for a broader token.
+#
+# Normally, we'd use a GitHub team to cover all maintainers, but org-level
+# policies prevent outside collaborators from being on a GH team at this time
+# so we spell them out explicitly.
+
+# Core check mechanisms
+/.github/workflows/ @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/.github/actions/ @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/.github/CODEOWNERS @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/.github/zizmor.yml @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+
+# `MAINTAINERS.md` maintainer approval checks
+/MAINTAINERS.md @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/check_maintainer_approval.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/alert_maintainer_change.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/check_maintainer_approval_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/alert_maintainer_change_test.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+
+# Auditable SBOM check
+/tasks/scripts/verify-image-sbom.sh @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
