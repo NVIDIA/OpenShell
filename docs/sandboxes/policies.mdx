@@ -126,7 +126,33 @@ See [Supervisor Middleware](/extensibility/supervisor-middleware) for registrati
 
 When a sandbox runs in proxy mode (the default), OpenShell automatically adds baseline filesystem paths required for the sandbox child process to function: `/usr`, `/lib`, `/etc`, and `/var/log` (read-only), plus `/tmp` (read-write). When `filesystem.include_workdir` is `true`, OpenShell also adds the resolved working directory as read-write. Paths like `/app` are included in the baseline set but are only added if they exist in the container image.
 
-For GPU sandboxes, OpenShell also adds existing GPU device nodes as read-write paths. CUDA workloads require write access to procfs for thread metadata, so GPU baseline enrichment moves `/proc` from read-only to read-write when GPU devices are present.
+For GPU sandboxes without a CDI context, OpenShell also adds existing GPU
+device nodes as read-write paths. GPU baseline enrichment grants read-only
+access to the `/sys` tree already exposed by the container runtime because CUDA
+reads hardware and driver topology during initialization. CUDA workloads also
+require write access to procfs for thread metadata, so GPU enrichment moves
+`/proc` from read-only to read-write when GPU devices or CDI specs are present.
+
+GPU sandboxes from CDI-capable compute drivers receive CDI-derived filesystem
+requirements instead of the hard-coded GPU device and library baseline. The
+workload-side sandbox runtime resolves the selected CDI device specs and adds
+CDI device nodes as read-write paths. For read-only mounts, it adds the parent directories of shared
+libraries whose filenames end in `.so` or a numeric SONAME suffix with any
+number of dot-separated components, such as `.so.1`, `.so.1.2`, or
+`.so.1.2.3`. It retains exact destinations for other read-only mounts. OpenShell
+does not add a derived path when an existing read-only or read-write parent
+already covers it. CDI `additionalGids` are applied as
+supplemental groups before agent processes drop privileges.
+
+Writable CDI mount destinations are fail-closed. OpenShell accepts a writable
+CDI mount only when it targets a single file and that exact path is already
+listed in `filesystem_policy.read_write`. Writable CDI directory mounts and
+CDI paths such as `/`, `/dev`, `/proc`, `/sys`, `/run`, or `/usr` are rejected
+during sandbox startup.
+
+The GPU `/sys` permission is a runtime-owned compatibility baseline. CDI
+specs cannot request broad sysfs access, and non-GPU sandboxes do not receive
+this baseline.
 
 This filtering prevents a missing baseline path from degrading Landlock enforcement. Without it, a single missing path could cause the entire Landlock ruleset to fail, leaving the sandbox with no filesystem restrictions at all.
 
