@@ -147,13 +147,14 @@ def test_resolve_availability() -> None:
         sdw.resolve_availability("dev", "alpha")
 
 
-def test_parse_and_render_versions_preserves_availability() -> None:
+def test_parse_and_render_versions_preserves_version_settings() -> None:
     raw_versions = [
         {
             "display-name": "v0.0.36",
             "path": "./versions/v0.0.36.yml",
             "slug": "v0.0.36",
             "availability": "deprecated",
+            "announcement": {"message": "Upgrade to the latest version."},
         }
     ]
 
@@ -165,9 +166,94 @@ def test_parse_and_render_versions_preserves_availability() -> None:
             "v0.0.36",
             "./versions/v0.0.36.yml",
             "deprecated",
+            {"message": "Upgrade to the latest version."},
         )
     ]
     assert sdw.render_versions(entries) == raw_versions
+
+
+def test_sync_announcements_applies_source_config(tmp_path: Path) -> None:
+    source_docs_yml = tmp_path / "source.yml"
+    target_docs_yml = tmp_path / "target.yml"
+    source_docs_yml.write_text(
+        yaml.safe_dump(
+            {
+                "announcement": {"message": "Current global announcement."},
+                "versions": [
+                    {
+                        "display-name": "Latest",
+                        "path": "../docs/index.yml",
+                        "slug": "latest",
+                        "announcement": {"message": "OpenShell 0.1.0 is coming soon."},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    target_docs_yml.write_text(
+        yaml.safe_dump(
+            {
+                "announcement": {"message": "Stale global announcement."},
+                "versions": [
+                    {
+                        "display-name": "Latest (v0.0.116)",
+                        "path": "./versions/latest.yml",
+                        "slug": "latest",
+                    },
+                    {
+                        "display-name": "Dev",
+                        "path": "./versions/dev.yml",
+                        "slug": "dev",
+                        "announcement": {"message": "Development docs."},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sdw.sync_announcements(source_docs_yml, target_docs_yml)
+
+    target_data = read_yaml(target_docs_yml)
+    assert target_data["announcement"] == {"message": "Current global announcement."}
+    assert target_data["versions"] == [
+        {
+            "display-name": "Latest (v0.0.116)",
+            "path": "./versions/latest.yml",
+            "slug": "latest",
+            "announcement": {"message": "OpenShell 0.1.0 is coming soon."},
+        },
+        {
+            "display-name": "Dev",
+            "path": "./versions/dev.yml",
+            "slug": "dev",
+            "announcement": {"message": "Development docs."},
+        },
+    ]
+
+    source_docs_yml.write_text(
+        yaml.safe_dump(
+            {
+                "versions": [
+                    {
+                        "display-name": "Latest",
+                        "path": "../docs/index.yml",
+                        "slug": "latest",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sdw.sync_announcements(source_docs_yml, target_docs_yml)
+
+    target_data = read_yaml(target_docs_yml)
+    assert "announcement" not in target_data
+    versions = target_data["versions"]
+    assert "announcement" not in versions[0]
+    assert versions[1]["announcement"] == {"message": "Development docs."}
 
 
 def test_ordered_entries_pins_latest_then_dev() -> None:
@@ -212,6 +298,8 @@ def _make_source_tree(root: Path) -> None:
         encoding="utf-8",
     )
     fern = root / "fern"
+    fern.mkdir(parents=True)
+    (fern / "docs.yml").write_text(yaml.safe_dump({"versions": []}), encoding="utf-8")
     (fern / "assets").mkdir(parents=True)
     (fern / "assets" / "logo.svg").write_text("<svg/>", encoding="utf-8")
     (fern / "components").mkdir(parents=True)
@@ -233,6 +321,30 @@ def test_sync_docs_creates_planned_latest_and_dev_selector(tmp_path: Path) -> No
     website = tmp_path / "docs-website"
     _make_source_tree(source)
     _make_docs_website_tree(website)
+    (source / "fern" / "docs.yml").write_text(
+        yaml.safe_dump(
+            {
+                "versions": [
+                    {
+                        "display-name": "Latest",
+                        "path": "../docs/index.yml",
+                        "slug": "latest",
+                        "announcement": {"message": "OpenShell 0.1.0 is coming soon."},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (website / "fern" / "docs.yml").write_text(
+        yaml.safe_dump(
+            {
+                "announcement": {"message": "Stale global announcement."},
+                "versions": [],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     sdw.sync_docs(
         Namespace(
@@ -276,6 +388,7 @@ def test_sync_docs_creates_planned_latest_and_dev_selector(tmp_path: Path) -> No
             "display-name": "Latest (v0.0.116)",
             "path": "./versions/latest.yml",
             "slug": "latest",
+            "announcement": {"message": "OpenShell 0.1.0 is coming soon."},
         },
         {
             "display-name": "Dev",
@@ -284,6 +397,7 @@ def test_sync_docs_creates_planned_latest_and_dev_selector(tmp_path: Path) -> No
             "availability": "beta",
         },
     ]
+    assert "announcement" not in docs_yml
     assert "./components" in docs_yml["experimental"]["mdx-components"]
 
 
