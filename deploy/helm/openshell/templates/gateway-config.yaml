@@ -220,6 +220,12 @@ data:
     gateway_namespace             = {{ .Release.Namespace | quote }}
     gateway_pod_selector          = { "app.kubernetes.io/name" = {{ include "openshell.name" . | quote }}, "app.kubernetes.io/instance" = {{ .Release.Name | quote }} }
 
+    [openshell.drivers.kubernetes.warm_pool]
+    enabled = {{ .Values.server.drivers.kubernetes.warmPool.enabled }}
+    max_pairs = {{ .Values.server.drivers.kubernetes.warmPool.maxPairs }}
+    preparation_timeout_seconds = {{ .Values.server.drivers.kubernetes.warmPool.preparationTimeoutSeconds }}
+    max_idle_seconds = {{ .Values.server.drivers.kubernetes.warmPool.maxIdleSeconds }}
+
     [openshell.drivers.kubernetes.sandbox_runtime]
     network_policy_enforced      = {{ .Values.supervisor.sandboxRuntime.networkPolicyEnforced }}
     boundary_port                = {{ .Values.supervisor.sandboxRuntime.boundaryPort | default 5500 }}

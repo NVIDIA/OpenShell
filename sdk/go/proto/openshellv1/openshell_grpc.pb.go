@@ -92,6 +92,7 @@ const (
 	OpenShell_UndoDraftChunk_FullMethodName                = "/openshell.v1.OpenShell/UndoDraftChunk"
 	OpenShell_ClearDraftChunks_FullMethodName              = "/openshell.v1.OpenShell/ClearDraftChunks"
 	OpenShell_GetDraftHistory_FullMethodName               = "/openshell.v1.OpenShell/GetDraftHistory"
+	OpenShell_RegisterSupervisor_FullMethodName            = "/openshell.v1.OpenShell/RegisterSupervisor"
 	OpenShell_IssueSandboxToken_FullMethodName             = "/openshell.v1.OpenShell/IssueSandboxToken"
 	OpenShell_RefreshSandboxToken_FullMethodName           = "/openshell.v1.OpenShell/RefreshSandboxToken"
 	OpenShell_CreateWorkspace_FullMethodName               = "/openshell.v1.OpenShell/CreateWorkspace"
@@ -292,6 +293,8 @@ type OpenShellClient interface {
 	ClearDraftChunks(ctx context.Context, in *ClearDraftChunksRequest, opts ...grpc.CallOption) (*ClearDraftChunksResponse, error)
 	// Get decision history for a sandbox's draft policy.
 	GetDraftHistory(ctx context.Context, in *GetDraftHistoryRequest, opts ...grpc.CallOption) (*GetDraftHistoryResponse, error)
+	// Wait for the driver-verified proxy's durable assignment before activation.
+	RegisterSupervisor(ctx context.Context, in *RegisterSupervisorRequest, opts ...grpc.CallOption) (*RegisterSupervisorResponse, error)
 	// Exchange a sandbox-bootstrap credential (e.g. a Kubernetes projected
 	// ServiceAccount token) for a gateway-minted JWT bound to the calling
 	// sandbox's UUID. Used by the Kubernetes driver path; singleplayer
@@ -1052,6 +1055,16 @@ func (c *openShellClient) GetDraftHistory(ctx context.Context, in *GetDraftHisto
 	return out, nil
 }
 
+func (c *openShellClient) RegisterSupervisor(ctx context.Context, in *RegisterSupervisorRequest, opts ...grpc.CallOption) (*RegisterSupervisorResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RegisterSupervisorResponse)
+	err := c.cc.Invoke(ctx, OpenShell_RegisterSupervisor_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *openShellClient) IssueSandboxToken(ctx context.Context, in *IssueSandboxTokenRequest, opts ...grpc.CallOption) (*IssueSandboxTokenResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(IssueSandboxTokenResponse)
@@ -1331,6 +1344,8 @@ type OpenShellServer interface {
 	ClearDraftChunks(context.Context, *ClearDraftChunksRequest) (*ClearDraftChunksResponse, error)
 	// Get decision history for a sandbox's draft policy.
 	GetDraftHistory(context.Context, *GetDraftHistoryRequest) (*GetDraftHistoryResponse, error)
+	// Wait for the driver-verified proxy's durable assignment before activation.
+	RegisterSupervisor(context.Context, *RegisterSupervisorRequest) (*RegisterSupervisorResponse, error)
 	// Exchange a sandbox-bootstrap credential (e.g. a Kubernetes projected
 	// ServiceAccount token) for a gateway-minted JWT bound to the calling
 	// sandbox's UUID. Used by the Kubernetes driver path; singleplayer
@@ -1574,6 +1589,9 @@ func (UnimplementedOpenShellServer) ClearDraftChunks(context.Context, *ClearDraf
 }
 func (UnimplementedOpenShellServer) GetDraftHistory(context.Context, *GetDraftHistoryRequest) (*GetDraftHistoryResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetDraftHistory not implemented")
+}
+func (UnimplementedOpenShellServer) RegisterSupervisor(context.Context, *RegisterSupervisorRequest) (*RegisterSupervisorResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RegisterSupervisor not implemented")
 }
 func (UnimplementedOpenShellServer) IssueSandboxToken(context.Context, *IssueSandboxTokenRequest) (*IssueSandboxTokenResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method IssueSandboxToken not implemented")
@@ -2796,6 +2814,24 @@ func _OpenShell_GetDraftHistory_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_RegisterSupervisor_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterSupervisorRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).RegisterSupervisor(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_RegisterSupervisor_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).RegisterSupervisor(ctx, req.(*RegisterSupervisorRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OpenShell_IssueSandboxToken_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(IssueSandboxTokenRequest)
 	if err := dec(in); err != nil {
@@ -3212,6 +3248,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetDraftHistory",
 			Handler:    _OpenShell_GetDraftHistory_Handler,
+		},
+		{
+			MethodName: "RegisterSupervisor",
+			Handler:    _OpenShell_RegisterSupervisor_Handler,
 		},
 		{
 			MethodName: "IssueSandboxToken",

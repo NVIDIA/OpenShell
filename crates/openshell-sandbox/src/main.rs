@@ -1856,8 +1856,31 @@ fn run_boundary(_bootstrap: &Path, _log_level: &str) -> Result<()> {
     Err(miette::miette!("openshell-sandbox requires Linux"))
 }
 
+fn boundary_health() -> Result<()> {
+    let saved = std::fs::read_to_string("/.openshell/state/boundary-ready").into_diagnostic()?;
+    let pid = saved
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| miette::miette!("missing boundary PID"))?;
+    let pid: u32 = pid.parse().into_diagnostic()?;
+    let current = std::fs::read_to_string(format!("/proc/{pid}/stat")).into_diagnostic()?;
+    // comm may contain spaces: fields after the final ')' start at field 3.
+    let start = |stat: &str| {
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(19))
+            .map(str::to_owned)
+    };
+    if start(&saved).is_none() || start(&saved) != start(&current) {
+        return Err(miette::miette!("boundary listener is not ready"));
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let raw_args = std::env::args().collect::<Vec<_>>();
+    if raw_args.get(1).map(String::as_str) == Some("boundary-health") {
+        return boundary_health();
+    }
     if raw_args.get(1).map(String::as_str) == Some(COPY_SELF_SUBCOMMAND) {
         let dest = raw_args.get(2).ok_or_else(|| {
             miette::miette!("usage: openshell-sandbox {COPY_SELF_SUBCOMMAND} <DEST>")

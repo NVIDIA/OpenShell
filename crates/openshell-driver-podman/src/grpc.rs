@@ -50,6 +50,23 @@ impl ComputeDriverService {
 
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
+    async fn select_warm_pair(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>, Status> {
+        let _ = &request;
+        Err(Status::unimplemented(
+            "warm pair allocation is not supported",
+        ))
+    }
+
+    async fn sync_warm_pools(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>, Status> {
+        Err(Status::unimplemented("warm pools are not supported"))
+    }
+
     async fn authenticate_sandbox(
         &self,
         _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
@@ -663,6 +680,7 @@ mod tests {
             Request::new(DeleteSandboxRequest {
                 sandbox_id: String::new(),
                 name: "demo".to_string(),
+                ..Default::default()
             }),
         )
         .await
@@ -694,6 +712,7 @@ mod tests {
             Request::new(DeleteSandboxRequest {
                 sandbox_id: sandbox_id.to_string(),
                 name: "demo".to_string(),
+                ..Default::default()
             }),
         )
         .await

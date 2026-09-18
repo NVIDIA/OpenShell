@@ -198,6 +198,7 @@ pub struct KubernetesComputeConfig {
     pub supervisor_image_pull_policy: Option<KubernetesImagePullPolicy>,
     /// Cross-pod sandbox/supervisor settings.
     pub sandbox_runtime: KubernetesSandboxRuntimeConfig,
+    pub warm_pool: WarmPoolConfig,
     /// Corporate HTTP forward proxy used by the network supervisor for
     /// policy-approved TLS CONNECT egress.
     pub https_proxy: Option<String>,
@@ -312,6 +313,7 @@ impl Default for KubernetesComputeConfig {
             supervisor_image: config::default_supervisor_image(),
             supervisor_image_pull_policy: None,
             sandbox_runtime: KubernetesSandboxRuntimeConfig::default(),
+            warm_pool: WarmPoolConfig::default(),
             https_proxy: None,
             no_proxy: None,
             proxy_auth_secret_name: None,
@@ -337,6 +339,7 @@ impl Default for KubernetesComputeConfig {
 impl KubernetesComputeConfig {
     /// Validate startup configuration without connecting to Kubernetes.
     pub fn validate_configuration(&self) -> Result<(), String> {
+        self.warm_pool.validate()?;
         self.validate_workspace_mode()?;
         self.validate_provider_spiffe_workload_api_socket_path()?;
         self.validate_sandbox_identity_config()?;
@@ -1617,5 +1620,38 @@ mod tests {
         assert!(al.insert("ns2".to_string()));
         assert!(al.read().contains("ns2"));
         assert!(al.remove("ns1"));
+    }
+}
+
+/// Limits for template-scoped, single-use spare pairs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WarmPoolConfig {
+    pub enabled: bool,
+    pub max_pairs: u32,
+    pub preparation_timeout_seconds: u64,
+    pub max_idle_seconds: u64,
+}
+impl Default for WarmPoolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_pairs: 10,
+            preparation_timeout_seconds: 300,
+            max_idle_seconds: 3600,
+        }
+    }
+}
+
+impl WarmPoolConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_pairs > 1000
+            || self.preparation_timeout_seconds < 30
+            || self.max_idle_seconds < self.preparation_timeout_seconds
+            || self.max_idle_seconds > 86400
+        {
+            return Err("warm_pool requires max_pairs <= 1000 and 30 <= preparation_timeout_seconds <= max_idle_seconds <= 86400".into());
+        }
+        Ok(())
     }
 }

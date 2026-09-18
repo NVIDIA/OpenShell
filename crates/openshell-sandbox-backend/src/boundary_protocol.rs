@@ -323,7 +323,8 @@ impl SandboxRuntimeDescriptor {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BoundaryConfig {
-    /// Stable identity expected in every authenticated request.
+    /// Logical sandbox identity. Empty for a prepared Kubernetes pair whose
+    /// first signed, resource-bound credential establishes assignment.
     pub boundary_id: String,
     /// Immutable driver-owned workload generation.
     pub generation: String,

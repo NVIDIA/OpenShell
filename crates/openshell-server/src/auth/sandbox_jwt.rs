@@ -262,10 +262,50 @@ impl SandboxSessionJwtAuthority {
         })
     }
 
+    pub(crate) fn preparation_trust(&self) -> Result<(String, Vec<u8>), Status> {
+        Ok((
+            self.gateway_id.clone(),
+            serde_json::to_vec(&self.verification_keys)
+                .map_err(|_| Status::internal("encode preparation trust"))?,
+        ))
+    }
+
     pub fn verify_gateway_token(&self, token: &str) -> Result<AuthenticatedSandboxSession, Status> {
         self.gateway_verifier
             .verify(token)
             .map_err(|error| Status::unauthenticated(format!("invalid gateway session: {error}")))
+    }
+
+    /// Mint initial assignment without reviving a superseded credential lineage.
+    pub fn mint_registration(
+        &self,
+        sandbox_id: &str,
+        identity: &crate::auth::sandbox_session::PersistedSandboxIdentity,
+        session_id: SandboxSessionId,
+        resource_binding: std::collections::BTreeMap<String, String>,
+    ) -> Result<SupervisorAuthBundle, Status> {
+        if identity.refresh_replay.is_some() {
+            return Err(Status::failed_precondition(
+                "runtime has already refreshed; use the cold-path restart lifecycle",
+            ));
+        }
+        let mut bundle = self.mint_persisted_launch(sandbox_id, identity)?.supervisor;
+        let token = self
+            .issuer
+            .mint_bound_sandbox_token(
+                &SandboxRuntimeIdentity {
+                    sandbox_id: SandboxId::parse(sandbox_id)
+                        .map_err(|_| Status::invalid_argument("invalid sandbox ID"))?,
+                    runtime_generation: identity.runtime_generation.clone(),
+                    auth_epoch: identity.auth_epoch,
+                },
+                resource_binding,
+            )
+            .map_err(|_| Status::internal("assignment signing failed"))?;
+        bundle.session_id = session_id;
+        bundle.sandbox_token = token.token;
+        bundle.sandbox_expires_at = token.expires_at;
+        Ok(bundle)
     }
 }
 

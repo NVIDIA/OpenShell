@@ -4,6 +4,26 @@ A sandbox is the runtime boundary where agent code executes. A compute driver
 creates it and connects two dedicated components: `openshell-sandbox` inside
 the workload boundary and `openshell-supervisor` outside it.
 
+Kubernetes warm pooling is enabled by default, but only templates with startup
+hints request spare workload/supervisor pairs. The driver caps total unassigned
+inventory; operators can disable pooling through driver configuration or Helm.
+Each claimed pair belongs to one logical sandbox and is never returned to the pool.
+The gateway reserves each physical target in its database atomically with the
+logical allocation intent before sending a claim to the driver. Concurrent
+requests that lose the reservation immediately select another candidate without
+retiring the winner's pair. Create and recovery use bounded retries for definite
+claim rejection and persist each replacement before claiming it. Exhausted warm
+capacity falls back to cold creation in the same invocation. Uncertain claims
+retain their target and generation for idempotent recovery.
+The Sandbox resource owns the assignment. Reconciliation copies its logical
+sandbox name and ID onto both Pods as display labels and updates their sandbox-ID
+annotations for SPIFFE identity. Physical pair selectors and registration
+bindings remain stable. A successful claim wakes
+registration waiters on the same gateway replica; polling durable state remains
+the fallback for other replicas and recovery. Every wake revalidates identity.
+Prepared pairs also carry template name and ID labels on their parent and both
+Pods. These display labels survive assignment and do not affect pool compatibility.
+
 ## Runtime Model
 
 Each sandbox has three trust levels:
@@ -27,6 +47,10 @@ TCP Service, or VM vsock channel. Independent bidirectional `Exchange` RPCs
 carry lifecycle, exec, TCP, and forwarding traffic, while one persistent
 bidirectional `Mediate` RPC carries multiplexed DNS traffic. General application
 UDP is unsupported; UDP DNS remains mediated by the supervisor.
+Boundary connection attempts bound transport establishment and TLS negotiation
+to two seconds per attempt within a 30-second retry window. The window also
+cancels an in-flight attempt at its deadline. Initial attachment can retry calls
+for up to five minutes while the workload boots.
 The sandbox probes HTTP/2 connection liveness every five seconds and closes
 connections that miss a ten-second acknowledgement deadline. Closing a
 connection freezes the owned workload process tree and cancels its stream
@@ -50,9 +74,13 @@ connections, including loopback aliases. Unix control listeners reject workload
 descendants using kernel peer credentials and process ancestry, while ordinary
 workload loopback and Unix services remain available.
 NetworkPolicy is an outer reachability fence, not a confidentiality boundary.
-Each sandbox generation receives a fresh CA and distinct server/client leaves;
-both endpoints bind the same workload identity and immutable driver resource
-claims. Driver crates do not appear in generic process, network, SSH, or
+Each sandbox generation receives a fresh CA and server certificate. The
+supervisor verifies server TLS; the workload authenticates the supervisor using
+a gateway-signed boundary JWT, not a TLS client certificate. Both endpoints bind
+the workload identity and immutable driver resource claims. Kubernetes can
+prepare the listener before logical assignment: the first JWT must also contain
+the exact protected resource binding before the workload accepts its sandbox ID.
+Driver crates do not appear in generic process, network, SSH, or
 session code.
 
 The supervisor exposes readiness only after the sandbox is confirmed and the
@@ -656,6 +684,14 @@ A leader-owned scan runs independently of driver inventory. Expiry records
 `Error`/`ProvisioningTimedOut` before reclaiming compute; cleanup progress and
 backoff survive restart. Late runtime reports cannot replace that result. The
 record and restartable storage survive cleanup, including for ephemeral creates.
+Allocation recovery checks the same persisted deadline before retrying compute.
+Timeout cleanup retires an unclaimed warm candidate through the driver's claim
+CAS before acknowledging reclamation; a candidate already claimed by the sandbox
+uses normal stop semantics to retain storage. Cleanup clears allocation intent
+only after retirement and reclamation succeed. Late allocation results are fenced
+by provisioning attempt and runtime generation, and cannot rearm an expired
+attempt. Records with leftover allocation intent require cleanup even if an older
+gateway already recorded cleanup completion.
 Explicit start is blocked while cleanup is pending, then creates a fresh attempt
 using the latest configuration. Configuration edits alone never restart an
 expired sandbox. Legacy provisioning records receive one persisted rollout

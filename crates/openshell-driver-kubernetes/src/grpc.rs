@@ -52,20 +52,51 @@ impl ComputeDriverService {
 
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
+    async fn select_warm_pair(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>, Status> {
+        let _ = &request;
+        Ok(Response::new(
+            self.driver.select_warm_pair(request.into_inner()).await?,
+        ))
+    }
+
+    async fn sync_warm_pools(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>, Status> {
+        self.driver.sync_warm_pools(_request.into_inner()).await?;
+        Ok(Response::new(
+            openshell_core::proto::compute::v1::SyncWarmPoolsResponse {},
+        ))
+    }
+
     async fn authenticate_sandbox(
         &self,
         request: Request<AuthenticateSandboxRequest>,
     ) -> Result<Response<AuthenticateSandboxResponse>, Status> {
-        self.rpc_tracer
-            .trace(openshell_otel::rpc::AUTHENTICATE_SANDBOX, async {
-                let credential = request.into_inner().credential;
-                if credential.is_empty() {
-                    return Err(Status::invalid_argument("credential is required"));
-                }
-                let sandbox_id = self.driver.authenticate_sandbox(&credential).await?;
-                Ok(Response::new(AuthenticateSandboxResponse { sandbox_id }))
-            })
-            .await
+        Box::pin(
+            self.rpc_tracer
+                .trace(openshell_otel::rpc::AUTHENTICATE_SANDBOX, async {
+                    let request = request.into_inner();
+                    let credential = request.credential;
+                    if credential.is_empty() {
+                        return Err(Status::invalid_argument("credential is required"));
+                    }
+                    if request.supervisor_registration {
+                        return Box::pin(self.driver.authenticate_supervisor(&credential))
+                            .await
+                            .map(Response::new);
+                    }
+                    let sandbox_id = self.driver.authenticate_sandbox(&credential).await?;
+                    Ok(Response::new(AuthenticateSandboxResponse {
+                        sandbox_id,
+                        registration: None,
+                    }))
+                }),
+        )
+        .await
     }
 
     async fn get_capabilities(
@@ -149,10 +180,14 @@ impl ComputeDriver for ComputeDriverService {
         Box::pin(
             self.rpc_tracer
                 .trace(openshell_otel::rpc::CREATE_SANDBOX, async {
+                    let request = request.into_inner();
                     let sandbox = request
-                        .into_inner()
                         .sandbox
                         .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
+                    if let Some(candidate) = request.warm_pair {
+                        self.driver.claim_warm_pair(&sandbox, &candidate).await?;
+                        return Ok(Response::new(CreateSandboxResponse {}));
+                    }
                     self.driver
                         .create_sandbox(&sandbox)
                         .await
@@ -219,6 +254,18 @@ impl ComputeDriver for ComputeDriverService {
                 let request = request.into_inner();
                 if request.sandbox_id.is_empty() {
                     return Err(Status::invalid_argument("sandbox_id is required"));
+                }
+                if let Some(candidate) = &request.warm_pair {
+                    self.driver
+                        .cancel_warm_pair(
+                            &request.sandbox_id,
+                            candidate,
+                            request.only_unassigned_pair,
+                        )
+                        .await?;
+                }
+                if request.only_unassigned_pair {
+                    return Ok(Response::new(DeleteSandboxResponse { deleted: true }));
                 }
                 let deleted = self
                     .driver
