@@ -70,6 +70,7 @@ fn hello() -> SupervisorHello {
     SupervisorHello {
         sandbox_id: Uuid::new_v4().to_string(),
         instance_id: Uuid::new_v4().to_string(),
+        capabilities: Vec::new(),
         supports_provider_readiness: true,
     }
 }

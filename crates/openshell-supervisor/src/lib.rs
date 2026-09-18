@@ -19,11 +19,8 @@ mod activity_aggregator;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
-<<<<<<< HEAD
-mod provider_readiness;
-=======
 mod otlp_relay;
->>>>>>> e9eff28c0 (feat(supervisor): wire the OTLP relay into the proxy and gateway session)
+mod provider_readiness;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
