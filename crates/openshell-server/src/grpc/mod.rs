@@ -9,7 +9,8 @@ pub mod policy;
 pub mod provider;
 mod provider_credentials;
 pub mod provider_readiness;
-mod sandbox;
+pub mod sandbox;
+mod supervisor_registration;
 pub use sandbox::mint_persisted_authentication;
 mod service;
 mod validation;
@@ -765,6 +766,13 @@ impl OpenShell for OpenShellService {
     }
 
     // --- Sandbox identity ---
+
+    async fn register_supervisor(
+        &self,
+        request: Request<openshell_core::proto::RegisterSupervisorRequest>,
+    ) -> Result<Response<openshell_core::proto::RegisterSupervisorResponse>, Status> {
+        supervisor_registration::register(&self.state, request).await
+    }
 
     async fn issue_sandbox_token(
         &self,

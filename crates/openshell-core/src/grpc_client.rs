@@ -294,6 +294,79 @@ impl Drop for ClientSpanStatus {
     }
 }
 
+/// Register with a driver-native projected credential, before installing any
+/// operational token slots. Re-read the token on every reconnect for rotation.
+pub async fn register_supervisor(
+    endpoint: &str,
+) -> Result<crate::proto::RegisterSupervisorResponse> {
+    let path = std::env::var(sandbox_env::K8S_SA_TOKEN_FILE)
+        .into_diagnostic()
+        .wrap_err("registration requires a projected service-account token")?;
+    register_supervisor_until_assigned(Duration::from_secs(2), || async {
+        let token = tokio::fs::read_to_string(&path).await.into_diagnostic()?;
+        let result = match build_plain_channel(endpoint).await {
+            Ok(channel) => {
+                let mut client = OpenShellClient::new(channel);
+                let mut request = tonic::Request::new(crate::proto::RegisterSupervisorRequest {});
+                request.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", token.trim())
+                        .parse()
+                        .into_diagnostic()?,
+                );
+                request.set_timeout(Duration::from_secs(45));
+                client
+                    .register_supervisor(request)
+                    .await
+                    .map(tonic::Response::into_inner)
+            }
+            Err(_) => Err(Status::unavailable("registration transport unavailable")),
+        };
+        Ok(result)
+    })
+    .await
+}
+
+async fn register_supervisor_until_assigned<F, Fut>(
+    retry_delay: Duration,
+    mut attempt: F,
+) -> Result<crate::proto::RegisterSupervisorResponse>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<
+        Output = Result<std::result::Result<crate::proto::RegisterSupervisorResponse, Status>>,
+    >,
+{
+    loop {
+        match attempt().await? {
+            Ok(assignment) => return Ok(assignment),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    tonic::Code::Unavailable
+                        | tonic::Code::DeadlineExceeded
+                        | tonic::Code::Cancelled
+                        | tonic::Code::Aborted
+                        | tonic::Code::Unauthenticated
+                        // A gateway Service may still route to an older replica
+                        // during a rollout. Provisioning deadlines bound startup.
+                        | tonic::Code::Unimplemented
+                ) =>
+            {
+                // Log only the code, never credential-bearing response bodies.
+                debug!(code = ?error.code(), "supervisor registration unavailable; retrying");
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => {
+                return Err(miette::miette!(
+                    "supervisor registration rejected ({:?})",
+                    error.code()
+                ));
+            }
+        }
+    }
+}
+
 /// Build a Bearer-authenticated channel to the gateway.
 ///
 /// First call per process resolves the sandbox JWT via the three-step
@@ -715,6 +788,35 @@ fn parse_jwt_exp_ms(jwt: &str) -> Option<i64> {
 #[cfg(test)]
 mod auth_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn supervisor_registration_survives_older_gateway_replicas() {
+        let mut responses = std::collections::VecDeque::from([
+            Err(Status::unimplemented("older gateway")),
+            Err(Status::unauthenticated("older authenticator")),
+            Ok(crate::proto::RegisterSupervisorResponse {
+                sandbox_id: "assigned".into(),
+                ..Default::default()
+            }),
+        ]);
+        let assignment = register_supervisor_until_assigned(Duration::ZERO, || {
+            std::future::ready(Ok(responses.pop_front().expect("unexpected retry")))
+        })
+        .await
+        .unwrap();
+        assert_eq!(assignment.sandbox_id, "assigned");
+        assert!(responses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn supervisor_registration_stops_on_permanent_rejection() {
+        let error = register_supervisor_until_assigned(Duration::ZERO, || {
+            std::future::ready(Ok(Err(Status::permission_denied("rejected"))))
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("PermissionDenied"));
+    }
 
     #[cfg(feature = "jwt")]
     #[test]

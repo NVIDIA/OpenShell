@@ -64,6 +64,9 @@ rules:
       - delete
       {{- end }}
   {{- if ne $workspaceMode "shared" }}
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
   # Cluster-wide sandbox CRD access for managed/operator workspace modes.
   - apiGroups:
       - agents.x-k8s.io
@@ -107,8 +110,8 @@ rules:
     verbs: ["create", "get"]
   {{- end }}
   {{- if eq $workspaceMode "managed" }}
-  # Operator-mode namespaces receive Secret permissions from the
-  # openshell-workspace chart Role instead.
+  # Reads of managed bootstrap journals are scoped to the driver namespace.
+  # Operator namespaces grant Secret permissions through the workspace chart.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create", "delete"]

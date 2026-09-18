@@ -3043,6 +3043,23 @@ fn validate_docker_outer_fence(
 }
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
+    async fn select_warm_pair(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>, Status> {
+        let _ = &request;
+        Err(Status::unimplemented(
+            "warm pair allocation is not supported",
+        ))
+    }
+
+    async fn sync_warm_pools(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>, Status> {
+        Err(Status::unimplemented("warm pools are not supported"))
+    }
+
     type WatchSandboxesStream = WatchStream;
 
     async fn authenticate_sandbox(
@@ -3196,6 +3213,23 @@ impl ComputeDriver for ComputeDriverService {
 
 #[tonic::async_trait]
 impl ComputeDriver for DockerComputeDriver {
+    async fn select_warm_pair(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>, Status> {
+        let _ = &request;
+        Err(Status::unimplemented(
+            "warm pair allocation is not supported",
+        ))
+    }
+
+    async fn sync_warm_pools(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>, Status> {
+        Err(Status::unimplemented("warm pools are not supported"))
+    }
+
     async fn authenticate_sandbox(
         &self,
         _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
@@ -3264,6 +3298,7 @@ impl ComputeDriver for DockerComputeDriver {
 
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
+            runtime_identity: String::new(),
         }))
     }
 

@@ -86,6 +86,14 @@ impl ComputeDriverRpc {
 pub mod rpc {
     use super::ComputeDriverRpc;
 
+    pub const SELECT_WARM_PAIR: ComputeDriverRpc = ComputeDriverRpc::new(
+        "SelectWarmPair",
+        "openshell.compute.v1.ComputeDriver/SelectWarmPair",
+    );
+    pub const SYNC_WARM_POOLS: ComputeDriverRpc = ComputeDriverRpc::new(
+        "SyncWarmPools",
+        "openshell.compute.v1.ComputeDriver/SyncWarmPools",
+    );
     pub const AUTHENTICATE_SANDBOX: ComputeDriverRpc = ComputeDriverRpc::new(
         "AuthenticateSandbox",
         "openshell.compute.v1.ComputeDriver/AuthenticateSandbox",
@@ -186,6 +194,8 @@ impl<B> MakeSpan<B> for ComputeDriverRpcSpan {
 /// Maps the generated compute-driver RPC schema to low-cardinality span names.
 pub fn compute_driver_rpc_operation(path: &str) -> Option<ComputeDriverRpc> {
     match path.rsplit('/').next() {
+        Some("SelectWarmPair") => Some(rpc::SELECT_WARM_PAIR),
+        Some("SyncWarmPools") => Some(rpc::SYNC_WARM_POOLS),
         Some("AuthenticateSandbox") => Some(rpc::AUTHENTICATE_SANDBOX),
         Some("GetCapabilities") => Some(rpc::GET_CAPABILITIES),
         Some("ValidateSandboxCreate") => Some(rpc::VALIDATE_SANDBOX_CREATE),
@@ -308,6 +318,8 @@ mod tests {
     #[test]
     fn compute_driver_rpc_names_are_explicitly_mapped_and_schema_bounded() {
         for rpc in [
+            rpc::SELECT_WARM_PAIR,
+            rpc::SYNC_WARM_POOLS,
             rpc::AUTHENTICATE_SANDBOX,
             rpc::GET_CAPABILITIES,
             rpc::VALIDATE_SANDBOX_CREATE,
