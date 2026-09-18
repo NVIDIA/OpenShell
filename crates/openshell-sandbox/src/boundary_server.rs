@@ -4271,7 +4271,7 @@ mod linux {
         fn test_outer_fence() -> openshell_isolation_interface::contract::OuterFenceGuarantees {
             use openshell_isolation_interface::contract::OuterFenceGuarantee;
 
-            openshell_isolation_interface::contract::OuterFenceGuarantees::from_driver_evidence(
+            openshell_isolation_interface::contract::OuterFenceGuarantees::from_enforcement_evidence(
                 "generation-1",
                 [
                     OuterFenceGuarantee::DefaultDenyEgress,

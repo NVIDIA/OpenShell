@@ -52,7 +52,7 @@ impl DockerOuterFenceEvidence<'_> {
             BackendError::Descriptor(format!("encode Docker outer fence evidence: {error}"))
         })?;
         let projection =
-            OuterFenceGuarantees::from_driver_evidence(generation, established, &encoded)?;
+            OuterFenceGuarantees::from_enforcement_evidence(generation, established, &encoded)?;
         projection.validate(generation)?;
         Ok(projection)
     }

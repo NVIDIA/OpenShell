@@ -43,7 +43,7 @@ impl VmOuterFenceEvidence<'_> {
         let encoded = serde_json::to_vec(self).map_err(|error| {
             BackendError::Descriptor(format!("encode VM outer fence evidence: {error}"))
         })?;
-        let projection = OuterFenceGuarantees::from_driver_evidence(
+        let projection = OuterFenceGuarantees::from_enforcement_evidence(
             self.generation,
             established.into_iter().flatten(),
             &encoded,

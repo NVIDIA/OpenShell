@@ -426,7 +426,7 @@ pub struct SandboxRuntimeDescriptor {
     /// example pod UID, VM generation, or container ID).
     #[serde(default)]
     pub resource_claims: std::collections::BTreeMap<String, String>,
-    /// Backend-neutral projection of the driver-validated outer fence.
+    /// Backend-neutral projection of the validated outer network fence.
     pub outer_fence: OuterFenceGuarantees,
 }
 
@@ -494,7 +494,7 @@ pub struct BoundaryConfig {
     pub resource_claim_files: std::collections::BTreeMap<String, PathBuf>,
     /// Exact identity already applied by the runtime to the sandbox process.
     pub workload_identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
-    /// Backend-neutral projection of the driver-validated outer fence.
+    /// Backend-neutral projection of the validated outer network fence.
     pub outer_fence: OuterFenceGuarantees,
     /// Driver-resolved environment exposed only to workload processes.
     #[serde(default)]

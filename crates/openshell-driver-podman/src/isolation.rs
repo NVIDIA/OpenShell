@@ -56,7 +56,7 @@ impl PodmanOuterFenceEvidence<'_> {
         }
         let encoded = serde_json::to_vec(self).map_err(invalid)?;
         let projection =
-            OuterFenceGuarantees::from_driver_evidence(generation, established, &encoded)
+            OuterFenceGuarantees::from_enforcement_evidence(generation, established, &encoded)
                 .map_err(invalid)?;
         projection.validate(generation).map_err(invalid)?;
         Ok(projection)

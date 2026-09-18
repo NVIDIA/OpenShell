@@ -386,23 +386,25 @@ pub trait BoundBoundary: Send {
     async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError>;
 }
 
-/// Backend-neutral guarantees established by the compute driver's outer fence.
+/// Backend-neutral guarantees established by the component that owns the outer
+/// network fence.
 ///
-/// Each driver owns its native evidence schema and the code that validates it.
-/// After validation, the driver projects that evidence into these guarantees
-/// and supplies a digest that binds the original evidence to this generation.
-/// The common runtime only validates and compares this projection; it never
-/// interprets runtime- or accelerator-specific fields.
+/// The enforcement owner may be a compute driver or a delegated isolation
+/// backend. It owns its native evidence schema and the code that validates it.
+/// After validation, it projects that evidence into these guarantees and
+/// supplies a digest that binds the original evidence to this generation. The
+/// common runtime only validates and compares this projection; it never
+/// interprets backend- or runtime-specific fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OuterFenceGuarantee {
     /// No workload packet can leave without an explicit mediated decision.
     DefaultDenyEgress,
-    /// The driver found no network path outside the mediated boundary.
+    /// The enforcement owner found no network path outside the mediated boundary.
     NoUnmanagedEgressPath,
-    /// Previously granted access can be revoked by the driver-owned fence.
+    /// Previously granted access can be revoked by the enforcement owner.
     RevocationVerified,
-    /// Loss of the driver or its controller does not open network access.
+    /// Loss of the fence's controller does not open network access.
     ControllerLossFailsClosed,
 }
 
@@ -410,19 +412,20 @@ pub enum OuterFenceGuarantee {
 pub struct OuterFenceGuarantees {
     /// Sandbox generation for which the evidence was collected.
     pub generation: String,
-    /// Complete set of normalized guarantees established by the driver.
+    /// Complete set of normalized guarantees established by the enforcement owner.
     pub established: BTreeSet<OuterFenceGuarantee>,
-    /// Commitment to the driver-owned native evidence used for this projection.
+    /// Commitment to the enforcement owner's native evidence.
     pub evidence_digest: Sha256Digest,
 }
 
 impl OuterFenceGuarantees {
-    /// Bind the guarantees explicitly established by driver-owned evidence.
+    /// Bind guarantees explicitly established by validated enforcement evidence.
     ///
     /// This constructor deliberately does not infer guarantees from the mere
-    /// presence of evidence. The driver must inspect its native state and
-    /// project each established guarantee before calling this function.
-    pub fn from_driver_evidence(
+    /// presence of evidence. The enforcement owner must inspect its native
+    /// state and project each established guarantee before calling this
+    /// function.
+    pub fn from_enforcement_evidence(
         generation: impl Into<String>,
         established: impl IntoIterator<Item = OuterFenceGuarantee>,
         native_evidence: &[u8],
@@ -529,7 +532,7 @@ pub struct BoundaryConfirmation {
     pub authenticated_supervisor: bool,
     pub session_id: SandboxSessionId,
     pub outer_fence: OuterFenceGuarantees,
-    /// The driver-owned containment primitive terminates the workload when its
+    /// The backend-owned containment primitive terminates the workload when its
     /// Sandbox Runtime exits.
     pub runtime_exit_terminates_workload: bool,
     pub resource_claims: BTreeMap<String, String>,

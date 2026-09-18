@@ -1944,7 +1944,7 @@ mod tests {
     fn test_outer_fence() -> openshell_isolation_interface::contract::OuterFenceGuarantees {
         use openshell_isolation_interface::contract::OuterFenceGuarantee;
 
-        openshell_isolation_interface::contract::OuterFenceGuarantees::from_driver_evidence(
+        openshell_isolation_interface::contract::OuterFenceGuarantees::from_enforcement_evidence(
             "test-generation",
             [
                 OuterFenceGuarantee::DefaultDenyEgress,
@@ -2737,7 +2737,7 @@ mod tests {
     async fn remote_confirm_rejects_outer_fence_digest_mismatch_before_monitoring() {
         let mut confirmation = test_confirmation();
         let different_fence =
-            openshell_isolation_interface::contract::OuterFenceGuarantees::from_driver_evidence(
+            openshell_isolation_interface::contract::OuterFenceGuarantees::from_enforcement_evidence(
                 "test-generation",
                 confirmation.outer_fence.established.iter().copied(),
                 b"different evidence",

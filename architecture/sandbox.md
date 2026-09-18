@@ -84,17 +84,20 @@ replacement from granting authority.
 6. Exec, signaling, PTY, DNS, TCP, and loopback-forwarding operations cross the
    authenticated channel for the lifetime of the sandbox generation.
 
-The shared isolation contract receives only the driver's normalized outer-fence
-guarantees: egress is default-deny, there is no unmanaged egress path, the
-evidence is bound to the sandbox generation, revocation has been verified, and
-controller loss fails closed. A digest commits those guarantees to the native
-driver evidence without teaching the shared contract about container networks,
+The shared isolation contract receives only normalized outer-fence guarantees:
+egress is default-deny, there is no unmanaged egress path, the evidence is bound
+to the sandbox generation, revocation has been verified, and controller loss
+fails closed. A digest commits those guarantees to the native
+evidence without teaching the shared contract about container networks,
 Kubernetes objects, VM devices, or accelerator resources.
 
-Each driver makes that projection explicitly. Non-empty native evidence alone
-does not establish a guarantee:
+The component that owns the outer fence also validates its native evidence and
+makes that projection explicitly. In the current Docker, Podman, Kubernetes,
+and VM placements, that component is the compute driver. A delegated isolation
+backend may own the fence and make the same projection instead. Non-empty native
+evidence alone does not establish a guarantee:
 
-| Driver | Native evidence | Guarantees projected by the driver |
+| Current enforcement owner | Native evidence | Guarantees projected by the owner |
 |---|---|---|
 | Docker | Pinned container ID, `network_mode=none`, and no unexpected network attachments | No workload route establishes default-deny, revocation, and controller-loss behavior; the attachment inspection establishes that no unmanaged route exists. |
 | Podman | Pinned container ID, `--network=none`, and no unexpected network attachments | The same container-network facts establish the same four guarantees. |
@@ -129,7 +132,7 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 | Filesystem policy | Landlock restricts the paths the agent can read or write. |
 | Process policy | Sandbox and children run as one immutable non-root identity with zero capabilities. |
 | Seccomp notification | Virtualizes supported INET sockets and sends DNS/TCP decisions to the supervisor without nftables or proxy environment variables. |
-| Driver outer fence | Docker `network_mode=none`, a NIC-less VM, or Kubernetes NetworkPolicy prevents any missed or unsupported kernel path from escaping. |
+| Outer network fence | The component that owns network enforcement prevents any missed or unsupported kernel path from escaping. Current examples are Docker `network_mode=none`, a NIC-less VM, and Kubernetes NetworkPolicy. |
 | Policy proxy | Evaluates destination, binary identity, TLS/L7 rules, SSRF checks, and inference interception. |
 
 The supervisor may enrich baseline filesystem allowances for runtime-required
@@ -230,7 +233,7 @@ cannot transfer that approval to another socket.
 
 The outer fence remains mandatory. If notification handling misses a syscall,
 loses the supervisor, exceeds a bound, or encounters an unsupported socket
-type, the request fails and the driver-owned fence still blocks direct egress.
+type, the request fails and the outer fence still blocks direct egress.
 
 CONNECT and absolute-form forward HTTP are explicit-proxy adapters over the same
 egress pipeline. Each adapter normalizes its request into an egress intent, and

@@ -369,7 +369,7 @@ fn workload_identity() -> ResolvedWorkloadIdentity {
 }
 
 fn complete_outer_fence(generation: &str, evidence: &[u8]) -> OuterFenceGuarantees {
-    OuterFenceGuarantees::from_driver_evidence(
+    OuterFenceGuarantees::from_enforcement_evidence(
         generation,
         [
             OuterFenceGuarantee::DefaultDenyEgress,
@@ -425,10 +425,10 @@ fn outer_fence_guarantees_are_backend_neutral_and_fail_closed() {
         assert!(incomplete.validate("generation-1").is_err());
     }
 
-    assert!(OuterFenceGuarantees::from_driver_evidence("", [], b"evidence").is_err());
-    assert!(OuterFenceGuarantees::from_driver_evidence("generation-1", [], b"").is_err());
+    assert!(OuterFenceGuarantees::from_enforcement_evidence("", [], b"evidence").is_err());
+    assert!(OuterFenceGuarantees::from_enforcement_evidence("generation-1", [], b"").is_err());
 
-    let unproven = OuterFenceGuarantees::from_driver_evidence(
+    let unproven = OuterFenceGuarantees::from_enforcement_evidence(
         "generation-1",
         [OuterFenceGuarantee::DefaultDenyEgress],
         b"native-driver-evidence",
