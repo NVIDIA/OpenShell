@@ -1698,7 +1698,12 @@ fn write_socket_addr(
     if copied != 0 {
         listener.write_task_output(notification_id, tid, address, &bytes[..copied])?;
     }
-    listener.write_task_output(notification_id, tid, length_address, &actual_length.to_ne_bytes())
+    listener.write_task_output(
+        notification_id,
+        tid,
+        length_address,
+        &actual_length.to_ne_bytes(),
+    )
 }
 
 fn sockaddr_bytes(address: SocketAddr) -> io::Result<(Vec<u8>, libc::socklen_t)> {

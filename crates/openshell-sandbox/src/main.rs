@@ -146,8 +146,8 @@ struct QualificationReport {
     tcp_allow_round_trip: bool,
     tcp_deny_round_trip: bool,
     wait_killable_recv: bool,
-    /// Selected seccomp listener cancellation mode: "killable" (>= 5.19) or
-    /// "legacy_read_only" (< 5.19, broker output writes disabled).
+    /// Selected seccomp listener cancellation mode: `killable` (>= 5.19) or
+    /// `legacy_read_only` (< 5.19, broker output writes disabled).
     seccomp_listener_mode: &'static str,
     /// Whether the broker disables task-memory output writes (legacy mode).
     task_memory_writes_disabled: bool,
