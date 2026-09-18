@@ -7,7 +7,7 @@ use crate::persistence::{PersistenceError, Store, WriteCondition};
 use openshell_core::time::now_ms;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const OWNER_OBJECT_TYPE: &str = "supervisor_session_owner";
@@ -26,6 +26,14 @@ pub enum OwnerError {
     Conflict,
     #[error("persistence error: {0}")]
     Store(#[from] PersistenceError),
+}
+
+impl OwnerError {
+    /// True when another replica holds ownership, as opposed to the store
+    /// being unreachable.
+    pub fn is_ownership_lost(&self) -> bool {
+        matches!(self, Self::AlreadyOwned | Self::Conflict)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +60,14 @@ pub struct OwnerRecord {
     pub resource_version: u64,
 }
 
+impl OwnerRecord {
+    /// True while the record's last update is within `ttl`.
+    pub fn is_fresh(&self, ttl: Duration) -> bool {
+        let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+        now_ms().saturating_sub(self.updated_at_ms).max(0) < ttl_ms
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OwnerGuard {
     pub sandbox_id: String,
@@ -62,6 +78,15 @@ pub struct OwnerGuard {
     pub owner_peer_endpoint: String,
     connected_at_ms: i64,
     resource_version: u64,
+    last_renewed_at: Instant,
+}
+
+impl OwnerGuard {
+    /// True once renewals have failed for long enough that another replica can
+    /// supersede this claim, making it unsafe to keep serving the session.
+    pub fn claim_expired(&self, ttl: Duration) -> bool {
+        self.last_renewed_at.elapsed() >= ttl
+    }
 }
 
 pub struct SupervisorOwnerIndex {
@@ -119,6 +144,7 @@ impl SupervisorOwnerIndex {
             owner_peer_endpoint: owner_peer_endpoint.to_string(),
             connected_at_ms,
             resource_version: result.resource_version,
+            last_renewed_at: Instant::now(),
         })
     }
 
@@ -143,6 +169,7 @@ impl SupervisorOwnerIndex {
         {
             Ok(result) => {
                 guard.resource_version = result.resource_version;
+                guard.last_renewed_at = Instant::now();
                 Ok(())
             }
             Err(OwnerError::Store(PersistenceError::Conflict { .. })) => Err(OwnerError::Conflict),
@@ -234,9 +261,7 @@ fn can_supersede(
     connection_epoch: u64,
     ttl: Duration,
 ) -> bool {
-    let age_ms = now_ms() - existing.updated_at_ms;
-    let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
-    if age_ms >= ttl_ms {
+    if !existing.is_fresh(ttl) {
         return true;
     }
 
@@ -251,6 +276,64 @@ mod tests {
     async fn test_index(ttl: Duration) -> SupervisorOwnerIndex {
         let store = Arc::new(crate::persistence::test_store().await);
         SupervisorOwnerIndex::new(store, ttl)
+    }
+
+    fn record_updated_at(updated_at_ms: i64) -> OwnerRecord {
+        OwnerRecord {
+            session_id: "s1".to_string(),
+            supervisor_instance_id: "inst".to_string(),
+            connection_epoch: 1,
+            owner_replica_id: "gw-1".to_string(),
+            owner_peer_endpoint: "https://gw-1".to_string(),
+            connected_at_ms: 0,
+            updated_at_ms,
+            resource_version: 1,
+        }
+    }
+
+    fn owner_ttl_ms() -> i64 {
+        i64::try_from(OWNER_TTL.as_millis()).unwrap()
+    }
+
+    #[test]
+    fn freshness_clamps_a_future_timestamp_instead_of_going_negative() {
+        let skewed = record_updated_at(now_ms() + owner_ttl_ms() * 10);
+        assert!(skewed.is_fresh(OWNER_TTL));
+        assert!(!can_supersede(&skewed, "other-inst", 99, OWNER_TTL));
+    }
+
+    #[test]
+    fn only_ownership_conflicts_count_as_lost_ownership() {
+        assert!(OwnerError::AlreadyOwned.is_ownership_lost());
+        assert!(OwnerError::Conflict.is_ownership_lost());
+        assert!(
+            !OwnerError::Store(PersistenceError::Database("db unreachable".to_string()))
+                .is_ownership_lost()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claim_expires_once_renewals_stop_for_the_ttl() {
+        let index = test_index(OWNER_TTL).await;
+        let guard = index
+            .publish("sbx", "s1", "inst", 1, "gw-1", "http://gw-1")
+            .await
+            .unwrap();
+        assert!(!guard.claim_expired(OWNER_TTL));
+        assert!(guard.claim_expired(Duration::ZERO));
+    }
+
+    #[test]
+    fn freshness_survives_a_corrupt_timestamp() {
+        let corrupt = record_updated_at(i64::MIN);
+        assert!(!corrupt.is_fresh(OWNER_TTL));
+    }
+
+    #[test]
+    fn freshness_expires_past_the_ttl() {
+        let stale = record_updated_at(now_ms() - owner_ttl_ms() - 1);
+        assert!(!stale.is_fresh(OWNER_TTL));
+        assert!(can_supersede(&stale, "other-inst", 1, OWNER_TTL));
     }
 
     #[tokio::test]

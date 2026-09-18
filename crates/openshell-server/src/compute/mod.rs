@@ -3378,9 +3378,9 @@ impl ComputeRuntime {
         else {
             return Ok(None);
         };
-        let age_ms = openshell_core::time::now_ms() - owner.updated_at_ms;
-        let ttl_ms = i64::try_from(OWNER_TTL.as_millis()).unwrap_or(i64::MAX);
-        Ok((age_ms < ttl_ms).then_some(owner.supervisor_instance_id))
+        Ok(owner
+            .is_fresh(OWNER_TTL)
+            .then_some(owner.supervisor_instance_id))
     }
 
     async fn set_supervisor_session_state(
@@ -4028,8 +4028,9 @@ impl ComputeRuntime {
             }
 
             let sandbox = decode_sandbox_record(&current_record)?;
-            let age_ms =
-                openshell_core::time::now_ms().saturating_sub(current_record.created_at_ms);
+            let age_ms = openshell_core::time::now_ms()
+                .saturating_sub(current_record.created_at_ms)
+                .max(0);
             if age_ms < grace_ms {
                 return Ok(());
             }
