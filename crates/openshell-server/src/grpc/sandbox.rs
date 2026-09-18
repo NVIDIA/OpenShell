@@ -630,14 +630,41 @@ async fn handle_create_sandbox_inner(
 
     let mut service_urls = HashMap::with_capacity(request.service_exposures.len());
     for exposure in &request.service_exposures {
-        let endpoint = super::service::expose_service_endpoint(
+        let endpoint = match super::service::expose_service_endpoint(
             state,
             sandbox.object_workspace(),
             &sandbox,
             &exposure.service,
             exposure.target_port,
         )
-        .await?;
+        .await
+        {
+            Ok(endpoint) => endpoint,
+            Err(exposure_error) => {
+                let rollback = state
+                    .compute
+                    .delete_sandbox(sandbox.object_workspace(), sandbox.object_name())
+                    .await;
+                if let Err(rollback_error) = rollback {
+                    warn!(
+                        sandbox_id = %sandbox.object_id(),
+                        sandbox_name = %sandbox.object_name(),
+                        service_name = %exposure.service,
+                        exposure_error = %exposure_error,
+                        rollback_error = %rollback_error,
+                        "Failed to roll back sandbox after service exposure failed"
+                    );
+                    return Err(Status::internal(format!(
+                        "create sandbox failed while exposing service '{}': {}; rollback failed: {}; sandbox '{}' may require manual deletion",
+                        exposure.service,
+                        exposure_error.message(),
+                        rollback_error.message(),
+                        sandbox.object_name(),
+                    )));
+                }
+                return Err(exposure_error);
+            }
+        };
         service_urls.insert(exposure.service.clone(), endpoint.into_inner().url);
     }
 
@@ -5094,6 +5121,62 @@ mod tests {
             assert_eq!(endpoint.target_port, target_port);
             assert!(endpoint.domain);
         }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_begins_rollback_when_service_exposure_fails() {
+        let state = test_server_state().await;
+        let corrupt_service_key =
+            crate::service_routing::endpoint_key("rollback-services", "metrics");
+        state
+            .store
+            .put_if(
+                ServiceEndpoint::object_type(),
+                "corrupt-service-endpoint",
+                &corrupt_service_key,
+                "default",
+                b"not-a-service-endpoint",
+                None,
+                WriteCondition::MustCreate,
+            )
+            .await
+            .expect("corrupt service endpoint fixture should be stored");
+
+        let error = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "rollback-services".to_string(),
+                spec: Some(SandboxSpec::default()),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                service_exposures: vec![
+                    SandboxServiceExposure {
+                        service: "web".to_string(),
+                        target_port: 8080,
+                    },
+                    SandboxServiceExposure {
+                        service: "metrics".to_string(),
+                        target_port: 9090,
+                    },
+                ],
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("corrupt endpoint should fail sandbox creation");
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("fetch endpoint failed"));
+        let sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "rollback-services")
+            .await
+            .expect("sandbox lookup should succeed")
+            .expect("asynchronous driver cleanup retains a deleting record");
+        assert_eq!(
+            SandboxPhase::try_from(sandbox.phase()).ok(),
+            Some(SandboxPhase::Deleting),
+            "failed create must begin sandbox cleanup"
+        );
     }
 
     #[tokio::test]
