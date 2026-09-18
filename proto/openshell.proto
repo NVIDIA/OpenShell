@@ -2531,7 +2531,7 @@ message ExchangeProviderSubjectTokenResponse {
 
 // Update sandbox policy request.
 message UpdateConfigRequest {
-  // Workspace scope. Only a named workspace selection is accepted.
+  // Workspace scope. Omit for global updates; otherwise select one named workspace.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 10;
   // The new policy to apply.
   //
@@ -2648,7 +2648,7 @@ message UpdateConfigResponse {
 
 // Get sandbox policy status request.
 message GetSandboxPolicyStatusRequest {
-  // Workspace scope. Only a named workspace selection is accepted.
+  // Workspace scope. Omit for global queries; otherwise select one named workspace.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
   // The specific policy version to query. 0 means latest.
   uint32 version = 2;
@@ -2667,7 +2667,7 @@ message GetSandboxPolicyStatusResponse {
 
 // List sandbox policies request.
 message ListSandboxPoliciesRequest {
-  // Workspace scope. Only a named workspace selection is accepted.
+  // Workspace scope. Omit for global queries; otherwise select one named workspace.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
   // The maximum number of revisions to return. Zero uses 100. Values above
   // 1000 are coerced to 1000; negative values are invalid.

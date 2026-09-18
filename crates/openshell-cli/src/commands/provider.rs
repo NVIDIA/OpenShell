@@ -758,6 +758,12 @@ fn provider_profile_lookup_error(status: &Status) -> miette::Report {
     }
 }
 
+fn provider_profile_workspace_scope(
+    workspace: &str,
+) -> Option<openshell_core::proto::WorkspaceSelector> {
+    (!workspace.is_empty()).then(|| openshell_core::proto::workspace_selector(workspace))
+}
+
 /// Fetch the gateway's active provider profile catalog.
 ///
 /// Nothing about provider profiles is compiled into the CLI: the catalog is
@@ -774,9 +780,7 @@ pub async fn fetch_provider_profile_catalog(
             .list_provider_profiles(ListProviderProfilesRequest {
                 page_size: 100,
                 page_token,
-                workspace_scope: Some(openshell_core::proto::workspace_selector(
-                    workspace.to_string(),
-                )),
+                workspace_scope: provider_profile_workspace_scope(workspace),
             })
             .await
             .into_diagnostic()?
@@ -824,9 +828,7 @@ async fn fetch_provider_profile_exact(
     client
         .get_provider_profile(GetProviderProfileRequest {
             id: provider_type.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                workspace.to_string(),
-            )),
+            workspace_scope: provider_profile_workspace_scope(workspace),
         })
         .await
         .and_then(|response| {
@@ -1633,9 +1635,7 @@ pub async fn provider_profile_export_text(
     let response = client
         .get_provider_profile(GetProviderProfileRequest {
             id: id.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                workspace.to_string(),
-            )),
+            workspace_scope: provider_profile_workspace_scope(workspace),
         })
         .await
         .into_diagnostic()?;
@@ -1677,9 +1677,7 @@ pub async fn provider_profile_import(
             .import_provider_profiles(ImportProviderProfilesRequest {
                 request_id: String::new(),
                 profiles: items,
-                workspace_scope: Some(openshell_core::proto::workspace_selector(
-                    workspace.to_string(),
-                )),
+                workspace_scope: provider_profile_workspace_scope(workspace),
             })
             .await
             .into_diagnostic()?
@@ -1731,9 +1729,7 @@ pub async fn provider_profile_update(
                 profile: Some(item),
                 expected_resource_version,
                 id: id.to_string(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(
-                    workspace.to_string(),
-                )),
+                workspace_scope: provider_profile_workspace_scope(workspace),
             })
             .await
             .into_diagnostic()?
@@ -1766,9 +1762,7 @@ pub async fn provider_profile_lint(
         let response = client
             .lint_provider_profiles(LintProviderProfilesRequest {
                 profiles: items,
-                workspace_scope: Some(openshell_core::proto::workspace_selector(
-                    workspace.to_string(),
-                )),
+                workspace_scope: provider_profile_workspace_scope(workspace),
             })
             .await
             .into_diagnostic()?
@@ -1799,9 +1793,7 @@ pub async fn provider_profile_delete(
                 request_id: String::new(),
                 allow_missing: true,
                 id: id.clone(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(
-                    workspace.to_string(),
-                )),
+                workspace_scope: provider_profile_workspace_scope(workspace),
             })
             .await
         {
@@ -2557,6 +2549,18 @@ mod tests {
         ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
         ProviderProfileCredential, datamodel::v1::ObjectMeta,
     };
+
+    #[test]
+    fn provider_profile_workspace_scope_omits_platform_scope() {
+        assert!(provider_profile_workspace_scope("").is_none());
+
+        let scope = provider_profile_workspace_scope("team-a").expect("named workspace scope");
+        assert!(matches!(
+            scope.selection,
+            Some(openshell_core::proto::workspace_selector::Selection::Workspace(workspace))
+                if workspace == "team-a"
+        ));
+    }
 
     #[test]
     fn attached_provider_json_is_sorted_and_secret_safe() {

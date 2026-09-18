@@ -358,7 +358,7 @@ impl KubernetesSandboxDriverConfig {
 #[serde(default, deny_unknown_fields)]
 struct KubernetesPodDriverConfig {
     node_selector: BTreeMap<String, String>,
-    runtime_class: String,
+    runtime_class_name: String,
     tolerations: Vec<serde_json::Value>,
     priority_class_name: String,
 }
@@ -5920,8 +5920,8 @@ fn sandbox_template_to_k8s_with_validated_config(
     let mut spec = serde_json::Map::new();
     let runtime_class_name = platform_config_string(template, "runtime_class_name")
         .or_else(|| {
-            (!driver_config.pod.runtime_class.is_empty())
-                .then(|| driver_config.pod.runtime_class.clone())
+            (!driver_config.pod.runtime_class_name.is_empty())
+                .then(|| driver_config.pod.runtime_class_name.clone())
         })
         .or_else(|| {
             (!params.default_runtime_class_name.is_empty())

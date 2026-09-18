@@ -1196,7 +1196,7 @@ mod tests {
             &codec,
             "openshell.v1.UpdateConfigRequest",
             json!({
-                "sandbox": "demo", "workspace": "default",
+                "workspaceScope": {"workspace": "default"}, "sandbox": "demo",
                 "expectedResourceVersion": "7"
             }),
         )
@@ -1237,7 +1237,7 @@ mod tests {
             &codec,
             "openshell.v1.UpdateConfigRequest",
             json!({
-                "sandbox": "demo", "workspace": "default",
+                "workspaceScope": {"workspace": "default"}, "sandbox": "demo",
                 "expectedResourceVersion": "7"
             }),
         )
@@ -1278,7 +1278,7 @@ mod tests {
             &codec,
             "openshell.v1.UpdateConfigRequest",
             json!({
-                "sandbox": "demo", "workspace": "default",
+                "workspaceScope": {"workspace": "default"}, "sandbox": "demo",
                 "expectedResourceVersion": "7"
             }),
         )
@@ -1311,7 +1311,7 @@ mod tests {
             &codec,
             "openshell.v1.UpdateConfigRequest",
             json!({
-                "sandbox": "demo", "workspace": "default",
+                "workspaceScope": {"workspace": "default"}, "sandbox": "demo",
                 "expectedResourceVersion": "7"
             }),
         )
@@ -1393,7 +1393,7 @@ mod tests {
             &codec,
             "openshell.v1.UpdateConfigRequest",
             json!({
-                "sandbox": "demo", "workspace": "default",
+                "workspaceScope": {"workspace": "default"}, "sandbox": "demo",
                 "expectedResourceVersion": "7"
             }),
         )
