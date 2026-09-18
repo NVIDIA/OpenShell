@@ -37,6 +37,7 @@ use oci_client::manifest::{
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
 use openshell_core::UpstreamProxyConfig;
+use openshell_core::driver_mounts;
 use openshell_core::gpu::{
     driver_gpu_requirements, effective_driver_gpu_count, validate_specific_gpu_device_request,
 };
@@ -112,6 +113,30 @@ const DEFAULT_ROOTFS_TAR_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const ROOTFS_TAR_STAGING_DIR: &str = "rootfs-tar-staging";
 const VM_CONSOLE_DIAGNOSTIC_BYTES: u64 = 8 * 1024;
 
+/// Mirrors the Docker/Podman `type` tag so their bind entries parse
+/// unchanged; virtiofs can only share host directories.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum VmMountType {
+    Bind,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VmMountConfig {
+    #[serde(default, rename = "type")]
+    #[allow(dead_code)]
+    mount_type: Option<VmMountType>,
+    source: String,
+    target: String,
+    #[serde(default = "default_read_only")]
+    read_only: bool,
+}
+
+fn default_read_only() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct VmSandboxDriverConfig {
@@ -121,6 +146,8 @@ struct VmSandboxDriverConfig {
     )]
     gpu_device_ids: Option<Vec<String>>,
     rootfs_tar_path: Option<String>,
+    #[serde(default)]
+    mounts: Vec<VmMountConfig>,
 }
 
 impl VmSandboxDriverConfig {
@@ -242,6 +269,7 @@ enum GuestImagePayloadSource {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct VmDriverConfig {
     /// Permit caller-supplied driver JSON. Does not waive resource admission.
     #[serde(default)]
@@ -293,6 +321,9 @@ pub struct VmDriverConfig {
     /// Maximum rootfs tar file size in bytes. Defaults to 10 GiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootfs_tar_max_bytes: Option<u64>,
+
+    #[serde(default)]
+    pub enable_bind_mounts: bool,
 }
 
 /// Redacting `Debug` so a proxy URL or credential path never reaches a log.
@@ -354,6 +385,7 @@ impl std::fmt::Debug for VmDriverConfig {
             )
             .field("rootfs_tar_staging_dir", &self.rootfs_tar_staging_dir)
             .field("rootfs_tar_max_bytes", &self.rootfs_tar_max_bytes)
+            .field("enable_bind_mounts", &self.enable_bind_mounts)
             .finish()
     }
 }
@@ -392,6 +424,7 @@ impl Default for VmDriverConfig {
             sandbox_gid: None,
             rootfs_tar_staging_dir: None,
             rootfs_tar_max_bytes: None,
+            enable_bind_mounts: false,
         }
     }
 }
@@ -1069,8 +1102,14 @@ impl VmDriver {
             sandbox,
         )?;
         validate_vm_sandbox(sandbox, self.config.gpu_enabled)?;
-        let has_rootfs_tar =
-            VmSandboxDriverConfig::from_sandbox(sandbox).is_ok_and(|c| c.rootfs_tar_path.is_some());
+        let driver_config =
+            VmSandboxDriverConfig::from_sandbox(sandbox).map_err(Status::invalid_argument)?;
+        validate_vm_driver_mounts(
+            &driver_config.mounts,
+            &self.config,
+            sandbox_requests_gpu(sandbox),
+        )?;
+        let has_rootfs_tar = driver_config.rootfs_tar_path.is_some();
         if self.resolved_sandbox_image(sandbox).is_none() && !has_rootfs_tar {
             return Err(Status::failed_precondition(
                 "vm sandboxes require template.image, rootfs_tar_path in driver_config, or a configured default sandbox image",
@@ -1274,12 +1313,7 @@ impl VmDriver {
         overlay_preparation: OverlayPreparation,
     ) -> Result<(), Status> {
         self.ensure_provisioning_active(&sandbox.id).await?;
-        let is_gpu = sandbox
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.resource_requirements.as_ref())
-            .and_then(|requirements| driver_gpu_requirements(Some(requirements)))
-            .is_some();
+        let is_gpu = sandbox_requests_gpu(&sandbox);
         let driver_config =
             VmSandboxDriverConfig::from_sandbox(&sandbox).map_err(Status::invalid_argument)?;
         let driver_config_had_rootfs_tar = driver_config.rootfs_tar_path.is_some();
@@ -1415,6 +1449,7 @@ impl VmDriver {
         };
 
         let needs_qemu = is_gpu;
+        validate_vm_mount_sources(&driver_config.mounts)?;
 
         let mut plan =
             match self.build_vm_launch_plan(&sandbox.id, needs_qemu, is_gpu, gpu_bdf.clone()) {
@@ -1587,6 +1622,10 @@ impl VmDriver {
             &channel_tls,
         )
         .map_err(|error| Status::internal(format!("inject VM boundary configuration: {error}")))?;
+        // Always written, even when empty, so an image-supplied manifest in
+        // the lowerdir can never drive guest mounts.
+        inject_guest_mount_manifest(&overlay_disk, &driver_config.mounts)
+            .map_err(|error| Status::internal(format!("inject VM mount manifest: {error}")))?;
         write_private_file(
             &state_dir.join(HOST_BOUNDARY_GENERATION_FILE),
             boundary_generation.as_bytes().to_vec(),
@@ -1648,6 +1687,14 @@ impl VmDriver {
         }
         for env in sandbox_owner_state.guest_environment() {
             command.arg("--vm-env").arg(env);
+        }
+        for (i, mount) in driver_config.mounts.iter().enumerate() {
+            command.arg("--vm-mount").arg(format!(
+                "{}\t{}\t{}",
+                mount.source,
+                virtiofs_tag(i),
+                vm_mount_mode(mount.read_only)
+            ));
         }
 
         info!(
@@ -4563,6 +4610,146 @@ fn validate_vm_sandbox_template(template: &SandboxTemplate) -> Result<(), Status
     Ok(())
 }
 
+const VM_RESERVED_GUEST_PATHS: &[&str] = &[
+    "/.openshell",
+    "/.openshell-bootstrap",
+    "/overlay",
+    "/lower",
+    "/newroot",
+    "/image-cache",
+    "/srv",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/tmp",
+];
+
+const VIRTIOFS_TAG_PREFIX: &str = "osfs";
+
+fn virtiofs_tag(index: usize) -> String {
+    format!("{VIRTIOFS_TAG_PREFIX}{index}")
+}
+
+fn vm_mount_mode(read_only: bool) -> &'static str {
+    if read_only { "ro" } else { "rw" }
+}
+
+/// Guest manifest consumed by `mount_virtiofs_shares`: `tag\ttarget\tmode`.
+fn render_mount_manifest(mounts: &[VmMountConfig]) -> String {
+    let mut manifest = String::new();
+    for (i, mount) in mounts.iter().enumerate() {
+        writeln!(
+            manifest,
+            "{}\t{}\t{}",
+            virtiofs_tag(i),
+            driver_mounts::normalize_mount_target(&mount.target),
+            vm_mount_mode(mount.read_only)
+        )
+        .expect("write to String cannot fail");
+    }
+    manifest
+}
+
+fn sandbox_requests_gpu(sandbox: &Sandbox) -> bool {
+    sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.resource_requirements.as_ref())
+        .and_then(|requirements| driver_gpu_requirements(Some(requirements)))
+        .is_some()
+}
+
+fn validate_no_control_chars(value: &str, field: &str) -> Result<(), String> {
+    if value.chars().any(char::is_control) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_vm_driver_mounts(
+    mounts: &[VmMountConfig],
+    config: &VmDriverConfig,
+    is_qemu: bool,
+) -> Result<(), Status> {
+    if mounts.is_empty() {
+        return Ok(());
+    }
+    if is_qemu {
+        return Err(Status::failed_precondition(
+            "virtiofs mounts are not supported with the QEMU backend",
+        ));
+    }
+    if !config.enable_bind_mounts {
+        return Err(Status::failed_precondition(
+            "vm bind mounts require enable_bind_mounts = true in the VM driver configuration",
+        ));
+    }
+    config
+        .resource_admission
+        .reject_unlabelable("host bind mount")?;
+    let mut targets: Vec<String> = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        driver_mounts::validate_absolute_mount_source(&mount.source, "vm mount source")
+            .map_err(Status::invalid_argument)?;
+        validate_no_control_chars(&mount.source, "vm mount source")
+            .map_err(Status::invalid_argument)?;
+        driver_mounts::validate_container_mount_target(&mount.target)
+            .map_err(Status::invalid_argument)?;
+        let normalized = driver_mounts::normalize_mount_target(&mount.target);
+        driver_mounts::validate_workspace_mount_target(
+            &normalized,
+            driver_mounts::DEFAULT_WORKSPACE_ROOT,
+        )
+        .map_err(Status::invalid_argument)?;
+        for reserved in VM_RESERVED_GUEST_PATHS {
+            if driver_mounts::paths_overlap(Path::new(&normalized), Path::new(reserved)) {
+                return Err(Status::invalid_argument(format!(
+                    "vm mount target '{}' conflicts with VM-internal path '{reserved}'",
+                    mount.target
+                )));
+            }
+        }
+        // Nested shares would make guest init create directories inside an
+        // already-mounted host share, so targets must be disjoint.
+        if let Some(existing) = targets.iter().find(|existing| {
+            driver_mounts::paths_overlap(Path::new(&normalized), Path::new(existing))
+        }) {
+            return Err(Status::invalid_argument(if *existing == normalized {
+                format!("duplicate vm driver_config mount target '{normalized}'")
+            } else {
+                format!("vm mount target '{normalized}' overlaps mount target '{existing}'")
+            }));
+        }
+        targets.push(normalized);
+    }
+    Ok(())
+}
+
+/// Host filesystem checks, run at provisioning rather than in
+/// `validate_sandbox` so a briefly missing source (for example an NFS share
+/// not yet mounted after a reboot) fails provisioning visibly instead of
+/// denying recovery of a persisted sandbox.
+#[allow(clippy::result_large_err)]
+fn validate_vm_mount_sources(mounts: &[VmMountConfig]) -> Result<(), Status> {
+    for mount in mounts {
+        let source_path = Path::new(&mount.source);
+        if !source_path.exists() {
+            return Err(Status::failed_precondition(format!(
+                "vm mount source path does not exist: {}",
+                mount.source
+            )));
+        }
+        if !source_path.is_dir() {
+            return Err(Status::invalid_argument(format!(
+                "vm mount source must be a directory, not a file: {}",
+                mount.source
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::result_large_err)]
 fn validate_gpu_request(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Status> {
     let spec = sandbox
@@ -6389,6 +6576,17 @@ fn inject_guest_boundary_bundle(
         write_rootfs_image_file(overlay_disk, &path, contents)?;
         set_rootfs_image_file_mode(overlay_disk, &path, 0o600)?;
     }
+    Ok(())
+}
+
+fn inject_guest_mount_manifest(
+    overlay_disk: &Path,
+    mounts: &[VmMountConfig],
+) -> Result<(), String> {
+    let manifest = render_mount_manifest(mounts);
+    let guest_path = overlay_upper_path("/.openshell/mounts.manifest");
+    write_rootfs_image_file(overlay_disk, &guest_path, manifest.as_bytes())?;
+    set_rootfs_image_file_mode(overlay_disk, &guest_path, 0o644)?;
     Ok(())
 }
 
@@ -11418,5 +11616,294 @@ mod tests {
             .expect("an unambiguous name-only stop should still resolve");
 
         assert!(alpha.join(SANDBOX_STOPPED_FILE).exists());
+    }
+
+    // ── VM mount config tests ──────────────────────────────────────────
+
+    fn mount_test_config(enable_bind_mounts: bool) -> VmDriverConfig {
+        let mut config = VmDriverConfig {
+            enable_bind_mounts,
+            ..VmDriverConfig::default()
+        };
+        config.resource_admission.enabled = false;
+        config
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_when_resource_admission_enabled() {
+        let dir = std::env::temp_dir();
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: dir.display().to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        let mut config = mount_test_config(true);
+        config.resource_admission.enabled = true;
+        let err = validate_vm_driver_mounts(&mounts, &config, false).unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("resource admission"));
+    }
+
+    #[test]
+    fn vm_mount_config_deserializes_with_default_readonly() {
+        let json = serde_json::json!({
+            "mounts": [{"source": "/host/data", "target": "/sandbox/data"}]
+        });
+        let config: VmSandboxDriverConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.mounts.len(), 1);
+        assert_eq!(config.mounts[0].source, "/host/data");
+        assert_eq!(config.mounts[0].target, "/sandbox/data");
+        assert!(config.mounts[0].read_only);
+    }
+
+    #[test]
+    fn vm_mount_config_accepts_docker_style_bind_type() {
+        let json = serde_json::json!({
+            "mounts": [{"type": "bind", "source": "/host/data", "target": "/sandbox/data"}]
+        });
+        let config: VmSandboxDriverConfig = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            config.mounts[0].mount_type,
+            Some(VmMountType::Bind)
+        ));
+        assert!(config.mounts[0].read_only);
+    }
+
+    #[test]
+    fn vm_mount_config_rejects_non_bind_types() {
+        for mount_type in ["volume", "tmpfs", "image"] {
+            let json = serde_json::json!({
+                "mounts": [{"type": mount_type, "source": "x", "target": "/sandbox/data"}]
+            });
+            let err = serde_json::from_value::<VmSandboxDriverConfig>(json).unwrap_err();
+            assert!(
+                err.to_string().contains("expected `bind`"),
+                "{mount_type}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn vm_mount_config_deserializes_explicit_readwrite() {
+        let json = serde_json::json!({
+            "mounts": [{"source": "/host/data", "target": "/sandbox/data", "read_only": false}]
+        });
+        let config: VmSandboxDriverConfig = serde_json::from_value(json).unwrap();
+        assert!(!config.mounts[0].read_only);
+    }
+
+    #[test]
+    fn vm_mount_validation_requires_enable_bind_mounts() {
+        let dir = std::env::temp_dir();
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: dir.display().to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        let err = validate_vm_driver_mounts(&mounts, &mount_test_config(false), false).unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("enable_bind_mounts"));
+    }
+
+    #[test]
+    fn vm_mount_validation_allows_when_enabled() {
+        let dir = std::env::temp_dir();
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: dir.display().to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        assert!(validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).is_ok());
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_relative_source() {
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: "relative/path".to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        let err = validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_reserved_openshell_target() {
+        let dir = std::env::temp_dir();
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: dir.display().to_string(),
+            target: "/opt/openshell/data".to_string(),
+            read_only: true,
+        }];
+        let err = validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_vm_internal_paths() {
+        let dir = std::env::temp_dir();
+        for reserved in VM_RESERVED_GUEST_PATHS {
+            let mounts = vec![VmMountConfig {
+                mount_type: None,
+                source: dir.display().to_string(),
+                target: reserved.to_string(),
+                read_only: true,
+            }];
+            let err =
+                validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).unwrap_err();
+            assert_eq!(
+                err.code(),
+                Code::InvalidArgument,
+                "expected rejection for target {reserved}"
+            );
+            assert!(
+                err.message().contains("VM-internal path"),
+                "expected VM-internal path message for {reserved}, got: {}",
+                err.message()
+            );
+        }
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_duplicate_targets() {
+        let dir = std::env::temp_dir();
+        let mounts = vec![
+            VmMountConfig {
+                mount_type: None,
+                source: dir.display().to_string(),
+                target: "/sandbox/data".to_string(),
+                read_only: true,
+            },
+            VmMountConfig {
+                mount_type: None,
+                source: dir.display().to_string(),
+                target: "/sandbox/data".to_string(),
+                read_only: false,
+            },
+        ];
+        let err = validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("duplicate"));
+    }
+
+    #[test]
+    fn vm_mount_validation_defers_missing_source_to_provisioning() {
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: "/nonexistent/openshell-vm-mount-source".to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        assert!(validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).is_ok());
+        let err = validate_vm_mount_sources(&mounts).unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_nested_targets() {
+        let dir = std::env::temp_dir().display().to_string();
+        for (first, second) in [
+            ("/sandbox/a", "/sandbox/a/b"),
+            ("/sandbox/a/b", "/sandbox/a"),
+        ] {
+            let mounts = vec![
+                VmMountConfig {
+                    mount_type: None,
+                    source: dir.clone(),
+                    target: first.to_string(),
+                    read_only: true,
+                },
+                VmMountConfig {
+                    mount_type: None,
+                    source: dir.clone(),
+                    target: second.to_string(),
+                    read_only: true,
+                },
+            ];
+            let err =
+                validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument);
+            assert!(err.message().contains("overlaps"), "{first} vs {second}");
+        }
+    }
+
+    #[test]
+    fn vm_mount_validation_allows_sibling_targets() {
+        let dir = std::env::temp_dir().display().to_string();
+        let mounts = vec![
+            VmMountConfig {
+                mount_type: None,
+                source: dir.clone(),
+                target: "/sandbox/a".to_string(),
+                read_only: true,
+            },
+            VmMountConfig {
+                mount_type: None,
+                source: dir,
+                target: "/sandbox/ab".to_string(),
+                read_only: true,
+            },
+        ];
+        assert!(validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).is_ok());
+    }
+
+    #[test]
+    fn vm_mount_validation_empty_passes() {
+        assert!(validate_vm_driver_mounts(&[], &mount_test_config(false), false).is_ok());
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_qemu_backend() {
+        let dir = std::env::temp_dir();
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: dir.display().to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        let err = validate_vm_driver_mounts(&mounts, &mount_test_config(true), true).unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("QEMU"));
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_file_source() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: file.path().display().to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        let err = validate_vm_mount_sources(&mounts).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("must be a directory"));
+    }
+
+    #[test]
+    fn vm_mount_manifest_renders_tab_separated_entries() {
+        let mounts = [
+            VmMountConfig {
+                mount_type: None,
+                source: "/host/a".to_string(),
+                target: "/sandbox/a".to_string(),
+                read_only: true,
+            },
+            VmMountConfig {
+                mount_type: None,
+                source: "/host/b".to_string(),
+                target: "/sandbox/b".to_string(),
+                read_only: false,
+            },
+        ];
+        assert_eq!(
+            render_mount_manifest(&mounts),
+            "osfs0\t/sandbox/a\tro\nosfs1\t/sandbox/b\trw\n"
+        );
     }
 }
