@@ -939,6 +939,10 @@ async fn fetch_settings_snapshot_with_client(
     Ok(settings_poll_result(response.into_inner()))
 }
 
+fn learned_workspace_selector(workspace: Option<&str>) -> Option<crate::proto::WorkspaceSelector> {
+    workspace.map(crate::proto::workspace_selector)
+}
+
 /// Fetch sandbox policy using an existing client connection.
 async fn fetch_policy_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
@@ -1315,7 +1319,7 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
 
 #[cfg(test)]
 mod settings_poll_tests {
-    use super::settings_poll_result;
+    use super::{learned_workspace_selector, settings_poll_result};
     use crate::PolicyValidationFailureMode;
     use crate::proto::GetSandboxConfigResponse;
 
@@ -1353,6 +1357,19 @@ mod settings_poll_tests {
 
         let legacy = settings_poll_result(GetSandboxConfigResponse::default());
         assert!(!legacy.extension_authentication_enabled);
+    }
+
+    #[test]
+    fn workspace_selector_is_omitted_until_bootstrap_learns_the_workspace() {
+        assert!(learned_workspace_selector(None).is_none());
+
+        let selector = learned_workspace_selector(Some("team-a")).expect("workspace selector");
+        assert_eq!(
+            selector.selection,
+            Some(crate::proto::workspace_selector::Selection::Workspace(
+                "team-a".to_string()
+            ))
+        );
     }
 }
 
@@ -1409,12 +1426,15 @@ impl CachedOpenShellClient {
 
     /// Poll for current effective sandbox settings and policy metadata.
     pub async fn poll_settings(&self, sandbox_name: &str) -> Result<SettingsPollResult> {
-        let workspace = self.workspace();
+        // Sandbox-authenticated callers may omit the selector during bootstrap.
+        // Once the first response identifies the workspace, scope every later
+        // poll explicitly instead of constructing an invalid empty selector.
+        let workspace_scope = learned_workspace_selector(self.workspace.get().map(String::as_str));
         let response = self
             .client
             .clone()
             .get_sandbox_config(GetSandboxConfigRequest {
-                workspace_scope: Some(crate::proto::workspace_selector(workspace.clone())),
+                workspace_scope,
                 name: sandbox_name.to_string(),
             })
             .await
