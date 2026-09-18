@@ -1992,7 +1992,7 @@ async fn establish_supervisor_session(
     }
 
     // Step 3: Determine confirmed capabilities.
-    let confirmed_capabilities = confirm_capabilities(&hello.capabilities, state);
+    let confirmed_capabilities = confirm_capabilities(&hello.capabilities, &state);
 
     // Step 4: Send SessionAccepted.
     let accepted = GatewayMessage {

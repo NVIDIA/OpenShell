@@ -19,11 +19,8 @@ mod activity_aggregator;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
-<<<<<<< HEAD
-mod provider_readiness;
-=======
 mod otlp_relay;
->>>>>>> e9eff28c0 (feat(supervisor): wire the OTLP relay into the proxy and gateway session)
+mod provider_readiness;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
@@ -843,7 +840,6 @@ pub async fn run_sandbox(
     // Span enrichment reads these after the descriptor's identity moves into
     // the sandbox context below.
     let workload_uid = runtime_descriptor.workload_identity.uid;
-    let driver_name = runtime_descriptor.driver_fence.driver_name();
     let context = openshell_isolation_interface::contract::SandboxContext {
         sandbox_id: sandbox_id.clone().unwrap_or_default(),
         session_id,
@@ -941,7 +937,9 @@ pub async fn run_sandbox(
             // Only the Podman driver sets this today; the OCSF context reads
             // the same variable and shares the gap.
             image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
-            driver: driver_name.to_string(),
+            // The backend-neutral runtime descriptor no longer names the
+            // compute driver; empty until the gateway injects it.
+            driver: String::new(),
         },
     );
     let otlp_destination = otlp_relay::reserved_destination(otlp_server);

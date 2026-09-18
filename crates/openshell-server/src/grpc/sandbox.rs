@@ -3993,7 +3993,8 @@ mod tests {
             annotations: HashMap::new(),
             workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             await_main_process_attachment: false,
-            workload_template_name: String::new(),
+            workload_template: String::new(),
+            service_exposures: Vec::new(),
             request_id: String::new(),
         }
     }
