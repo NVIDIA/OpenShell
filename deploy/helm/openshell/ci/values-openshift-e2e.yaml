@@ -37,14 +37,9 @@ server:
 gatewayConfig:
   openshell.gateway.auth:
     allow_unauthenticated_users: true
-
-sandboxRuntime:
-  image:
-    pullPolicy: Always
-
-supervisor:
-  image:
-    pullPolicy: Always
+  openshell.drivers.kubernetes:
+    sandbox_runtime_image_pull_policy: always
+    supervisor_image_pull_policy: always
 
 openshiftRoute:
   enabled: true

@@ -176,7 +176,9 @@ tests:
 
   - it: grants managed sandbox-runtime companion permissions
     set:
-      server.drivers.kubernetes.workspaceMode: managed
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: managed
     asserts:
       - contains:
           path: rules
@@ -199,7 +201,9 @@ tests:
 
   - it: grants operator sandbox-runtime companion permissions
     set:
-      server.drivers.kubernetes.workspaceMode: operator
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: operator
     asserts:
       - contains:
           path: rules

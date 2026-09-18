@@ -52,7 +52,7 @@ The chart does not install or upgrade the cluster-scoped Agent Sandbox CRDs or
 controller.
 
 <Note>
-**Air-gapped clusters:** mirror the manifest above and the `registry.k8s.io/agent-sandbox/agent-sandbox-controller` image referenced inside it to your internal registry, then point the manifest's image reference at your mirror before applying. You will also need to mirror the OpenShell gateway and sandbox images — see the chart's `image.repository` value for the gateway, `gatewayConfig.openshell.drivers.kubernetes.default_image` for default sandbox images, and `sandboxRuntime.image` / `supervisor.image` for isolated runtime images.
+**Air-gapped clusters:** mirror the manifest above and the `registry.k8s.io/agent-sandbox/agent-sandbox-controller` image referenced inside it to your internal registry, then point the manifest's image reference at your mirror before applying. You will also need to mirror the OpenShell gateway and sandbox images — see `image.repository` for the gateway and `gatewayConfig.openshell.drivers.kubernetes.{default_image,sandbox_runtime_image,supervisor_image}` for sandbox runtime images.
 </Note>
 
 Confirm the controller pod is running before proceeding:
@@ -86,7 +86,7 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
+  --set 'gatewayConfig.openshell\.drivers\.kubernetes.sandbox_runtime.network_policy_enforced=true'
 ```
 
 To use the latest development build instead of a stable release:
@@ -96,7 +96,7 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version 0.0.0-dev \
   --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
+  --set 'gatewayConfig.openshell\.drivers\.kubernetes.sandbox_runtime.network_policy_enforced=true'
 ```
 
 The chart automatically generates PKI secrets on first install using pre-install Helm hooks. No manual secret creation is required.
@@ -111,9 +111,8 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
+  --set 'gatewayConfig.openshell\.drivers\.kubernetes.sandbox_runtime.network_policy_enforced=true' \
   --set workspaceResources.enabled=false \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set server.sandboxNamespace=app-a
 
 helm upgrade --install openshell-workspace \
@@ -206,9 +205,9 @@ The most commonly changed values are:
 | `gatewayConfig.openshell.gateway.auth.allow_unauthenticated_users` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |
 | `gatewayConfig.openshell.gateway.enable_loopback_service_http` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
 | `pkiInitJob.serverDnsNames` / `certManager.serverDnsNames` | Additional gateway server DNS SANs. Wildcard SANs also enable sandbox service URLs under that domain. |
-| `sandboxRuntime.image` / `supervisor.image` | Images for the isolated sandbox workload and its supervisor. Helm derives the paired runtime fields. |
-| `supervisor.sandboxRuntime.networkPolicyEnforced` | Explicit acknowledgement that the cluster CNI enforces ingress and egress NetworkPolicy in every sandbox namespace. |
-| `upstreamProxy` | Operator-owned corporate HTTP forward proxy settings. Helm derives the Kubernetes-driver runtime fields. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
+| `gatewayConfig.openshell.drivers.kubernetes.{sandbox_runtime_image,supervisor_image}` | Images for the isolated sandbox workload and its supervisor. |
+| `gatewayConfig.openshell.drivers.kubernetes.sandbox_runtime.network_policy_enforced` | Explicit acknowledgement that the cluster CNI enforces ingress and egress NetworkPolicy in every sandbox namespace. |
+| `gatewayConfig.openshell.drivers.kubernetes.{https_proxy,no_proxy,proxy_auth_*}` | Corporate HTTP forward proxy settings. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
 
 Use a values file for repeatable deployments:
 
@@ -217,7 +216,7 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
+  --set 'gatewayConfig.openshell\.drivers\.kubernetes.sandbox_runtime.network_policy_enforced=true' \
   --values my-values.yaml
 ```
 
@@ -253,13 +252,13 @@ kubectl -n openshell create secret generic corporate-proxy-auth \
 Add the proxy settings to your Helm values file. Replace the DNS suffixes and CIDRs in `no_proxy` with values for your cluster. `no_proxy` bypasses only the corporate proxy. OpenShell policy evaluation still applies.
 
 ```yaml
-upstreamProxy:
-  url: http://proxy.corp.example:8080
-  noProxy: .svc,.svc.cluster.local,10.96.0.0/12,10.244.0.0/16
-  authSecret:
-    name: corporate-proxy-auth
-    key: credentials
-  authAllowInsecure: true
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    https_proxy: http://proxy.corp.example:8080
+    no_proxy: .svc,.svc.cluster.local,10.96.0.0/12,10.244.0.0/16
+    proxy_auth_secret_name: corporate-proxy-auth
+    proxy_auth_secret_key: credentials
+    proxy_auth_allow_insecure: true
 ```
 
 Use `proxy_auth_allow_insecure: true` only when you accept that Basic authentication is cleartext on the connection to an `http://` proxy. The initial release supports `http://` proxy endpoints and TLS CONNECT egress. It does not support HTTPS-to-proxy, custom corporate CA bundles, or forwarding plain HTTP egress through the proxy.
@@ -301,7 +300,7 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
+  --set 'gatewayConfig.openshell\.drivers\.kubernetes.sandbox_runtime.network_policy_enforced=true' \
   --set serviceAccount.create=false \
   --set serviceAccount.name=my-existing-sa
 ```

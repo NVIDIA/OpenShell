@@ -172,8 +172,7 @@ verify_gateway_config_rollout() {
     --set "fullnameOverride=openshell" \
     --set "image.repository=${REGISTRY_VALUE}/gateway" \
     --set "image.tag=${IMAGE_TAG_VALUE}" \
-    --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
-    --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    --set-string "gatewayConfig.openshell\\.drivers\\.kubernetes.supervisor_image=${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}" \
     "${helm_extra_args[@]}" \
     "${helm_post_renderer_args[@]}" \
     --set-string 'gatewayConfig.openshell\.gateway.log_level=debug' \
@@ -567,10 +566,8 @@ run_scenario() {
     --set "fullnameOverride=openshell" \
     --set "image.repository=${REGISTRY_VALUE}/gateway" \
     --set "image.tag=${IMAGE_TAG_VALUE}" \
-    --set "sandboxRuntime.image.repository=${REGISTRY_VALUE}/sandbox" \
-    --set "sandboxRuntime.image.tag=${IMAGE_TAG_VALUE}" \
-    --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
-    --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    --set-string "gatewayConfig.openshell\\.drivers\\.kubernetes.sandbox_runtime_image=${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}" \
+    --set-string "gatewayConfig.openshell\\.drivers\\.kubernetes.supervisor_image=${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}" \
     "${helm_post_renderer_args[@]}" \
     "$@" \
     --wait --timeout 5m
@@ -1057,11 +1054,10 @@ fi
 helm_extra_args=()
 helm_post_renderer_args=()
 helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
-helm_extra_args+=(--set supervisor.sandboxRuntime.networkPolicyEnforced=true)
-# `supervisor.image` is the chart-owned input and is derived into the runtime
-# TOML. Keep it aligned with the locally built/imported image and CI overrides.
-helm_extra_args+=(--set-string "supervisor.image.repository=${REGISTRY_VALUE}/supervisor")
-helm_extra_args+=(--set-string "supervisor.image.tag=${IMAGE_TAG_VALUE}")
+helm_extra_args+=(--set 'gatewayConfig.openshell\.drivers\.kubernetes.sandbox_runtime.network_policy_enforced=true')
+# Keep the runtime configuration aligned with the locally built/imported image
+# without creating a second Helm values API for driver configuration.
+helm_extra_args+=(--set-string "gatewayConfig.openshell\\.drivers\\.kubernetes.supervisor_image=${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}")
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" != "1" ]; then
     echo "ERROR: external Kubernetes driver e2e requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=1." >&2
@@ -1122,13 +1118,14 @@ if [ "${OPENSHELL_E2E_KUBE_CORPORATE_PROXY:-0}" = "1" ]; then
   fi
   CORPORATE_PROXY_VALUES="${WORKDIR}/corporate-proxy-values.yaml"
   cat >"${CORPORATE_PROXY_VALUES}" <<EOF
-upstreamProxy:
-  url: http://host.openshell.internal:${CORPORATE_PROXY_PORT}
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    https_proxy: http://host.openshell.internal:${CORPORATE_PROXY_PORT}
 EOF
   if [ "${CORPORATE_PROXY_MODE}" = "no-proxy" ]; then
     CORPORATE_PROXY_UPSTREAM_PORT="$(e2e_pick_port)"
     cat >>"${CORPORATE_PROXY_VALUES}" <<EOF
-  noProxy: host.openshell.internal
+    no_proxy: host.openshell.internal
 EOF
   fi
   case "${CORPORATE_PROXY_MODE}" in
@@ -1222,10 +1219,8 @@ else
     --set "fullnameOverride=openshell" \
     --set "image.repository=${REGISTRY_VALUE}/gateway" \
     --set "image.tag=${IMAGE_TAG_VALUE}" \
-    --set "sandboxRuntime.image.repository=${REGISTRY_VALUE}/sandbox" \
-    --set "sandboxRuntime.image.tag=${IMAGE_TAG_VALUE}" \
-    --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
-    --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    --set-string "gatewayConfig.openshell\\.drivers\\.kubernetes.sandbox_runtime_image=${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}" \
+    --set-string "gatewayConfig.openshell\\.drivers\\.kubernetes.supervisor_image=${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}" \
     "${helm_extra_args[@]}" \
     "${helm_post_renderer_args[@]}" \
     --wait --timeout 5m

@@ -176,19 +176,18 @@ gatewayConfig:
     gateway_id: '{{ include "openshell.fullname" . }}'
     grpc_endpoint: '{{ include "openshell.grpcEndpoint" . }}'
     service_account_name: '{{ include "openshell.sandboxServiceAccountName" . }}'
-    supervisor_sideload_method: '{{ if semverCompare ">=1.35-0" .Capabilities.KubeVersion.Version }}image-volume{{ else }}init-container{{ end }}'
-    topology: combined
+    sandbox_runtime_image: ghcr.io/nvidia/openshell/sandbox:{{ .Chart.AppVersion }}
+    supervisor_image: ghcr.io/nvidia/openshell/supervisor:{{ .Chart.AppVersion }}
+    sandbox_runtime:
+      network_policy_enforced: false
+      boundary_port: 5500
     sa_token_ttl_secs: 3600
-    app_armor_profile: Unconfined
   openshell.drivers.kubernetes.managed_ssh_ingress:
     enabled: true
     gateway_namespace: '{{ .Release.Namespace }}'
     gateway_pod_selector:
       app.kubernetes.io/name: '{{ include "openshell.name" . }}'
       app.kubernetes.io/instance: '{{ .Release.Name }}'
-  openshell.drivers.kubernetes.sidecar:
-    proxy_uid: 1337
-    process_binary_aware_network_policy: true
   openshell.gateway.credential_storage:
     key_encryption_key_env: '{{ include "openshell.credentialStorageKeyEncryptionKeyEnvName" . }}'
 
