@@ -89,7 +89,6 @@ let
         use_galaxy = false;
         playbooks = [
           "ansible/playbooks/openshell-deb.yaml"
-          "ansible/playbooks/gateway.yaml"
         ];
         inputs = {
           openshell_deb = "../artifacts/packages/openshell.deb";
