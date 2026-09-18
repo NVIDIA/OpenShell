@@ -61,7 +61,6 @@ depends = [
   "helm:lint",
   "helm:docs:check",
   "markdown:lint",
-  "proto:conventions",
   "proto:lint",
   "sdk:ts:lint",
 ]

@@ -84,7 +84,3 @@ identifies the service being exposed.
 - Regenerate Rust, Python, Go, and TypeScript bindings after contract changes.
   Run `mise run pre-commit`, the affected SDK checks, and relevant server tests
   before submitting the change.
-
-`mise run proto:conventions` checks the mechanical workspace-selector and
-legacy entity-reference rules. The guide remains authoritative for semantic
-rules that tooling cannot infer, including which resource is primary.

@@ -87,8 +87,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 
 Follow [proto/README.md](proto/README.md) for public protobuf API design. It is
 the canonical source for entity-reference naming, workspace selectors, field
-design, and schema evolution. Run `mise run proto:conventions` after changing a
-public request contract.
+design, and schema evolution.
 
 ## Vouch System
 

@@ -483,8 +483,7 @@ New features always start as GitHub issues using the feature request template. F
 
 Follow [the protobuf API conventions](proto/README.md) when adding or changing
 gRPC contracts. The guide defines entity-reference naming, workspace selectors,
-field design, and schema-evolution rules. Run `mise run proto:conventions` to
-check the mechanically enforceable rules.
+field design, and schema-evolution rules.
 
 ## Documentation
 
