@@ -5706,6 +5706,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_sandbox_providers_returns_attached_provider_records() {
+        use openshell_core::proto::CreateWorkspaceRequest;
+
         let state = test_server_state().await;
         state
             .store
@@ -5753,6 +5755,38 @@ mod tests {
             Some(&"REDACTED".to_string())
         );
         assert!(!first_page.next_page_token.is_empty());
+
+        crate::grpc::workspace::handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
+                name: "beta".to_string(),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .expect("beta workspace should be created");
+        let mut beta_provider = test_provider("work-github", "github");
+        beta_provider.metadata.as_mut().unwrap().id = "provider-beta-work-github".to_string();
+        beta_provider.metadata.as_mut().unwrap().workspace = "beta".to_string();
+        state.store.put_message(&beta_provider).await.unwrap();
+        let mut beta_sandbox = test_sandbox("work", vec!["work-github".to_string()]);
+        beta_sandbox.metadata.as_mut().unwrap().id = "sandbox-beta-work".to_string();
+        beta_sandbox.metadata.as_mut().unwrap().workspace = "beta".to_string();
+        state.store.put_message(&beta_sandbox).await.unwrap();
+
+        let err = handle_list_sandbox_providers(
+            &state,
+            authed_request(ListSandboxProvidersRequest {
+                sandbox_name: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("beta")),
+                page_size: 1,
+                page_token: first_page.next_page_token.clone(),
+            }),
+        )
+        .await
+        .expect_err("a token for one workspace must not list a same-named sandbox elsewhere");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
         let mut sandbox = state
             .store

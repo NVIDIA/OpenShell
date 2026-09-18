@@ -1799,6 +1799,14 @@ enum SandboxProviderCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
+        /// Maximum number of attached providers to return in this page.
+        #[arg(long, default_value_t = 100)]
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
+
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
@@ -3573,11 +3581,18 @@ async fn run_async() -> Result<()> {
                             run::print_ssh_config(&ctx.name, &name, &cli.workspace);
                         }
                         SandboxCommands::Provider(command) => match command {
-                            SandboxProviderCommands::List { name, output } => {
+                            SandboxProviderCommands::List {
+                                name,
+                                page_size,
+                                page_token,
+                                output,
+                            } => {
                                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                                 run::sandbox_provider_list(
                                     endpoint,
                                     &name,
+                                    page_size,
+                                    &page_token,
                                     output.as_str(),
                                     &cli.workspace,
                                     &tls,
