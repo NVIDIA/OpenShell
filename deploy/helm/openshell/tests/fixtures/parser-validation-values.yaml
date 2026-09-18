@@ -5,15 +5,8 @@
 # intentionally opaque to the gateway loader, which makes it a safe way to
 # exercise every TOML shape supported by the chart serializer.
 gatewayConfig:
-  openshell.gateway:
-    name: '{{ .Release.Namespace }}/{{ .Release.Name }} "quoted" \\ path'
-    server_sans:
-      - localhost
-      - gateway.example.test
-    provider_profile_sources:
-      - type: builtin
-      - type: user
   openshell.drivers.parser-validation:
+    rendered_name: '{{ .Release.Namespace }}/{{ .Release.Name }} "quoted" \\ path'
     boolean_value: true
     integer_value: 42
     float_value: 1.5
