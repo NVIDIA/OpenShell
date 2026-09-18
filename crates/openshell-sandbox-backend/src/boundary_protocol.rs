@@ -352,6 +352,12 @@ pub struct BoundaryConfig {
     /// Downward API. Other drivers may leave the map empty.
     #[serde(default)]
     pub resource_claim_files: std::collections::BTreeMap<String, PathBuf>,
+    /// Driver-protected CDI selection and workload-local specification projections.
+    ///
+    /// The sandbox runtime resolves this context inside the workload mount
+    /// namespace before applying launch-time filesystem controls.
+    #[serde(default)]
+    pub cdi_context: Option<openshell_core::cdi::CdiContext>,
     /// Exact identity already applied by the runtime to the sandbox process.
     pub workload_identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
     /// Concrete outer-fence evidence validated by the driver.
@@ -382,6 +388,7 @@ impl fmt::Debug for BoundaryConfig {
             .field("listener", &self.listener)
             .field("resource_claims", &self.resource_claims)
             .field("resource_claim_files", &self.resource_claim_files)
+            .field("has_cdi_context", &self.cdi_context.is_some())
             .field("workload_identity", &self.workload_identity)
             .field("driver_fence", &self.driver_fence)
             .field("child_env_keys", &self.child_env.keys().collect::<Vec<_>>())
@@ -926,6 +933,8 @@ pub struct SandboxPolicyWire {
     pub landlock: LandlockCompatibilityWire,
     pub run_as_user: Option<String>,
     pub run_as_group: Option<String>,
+    #[serde(default)]
+    pub supplemental_groups: Vec<u32>,
 }
 
 impl From<SandboxPolicy> for SandboxPolicyWire {
@@ -950,6 +959,7 @@ impl From<SandboxPolicy> for SandboxPolicyWire {
         let ProcessPolicy {
             run_as_user,
             run_as_group,
+            supplemental_groups,
         } = process;
         Self {
             version,
@@ -961,6 +971,7 @@ impl From<SandboxPolicy> for SandboxPolicyWire {
             landlock: LandlockCompatibilityWire::from(compatibility),
             run_as_user,
             run_as_group,
+            supplemental_groups,
         }
     }
 }
@@ -987,6 +998,7 @@ impl From<SandboxPolicyWire> for SandboxPolicy {
             process: ProcessPolicy {
                 run_as_user: policy.run_as_user,
                 run_as_group: policy.run_as_group,
+                supplemental_groups: policy.supplemental_groups,
             },
         }
     }

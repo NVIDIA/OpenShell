@@ -183,6 +183,11 @@ where
             });
         }
     }
+    for path in &requirements.read_only_paths {
+        if path_kind(path).is_none() {
+            return Err(CdiError::ReadOnlyPathMissing { path: path.clone() });
+        }
+    }
     for path in &requirements.read_write_mount_paths {
         if !normalized_allowlist.contains(path) {
             return Err(CdiError::WritableMountNotAllowed { path: path.clone() });
@@ -445,12 +450,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_spec(dir.path(), "nvidia.yaml", spec);
 
-        let requirements = resolve_with_kind(
-            &context(dir.path(), &["nvidia.com/gpu=all"]),
-            &[],
-            fake_device_node,
-        )
-        .unwrap();
+        let requirements =
+            resolve_cdi_context(&context(dir.path(), &["nvidia.com/gpu=all"])).unwrap();
         let baseline = CdiRequirementsBaseline {
             device_node_paths: &requirements.device_node_paths,
             read_only_paths: &requirements.read_only_paths,
@@ -507,12 +508,8 @@ devices:
 "#,
         );
 
-        let requirements = resolve_with_kind(
-            &context(dir.path(), &["nvidia.com/gpu=0"]),
-            &[],
-            fake_device_node,
-        )
-        .unwrap();
+        let requirements =
+            resolve_cdi_context(&context(dir.path(), &["nvidia.com/gpu=0"])).unwrap();
 
         assert_eq!(
             requirements.device_node_paths,
@@ -540,12 +537,8 @@ devices:
 ",
         );
 
-        let requirements = resolve_with_kind(
-            &context(dir.path(), &["nvidia.com/gpu=all"]),
-            &[],
-            fake_device_node,
-        )
-        .unwrap();
+        let requirements =
+            resolve_cdi_context(&context(dir.path(), &["nvidia.com/gpu=all"])).unwrap();
 
         assert_eq!(
             requirements.device_node_paths,
@@ -573,12 +566,8 @@ devices:
 ",
         );
 
-        let requirements = resolve_with_kind(
-            &context(dir.path(), &["nvidia.com/gpu=all"]),
-            &[],
-            fake_device_node,
-        )
-        .unwrap();
+        let requirements =
+            resolve_cdi_context(&context(dir.path(), &["nvidia.com/gpu=all"])).unwrap();
 
         assert_eq!(requirements.device_node_paths, vec!["/dev/dxg"]);
         assert_eq!(requirements.read_only_paths, vec!["/usr/lib/wsl/lib"]);
@@ -618,12 +607,8 @@ devices:
 "#,
         );
 
-        let requirements = resolve_with_kind(
-            &context(dir.path(), &["nvidia.com/gpu=0"]),
-            &[],
-            always_missing,
-        )
-        .unwrap();
+        let requirements =
+            resolve_cdi_context(&context(dir.path(), &["nvidia.com/gpu=0"])).unwrap();
 
         assert_eq!(
             requirements.read_only_paths,
@@ -660,12 +645,8 @@ devices:
 "#,
         );
 
-        let requirements = resolve_with_kind(
-            &context(dir.path(), &["nvidia.com/gpu=0"]),
-            &[],
-            fake_device_node,
-        )
-        .unwrap();
+        let requirements =
+            resolve_cdi_context(&context(dir.path(), &["nvidia.com/gpu=0"])).unwrap();
 
         assert_eq!(requirements.additional_gids, vec![44]);
         assert_eq!(
@@ -948,6 +929,32 @@ devices:
         .unwrap_err();
 
         assert!(matches!(err, CdiError::RootAdditionalGid));
+    }
+
+    #[test]
+    fn validates_read_only_paths_in_the_workload_namespace() {
+        let requirements = CdiDerivedRequirements {
+            read_only_paths: vec!["/opt/nvidia/runtime.json".to_string()],
+            ..CdiDerivedRequirements::default()
+        };
+        let writable_file_allowlist = HashSet::<String>::new();
+
+        let err = validate_cdi_requirements_with_path_kind(
+            &requirements,
+            &writable_file_allowlist,
+            always_missing,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CdiError::ReadOnlyPathMissing { path }
+                if path == "/opt/nvidia/runtime.json"
+        ));
+
+        validate_cdi_requirements_with_path_kind(&requirements, &writable_file_allowlist, |_| {
+            Some(CdiPathKind::File)
+        })
+        .unwrap();
     }
 
     #[test]
