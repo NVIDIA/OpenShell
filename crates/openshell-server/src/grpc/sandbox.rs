@@ -481,31 +481,36 @@ async fn handle_create_sandbox_inner(
         .await?
         .ensure_active()?;
 
-    let (mut spec, created_from_workload_template) = if workload_template_name.is_empty() {
-        let spec = request
-            .spec
-            .ok_or_else(|| Status::invalid_argument("spec is required"))?;
-        (spec, None)
-    } else {
-        let governance_spec = request.spec.unwrap_or_default();
-        let template = state
-            .store
-            .get_message_by_name::<SandboxWorkloadTemplate>(&workspace, &workload_template_name)
-            .await
-            .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox template not found"))?;
-        let provenance = SandboxWorkloadTemplateProvenance {
-            name: template.object_name().to_string(),
-            resource_version: template.get_resource_version().to_string(),
+    let (mut spec, created_from_workload_template, source_template_id) =
+        if workload_template_name.is_empty() {
+            let spec = request
+                .spec
+                .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+            (spec, None, None)
+        } else {
+            let governance_spec = request.spec.unwrap_or_default();
+            let template = state
+                .store
+                .get_message_by_name::<SandboxWorkloadTemplate>(&workspace, &workload_template_name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?
+                .ok_or_else(|| Status::not_found("sandbox template not found"))?;
+            let provenance = SandboxWorkloadTemplateProvenance {
+                name: template.object_name().to_string(),
+                resource_version: template.get_resource_version().to_string(),
+            };
+            let mut resolved = sandbox_spec_from_stored_workload_template(&template)?;
+            resolved.policy = governance_spec.policy;
+            resolved.providers = governance_spec.providers;
+            resolved.command = governance_spec.command;
+            resolved.tty = governance_spec.tty;
+            resolved.restart_policy = governance_spec.restart_policy;
+            (
+                resolved,
+                Some(provenance),
+                Some(template.object_id().to_string()),
+            )
         };
-        let mut resolved = sandbox_spec_from_stored_workload_template(&template)?;
-        resolved.policy = governance_spec.policy;
-        resolved.providers = governance_spec.providers;
-        resolved.command = governance_spec.command;
-        resolved.tty = governance_spec.tty;
-        resolved.restart_policy = governance_spec.restart_policy;
-        (resolved, Some(provenance))
-    };
 
     // Attachment identity belongs to the gateway. Accepting an epoch from a
     // create request or workload template could revive stale installation proof.
@@ -542,11 +547,75 @@ async fn handle_create_sandbox_inner(
     } else {
         request.name.clone()
     };
+    // Selection only reads pool inventory. Resolve the immutable workload shape
+    // before calling the driver so the create mutation guard does not hold a
+    // PostgreSQL lock-pool connection across that RPC.
+    let template = spec.template.get_or_insert_with(SandboxTemplate::default);
+    if template.image.trim().is_empty() {
+        template.image = state.compute.default_image().to_string();
+    }
+    if let Some(ref mut policy) = spec.policy {
+        super::policy::clear_provider_credentialed_markers(policy);
+        validate_no_reserved_provider_policy_keys(policy)?;
+        *policy = validate_and_canonicalize_policy(policy.clone())?;
+    }
+    // Selection must see the same canonical workload shape that validation and
+    // creation use. Keep the size and safety checks ahead of the driver call.
+    validate_sandbox_spec(&request.name, &spec)?;
+    if let Some(ref policy) = spec.policy {
+        validate_policy_safety(policy)?;
+    }
+    let selection_preview = Sandbox {
+        metadata: Some(ObjectMeta {
+            id: id.clone(),
+            name: name.clone(),
+            annotations: request.annotations.clone(),
+            workspace: workspace.clone(),
+            ..Default::default()
+        }),
+        spec: Some(spec.clone()),
+        created_from_workload_template: created_from_workload_template.clone(),
+        ..Default::default()
+    };
+    let selected_pair =
+        crate::compute::warm_pool::select_for_create(state, &selection_preview).await?;
+
     let (sandbox_lifecycle_guard, mutation_guard) = state
         .compute
         .sandbox_create_guards(&workspace, &id)
         .await
         .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
+    if let (Some(provenance), Some(source_id)) =
+        (&created_from_workload_template, &source_template_id)
+    {
+        let current = state
+            .store
+            .get_message_by_name::<SandboxWorkloadTemplate>(&workspace, &provenance.name)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("reload sandbox template failed: {error}"))
+            })?;
+        if !current.as_ref().is_some_and(|template| {
+            template.object_id() == source_id
+                && template.get_resource_version().to_string() == provenance.resource_version
+                && template
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.deletion_time.is_none())
+        }) {
+            return Err(Status::aborted(
+                "sandbox template changed during create; retry",
+            ));
+        }
+        if selected_pair
+            .as_ref()
+            .is_some_and(|pair| pair.template_id != *source_id)
+        {
+            return Err(Status::aborted(
+                "warm pair template changed during create; retry",
+            ));
+        }
+    }
 
     // Validate provider names exist (fail fast).
     for name in &spec.providers {
@@ -576,26 +645,7 @@ async fn handle_create_sandbox_inner(
     )
     .await?;
 
-    // Ensure the template always carries the resolved image.
-    let template = spec.template.get_or_insert_with(SandboxTemplate::default);
-    if template.image.trim().is_empty() {
-        template.image = state.compute.default_image().to_string();
-    }
-
-    if let Some(ref mut policy) = spec.policy {
-        super::policy::clear_provider_credentialed_markers(policy);
-        validate_no_reserved_provider_policy_keys(policy)?;
-        *policy = validate_and_canonicalize_policy(policy.clone())?;
-    }
-
-    // Process identity and MCP default materialization can increase the
-    // protobuf size. Recheck the exact canonical spec before any middleware or
-    // compute boundary can observe or persist it. The initial check remains
-    // above so requests that are already oversized still fail before I/O.
-    validate_sandbox_spec(&request.name, &spec)?;
-
     if let Some(ref policy) = spec.policy {
-        validate_policy_safety(policy)?;
         crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
     }
     super::policy::validate_candidate_sandbox_credential_policy(
@@ -691,8 +741,14 @@ async fn handle_create_sandbox_inner(
             status
         })?;
 
-    let runtime_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+    let mut runtime_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
         .map_err(|error| Status::internal(error.to_string()))?;
+    crate::compute::warm_pool::prepare(
+        &mut sandbox,
+        &mut runtime_identity,
+        await_main_process_attachment,
+        selected_pair,
+    )?;
     if let Some(metadata) = sandbox.metadata.as_mut() {
         runtime_identity.write(&mut metadata.annotations);
     }
@@ -716,15 +772,26 @@ async fn handle_create_sandbox_inner(
         .transpose()?;
     runtime_inputs.launch_authentication = launch_authentication;
 
-    let sandbox = Box::pin(state.compute.create_sandbox_with_runtime_inputs_and_guards(
-        sandbox,
-        sandbox_token,
-        await_main_process_attachment,
-        runtime_inputs,
-        sandbox_lifecycle_guard,
-        mutation_guard,
-    ))
-    .await?;
+    let sandbox = if crate::compute::warm_pool::pending(&sandbox) {
+        Box::pin(crate::compute::warm_pool::create(
+            state,
+            sandbox,
+            Some(sandbox_lifecycle_guard),
+            Some(mutation_guard),
+            runtime_inputs,
+        ))
+        .await?
+    } else {
+        Box::pin(state.compute.create_sandbox_with_runtime_inputs_and_guards(
+            sandbox,
+            sandbox_token,
+            await_main_process_attachment,
+            runtime_inputs,
+            sandbox_lifecycle_guard,
+            mutation_guard,
+        ))
+        .await?
+    };
 
     let mut service_urls = HashMap::with_capacity(request.service_exposures.len());
     for exposure in &request.service_exposures {
@@ -855,7 +922,7 @@ fn validate_template_create_governance_spec(spec: &SandboxSpec) -> Result<(), St
     Ok(())
 }
 
-fn sandbox_spec_from_stored_workload_template(
+pub fn sandbox_spec_from_stored_workload_template(
     template: &SandboxWorkloadTemplate,
 ) -> Result<SandboxSpec, Status> {
     sandbox_spec_from_workload_template(template, tonic::Code::Internal)

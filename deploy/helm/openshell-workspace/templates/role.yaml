@@ -43,11 +43,12 @@ rules:
       - pods
     verbs:
       - get
-  # Generation-scoped sandbox bootstrap Secrets.
+  # Registration and interrupted preparation read generation-scoped bootstrap Secrets.
   - apiGroups:
       - ""
     resources:
       - secrets
     verbs:
       - create
+      - get
       - delete

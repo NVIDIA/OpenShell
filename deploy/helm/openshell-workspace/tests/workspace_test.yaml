@@ -51,7 +51,7 @@ tests:
             resources: ["persistentvolumeclaims"]
             verbs: ["get"]
 
-  - it: grants generation Secret lifecycle and names no Secrets
+  - it: grants namespace-scoped generation Secret reads and lifecycle
     template: templates/role.yaml
     asserts:
       - contains:
@@ -59,7 +59,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "delete"]
+            verbs: ["create", "get", "delete"]
       - notExists:
           path: rules[*].resourceNames
 
