@@ -11,12 +11,14 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Dependencies that select their own provider must be configured as well as
-# first-party calls. Consumers enable these integration features, never a backend.
-tls-tonic = ["dep:tonic", "tonic/tls-aws-lc"]
-tls-hyper = ["dep:hyper-rustls", "hyper-rustls/aws-lc-rs"]
-tls-kube = ["dep:kube", "dep:k8s-openapi", "kube/aws-lc-rs"]
-tls-sqlx = ["dep:sqlx", "sqlx/tls-rustls-aws-lc-rs"]
+# Only this feature selects the default backend. With defaults disabled an
+# embedder must install its backend before any crypto operation.
+default = ["aws-lc"]
+aws-lc = ["dep:aws-lc-rs", "rustls/aws_lc_rs", "rcgen/aws_lc_rs", "jsonwebtoken/aws_lc_rs", "tonic?/tls-aws-lc", "hyper-rustls?/aws-lc-rs", "kube?/aws-lc-rs", "sqlx?/tls-rustls-aws-lc-rs"]
+tls-tonic = ["dep:tonic"]
+tls-hyper = ["dep:hyper-rustls"]
+tls-kube = ["dep:kube", "dep:k8s-openapi"]
+tls-sqlx = ["dep:sqlx"]
 
 [dependencies]
 tonic = { workspace = true, optional = true }
@@ -25,10 +27,12 @@ kube = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 
-aws-lc-rs = { workspace = true }
-rustls = { workspace = true, features = ["aws_lc_rs"] }
-rcgen = { workspace = true, features = ["aws_lc_rs"] }
-jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
+aws-lc-rs = { workspace = true, optional = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+jsonwebtoken = { workspace = true }
+pem = "3"
+x509-parser = { version = "0.18.1", default-features = false }
 serde = { workspace = true }
 thiserror = { workspace = true }
 

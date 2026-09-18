@@ -4,7 +4,7 @@
 use crate::jwt::{JwtKeyMaterial, generate_jwt_key};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, Ia5String, IsCa, KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, DnType, IsCa, KeyUsagePurpose, SanType, string::Ia5String,
 };
 use std::net::IpAddr;
 
@@ -121,11 +121,11 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
 
     Ok(PkiBundle {
         ca_cert_pem: ca_cert.pem(),
-        ca_key_pem: ca_key.serialize_pem(),
+        ca_key_pem: ca_key.serialize_pem().into_diagnostic()?,
         server_cert_pem: server_cert.pem(),
-        server_key_pem: server_key.serialize_pem(),
+        server_key_pem: server_key.serialize_pem().into_diagnostic()?,
         client_cert_pem: client_cert.pem(),
-        client_key_pem: client_key.serialize_pem(),
+        client_key_pem: client_key.serialize_pem().into_diagnostic()?,
         jwt_signing_key_pem,
         jwt_public_key_pem,
         jwt_key_id,

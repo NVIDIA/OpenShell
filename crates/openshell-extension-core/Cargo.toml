@@ -19,7 +19,7 @@ tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tower = { workspace = true }
 
 [dev-dependencies]
-openshell-crypto = { path = "../openshell-crypto" }
+openshell-crypto = { workspace = true }
 http = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
