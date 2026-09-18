@@ -63,6 +63,7 @@ let
           use_galaxy = false;
           playbooks = [
             "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/selinux.yaml"
             "ansible/playbooks/podman-rootful.yaml"
           ];
         };
@@ -87,6 +88,7 @@ let
           use_galaxy = false;
           playbooks = [
             "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/selinux.yaml"
             "ansible/playbooks/podman-rootless.yaml"
           ];
         };
