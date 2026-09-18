@@ -82,6 +82,7 @@ struct SandboxState {
     template_get_requests: Arc<Mutex<Vec<GetSandboxTemplateRequest>>>,
     template_list_requests: Arc<Mutex<Vec<ListSandboxTemplatesRequest>>>,
     template_delete_requests: Arc<Mutex<Vec<DeleteSandboxTemplateRequest>>>,
+    sandboxes: Arc<Mutex<Vec<Sandbox>>>,
 }
 
 #[derive(Clone, Default)]
@@ -211,7 +212,10 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
-        Ok(Response::new(ListSandboxesResponse::default()))
+        Ok(Response::new(ListSandboxesResponse {
+            sandboxes: self.state.sandboxes.lock().await.clone(),
+            next_page_token: String::new(),
+        }))
     }
 
     async fn create_sandbox_template(
@@ -1494,6 +1498,24 @@ async fn add_provider(server: &TestServer, name: &str, provider_type: &str) {
         });
 }
 
+async fn add_sandbox(server: &TestServer, name: &str, phase: SandboxPhase) {
+    let mut sandbox = Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: format!("sandbox-{name}"),
+            name: name.to_string(),
+            created_time: None,
+            labels: HashMap::new(),
+            resource_version: 0,
+            annotations: HashMap::new(),
+            workspace: String::new(),
+            deletion_time: None,
+        }),
+        ..Sandbox::default()
+    };
+    sandbox.set_phase(phase as i32);
+    server.openshell.state.sandboxes.lock().await.push(sandbox);
+}
+
 fn test_tls(server: &TestServer) -> TlsOptions {
     server.tls.with_gateway_name("openshell")
 }
@@ -1529,6 +1551,7 @@ async fn sandbox_delete_continues_after_entry_failure() {
     let err = run::sandbox_delete(
         &server.endpoint,
         &["failing-sandbox".to_string(), "later-sandbox".to_string()],
+        false,
         false,
         "default",
         &tls,
@@ -1592,6 +1615,89 @@ async fn sandbox_create_tolerates_an_unreachable_profile_catalog() {
             .as_ref()
             .is_none_or(|spec| spec.providers.is_empty()),
         "no provider should be attached without an explicit --provider"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_delete_all() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+
+    add_sandbox(&server, "unspecified", SandboxPhase::Unspecified).await;
+    add_sandbox(&server, "provisioning", SandboxPhase::Provisioning).await;
+    add_sandbox(&server, "ready", SandboxPhase::Ready).await;
+    add_sandbox(&server, "error", SandboxPhase::Error).await;
+    add_sandbox(&server, "deleting", SandboxPhase::Deleting).await;
+    add_sandbox(&server, "stopping", SandboxPhase::Stopping).await;
+    add_sandbox(&server, "stopped", SandboxPhase::Stopped).await;
+    add_sandbox(&server, "starting", SandboxPhase::Starting).await;
+    add_sandbox(&server, "completed", SandboxPhase::Completed).await;
+    add_sandbox(&server, "unknown", SandboxPhase::Unknown).await;
+
+    assert!(
+        run::sandbox_delete(
+            &server.endpoint,
+            &[],
+            true,
+            false,
+            "default",
+            &tls,
+            "openshell"
+        )
+        .await
+        .is_ok()
+    );
+
+    assert_eq!(
+        deleted_names(&server).await,
+        vec![
+            vec!["unspecified".to_string()],
+            vec!["provisioning".to_string()],
+            vec!["ready".to_string()],
+            vec!["error".to_string()],
+            vec!["deleting".to_string()],
+            vec!["stopping".to_string()],
+            vec!["stopped".to_string()],
+            vec!["starting".to_string()],
+            vec!["completed".to_string()],
+            vec!["unknown".to_string()],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn sandbox_delete_prune() {
+    let server = run_server().await;
+    let tls = test_tls(&server);
+
+    add_sandbox(&server, "unspecified", SandboxPhase::Unspecified).await;
+    add_sandbox(&server, "provisioning", SandboxPhase::Provisioning).await;
+    add_sandbox(&server, "ready", SandboxPhase::Ready).await;
+    add_sandbox(&server, "error", SandboxPhase::Error).await;
+    add_sandbox(&server, "deleting", SandboxPhase::Deleting).await;
+    add_sandbox(&server, "stopping", SandboxPhase::Stopping).await;
+    add_sandbox(&server, "stopped", SandboxPhase::Stopped).await;
+    add_sandbox(&server, "starting", SandboxPhase::Starting).await;
+    add_sandbox(&server, "completed", SandboxPhase::Completed).await;
+    add_sandbox(&server, "unknown", SandboxPhase::Unknown).await;
+
+    assert!(
+        run::sandbox_delete(
+            &server.endpoint,
+            &[],
+            false,
+            true,
+            "default",
+            &tls,
+            "openshell"
+        )
+        .await
+        .is_ok()
+    );
+
+    assert_eq!(
+        deleted_names(&server).await,
+        vec![vec!["error".to_string()], vec!["completed".to_string()],]
     );
 }
 

@@ -416,6 +416,7 @@ openshell logs my-sandbox --since 5m
 openshell sandbox delete my-sandbox
 openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 openshell sandbox delete --all
+openshell sandbox delete --prune   # Only inactive
 ```
 
 `deletion accepted` means cleanup is still pending. Inspect the sandbox until

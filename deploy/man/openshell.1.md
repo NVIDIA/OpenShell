@@ -65,8 +65,8 @@ development task, or behind a cloud reverse proxy.
 **sandbox get** *NAME*
 :   Show details for a sandbox.
 
-**sandbox delete** *NAME* \| **--all**
-:   Delete one or all sandboxes.
+**sandbox delete** *NAME* \| **--prune** \| **--all**
+:   Delete one, all inactive or all sandboxes.
 
 **sandbox connect** *NAME* \[**--editor** *EDITOR*\]
 :   SSH into a running sandbox.
