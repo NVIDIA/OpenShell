@@ -1272,11 +1272,8 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
         ));
     }
 
-    // Full image reference or community sandbox name — delegate to shared
-    // resolution in openshell-core.
-    Ok(ResolvedSource::Image(
-        openshell_core::image::resolve_community_image(value),
-    ))
+    // Explicit OCI image reference — passed through to the gateway unchanged.
+    Ok(ResolvedSource::Image(value.to_string()))
 }
 
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // already lowercased
@@ -6801,7 +6798,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_from_keeps_bare_community_name_when_local_directory_matches() {
+    fn resolve_from_keeps_bare_name_as_image_when_local_directory_matches() {
         let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6813,11 +6810,10 @@ mod tests {
         let result = resolve_from("python");
 
         std::env::set_current_dir(original_dir).expect("restore current directory");
-        match result.expect("bare community name should not be a local path") {
-            super::ResolvedSource::Image(image) => assert_eq!(
-                image,
-                "ghcr.io/nvidia/openshell-community/sandboxes/python:latest"
-            ),
+        match result.expect("bare name should be treated as an image, not a local path") {
+            // Bare values are passed through unchanged as explicit OCI references
+            // (community-name expansion was removed).
+            super::ResolvedSource::Image(image) => assert_eq!(image, "python"),
             other @ super::ResolvedSource::RootfsTar { .. } => {
                 panic!("expected image source, got {other:?}");
             }

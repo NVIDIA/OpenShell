@@ -176,7 +176,7 @@ sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER
 **Image pull failure.** Verify ghcr.io is reachable:
 
 ```shell
-podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+podman pull docker.io/library/alpine:3.22
 ```
 
 ### Images not updating
@@ -185,7 +185,7 @@ The default image pull policy is `if_not_present` -- images are pulled once
 and cached. To update:
 
 ```shell
-podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+podman pull docker.io/library/alpine:3.22
 podman pull ghcr.io/nvidia/openshell/supervisor:latest
 ```
 
@@ -239,7 +239,7 @@ To pick up new container images after an upgrade:
 
 ```shell
 podman pull ghcr.io/nvidia/openshell/supervisor:latest
-podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+podman pull docker.io/library/alpine:3.22
 ```
 
 ### Migrating a TLS-enabled local driver to schema version 2

@@ -62,7 +62,7 @@ fn test_sandbox() -> DriverSandbox {
             log_level: "debug".to_string(),
             environment: HashMap::from([("SPEC_ENV".to_string(), "spec".to_string())]),
             template: Some(DriverSandboxTemplate {
-                image: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
+                image: "docker.io/library/alpine:3.22".to_string(),
                 agent_socket_path: String::new(),
                 labels: HashMap::new(),
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
