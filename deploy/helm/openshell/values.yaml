@@ -56,7 +56,8 @@ supervisor:
 # -- Operator-owned corporate forward proxy for policy-approved TLS egress
 # from Kubernetes sandboxes. The workload cannot select or override it.
 upstreamProxy:
-  # -- HTTP proxy URL in http://host:port form. HTTPS-to-proxy is not supported.
+  # -- Proxy URL in http://host:port or https://host:port form. An https:// proxy
+  # whose certificate is not publicly trusted also needs caBundle below.
   url: ""
   # -- Comma-separated destinations that bypass only the corporate proxy.
   noProxy: ""
@@ -69,6 +70,22 @@ upstreamProxy:
   authAllowInsecure: false
   # -- Last-resort option for hostname-filtering proxy ACLs. It lets the proxy resolve CONNECT targets.
   connectByHostname: false
+  caBundle:
+    # -- ConfigMap in the release namespace holding the corporate proxy CA bundle.
+    # Required for an https:// proxy with a private CA, and for a TLS-intercepting
+    # proxy that re-signs upstream certificates. The gateway reads it and stages it
+    # into each sandbox's immutable supervisor bootstrap Secret, so the anchor stays
+    # in the gateway's trust domain rather than the workload namespace.
+    # Supply only the CA that signs your proxy's certificate, or that the proxy
+    # re-signs intercepted upstream certificates with. Public roots already come
+    # from the supervisor image and its TLS stack, so a full merged trust bundle
+    # (for example an OpenShift config.openshift.io/inject-trusted-cabundle
+    # ConfigMap) adds hundreds of kilobytes of duplicated roots and can exceed
+    # the sandbox boundary's control-frame budget.
+    configMapName: ""
+    # -- Key inside that ConfigMap. Change this only to reuse an existing
+    # ConfigMap whose key is not ca.crt.
+    key: ca.crt
 
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []

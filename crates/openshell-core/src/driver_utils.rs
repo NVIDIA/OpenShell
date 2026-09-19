@@ -561,7 +561,9 @@ fn read_regular_file_bounded(path: &str, max_bytes: u64) -> Result<String, Bound
 /// between them live in one place instead of being restated per driver.
 /// Field names map 1:1 onto the documented TOML keys `https_proxy`,
 /// `no_proxy`, `proxy_auth_file`, `proxy_auth_allow_insecure`,
-/// `proxy_connect_by_hostname`, and `proxy_ca_bundle`.
+/// `proxy_connect_by_hostname`, and `proxy_ca_bundle`. The trailing
+/// `auth_setting_label` is not a TOML key; it only names the credential
+/// setting in diagnostics.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UpstreamProxySettings<'a> {
     /// `https_proxy`: the corporate forward proxy URL.
@@ -578,6 +580,14 @@ pub struct UpstreamProxySettings<'a> {
     pub connect_by_hostname: Option<bool>,
     /// `proxy_ca_bundle`: host path to a PEM CA bundle trusted for the proxy.
     pub ca_bundle: Option<&'a str>,
+    /// Operator-facing name of this driver's credential setting, used only in
+    /// diagnostics. `None` means `proxy_auth_file`, the local-driver default.
+    ///
+    /// Drivers that deliver the credential by another mechanism set this so an
+    /// error never points the operator at a key their driver rejects: the
+    /// Kubernetes driver takes credentials from a Secret and denies unknown
+    /// config keys, so `proxy_auth_file` would be actively misleading there.
+    pub auth_setting_label: Option<&'a str>,
 }
 
 /// Validate operator-supplied corporate upstream-proxy settings, fail-closed.
@@ -603,9 +613,11 @@ pub fn validate_upstream_proxy_settings(
         let addr = parse_upstream_proxy_url(url).map_err(|err| match err {
             UpstreamProxyUrlError::Empty => "https_proxy must not be empty when set".to_string(),
             UpstreamProxyUrlError::InlineCredentials => {
-                "https_proxy must not embed credentials in the URL; supply them via \
-                 proxy_auth_file so they are not stored in config or sandbox metadata"
-                    .to_string()
+                let auth_setting = settings.auth_setting_label.unwrap_or("proxy_auth_file");
+                format!(
+                    "https_proxy must not embed credentials in the URL; supply them via \
+                     {auth_setting} so they are not stored in config or sandbox metadata"
+                )
             }
             err => format!("https_proxy {err}"),
         })?;
@@ -1331,6 +1343,24 @@ mod tests {
         let err = validate_upstream_proxy_settings(&proxy_settings(Some("http://u:p@proxy:3128")))
             .expect_err("inline credentials would be stored in gateway config");
         assert!(err.contains("proxy_auth_file"), "{err}");
+    }
+
+    #[test]
+    fn upstream_proxy_settings_name_the_driver_credential_setting_in_diagnostics() {
+        // A driver that takes credentials elsewhere must not send the operator
+        // looking for `proxy_auth_file`; the Kubernetes driver denies unknown
+        // config keys, so naming it there would be an actively wrong hint.
+        let err = validate_upstream_proxy_settings(&UpstreamProxySettings {
+            url: Some("http://u:p@proxy:3128"),
+            auth_setting_label: Some("proxy_auth_secret_name and proxy_auth_secret_key"),
+            ..UpstreamProxySettings::default()
+        })
+        .expect_err("inline credentials would be stored in gateway config");
+        assert!(
+            err.contains("proxy_auth_secret_name and proxy_auth_secret_key"),
+            "{err}"
+        );
+        assert!(!err.contains("proxy_auth_file"), "{err}");
     }
 
     #[test]
