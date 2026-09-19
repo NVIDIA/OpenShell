@@ -1127,8 +1127,43 @@ pub(super) async fn handle_list_sandbox_providers(
     )
     .await?;
     let workspace = sandbox.object_workspace().to_string();
-    let providers = providers_for_sandbox(state, &sandbox, &workspace).await?;
-    Ok(Response::new(ListSandboxProvidersResponse { providers }))
+    let pagination = Pagination::new(
+        req.page_size,
+        &req.page_token,
+        "ListSandboxProviders",
+        &[&workspace, &req.sandbox],
+    )?;
+    let mut providers = providers_for_sandbox(state, &sandbox, &workspace)
+        .await?
+        .into_iter()
+        .map(|provider| {
+            let name = provider
+                .metadata
+                .as_ref()
+                .filter(|metadata| !metadata.name.is_empty())
+                .map(|metadata| metadata.name.clone())
+                .ok_or_else(|| Status::internal("provider metadata name is missing"))?;
+            Ok((name, provider))
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    providers.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let start = pagination.provider_cursor()?.map_or(0, |cursor| {
+        providers.partition_point(|(name, _)| name.as_str() <= cursor)
+    });
+    let end = start
+        .saturating_add(usize::try_from(pagination.page_size()).expect("u32 fits in usize"))
+        .min(providers.len());
+    let next_page_token = pagination
+        .next_provider_token((end < providers.len()).then(|| providers[end - 1].0.as_str()));
+    Ok(Response::new(ListSandboxProvidersResponse {
+        providers: providers
+            .into_iter()
+            .skip(start)
+            .take(end - start)
+            .map(|(_, provider)| provider)
+            .collect(),
+        next_page_token,
+    }))
 }
 
 pub(super) async fn handle_attach_sandbox_provider(
@@ -4206,6 +4241,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_sandbox_providers_returns_attached_provider_records() {
+        use openshell_core::proto::CreateWorkspaceRequest;
+
         let state = test_server_state().await;
         state
             .store
@@ -4214,29 +4251,120 @@ mod tests {
             .unwrap();
         state
             .store
-            .put_message(&test_sandbox("work", vec!["work-github".to_string()]))
+            .put_message(&test_provider("work-gitlab", "gitlab"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "work",
+                vec!["work-github".to_string(), "work-gitlab".to_string()],
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("other", vec!["work-github".to_string()]))
             .await
             .unwrap();
 
-        let response = handle_list_sandbox_providers(
+        let first_page = handle_list_sandbox_providers(
             &state,
             authed_request(ListSandboxProvidersRequest {
                 sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                page_size: 1,
+                page_token: String::new(),
             }),
         )
         .await
         .unwrap()
         .into_inner();
 
-        assert_eq!(response.providers.len(), 1);
-        assert_eq!(response.providers[0].r#type, "github");
+        assert_eq!(first_page.providers.len(), 1);
+        assert_eq!(first_page.providers[0].r#type, "github");
         assert_eq!(
-            response.providers[0].credentials.get("TOKEN"),
+            first_page.providers[0].credentials.get("TOKEN"),
             Some(&"REDACTED".to_string())
         );
+        assert!(!first_page.next_page_token.is_empty());
+
+        crate::grpc::workspace::handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
+                name: "beta".to_string(),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .expect("beta workspace should be created");
+        let mut beta_provider = test_provider("work-github", "github");
+        beta_provider.metadata.as_mut().unwrap().id = "provider-beta-work-github".to_string();
+        beta_provider.metadata.as_mut().unwrap().workspace = "beta".to_string();
+        state.store.put_message(&beta_provider).await.unwrap();
+        let mut beta_sandbox = test_sandbox("work", vec!["work-github".to_string()]);
+        beta_sandbox.metadata.as_mut().unwrap().id = "sandbox-beta-work".to_string();
+        beta_sandbox.metadata.as_mut().unwrap().workspace = "beta".to_string();
+        state.store.put_message(&beta_sandbox).await.unwrap();
+
+        let err = handle_list_sandbox_providers(
+            &state,
+            authed_request(ListSandboxProvidersRequest {
+                sandbox: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("beta")),
+                page_size: 1,
+                page_token: first_page.next_page_token.clone(),
+            }),
+        )
+        .await
+        .expect_err("a token for one workspace must not list a same-named sandbox elsewhere");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        let mut sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "work")
+            .await
+            .unwrap()
+            .expect("sandbox exists");
+        sandbox
+            .spec
+            .as_mut()
+            .expect("sandbox has a spec")
+            .providers
+            .retain(|name| name != "work-github");
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let err = handle_list_sandbox_providers(
+            &state,
+            authed_request(ListSandboxProvidersRequest {
+                sandbox: "other".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                page_size: 1,
+                page_token: first_page.next_page_token.clone(),
+            }),
+        )
+        .await
+        .expect_err("a token for one sandbox must not list another sandbox");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        let second_page = handle_list_sandbox_providers(
+            &state,
+            authed_request(ListSandboxProvidersRequest {
+                sandbox: "work".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                page_size: 100,
+                page_token: first_page.next_page_token,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(second_page.providers.len(), 1);
+        assert_eq!(second_page.providers[0].r#type, "gitlab");
+        assert!(second_page.next_page_token.is_empty());
     }
 
     #[tokio::test]
@@ -7192,6 +7320,8 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "no-such-ws".to_string(),
                 )),
+                page_size: 0,
+                page_token: String::new(),
             }),
         )
         .await
