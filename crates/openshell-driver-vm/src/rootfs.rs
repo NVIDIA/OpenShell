@@ -1053,8 +1053,17 @@ fn run_debugfs(image_path: &Path, command: &str) -> Result<(), String> {
     ))
 }
 
+/// Resolve the places an e2fsprogs binary may live, starting with `PATH`.
+///
+/// Distributions install `mke2fs`, `e2fsck`, and `debugfs` under `/usr/sbin`
+/// or `/sbin`, which most Linux hosts leave out of a non-root user's `PATH`,
+/// so those directories are probed explicitly. Homebrew keeps e2fsprogs
+/// keg-only on macOS, so its prefixes are probed as well.
 fn e2fs_tool_candidates(tool: &str) -> Vec<PathBuf> {
     let mut candidates = vec![PathBuf::from(tool)];
+    for dir in ["/usr/local/sbin", "/usr/sbin", "/sbin"] {
+        candidates.push(Path::new(dir).join(tool));
+    }
     for root in ["/opt/homebrew/opt/e2fsprogs", "/usr/local/opt/e2fsprogs"] {
         candidates.push(Path::new(root).join("sbin").join(tool));
         candidates.push(Path::new(root).join("bin").join(tool));
@@ -1583,6 +1592,20 @@ mod tests {
             Some("\"/tmp/path/with\\\\backslash/and\\\"quote\"".to_string())
         );
         assert_eq!(debugfs_quote_argument("/tmp/bad\npath"), None);
+    }
+
+    #[test]
+    fn e2fs_tool_candidates_probe_path_then_system_sbin_directories() {
+        let candidates = e2fs_tool_candidates("mke2fs");
+
+        assert_eq!(candidates.first(), Some(&PathBuf::from("mke2fs")));
+        for expected in ["/usr/local/sbin/mke2fs", "/usr/sbin/mke2fs", "/sbin/mke2fs"] {
+            assert!(
+                candidates.contains(&PathBuf::from(expected)),
+                "expected {expected} in {candidates:?}"
+            );
+        }
+        assert!(candidates.contains(&PathBuf::from("/opt/homebrew/opt/e2fsprogs/sbin/mke2fs")));
     }
 
     #[test]
