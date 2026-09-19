@@ -104,6 +104,11 @@ message GetCapabilitiesResponse {
   // portable SandboxPolicy.ui contract. Partial support must report false so
   // the gateway rejects every explicit UI section before provisioning.
   bool supports_ui_policy = 12;
+  // Whether the driver can apply policy changes to an already-created sandbox.
+  // Omit this field to preserve the legacy gateway behavior. Drivers that
+  // cannot update a live sandbox must explicitly report false so the gateway
+  // rejects changes instead of persisting a policy that is not enforced.
+  optional bool supports_live_policy_updates = 13;
 }
 
 message AuthenticateSandboxRequest {

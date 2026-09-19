@@ -3844,6 +3844,16 @@ async fn handle_update_config_inner(
     let sandbox_id = sandbox.object_id().to_string();
     let mut response_annotations = sandbox_metadata_annotations(&sandbox);
 
+    if !sandbox_caller
+        && (has_policy || has_merge_ops)
+        && !state.compute.supports_live_policy_updates()
+    {
+        return Err(Status::failed_precondition(format!(
+            "compute driver '{}' cannot apply policy updates to an existing sandbox; delete and recreate the sandbox with the requested policy",
+            state.compute.configured_driver_name()
+        )));
+    }
+
     if has_setting {
         let _settings_guard = state.settings_mutex.lock().await;
 
@@ -7307,7 +7317,9 @@ mod tests {
         Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
     };
     use crate::grpc::provider::ProviderEnvironment;
-    use crate::grpc::test_support::{authed_request, test_server_state};
+    use crate::grpc::test_support::{
+        authed_request, test_server_state, test_server_state_with_driver,
+    };
     use crate::persistence::test_store;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -8445,6 +8457,95 @@ mod tests {
             persisted.ui.expect("persisted UI").clipboard,
             UiClipboardAccess::None as i32
         );
+    }
+
+    #[tokio::test]
+    async fn mxc_rejects_operator_policy_update_before_persistence() {
+        use openshell_core::proto::FilesystemPolicy;
+
+        let state = test_server_state_with_driver("mxc").await;
+        let sandbox_id = "mxc-live-policy";
+        let mut baseline = openshell_policy::restrictive_default_policy();
+        baseline.filesystem = Some(FilesystemPolicy {
+            read_only: vec![r"C:\Windows".to_string()],
+            ..Default::default()
+        });
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_id,
+                baseline.clone(),
+                Vec::new(),
+            ))
+            .await
+            .expect("store MXC sandbox");
+
+        let mut additive = baseline;
+        additive
+            .filesystem
+            .as_mut()
+            .expect("filesystem policy")
+            .read_only
+            .push(r"C:\Program Files".to_string());
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: sandbox_id.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                policy: Some(additive),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("MXC cannot apply an operator policy update to a live sandbox");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("delete and recreate"));
+        assert!(
+            state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .expect("policy history lookup")
+                .is_none(),
+            "a rejected update must not create a pending revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn mxc_allows_sandbox_authored_policy_sync() {
+        let state = test_server_state_with_driver("mxc").await;
+        let sandbox_id = "mxc-policy-sync";
+        let policy = openshell_policy::restrictive_default_policy();
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_id,
+                policy.clone(),
+                Vec::new(),
+            ))
+            .await
+            .expect("store MXC sandbox");
+
+        let response = handle_update_config(
+            &state,
+            with_sandbox(
+                Request::new(UpdateConfigRequest {
+                    name: sandbox_id.to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    policy: Some(policy),
+                    ..Default::default()
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .expect("sandbox-authored startup sync remains supported")
+        .into_inner();
+
+        assert_eq!(response.version, 1);
     }
 
     #[tokio::test]

@@ -813,6 +813,7 @@ impl MxcComputeBackend {
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
             supports_ui_policy: self.config.backend == MxcBackend::ProcessContainer,
+            supports_live_policy_updates: Some(false),
         }
     }
 
@@ -2388,12 +2389,24 @@ mod lifecycle_tests {
     fn ui_policy_capability_tracks_configured_backend() {
         let process_container = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
         assert!(process_container.capabilities().supports_ui_policy);
+        assert_eq!(
+            process_container
+                .capabilities()
+                .supports_live_policy_updates,
+            Some(false)
+        );
 
         let isolation_session = MxcComputeBackend::new_mocked(MxcComputeConfig {
             backend: MxcBackend::IsolationSession,
             ..Default::default()
         });
         assert!(!isolation_session.capabilities().supports_ui_policy);
+        assert_eq!(
+            isolation_session
+                .capabilities()
+                .supports_live_policy_updates,
+            Some(false)
+        );
     }
 
     fn driver_sandbox_with_command(id: &str, cwd: &str, command: Vec<String>) -> DriverSandbox {

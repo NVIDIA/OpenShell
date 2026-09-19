@@ -5171,6 +5171,32 @@ where
     } else {
         config.version
     };
+    let (status, active_version) = if policy_source == PolicySource::Global {
+        // Global policy writes are validated and marked loaded synchronously.
+        // Do not query the global history endpoint here: policy get on a
+        // sandbox is workspace-readable, while global history is platform-admin
+        // scoped.
+        (PolicyStatus::Loaded, version)
+    } else {
+        let status_response = client
+            .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
+                name: name.to_string(),
+                version,
+                global: false,
+                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner();
+        let revision = status_response
+            .revision
+            .as_ref()
+            .ok_or_else(|| miette!("policy version {version} is missing from policy history"))?;
+        (
+            PolicyStatus::try_from(revision.status).unwrap_or(PolicyStatus::Unspecified),
+            status_response.active_version,
+        )
+    };
 
     match output {
         "json" => {
@@ -5178,9 +5204,15 @@ where
             obj.insert("scope".to_string(), serde_json::json!("sandbox"));
             obj.insert("sandbox".to_string(), serde_json::json!(name));
             obj.insert("version".to_string(), serde_json::json!(version));
-            obj.insert("active_version".to_string(), serde_json::json!(version));
+            obj.insert(
+                "active_version".to_string(),
+                serde_json::json!(active_version),
+            );
             obj.insert("hash".to_string(), serde_json::json!(config.policy_hash));
-            obj.insert("status".to_string(), serde_json::json!("effective"));
+            obj.insert(
+                "status".to_string(),
+                serde_json::json!(policy_status_json_name(status)),
+            );
             obj.insert(
                 "config_revision".to_string(),
                 serde_json::json!(config.config_revision),
@@ -5211,8 +5243,9 @@ where
         }
         "table" => {
             writeln!(stdout, "Version:      {version}").into_diagnostic()?;
+            writeln!(stdout, "Active:       {active_version}").into_diagnostic()?;
             writeln!(stdout, "Hash:         {}", config.policy_hash).into_diagnostic()?;
-            writeln!(stdout, "Status:       Effective").into_diagnostic()?;
+            writeln!(stdout, "Status:       {status:?}").into_diagnostic()?;
             writeln!(stdout, "Source:       {policy_source_label}").into_diagnostic()?;
             writeln!(stdout, "Config rev:   {}", config.config_revision).into_diagnostic()?;
             if config.global_policy_version > 0 {

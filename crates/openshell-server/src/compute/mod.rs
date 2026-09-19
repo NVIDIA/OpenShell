@@ -382,6 +382,9 @@ pub struct ComputeDriverInfoSnapshot {
     /// Whether this configured driver instance completely enforces the portable
     /// UI policy contract.
     pub supports_ui_policy: bool,
+    /// Whether this driver can apply policy changes after sandbox creation.
+    /// `None` preserves the behavior of older external drivers.
+    pub supports_live_policy_updates: Option<bool>,
 }
 
 /// Interval between store-vs-backend reconciliation sweeps.
@@ -743,6 +746,7 @@ impl ComputeRuntime {
             rootfs_tar_staging_dir: capabilities.rootfs_tar_staging_dir,
             rootfs_tar_max_bytes: capabilities.rootfs_tar_max_bytes,
             supports_ui_policy: capabilities.supports_ui_policy,
+            supports_live_policy_updates: capabilities.supports_live_policy_updates,
         };
         let default_image = capabilities.default_image;
         let gateway_listener_requirements = match driver
@@ -922,6 +926,15 @@ impl ComputeRuntime {
     #[must_use]
     pub fn supports_sandbox_authentication(&self) -> bool {
         self.driver_info.supports_sandbox_authentication
+    }
+
+    /// Whether operator-authored policy updates can reach an already-created
+    /// sandbox. Unspecified preserves compatibility with older drivers.
+    #[must_use]
+    pub(crate) fn supports_live_policy_updates(&self) -> bool {
+        self.driver_info
+            .supports_live_policy_updates
+            .unwrap_or(true)
     }
 
     pub(crate) async fn authenticate_sandbox(&self, credential: &str) -> Result<String, Status> {
@@ -5001,6 +5014,7 @@ impl ComputeDriver for NoopTestDriver {
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
                 supports_ui_policy: false,
+                supports_live_policy_updates: None,
             },
         ))
     }
@@ -5126,7 +5140,12 @@ pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
 
 #[cfg(test)]
 pub async fn new_test_runtime_for_driver(store: Arc<Store>, driver_name: &str) -> ComputeRuntime {
-    new_test_runtime_with_driver(store, driver_name, Arc::new(NoopTestDriver::default())).await
+    let mut runtime =
+        new_test_runtime_with_driver(store, driver_name, Arc::new(NoopTestDriver::default())).await;
+    if driver_name == "mxc" {
+        runtime.driver_info.supports_live_policy_updates = Some(false);
+    }
+    runtime
 }
 
 #[cfg(test)]
@@ -5149,6 +5168,7 @@ pub async fn new_test_runtime_with_driver(
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
             supports_ui_policy: false,
+            supports_live_policy_updates: None,
         },
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
@@ -5473,6 +5493,7 @@ mod tests {
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
                 supports_ui_policy: false,
+                supports_live_policy_updates: None,
             }))
         }
 
@@ -5839,6 +5860,7 @@ mod tests {
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
                 supports_ui_policy: false,
+                supports_live_policy_updates: None,
             }))
         }
 
@@ -6053,6 +6075,7 @@ mod tests {
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
                 supports_ui_policy: false,
+                supports_live_policy_updates: None,
             },
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,

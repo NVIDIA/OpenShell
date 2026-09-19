@@ -25,6 +25,7 @@ use openshell_core::proto::{
     ServiceStatus, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
@@ -38,6 +39,7 @@ use tonic::{Response, Status};
 #[derive(Clone, Default)]
 struct SandboxState {
     last_get_name: Arc<Mutex<Option<String>>>,
+    global_policy: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
@@ -191,6 +193,7 @@ impl OpenShell for TestOpenShell {
             req.sandbox_id, "test-id",
             "GetSandboxConfig should pass the id from GetSandbox"
         );
+        let global_policy = self.state.global_policy.load(Ordering::Relaxed);
         Ok(Response::new(GetSandboxConfigResponse {
             policy: Some(SandboxPolicy {
                 version: 9,
@@ -233,7 +236,12 @@ impl OpenShell for TestOpenShell {
             version: 9,
             policy_hash: "sha256:effective-policy".to_string(),
             config_revision: 42,
-            policy_source: openshell_core::proto::PolicySource::Sandbox.into(),
+            policy_source: if global_policy {
+                openshell_core::proto::PolicySource::Global.into()
+            } else {
+                openshell_core::proto::PolicySource::Sandbox.into()
+            },
+            global_policy_version: if global_policy { 4 } else { 0 },
             ..Default::default()
         }))
     }
@@ -460,8 +468,21 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
         let req = request.into_inner();
         assert_eq!(req.name, "my-sandbox");
-        assert_eq!(req.version, 3);
         assert!(!req.global);
+
+        if req.version == 9 {
+            return Ok(Response::new(GetSandboxPolicyStatusResponse {
+                revision: Some(SandboxPolicyRevision {
+                    version: 9,
+                    policy_hash: "sha256:effective-policy".to_string(),
+                    status: PolicyStatus::Pending.into(),
+                    ..Default::default()
+                }),
+                active_version: 7,
+            }));
+        }
+
+        assert_eq!(req.version, 3);
 
         let policy = SandboxPolicy {
             version: 7,
@@ -843,9 +864,9 @@ async fn policy_get_full_json_cli_prints_policy_payload() {
     assert_eq!(json["scope"], "sandbox");
     assert_eq!(json["sandbox"], "my-sandbox");
     assert_eq!(json["version"], 9);
-    assert_eq!(json["active_version"], 9);
+    assert_eq!(json["active_version"], 7);
     assert_eq!(json["hash"], "sha256:effective-policy");
-    assert_eq!(json["status"], "effective");
+    assert_eq!(json["status"], "pending");
     assert_eq!(json["config_revision"], 42);
     assert_eq!(json["policy_source"], "sandbox");
     assert_eq!(
@@ -891,7 +912,7 @@ async fn policy_get_base_json_cli_prints_round_trippable_policy_payload() {
         serde_json::from_slice(&stdout).expect("stdout should be valid JSON");
     assert_eq!(json["scope"], "sandbox");
     assert_eq!(json["sandbox"], "my-sandbox");
-    assert_eq!(json["status"], "effective");
+    assert_eq!(json["status"], "pending");
     assert!(
         json["policy"]["network_policies"]
             .get("_provider_api")
@@ -902,6 +923,63 @@ async fn policy_get_base_json_cli_prints_round_trippable_policy_payload() {
         json["policy"]["network_policies"]["user_api"]["endpoints"][0]["host"],
         "api.user.example.com"
     );
+}
+
+#[tokio::test]
+async fn policy_get_latest_table_reports_persisted_status_and_active_version() {
+    let ts = run_server().await;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    run::sandbox_policy_get_to_writer(
+        &ts.endpoint,
+        "my-sandbox",
+        0,
+        run::PolicyGetView::Metadata,
+        "table",
+        "default",
+        &ts.tls,
+        (&mut stdout, &mut stderr),
+    )
+    .await
+    .expect("policy get should succeed");
+
+    assert!(stderr.is_empty());
+    let output = String::from_utf8(stdout).expect("table output should be UTF-8");
+    assert!(output.contains("Version:      9"), "{output}");
+    assert!(output.contains("Active:       7"), "{output}");
+    assert!(output.contains("Status:       Pending"), "{output}");
+}
+
+#[tokio::test]
+async fn policy_get_global_effective_policy_remains_workspace_readable() {
+    let ts = run_server().await;
+    ts.openshell
+        .state
+        .global_policy
+        .store(true, Ordering::Relaxed);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    run::sandbox_policy_get_to_writer(
+        &ts.endpoint,
+        "my-sandbox",
+        0,
+        run::PolicyGetView::Metadata,
+        "json",
+        "default",
+        &ts.tls,
+        (&mut stdout, &mut stderr),
+    )
+    .await
+    .expect("workspace-readable global effective policy should not query admin-only history");
+
+    assert!(stderr.is_empty());
+    let json: serde_json::Value = serde_json::from_slice(&stdout).expect("valid JSON");
+    assert_eq!(json["version"], 4);
+    assert_eq!(json["active_version"], 4);
+    assert_eq!(json["status"], "loaded");
+    assert_eq!(json["policy_source"], "global");
 }
 
 #[tokio::test]

@@ -801,6 +801,7 @@ impl VmDriver {
                 .into_owned(),
             rootfs_tar_max_bytes: self.config.rootfs_tar_max_bytes(),
             supports_ui_policy: false,
+            supports_live_policy_updates: None,
         }
     }
 
