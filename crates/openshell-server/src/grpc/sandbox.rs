@@ -643,7 +643,7 @@ async fn handle_create_sandbox_inner(
             Err(exposure_error) => {
                 let rollback = state
                     .compute
-                    .delete_sandbox(sandbox.object_workspace(), sandbox.object_name())
+                    .delete_sandbox_by_id(sandbox.object_id(), sandbox.object_name())
                     .await;
                 if let Err(rollback_error) = rollback {
                     warn!(
@@ -3403,8 +3403,6 @@ mod tests {
     use crate::grpc::test_support::{
         authed_request, test_server_state, test_server_state_with_driver,
     };
-    use crate::provider_profile_sources::ProviderProfileSources;
-    use openshell_core::GatewayProviderProfileSourceConfig;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{GpuResourceRequirements, SandboxServiceExposure, ServiceEndpoint};
 
@@ -4574,6 +4572,7 @@ mod tests {
                 )),
                 await_main_process_attachment: false,
                 workload_template: String::new(),
+                service_exposures: Vec::new(),
             }),
         )
         .await
@@ -5116,8 +5115,8 @@ mod tests {
                 .expect("service endpoint lookup should succeed")
                 .expect("service endpoint should be persisted");
             assert_eq!(endpoint.sandbox_id, sandbox.object_id());
-            assert_eq!(endpoint.sandbox_name, "services");
-            assert_eq!(endpoint.service_name, service);
+            assert_eq!(endpoint.sandbox, "services");
+            assert_eq!(endpoint.name, service);
             assert_eq!(endpoint.target_port, target_port);
             assert!(endpoint.domain);
         }
@@ -5177,6 +5176,53 @@ mod tests {
             Some(SandboxPhase::Deleting),
             "failed create must begin sandbox cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn create_rollback_by_id_preserves_same_name_replacement() {
+        let state = test_server_state().await;
+        let original = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "rollback-replace".to_string(),
+                spec: Some(SandboxSpec::default()),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+        let original_id = original.object_id().to_string();
+        let original_name = original.object_name().to_string();
+
+        state
+            .store
+            .delete(Sandbox::object_type(), &original_id)
+            .await
+            .unwrap();
+        let mut replacement = original;
+        let replacement_id = uuid::Uuid::new_v4().to_string();
+        let metadata = replacement.metadata.as_mut().unwrap();
+        metadata.id.clone_from(&replacement_id);
+        metadata.resource_version = 0;
+        state.store.put_message(&replacement).await.unwrap();
+
+        state
+            .compute
+            .delete_sandbox_by_id(&original_id, &original_name)
+            .await
+            .unwrap();
+
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("default", &original_name)
+            .await
+            .unwrap()
+            .expect("replacement must survive rollback for the original ID");
+        assert_eq!(stored.object_id(), replacement_id);
     }
 
     #[tokio::test]
@@ -5919,7 +5965,7 @@ mod tests {
                 + generated_by_gateway.len(),
             "every field must have exactly one create-time owner"
         );
-        let actual: std::collections::HashSet<String> = message
+        let actual: HashSet<String> = message
             .fields()
             .map(|field| field.name().to_string())
             .collect();
@@ -5959,7 +6005,7 @@ mod tests {
         .await
         .unwrap();
         let supplied_epoch = uuid::Uuid::new_v4().to_string();
-        let mut generated_epochs = std::collections::HashSet::new();
+        let mut generated_epochs = HashSet::new();
         for (name, workload_template_name) in
             [("direct-epoch", ""), ("template-epoch", "epoch-template")]
         {

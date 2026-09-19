@@ -35,15 +35,16 @@ const idToken = [
 const codexHome = path.join(process.env.HOME, ".codex");
 fs.mkdirSync(codexHome, { recursive: true });
 fs.writeFileSync(path.join(codexHome, "auth.json"), JSON.stringify({
-  auth_mode: "chatgpt",
+  // The gateway owns token refresh; Codex must not attempt to refresh these
+  // externally managed tokens itself.
+  auth_mode: "chatgptAuthTokens",
   OPENAI_API_KEY: null,
   tokens: {
     // Provider values are opaque stable handles. Codex parses the ID token
     // locally, so use a short-lived, non-secret identity placeholder for it.
     id_token: idToken,
     access_token: process.env.CODEX_AUTH_ACCESS_TOKEN,
-    // The gateway owns refresh material and rotates the access-token handle.
-    refresh_token: "gateway-managed-refresh-token",
+    refresh_token: "",
     account_id: process.env.CODEX_AUTH_ACCOUNT_ID,
   },
   last_refresh: new Date().toISOString(),
