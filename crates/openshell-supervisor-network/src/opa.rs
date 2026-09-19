@@ -448,6 +448,7 @@ impl OpaEngine {
         let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
             .map_err(|e| miette::miette!("internal: failed to parse proto JSON: {e}"))?;
         inject_runtime_policy_data(&mut data, require_binary_identity);
+        normalize_network_binary_paths(&mut data);
         normalize_endpoint_protocols(&mut data);
 
         // Validate BEFORE expanding presets
@@ -1141,7 +1142,7 @@ fn network_input_json(input: &NetworkInput) -> serde_json::Value {
     let ancestor_strs: Vec<String> = input
         .ancestors
         .iter()
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| network_binary_match_path(p))
         .collect();
     let cmdline_strs: Vec<String> = input
         .cmdline_paths
@@ -1150,7 +1151,7 @@ fn network_input_json(input: &NetworkInput) -> serde_json::Value {
         .collect();
     serde_json::json!({
         "exec": {
-            "path": input.binary_path.to_string_lossy(),
+            "path": network_binary_match_path(&input.binary_path),
             "ancestors": ancestor_strs,
             "cmdline_paths": cmdline_strs,
         },
@@ -1159,6 +1160,29 @@ fn network_input_json(input: &NetworkInput) -> serde_json::Value {
             "port": input.port,
         }
     })
+}
+
+/// Return the stable representation used only for network-policy path matching.
+///
+/// Windows paths are case-insensitive by default and accept either path separator.
+/// Normalizing both policy data and runtime input prevents equivalent spellings from
+/// being denied while leaving the original path intact for filesystem access and
+/// executable hashing. Other platforms retain exact path matching.
+pub(crate) fn network_binary_match_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    #[cfg(target_os = "windows")]
+    {
+        windows_network_binary_match_path(&path)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.into_owned()
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_network_binary_match_path(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
 }
 
 /// Sets an already-built JSON value as Regorus input without encoding and reparsing JSON text.
@@ -1463,6 +1487,7 @@ fn preprocess_yaml_data(
         .map_err(|e| miette::miette!("failed to parse YAML data: {e}"))?;
     validate_opa_data_structure(&data)?;
     inject_runtime_policy_data(&mut data, require_binary_identity);
+    normalize_network_binary_paths(&mut data);
     normalize_endpoint_protocols(&mut data);
 
     // Normalize port → ports for all endpoints so Rego always sees "ports" array.
@@ -1560,6 +1585,35 @@ fn normalize_endpoint_protocols(data: &mut serde_json::Value) {
                     serde_json::Value::String(canonical.to_string()),
                 );
             }
+        }
+    }
+}
+
+/// Normalize configured binary paths to the same platform-specific representation
+/// used for runtime process identity before any Rego evaluation.
+fn normalize_network_binary_paths(data: &mut serde_json::Value) {
+    let Some(policies) = data
+        .get_mut("network_policies")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    for policy in policies.values_mut() {
+        let Some(binaries) = policy
+            .get_mut("binaries")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for binary in binaries {
+            let Some(path) = binary.get_mut("path") else {
+                continue;
+            };
+            let Some(value) = path.as_str() else {
+                continue;
+            };
+            *path = network_binary_match_path(Path::new(value)).into();
         }
     }
 }
@@ -2395,6 +2449,16 @@ mod tests {
 
     fn test_engine() -> OpaEngine {
         OpaEngine::from_strings(TEST_POLICY, TEST_DATA_YAML).expect("Failed to load test policy")
+    }
+
+    #[test]
+    fn windows_binary_match_path_normalizes_case_and_separators() {
+        let normalized = windows_network_binary_match_path(r"C:\WINDOWS\SYSTEM32\CURL.EXE");
+        assert_eq!(normalized, "c:/windows/system32/curl.exe");
+        assert_ne!(
+            normalized,
+            windows_network_binary_match_path(r"C:\Windows\System32\powershell.exe")
+        );
     }
 
     fn opa_container_policy() -> serde_json::Value {
@@ -3418,6 +3482,84 @@ network_policies:
             decision.reason
         );
         assert_eq!(decision.matched_policy.as_deref(), Some("claude_code"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn from_proto_matches_windows_equivalent_binary_path() {
+        let mut proto = openshell_policy::restrictive_default_policy();
+        proto.network_policies.insert(
+            "windows_binary".to_string(),
+            NetworkPolicyRule {
+                name: "windows_binary".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: r"C:\WINDOWS\SYSTEM32\CURL.EXE".to_string(),
+                }],
+            },
+        );
+        let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
+
+        let equivalent = NetworkInput {
+            host: "example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("c:/windows/system32/curl.exe"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&equivalent).unwrap();
+        assert!(
+            decision.allowed,
+            "Windows-equivalent binary path should be allowed: {}",
+            decision.reason
+        );
+
+        let different_binary = NetworkInput {
+            binary_path: PathBuf::from("c:/windows/system32/powershell.exe"),
+            ..equivalent
+        };
+        let decision = engine.evaluate_network(&different_binary).unwrap();
+        assert!(
+            !decision.allowed,
+            "normalization must not allow a different binary"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn from_strings_matches_windows_equivalent_binary_path() {
+        let engine = OpaEngine::from_strings(
+            TEST_POLICY,
+            r#"
+network_policies:
+  windows_binary:
+    endpoints:
+      - { host: example.com, port: 443 }
+    binaries:
+      - { path: 'C:\WINDOWS\SYSTEM32\CURL.EXE' }
+"#,
+        )
+        .expect("Failed to create engine from YAML");
+        let input = NetworkInput {
+            host: "example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("c:/windows/system32/curl.exe"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "Windows-equivalent YAML binary path should be allowed: {}",
+            decision.reason
+        );
     }
 
     #[test]

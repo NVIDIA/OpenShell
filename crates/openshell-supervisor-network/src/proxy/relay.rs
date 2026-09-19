@@ -76,12 +76,12 @@ pub(super) fn http_context(
         binary_path: decision
             .binary
             .as_ref()
-            .map(|path| path.to_string_lossy().into_owned())
+            .map(|path| crate::opa::network_binary_match_path(path))
             .unwrap_or_default(),
         ancestors: decision
             .ancestors
             .iter()
-            .map(|path| path.to_string_lossy().into_owned())
+            .map(|path| crate::opa::network_binary_match_path(path))
             .collect(),
         cmdline_paths: decision
             .cmdline_paths
