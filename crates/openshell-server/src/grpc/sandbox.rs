@@ -5778,7 +5778,7 @@ mod tests {
         let err = handle_list_sandbox_providers(
             &state,
             authed_request(ListSandboxProvidersRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("beta")),
                 page_size: 1,
                 page_token: first_page.next_page_token.clone(),
@@ -5805,7 +5805,7 @@ mod tests {
         let err = handle_list_sandbox_providers(
             &state,
             authed_request(ListSandboxProvidersRequest {
-                sandbox_name: "other".to_string(),
+                sandbox: "other".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 page_size: 1,
                 page_token: first_page.next_page_token.clone(),
@@ -5818,7 +5818,7 @@ mod tests {
         let second_page = handle_list_sandbox_providers(
             &state,
             authed_request(ListSandboxProvidersRequest {
-                sandbox_name: "work".to_string(),
+                sandbox: "work".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 page_size: 100,
                 page_token: first_page.next_page_token,
@@ -9041,6 +9041,8 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "no-such-ws".to_string(),
                 )),
+                page_size: 0,
+                page_token: String::new(),
             }),
         )
         .await
