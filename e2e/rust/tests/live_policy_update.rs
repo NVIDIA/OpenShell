@@ -52,7 +52,7 @@ fn write_policy(hosts: &[&str]) -> Result<NamedTempFile, String> {
     name: rule_{i}
     endpoints:
       - host: {host}
-        port: 443
+        ports: [443]
     binaries:
       - path: "/**"
 "#
@@ -222,7 +222,7 @@ network_policies:
         protocol: rest
         access: read-only
       - host: other.example.com
-        port: 443
+        ports: [443]
         protocol: rest
         access: read-only
   sibling:

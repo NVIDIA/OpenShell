@@ -85,7 +85,7 @@ async fn policy_only_preserves_all_process_identity_combinations_through_gateway
 
     for (name, process_yaml, expected) in cases {
         let authored = format!("version: 1\n{process_yaml}\n");
-        let policy = openshell_policy::parse_sandbox_policy(&authored)
+        let policy = openshell_policy::parse_authored_policy(&authored)
             .unwrap_or_else(|error| panic!("{name}: authored policy should parse: {error}"));
 
         let mut client = grpc_client(&server.endpoint, &server.tls).await.unwrap();

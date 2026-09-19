@@ -180,7 +180,7 @@ pub struct SandboxTemplateCreateSpec {
     pub tty: bool,
     /// Create-time sandbox policy. The named workload template supplies runtime
     /// workload fields; policy remains part of the sandbox's governance spec.
-    pub policy: Option<proto::SandboxPolicy>,
+    pub policy: Option<proto::policy::PolicyDocument>,
 }
 
 /// Reusable sandbox workload template resource.

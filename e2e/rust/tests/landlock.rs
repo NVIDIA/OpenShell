@@ -40,7 +40,7 @@ network_policies:
     name: landlock_regression
     endpoints:
       - host: example.com
-        port: 443
+        ports: [443]
     binaries:
       - path: "/**"
 "#;

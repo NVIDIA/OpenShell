@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from .errors import ErrorInfo, FieldViolation, GatewayError, from_grpc_error
 from .mutations import DeletionOutcome, DeletionResult
+from .policy import PolicyDocument, validate_policy_document
 from .sandbox import (
     ClientCredentialsAuth,
     ExecChunk,
@@ -44,6 +45,7 @@ __all__ = [
     "GatewayError",
     "Page",
     "Pager",
+    "PolicyDocument",
     "Sandbox",
     "SandboxClient",
     "SandboxError",
@@ -57,4 +59,5 @@ __all__ = [
     "WorkspaceRef",
     "__version__",
     "from_grpc_error",
+    "validate_policy_document",
 ]

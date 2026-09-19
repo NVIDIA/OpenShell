@@ -169,7 +169,7 @@ credentials:
     header_name: authorization
 endpoints:
   - host: {host}
-    port: {port}
+    ports: [{port}]
     path: /allowed/**
     protocol: rest
     access: full
@@ -206,13 +206,13 @@ network_policies:
     name: binding_test
     endpoints:
       - host: host.openshell.internal
-        port: {port}
+        ports: [{port}]
         path: /**
         protocol: rest
         access: full
         enforcement: enforce
       - host: host.docker.internal
-        port: {port}
+        ports: [{port}]
         path: /**
         protocol: rest
         access: full
@@ -287,7 +287,7 @@ network_policies:
     name: host_echo
     endpoints:
       - host: host.openshell.internal
-        port: {port}
+        ports: [{port}]
         allowed_ips:
           - "10.0.0.0/8"
           - "172.0.0.0/8"

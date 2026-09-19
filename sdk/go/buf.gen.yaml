@@ -9,24 +9,30 @@
 version: v2
 
 inputs:
-  - proto_file: proto/openshell.proto
+  - directory: proto
+    paths:
+      - proto/openshell.proto
+      - proto/sandbox.proto
+      - proto/datamodel.proto
+      - proto/options.proto
+      - proto/policy.proto
 
 plugins:
   - local: protoc-gen-go
     out: sdk/go
-    include_imports: true
     opt:
       - module=github.com/NVIDIA/OpenShell/sdk/go
       - Mopenshell.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1
       - Mdatamodel.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1
       - Msandbox.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1
       - Moptions.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/optionsv1
+      - Mpolicy.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/policyv1
   - local: protoc-gen-go-grpc
     out: sdk/go
-    include_imports: true
     opt:
       - module=github.com/NVIDIA/OpenShell/sdk/go
       - Mopenshell.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1
       - Mdatamodel.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1
       - Msandbox.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1
       - Moptions.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/optionsv1
+      - Mpolicy.proto=github.com/NVIDIA/OpenShell/sdk/go/proto/policyv1

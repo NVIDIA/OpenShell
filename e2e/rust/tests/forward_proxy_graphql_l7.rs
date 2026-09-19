@@ -91,7 +91,7 @@ network_policies:
     name: test_graphql_l7
     endpoints:
       - host: {host}
-        port: {port}
+        ports: [{port}]
         protocol: graphql
         enforcement: enforce
         persisted_queries: allow_registered

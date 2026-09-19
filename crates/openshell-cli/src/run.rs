@@ -43,6 +43,7 @@ use openshell_bootstrap::{
     GatewayMetadata, clear_last_sandbox_if_matches, get_gateway_metadata, save_last_sandbox,
 };
 use openshell_core::net::set_tcp_nodelay_best_effort;
+use openshell_core::proto::policy::PolicyDocument;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, BeginRootfsTarStagingRequest,
     ClearDraftChunksRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
@@ -1475,8 +1476,8 @@ fn merge_rootfs_tar_driver_config(
 /// Resolution order: `--policy` flag > `OPENSHELL_SANDBOX_POLICY` env var.
 /// Returns `None` when no policy source is configured, allowing the server
 /// to apply its own default.
-fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
-    openshell_policy::load_sandbox_policy(cli_path)
+fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<PolicyDocument>> {
+    openshell_policy::load_authored_policy(cli_path)
 }
 
 /// Sync files to or from a sandbox.
@@ -5338,8 +5339,8 @@ where
         if view.includes_policy() {
             if let Some(ref policy) = rev.policy {
                 writeln!(stdout, "---").into_diagnostic()?;
-                let policy = policy_for_view(policy, view);
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
+                let policy = authored_policy_for_view(policy, view);
+                let yaml_str = openshell_policy::serialize_authored_policy(policy.as_ref())
                     .wrap_err("failed to serialize policy to YAML")?;
                 write!(stdout, "{yaml_str}").into_diagnostic()?;
             } else {
@@ -5508,8 +5509,8 @@ pub async fn sandbox_policy_get_global(
         if view.includes_policy() {
             if let Some(ref policy) = rev.policy {
                 println!("---");
-                let policy = policy_for_view(policy, view);
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
+                let policy = authored_policy_for_view(policy, view);
+                let yaml_str = openshell_policy::serialize_authored_policy(policy.as_ref())
                     .wrap_err("failed to serialize policy to YAML")?;
                 print!("{yaml_str}");
             } else {
@@ -5579,8 +5580,8 @@ fn policy_revision_to_json(
     if view.includes_policy() {
         let policy = match rev.policy.as_ref() {
             Some(policy) => {
-                let policy = policy_for_view(policy, view);
-                openshell_policy::sandbox_policy_to_json_value(policy.as_ref())?
+                let policy = authored_policy_for_view(policy, view);
+                openshell_policy::authored_policy_to_json_value(policy.as_ref())?
             }
             None => serde_json::Value::Null,
         };
@@ -5590,6 +5591,21 @@ fn policy_revision_to_json(
 }
 
 fn policy_for_view(policy: &SandboxPolicy, view: PolicyGetView) -> Cow<'_, SandboxPolicy> {
+    if view != PolicyGetView::Base {
+        return Cow::Borrowed(policy);
+    }
+
+    let mut base_policy = policy.clone();
+    base_policy
+        .network_policies
+        .retain(|name, _| !openshell_policy::is_provider_rule_name(name));
+    Cow::Owned(base_policy)
+}
+
+fn authored_policy_for_view(
+    policy: &PolicyDocument,
+    view: PolicyGetView,
+) -> Cow<'_, PolicyDocument> {
     if view != PolicyGetView::Base {
         return Cow::Borrowed(policy);
     }
@@ -6212,7 +6228,10 @@ pub async fn sandbox_draft_history(
 }
 
 /// Format a `NetworkPolicyRule`'s endpoints as a compact string.
-fn format_endpoints(rule: &openshell_core::proto::NetworkPolicyRule) -> String {
+fn format_endpoints(rule: &openshell_core::proto::policy::NetworkPolicyRule) -> String {
+    let Ok(rule) = openshell_policy::lower_authored_rule("display", rule.clone()) else {
+        return "<invalid policy rule>".to_string();
+    };
     rule.endpoints
         .iter()
         .map(format_endpoint)
@@ -6307,10 +6326,10 @@ mod tests {
     use openshell_core::proto::{
         EndpointResult, EndpointStatus, GetSandboxConfigResponse, GpuResourceRequirements,
         PolicySource, PolicyStatus, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
-        SandboxPolicy, SandboxPolicyRevision, SandboxResources, SandboxStatus,
-        SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
-        SandboxWorkloadTemplateSpec, ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember,
-        WorkspaceRole, datamodel::v1::ObjectMeta,
+        SandboxPolicyRevision, SandboxResources, SandboxStatus, SandboxWorkloadConfig,
+        SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec,
+        ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember, WorkspaceRole,
+        datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -6351,7 +6370,7 @@ mod tests {
             load_error: load_error.to_string(),
             created_time: openshell_core::time::timestamp_from_millis(100).ok(),
             loaded_time: openshell_core::time::timestamp_from_millis(200).ok(),
-            policy: Some(SandboxPolicy::default()),
+            policy: Some(openshell_core::proto::policy::PolicyDocument::default()),
             provenance: std::collections::HashMap::from([(
                 "source".to_string(),
                 "provider-composition".to_string(),

@@ -108,10 +108,10 @@ network_policies:
     name: internet_performance
     endpoints:
       - host: example.com
-        port: 80
+        ports: [80]
         protocol: tcp
       - host: example.com
-        port: 443
+        ports: [443]
         protocol: tcp
     binaries:
       - path: "/**"

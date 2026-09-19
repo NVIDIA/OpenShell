@@ -13,6 +13,9 @@ modules:
 lint:
   use:
     - STANDARD
+  # This file is a vendored upstream dependency, not an OpenShell API.
+  ignore:
+    - proto/buf/validate/validate.proto
   except:
     # Flat proto/ layout: all files live in one directory with nested
     # packages (openshell.v1, openshell.sandbox.v1, ...). Adopting these
@@ -30,3 +33,5 @@ lint:
 breaking:
   use:
     - FILE
+  ignore:
+    - proto/buf/validate/validate.proto

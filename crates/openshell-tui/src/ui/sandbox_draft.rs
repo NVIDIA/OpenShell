@@ -4,7 +4,8 @@
 //! Network rules panel for the sandbox screen.
 
 use crate::app::App;
-use openshell_core::proto::{L7Allow, L7DenyRule, L7QueryMatcher, NetworkEndpoint, PolicyChunk};
+use openshell_core::proto::PolicyChunk;
+use openshell_core::proto::policy::{L7Allow, L7DenyRule, Matcher, NetworkEndpoint, matcher};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -823,18 +824,21 @@ fn validation_issue_summary(validation: &str) -> String {
 }
 
 fn format_endpoint_summary(endpoint: &NetworkEndpoint) -> String {
-    let host_port = if endpoint.port > 0 {
-        format!("{}:{}", endpoint.host, endpoint.port)
-    } else {
+    let host_port = if endpoint.ports.is_empty() {
         endpoint.host.clone()
+    } else {
+        let ports = endpoint
+            .ports
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{}:{ports}", endpoint.host)
     };
 
     let mut tags = vec![endpoint_layer_label(endpoint).to_string()];
-    if endpoint.access != 0 {
-        tags.push(format!(
-            "access={}",
-            openshell_policy::network_access_preset_to_str(endpoint.access).unwrap_or("unknown")
-        ));
+    if !endpoint.access.is_empty() {
+        tags.push(format!("access={}", endpoint.access));
     }
     for rule in &endpoint.rules {
         if let Some(allow) = &rule.allow {
@@ -854,18 +858,11 @@ fn format_endpoint_details(endpoint: &NetworkEndpoint) -> Vec<String> {
     if !endpoint.path.is_empty() {
         details.push(format!("Path scope: {}", endpoint.path));
     }
-    if endpoint.tls != 0 {
-        details.push(format!(
-            "TLS: {}",
-            openshell_policy::network_tls_mode_to_str(endpoint.tls).unwrap_or("unknown")
-        ));
+    if !endpoint.tls.is_empty() {
+        details.push(format!("TLS: {}", endpoint.tls));
     }
-    if endpoint.enforcement != 0 {
-        details.push(format!(
-            "Enforcement: {}",
-            openshell_policy::network_enforcement_mode_to_str(endpoint.enforcement)
-                .unwrap_or("unknown")
-        ));
+    if !endpoint.enforcement.is_empty() {
+        details.push(format!("Enforcement: {}", endpoint.enforcement));
     }
     if endpoint.request_body_credential_rewrite {
         details.push("Request body credential rewrite".to_string());
@@ -957,7 +954,7 @@ fn format_deny_rule(deny: &L7DenyRule) -> String {
 
 fn append_query_matchers(
     parts: &mut Vec<String>,
-    query: &std::collections::HashMap<String, L7QueryMatcher>,
+    query: &std::collections::HashMap<String, Matcher>,
 ) {
     if query.is_empty() {
         return;
@@ -966,12 +963,14 @@ fn append_query_matchers(
     entries.sort_by_key(|(key, _)| *key);
     let formatted = entries
         .into_iter()
-        .map(|(key, matcher)| {
-            if matcher.any.is_empty() {
-                format!("{key}={}", non_empty_or(&matcher.glob, "*"))
-            } else {
-                format!("{key} in [{}]", matcher.any.join(","))
+        .map(|(key, matcher)| match matcher.kind.as_ref() {
+            Some(matcher::Kind::Glob(glob)) => {
+                format!("{key}={}", non_empty_or(glob, "*"))
             }
+            Some(matcher::Kind::Any(any)) => {
+                format!("{key} in [{}]", any.values.join(","))
+            }
+            None => format!("{key}=*"),
         })
         .collect::<Vec<_>>()
         .join(", ");

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from openshell._proto import datamodel_pb2, sandbox_pb2
+from openshell._proto import datamodel_pb2, policy_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -34,25 +34,25 @@ if TYPE_CHECKING:
 # Policy helpers
 # =============================================================================
 
-_LANDLOCK_FILESYSTEM = sandbox_pb2.FilesystemPolicy(
+_LANDLOCK_FILESYSTEM = policy_pb2.FilesystemPolicy(
     include_workdir=True,
     read_only=["/usr", "/lib", "/etc", "/proc", "/dev/urandom"],
     read_write=["/sandbox", "/tmp"],
 )
-_LANDLOCK_BEST_EFFORT = sandbox_pb2.LandlockPolicy(compatibility="best_effort")
-_LANDLOCK_PROCESS = sandbox_pb2.ProcessPolicy(
+_LANDLOCK_BEST_EFFORT = policy_pb2.LandlockPolicy(compatibility="best_effort")
+_LANDLOCK_PROCESS = policy_pb2.ProcessPolicy(
     run_as_user="sandbox", run_as_group="sandbox"
 )
 
 
 def _landlock_policy(
     *,
-    filesystem: sandbox_pb2.FilesystemPolicy | None = None,
-    landlock: sandbox_pb2.LandlockPolicy | None = None,
-) -> sandbox_pb2.SandboxPolicy:
-    return sandbox_pb2.SandboxPolicy(
+    filesystem: policy_pb2.FilesystemPolicy | None = None,
+    landlock: policy_pb2.LandlockPolicy | None = None,
+) -> policy_pb2.PolicyDocument:
+    return policy_pb2.PolicyDocument(
         version=1,
-        filesystem=filesystem or _LANDLOCK_FILESYSTEM,
+        filesystem_policy=filesystem or _LANDLOCK_FILESYSTEM,
         landlock=landlock or _LANDLOCK_BEST_EFFORT,
         process=_LANDLOCK_PROCESS,
         network_policies={},

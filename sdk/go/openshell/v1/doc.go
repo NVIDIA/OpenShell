@@ -301,7 +301,7 @@
 //
 //	sandbox, err := client.Sandboxes().Create(ctx, "default", "secure-sandbox", &v1.SandboxSpec{
 //	    Template: &v1.SandboxTemplate{Image: "python:3.12"},
-//	    Policy: &v1.SandboxPolicy{
+//	    Policy: &v1.PolicyDocument{
 //	        Version: 1,
 //	        Filesystem: &v1.FilesystemPolicy{
 //	            IncludeWorkdir: true,
@@ -315,7 +315,7 @@
 //	            "allow-api": {
 //	                Name: "allow-api",
 //	                Endpoints: []v1.PolicyNetworkEndpoint{
-//	                    {Host: "api.example.com", Port: 443, Protocol: "tcp"},
+//	                    {Host: "api.example.com", Ports: []uint32{443}, Protocol: "tcp"},
 //	                },
 //	            },
 //	        },
@@ -326,7 +326,7 @@
 //
 //	result, err := client.Config().Update(ctx, "default", &v1.ConfigUpdate{
 //	    Name: "secure-sandbox",
-//	    Policy: &v1.SandboxPolicy{
+//	    Policy: &v1.PolicyDocument{
 //	        Version: 2,
 //	        NetworkPolicies: map[string]v1.NetworkPolicyRule{
 //	            "allow-all": {Name: "allow-all"},

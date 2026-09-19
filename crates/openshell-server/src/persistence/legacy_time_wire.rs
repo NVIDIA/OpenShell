@@ -40,11 +40,11 @@ pub(super) fn migrate(object_type: &str, payload: &[u8]) -> PersistenceResult<Ve
 
 fn root_message_name(object_type: &str) -> Option<&'static str> {
     match object_type {
-        "sandbox" => Some("openshell.v1.Sandbox"),
+        "sandbox" => Some("openshell.storage.v1.StoredSandbox"),
         "provider" => Some("openshell.datamodel.v1.Provider"),
         "workspace" => Some("openshell.datamodel.v1.Workspace"),
         "workspace_member" => Some("openshell.v1.WorkspaceMember"),
-        "provider_profile" => Some("openshell.storage.v1.StoredProviderProfile"),
+        "provider_profile" => Some("openshell.storage.v1.StoredProviderProfileWire"),
         "provider_credential_refresh_state" => {
             Some("openshell.storage.v1.StoredProviderCredentialRefreshStateV2")
         }

@@ -107,11 +107,11 @@ credentials:
     header_name: authorization
 endpoints:
   - host: {TEST_HOST}
-    port: {rest_port}
+    ports: [{rest_port}]
     protocol: rest
     access: full
   - host: {TEST_HOST}
-    port: {websocket_port}
+    ports: [{websocket_port}]
     protocol: websocket
     access: read-write
 binaries:
@@ -271,7 +271,7 @@ network_policies:
     name: credential_gating
     endpoints:
       - host: {TEST_HOST}
-        port: {port}
+        ports: [{port}]
 {endpoint_options}{credential_binding}    binaries:
       - path: /usr/bin/python*
       - path: /usr/local/bin/python*

@@ -18,7 +18,7 @@ entry that allows any binary to reach port 8080 on the configured pod network:
 cluster_pods:
   name: cluster_pods
   endpoints:
-    - port: 8080
+    - ports: [8080]
       allowed_ips:
         - "10.42.0.0/16"
   binaries:

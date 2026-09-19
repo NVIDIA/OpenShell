@@ -236,10 +236,52 @@ fn decode_record<T: Message + Default + SetResourceVersion + ObjectType>(
     record: ObjectRecord,
 ) -> PersistenceResult<T> {
     let payload = legacy_time_wire::migrate(T::object_type(), &record.payload)?;
+    let payload = decode_storage_payload(T::object_type(), &payload)?;
     let mut message = T::decode(payload.as_slice())
         .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))?;
     message.set_resource_version(record.resource_version);
     Ok(message)
+}
+
+fn encode_storage_payload<T: Message + ObjectType>(message: &T) -> PersistenceResult<Vec<u8>> {
+    let payload = message.encode_to_vec();
+    match T::object_type() {
+        "sandbox" => {
+            let sandbox =
+                openshell_core::proto::Sandbox::decode(payload.as_slice()).map_err(|error| {
+                    PersistenceError::Encode(format!("encode sandbox payload failed: {error}"))
+                })?;
+            crate::storage_proto::encode_sandbox(&sandbox).map_err(|error| {
+                PersistenceError::Encode(format!("encode sandbox payload failed: {error}"))
+            })
+        }
+        "provider_profile" => {
+            let profile = crate::storage_proto::StoredProviderProfile::decode(payload.as_slice())
+                .map_err(|error| {
+                PersistenceError::Encode(format!("encode provider profile payload failed: {error}"))
+            })?;
+            crate::storage_proto::encode_provider_profile(&profile).map_err(|error| {
+                PersistenceError::Encode(format!("encode provider profile payload failed: {error}"))
+            })
+        }
+        _ => Ok(payload),
+    }
+}
+
+fn decode_storage_payload(object_type: &str, payload: &[u8]) -> PersistenceResult<Vec<u8>> {
+    match object_type {
+        "sandbox" => crate::storage_proto::decode_sandbox(payload)
+            .map(|sandbox| sandbox.encode_to_vec())
+            .map_err(|error| {
+                PersistenceError::Decode(format!("decode sandbox payload failed: {error}"))
+            }),
+        "provider_profile" => crate::storage_proto::decode_provider_profile(payload)
+            .map(|profile| profile.encode_to_vec())
+            .map_err(|error| {
+                PersistenceError::Decode(format!("decode provider profile payload failed: {error}"))
+            }),
+        _ => Ok(payload.to_vec()),
+    }
 }
 
 /// Dispatch a method call to the underlying store implementation.
@@ -909,7 +951,7 @@ impl Store {
             message.object_name(),
             message.object_workspace(),
             scope,
-            &message.encode_to_vec(),
+            &encode_storage_payload(message)?,
             labels_json.as_deref(),
         )
         .await
@@ -1147,7 +1189,7 @@ impl Store {
                 updated.object_id(),
                 updated.object_name(),
                 updated.object_workspace(),
-                &updated.encode_to_vec(),
+                &encode_storage_payload(&updated)?,
                 labels_json.as_deref(),
                 WriteCondition::MatchResourceVersion(cas_version),
             )
@@ -1283,7 +1325,7 @@ impl Store {
             message.object_id(),
             message.object_name(),
             message.object_workspace(),
-            &message.encode_to_vec(),
+            &encode_storage_payload(message)?,
             labels_json.as_deref(),
         )
         .await

@@ -14,51 +14,50 @@ type NetworkPolicyRule struct {
 }
 
 // NetworkTLSMode controls TLS handling for a policy endpoint.
-type NetworkTLSMode int32
+type NetworkTLSMode string
 
 const (
 	// NetworkTLSModeUnspecified uses automatic TLS handling.
-	NetworkTLSModeUnspecified NetworkTLSMode = 0
+	NetworkTLSModeUnspecified NetworkTLSMode = ""
 	// NetworkTLSModeSkip disables TLS inspection.
-	NetworkTLSModeSkip NetworkTLSMode = 1
+	NetworkTLSModeSkip NetworkTLSMode = "skip"
 	// NetworkTLSModeTerminate is retained for wire compatibility; prefer unspecified.
-	NetworkTLSModeTerminate NetworkTLSMode = 2
+	NetworkTLSModeTerminate NetworkTLSMode = "terminate"
 	// NetworkTLSModePassthrough is retained for wire compatibility; prefer unspecified.
-	NetworkTLSModePassthrough NetworkTLSMode = 3
+	NetworkTLSModePassthrough NetworkTLSMode = "passthrough"
 )
 
 // NetworkEnforcementMode controls whether an endpoint audits or enforces L7 rules.
-type NetworkEnforcementMode int32
+type NetworkEnforcementMode string
 
 const (
 	// NetworkEnforcementModeUnspecified uses the documented audit default.
-	NetworkEnforcementModeUnspecified NetworkEnforcementMode = 0
+	NetworkEnforcementModeUnspecified NetworkEnforcementMode = ""
 	// NetworkEnforcementModeEnforce blocks policy violations.
-	NetworkEnforcementModeEnforce NetworkEnforcementMode = 1
+	NetworkEnforcementModeEnforce NetworkEnforcementMode = "enforce"
 	// NetworkEnforcementModeAudit logs policy violations without blocking them.
-	NetworkEnforcementModeAudit NetworkEnforcementMode = 2
+	NetworkEnforcementModeAudit NetworkEnforcementMode = "audit"
 )
 
 // NetworkAccessPreset selects a predefined endpoint access policy.
-type NetworkAccessPreset int32
+type NetworkAccessPreset string
 
 const (
 	// NetworkAccessPresetUnspecified selects no access preset.
-	NetworkAccessPresetUnspecified NetworkAccessPreset = 0
+	NetworkAccessPresetUnspecified NetworkAccessPreset = ""
 	// NetworkAccessPresetReadOnly permits read operations.
-	NetworkAccessPresetReadOnly NetworkAccessPreset = 1
+	NetworkAccessPresetReadOnly NetworkAccessPreset = "read-only"
 	// NetworkAccessPresetReadWrite permits read and write operations.
-	NetworkAccessPresetReadWrite NetworkAccessPreset = 2
+	NetworkAccessPresetReadWrite NetworkAccessPreset = "read-write"
 	// NetworkAccessPresetFull permits every operation supported by the protocol.
-	NetworkAccessPresetFull NetworkAccessPreset = 3
+	NetworkAccessPresetFull NetworkAccessPreset = "full"
 )
 
 // PolicyNetworkEndpoint describes a full network endpoint with its access controls
 // as used in sandbox network policy rules. This is distinct from [NetworkEndpoint]
-// which is the simplified profile-level endpoint (Host, Port, Protocol only).
+// which is the simplified profile-level endpoint (Host, Ports, Protocol only).
 type PolicyNetworkEndpoint struct {
 	Host                         string
-	Port                         uint32
 	Ports                        []uint32
 	Protocol                     string
 	TLS                          NetworkTLSMode
@@ -77,16 +76,12 @@ type PolicyNetworkEndpoint struct {
 	// AllowUninspectedCredentials explicitly permits credential-bearing traffic
 	// on paths OpenShell cannot inspect or rewrite.
 	AllowUninspectedCredentials bool
-	// ProviderCredentialed is gateway-derived provenance indicating that the
-	// endpoint belongs to an attached credentialed provider.
-	ProviderCredentialed bool
-	AdvisorProposed      bool
-	CredentialSigning    string
-	SigningService       string
-	SigningRegion        string
-	JSONRPCMaxBodyBytes  uint32
-	Mcp                  *McpOptions
-	CredentialBinding    *NetworkCredentialBinding
+	CredentialSigning           string
+	SigningService              string
+	SigningRegion               string
+	JSONRPCMaxBodyBytes         uint32
+	Mcp                         *McpOptions
+	CredentialBinding           *NetworkCredentialBinding
 }
 
 // NetworkCredentialBinding binds an endpoint to static credentials from an attached provider.
@@ -116,7 +111,8 @@ type L7Allow struct {
 	OperationType string
 	OperationName string
 	Fields        []string
-	Params        map[string]L7QueryMatcher
+	Tool          *L7QueryMatcher
+	Params        map[string]ParameterMatcher
 }
 
 // L7DenyRule specifies layer-7 deny criteria for HTTP/GraphQL traffic.
@@ -128,7 +124,8 @@ type L7DenyRule struct {
 	OperationType string
 	OperationName string
 	Fields        []string
-	Params        map[string]L7QueryMatcher
+	Tool          *L7QueryMatcher
+	Params        map[string]ParameterMatcher
 }
 
 // L7QueryMatcher matches query parameters by glob pattern or exact values.
@@ -137,8 +134,16 @@ type L7QueryMatcher struct {
 	Any  []string
 }
 
+// ParameterMatcher recursively matches either a scalar value or an object.
+// Exactly one of Matcher or Object should be set.
+type ParameterMatcher struct {
+	Matcher *L7QueryMatcher
+	Object  map[string]ParameterMatcher
+}
+
 // McpOptions configures MCP-specific policy controls on a network endpoint.
 type McpOptions struct {
+	MaxBodyBytes            uint32
 	StrictToolNames         *bool
 	AllowAllKnownMcpMethods *bool
 	// Versions lists the exact MCP protocol revisions accepted by the endpoint.

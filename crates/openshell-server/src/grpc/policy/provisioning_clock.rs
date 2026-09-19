@@ -76,7 +76,14 @@ pub async fn configuration_change(
                 .spec
                 .as_ref()
                 .and_then(|spec| spec.policy.as_ref())
-                .map(openshell_core::policy_identity::deterministic_policy_hash)
+                .map(|policy| {
+                    openshell_policy::lower_authored_policy(policy.clone())
+                        .map(|policy| {
+                            openshell_core::policy_identity::deterministic_policy_hash(&policy)
+                        })
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()?
                 .unwrap_or_default();
             sources.push(("policy".into(), format!("1:{hash}")));
         }
@@ -235,7 +242,7 @@ mod tests {
         let policy = openshell_policy::restrictive_default_policy();
         let hash = openshell_core::policy_identity::deterministic_policy_hash(&policy);
         sandbox.spec = Some(openshell_core::proto::SandboxSpec {
-            policy: Some(policy.clone()),
+            policy: Some(openshell_policy::project_base_policy(&policy).unwrap()),
             ..Default::default()
         });
         let first = configuration_change(&store, &sandbox).await.unwrap();

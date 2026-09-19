@@ -15,10 +15,10 @@ network_policies:
   codex:
     name: codex
     endpoints:
-      - { host: api.openai.com, port: 443, protocol: rest, enforcement: enforce, access: full }
-      - { host: auth.openai.com, port: 443, protocol: rest, enforcement: enforce, access: full }
-      - { host: chatgpt.com, port: 443, protocol: rest, enforcement: enforce, access: full }
-      - { host: ab.chatgpt.com, port: 443, protocol: rest, enforcement: enforce, access: full }
+      - { host: api.openai.com, ports: [443], protocol: rest, enforcement: enforce, access: full }
+      - { host: auth.openai.com, ports: [443], protocol: rest, enforcement: enforce, access: full }
+      - { host: chatgpt.com, ports: [443], protocol: rest, enforcement: enforce, access: full }
+      - { host: ab.chatgpt.com, ports: [443], protocol: rest, enforcement: enforce, access: full }
     binaries:
       - { path: /usr/bin/codex }
       - { path: /usr/bin/node }
@@ -28,7 +28,7 @@ network_policies:
     name: codex-plugins
     endpoints:
       - host: github.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         rules:
@@ -47,7 +47,7 @@ network_policies:
     name: github-memory
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         rules:

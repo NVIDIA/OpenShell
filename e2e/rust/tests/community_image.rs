@@ -39,14 +39,17 @@ async fn sandbox_from_community_base_image() {
     guard.cleanup().await;
 }
 
-/// Create a sandbox using the full GHCR image path explicitly.
+/// Create a sandbox using a full community image reference explicitly.
 ///
-/// This tests that explicit image references work correctly.
+/// This tests that explicit image references work correctly. Docker E2E can
+/// override the image with its schema-migrated local fixture while the normal
+/// path continues to exercise the published GHCR reference.
 #[tokio::test]
 async fn sandbox_from_explicit_ghcr_image() {
-    let image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
+    let image = std::env::var("OPENSHELL_E2E_COMMUNITY_BASE_IMAGE")
+        .unwrap_or_else(|_| "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string());
 
-    let mut guard = SandboxGuard::create(&["--from", image, "--", "cat", "/etc/os-release"])
+    let mut guard = SandboxGuard::create(&["--from", &image, "--", "cat", "/etc/os-release"])
         .await
         .expect("sandbox create from explicit GHCR image");
 

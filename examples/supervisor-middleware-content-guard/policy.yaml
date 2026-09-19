@@ -25,7 +25,7 @@ network_policies:
     name: httpbin
     endpoints:
       - host: httpbin.org
-        port: 443
+        ports: [443]
         protocol: rest
         rules:
           - allow:
@@ -37,7 +37,7 @@ network_policies:
     name: httpbingo
     endpoints:
       - host: httpbingo.org
-        port: 443
+        ports: [443]
         protocol: rest
         rules:
           - allow:
@@ -49,7 +49,7 @@ network_policies:
     name: Guard responses
     endpoints:
       - host: host.openshell.internal
-        port: 18081
+        ports: [18081]
         protocol: rest
         rules:
           - allow:

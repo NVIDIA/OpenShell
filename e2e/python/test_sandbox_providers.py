@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from openshell._proto import datamodel_pb2, openshell_pb2, sandbox_pb2
+from openshell._proto import datamodel_pb2, openshell_pb2, policy_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -47,19 +47,17 @@ def _is_placeholder_for_env_key(value: str, key: str) -> bool:
     return token.startswith(("v", "s")) and token.endswith(f"_{key}")
 
 
-def _default_policy() -> sandbox_pb2.SandboxPolicy:
+def _default_policy() -> policy_pb2.PolicyDocument:
     """Build a sandbox policy with standard filesystem/process/landlock settings."""
-    return sandbox_pb2.SandboxPolicy(
+    return policy_pb2.PolicyDocument(
         version=1,
-        filesystem=sandbox_pb2.FilesystemPolicy(
+        filesystem_policy=policy_pb2.FilesystemPolicy(
             include_workdir=True,
             read_only=["/usr", "/lib", "/etc", "/app", "/dev/urandom"],
             read_write=["/sandbox", "/tmp"],
         ),
-        landlock=sandbox_pb2.LandlockPolicy(compatibility="best_effort"),
-        process=sandbox_pb2.ProcessPolicy(
-            run_as_user="sandbox", run_as_group="sandbox"
-        ),
+        landlock=policy_pb2.LandlockPolicy(compatibility="best_effort"),
+        process=policy_pb2.ProcessPolicy(run_as_user="sandbox", run_as_group="sandbox"),
     )
 
 
@@ -160,7 +158,7 @@ def _native_inference_profile(
     profile_id: str,
     env_var: str,
     port: int,
-    rules: list[sandbox_pb2.L7Rule],
+    rules: list[policy_pb2.L7Rule],
     auth_style: str = "bearer",
     header_name: str = "authorization",
 ) -> openshell_pb2.ProviderProfile:
@@ -181,12 +179,11 @@ def _native_inference_profile(
             )
         ],
         endpoints=[
-            sandbox_pb2.NetworkEndpoint(
+            policy_pb2.NetworkEndpoint(
                 host="host.openshell.internal",
-                port=port,
+                ports=[port],
                 protocol="rest",
-                tls=sandbox_pb2.NETWORK_TLS_MODE_UNSPECIFIED,
-                enforcement=sandbox_pb2.NETWORK_ENFORCEMENT_MODE_ENFORCE,
+                enforcement="enforce",
                 rules=rules,
                 allowed_ips=[
                     "10.0.0.0/8",
@@ -197,9 +194,9 @@ def _native_inference_profile(
             )
         ],
         binaries=[
-            sandbox_pb2.NetworkBinary(path="/usr/bin/python*"),
-            sandbox_pb2.NetworkBinary(path="/usr/local/bin/python*"),
-            sandbox_pb2.NetworkBinary(path="/sandbox/.uv/python/**/python*"),
+            policy_pb2.NetworkBinary(path="/usr/bin/python*"),
+            policy_pb2.NetworkBinary(path="/usr/local/bin/python*"),
+            policy_pb2.NetworkBinary(path="/sandbox/.uv/python/**/python*"),
         ],
     )
 
@@ -379,15 +376,15 @@ def test_endpointless_profile_credentials_use_explicit_policy_binding(
     ) as provider_name:
         policy = _default_policy()
         policy.network_policies["gcp_storage"].CopyFrom(
-            sandbox_pb2.NetworkPolicyRule(
+            policy_pb2.NetworkPolicyRule(
                 name="gcp_storage",
                 endpoints=[
-                    sandbox_pb2.NetworkEndpoint(
+                    policy_pb2.NetworkEndpoint(
                         host="storage.googleapis.com",
-                        port=443,
+                        ports=[443],
                         protocol="rest",
-                        access=sandbox_pb2.NETWORK_ACCESS_PRESET_FULL,
-                        credential_binding=sandbox_pb2.NetworkCredentialBinding(
+                        access="full",
+                        credential_binding=policy_pb2.NetworkCredentialBinding(
                             provider=provider_name
                         ),
                     )
@@ -538,8 +535,8 @@ def test_imported_openai_profile_allows_native_endpoint_with_attached_provider(
         env_var="OPENAI_API_KEY",
         port=0,
         rules=[
-            sandbox_pb2.L7Rule(
-                allow=sandbox_pb2.L7Allow(
+            policy_pb2.L7Rule(
+                allow=policy_pb2.L7Allow(
                     method="POST",
                     path="/v1/chat/completions",
                 )
@@ -578,7 +575,7 @@ def test_imported_openai_profile_allows_native_endpoint_with_attached_provider(
             ) from exc
 
     with native_endpoint_server() as port:
-        profile.endpoints[0].port = port
+        profile.endpoints[0].ports[0] = port
         with imported_provider_profile(
             stub,
             profile=profile,
@@ -624,8 +621,8 @@ def test_imported_anthropic_profile_allows_native_endpoint_with_attached_provide
         env_var="ANTHROPIC_API_KEY",
         port=0,
         rules=[
-            sandbox_pb2.L7Rule(
-                allow=sandbox_pb2.L7Allow(
+            policy_pb2.L7Rule(
+                allow=policy_pb2.L7Allow(
                     method="POST",
                     path="/v1/messages",
                 )
@@ -667,7 +664,7 @@ def test_imported_anthropic_profile_allows_native_endpoint_with_attached_provide
             ) from exc
 
     with native_endpoint_server() as port:
-        profile.endpoints[0].port = port
+        profile.endpoints[0].ports[0] = port
         with imported_provider_profile(
             stub,
             profile=profile,
@@ -980,7 +977,7 @@ def test_github_provider_allows_https_git_clone(
         # _default_policy only grants /dev/urandom. Everything else (binaries,
         # CA bundle, clone target) is covered by the standard allowlist.
         policy = _default_policy()
-        policy.filesystem.read_write.append("/dev/null")
+        policy.filesystem_policy.read_write.append("/dev/null")
         spec = datamodel_pb2.SandboxSpec(
             policy=policy,
             providers=[provider_name],

@@ -1968,7 +1968,10 @@ enum PolicyCommands {
         #[arg(long = "rule-name")]
         rule_name: Option<String>,
 
-        /// Explicitly declare that the target rule for L7 appends allows any binary.
+        /// Select the incremental update API's internal any-binary target state.
+        ///
+        /// This is not an authored policy-file state; omitted or empty public
+        /// binary lists match no executable.
         #[arg(long, conflicts_with = "binaries")]
         any_binary: bool,
 

@@ -54,13 +54,13 @@ func copySandboxSpec(s types.SandboxSpec) types.SandboxSpec {
 		v := *s.GPUCount
 		s.GPUCount = &v
 	}
-	s.Policy = copySandboxPolicy(s.Policy)
+	s.Policy = copyPolicyDocument(s.Policy)
 	return s
 }
 
-// copySandboxPolicy returns a deep copy of a SandboxPolicy pointer.
+// copyPolicyDocument returns a deep copy of a PolicyDocument pointer.
 // All sub-policies, slices, and map entries are duplicated.
-func copySandboxPolicy(p *types.SandboxPolicy) *types.SandboxPolicy {
+func copyPolicyDocument(p *types.PolicyDocument) *types.PolicyDocument {
 	if p == nil {
 		return nil
 	}
@@ -130,7 +130,12 @@ func copyPolicyNetworkEndpoint(ep types.PolicyNetworkEndpoint) types.PolicyNetwo
 				a := *r.Allow
 				a.Query = copyL7QueryMap(r.Allow.Query)
 				a.Fields = copyStringSlice(r.Allow.Fields)
-				a.Params = copyL7QueryMap(r.Allow.Params)
+				a.Params = copyParameterMap(r.Allow.Params)
+				if r.Allow.Tool != nil {
+					tool := *r.Allow.Tool
+					tool.Any = copyStringSlice(tool.Any)
+					a.Tool = &tool
+				}
 				rules[i].Allow = &a
 			}
 		}
@@ -142,7 +147,12 @@ func copyPolicyNetworkEndpoint(ep types.PolicyNetworkEndpoint) types.PolicyNetwo
 		for i, dr := range ep.DenyRules {
 			dr.Query = copyL7QueryMap(dr.Query)
 			dr.Fields = copyStringSlice(dr.Fields)
-			dr.Params = copyL7QueryMap(dr.Params)
+			dr.Params = copyParameterMap(dr.Params)
+			if dr.Tool != nil {
+				tool := *dr.Tool
+				tool.Any = copyStringSlice(tool.Any)
+				dr.Tool = &tool
+			}
 			drs[i] = dr
 		}
 		ep.DenyRules = drs
@@ -166,6 +176,23 @@ func copyPolicyNetworkEndpoint(ep types.PolicyNetworkEndpoint) types.PolicyNetwo
 		ep.Mcp = &mcp
 	}
 	return ep
+}
+
+func copyParameterMap(src map[string]types.ParameterMatcher) map[string]types.ParameterMatcher {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]types.ParameterMatcher, len(src))
+	for key, value := range src {
+		if value.Matcher != nil {
+			matcher := *value.Matcher
+			matcher.Any = copyStringSlice(matcher.Any)
+			value.Matcher = &matcher
+		}
+		value.Object = copyParameterMap(value.Object)
+		dst[key] = value
+	}
+	return dst
 }
 
 func copyBoolPtr(p *bool) *bool {
@@ -357,7 +384,7 @@ func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, nam
 
 	resolvedSpec := sandboxSpecFromWorkloadTemplate(template)
 	resolvedSpec.Providers = copyStringSlice(spec.Providers)
-	resolvedSpec.Policy = copySandboxPolicy(spec.Policy)
+	resolvedSpec.Policy = copyPolicyDocument(spec.Policy)
 	resolvedSpec.Command = copyStringSlice(spec.Command)
 	resolvedSpec.TTY = spec.TTY
 

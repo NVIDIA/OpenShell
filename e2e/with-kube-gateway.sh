@@ -31,6 +31,9 @@
 # Set OPENSHELL_E2E_KUBE_EXTRA_VALUES to one or more colon-separated Helm values
 # files, relative to the repository root or absolute, to layer additional chart
 # configuration on top of ci/values-skaffold.yaml.
+# Set OPENSHELL_E2E_KUBE_SANDBOX_IMAGE to test a non-default workload image. The
+# local kind/k3d path otherwise derives a strict PolicyDocument fixture from the
+# published community base image, whose baked policy predates that contract.
 #
 # Image source:
 #   - Ephemeral k3d mode builds local
@@ -803,6 +806,33 @@ else
 fi
 REGISTRY_VALUE="${REGISTRY_VALUE%/}"
 
+prepare_policy_document_community_image() {
+  local source_image=$1
+  local source_id source_digest fixture_image
+
+  echo "Refreshing latest sandbox image ${source_image}..." >&2
+  docker pull "${source_image}" >&2
+  source_id="$(docker image inspect --format '{{.Id}}' "${source_image}")"
+  source_digest="${source_id#sha256:}"
+  if ! [[ "${source_digest}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "ERROR: could not resolve a stable image ID for ${source_image}." >&2
+    return 1
+  fi
+
+  fixture_image="openshell/e2e-community-base:policy-document-v1-${source_digest:0:12}"
+  if ! docker image inspect "${fixture_image}" >/dev/null 2>&1; then
+    echo "Preparing PolicyDocument E2E fixture from ${source_image}..." >&2
+    docker build \
+      --pull=false \
+      --build-arg "BASE_IMAGE=${source_image}" \
+      --file "${ROOT}/e2e/docker/Dockerfile.policy-document-community-base" \
+      --tag "${fixture_image}" \
+      "${ROOT}/e2e/docker" >&2
+  fi
+
+  printf '%s\n' "${fixture_image}"
+}
+
 # Resolve a host-gateway IP that sandbox pods can dial to reach test fixtures
 # running on the developer/CI host (HTTP fixtures bound to 0.0.0.0 plus sibling
 # Docker containers with published ports). The Helm chart wires this into pod
@@ -892,6 +922,26 @@ elif [[ "${KUBE_CONTEXT}" == k3d-* ]] && command -v k3d >/dev/null 2>&1; then
     import_cluster_name="${candidate}"
   fi
 fi
+
+DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+KUBE_SANDBOX_IMAGE="${OPENSHELL_E2E_KUBE_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}"
+KUBE_SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_E2E_KUBE_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}"
+POLICY_DOCUMENT_FIXTURE_IMAGE=""
+if [ "${KUBE_SANDBOX_IMAGE}" = "${DEFAULT_SANDBOX_IMAGE}" ]; then
+  if [ -z "${import_cluster_name}" ] && ! [[ "${KUBE_CONTEXT}" == kind-* ]]; then
+    echo "ERROR: the published community base image still contains a legacy policy." >&2
+    echo "       Set OPENSHELL_E2E_KUBE_SANDBOX_IMAGE to a PolicyDocument-compatible image for this cluster." >&2
+    exit 2
+  fi
+  require_cmd docker
+  POLICY_DOCUMENT_FIXTURE_IMAGE="$(prepare_policy_document_community_image "${KUBE_SANDBOX_IMAGE}")"
+  export OPENSHELL_COMMUNITY_REGISTRY="openshell/e2e-community-sandboxes"
+  KUBE_SANDBOX_IMAGE="${OPENSHELL_COMMUNITY_REGISTRY}/base:latest"
+  docker image tag "${POLICY_DOCUMENT_FIXTURE_IMAGE}" "${KUBE_SANDBOX_IMAGE}"
+  export OPENSHELL_E2E_COMMUNITY_BASE_IMAGE="${KUBE_SANDBOX_IMAGE}"
+  KUBE_SANDBOX_IMAGE_PULL_POLICY=never
+fi
+
 if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
   require_cmd docker
   echo "Building local Kubernetes e2e images (${REGISTRY_VALUE}/{gateway,sandbox,supervisor}:${IMAGE_TAG_VALUE})..."
@@ -925,6 +975,8 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
       --build-arg "TARGETARCH=${external_arch}" \
       --build-arg "SUPERVISOR_IMAGE=${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}" \
       --build-arg "SANDBOX_RUNTIME_IMAGE=${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}" \
+      --build-arg "SANDBOX_IMAGE=${KUBE_SANDBOX_IMAGE}" \
+      --build-arg "SANDBOX_IMAGE_PULL_POLICY=${KUBE_SANDBOX_IMAGE_PULL_POLICY}" \
       --tag "${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}" \
       --file "${ROOT}/e2e/docker/Dockerfile.external-kubernetes-gateway" \
       "${ROOT}"
@@ -983,6 +1035,20 @@ elif [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ] \
     kind load docker-image "${image}" --name "${kind_cluster_name}"
   done
 fi
+if [ -n "${POLICY_DOCUMENT_FIXTURE_IMAGE}" ]; then
+  if [ -n "${import_cluster_name}" ]; then
+    echo "Importing ${KUBE_SANDBOX_IMAGE} into k3d cluster ${import_cluster_name}..."
+    k3d image import "${KUBE_SANDBOX_IMAGE}" --cluster "${import_cluster_name}" \
+      --mode direct >/dev/null
+  elif [[ "${KUBE_CONTEXT}" == kind-* ]] && command -v kind >/dev/null 2>&1; then
+    kind_cluster_name="${KUBE_CONTEXT#kind-}"
+    echo "Loading ${KUBE_SANDBOX_IMAGE} into kind cluster ${kind_cluster_name}..."
+    kind load docker-image "${KUBE_SANDBOX_IMAGE}" --name "${kind_cluster_name}"
+  else
+    echo "ERROR: cannot load the PolicyDocument sandbox fixture into ${KUBE_CONTEXT}." >&2
+    exit 2
+  fi
+fi
 
 # The Kubernetes compute driver creates and watches Sandbox CRs reconciled
 # by the upstream agent-sandbox-controller. Without the CRD + controller,
@@ -1009,6 +1075,8 @@ fi
 helm_extra_args=()
 helm_post_renderer_args=()
 helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
+helm_extra_args+=(--set "server.sandboxImage=${KUBE_SANDBOX_IMAGE}")
+helm_extra_args+=(--set "server.sandboxImagePullPolicy=${KUBE_SANDBOX_IMAGE_PULL_POLICY}")
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" != "1" ]; then
     echo "ERROR: external Kubernetes driver e2e requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=1." >&2

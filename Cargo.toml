@@ -24,6 +24,7 @@ tonic-prost-build = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 prost-reflect = { version = "0.16.5", features = ["serde"] }
+prost-protovalidate = { version = "=0.6.0", default-features = false, features = ["reflect"] }
 
 # HTTP server
 axum = { version = "0.8", features = ["ws"] }

@@ -39,6 +39,29 @@
           - conformance_archive.stat.isreg | default(false)
         fail_msg: OpenShell conformance test bundle did not contain tests.tar.zst
 
+    # The published community image still contains the legacy singular `port`
+    # policy field. This suite validates CLI lifecycle behavior, so provide a
+    # minimal current PolicyDocument explicitly and keep production parsing
+    # strict. Container-backed e2e suites separately cover image policy loading.
+    - name: Install PolicyDocument conformance fixture
+      become: true
+      ansible.builtin.copy:
+        content: |
+          version: 1
+          filesystem_policy:
+            include_workdir: true
+            read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+            read_write: [/sandbox, /tmp, /dev/null]
+          landlock:
+            compatibility: best_effort
+          process:
+            run_as_user: sandbox
+            run_as_group: sandbox
+        dest: /var/lib/openshell-conformance/policy-document-default.yaml
+        owner: tmachine
+        group: tmachine
+        mode: "0600"
+
     - name: Run OpenShell conformance archive
       ansible.builtin.command:
         argv:
@@ -52,6 +75,7 @@
           - --no-capture
       environment:
         OPENSHELL_BIN: /usr/local/bin/openshell
+        OPENSHELL_SANDBOX_POLICY: /var/lib/openshell-conformance/policy-document-default.yaml
       register: conformance_result
       changed_when: false
       failed_when: false

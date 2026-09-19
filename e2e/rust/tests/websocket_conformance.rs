@@ -107,7 +107,7 @@ credentials:
     header_name: authorization
 endpoints:
   - host: {TEST_SERVER_HOST}
-    port: {port}
+    ports: [{port}]
     path: /ws
     protocol: websocket
     enforcement: enforce
@@ -332,7 +332,7 @@ network_policies:
     name: websocket_conformance
     endpoints:
       - host: {host}
-        port: {port}
+        ports: [{port}]
         protocol: websocket
         enforcement: enforce
         access: read-write

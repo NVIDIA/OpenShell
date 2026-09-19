@@ -327,7 +327,7 @@ mod tests {
     };
 
     fn policy(host: &str, ips: &str) -> ContainmentPolicy {
-        parse_policy_str(&format!("version: 1\nnetwork_policies:\n  api:\n    endpoints: [{{host: '{host}', port: 443, allowed_ips: [{ips}]}}]\n    binaries: [{{path: /usr/bin/curl}}]\n")).unwrap()
+        parse_policy_str(&format!("version: 1\nnetwork_policies:\n  api:\n    endpoints: [{{host: '{host}', ports: [443], allowed_ips: [{ips}]}}]\n    binaries: [{{path: /usr/bin/curl}}]\n")).unwrap()
     }
 
     fn check(host: &str, boundary: &str, candidate: &str) -> CheckResult {
@@ -407,11 +407,11 @@ mod tests {
     #[test]
     fn exact_and_wildcard_overlap_with_implicit_ip_modes_is_unsupported() {
         let boundary = parse_policy_str(
-            "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - { host: '*.example.com', port: 6443 }\n      - { host: api.example.com, port: 6443 }\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - { host: '*.example.com', ports: [6443] }\n      - { host: api.example.com, ports: [6443] }\n    binaries: [{ path: /usr/bin/curl }]\n",
         )
         .unwrap();
         let candidate = parse_policy_str(
-            "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - { host: '*.example.com', port: 6443 }\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - { host: '*.example.com', ports: [6443] }\n    binaries: [{ path: /usr/bin/curl }]\n",
         )
         .unwrap();
 
@@ -429,11 +429,11 @@ mod tests {
     #[test]
     fn split_rule_exact_and_wildcard_overlap_with_implicit_ip_modes_is_unsupported() {
         let boundary = parse_policy_str(
-            "version: 1\nnetwork_policies:\n  wildcard:\n    endpoints:\n      - { host: '*.example.com', port: 6443 }\n    binaries: [{ path: /usr/bin/curl }]\n  exact:\n    endpoints:\n      - { host: api.example.com, port: 6443 }\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  wildcard:\n    endpoints:\n      - { host: '*.example.com', ports: [6443] }\n    binaries: [{ path: /usr/bin/curl }]\n  exact:\n    endpoints:\n      - { host: api.example.com, ports: [6443] }\n    binaries: [{ path: /usr/bin/curl }]\n",
         )
         .unwrap();
         let candidate = parse_policy_str(
-            "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - { host: '*.example.com', port: 6443 }\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - { host: '*.example.com', ports: [6443] }\n    binaries: [{ path: /usr/bin/curl }]\n",
         )
         .unwrap();
 

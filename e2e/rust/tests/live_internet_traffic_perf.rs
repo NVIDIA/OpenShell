@@ -237,15 +237,15 @@ network_policies:
   live_internet_performance:
     name: live_internet_performance
     endpoints:
-      - {{ host: example.com, port: 443, protocol: tcp }}
-      - {{ host: github.com, port: 443, protocol: tcp }}
-      - {{ host: raw.githubusercontent.com, port: 443, protocol: tcp }}
-      - {{ host: pypi.org, port: 443, protocol: tcp }}
-      - {{ host: files.pythonhosted.org, port: 443, protocol: tcp }}
-      - {{ host: registry.npmjs.org, port: 443, protocol: tcp }}
-      - {{ host: crates.io, port: 443, protocol: tcp }}
-      - {{ host: docs.python.org, port: 443, protocol: tcp }}
-      - {{ host: speed.cloudflare.com, port: 443, protocol: tcp }}
+      - {{ host: example.com, ports: [443], protocol: tcp }}
+      - {{ host: github.com, ports: [443], protocol: tcp }}
+      - {{ host: raw.githubusercontent.com, ports: [443], protocol: tcp }}
+      - {{ host: pypi.org, ports: [443], protocol: tcp }}
+      - {{ host: files.pythonhosted.org, ports: [443], protocol: tcp }}
+      - {{ host: registry.npmjs.org, ports: [443], protocol: tcp }}
+      - {{ host: crates.io, ports: [443], protocol: tcp }}
+      - {{ host: docs.python.org, ports: [443], protocol: tcp }}
+      - {{ host: speed.cloudflare.com, ports: [443], protocol: tcp }}
     binaries:
       - path: "/**"
 "#

@@ -8,7 +8,8 @@
 // forward() byte relay without a running gateway.
 
 import * as net from 'node:net';
-import type { MessageInitShape } from '@bufbuild/protobuf';
+import { create, type MessageInitShape } from '@bufbuild/protobuf';
+import { createValidator } from '@bufbuild/protovalidate';
 import { Code, ConnectError, createRouterTransport, type ServiceImpl, type Transport } from '@connectrpc/connect';
 import { describe, expect, it } from 'vitest';
 import {
@@ -21,8 +22,10 @@ import {
   SandboxTemplateClient,
   SCOPE_NAMES,
   STATUS_NAMES,
+  validatePolicyDocument,
 } from './client.js';
 import { OpenShell, SandboxPhase, ServiceStatus } from './gen/openshell_pb.js';
+import { PolicyDocumentSchema } from './gen/policy_pb.js';
 import { PolicySource, SettingScope } from './gen/sandbox_pb.js';
 
 function client(impl: Partial<ServiceImpl<typeof OpenShell>>): SandboxClient {
@@ -38,6 +41,73 @@ function templateClient(impl: Partial<ServiceImpl<typeof OpenShell>>): SandboxTe
   });
   return new SandboxTemplateClient(transport);
 }
+
+describe('policy document validation', () => {
+  it('runs the portable protobuf rules before an SDK request', () => {
+    expect(validatePolicyDocument({ version: 1 }).version).toBe(1);
+    expect(() => validatePolicyDocument({ version: 0 })).toThrow(/policy document validation failed/);
+    expect(() =>
+      validatePolicyDocument({
+        version: 1,
+        networkPolicies: {
+          api: { endpoints: [{ host: 'api.example.com', ports: [443, 443] }] },
+        },
+      }),
+    ).toThrow(/policy document validation failed/);
+  });
+
+  it('reports the portable validation rule IDs', () => {
+    const validator = createValidator();
+    const cases: Array<[string, MessageInitShape<typeof PolicyDocumentSchema>, string]> = [
+      ['version', { version: 0 }, 'uint32.const'],
+      [
+        'missing ports',
+        { version: 1, networkPolicies: { api: { endpoints: [{ host: 'api.example.com' }] } } },
+        'repeated.min_items',
+      ],
+      [
+        'duplicate ports',
+        { version: 1, networkPolicies: { api: { endpoints: [{ host: 'api.example.com', ports: [443, 443] }] } } },
+        'repeated.unique',
+      ],
+      [
+        'port range',
+        { version: 1, networkPolicies: { api: { endpoints: [{ host: 'api.example.com', ports: [65536] }] } } },
+        'uint32.gte_lte',
+      ],
+      ['binary path', { version: 1, networkPolicies: { api: { binaries: [{ path: '' }] } } }, 'string.min_len'],
+      [
+        'matcher choice',
+        {
+          version: 1,
+          networkPolicies: {
+            api: {
+              endpoints: [
+                {
+                  host: 'api.example.com',
+                  ports: [443],
+                  rules: [{ allow: { query: { owner: {} } } }],
+                },
+              ],
+            },
+          },
+        },
+        'required',
+      ],
+    ];
+
+    for (const [name, policy, ruleId] of cases) {
+      const result = validator.validate(PolicyDocumentSchema, create(PolicyDocumentSchema, policy));
+      expect(result.kind, name).toBe('invalid');
+      if (result.kind === 'invalid') {
+        expect(
+          result.violations.some((violation) => violation.ruleId === ruleId),
+          `${name} should report ${ruleId}`,
+        ).toBe(true);
+      }
+    }
+  });
+});
 
 function readySandbox(
   name: string,
@@ -1130,6 +1200,91 @@ describe('config / policy', () => {
       case: 'intValue',
       value: 30n,
     });
+  });
+
+  it('getConfig projects the runtime policy onto the public authored contract', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      getSandboxConfig: () => ({
+        policy: {
+          version: 1,
+          networkPolicies: {
+            api: {
+              name: 'api',
+              binaries: [{ path: '/usr/bin/curl' }],
+              endpoints: [
+                {
+                  host: 'mcp.example.com',
+                  port: 443,
+                  protocol: 'mcp',
+                  tls: 1,
+                  enforcement: 1,
+                  access: 3,
+                  rules: [
+                    {
+                      allow: {
+                        method: 'tools/call',
+                        params: {
+                          name: { glob: 'weather.*' },
+                          'arguments.limit': { any: ['10', '20'] },
+                          'arguments.__proto__.limit': { glob: '30' },
+                          'arguments.constructor.limit': { glob: '40' },
+                        },
+                      },
+                    },
+                  ],
+                  jsonRpcMaxBodyBytes: 12345,
+                  mcp: { allowAllKnownMcpMethods: true, versions: ['2025-11-25'] },
+                  advisorProposed: true,
+                  providerCredentialed: true,
+                },
+              ],
+            },
+          },
+        },
+        settings: {},
+      }),
+    });
+
+    const config = await sandbox.getConfig('sb');
+    expect(config.policy?.$typeName).toBe('openshell.policy.v1.PolicyDocument');
+    const endpoint = config.policy?.networkPolicies.api?.endpoints[0];
+    expect(endpoint?.ports).toEqual([443]);
+    expect(endpoint?.tls).toBe('skip');
+    expect(endpoint?.enforcement).toBe('enforce');
+    expect(endpoint?.access).toBe('full');
+    expect(endpoint?.mcp?.maxBodyBytes).toBe(12345);
+    expect(endpoint?.jsonRpc).toBeUndefined();
+    expect(endpoint).not.toHaveProperty('advisorProposed');
+    expect(endpoint).not.toHaveProperty('providerCredentialed');
+    const allow = endpoint?.rules[0]?.allow;
+    expect(allow?.method).toBe('');
+    expect(allow?.tool?.kind).toEqual({ case: 'glob', value: 'weather.*' });
+    const limit = allow?.params.arguments?.kind;
+    expect(limit?.case).toBe('object');
+    if (limit?.case === 'object') {
+      expect(limit.value.fields.limit?.kind).toEqual({
+        case: 'matcher',
+        value: expect.objectContaining({
+          kind: { case: 'any', value: expect.objectContaining({ values: ['10', '20'] }) },
+        }),
+      });
+      for (const [field, value] of [
+        ['__proto__', '30'],
+        ['constructor', '40'],
+      ] as const) {
+        const nested = limit.value.fields[field]?.kind;
+        expect(nested?.case).toBe('object');
+        if (nested?.case === 'object') {
+          expect(nested.value.fields.limit?.kind).toEqual({
+            case: 'matcher',
+            value: expect.objectContaining({ kind: { case: 'glob', value } }),
+          });
+        }
+      }
+    }
+    expect(Object.hasOwn(Object.prototype, 'children')).toBe(false);
+    expect(Object.hasOwn(Object, 'children')).toBe(false);
   });
 
   it('setPolicy sends global=false + version pin and (wait) polls until the hash matches', async () => {

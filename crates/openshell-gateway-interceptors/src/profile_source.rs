@@ -121,7 +121,7 @@ fn resolve_provider_profile_snapshot_revision(
 
 #[cfg(test)]
 mod tests {
-    use openshell_core::proto::{McpOptions, NetworkEndpoint};
+    use openshell_core::proto::policy::{McpConfig, NetworkEndpoint};
 
     use super::*;
 
@@ -130,14 +130,14 @@ mod tests {
             id: "governed-mcp".to_string(),
             endpoints: vec![NetworkEndpoint {
                 host: "mcp.example.com".to_string(),
-                port: 443,
+                ports: vec![443],
                 protocol: "mcp".to_string(),
-                mcp: versions.map(|versions| McpOptions {
+                mcp: versions.map(|versions| McpConfig {
                     versions: versions
                         .iter()
                         .map(|version| (*version).to_string())
                         .collect(),
-                    ..McpOptions::default()
+                    ..McpConfig::default()
                 }),
                 ..NetworkEndpoint::default()
             }],

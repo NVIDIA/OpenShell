@@ -6,6 +6,6 @@ network_policies:
   api:
     endpoints:
       - host: api.example.com
-        port: 443
+        ports: [443]
         allowed_ips:
           - 2001:db8::/32

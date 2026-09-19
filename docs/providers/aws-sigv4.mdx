@@ -72,7 +72,7 @@ network_policies:
   aws_bedrock:
     endpoints:
       - host: bedrock-runtime.us-east-1.amazonaws.com
-        port: 443
+        ports: [443]
         protocol: rest
         credential_binding:
           provider: aws-prod
@@ -95,7 +95,7 @@ network_policies:
   aws_s3:
     endpoints:
       - host: "*.s3.us-east-1.amazonaws.com"
-        port: 443
+        ports: [443]
         protocol: rest
         access: full
         credential_binding:
@@ -111,7 +111,7 @@ network_policies:
   aws_sts:
     endpoints:
       - host: sts.us-east-1.amazonaws.com
-        port: 443
+        ports: [443]
         protocol: rest
         access: full
         credential_binding:
@@ -150,7 +150,7 @@ For endpoints where the region cannot be inferred from the hostname, set `signin
 ```yaml
 endpoints:
   - host: custom-vpc-endpoint.example.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: full
     credential_binding:

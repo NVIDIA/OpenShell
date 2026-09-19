@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::proto::{McpOptions, ProviderProfile};
+use crate::proto::{ProviderProfile, policy::McpConfig};
 
 pub use openshell_policy_schema::{
     DEFAULT_MCP_PROTOCOL_VERSION, MAX_MCP_LEGACY_BATCH_MESSAGES, McpProtocolVersion,
@@ -36,9 +36,9 @@ pub fn normalize_provider_profile_mcp_fields(profile: &mut ProviderProfile) {
         }
 
         let Some(options) = endpoint.mcp.as_mut() else {
-            endpoint.mcp = Some(McpOptions {
+            endpoint.mcp = Some(McpConfig {
                 versions: vec![DEFAULT_MCP_PROTOCOL_VERSION.as_str().to_string()],
-                ..McpOptions::default()
+                ..McpConfig::default()
             });
             continue;
         };
@@ -51,7 +51,7 @@ pub fn normalize_provider_profile_mcp_fields(profile: &mut ProviderProfile) {
         // Parse into the shared version type before mutation. Comparing the
         // set size with the input length detects duplicates without erasing
         // the duplicate values that a fail-closed validator must report.
-        let Ok(versions) = options
+        let Ok(canonical) = options
             .versions
             .iter()
             .map(|version| version.parse::<McpProtocolVersion>())
@@ -59,11 +59,11 @@ pub fn normalize_provider_profile_mcp_fields(profile: &mut ProviderProfile) {
         else {
             continue;
         };
-        if versions.len() != options.versions.len() {
+        if canonical.len() != options.versions.len() {
             continue;
         }
 
-        options.versions = versions
+        options.versions = canonical
             .into_iter()
             .map(|version| version.as_str().to_string())
             .collect();
@@ -108,24 +108,24 @@ mod tests {
         assert_eq!(profile.max_batch_messages(), None);
     }
 
-    fn provider_profile_with_mcp(protocol: &str, options: Option<McpOptions>) -> ProviderProfile {
+    fn provider_profile_with_mcp(protocol: &str, options: Option<McpConfig>) -> ProviderProfile {
         ProviderProfile {
             id: "mcp-profile".to_string(),
             display_name: "MCP profile".to_string(),
             description: "source-owned description".to_string(),
-            endpoints: vec![crate::proto::NetworkEndpoint {
+            endpoints: vec![crate::proto::policy::NetworkEndpoint {
                 host: "mcp.example.com".to_string(),
-                port: 443,
+                ports: vec![443],
                 protocol: protocol.to_string(),
                 mcp: options,
-                ..crate::proto::NetworkEndpoint::default()
+                ..crate::proto::policy::NetworkEndpoint::default()
             }],
             ..ProviderProfile::default()
         }
     }
 
     #[test]
-    fn provider_profile_mcp_normalization_materializes_omitted_and_empty_versions() {
+    fn provider_profile_mcp_normalization_materializes_empty_versions() {
         let mut omitted = provider_profile_with_mcp("McP", None);
         normalize_provider_profile_mcp_fields(&mut omitted);
         assert_eq!(
@@ -139,10 +139,11 @@ mod tests {
 
         let mut empty = provider_profile_with_mcp(
             "mcp",
-            Some(McpOptions {
+            Some(McpConfig {
                 strict_tool_names: Some(false),
                 allow_all_known_mcp_methods: Some(true),
                 versions: Vec::new(),
+                ..McpConfig::default()
             }),
         );
         normalize_provider_profile_mcp_fields(&mut empty);
@@ -150,11 +151,12 @@ mod tests {
             empty.endpoints[0]
                 .mcp
                 .as_ref()
-                .expect("empty MCP versions must materialize"),
-            &McpOptions {
+                .expect("explicit MCP options remain present"),
+            &McpConfig {
                 strict_tool_names: Some(false),
                 allow_all_known_mcp_methods: Some(true),
                 versions: vec!["2025-11-25".to_string()],
+                ..McpConfig::default()
             }
         );
     }
@@ -163,14 +165,14 @@ mod tests {
     fn provider_profile_mcp_normalization_canonicalizes_valid_explicit_versions_only() {
         let mut profile = provider_profile_with_mcp(
             "mcp",
-            Some(McpOptions {
+            Some(McpConfig {
                 strict_tool_names: Some(true),
                 versions: vec![
                     "2025-11-25".to_string(),
                     "2025-03-26".to_string(),
                     "2025-06-18".to_string(),
                 ],
-                ..McpOptions::default()
+                ..McpConfig::default()
             }),
         );
         let original = profile.clone();
@@ -181,7 +183,7 @@ mod tests {
         assert_eq!(profile.display_name, original.display_name);
         assert_eq!(profile.description, original.description);
         assert_eq!(profile.endpoints[0].host, original.endpoints[0].host);
-        assert_eq!(profile.endpoints[0].port, original.endpoints[0].port);
+        assert_eq!(profile.endpoints[0].ports, original.endpoints[0].ports);
         assert_eq!(
             profile.endpoints[0].protocol,
             original.endpoints[0].protocol
@@ -191,14 +193,14 @@ mod tests {
                 .mcp
                 .as_ref()
                 .expect("valid MCP options"),
-            &McpOptions {
+            &McpConfig {
                 strict_tool_names: Some(true),
                 versions: vec![
                     "2025-03-26".to_string(),
                     "2025-06-18".to_string(),
                     "2025-11-25".to_string(),
                 ],
-                ..McpOptions::default()
+                ..McpConfig::default()
             }
         );
     }
@@ -215,9 +217,9 @@ mod tests {
         ] {
             let mut profile = provider_profile_with_mcp(
                 "mcp",
-                Some(McpOptions {
+                Some(McpConfig {
                     versions: versions.into_iter().map(ToString::to_string).collect(),
-                    ..McpOptions::default()
+                    ..McpConfig::default()
                 }),
             );
             let original = profile.clone();
@@ -232,9 +234,9 @@ mod tests {
     fn provider_profile_mcp_normalization_ignores_non_mcp_endpoint_evidence() {
         let mut profile = provider_profile_with_mcp(
             "rest",
-            Some(McpOptions {
+            Some(McpConfig {
                 versions: vec!["latest".to_string()],
-                ..McpOptions::default()
+                ..McpConfig::default()
             }),
         );
         let original = profile.clone();

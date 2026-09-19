@@ -14,7 +14,6 @@ use crate::policy_store::{
 use openshell_core::SetResourceVersion;
 use openshell_core::paths::set_file_owner_only;
 use openshell_core::proto::Sandbox;
-use prost::Message;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePoolOptions};
 use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqlitePool};
 use std::path::{Path, PathBuf};
@@ -1158,7 +1157,11 @@ WHERE "object_type" = 'sandbox' AND "id" = ?1 AND "resource_version" = ?4
 "#,
             )
             .bind(&write.sandbox_id)
-            .bind(sandbox.encode_to_vec())
+            .bind(
+                crate::storage_proto::encode_sandbox(&sandbox).map_err(|error| {
+                    PersistenceError::Encode(format!("encode sandbox payload failed: {error}"))
+                })?,
+            )
             .bind(now_ms)
             .bind(i64::try_from(current_version).unwrap_or(i64::MAX))
             .execute(&mut *tx)

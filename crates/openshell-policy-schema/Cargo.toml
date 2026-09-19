@@ -12,9 +12,17 @@ repository.workspace = true
 
 [dependencies]
 miette = { workspace = true }
+prost = { workspace = true }
+prost-reflect = { workspace = true }
+prost-protovalidate = { workspace = true }
+prost-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
+
+[build-dependencies]
+protoc-bin-vendored = { workspace = true }
+tonic-prost-build = { workspace = true }
 
 [lints]
 workspace = true

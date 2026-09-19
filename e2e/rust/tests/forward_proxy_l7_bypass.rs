@@ -67,7 +67,7 @@ network_policies:
     name: test_l7
     endpoints:
       - host: {host}
-        port: {port}
+        ports: [{port}]
         protocol: rest
         enforcement: enforce
         allowed_ips:

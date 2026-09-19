@@ -36,7 +36,14 @@ The YAML root and each present top-level section listed as an object or map must
 
 Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
 
-For query parameters and MCP tool names, the OPA loader normalizes nonempty string matchers to explicit `glob` objects after validation. For example, `query: { status: "active*" }` becomes `query: { status: { glob: "active*" } }` in runtime endpoint data. The same normalization applies to allow and deny rules and to MCP `tool` aliases. Matchers supported by both YAML and protobuf use the same runtime representation; `any` matchers retain their listed values. Raw OPA data also accepts empty scalar query matchers, which match empty query values and remain unchanged during loading. An empty protobuf glob cannot represent that OPA-only matcher.
+Policy files use the public protobuf message shape. Query and MCP tool matchers
+must select a `Matcher` oneof with `glob` or `any`. For example, write
+`query: { status: { glob: "active*" } }` rather than the legacy scalar
+`query: { status: "active*" }`. An `any` matcher is
+`{ any: { values: ["open", "pending"] } }`. MCP `params` entries use the
+`ParameterMatcher` shape, such as
+`name: { matcher: { glob: "search_*" } }`. Scalar matchers, the old
+`{ any: [...] }` form, and unwrapped nested parameter objects are rejected.
 
 ## Parsing and representation
 
@@ -47,7 +54,21 @@ models. The parser requires `version: 1`, rejects duplicate mapping keys and
 YAML merge keys, and accepts one document of at most 4 MiB. It limits nesting
 to 64 levels, total AST nodes to 100,000, parser events to 300,000, cumulative
 scalar data to 4 MiB, alias expansions to 100 with a 5:1 alias-to-anchor ratio,
-and each mapping or sequence to 10,000 entries.
+and each mapping or sequence to 10,000 entries. Every mapping key must be a
+string. Quote keys such as `"1"`, `"true"`, or `"null"` when those exact
+strings are intended. Middleware config integers must be exactly representable
+as protobuf `double` values, so integers that would round above the 53-bit
+precision range are rejected.
+
+OpenShell rejects YAML `null` for every typed protobuf field. Omit an optional
+field instead. Null remains valid only as data nested inside a middleware
+`config` object, which uses `google.protobuf.Struct` and intentionally accepts
+arbitrary JSON values.
+
+The gateway separately limits the canonical protobuf policy to 256 KiB. This
+limit applies after defaults and normalization to sandbox creation, full policy
+replacement, global policy replacement, and incremental merges. The gateway
+returns `INVALID_ARGUMENT` and does not persist a candidate that exceeds it.
 
 Unknown keys in closed schema objects are rejected with their field path before
 the policy is converted or analyzed. The following maps are intentionally
@@ -57,12 +78,11 @@ query matcher names, GraphQL persisted-query names, and recursively nested MCP
 
 An absent `filesystem_policy` resolves to the runtime-effective
 `include_workdir: true`. An explicitly present `filesystem_policy: {}` keeps
-`include_workdir: false`. During protobuf conversion, `ports` takes precedence
-over scalar `port`, one effective port serializes in compact scalar form, empty
-rule names fall back to their map key, and runtime-only provenance fields are
-omitted. Because proto3 scalar fields do not preserve presence, protobuf `version: 0` means omission. Canonical serialization materializes
-`version: 1`; any other unsupported protobuf version is rejected. A protobuf port above
-65535 is rejected rather than clamped.
+`include_workdir: false`. Public endpoints have one port representation:
+`ports` must be a non-empty list of unique integers from 1 through 65535.
+Empty rule names fall back to their map key, and runtime-only provenance fields
+are omitted. The document must set `version: 1`; protobuf's default value `0`
+is invalid. A protobuf port above 65535 is rejected rather than clamped.
 
 ## Policy Load Diagnostics
 
@@ -200,7 +220,7 @@ Each entry in the `network_policies` map has the following fields:
 |---|---|---|---|
 | `name` | string | No | Display name for the policy entry. Used in log output. Defaults to the map key. |
 | `endpoints` | list of endpoint objects | Yes | Hosts and ports this entry permits. |
-| `binaries` | list of binary objects | Yes | Executables allowed to connect to these endpoints. |
+| `binaries` | list of binary objects | No | Executables allowed to connect to these endpoints. Omitted and empty lists are equivalent and match no executable, so the entry grants no network access until it names at least one binary. |
 
 ### Endpoint Object
 
@@ -209,7 +229,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `host` | string | Conditional | Hostname or IP address. Required for `protocol: tcp`; transparent TCP requires a valid DNS hostname and rejects literal IPs. A non-TCP proxy endpoint may omit `host` only when `allowed_ips` supplies the destination constraint. Supports a `*` wildcard inside the first DNS label only: `*.example.com`, `**.example.com`, and intra-label patterns like `*-aiplatform.googleapis.com` are accepted; bare `*`/`**`, TLD wildcards (`*.com`), and wildcards outside the first label are rejected at load time. Prefer exact hosts for `protocol: tcp`: a wildcard authorizes DNS queries for all matching names and can provide a DNS-label exfiltration channel. |
-| `port` | integer | Yes | TCP port number. |
+| `ports` | list of integers | Yes | Non-empty, unique TCP port numbers from `1` through `65535`. Use a one-item list for a single port. |
 | `path` | string | No | Optional HTTP path glob used to select between L7 endpoints that share the same host and port. Empty means all paths. Use this when REST and GraphQL live under the same host, such as `/repos/**` and `/graphql`. |
 | `protocol` | string | No | Set to `tcp` with a valid DNS hostname to allow native TCP clients through policy DNS and transparent capture without payload inspection. Omit the field for L4 passthrough through an explicit proxy, including legacy hostless `allowed_ips` endpoints. Set to `rest` for HTTP method/path inspection, `websocket` for RFC 6455 upgrade and client text-message inspection, `graphql` for GraphQL-over-HTTP operation inspection, `mcp` for MCP Streamable HTTP request inspection, or `json-rpc` for generic JSON-RPC-over-HTTP method inspection. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket traffic. Provider-credentialed endpoints require an inspected protocol unless `allow_uninspected_credentials` is explicitly set. |
 | `tls` | string | No | TLS handling mode. The proxy auto-detects TLS by peeking the first bytes of each connection and terminates it for inspected HTTPS traffic, so this field is optional in most cases. Set to `skip` to disable auto-detection for edge cases such as client-certificate mTLS or non-standard protocols. Provider-credentialed endpoints reject `tls: skip` unless `allow_uninspected_credentials` is explicitly set. The values `terminate` and `passthrough` are deprecated and log a warning; they are still accepted for backward compatibility but have no effect on behavior. Remove either value and omit `tls` to use the equivalent automatic handling. Other values are rejected before activation. |
@@ -230,21 +250,17 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `persisted_queries` | string | No | GraphQL hash-only behavior for `protocol: graphql` and GraphQL-over-WebSocket operation policy. Default is `deny`; use `allow_registered` only with `graphql_persisted_queries`. |
 | `graphql_persisted_queries` | map | No | Trusted GraphQL persisted-query registry keyed by hash or saved-query ID. Values contain `operation_type`, optional `operation_name`, and optional root `fields`. |
 | `graphql_max_body_bytes` | integer | No | Maximum GraphQL-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
-| `mcp` | object | No | MCP endpoint options for `protocol: mcp`. Omit this key to use all MCP endpoint defaults, including the exact `2025-11-25` revision; `mcp: null` is invalid. The object is rejected on other protocols. Every MCP endpoint must still set a concrete `host` and `port` or `ports`; an entry containing only `protocol: mcp` is invalid and is not treated as a wildcard endpoint. |
-| `mcp.versions` | list of string | No | Nonempty allowlist of exact supported MCP core revisions: `2025-03-26`, `2025-06-18`, and `2025-11-25`. Omission resolves to the exact allowlist `["2025-11-25"]`; it never means latest or all known revisions. The key must be absent to use this default; `versions: null` and `versions: []` are invalid. Values must be unique, contain no extra whitespace, and name a revision in the closed supported set. For every request except a valid standalone `initialize`, OpenShell selects the revision from one `MCP-Protocol-Version` header or, when the header is absent, the MCP specification's `2025-03-26` compatibility fallback. The selected revision must appear in this allowlist. Duplicate, empty, or unsupported header values receive `400 Bad Request`; a supported revision outside the allowlist receives `403 Forbidden`. The sessionless `2026-07-28` revision is not yet supported. For an unsupported revision, omit `protocol` and `mcp` only when deliberate uninspected L4 passthrough is an acceptable weaker boundary. |
+| `mcp` | object | No | MCP endpoint options for `protocol: mcp`. Omit this field to use all MCP endpoint defaults, including the exact `2025-11-25` revision. The object is rejected on other protocols. Every MCP endpoint must still set a concrete `host` and non-empty `ports`; an entry containing only `protocol: mcp` is invalid and is not treated as a wildcard endpoint. |
+| `mcp.versions` | list of string | No | Allowlist of exact supported MCP core revisions: `2025-03-26`, `2025-06-18`, and `2025-11-25`. Omitted and empty lists resolve to `["2025-11-25"]`; they never mean latest or all known revisions. Nonempty values must be unique, contain no extra whitespace, and name a revision in the closed supported set. For every request except a valid standalone `initialize`, OpenShell selects the revision from one `MCP-Protocol-Version` header or, when the header is absent, the MCP specification's `2025-03-26` compatibility fallback. The selected revision must appear in this allowlist. Duplicate, empty, or unsupported header values receive `400 Bad Request`; a supported revision outside the allowlist receives `403 Forbidden`. The sessionless `2026-07-28` revision is not yet supported. |
 | `mcp.max_body_bytes` | integer | No | Maximum MCP JSON-RPC-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
 | `mcp.strict_tool_names` | bool | No | Defaults to `true`. Requires `tools/call` `params.name` values to match `^[A-Za-z0-9_.-]{1,128}$` before policy evaluation. Set to `false` only for compatibility with MCP servers that intentionally use non-recommended tool names. Wildcard `tool` matchers require this to remain enabled. |
 | `mcp.allow_all_known_mcp_methods` | bool | No | Defaults to `false`. When `true`, enables the endpoint MCP method profile: omitted `rules` allow all MCP-family methods and all tools before `deny_rules`, and omitted rule `method` uses that profile. When unset or `false`, explicit MCP method rules are required; rules with `tool` or `params.name` must set `method: tools/call`. |
 | `json_rpc` | object | No | JSON-RPC endpoint options. For `protocol: json-rpc`, `json_rpc.max_body_bytes` sets the maximum JSON-RPC-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
 
-The YAML representation keeps the names shown above. Protobuf and generated SDK
-clients use `NetworkTlsMode`, `NetworkEnforcementMode`, and
-`NetworkAccessPreset` enums for these fields. This is a breaking source and wire
-contract change for clients generated from the earlier string fields.
-Regenerate bindings from the current protobuf definitions and replace string
-assignments with the corresponding enum values. Unspecified TLS keeps automatic
-handling, unspecified enforcement keeps the audit default, and unspecified
-access selects no preset. Unknown enum numbers are rejected before activation.
+The YAML representation, protobuf API, and generated SDKs use the string values
+shown above. Unspecified TLS keeps automatic handling, unspecified enforcement
+keeps the audit default, and unspecified access selects no preset. OpenShell
+rejects other values before activation.
 
 **Validation constraints:**
 
@@ -260,7 +276,7 @@ access selects no preset. Unknown enum numbers are rejected before activation.
 - `mcp` and `json-rpc` reject `access` presets; use explicit `rules`.
 - `json-rpc` requires explicit `rules` with `allow.method`.
 - `mcp` requires `rules` unless `mcp.allow_all_known_mcp_methods: true`.
-- YAML defaulting requires the `mcp` or `mcp.versions` key to be absent. Explicit `mcp: null`, `versions: null`, and `versions: []` values are rejected. At protobuf ingress, an empty repeated `versions` field means omission and resolves to `["2025-11-25"]` because protobuf repeated fields do not preserve field presence.
+- Policy YAML follows protobuf presence semantics. Omitted and empty `mcp.versions` values both select the pinned `["2025-11-25"]` default because protobuf repeated fields do not preserve field presence. Explicit `null` is rejected.
 - `deny_rules` require `protocol`. For non-MCP protocols, `deny_rules` also require `rules` or `access` to define the base allow set. MCP `deny_rules` may omit both when `mcp.allow_all_known_mcp_methods: true` supplies the base allow set.
 - `rules: []` (empty list) is rejected; use `access: full` or remove `rules`.
 - Non-empty `rules` must contain at least one effective allow clause; rules where every entry lacks an allow are rejected as deny-all.
@@ -288,7 +304,7 @@ network_policies:
   gcp_storage:
     endpoints:
       - host: storage.googleapis.com
-        port: 443
+        ports: [443]
         protocol: rest
         access: full
         credential_binding:
@@ -319,7 +335,7 @@ REST allow rules match HTTP requests by method, path, and optional query paramet
 |---|---|---|---|
 | `method` | string | Yes | HTTP method to allow (for example, `GET`, `POST`). `*` matches any method. |
 | `path` | string | Yes | URL path glob. `*` and `**` match zero or more characters and may cross `/`; `?` matches one character; bracket classes such as `[0-9]` and `[!0]` are supported. |
-| `query` | map | No | Query parameter matchers keyed by decoded param name. Matcher value can be a glob string (`tag: "foo-*"`) or an object with `any` (`tag: { any: ["foo-*", "bar-*"] }`). |
+| `query` | map | No | Query parameter matchers keyed by decoded param name. Use the protobuf oneof shape: `tag: { glob: "foo-*" }` or `tag: { any: { values: ["foo-*", "bar-*"] } }`. |
 
 Example REST allow rules:
 
@@ -329,13 +345,14 @@ rules:
       method: GET
       path: /**/info/refs*
       query:
-        service: "git-*"
+        service: { glob: "git-*" }
   - allow:
       method: POST
       path: /**/git-upload-pack
       query:
         tag:
-          any: ["v1.*", "v2.*"]
+          any:
+            values: ["v1.*", "v2.*"]
 ```
 
 ##### WebSocket Allow Rule (`protocol: websocket`)
@@ -409,15 +426,15 @@ Use `rules` for MCP allow rules and `deny_rules` for MCP deny rules. Deny rules 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `method` | string | No | MCP method name, such as `initialize`, `tools/list`, `tools/call`, or an unknown extension method. Globs are accepted only for the `tools/` method family, such as `tools/*`. Required unless `mcp.allow_all_known_mcp_methods` is `true`; when that option is true, omitted method uses the endpoint method profile. Do not use `method: "*"` for MCP; omit `method` only when using the allow-all MCP method profile. |
-| `tool` | string or matcher | No | Convenience matcher for `tools/call` `params.name`. Supports a glob string or `{ any: [...] }`. Requires `method: tools/call` unless `mcp.allow_all_known_mcp_methods` is `true`; validation fails otherwise. Omit to match every tool. |
-| `params` | map | No | MCP currently accepts only `params.name` as a lower-level tool-name matcher. Omit this field when using only `tool`; an explicit `params: null` is invalid in allow and deny rules. Requires `method: tools/call` unless `mcp.allow_all_known_mcp_methods` is `true`; validation fails otherwise. Tool argument matching is not supported yet; allowed tools accept all argument payloads by default. |
+| `tool` | matcher | No | Matcher for `tools/call` `params.name`. Use `{ glob: "name" }` or `{ any: { values: [...] } }`. Requires `method: tools/call` unless `mcp.allow_all_known_mcp_methods` is `true`; validation fails otherwise. Omit to match every tool. |
+| `params` | map | No | MCP currently accepts only `params.name` as a lower-level tool-name matcher. Use the `ParameterMatcher` shape, for example `name: { matcher: { glob: "search_*" } }`. Requires `method: tools/call` unless `mcp.allow_all_known_mcp_methods` is `true`; validation fails otherwise. Tool argument matching is not supported yet; allowed tools accept all argument payloads by default. |
 
 An MCP client first sends `initialize`. After the server returns a successful response, the client sends `notifications/initialized`. After initialization completes and the server advertises the `tools` capability, the client can call an advertised tool. The response does not need an allow rule because these rules inspect messages sent from the client to the server. This example adds both client initialization messages to the existing tool rules. It omits `tools/list` because it assumes the client already knows the tool names; add that method when the client performs discovery.
 
 ```yaml showLineNumbers={false}
 endpoints:
   - host: mcp.example.com
-    port: 443
+    ports: [443]
     path: /mcp
     protocol: mcp
     enforcement: enforce
@@ -430,16 +447,17 @@ endpoints:
           method: notifications/initialized
       - allow:
           method: tools/call
-          tool: search_web
+          tool: { glob: search_web }
       - allow:
           method: tools/call
           tool:
-            any: [create_issue, list_issues]
+            any:
+              values: [create_issue, list_issues]
     deny_rules:
       - method: tools/call
-        tool: send_email
+        tool: { glob: send_email }
       - method: tools/call
-        tool: execute_code
+        tool: { glob: execute_code }
 ```
 
 This example omits `mcp.versions`, so OpenShell materializes `["2025-11-25"]`. To authorize an intentional compatibility range for an older server, set an explicit nonempty allowlist:
@@ -466,7 +484,7 @@ Example JSON-RPC allow rules:
 ```yaml showLineNumbers={false}
 endpoints:
   - host: jsonrpc.example.com
-    port: 443
+    ports: [443]
     path: /rpc
     protocol: json-rpc
     enforcement: enforce
@@ -500,7 +518,7 @@ Example REST deny rules:
 ```yaml showLineNumbers={false}
 endpoints:
   - host: api.github.com
-    port: 443
+    ports: [443]
     protocol: rest
     enforcement: enforce
     access: read-write
@@ -528,7 +546,7 @@ Example WebSocket deny rules:
 ```yaml showLineNumbers={false}
 endpoints:
   - host: realtime.example.com
-    port: 443
+    ports: [443]
     protocol: websocket
     enforcement: enforce
     access: read-write
@@ -552,7 +570,7 @@ Example GraphQL deny rules:
 ```yaml showLineNumbers={false}
 endpoints:
   - host: api.github.com
-    port: 443
+    ports: [443]
     protocol: graphql
     enforcement: enforce
     access: read-write
@@ -578,7 +596,7 @@ Example JSON-RPC deny rules:
 ```yaml showLineNumbers={false}
 endpoints:
   - host: jsonrpc.example.com
-    port: 443
+    ports: [443]
     path: /rpc
     protocol: json-rpc
     enforcement: enforce
@@ -640,7 +658,7 @@ network_policies:
     name: github-rest-api
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: read-only
@@ -652,7 +670,7 @@ network_policies:
     name: npm-registry
     endpoints:
       - host: registry.npmjs.org
-        port: 443
+        ports: [443]
         protocol: rest
         access: read-only
         allow_encoded_slash: true

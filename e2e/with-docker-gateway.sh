@@ -499,6 +499,30 @@ ensure_sandbox_image_available() {
   docker_pull_with_retry "${image}"
 }
 
+prepare_policy_document_community_image() {
+  local source_image=$1
+  local source_id source_digest fixture_image
+
+  source_id="$(docker image inspect --format '{{.Id}}' "${source_image}")"
+  source_digest="${source_id#sha256:}"
+  if ! [[ "${source_digest}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "ERROR: could not resolve a stable image ID for ${source_image}." >&2
+    return 1
+  fi
+
+  fixture_image="openshell/e2e-community-base:policy-document-v1-${source_digest:0:12}"
+  if ! docker image inspect "${fixture_image}" >/dev/null 2>&1; then
+    echo "Preparing PolicyDocument E2E fixture from ${source_image}..." >&2
+    ce_build \
+      --build-arg "BASE_IMAGE=${source_image}" \
+      --file "${ROOT}/e2e/docker/Dockerfile.policy-document-community-base" \
+      --tag "${fixture_image}" \
+      "${ROOT}/e2e/docker" >&2
+  fi
+
+  printf '%s\n' "${fixture_image}"
+}
+
 e2e_build_gateway_binaries "${ROOT}" TARGET_DIR GATEWAY_BIN CLI_BIN
 export OPENSHELL_BIN="${CLI_BIN}"
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
@@ -522,6 +546,13 @@ SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY:-${O
 if ! ensure_sandbox_image_available "${SANDBOX_IMAGE}"; then
   echo "ERROR: sandbox image '${SANDBOX_IMAGE}' is not available." >&2
   exit 2
+fi
+if [ "${SANDBOX_IMAGE}" = "${DEFAULT_SANDBOX_IMAGE}" ]; then
+  SANDBOX_IMAGE="$(prepare_policy_document_community_image "${SANDBOX_IMAGE}")"
+  SANDBOX_IMAGE_PULL_POLICY=never
+  export OPENSHELL_E2E_COMMUNITY_BASE_IMAGE="${SANDBOX_IMAGE}"
+  export OPENSHELL_COMMUNITY_REGISTRY="openshell/e2e-community-sandboxes"
+  docker image tag "${SANDBOX_IMAGE}" "${OPENSHELL_COMMUNITY_REGISTRY}/base:latest"
 fi
 
 HOST_PORT=$(e2e_pick_port)

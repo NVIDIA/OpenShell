@@ -96,7 +96,7 @@ network_policies:
     name: github-api-readonly
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         tls: terminate
         enforcement: enforce

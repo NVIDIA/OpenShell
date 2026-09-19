@@ -162,7 +162,7 @@ Read the published [policy schema reference](https://docs.nvidia.com/openshell/l
 Key sections to reference:
 - **Policy Schema Reference** — top-level structure
 - **`network_policies`** — rule structure
-- **`NetworkEndpoint`** fields — host, port, protocol, tls, enforcement, access, rules, allowed_ips
+- **`NetworkEndpoint`** fields — host, ports, protocol, tls, enforcement, access, rules, allowed_ips
 - **`L7Rule` / `L7Allow`** — method + path matching
 - **Access Presets** — `read-only`, `read-write`, `full`
 - **Private IP Access via `allowed_ips`** — CIDR allowlist for private IP space
@@ -272,7 +272,7 @@ network_policies:
     name: <policy_key>
     endpoints:
       - host: <api_host>
-        port: <port>
+        ports: [<port>]
         protocol: rest          # Required for L7 inspection
         tls: terminate          # Required for HTTPS + L7
         enforcement: enforce    # or audit
@@ -317,7 +317,7 @@ github_api:
   name: github_api
   endpoints:
     - host: api.github.com
-      port: 443
+      ports: [443]
       protocol: rest
       enforcement: enforce
       access: read-write
@@ -349,7 +349,7 @@ internal_api:
   name: internal_api
   endpoints:
     - host: api.internal.corp
-      port: 8080
+      ports: [8080]
       allowed_ips:
         - "10.0.5.0/24"
   binaries:
@@ -399,7 +399,7 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 ### Structural Checks
 
 - [ ] Every policy has `name`, `endpoints`, and `binaries`
-- [ ] Every endpoint has `host` and `port`
+- [ ] Every endpoint has `host` and nonempty `ports`
 - [ ] Every binary has `path`
 - [ ] Policy key matches `name` field
 - [ ] Every middleware selector has at most 32 combined `include` and `exclude` patterns
@@ -450,7 +450,7 @@ The policy needs to go somewhere. Determine which mode applies:
 1. **Read the existing file** to understand current state:
    - What policies already exist under `network_policies`
    - What the `filesystem_policy`, `landlock`, and `process` sections look like
-   - Whether the file uses compact (`{ host: ..., port: ... }`) or expanded YAML style
+   - Whether the file uses compact (`{ host: ..., ports: [...] }`) or expanded YAML style
 
 2. **Check for conflicts**:
    - Does a policy with the same key already exist? If so, ask the user whether to **replace** it, **merge** new endpoints/binaries into it, or use a different key.
@@ -465,7 +465,7 @@ The policy needs to go somewhere. Determine which mode applies:
 
 3. **Apply the change**:
    - **Adding a new policy**: Insert the new policy block under `network_policies`, maintaining the file's existing indentation and style.
-   - **Modifying an existing policy**: Edit the specific policy in place — add/remove endpoints, change access presets, update rules, add binaries, etc. A rule authorizes every binary it lists to reach every endpoint and port it lists, so adding one binary grants it all of that rule's endpoints, and adding one endpoint grants it to all of that rule's binaries. State the resulting pairs to the user before writing them. When the user wants a binary to reach only part of a rule's endpoints, put that binary and those endpoints in a separate rule instead of extending the existing one. An empty `binaries` list means any binary, so leaving it off widens the rule to every process.
+   - **Modifying an existing policy**: Edit the specific policy in place — add/remove endpoints, change access presets, update rules, add binaries, etc. A rule authorizes every binary it lists to reach every endpoint and port it lists, so adding one binary grants it all of that rule's endpoints, and adding one endpoint grants it to all of that rule's binaries. State the resulting pairs to the user before writing them. When the user wants a binary to reach only part of a rule's endpoints, put that binary and those endpoints in a separate rule instead of extending the existing one. An omitted or empty `binaries` list matches no executable and grants no network access.
    - **Removing a policy**: Delete the policy block if the user asks.
 
 4. **Preserve everything else**: Do not modify `filesystem_policy`, `landlock`, `process`, or other policies unless the user explicitly asks.
@@ -543,7 +543,7 @@ After presenting or applying the policy, ask if the user wants to:
 my_api:
   name: my_api
   endpoints:
-    - { host: api.example.com, port: 443 }
+    - { host: api.example.com, ports: [443] }
   binaries:
     - { path: /usr/bin/curl }
 ```
@@ -555,7 +555,7 @@ my_api_readonly:
   name: my_api_readonly
   endpoints:
     - host: api.example.com
-      port: 443
+      ports: [443]
       protocol: rest
       tls: terminate
       enforcement: enforce
@@ -571,7 +571,7 @@ my_api_custom:
   name: my_api_custom
   endpoints:
     - host: api.example.com
-      port: 443
+      ports: [443]
       protocol: rest
       tls: terminate
       enforcement: enforce
@@ -594,7 +594,7 @@ internal_svc:
   name: internal_svc
   endpoints:
     - host: api.internal.svc
-      port: 8080
+      ports: [8080]
       protocol: rest
       enforcement: enforce
       rules:
@@ -615,7 +615,7 @@ internal_db:
   name: internal_db
   endpoints:
     - host: db.internal.corp
-      port: 5432
+      ports: [5432]
       allowed_ips:
         - "10.0.5.0/24"
   binaries:
@@ -628,7 +628,7 @@ internal_db:
 private_services:
   name: private_services
   endpoints:
-    - port: 8080
+    - ports: [8080]
       allowed_ips:
         - "10.0.5.0/24"
         - "10.0.6.0/24"

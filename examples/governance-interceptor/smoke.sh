@@ -448,7 +448,7 @@ display_name: Unvended API
 category: other
 endpoints:
   - host: api.unvended.example
-    port: 443
+    ports: [443]
 binaries: [/usr/bin/curl]
 EOF
   "${CLI[@]}" provider profile import -f "$TMPDIR/unvended-profile.yaml" --global >/dev/null 2>&1 || true
@@ -526,7 +526,7 @@ network_policies:
     name: example-api
     endpoints:
     - host: example.com
-      port: 443
+      ports: [443]
       protocol: rest
       enforcement: enforce
       access: read-only
@@ -571,23 +571,23 @@ discovery:
   credentials: [api_token]
 endpoints:
   - host: api.github.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-only
     enforcement: enforce
   - host: api.github.com
-    port: 443
+    ports: [443]
     path: /graphql
     protocol: graphql
     access: read-only
     enforcement: enforce
   - host: github.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-only
     enforcement: enforce
   - host: profile-reload.example
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-only
     enforcement: enforce

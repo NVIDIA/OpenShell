@@ -29,7 +29,7 @@ network_policies:
   image_api:
     endpoints:
       - host: api.example.com
-        port: 443
+        ports: [443]
     binaries:
       - path: /usr/bin/curl
 ";
@@ -210,7 +210,7 @@ credentials:
     header_name: authorization
 endpoints:
   - host: api.example.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: full
 binaries:
@@ -327,8 +327,8 @@ binaries:
     std::fs::write(
         &repaired,
         POLICY.replace(
-            "        port: 443",
-            "        port: 443\n        protocol: rest\n        access: full",
+            "        ports: [443]",
+            "        ports: [443]\n        protocol: rest\n        access: full",
         ),
     )
     .unwrap();

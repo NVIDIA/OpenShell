@@ -27,12 +27,16 @@ verifier = _load_verifier_module()
 
 def _wheel_files() -> set[str]:
     files = {
+        "buf/__init__.py",
+        "buf/validate/__init__.py",
+        "buf/validate/validate_pb2.py",
+        "buf/validate/validate_pb2.pyi",
         "openshell/__init__.py",
         "openshell/sandbox.py",
         "openshell/py.typed",
         "openshell/_proto/__init__.py",
     }
-    for stem in ("datamodel", "openshell", "options", "sandbox"):
+    for stem in ("datamodel", "openshell", "options", "policy", "sandbox"):
         files.add(f"openshell/_proto/{stem}_pb2.py")
         files.add(f"openshell/_proto/{stem}_pb2.pyi")
         files.add(f"openshell/_proto/{stem}_pb2_grpc.py")
@@ -84,6 +88,14 @@ def test_rejects_missing_generated_proto(tmp_path: Path) -> None:
     wheel = _write_wheel(tmp_path, files=files)
 
     with pytest.raises(ValueError, match=r"sandbox_pb2\.py"):
+        verifier.verify_wheel(wheel)
+
+
+def test_rejects_missing_validation_descriptor(tmp_path: Path) -> None:
+    files = _wheel_files() - {"buf/validate/validate_pb2.py"}
+    wheel = _write_wheel(tmp_path, files=files)
+
+    with pytest.raises(ValueError, match=r"buf/validate/validate_pb2\.py"):
         verifier.verify_wheel(wheel)
 
 

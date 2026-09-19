@@ -3352,25 +3352,27 @@ impl App {
                         } else {
                             endpoint.protocol.as_str()
                         };
-                        let access = if endpoint.access == 0 {
+                        let access = if endpoint.access.is_empty() {
                             if endpoint.rules.is_empty() {
                                 "custom"
                             } else {
                                 "rules"
                             }
                         } else {
-                            openshell_policy::network_access_preset_to_str(endpoint.access)
-                                .unwrap_or("unknown")
+                            endpoint.access.as_str()
                         };
                         let path = if endpoint.path.is_empty() {
                             String::new()
                         } else {
                             format!(" path={}", endpoint.path)
                         };
-                        format!(
-                            "{}:{} {protocol} {access}{path}",
-                            endpoint.host, endpoint.port
-                        )
+                        let ports = endpoint
+                            .ports
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("{}:{ports} {protocol} {access}{path}", endpoint.host)
                     })
                     .collect::<Vec<_>>();
                 if lines.is_empty() {

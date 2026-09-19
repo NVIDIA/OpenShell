@@ -11,4 +11,4 @@ network_policies:
   anthropic:
     name: Anthropic API
     endpoints:
-      - { host: api.anthropic.com, port: 443 }
+      - { host: api.anthropic.com, ports: [443] }

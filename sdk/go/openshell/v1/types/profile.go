@@ -128,7 +128,7 @@ type TokenGrantAudienceOverride struct {
 // NetworkEndpoint describes a network endpoint provided by a profile.
 type NetworkEndpoint struct {
 	Host     string
-	Port     uint32
+	Ports    []uint32
 	Protocol string
 }
 

@@ -3919,7 +3919,7 @@ discovery:
   credentials: [api_key]
 endpoints:
   - host: api.custom.example
-    port: 443
+    ports: [443]
 binaries: [/usr/bin/custom]
 ",
     )
@@ -4475,7 +4475,7 @@ display_name: Custom YAML
 category: other
 endpoints:
   - host: api.yaml.example
-    port: 443
+    ports: [443]
 binaries: [/usr/bin/yaml-client]
 ",
     )
@@ -4488,7 +4488,7 @@ binaries: [/usr/bin/yaml-client]
   "description": "",
   "category": "other",
   "credentials": [],
-  "endpoints": [{"host": "api.json.example", "port": 443}],
+  "endpoints": [{"host": "api.json.example", "ports": [443]}],
   "binaries": ["/usr/bin/json-client"],
   "inference_capable": false
 }"#,
@@ -4580,7 +4580,7 @@ display_name: Custom Good
 category: other
 endpoints:
   - host: api.good.example
-    port: 443
+    ports: [443]
 ",
     )
     .unwrap();
@@ -4612,7 +4612,7 @@ display_name: Custom Good
 category: other
 endpoints:
   - host: api.good.example
-    port: 443
+    ports: [443]
 ",
     )
     .unwrap();

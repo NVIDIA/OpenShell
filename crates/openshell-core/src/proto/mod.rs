@@ -36,6 +36,11 @@ pub mod sandbox {
     pub use super::generated::openshell::sandbox::v1;
 }
 
+/// Public author-controlled policy messages.
+pub mod policy {
+    pub use openshell_policy_schema::proto::*;
+}
+
 pub mod compute {
     pub use super::generated::openshell::compute::v1;
 }

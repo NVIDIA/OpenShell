@@ -1021,7 +1021,7 @@ async fn create_sandbox_from_template_passes_template_name() {
             providers: vec!["openai".to_string()],
             command: vec!["python".to_string(), "-m".to_string(), "agent".to_string()],
             tty: false,
-            policy: Some(proto::SandboxPolicy {
+            policy: Some(proto::policy::PolicyDocument {
                 version: 1,
                 ..Default::default()
             }),
@@ -1652,7 +1652,7 @@ async fn workspace_scoped_create_from_template_passes_workspace() {
         .create_sandbox_from_template(SandboxTemplateCreateSpec {
             name: Some("from-template".to_string()),
             template_name: "python".to_string(),
-            policy: Some(proto::SandboxPolicy {
+            policy: Some(proto::policy::PolicyDocument {
                 version: 2,
                 ..Default::default()
             }),

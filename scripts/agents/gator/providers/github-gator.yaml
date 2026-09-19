@@ -16,7 +16,7 @@ discovery:
   credentials: [GITHUB_TOKEN]
 endpoints:
   - host: api.github.com
-    port: 443
+    ports: [443]
     protocol: rest
     enforcement: enforce
     rules:
@@ -58,7 +58,7 @@ endpoints:
       - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/pulls/*/reviews/*/comments }
       - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/statuses/* }
   - host: api.github.com
-    port: 443
+    ports: [443]
     path: /graphql
     protocol: graphql
     enforcement: enforce
@@ -70,7 +70,7 @@ endpoints:
           operation_name: ResolveGatorReviewThread
           fields: [resolveReviewThread]
   - host: github.com
-    port: 443
+    ports: [443]
     protocol: rest
     enforcement: enforce
     rules:
@@ -85,14 +85,14 @@ endpoints:
       - allow: { method: POST, path: /NVIDIA/OpenShell-Community/**/git-upload-pack }
       - allow: { method: POST, path: /NVIDIA/OpenShell-Community.git/**/git-upload-pack }
   - host: codeload.github.com
-    port: 443
+    ports: [443]
     protocol: rest
     enforcement: enforce
     rules:
       - allow: { method: GET, path: /NVIDIA/OpenShell/** }
       - allow: { method: GET, path: /NVIDIA/OpenShell-Community/** }
   - host: results-receiver.actions.githubusercontent.com
-    port: 443
+    ports: [443]
     protocol: rest
     enforcement: enforce
     rules:

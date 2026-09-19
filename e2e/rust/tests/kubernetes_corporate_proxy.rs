@@ -106,7 +106,7 @@ network_policies:
     name: proxy_e2e
     endpoints:
       - host: {HOST_ALIAS}
-        port: {upstream_port}
+        ports: [{upstream_port}]
         tls: skip
         enforcement: enforce
         allowed_ips: ["10.0.0.0/8", "172.0.0.0/8", "192.168.0.0/16", "fc00::/7"]

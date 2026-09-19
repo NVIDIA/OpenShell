@@ -84,7 +84,7 @@ from the profile to `api.example.com:443` under `/v1`:
 ```yaml showLineNumbers={false}
 endpoints:
   - host: api.example.com
-    port: 443
+    ports: [443]
     path: /v1/**
 ```
 
@@ -103,7 +103,7 @@ network_policies:
   gcp_storage:
     endpoints:
       - host: storage.googleapis.com
-        port: 443
+        ports: [443]
         protocol: rest
         access: full
         credential_binding:
@@ -127,7 +127,7 @@ network_policies:
   aws_s3:
     endpoints:
       - host: s3.us-west-2.amazonaws.com
-        port: 443
+        ports: [443]
         protocol: rest
         access: full
         credential_binding:
@@ -380,13 +380,12 @@ discovery:
 
 endpoints:
   - host: api.example.com
-    port: 443
+    ports: [443]
     path: /v1/**
     protocol: rest
     tls: ""
     enforcement: enforce
     allowed_ips: []
-    ports: []
     allow_encoded_slash: false
     websocket_credential_rewrite: false
     request_body_credential_rewrite: false
@@ -883,18 +882,18 @@ credentials:
     header_name: authorization
 endpoints:
   - host: api.github.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-only
     enforcement: enforce
   - host: api.github.com
-    port: 443
+    ports: [443]
     path: /graphql
     protocol: graphql
     access: read-only
     enforcement: enforce
   - host: github.com
-    port: 443
+    ports: [443]
     protocol: rest
     enforcement: enforce
     rules:
@@ -915,7 +914,7 @@ network_policies:
     name: custom_pypi
     endpoints:
       - host: pypi.org
-        port: 443
+        ports: [443]
         protocol: rest
         access: read-only
         enforcement: enforce
@@ -926,18 +925,18 @@ network_policies:
     name: _provider_work_github
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         access: read-only
         enforcement: enforce
       - host: api.github.com
-        port: 443
+        ports: [443]
         path: /graphql
         protocol: graphql
         access: read-only
         enforcement: enforce
       - host: github.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         rules:

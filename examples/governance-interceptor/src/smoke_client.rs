@@ -62,10 +62,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?
         .into_inner();
-    let mut widened_policy = before
-        .policy
-        .clone()
-        .ok_or("governed sandbox did not have an active policy")?;
+    let mut widened_policy = openshell_policy::project_base_policy(
+        &before
+            .policy
+            .ok_or("governed sandbox did not have an active policy")?,
+    )?;
     let mut added_rule = widened_policy
         .network_policies
         .values()

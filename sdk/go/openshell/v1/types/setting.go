@@ -54,7 +54,7 @@ type EffectiveSetting struct {
 // including policy, effective settings, and revision metadata.
 type SandboxConfig struct {
 	// Policy is the typed security policy for this sandbox. Nil means no policy in the response.
-	Policy *SandboxPolicy
+	Policy *PolicyDocument
 	// PolicyVersion is monotonically increasing per sandbox.
 	PolicyVersion uint32
 	// PolicyHash is the SHA-256 of the serialized policy payload.
@@ -89,7 +89,7 @@ type ConfigUpdate struct {
 	// Name is the sandbox name (required for sandbox-scoped updates).
 	Name string
 	// Policy is the typed security policy for a full policy replacement. Nil means no policy change.
-	Policy *SandboxPolicy
+	Policy *PolicyDocument
 	// SettingKey is a single setting key to mutate.
 	SettingKey string
 	// SettingValue is the setting value for upsert. Nil means no value change.

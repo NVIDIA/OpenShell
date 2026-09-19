@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"slices"
 
+	"buf.build/go/protovalidate"
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
+	policyv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/policyv1"
 	sbv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // --- SettingValue oneof conversion ---
@@ -133,8 +136,8 @@ func SandboxConfigFromProto(resp *sbv1.GetSandboxConfigResponse) *v1.SandboxConf
 		PolicyValidationFailureMode: resp.GetPolicyValidationFailureMode(),
 	}
 
-	// Convert proto SandboxPolicy to typed SDK SandboxPolicy.
-	sc.Policy = SandboxPolicyFromProto(resp.GetPolicy())
+	// Project the supervisor's internal effective policy onto the public SDK model.
+	sc.Policy = PolicyDocumentFromInternalProto(resp.GetPolicy())
 
 	// Deep-copy settings map.
 	if m := resp.GetSettings(); len(m) > 0 {
@@ -192,8 +195,8 @@ func ConfigUpdateToProto(cu *v1.ConfigUpdate) (*pb.UpdateConfigRequest, error) {
 		req.Sandbox = cu.Name
 	}
 
-	// Convert typed SDK SandboxPolicy to proto SandboxPolicy.
-	policy, err := SandboxPolicyToProtoChecked(cu.Policy)
+	// Convert typed SDK PolicyDocument to proto PolicyDocument.
+	policy, err := PolicyDocumentToProtoChecked(cu.Policy)
 	if err != nil {
 		return nil, err
 	}
@@ -252,9 +255,9 @@ func PolicyMergeOperationToProto(op *v1.PolicyMergeOperation) (*pb.PolicyMergeOp
 			},
 		}
 	case op.AddDenyRules != nil:
-		var denyRules []*sbv1.L7DenyRule
+		var denyRules []*policyv1.L7DenyRule
 		if len(op.AddDenyRules.DenyRules) > 0 {
-			denyRules = make([]*sbv1.L7DenyRule, len(op.AddDenyRules.DenyRules))
+			denyRules = make([]*policyv1.L7DenyRule, len(op.AddDenyRules.DenyRules))
 			for i := range op.AddDenyRules.DenyRules {
 				denyRules[i] = l7DenyRuleToProto(&op.AddDenyRules.DenyRules[i])
 			}
@@ -266,9 +269,9 @@ func PolicyMergeOperationToProto(op *v1.PolicyMergeOperation) (*pb.PolicyMergeOp
 			},
 		}
 	case op.AddAllowRules != nil:
-		var rules []*sbv1.L7Rule
+		var rules []*policyv1.L7Rule
 		if len(op.AddAllowRules.Rules) > 0 {
-			rules = make([]*sbv1.L7Rule, len(op.AddAllowRules.Rules))
+			rules = make([]*policyv1.L7Rule, len(op.AddAllowRules.Rules))
 			for i := range op.AddAllowRules.Rules {
 				rules[i] = l7RuleToProto(&op.AddAllowRules.Rules[i])
 			}
@@ -287,7 +290,61 @@ func PolicyMergeOperationToProto(op *v1.PolicyMergeOperation) (*pb.PolicyMergeOp
 			},
 		}
 	}
+	if err := validatePolicyMergeOperationContract(pmo); err != nil {
+		return nil, err
+	}
 	return pmo, nil
+}
+
+func validatePolicyMergeOperationContract(operation *pb.PolicyMergeOperation) error {
+	validate := func(name string, message interface{ ProtoReflect() protoreflect.Message }) error {
+		if err := protovalidate.Validate(message); err != nil {
+			return fmt.Errorf("%s validation: %w", name, err)
+		}
+		return nil
+	}
+
+	switch op := operation.GetOperation().(type) {
+	case *pb.PolicyMergeOperation_AddRule:
+		document := &policyv1.PolicyDocument{
+			Version: 1,
+			NetworkPolicies: map[string]*policyv1.NetworkPolicyRule{
+				op.AddRule.GetRuleName(): op.AddRule.GetRule(),
+			},
+		}
+		return validate("add rule", document)
+	case *pb.PolicyMergeOperation_AddDenyRules:
+		for index, rule := range op.AddDenyRules.GetDenyRules() {
+			if err := validate(fmt.Sprintf("deny rule [%d]", index), rule); err != nil {
+				return err
+			}
+		}
+		return validateL7TargetBinaries(op.AddDenyRules.GetTarget(), validate)
+	case *pb.PolicyMergeOperation_AddAllowRules:
+		for index, rule := range op.AddAllowRules.GetRules() {
+			if err := validate(fmt.Sprintf("allow rule [%d]", index), rule); err != nil {
+				return err
+			}
+		}
+		return validateL7TargetBinaries(op.AddAllowRules.GetTarget(), validate)
+	default:
+		return nil
+	}
+}
+
+func validateL7TargetBinaries(
+	target *pb.L7RuleTarget,
+	validate func(string, interface{ ProtoReflect() protoreflect.Message }) error,
+) error {
+	if target == nil {
+		return nil
+	}
+	for index, binary := range target.GetBinaries() {
+		if err := validate(fmt.Sprintf("target binary [%d]", index), binary); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // l7RuleTargetToProto preserves the caller's declaration without inferring scope.
@@ -309,9 +366,9 @@ func l7RuleTargetToProto(target *v1.L7RuleTarget) *pb.L7RuleTarget {
 		result.Path = &path
 	}
 	if target.Binaries != nil {
-		result.Binaries = make([]*sbv1.NetworkBinary, len(target.Binaries))
+		result.Binaries = make([]*policyv1.NetworkBinary, len(target.Binaries))
 		for i, binary := range target.Binaries {
-			result.Binaries[i] = &sbv1.NetworkBinary{Path: binary.Path}
+			result.Binaries[i] = &policyv1.NetworkBinary{Path: binary.Path}
 		}
 	}
 	return result

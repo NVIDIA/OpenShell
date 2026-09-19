@@ -38,17 +38,17 @@ discovery:
   credentials: [api_key]
 endpoints:
   - host: api.anthropic.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce
   - host: statsig.anthropic.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce
   - host: sentry.io
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce

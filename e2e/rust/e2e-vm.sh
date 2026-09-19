@@ -53,6 +53,12 @@ E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
 E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES-e2e-vm}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-${COMMUNITY_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}}"
 
+# The published community image predates the strict public PolicyDocument
+# contract. VM e2e pulls that image directly from its registry, so give the
+# lifecycle-oriented suite an explicit compatible policy instead of weakening
+# production parsing or requiring a local registry just for the fixture.
+export OPENSHELL_SANDBOX_POLICY="${OPENSHELL_SANDBOX_POLICY:-${ROOT}/e2e/configs/policy-document-default.yaml}"
+
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
 # AF_UNIX SUN_LEN is 104 bytes on macOS (108 on Linux), so paths anchored
 # in the workspace's `target/` blow the limit on typical developer

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from openshell._proto import datamodel_pb2, sandbox_pb2
+from openshell._proto import datamodel_pb2, policy_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -37,25 +37,25 @@ def _pypi_spec() -> datamodel_pb2.SandboxSpec:
         "downloads.python.org",
     ]
     return datamodel_pb2.SandboxSpec(
-        policy=sandbox_pb2.SandboxPolicy(
+        policy=policy_pb2.PolicyDocument(
             version=1,
-            filesystem=sandbox_pb2.FilesystemPolicy(
+            filesystem_policy=policy_pb2.FilesystemPolicy(
                 include_workdir=True,
                 read_only=["/usr", "/lib", "/etc", "/app", "/proc"],
                 read_write=["/sandbox", "/tmp"],
             ),
-            landlock=sandbox_pb2.LandlockPolicy(compatibility="best_effort"),
-            process=sandbox_pb2.ProcessPolicy(
+            landlock=policy_pb2.LandlockPolicy(compatibility="best_effort"),
+            process=policy_pb2.ProcessPolicy(
                 run_as_user="sandbox", run_as_group="sandbox"
             ),
             network_policies={
-                "pypi": sandbox_pb2.NetworkPolicyRule(
+                "pypi": policy_pb2.NetworkPolicyRule(
                     name="pypi",
                     endpoints=[
-                        sandbox_pb2.NetworkEndpoint(host=host, port=443)
+                        policy_pb2.NetworkEndpoint(host=host, ports=[443])
                         for host in endpoints
                     ],
-                    binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+                    binaries=[policy_pb2.NetworkBinary(path="/**")],
                 )
             },
         )

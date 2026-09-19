@@ -13,7 +13,7 @@ import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 )
 
-func copySandboxPolicyRevision(r types.SandboxPolicyRevision) types.SandboxPolicyRevision {
+func copyPolicyDocumentRevision(r types.SandboxPolicyRevision) types.SandboxPolicyRevision {
 	if r.Policy != nil {
 		cp := *r.Policy
 		if r.Policy.NetworkPolicies != nil {
@@ -50,7 +50,7 @@ func newFakePolicyClient(closedFunc func() bool) *fakePolicyClient {
 func (c *fakePolicyClient) AddGlobalRevision(rev types.SandboxPolicyRevision) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.globalRevisions = append(c.globalRevisions, copySandboxPolicyRevision(rev))
+	c.globalRevisions = append(c.globalRevisions, copyPolicyDocumentRevision(rev))
 }
 
 // AddRevision adds a sandbox-scoped policy revision for test seeding.
@@ -58,7 +58,7 @@ func (c *fakePolicyClient) AddRevision(workspace, name string, rev types.Sandbox
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := workspace + "/" + name
-	c.sandboxRevisions[key] = append(c.sandboxRevisions[key], copySandboxPolicyRevision(rev))
+	c.sandboxRevisions[key] = append(c.sandboxRevisions[key], copyPolicyDocumentRevision(rev))
 }
 
 // GetDraft returns Unimplemented.
@@ -156,13 +156,13 @@ func (c *fakePolicyClient) GetStatus(_ context.Context, workspace, sandboxName s
 	targetVersion := cfg.Version()
 	if targetVersion == 0 {
 		// Latest revision (by highest version, not insertion order).
-		rev := copySandboxPolicyRevision(revisions[maxIdx])
+		rev := copyPolicyDocumentRevision(revisions[maxIdx])
 		return &types.PolicyStatusResult{Revision: rev, ActiveVersion: activeVersion}, nil
 	}
 
 	for _, r := range revisions {
 		if r.Version == targetVersion {
-			rev := copySandboxPolicyRevision(r)
+			rev := copyPolicyDocumentRevision(r)
 			return &types.PolicyStatusResult{Revision: rev, ActiveVersion: activeVersion}, nil
 		}
 	}
@@ -207,7 +207,7 @@ func (c *fakePolicyClient) List(workspace, sandboxName string, opts ...v1.ListPo
 
 	result := make([]types.SandboxPolicyRevision, len(revisions))
 	for i, r := range revisions {
-		result[i] = copySandboxPolicyRevision(r)
+		result[i] = copyPolicyDocumentRevision(r)
 	}
 	return newSlicePager(result, int(cfg.PageSize()), cfg.PageToken())
 }

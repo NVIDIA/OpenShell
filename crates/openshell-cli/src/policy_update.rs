@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use miette::{Result, miette};
+use openshell_core::proto::policy::NetworkBinary as AuthoredNetworkBinary;
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::{
     AddAllowRules, AddDenyRules, AddNetworkRule, L7Allow, L7DenyRule, L7Rule,
@@ -120,7 +121,10 @@ pub fn build_policy_update_plan(
         merge_operations.push(PolicyMergeOperation {
             operation: Some(policy_merge_operation::Operation::AddRule(AddNetworkRule {
                 rule_name: target_rule_name.clone(),
-                rule: Some(rule.clone()),
+                rule: Some(openshell_policy::project_authored_rule(
+                    &target_rule_name,
+                    &rule,
+                )?),
             })),
         });
         preview_operations.push(PolicyMergeOp::AddRule {
@@ -178,7 +182,10 @@ pub fn build_policy_update_plan(
             operation: Some(policy_merge_operation::Operation::AddAllowRules(
                 AddAllowRules {
                     target: Some(l7_target_to_proto(&target)),
-                    rules: rules.clone(),
+                    rules: rules
+                        .iter()
+                        .map(openshell_policy::project_authored_l7_rule)
+                        .collect::<Result<Vec<_>>>()?,
                 },
             )),
         });
@@ -199,7 +206,10 @@ pub fn build_policy_update_plan(
             operation: Some(policy_merge_operation::Operation::AddDenyRules(
                 AddDenyRules {
                     target: Some(l7_target_to_proto(&target)),
-                    deny_rules: deny_rules.clone(),
+                    deny_rules: deny_rules
+                        .iter()
+                        .map(openshell_policy::project_authored_l7_deny_rule)
+                        .collect::<Result<Vec<_>>>()?,
                 },
             )),
         });
@@ -263,7 +273,12 @@ fn l7_target_to_proto(target: &L7RuleTarget) -> ProtoL7RuleTarget {
         host: target.host.clone(),
         ports: target.ports.clone(),
         path: target.path.clone(),
-        binaries,
+        binaries: binaries
+            .iter()
+            .map(|binary| AuthoredNetworkBinary {
+                path: binary.path.clone(),
+            })
+            .collect(),
         any_binary,
     }
 }
@@ -1251,7 +1266,14 @@ mod tests {
                     Some(Operation::AddAllowRules(wire)),
                     PolicyMergeOp::AddAllowRules { target, rules },
                 ) => {
-                    assert_eq!(wire.rules, *rules);
+                    assert_eq!(
+                        wire.rules,
+                        rules
+                            .iter()
+                            .map(openshell_policy::project_authored_l7_rule)
+                            .collect::<miette::Result<Vec<_>>>()
+                            .unwrap()
+                    );
                     assert_eq!(rules.len(), 2);
                     assert_eq!(
                         rules[0].allow.as_ref().expect("allow matcher").path,
@@ -1263,7 +1285,14 @@ mod tests {
                     Some(Operation::AddDenyRules(wire)),
                     PolicyMergeOp::AddDenyRules { target, deny_rules },
                 ) => {
-                    assert_eq!(wire.deny_rules, *deny_rules);
+                    assert_eq!(
+                        wire.deny_rules,
+                        deny_rules
+                            .iter()
+                            .map(openshell_policy::project_authored_l7_deny_rule)
+                            .collect::<miette::Result<Vec<_>>>()
+                            .unwrap()
+                    );
                     assert_eq!(deny_rules.len(), 2);
                     assert_eq!(deny_rules[0].path, "/v1/a:b");
                     (wire.target.as_ref().expect("wire target"), target)
@@ -1284,7 +1313,17 @@ mod tests {
             assert_eq!(wire_target.host, target.host);
             assert_eq!(wire_target.ports, target.ports);
             assert_eq!(wire_target.path, target.path);
-            assert_eq!(wire_target.binaries, *binaries);
+            assert_eq!(
+                wire_target
+                    .binaries
+                    .iter()
+                    .map(|binary| binary.path.as_str())
+                    .collect::<Vec<_>>(),
+                binaries
+                    .iter()
+                    .map(|binary| binary.path.as_str())
+                    .collect::<Vec<_>>()
+            );
             assert!(!wire_target.any_binary);
         }
     }

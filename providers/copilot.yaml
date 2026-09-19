@@ -38,35 +38,35 @@ discovery:
   credentials: [api_token]
 endpoints:
   - host: api.githubcopilot.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce
   - host: api.individual.githubcopilot.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce
   - host: api.business.githubcopilot.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce
   - host: api.enterprise.githubcopilot.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce
   - host: copilot-proxy.githubusercontent.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce
   - host: telemetry.enterprise.githubcopilot.com
-    port: 443
+    ports: [443]
     allow_uninspected_credentials: true
   - host: default.exp-tas.com
-    port: 443
+    ports: [443]
     allow_uninspected_credentials: true
 binaries:
   - /usr/bin/copilot

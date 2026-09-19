@@ -41,6 +41,55 @@ before any consumer-specific projection runs. There is no permissive parsing
 profile: unsupported policy fields always invalidate the document. Middleware `config`, query and persisted-query names, and recursive MCP
 parameter names are open user-data maps rather than schema extensions.
 
+The generated `openshell.policy.v1` package is the language-neutral authored
+contract used by policy inputs and curated SDK policy surfaces. The gateway
+lowers that message at ingress into the internal `openshell.sandbox.v1` runtime
+policy and projects stored or effective runtime policy back to the public
+message at authored API boundaries. Compute drivers, the supervisor, policy
+history payloads, and merge execution continue to use the internal
+representation. `GetSandboxConfig` is also the authenticated supervisor's
+configuration RPC, so its wire response necessarily carries the effective
+internal policy; curated SDKs project that field to `PolicyDocument` before
+returning it to callers. Runtime-derived fields such as advisor and provider
+provenance have no public authored field and their internal wire numbers are
+reserved in the authored endpoint message.
+
+Existing policy revision rows, sandbox records, and provider-profile records
+remain internal and retain their current wire encoding. The gateway uses
+private storage envelopes whose field numbers mirror the historical records,
+then projects their policy fields to the public schema on read. No clean
+database or policy-data migration is required for this boundary. Mixed-version
+gateway rollouts remain unsupported because the public RPC contract changes.
+
+Policy YAML uses the public protobuf field shape directly. The schema crate
+performs bounded YAML decoding and descriptor-driven protobuf conversion; it
+does not rewrite legacy spellings. Scalar matchers, scalar MCP `tool` values,
+and other YAML-only shorthands are breaking changes and must be rewritten as
+their message or oneof forms. Protobuf cannot distinguish omitted repeated
+fields from empty lists, so both select the same default where the policy
+language defines one. Contextual validation remains explicit code because
+rules such as endpoint protocol, credential binding, and provider composition
+depend on more than one message; generated field validation is not an
+enforcement substitute.
+
+The portable field constraints use the vendored
+`proto/buf/validate/validate.proto` schema. Go, Python, and TypeScript execute
+those annotations with the official Protovalidate runtimes. Rust uses the
+exact-pinned `prost-protovalidate` reflection runtime because Buf does not
+publish an official Rust implementation; the dependency remains isolated in
+`openshell-policy-schema`, and the policy rules deliberately avoid CEL. Tests
+assert the same rule IDs in all four languages so runtime drift is visible.
+Cross-field policy semantics still run after portable field validation.
+
+Typed YAML fields reject explicit `null`; omission expresses absence. Null is
+accepted only as user data below middleware `config`, whose protobuf type is
+`google.protobuf.Struct`. Public endpoints expose only the non-empty `ports`
+list. Field number 2 and the name `port` stay reserved in the public message so
+the legacy scalar cannot reappear accidentally. The internal runtime policy
+keeps its scalar field for stored-data and rollout compatibility; lowering
+promotes a one-item public list into that scalar, and public projection always
+emits the effective repeated list.
+
 Before applying Landlock, the supervisor enriches baseline filesystem paths that
 the runtime needs. Missing baseline paths are skipped so one absent runtime path
 does not weaken the whole ruleset. When GPU devices are present, GPU baseline

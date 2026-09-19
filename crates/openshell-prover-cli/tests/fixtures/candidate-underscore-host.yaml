@@ -6,6 +6,6 @@ network_policies:
   underscore-host:
     endpoints:
       - host: api_internal.example.com
-        port: 443
+        ports: [443]
     binaries:
       - path: /usr/bin/curl

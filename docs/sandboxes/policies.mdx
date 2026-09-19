@@ -10,6 +10,12 @@ position: 6
 
 Use this page to apply and iterate policy changes on running sandboxes. For a full field-by-field YAML definition, use the [Policy Schema Reference](/reference/policy-schema).
 
+Policy files use the public protobuf field shape directly. Legacy scalar
+matcher shorthands are not accepted. Write matchers as messages, for example
+`tool: { glob: read_status }` or `tool: { any: { values: [a, b] } }`.
+The local YAML parser accepts at most 4 MiB. The gateway then limits the
+canonical protobuf policy to 256 KiB after applying defaults and normalization.
+
 ## Policy Structure
 
 A policy has static sections `filesystem_policy`, `landlock`, and `process` that are locked at sandbox creation, and dynamic `network_policies` and `network_middlewares` sections that are hot-reloadable on a running sandbox.
@@ -38,7 +44,7 @@ network_policies:
     name: my-api
     endpoints:
       - host: api.example.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: full
@@ -147,7 +153,7 @@ network_policies:
     name: postgres
     endpoints:
       - host: db.internal.example
-        port: 5432
+        ports: [5432]
         protocol: tcp
     binaries:
       - path: /usr/bin/psql
@@ -365,7 +371,7 @@ The incremental update surface is split into endpoint-level operations and metho
 | `--add-deny <SPEC>` | Appends method/path deny rules to an existing REST or WebSocket endpoint. | Block a sensitive REST path or WebSocket text-message path under an endpoint that is otherwise allowed. |
 | `--binary <PATH>` | Adds binaries for `--add-endpoint`; declares the complete existing binary set for L7 appends. | Repeat for every executable sharing the target rule. |
 | `--rule-name <NAME>` | Names one new endpoint rule or selects the existing rule for L7 appends. | Required for `--add-allow` and `--add-deny`. |
-| `--any-binary` | Explicitly acknowledges an existing rule that authorizes every binary. | Use for L7 appends instead of `--binary` when the target rule has no binary restriction. |
+| `--any-binary` | Selects the incremental update API's explicit any-binary target state. | Use only when the gateway reports that internal target state. It is not an authored policy-file value. |
 | `--endpoint-path <PATH>` | Selects an exact existing endpoint path for L7 appends. | Resolve path ambiguity; pass `''` to select an endpoint without a path scope. |
 | `--dry-run` | Shows the merged policy locally and does not call the gateway. | Review the result before persisting it. |
 | `--wait` | Polls until the sandbox reports that the new revision loaded. | Confirm the change took effect before continuing. |
@@ -491,7 +497,7 @@ Path globs follow the same semantics as YAML allow and deny rules:
 - `/repos/*/issues` matches any intervening text, including multiple path segments.
 - `/repos/**` matches everything under `/repos/`.
 
-The rule-level commands only modify method and path constraints. They do not change binaries, hostnames, ports, protocol settings, or WebSocket message payload matching. Each change applies to every binary and port on the target endpoint. Supply `--rule-name` and every binary with repeated `--binary`, or use `--any-binary` when the stored rule has an empty binary list. The declared binary and port sets must match the stored scope exactly; OpenShell reports the expected scope when they differ.
+The rule-level commands only modify method and path constraints. They do not change binaries, hostnames, ports, protocol settings, or WebSocket message payload matching. Each change applies to every binary and port on the target endpoint. Supply `--rule-name` and every binary with repeated `--binary`. The incremental update API also retains an explicit `any_binary` target selector for internal update scopes; `--any-binary` selects that state when the gateway reports it. This selector does not create an authored any-binary policy. In a complete policy document, omitted `binaries` and `binaries: []` both match no executable. The declared binary and port sets must match the stored scope exactly; OpenShell reports the expected scope when they differ.
 
 Use `--endpoint-path` to select an endpoint by its stored path when the rule contains more than one endpoint matching the host and ports. `--endpoint-path ''` selects an endpoint without a path selector. This selector is separate from the request path in the allow or deny rule. All L7 additions in one command use the same rule name, binary declaration, and endpoint-path selector.
 
@@ -627,11 +633,10 @@ The CLI validates the argument shapes before it sends the request. The gateway t
 - `--add-deny` targets an endpoint that has no base allow set.
 - an update names an existing rule and adds a binary to it without declaring every endpoint and port that rule already authorizes.
 - an update names an existing rule and adds or changes an endpoint on it without declaring every binary that rule already authorizes.
-- an update widens a rule to any binary without declaring every endpoint that rule already authorizes.
 - an update changes an endpoint without declaring every port that endpoint carries.
 - an update puts an MCP endpoint on the same host and port as a differently inspected endpoint, or gives one host and port two different MCP inspection contracts, including through separate rules or different paths.
 
-A rule authorizes every listed binary to reach every listed endpoint and port, so merging a binary and an endpoint into the same rule authorizes that pair too. The gateway rejects the whole batch rather than granting a pair the update did not ask for. The error names the binary scope and the ports involved, and lists the binaries you still need to declare. An empty binary list means any binary, so widening a rule to any binary is subject to the same requirement.
+A rule authorizes every listed binary to reach every listed endpoint and port, so merging a binary and an endpoint into the same rule authorizes that pair too. The gateway rejects the whole batch rather than granting a pair the update did not ask for. The error names the binary scope and the ports involved, and lists the binaries you still need to declare. An omitted or empty authored binary list matches no executable; the similarly named `any_binary` field belongs only to the incremental update target protocol.
 
 You can declare the scope across several `--add-endpoint` arguments. The update is complete as long as every binary-to-port pair the merged rule ends up authorizing appears somewhere in the update.
 
@@ -724,9 +729,9 @@ Allow `pip install` and `uv pip install` to reach PyPI:
     name: pypi
     endpoints:
       - host: pypi.org
-        port: 443
+        ports: [443]
       - host: files.pythonhosted.org
-        port: 443
+        ports: [443]
     binaries:
       - { path: /usr/bin/pip }
       - { path: /usr/local/bin/uv }
@@ -748,7 +753,7 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
     name: github_repos
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         path: "/**"
         protocol: rest
         enforcement: enforce
@@ -772,7 +777,7 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
               method: PATCH
               path: "/repos/<org_name>/bravo-repo/issues/*"
       - host: api.github.com
-        port: 443
+        ports: [443]
         path: "/graphql"
         protocol: graphql
         enforcement: enforce
@@ -804,7 +809,7 @@ REST rules can also constrain query parameter values:
     name: download_api
     endpoints:
       - host: api.example.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         rules:
@@ -812,9 +817,10 @@ REST rules can also constrain query parameter values:
               method: GET
               path: "/api/v1/download"
               query:
-                slug: "skill-*"
+                slug: { glob: "skill-*" }
                 version:
-                  any: ["1.*", "2.*"]
+                  any:
+                    values: ["1.*", "2.*"]
     binaries:
       - { path: /usr/bin/curl }
 ```
@@ -823,7 +829,7 @@ REST rules can also constrain query parameter values:
 
 ### MCP and JSON-RPC matching
 
-MCP endpoints use `protocol: mcp`. The proxy parses sandbox-to-server MCP Streamable HTTP request bodies, validates known MCP request and notification params, can evaluate the MCP method against rule `method`, and can match tool calls with the `tool` alias. Unknown extension methods stay addressable as literal method strings. You may omit the entire `mcp` stanza when using its defaults, or omit only `mcp.versions` when setting another MCP option. OpenShell immediately resolves either form to the exact `["2025-11-25"]` allowlist and stores the materialized list in canonical policy data. Adding another supported revision therefore never widens a normalized policy. Defaulting requires the `mcp` or `mcp.versions` key to be absent; explicit `mcp: null`, `versions: null`, and `versions: []` values are invalid. Use an explicit nonempty allowlist only for intentional compatibility or downgrade control. Supported revisions are `2025-03-26`, `2025-06-18`, and `2025-11-25`; the exact support floor is `2025-03-26`, and this is a closed set rather than a date range. Explicit values must be unique and contain no extra whitespace; OpenShell stores them in semantic order. Moving aliases such as `draft` or `latest` are rejected because they could change policy meaning without a policy edit; omission never means all known versions. The sessionless `2026-07-28` revision is not accepted until OpenShell supports its distinct per-request contract. A version identifies a core MCP revision only; there is no policy syntax for separately named SEP overlays. For every MCP HTTP request except a valid standalone `initialize`, OpenShell selects the revision from one `MCP-Protocol-Version` header or, when the header is absent, the MCP specification's `2025-03-26` compatibility fallback. The selected revision must appear in the allowlist. Duplicate, empty, and unsupported header values receive `400 Bad Request`; a supported revision outside the allowlist receives `403 Forbidden`. OpenShell checks the request again after middleware changes it and before forwarding. Generic JSON-RPC endpoints do not use this header and continue to evaluate only `method`. `mcp.allow_all_known_mcp_methods` defaults to `false`, so endpoints require explicit MCP method rules. Set it to `true` to enable the endpoint method profile; in that mode, rules can omit `method`, and tool selectors are normalized to `tools/call` internally. By default, MCP `tools/call` tool names must match `^[A-Za-z0-9_.-]{1,128}$`; set `mcp.strict_tool_names: false` on that endpoint only when a server intentionally uses names outside the MCP-recommended pattern. Wildcard `tool` matchers require `mcp.strict_tool_names` to remain enabled.
+MCP endpoints use `protocol: mcp`. The proxy parses sandbox-to-server MCP Streamable HTTP request bodies, validates known MCP request and notification params, evaluates `method`, and can match `tools/call` names with `tool`. Omitted, `null`, and empty `mcp.versions` values resolve to the exact `["2025-11-25"]` allowlist because policy YAML follows protobuf presence semantics. Use a nonempty list only for intentional compatibility or downgrade control. Supported revisions are `2025-03-26`, `2025-06-18`, and `2025-11-25`; values must be unique and contain no extra whitespace. For every MCP HTTP request except a valid standalone `initialize`, OpenShell selects the revision from one `MCP-Protocol-Version` header or the MCP specification's `2025-03-26` compatibility fallback. The selected revision must appear in the allowlist. `mcp.allow_all_known_mcp_methods` defaults to `false`, and `mcp.strict_tool_names` defaults to `true`.
 
 The current registry declares these profile facts for later runtime enforcement:
 
@@ -848,7 +854,7 @@ An MCP client first sends `initialize`. After the server returns a successful re
     name: mcp_server
     endpoints:
       - host: mcp.example.com
-        port: 443
+        ports: [443]
         path: /mcp
         protocol: mcp
         enforcement: enforce
@@ -859,14 +865,15 @@ An MCP client first sends `initialize`. After the server returns a successful re
               method: notifications/initialized
           - allow:
               method: tools/call
-              tool: read_status
+              tool: { glob: read_status }
           - allow:
               method: tools/call
               tool:
-                any: [submit_report, list_reports]
+                any:
+                  values: [submit_report, list_reports]
         deny_rules:
           - method: tools/call
-            tool: delete_resource
+            tool: { glob: delete_resource }
     binaries:
       - { path: /usr/bin/python3 }
 ```
@@ -884,7 +891,7 @@ Use `protocol: json-rpc` and `method` when you need generic JSON-RPC 2.0 matchin
 
 Generic JSON-RPC policy `params` matchers are not supported. Generic JSON-RPC policy rules match only the JSON-RPC method. For batch requests, OpenShell evaluates each JSON-RPC call independently and denies the whole batch if any call is denied.
 
-For MCP, `tool` accepts a string glob or `{ any: [...] }` matcher for `tools/call` `params.name`. Rules that use `tool` or lower-level `params.name` must set `method: tools/call` unless `mcp.allow_all_known_mcp_methods: true` enables the endpoint method profile. MCP method globs are accepted only for the `tools/` method family, such as `tools/*`; omit `method` instead of writing `method: "*"` only when the endpoint method profile should allow all MCP methods. Omit `tool` to allow all tools for a `tools/call` method rule. OpenShell does not support MCP tool argument matching yet; allowed tools accept all argument payloads by default. Other MCP `params` keys are rejected. For batch requests, OpenShell evaluates each JSON-RPC call independently and denies the whole batch if any call is denied.
+For MCP, `tool` uses the protobuf matcher shape: `{ glob: "name" }` or `{ any: { values: [...] } }`. Rules that use `tool` or `params.name` must set `method: tools/call` unless `mcp.allow_all_known_mcp_methods: true` enables the endpoint method profile. Omit `tool` to allow all tools for a `tools/call` method rule. For batch requests, OpenShell evaluates each JSON-RPC call independently and denies the whole batch if any call is denied.
 
 ### GraphQL matching
 
@@ -897,7 +904,7 @@ GraphQL endpoint policies currently require full policy YAML applied with `opens
     name: github_graphql
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         path: "/graphql"
         protocol: graphql
         enforcement: enforce
@@ -929,7 +936,7 @@ Some APIs carry GraphQL operations over RFC 6455 WebSockets, commonly for subscr
     name: realtime_graphql
     endpoints:
       - host: realtime.example.com
-        port: 443
+        ports: [443]
         path: "/graphql"
         protocol: websocket
         enforcement: enforce

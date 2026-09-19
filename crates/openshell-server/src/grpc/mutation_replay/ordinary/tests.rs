@@ -8,12 +8,15 @@ use crate::grpc::mutation_replay::tests::reason;
 use crate::grpc::mutation_replay::{Admission, OBJECT_TYPE, OriginalMutation, fingerprint, run};
 use crate::grpc::test_support::{authed_request, test_server_state};
 use openshell_core::proto::datamodel::v1::ObjectMeta;
+use openshell_core::proto::policy::{
+    NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyDocument,
+};
 use openshell_core::proto::{
-    DeletionOutcome, DraftChunkApproval, GetDraftPolicyRequest, NetworkBinary, NetworkEndpoint,
-    NetworkPolicyRule, PolicyChunk, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
+    DeletionOutcome, DraftChunkApproval, GetDraftPolicyRequest, PolicyChunk,
+    ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
     ProviderCredentialRefreshStrategy, ProviderProfileCategory, ProviderProfileCredential,
-    ProviderProfileImportItem, SandboxPhase, SandboxPolicy, SandboxSpec, ServiceEndpoint,
-    SettingValue, SubmitPolicyAnalysisRequest, WorkspaceMember, WorkspaceRole, setting_value,
+    ProviderProfileImportItem, SandboxPhase, SandboxSpec, ServiceEndpoint, SettingValue,
+    SubmitPolicyAnalysisRequest, WorkspaceMember, WorkspaceRole, setting_value,
 };
 use tonic::Code;
 
@@ -1003,7 +1006,10 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
     let sandbox = Sandbox {
         metadata: Some(meta(name)),
         spec: Some(SandboxSpec {
-            policy: Some(SandboxPolicy::default()),
+            policy: Some(PolicyDocument {
+                version: 1,
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         ..Default::default()
@@ -1013,7 +1019,7 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
         name: name.into(),
         endpoints: vec![NetworkEndpoint {
             host: format!("{name}.example.com"),
-            port: 443,
+            ports: vec![443],
             ..Default::default()
         }],
         binaries: vec![NetworkBinary {

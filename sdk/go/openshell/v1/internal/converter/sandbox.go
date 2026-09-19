@@ -59,7 +59,7 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 		LogLevel:    spec.GetLogLevel(),
 		Environment: CopyStringMap(spec.GetEnvironment()),
 		Providers:   CopyStringSlice(spec.GetProviders()),
-		Policy:      SandboxPolicyFromProto(spec.GetPolicy()),
+		Policy:      PolicyDocumentFromProto(spec.GetPolicy()),
 	}
 
 	if tmpl := spec.GetTemplate(); tmpl != nil {
@@ -252,7 +252,7 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 		LogLevel:    spec.LogLevel,
 		Environment: CopyStringMap(spec.Environment),
 		Providers:   CopyStringSlice(spec.Providers),
-		Policy:      SandboxPolicyToProto(spec.Policy),
+		Policy:      PolicyDocumentToProto(spec.Policy),
 	}
 
 	if spec.Template != nil {
@@ -303,7 +303,7 @@ func SandboxSpecToProtoChecked(spec *types.SandboxSpec) (*pb.SandboxSpec, error)
 	if spec == nil {
 		return result, nil
 	}
-	policy, err := SandboxPolicyToProtoChecked(spec.Policy)
+	policy, err := PolicyDocumentToProtoChecked(spec.Policy)
 	if err != nil {
 		return nil, fmt.Errorf("policy: %w", err)
 	}

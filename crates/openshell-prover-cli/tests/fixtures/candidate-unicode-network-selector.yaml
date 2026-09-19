@@ -6,6 +6,6 @@ network_policies:
   unicode-binary:
     endpoints:
       - host: api.example.com
-        port: 443
+        ports: [443]
     binaries:
       - path: /usr/bin/é*

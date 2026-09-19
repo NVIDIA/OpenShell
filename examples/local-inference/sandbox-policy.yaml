@@ -26,7 +26,7 @@ network_policies:
   pypi:
     name: PyPI
     endpoints:
-      - { host: pypi.org, port: 443 }
-      - { host: files.pythonhosted.org, port: 443 }
+      - { host: pypi.org, ports: [443] }
+      - { host: files.pythonhosted.org, ports: [443] }
     binaries:
       - path: /usr/bin/python3.13

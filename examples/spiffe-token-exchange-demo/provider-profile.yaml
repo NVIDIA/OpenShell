@@ -37,13 +37,13 @@ credentials:
           scopes: [beta]
 endpoints:
   - host: alpha-exchange.default.svc.cluster.local
-    port: 80
+    ports: [80]
     protocol: rest
     tls: none
     access: read-write
     enforcement: enforce
   - host: beta-exchange.default.svc.cluster.local
-    port: 80
+    ports: [80]
     protocol: rest
     tls: none
     access: read-write

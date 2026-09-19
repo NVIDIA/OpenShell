@@ -10,6 +10,7 @@ import "google/protobuf/duration.proto";
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 import "options.proto";
+import "policy.proto";
 import "sandbox.proto";
 
 // OpenShell service provides sandbox, provider, and runtime management capabilities.
@@ -958,7 +959,7 @@ message SandboxSpec {
   // Container or VM template used to provision the sandbox.
   SandboxTemplate template = 6;
   // Required sandbox policy configuration.
-  openshell.sandbox.v1.SandboxPolicy policy = 7;
+  openshell.policy.v1.PolicyDocument policy = 7;
   // Provider names to attach to this sandbox.
   repeated string providers = 8;
   // Portable resource requirements used by the gateway for driver selection
@@ -2331,8 +2332,8 @@ message ProviderProfile {
   string description = 3;
   ProviderProfileCategory category = 4;
   repeated ProviderProfileCredential credentials = 5;
-  repeated openshell.sandbox.v1.NetworkEndpoint endpoints = 6;
-  repeated openshell.sandbox.v1.NetworkBinary binaries = 7;
+  repeated openshell.policy.v1.NetworkEndpoint endpoints = 6;
+  repeated openshell.policy.v1.NetworkBinary binaries = 7;
   bool inference_capable = 8;
   ProviderProfileDiscovery discovery = 9;
   // Storage resource version for custom profiles. Built-in profiles and new
@@ -2541,7 +2542,7 @@ message UpdateConfigRequest {
   //
   // Global scope (`global=true`):
   // - applies to all sandboxes in full (no merge).
-  openshell.sandbox.v1.SandboxPolicy policy = 2;
+  openshell.policy.v1.PolicyDocument policy = 2;
   // Optional single setting key to mutate.
   string setting_key = 3;
   // Setting value for upsert operations.
@@ -2586,7 +2587,7 @@ message PolicyMergeOperation {
 
 message AddNetworkRule {
   string rule_name = 1;
-  openshell.sandbox.v1.NetworkPolicyRule rule = 2;
+  openshell.policy.v1.NetworkPolicyRule rule = 2;
 }
 
 message RemoveNetworkEndpoint {
@@ -2609,21 +2610,21 @@ message L7RuleTarget {
   // endpoint without a path selector. This is not the appended request path.
   optional string path = 4;
   // Declare either a nonempty binary list or any_binary, never both.
-  repeated openshell.sandbox.v1.NetworkBinary binaries = 5;
+  repeated openshell.policy.v1.NetworkBinary binaries = 5;
   bool any_binary = 6;
 }
 
 message AddDenyRules {
   reserved 1, 2;
   reserved "host", "port";
-  repeated openshell.sandbox.v1.L7DenyRule deny_rules = 3;
+  repeated openshell.policy.v1.L7DenyRule deny_rules = 3;
   L7RuleTarget target = 4;
 }
 
 message AddAllowRules {
   reserved 1, 2;
   reserved "host", "port";
-  repeated openshell.sandbox.v1.L7Rule rules = 3;
+  repeated openshell.policy.v1.L7Rule rules = 3;
   L7RuleTarget target = 4;
 }
 
@@ -2752,7 +2753,7 @@ message SandboxPolicyRevision {
   // Time when this revision was loaded by the sandbox. Absent if not loaded.
   google.protobuf.Timestamp loaded_time = 106;
   // The full policy (only populated when explicitly requested).
-  openshell.sandbox.v1.SandboxPolicy policy = 7;
+  openshell.policy.v1.PolicyDocument policy = 7;
   // Immutable provenance supplied with this policy revision.
   map<string, string> provenance = 8;
 }
@@ -3053,7 +3054,7 @@ message PolicyChunk {
   // Proposed network_policies map key.
   string rule_name = 3;
   // The proposed network policy rule.
-  openshell.sandbox.v1.NetworkPolicyRule proposed_rule = 4;
+  openshell.policy.v1.NetworkPolicyRule proposed_rule = 4;
   // Human-readable explanation of why this rule is proposed.
   string rationale = 5;
   // Security concerns flagged by analysis (empty if none).
@@ -3099,8 +3100,8 @@ message PolicyChunk {
   string candidate_effective_policy_hash = 22;
   // Complete effective policies used for review. These contain policy
   // configuration only; credential secret values are never materialized.
-  openshell.sandbox.v1.SandboxPolicy current_effective_policy = 23;
-  openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 24;
+  openshell.policy.v1.PolicyDocument current_effective_policy = 23;
+  openshell.policy.v1.PolicyDocument candidate_effective_policy = 24;
 }
 
 // Notification that the draft policy was updated.
@@ -3250,7 +3251,7 @@ message EditDraftChunkRequest {
   // Chunk ID to edit.
   string chunk_id = 2;
   // The modified rule (replaces existing proposed_rule).
-  openshell.sandbox.v1.NetworkPolicyRule proposed_rule = 3;
+  openshell.policy.v1.NetworkPolicyRule proposed_rule = 3;
   string sandbox = 1;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.

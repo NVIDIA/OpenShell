@@ -698,7 +698,15 @@ fn summarize_chunk_for_audit(chunk: &PolicyChunk) -> String {
     };
     let endpoint = rule.endpoints.first().map_or_else(
         || "unknown".to_string(),
-        |ep| format!("{}:{}", ep.host, ep.port),
+        |ep| {
+            let ports = ep
+                .ports
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{}:[{ports}]", ep.host)
+        },
     );
     let l7 = rule
         .endpoints
@@ -770,9 +778,15 @@ async fn proposal_wait_response(
                         tokio::time::Instant::now() + RELOAD_WAIT_MIN_FLOOR,
                     );
                     match chunk.proposed_rule.as_ref() {
-                        Some(rule) => {
-                            wait_for_local_policy_to_cover(ctx, rule, reload_deadline).await
-                        }
+                        Some(rule) => match openshell_policy::lower_authored_rule(
+                            &chunk.rule_name,
+                            rule.clone(),
+                        ) {
+                            Ok(rule) => {
+                                wait_for_local_policy_to_cover(ctx, &rule, reload_deadline).await
+                            }
+                            Err(_) => false,
+                        },
                         None => false,
                     }
                 } else {
@@ -1068,11 +1082,14 @@ fn policy_chunk_from_add_rule(
         .map(|binary| binary.path.clone())
         .unwrap_or_default();
 
+    let proposed_rule = openshell_policy::project_authored_rule(&rule_name, &rule)
+        .map_err(|error| format!("failed to project proposed rule: {error}"))?;
+
     Ok(PolicyChunk {
         id: String::new(),
         status: "pending".to_string(),
         rule_name,
-        proposed_rule: Some(rule),
+        proposed_rule: Some(proposed_rule),
         rationale: intent_summary.to_string(),
         security_notes: String::new(),
         confidence: 0.75,
@@ -1132,12 +1149,9 @@ fn network_endpoint_from_json(
         return Err(reason.to_string());
     }
 
-    let mut ports = endpoint.ports;
-    if ports.is_empty() && endpoint.port > 0 {
-        ports.push(endpoint.port);
-    }
+    let ports = endpoint.ports;
     if ports.is_empty() {
-        return Err("endpoint.port or endpoint.ports is required".to_string());
+        return Err("endpoint.ports is required".to_string());
     }
     if endpoint
         .rules
@@ -1355,8 +1369,6 @@ struct NetworkPolicyRuleJson {
 struct NetworkEndpointJson {
     host: String,
     #[serde(default)]
-    port: u32,
-    #[serde(default)]
     ports: Vec<u32>,
     #[serde(default)]
     protocol: String,
@@ -1427,7 +1439,7 @@ mod tests {
                             "endpoints": [
                                 {
                                     "host": "api.github.com",
-                                    "port": 443,
+                                    "ports": [443],
                                     "protocol": "rest",
                                     "tls": "terminate",
                                     "enforcement": "enforce",
@@ -1461,10 +1473,9 @@ mod tests {
         let rule = chunks[0].proposed_rule.as_ref().unwrap();
         assert_eq!(rule.name, "github_api_repo_create");
         assert_eq!(rule.endpoints[0].host, "api.github.com");
-        assert_eq!(rule.endpoints[0].port, 443);
         assert_eq!(rule.endpoints[0].ports, vec![443]);
         assert_eq!(rule.endpoints[0].protocol, "rest");
-        assert!(rule.endpoints[0].advisor_proposed);
+        assert!(openshell_policy::lower_authored_rule(&chunks[0].rule_name, rule.clone()).is_ok());
         assert_eq!(rule.binaries[0].path, "/usr/bin/gh");
         assert_eq!(
             rule.endpoints[0].rules[0].allow.as_ref().unwrap().path,
@@ -1483,7 +1494,7 @@ mod tests {
                             "endpoints": [
                                 {
                                     "host": "api.github.com",
-                                    "port": 443,
+                                    "ports": [443],
                                     "rules": [
                                         {
                                             "allow": {
@@ -1508,8 +1519,8 @@ mod tests {
     #[test]
     fn proposal_chunks_from_body_rejects_native_tcp_and_tls_skip() {
         for endpoint in [
-            r#"{"host":"db.example.com","port":5432,"protocol":"tcp"}"#,
-            r#"{"host":"api.example.com","port":443,"tls":"skip"}"#,
+            r#"{"host":"db.example.com","ports":[5432],"protocol":"tcp"}"#,
+            r#"{"host":"api.example.com","ports":[443],"tls":"skip"}"#,
         ] {
             let body = format!(
                 r#"{{
@@ -1534,7 +1545,7 @@ mod tests {
                 "addRule": {
                     "ruleName": "explicit_proxy",
                     "rule": {
-                        "endpoints": [{"host":"api.example.com","port":443}]
+                        "endpoints": [{"host":"api.example.com","ports":[443]}]
                     }
                 }
             }]
@@ -1543,10 +1554,7 @@ mod tests {
         let chunks = proposal_chunks_from_body(body).unwrap();
         let endpoint = &chunks[0].proposed_rule.as_ref().unwrap().endpoints[0];
         assert!(endpoint.protocol.is_empty());
-        assert_eq!(
-            endpoint.tls,
-            openshell_core::proto::NetworkTlsMode::Unspecified as i32
-        );
+        assert!(endpoint.tls.is_empty());
     }
 
     #[test]
@@ -1997,28 +2005,34 @@ mod tests {
             id: "ignored".to_string(),
             rule_name: "github_write".to_string(),
             binary: "/usr/bin/curl".to_string(),
-            proposed_rule: Some(NetworkPolicyRule {
-                name: "github_write".to_string(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "api.github.com".to_string(),
-                    port: 443,
-                    rules: vec![L7Rule {
-                        allow: Some(L7Allow {
-                            method: "PUT".to_string(),
-                            path: "/repos/foo/bar/contents/x.md".to_string(),
+            proposed_rule: Some(
+                openshell_policy::project_authored_rule(
+                    "github_write",
+                    &NetworkPolicyRule {
+                        name: "github_write".to_string(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: "api.github.com".to_string(),
+                            port: 443,
+                            rules: vec![L7Rule {
+                                allow: Some(L7Allow {
+                                    method: "PUT".to_string(),
+                                    path: "/repos/foo/bar/contents/x.md".to_string(),
+                                    ..Default::default()
+                                }),
+                            }],
                             ..Default::default()
-                        }),
-                    }],
-                    ..Default::default()
-                }],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/curl".to_string(),
-                }],
-            }),
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/curl".to_string(),
+                        }],
+                    },
+                )
+                .unwrap(),
+            ),
             ..Default::default()
         };
         let summary = summarize_chunk_for_audit(&chunk);
-        assert!(summary.contains("api.github.com:443"));
+        assert!(summary.contains("api.github.com:[443]"));
         assert!(summary.contains("PUT /repos/foo/bar/contents/x.md"));
         assert!(summary.contains("/usr/bin/curl"));
     }

@@ -91,25 +91,31 @@ pub fn project_policy_revision_onto_sandbox(
     }
 
     let payload = crate::persistence::migrate_legacy_time_fields("sandbox", payload)?;
-    let mut sandbox = Sandbox::decode(payload.as_slice())
+    let mut sandbox = crate::storage_proto::decode_sandbox(payload.as_slice())
         .map_err(|e| PersistenceError::Decode(format!("decode sandbox payload failed: {e}")))?;
     sandbox.set_resource_version(current_resource_version);
 
     let mut changed = false;
     let startup_blocked = permits_initial_static_policy_repair(&sandbox);
     if let Some(backfill_policy) = write.backfill_policy.as_ref() {
+        let public_backfill =
+            openshell_policy::project_base_policy(backfill_policy).map_err(|e| {
+                PersistenceError::Decode(format!(
+                    "project policy revision onto sandbox failed: {e}"
+                ))
+            })?;
         let spec = sandbox
             .spec
             .as_mut()
             .ok_or_else(|| PersistenceError::Decode("sandbox payload missing spec".to_string()))?;
         match spec.policy.as_ref() {
             None => {
-                spec.policy = Some(backfill_policy.clone());
+                spec.policy = Some(public_backfill);
                 changed = true;
             }
-            Some(current) if current == backfill_policy => {}
+            Some(current) if current == &public_backfill => {}
             Some(_) if startup_blocked => {
-                spec.policy = Some(backfill_policy.clone());
+                spec.policy = Some(public_backfill);
                 changed = true;
             }
             Some(_) => {
@@ -659,7 +665,7 @@ mod tests {
             for state in [Admission::Pending, Admission::Rejected, Admission::Accepted] {
                 let sandbox = Sandbox {
                     spec: Some(SandboxSpec {
-                        policy: Some(baseline.clone()),
+                        policy: Some(openshell_policy::project_base_policy(&baseline).unwrap()),
                         ..Default::default()
                     }),
                     status: Some(SandboxStatus {
@@ -672,12 +678,16 @@ mod tests {
                     }),
                     ..Default::default()
                 };
-                let result =
-                    project_policy_revision_onto_sandbox(&write, &sandbox.encode_to_vec(), 1);
+                let payload = crate::storage_proto::encode_sandbox(&sandbox)
+                    .expect("encode durable sandbox fixture");
+                let result = project_policy_revision_onto_sandbox(&write, &payload, 1);
                 if activated == Some(false) && state != Admission::Accepted {
                     let (projected, changed) = result.unwrap();
                     assert!(changed);
-                    assert_eq!(projected.spec.unwrap().policy, Some(replacement.clone()));
+                    assert_eq!(
+                        projected.spec.unwrap().policy,
+                        Some(openshell_policy::project_base_policy(&replacement).unwrap())
+                    );
                 } else {
                     assert!(
                         matches!(result, Err(PersistenceError::Conflict { .. })),

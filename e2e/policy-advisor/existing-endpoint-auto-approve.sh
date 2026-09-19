@@ -35,7 +35,7 @@ network_policies:
     name: cargo-registry
     endpoints:
       - host: index.crates.io
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: read-only

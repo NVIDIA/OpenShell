@@ -149,7 +149,7 @@ filesystem_policy:
     #[test]
     fn explicit_tcp_is_l4_in_the_risk_projection() {
         let model = policy::parse_policy_str(
-            "version: 1\nnetwork_policies:\n  tcp:\n    endpoints:\n      - host: example.com\n        port: 443\n        protocol: tcp\n",
+            "version: 1\nnetwork_policies:\n  tcp:\n    endpoints:\n      - host: example.com\n        ports: [443]\n        protocol: tcp\n",
         )
         .expect("parse");
         let endpoint = &model.network_policies["tcp"].endpoints[0];
@@ -261,7 +261,7 @@ network_policies:
     name: github-wildcard
     endpoints:
       - host: "*.github.com"
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: read-write
@@ -301,7 +301,7 @@ network_policies:
     name: metadata
     endpoints:
       - host: metadata.google.internal
-        port: 80
+        ports: [80]
     binaries:
       - path: /usr/bin/curl
 ",

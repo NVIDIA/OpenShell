@@ -1133,7 +1133,7 @@ async fn policy_atomic_write_commits_revision_provenance_and_sandbox_projection(
     assert_eq!(updated.metadata.as_ref().unwrap().annotations, provenance);
     assert_eq!(
         updated.spec.as_ref().unwrap().policy.as_ref(),
-        Some(&policy)
+        Some(&openshell_policy::project_base_policy(&policy).unwrap())
     );
     let revision = store
         .get_latest_policy("sandbox-atomic")

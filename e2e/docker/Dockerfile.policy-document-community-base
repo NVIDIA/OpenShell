@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG BASE_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+FROM ${BASE_IMAGE}
+
+# The published community image predates the breaking public PolicyDocument
+# contract. Keep the workload identical while making its baked policy an
+# explicit fixture for the contract under test. This is intentionally confined
+# to E2E image preparation; production policy parsing remains strict.
+USER root
+RUN sed -E -i 's/port: ([0-9]+)/ports: [\1]/g' /etc/openshell/policy.yaml
+USER sandbox
+
+LABEL openshell.ai/e2e-policy-contract="openshell.policy.v1.PolicyDocument"

@@ -233,7 +233,7 @@ fn unsupported_network_surfaces_fail_closed_at_the_cli_boundary() {
         fs::write(
             &path,
             format!(
-                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n{endpoint_fields}    binaries: [{{ path: /usr/bin/curl }}]\n"
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n{endpoint_fields}    binaries: [{{ path: /usr/bin/curl }}]\n"
             ),
         )
         .expect("write unsupported surface policy");
@@ -274,7 +274,7 @@ fn canonical_schema_errors_fail_closed_in_both_inputs() {
     let cases = [
         "version: 1\nmetadata: { policy_id: boundary }\n",
         "version: 1\nfilesystem_policy: null\n",
-        "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443, review: { required: true } }]\n",
+        "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, ports: [443], review: { required: true } }]\n",
         "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ rules: [{ allow: { method: GET, review: {} } }] }]\n",
         "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ credential_binding: { provider: demo, future: true } }]\n",
         "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ protocol: rest, mcp: {} }]\n",
@@ -378,7 +378,7 @@ fn embedded_nul_network_literal_is_unsupported_without_panicking() {
     ));
     fs::write(
         &path,
-        "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: \"G\\0ET\", path: '/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+        "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: \"G\\0ET\", path: '/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
     )
     .expect("write NUL selector policy");
     let output = run(&[
@@ -405,14 +405,15 @@ fn over_limit_mixed_protocol_policy_is_rejected_before_shape_validation() {
         "openshell-prover-resource-limit-{}.yaml",
         std::process::id()
     ));
-    let mut source = String::from("version: 1\nnetwork_policies:\n  mixed:\n    endpoints:\n");
+    let mut source = String::from("version: 1\nnetwork_policies:\n  l4:\n    endpoints:\n");
     for index in 0..2_500 {
         writeln!(
             source,
-            "      - {{ host: l4-{index}.example.com, port: 443 }}"
+            "      - {{ host: l4-{index}.example.com, ports: [443] }}"
         )
         .unwrap();
     }
+    source.push_str("  rest:\n    endpoints:\n");
     for index in 0..2_500 {
         let host = if index == 2_499 {
             "l4-0.example.com".to_owned()
@@ -421,7 +422,7 @@ fn over_limit_mixed_protocol_policy_is_rejected_before_shape_validation() {
         };
         writeln!(
             source,
-            "      - {{ host: {host}, port: 443, protocol: rest, enforcement: enforce, access: read-only }}"
+            "      - {{ host: {host}, ports: [443], protocol: rest, enforcement: enforce, access: read-only }}"
         )
         .unwrap();
     }
@@ -591,7 +592,7 @@ fn sigint_interrupts_the_check_with_exit_130() {
             "version": 1,
             "network_policies": {"many": {
                 "binaries": [{"path": "/usr/bin/curl"}],
-                "endpoints": [{"host": "api.example.com", "port": 443,
+                "endpoints": [{"host": "api.example.com", "ports": [443],
                     "protocol": "rest", "enforcement": "enforce",
                     "rules": paths.into_iter().map(|path| serde_json::json!({
                         "allow": {"method": "GET", "path": path}

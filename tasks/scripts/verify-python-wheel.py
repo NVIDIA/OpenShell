@@ -13,7 +13,7 @@ from email.parser import Parser
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
-PROTO_STEMS = ("datamodel", "openshell", "options", "sandbox")
+PROTO_STEMS = ("datamodel", "openshell", "options", "policy", "sandbox")
 BYTECODE_SUFFIXES = (".pyc", ".pyo")
 NATIVE_SUFFIXES = (".dll", ".dylib", ".exe", ".pyd", ".so")
 
@@ -30,6 +30,10 @@ def _find_wheel(path: Path) -> Path:
 
 def _required_files() -> set[str]:
     files = {
+        "buf/__init__.py",
+        "buf/validate/__init__.py",
+        "buf/validate/validate_pb2.py",
+        "buf/validate/validate_pb2.pyi",
         "openshell/__init__.py",
         "openshell/sandbox.py",
         "openshell/py.typed",

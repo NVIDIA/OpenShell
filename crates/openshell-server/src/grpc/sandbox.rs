@@ -489,11 +489,22 @@ async fn handle_create_sandbox_inner(
         template.image = state.compute.default_image().to_string();
     }
 
-    if let Some(ref mut policy) = spec.policy {
-        super::policy::clear_provider_credentialed_markers(policy);
-        validate_no_reserved_provider_policy_keys(policy)?;
-        *policy = validate_and_canonicalize_policy(policy.clone())?;
-    }
+    let internal_policy = spec
+        .policy
+        .take()
+        .map(super::policy::lower_public_policy)
+        .transpose()?
+        .map(|mut policy| {
+            super::policy::clear_provider_credentialed_markers(&mut policy);
+            validate_no_reserved_provider_policy_keys(&policy)?;
+            validate_and_canonicalize_policy(policy)
+        })
+        .transpose()?;
+    spec.policy = internal_policy
+        .as_ref()
+        .map(openshell_policy::project_base_policy)
+        .transpose()
+        .map_err(|error| Status::internal(format!("failed to project public policy: {error}")))?;
 
     // Process identity and MCP default materialization can increase the
     // protobuf size. Recheck the exact canonical spec before any middleware or
@@ -501,7 +512,7 @@ async fn handle_create_sandbox_inner(
     // above so requests that are already oversized still fail before I/O.
     validate_sandbox_spec(&request.name, &spec)?;
 
-    if let Some(ref policy) = spec.policy {
+    if let Some(ref policy) = internal_policy {
         validate_policy_safety(policy)?;
         crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
     }
@@ -509,7 +520,7 @@ async fn handle_create_sandbox_inner(
         state,
         &workspace,
         &spec.providers,
-        spec.policy.as_ref(),
+        internal_policy.as_ref(),
     )
     .await?;
 
@@ -1242,11 +1253,16 @@ pub(super) async fn handle_attach_sandbox_provider(
         &candidate_spec.providers,
     )
     .await?;
+    let candidate_internal_policy = candidate_spec
+        .policy
+        .clone()
+        .map(super::policy::lower_public_policy)
+        .transpose()?;
     super::policy::validate_candidate_sandbox_credential_policy(
         state,
         &workspace,
         &candidate_spec.providers,
-        candidate_spec.policy.as_ref(),
+        candidate_internal_policy.as_ref(),
     )
     .await?;
 
@@ -3345,6 +3361,37 @@ mod tests {
     use openshell_core::proto::GpuResourceRequirements;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
 
+    fn authored_policy(
+        mut policy: openshell_core::proto::SandboxPolicy,
+    ) -> openshell_core::proto::policy::PolicyDocument {
+        if policy.version == 0 {
+            policy.version = 1;
+        }
+        openshell_policy::project_base_policy(&policy).expect("test policy must be authorable")
+    }
+
+    fn authored_mcp_policy_with_versions(
+        versions: &[&str],
+    ) -> openshell_core::proto::policy::PolicyDocument {
+        let mut policy = authored_policy(mcp_policy_with_versions(&["2025-11-25"]));
+        policy.network_policies.get_mut("mcp").unwrap().endpoints[0]
+            .mcp
+            .as_mut()
+            .unwrap()
+            .versions = versions
+            .iter()
+            .map(|version| (*version).to_string())
+            .collect();
+        policy
+    }
+
+    fn authored_rule(
+        rule: openshell_core::proto::NetworkPolicyRule,
+    ) -> openshell_core::proto::policy::NetworkPolicyRule {
+        openshell_policy::project_authored_rule("test-rule", &rule)
+            .expect("test rule must be authorable")
+    }
+
     // ---- shell_escape ----
 
     #[test]
@@ -3384,7 +3431,10 @@ mod tests {
             request_id: String::new(),
             spec: Some(SandboxSpec {
                 providers: vec!["github".to_string()],
-                policy: Some(openshell_core::proto::SandboxPolicy::default()),
+                policy: Some(openshell_core::proto::policy::PolicyDocument {
+                    version: 1,
+                    ..Default::default()
+                }),
                 ..SandboxSpec::default()
             }),
             workload_template: "gpu-kata".to_string(),
@@ -3396,7 +3446,10 @@ mod tests {
         let created = Sandbox {
             spec: Some(SandboxSpec {
                 providers: vec!["github".to_string()],
-                policy: Some(openshell_core::proto::SandboxPolicy::default()),
+                policy: Some(openshell_core::proto::policy::PolicyDocument {
+                    version: 1,
+                    ..Default::default()
+                }),
                 resource_requirements: Some(ResourceRequirements {
                     gpu: Some(GpuResourceRequirements { count: Some(1) }),
                 }),
@@ -3788,7 +3841,10 @@ mod tests {
             }),
             spec: Some(SandboxSpec {
                 log_level: "debug".to_string(),
-                policy: Some(openshell_core::proto::SandboxPolicy::default()),
+                policy: Some(openshell_core::proto::policy::PolicyDocument {
+                    version: 1,
+                    ..Default::default()
+                }),
                 providers,
                 ..Default::default()
             }),
@@ -4160,7 +4216,7 @@ mod tests {
             .unwrap();
         policy.network_policies.insert(
             "gcp_storage".to_string(),
-            openshell_core::proto::NetworkPolicyRule {
+            authored_rule(openshell_core::proto::NetworkPolicyRule {
                 name: "gcp_storage".to_string(),
                 endpoints: vec![openshell_core::proto::NetworkEndpoint {
                     host: "storage.googleapis.com".to_string(),
@@ -4171,7 +4227,7 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            },
+            }),
         );
         state.store.put_message(&sandbox).await.unwrap();
 
@@ -4580,7 +4636,7 @@ mod tests {
                 request_id: String::new(),
                 name: "reserved-policy-key".to_string(),
                 spec: Some(SandboxSpec {
-                    policy: Some(policy),
+                    policy: Some(authored_policy(policy)),
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
@@ -4689,7 +4745,10 @@ mod tests {
             authed_request(CreateSandboxRequest {
                 name: "mcp-canonical".to_string(),
                 spec: Some(SandboxSpec {
-                    policy: Some(mcp_policy_with_versions(&["2025-11-25", "2025-03-26"])),
+                    policy: Some(authored_policy(mcp_policy_with_versions(&[
+                        "2025-11-25",
+                        "2025-03-26",
+                    ]))),
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
@@ -4748,7 +4807,7 @@ mod tests {
                 authed_request(CreateSandboxRequest {
                     name: sandbox_name.to_string(),
                     spec: Some(SandboxSpec {
-                        policy: Some(mcp_policy_with_options(mcp)),
+                        policy: Some(authored_policy(mcp_policy_with_options(mcp))),
                         ..Default::default()
                     }),
                     labels: HashMap::new(),
@@ -4834,11 +4893,7 @@ mod tests {
                 );
 
                 let raw_size = policy.encoded_len();
-                if spelling == "explicit" {
-                    assert_eq!(raw_size, target_size, "{sandbox_name}");
-                } else {
-                    assert!(raw_size < target_size, "{sandbox_name}: {raw_size}");
-                }
+                assert!(raw_size < target_size, "{sandbox_name}: {raw_size}");
 
                 let canonical = validate_and_canonicalize_policy(policy.clone())
                     .expect("defaultable MCP policy must be canonicalizable");
@@ -4849,7 +4904,7 @@ mod tests {
                     authed_request(CreateSandboxRequest {
                         name: sandbox_name.clone(),
                         spec: Some(SandboxSpec {
-                            policy: Some(policy),
+                            policy: Some(authored_policy(policy)),
                             ..Default::default()
                         }),
                         labels: HashMap::new(),
@@ -4875,9 +4930,11 @@ mod tests {
                         .expect("sandbox spec")
                         .policy
                         .expect("sandbox policy");
-                    assert_eq!(stored_policy, canonical, "{sandbox_name}");
+                    assert_eq!(stored_policy, authored_policy(canonical), "{sandbox_name}");
                     assert_eq!(
-                        stored_policy.encoded_len(),
+                        openshell_policy::lower_authored_policy(stored_policy)
+                            .expect("stored public policy must lower")
+                            .encoded_len(),
                         max_policy_size,
                         "{sandbox_name}"
                     );
@@ -4919,7 +4976,7 @@ mod tests {
                 authed_request(CreateSandboxRequest {
                     name: sandbox_name.to_string(),
                     spec: Some(SandboxSpec {
-                        policy: Some(mcp_policy_with_versions(versions)),
+                        policy: Some(authored_mcp_policy_with_versions(versions)),
                         ..Default::default()
                     }),
                     labels: HashMap::new(),
@@ -5021,7 +5078,7 @@ mod tests {
                 request_id: String::new(),
                 name: "partial-id".to_string(),
                 spec: Some(SandboxSpec {
-                    policy: Some(policy),
+                    policy: Some(authored_policy(policy)),
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
@@ -5091,7 +5148,7 @@ mod tests {
                 request_id: String::new(),
                 name: "kube-partial-id".to_string(),
                 spec: Some(SandboxSpec {
-                    policy: Some(policy),
+                    policy: Some(authored_policy(policy)),
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
@@ -5820,7 +5877,7 @@ mod tests {
                 name: "from-template".to_string(),
                 spec: Some(SandboxSpec {
                     providers: vec!["work-github".to_string()],
-                    policy: Some(policy),
+                    policy: Some(authored_policy(policy)),
                     command: vec!["echo".to_string(), "template-create".to_string()],
                     tty: false,
                     ..Default::default()

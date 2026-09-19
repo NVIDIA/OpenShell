@@ -446,7 +446,7 @@ network_policies:
     name: vm_corporate_proxy_e2e
     endpoints:
       - host: {HOST_ALIAS}
-        port: {allowed}
+        ports: [{allowed}]
         tls: skip
         enforcement: enforce
         allowed_ips:
@@ -455,7 +455,7 @@ network_policies:
           - "192.168.0.0/16"
           - "fc00::/7"
       - host: {HOST_ALIAS}
-        port: {bypass}
+        ports: [{bypass}]
         tls: skip
         enforcement: enforce
         allowed_ips:

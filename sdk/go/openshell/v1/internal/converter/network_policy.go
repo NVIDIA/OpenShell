@@ -5,13 +5,13 @@ package converter
 
 import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
-	sbv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
+	policyv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/policyv1"
 )
 
 // --- NetworkPolicyRule ---
 
 // NetworkPolicyRuleFromProto converts a proto NetworkPolicyRule to an SDK NetworkPolicyRule.
-func NetworkPolicyRuleFromProto(r *sbv1.NetworkPolicyRule) *types.NetworkPolicyRule {
+func NetworkPolicyRuleFromProto(r *policyv1.NetworkPolicyRule) *types.NetworkPolicyRule {
 	if r == nil {
 		return nil
 	}
@@ -38,23 +38,23 @@ func NetworkPolicyRuleFromProto(r *sbv1.NetworkPolicyRule) *types.NetworkPolicyR
 }
 
 // NetworkPolicyRuleToProto converts an SDK NetworkPolicyRule to a proto NetworkPolicyRule.
-func NetworkPolicyRuleToProto(r *types.NetworkPolicyRule) *sbv1.NetworkPolicyRule {
+func NetworkPolicyRuleToProto(r *types.NetworkPolicyRule) *policyv1.NetworkPolicyRule {
 	if r == nil {
 		return nil
 	}
-	result := &sbv1.NetworkPolicyRule{
+	result := &policyv1.NetworkPolicyRule{
 		Name: r.Name,
 	}
 	if len(r.Endpoints) > 0 {
-		result.Endpoints = make([]*sbv1.NetworkEndpoint, len(r.Endpoints))
+		result.Endpoints = make([]*policyv1.NetworkEndpoint, len(r.Endpoints))
 		for i := range r.Endpoints {
 			result.Endpoints[i] = policyNetworkEndpointToProto(&r.Endpoints[i])
 		}
 	}
 	if len(r.Binaries) > 0 {
-		result.Binaries = make([]*sbv1.NetworkBinary, len(r.Binaries))
+		result.Binaries = make([]*policyv1.NetworkBinary, len(r.Binaries))
 		for i := range r.Binaries {
-			result.Binaries[i] = &sbv1.NetworkBinary{Path: r.Binaries[i].Path}
+			result.Binaries[i] = &policyv1.NetworkBinary{Path: r.Binaries[i].Path}
 		}
 	}
 	return result
@@ -62,10 +62,9 @@ func NetworkPolicyRuleToProto(r *types.NetworkPolicyRule) *sbv1.NetworkPolicyRul
 
 // --- PolicyNetworkEndpoint ---
 
-func policyNetworkEndpointFromProto(ep *sbv1.NetworkEndpoint) types.PolicyNetworkEndpoint {
+func policyNetworkEndpointFromProto(ep *policyv1.NetworkEndpoint) types.PolicyNetworkEndpoint {
 	result := types.PolicyNetworkEndpoint{
 		Host:                         ep.GetHost(),
-		Port:                         ep.GetPort(),
 		Protocol:                     ep.GetProtocol(),
 		TLS:                          types.NetworkTLSMode(ep.GetTls()),
 		Enforcement:                  types.NetworkEnforcementMode(ep.GetEnforcement()),
@@ -77,12 +76,12 @@ func policyNetworkEndpointFromProto(ep *sbv1.NetworkEndpoint) types.PolicyNetwor
 		WebsocketCredentialRewrite:   ep.GetWebsocketCredentialRewrite(),
 		RequestBodyCredentialRewrite: ep.GetRequestBodyCredentialRewrite(),
 		AllowUninspectedCredentials:  ep.GetAllowUninspectedCredentials(),
-		ProviderCredentialed:         ep.GetProviderCredentialed(),
-		AdvisorProposed:              ep.GetAdvisorProposed(),
 		CredentialSigning:            ep.GetCredentialSigning(),
 		SigningService:               ep.GetSigningService(),
 		SigningRegion:                ep.GetSigningRegion(),
-		JSONRPCMaxBodyBytes:          ep.GetJsonRpcMaxBodyBytes(),
+	}
+	if jsonRPC := ep.GetJsonRpc(); jsonRPC != nil {
+		result.JSONRPCMaxBodyBytes = jsonRPC.GetMaxBodyBytes()
 	}
 	if binding := ep.GetCredentialBinding(); binding != nil {
 		result.CredentialBinding = &types.NetworkCredentialBinding{
@@ -124,14 +123,13 @@ func policyNetworkEndpointFromProto(ep *sbv1.NetworkEndpoint) types.PolicyNetwor
 	return result
 }
 
-func policyNetworkEndpointToProto(ep *types.PolicyNetworkEndpoint) *sbv1.NetworkEndpoint {
-	result := &sbv1.NetworkEndpoint{
+func policyNetworkEndpointToProto(ep *types.PolicyNetworkEndpoint) *policyv1.NetworkEndpoint {
+	result := &policyv1.NetworkEndpoint{
 		Host:                         ep.Host,
-		Port:                         ep.Port,
 		Protocol:                     ep.Protocol,
-		Tls:                          sbv1.NetworkTlsMode(ep.TLS),
-		Enforcement:                  sbv1.NetworkEnforcementMode(ep.Enforcement),
-		Access:                       sbv1.NetworkAccessPreset(ep.Access),
+		Tls:                          string(ep.TLS),
+		Enforcement:                  string(ep.Enforcement),
+		Access:                       string(ep.Access),
 		AllowEncodedSlash:            ep.AllowEncodedSlash,
 		PersistedQueries:             ep.PersistedQueries,
 		GraphqlMaxBodyBytes:          ep.GraphqlMaxBodyBytes,
@@ -139,15 +137,15 @@ func policyNetworkEndpointToProto(ep *types.PolicyNetworkEndpoint) *sbv1.Network
 		WebsocketCredentialRewrite:   ep.WebsocketCredentialRewrite,
 		RequestBodyCredentialRewrite: ep.RequestBodyCredentialRewrite,
 		AllowUninspectedCredentials:  ep.AllowUninspectedCredentials,
-		ProviderCredentialed:         ep.ProviderCredentialed,
-		AdvisorProposed:              ep.AdvisorProposed,
 		CredentialSigning:            ep.CredentialSigning,
 		SigningService:               ep.SigningService,
 		SigningRegion:                ep.SigningRegion,
-		JsonRpcMaxBodyBytes:          ep.JSONRPCMaxBodyBytes,
+	}
+	if ep.JSONRPCMaxBodyBytes != 0 {
+		result.JsonRpc = &policyv1.JsonRpcConfig{MaxBodyBytes: ep.JSONRPCMaxBodyBytes}
 	}
 	if ep.CredentialBinding != nil {
-		result.CredentialBinding = &sbv1.NetworkCredentialBinding{
+		result.CredentialBinding = &policyv1.NetworkCredentialBinding{
 			Provider: ep.CredentialBinding.Provider,
 		}
 	}
@@ -159,19 +157,19 @@ func policyNetworkEndpointToProto(ep *types.PolicyNetworkEndpoint) *sbv1.Network
 		result.AllowedIps = CopyStringSlice(ep.AllowedIPs)
 	}
 	if len(ep.Rules) > 0 {
-		result.Rules = make([]*sbv1.L7Rule, len(ep.Rules))
+		result.Rules = make([]*policyv1.L7Rule, len(ep.Rules))
 		for i := range ep.Rules {
 			result.Rules[i] = l7RuleToProto(&ep.Rules[i])
 		}
 	}
 	if len(ep.DenyRules) > 0 {
-		result.DenyRules = make([]*sbv1.L7DenyRule, len(ep.DenyRules))
+		result.DenyRules = make([]*policyv1.L7DenyRule, len(ep.DenyRules))
 		for i := range ep.DenyRules {
 			result.DenyRules[i] = l7DenyRuleToProto(&ep.DenyRules[i])
 		}
 	}
 	if len(ep.GraphqlPersistedQueries) > 0 {
-		result.GraphqlPersistedQueries = make(map[string]*sbv1.GraphqlOperation, len(ep.GraphqlPersistedQueries))
+		result.GraphqlPersistedQueries = make(map[string]*policyv1.GraphqlOperation, len(ep.GraphqlPersistedQueries))
 		for k, v := range ep.GraphqlPersistedQueries {
 			result.GraphqlPersistedQueries[k] = graphqlOperationToProto(&v)
 		}
@@ -185,22 +183,24 @@ func policyNetworkEndpointToProto(ep *types.PolicyNetworkEndpoint) *sbv1.Network
 // mcpOptionsFromProto performs a transport conversion only. It leaves an empty
 // version list empty because checked policy and server ingress own default
 // materialization and validation.
-func mcpOptionsFromProto(m *sbv1.McpOptions) *types.McpOptions {
+func mcpOptionsFromProto(m *policyv1.McpConfig) *types.McpOptions {
 	if m == nil {
 		return nil
 	}
 	return &types.McpOptions{
+		MaxBodyBytes:            m.GetMaxBodyBytes(),
 		StrictToolNames:         CopyBoolPtr(m.StrictToolNames),
 		AllowAllKnownMcpMethods: CopyBoolPtr(m.AllowAllKnownMcpMethods),
 		Versions:                CopyStringSlice(m.GetVersions()),
 	}
 }
 
-func mcpOptionsToProto(m *types.McpOptions) *sbv1.McpOptions {
+func mcpOptionsToProto(m *types.McpOptions) *policyv1.McpConfig {
 	if m == nil {
 		return nil
 	}
-	return &sbv1.McpOptions{
+	return &policyv1.McpConfig{
+		MaxBodyBytes:            m.MaxBodyBytes,
 		StrictToolNames:         CopyBoolPtr(m.StrictToolNames),
 		AllowAllKnownMcpMethods: CopyBoolPtr(m.AllowAllKnownMcpMethods),
 		Versions:                CopyStringSlice(m.Versions),
@@ -209,7 +209,7 @@ func mcpOptionsToProto(m *types.McpOptions) *sbv1.McpOptions {
 
 // --- L7Rule ---
 
-func l7RuleFromProto(r *sbv1.L7Rule) types.L7Rule {
+func l7RuleFromProto(r *policyv1.L7Rule) types.L7Rule {
 	result := types.L7Rule{}
 	if a := r.GetAllow(); a != nil {
 		result.Allow = &types.L7Allow{
@@ -224,16 +224,20 @@ func l7RuleFromProto(r *sbv1.L7Rule) types.L7Rule {
 			result.Allow.Query = l7QueryMapFromProto(q)
 		}
 		if p := a.GetParams(); len(p) > 0 {
-			result.Allow.Params = l7QueryMapFromProto(p)
+			result.Allow.Params = l7ParameterMapFromProto(p)
+		}
+		if tool := a.GetTool(); tool != nil {
+			converted := matcherFromProto(tool)
+			result.Allow.Tool = &converted
 		}
 	}
 	return result
 }
 
-func l7RuleToProto(r *types.L7Rule) *sbv1.L7Rule {
-	result := &sbv1.L7Rule{}
+func l7RuleToProto(r *types.L7Rule) *policyv1.L7Rule {
+	result := &policyv1.L7Rule{}
 	if r.Allow != nil {
-		result.Allow = &sbv1.L7Allow{
+		result.Allow = &policyv1.L7Allow{
 			Method:        r.Allow.Method,
 			Path:          r.Allow.Path,
 			Command:       r.Allow.Command,
@@ -245,7 +249,10 @@ func l7RuleToProto(r *types.L7Rule) *sbv1.L7Rule {
 			result.Allow.Query = l7QueryMapToProto(r.Allow.Query)
 		}
 		if len(r.Allow.Params) > 0 {
-			result.Allow.Params = l7QueryMapToProto(r.Allow.Params)
+			result.Allow.Params = l7ParameterMapToProto(r.Allow.Params)
+		}
+		if r.Allow.Tool != nil {
+			result.Allow.Tool = matcherToProto(*r.Allow.Tool)
 		}
 	}
 	return result
@@ -253,8 +260,8 @@ func l7RuleToProto(r *types.L7Rule) *sbv1.L7Rule {
 
 // --- L7DenyRule ---
 
-func l7DenyRuleFromProto(r *sbv1.L7DenyRule) types.L7DenyRule {
-	return types.L7DenyRule{
+func l7DenyRuleFromProto(r *policyv1.L7DenyRule) types.L7DenyRule {
+	result := types.L7DenyRule{
 		Method:        r.GetMethod(),
 		Path:          r.GetPath(),
 		Command:       r.GetCommand(),
@@ -262,12 +269,17 @@ func l7DenyRuleFromProto(r *sbv1.L7DenyRule) types.L7DenyRule {
 		OperationName: r.GetOperationName(),
 		Fields:        CopyStringSlice(r.GetFields()),
 		Query:         l7QueryMapFromProto(r.GetQuery()),
-		Params:        l7QueryMapFromProto(r.GetParams()),
+		Params:        l7ParameterMapFromProto(r.GetParams()),
 	}
+	if tool := r.GetTool(); tool != nil {
+		converted := matcherFromProto(tool)
+		result.Tool = &converted
+	}
+	return result
 }
 
-func l7DenyRuleToProto(r *types.L7DenyRule) *sbv1.L7DenyRule {
-	result := &sbv1.L7DenyRule{
+func l7DenyRuleToProto(r *types.L7DenyRule) *policyv1.L7DenyRule {
+	result := &policyv1.L7DenyRule{
 		Method:        r.Method,
 		Path:          r.Path,
 		Command:       r.Command,
@@ -279,38 +291,87 @@ func l7DenyRuleToProto(r *types.L7DenyRule) *sbv1.L7DenyRule {
 		result.Query = l7QueryMapToProto(r.Query)
 	}
 	if len(r.Params) > 0 {
-		result.Params = l7QueryMapToProto(r.Params)
+		result.Params = l7ParameterMapToProto(r.Params)
+	}
+	if r.Tool != nil {
+		result.Tool = matcherToProto(*r.Tool)
 	}
 	return result
 }
 
 // --- L7QueryMatcher helpers ---
 
-func l7QueryMapFromProto(m map[string]*sbv1.L7QueryMatcher) map[string]types.L7QueryMatcher {
+func l7QueryMapFromProto(m map[string]*policyv1.Matcher) map[string]types.L7QueryMatcher {
 	if len(m) == 0 {
 		return nil
 	}
 	result := make(map[string]types.L7QueryMatcher, len(m))
 	for k, v := range m {
 		if v != nil {
-			result[k] = types.L7QueryMatcher{
-				Glob: v.GetGlob(),
-				Any:  CopyStringSlice(v.GetAny()),
-			}
+			result[k] = matcherFromProto(v)
 		}
 	}
 	return result
 }
 
-func l7QueryMapToProto(m map[string]types.L7QueryMatcher) map[string]*sbv1.L7QueryMatcher {
+func l7QueryMapToProto(m map[string]types.L7QueryMatcher) map[string]*policyv1.Matcher {
 	if len(m) == 0 {
 		return nil
 	}
-	result := make(map[string]*sbv1.L7QueryMatcher, len(m))
+	result := make(map[string]*policyv1.Matcher, len(m))
 	for k, v := range m {
-		result[k] = &sbv1.L7QueryMatcher{
-			Glob: v.Glob,
-			Any:  CopyStringSlice(v.Any),
+		result[k] = matcherToProto(v)
+	}
+	return result
+}
+
+func matcherFromProto(m *policyv1.Matcher) types.L7QueryMatcher {
+	result := types.L7QueryMatcher{Glob: m.GetGlob()}
+	if anyMatcher := m.GetAny(); anyMatcher != nil {
+		result.Any = CopyStringSlice(anyMatcher.GetValues())
+	}
+	return result
+}
+
+func matcherToProto(m types.L7QueryMatcher) *policyv1.Matcher {
+	if len(m.Any) > 0 {
+		return &policyv1.Matcher{Kind: &policyv1.Matcher_Any{Any: &policyv1.AnyMatcher{
+			Values: CopyStringSlice(m.Any),
+		}}}
+	}
+	return &policyv1.Matcher{Kind: &policyv1.Matcher_Glob{Glob: m.Glob}}
+}
+
+func l7ParameterMapFromProto(m map[string]*policyv1.ParameterMatcher) map[string]types.ParameterMatcher {
+	if len(m) == 0 {
+		return nil
+	}
+	result := make(map[string]types.ParameterMatcher, len(m))
+	for key, value := range m {
+		if matcher := value.GetMatcher(); matcher != nil {
+			converted := matcherFromProto(matcher)
+			result[key] = types.ParameterMatcher{Matcher: &converted}
+		} else if object := value.GetObject(); object != nil {
+			result[key] = types.ParameterMatcher{Object: l7ParameterMapFromProto(object.GetFields())}
+		}
+	}
+	return result
+}
+
+func l7ParameterMapToProto(m map[string]types.ParameterMatcher) map[string]*policyv1.ParameterMatcher {
+	if len(m) == 0 {
+		return nil
+	}
+	result := make(map[string]*policyv1.ParameterMatcher, len(m))
+	for key, value := range m {
+		if value.Matcher != nil {
+			result[key] = &policyv1.ParameterMatcher{Kind: &policyv1.ParameterMatcher_Matcher{
+				Matcher: matcherToProto(*value.Matcher),
+			}}
+		} else {
+			result[key] = &policyv1.ParameterMatcher{Kind: &policyv1.ParameterMatcher_Object{
+				Object: &policyv1.ParameterObject{Fields: l7ParameterMapToProto(value.Object)},
+			}}
 		}
 	}
 	return result
@@ -318,7 +379,7 @@ func l7QueryMapToProto(m map[string]types.L7QueryMatcher) map[string]*sbv1.L7Que
 
 // --- GraphqlOperation ---
 
-func graphqlOperationFromProto(op *sbv1.GraphqlOperation) types.GraphqlOperation {
+func graphqlOperationFromProto(op *policyv1.GraphqlOperation) types.GraphqlOperation {
 	return types.GraphqlOperation{
 		OperationType: op.GetOperationType(),
 		OperationName: op.GetOperationName(),
@@ -326,8 +387,8 @@ func graphqlOperationFromProto(op *sbv1.GraphqlOperation) types.GraphqlOperation
 	}
 }
 
-func graphqlOperationToProto(op *types.GraphqlOperation) *sbv1.GraphqlOperation {
-	return &sbv1.GraphqlOperation{
+func graphqlOperationToProto(op *types.GraphqlOperation) *policyv1.GraphqlOperation {
+	return &policyv1.GraphqlOperation{
 		OperationType: op.OperationType,
 		OperationName: op.OperationName,
 		Fields:        CopyStringSlice(op.Fields),

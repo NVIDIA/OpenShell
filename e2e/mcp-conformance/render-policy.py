@@ -78,7 +78,7 @@ rewritten = urlunparse(
 template = string.Template(Path(policy_template).read_text(encoding="utf-8"))
 policy = template.substitute(
     host_spec=f"host: {json.dumps(target_host)}",
-    port_spec=f"        port: {port}",
+    port_spec=f"        ports: [{port}]",
     path=json.dumps(path),
     mcp_version=json.dumps(mcp_version),
 )

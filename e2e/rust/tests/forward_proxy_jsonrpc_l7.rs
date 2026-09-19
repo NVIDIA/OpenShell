@@ -92,7 +92,7 @@ network_policies:
     name: test_jsonrpc_l7
     endpoints:
       - host: {host}
-        port: {port}
+        ports: [{port}]
         path: /rpc
         protocol: json-rpc
         enforcement: enforce
@@ -157,7 +157,7 @@ network_policies:
     name: test_jsonrpc_l7_audit
     endpoints:
       - host: {host}
-        port: {port}
+        ports: [{port}]
         path: /rpc
         protocol: json-rpc
         allowed_ips:

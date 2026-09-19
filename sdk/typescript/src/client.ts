@@ -13,8 +13,9 @@
 
 import type { AddressInfo } from 'node:net';
 import * as net from 'node:net';
-import type { MessageInitShape } from '@bufbuild/protobuf';
+import { create, type MessageInitShape } from '@bufbuild/protobuf';
 import { durationFromMs } from '@bufbuild/protobuf/wkt';
+import { createValidator } from '@bufbuild/protovalidate';
 import { type CallOptions, type Client, createClient, type Transport } from '@connectrpc/connect';
 import { errorCode, fromConnect, SdkError } from './errors.js';
 import type { Provider, WorkspaceSelectorSchema } from './gen/datamodel_pb.js';
@@ -28,8 +29,27 @@ import {
   ServiceStatus,
   type TcpForwardFrameSchema,
 } from './gen/openshell_pb.js';
-import type { EffectiveSetting, GetSandboxConfigResponse, SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
-import { PolicySource, type SandboxPolicySchema, SettingScope, type SettingValueSchema } from './gen/sandbox_pb.js';
+import {
+  type L7AllowSchema,
+  type L7DenyRuleSchema,
+  type MatcherSchema,
+  type ParameterMatcherSchema,
+  type PolicyDocument,
+  PolicyDocumentSchema,
+  type NetworkEndpointSchema as PolicyNetworkEndpointSchema,
+} from './gen/policy_pb.js';
+import type {
+  EffectiveSetting,
+  GetSandboxConfigResponse,
+  L7Allow as RuntimeL7Allow,
+  L7DenyRule as RuntimeL7DenyRule,
+  L7QueryMatcher as RuntimeMatcher,
+  McpOptions as RuntimeMcpOptions,
+  NetworkEndpoint as RuntimeNetworkEndpoint,
+  SandboxPolicy as RuntimeSandboxPolicy,
+  SettingValue,
+} from './gen/sandbox_pb.js';
+import { PolicySource, SettingScope, type SettingValueSchema } from './gen/sandbox_pb.js';
 import { validateSshResponse } from './ssh-validate.js';
 import { buildTransport, type ConnectOptions } from './transport.js';
 
@@ -38,6 +58,17 @@ function durationFromSeconds(seconds: number) {
     throw new RangeError('timeoutSecs must be a finite, non-negative number');
   }
   return seconds === 0 ? undefined : durationFromMs(seconds * 1000);
+}
+
+const POLICY_VALIDATOR = createValidator();
+
+export function validatePolicyDocument(policy: MessageInitShape<typeof PolicyDocumentSchema>) {
+  const document = create(PolicyDocumentSchema, policy);
+  const result = POLICY_VALIDATOR.validate(PolicyDocumentSchema, document);
+  if (result.kind !== 'valid') {
+    throw new SdkError('invalid_config', `policy document validation failed: ${result.error.message}`);
+  }
+  return document;
 }
 
 function timestampMillis(timestamp: { seconds: bigint; nanos: number } | undefined): string | undefined {
@@ -56,7 +87,8 @@ export type {
   SandboxWorkloadTemplate,
   SandboxWorkloadTemplateSpec,
 } from './gen/openshell_pb.js';
-export type { SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
+export type { PolicyDocument } from './gen/policy_pb.js';
+export type { SettingValue } from './gen/sandbox_pb.js';
 export type { ConnectOptions };
 export { errorCode };
 
@@ -144,7 +176,7 @@ export interface SandboxSpec {
    * `setPolicy` cannot introduce static fields later, so express filesystem,
    * landlock, process, and initial network policy here.
    */
-  policy?: MessageInitShape<typeof SandboxPolicySchema>;
+  policy?: MessageInitShape<typeof PolicyDocumentSchema>;
   /**
    * Advanced escape hatch: the full generated proto spec. Curated fields build
    * the base spec, then `rawSpec` shallow-overrides at the top spec level, so
@@ -170,7 +202,7 @@ export interface SandboxFromTemplateSpec {
    * Create-time sandbox policy (the safety boundary). The named workload
    * template supplies runtime workload fields.
    */
-  policy?: MessageInitShape<typeof SandboxPolicySchema>;
+  policy?: MessageInitShape<typeof PolicyDocumentSchema>;
 }
 
 export interface SandboxRef {
@@ -373,7 +405,7 @@ export interface EffectiveSettingView {
 }
 
 export interface SandboxConfig {
-  policy?: SandboxPolicy;
+  policy?: PolicyDocument;
   version: number;
   policyHash: string;
   settings: Record<string, EffectiveSettingView>;
@@ -495,7 +527,7 @@ function sandboxConfig(resp: GetSandboxConfigResponse): SandboxConfig {
     settings[key] = effectiveSetting(setting);
   }
   return {
-    ...(resp.policy ? { policy: resp.policy } : {}),
+    ...(resp.policy ? { policy: policyDocumentFromRuntime(resp.policy) } : {}),
     version: resp.version,
     policyHash: resp.policyHash,
     settings,
@@ -504,6 +536,271 @@ function sandboxConfig(resp: GetSandboxConfigResponse): SandboxConfig {
     globalPolicyVersion: resp.globalPolicyVersion,
     providerEnvRevision: resp.providerEnvRevision.toString(),
   };
+}
+
+type MatcherInit = MessageInitShape<typeof MatcherSchema>;
+type ParameterMatcherInit = MessageInitShape<typeof ParameterMatcherSchema>;
+
+function policyDocumentFromRuntime(policy: RuntimeSandboxPolicy): PolicyDocument {
+  return create(PolicyDocumentSchema, {
+    version: policy.version,
+    filesystemPolicy: policy.filesystem
+      ? {
+          includeWorkdir: policy.filesystem.includeWorkdir,
+          readOnly: [...policy.filesystem.readOnly],
+          readWrite: [...policy.filesystem.readWrite],
+        }
+      : undefined,
+    landlock: policy.landlock ? { compatibility: policy.landlock.compatibility } : undefined,
+    process: policy.process
+      ? { runAsUser: policy.process.runAsUser, runAsGroup: policy.process.runAsGroup }
+      : undefined,
+    networkPolicies: Object.fromEntries(
+      Object.entries(policy.networkPolicies).map(([name, rule]) => [
+        name,
+        {
+          name: rule.name,
+          endpoints: rule.endpoints.map(policyEndpointFromRuntime),
+          binaries: rule.binaries.map((binary) => ({ path: binary.path })),
+        },
+      ]),
+    ),
+    networkMiddlewares: Object.fromEntries(
+      Object.entries(policy.networkMiddlewares).map(([name, middleware]) => [
+        name,
+        {
+          name: middleware.name,
+          middleware: middleware.middleware,
+          config: middleware.config,
+          onError: middleware.onError,
+          order: middleware.order,
+          endpoints: middleware.endpoints
+            ? {
+                include: [...middleware.endpoints.include],
+                exclude: [...middleware.endpoints.exclude],
+              }
+            : undefined,
+        },
+      ]),
+    ),
+  });
+}
+
+function policyEndpointFromRuntime(
+  endpoint: RuntimeNetworkEndpoint,
+): MessageInitShape<typeof PolicyNetworkEndpointSchema> {
+  const mcpProtocol = endpoint.protocol.toLowerCase() === 'mcp';
+  return {
+    host: endpoint.host,
+    ports: endpoint.ports.length > 0 ? [...endpoint.ports] : endpoint.port === 0 ? [] : [endpoint.port],
+    protocol: endpoint.protocol,
+    tls: runtimeTLSMode(endpoint.tls),
+    enforcement: runtimeEnforcementMode(endpoint.enforcement),
+    access: runtimeAccessPreset(endpoint.access),
+    rules: endpoint.rules.map((rule) => ({
+      allow: rule.allow ? policyAllowFromRuntime(endpoint.protocol, endpoint.mcp, rule.allow) : undefined,
+    })),
+    allowedIps: [...endpoint.allowedIps],
+    denyRules: endpoint.denyRules.map((rule) => policyDenyRuleFromRuntime(endpoint.protocol, endpoint.mcp, rule)),
+    allowEncodedSlash: endpoint.allowEncodedSlash,
+    persistedQueries: endpoint.persistedQueries,
+    graphqlPersistedQueries: Object.fromEntries(
+      Object.entries(endpoint.graphqlPersistedQueries).map(([name, operation]) => [
+        name,
+        {
+          operationType: operation.operationType,
+          operationName: operation.operationName,
+          fields: [...operation.fields],
+        },
+      ]),
+    ),
+    graphqlMaxBodyBytes: endpoint.graphqlMaxBodyBytes,
+    path: endpoint.path,
+    websocketCredentialRewrite: endpoint.websocketCredentialRewrite,
+    requestBodyCredentialRewrite: endpoint.requestBodyCredentialRewrite,
+    credentialSigning: endpoint.credentialSigning,
+    signingService: endpoint.signingService,
+    signingRegion: endpoint.signingRegion,
+    jsonRpc:
+      !mcpProtocol && endpoint.jsonRpcMaxBodyBytes !== 0 ? { maxBodyBytes: endpoint.jsonRpcMaxBodyBytes } : undefined,
+    mcp:
+      mcpProtocol && (endpoint.mcp !== undefined || endpoint.jsonRpcMaxBodyBytes !== 0)
+        ? {
+            versions: [...(endpoint.mcp?.versions ?? [])],
+            maxBodyBytes: endpoint.jsonRpcMaxBodyBytes,
+            strictToolNames: endpoint.mcp?.strictToolNames,
+            allowAllKnownMcpMethods: endpoint.mcp?.allowAllKnownMcpMethods,
+          }
+        : undefined,
+    credentialBinding: endpoint.credentialBinding ? { provider: endpoint.credentialBinding.provider } : undefined,
+    allowUninspectedCredentials: endpoint.allowUninspectedCredentials,
+  };
+}
+
+function policyAllowFromRuntime(
+  protocol: string,
+  options: RuntimeMcpOptions | undefined,
+  allow: RuntimeL7Allow,
+): MessageInitShape<typeof L7AllowSchema> {
+  const { tool, params } = policyParamsFromRuntime(protocol, allow.params);
+  return {
+    method: policyMCPMethod(protocol, options, allow.method, tool !== undefined),
+    path: allow.path,
+    command: allow.command,
+    query: policyMatcherMapFromRuntime(allow.query),
+    operationType: allow.operationType,
+    operationName: allow.operationName,
+    fields: [...allow.fields],
+    tool,
+    params,
+  };
+}
+
+function policyDenyRuleFromRuntime(
+  protocol: string,
+  options: RuntimeMcpOptions | undefined,
+  rule: RuntimeL7DenyRule,
+): MessageInitShape<typeof L7DenyRuleSchema> {
+  const { tool, params } = policyParamsFromRuntime(protocol, rule.params);
+  return {
+    method: policyMCPMethod(protocol, options, rule.method, tool !== undefined),
+    path: rule.path,
+    command: rule.command,
+    query: policyMatcherMapFromRuntime(rule.query),
+    operationType: rule.operationType,
+    operationName: rule.operationName,
+    fields: [...rule.fields],
+    tool,
+    params,
+  };
+}
+
+function policyMCPMethod(
+  protocol: string,
+  options: RuntimeMcpOptions | undefined,
+  method: string,
+  hasTool: boolean,
+): string {
+  if (protocol.toLowerCase() !== 'mcp') return method;
+  if (!hasTool && method === '*') return '';
+  if (hasTool && method === 'tools/call' && options?.allowAllKnownMcpMethods === true) return '';
+  return method;
+}
+
+function policyMatcherFromRuntime(matcher: RuntimeMatcher | undefined): MatcherInit {
+  if (matcher && matcher.any.length > 0) {
+    return { kind: { case: 'any', value: { values: [...matcher.any] } } };
+  }
+  return { kind: { case: 'glob', value: matcher?.glob ?? '' } };
+}
+
+function policyMatcherMapFromRuntime(matchers: Record<string, RuntimeMatcher>): Record<string, MatcherInit> {
+  return Object.fromEntries(
+    Object.entries(matchers).map(([name, matcher]) => [name, policyMatcherFromRuntime(matcher)]),
+  );
+}
+
+type ParameterTree = {
+  matcher?: RuntimeMatcher;
+  children?: Record<string, ParameterTree>;
+};
+
+function nullPrototypeRecord<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
+function policyParamsFromRuntime(
+  protocol: string,
+  params: Record<string, RuntimeMatcher>,
+): { tool?: MatcherInit; params: Record<string, ParameterMatcherInit> } {
+  let tool: MatcherInit | undefined;
+  let remaining = params;
+  if (protocol.toLowerCase() === 'mcp') {
+    remaining = nullPrototypeRecord<RuntimeMatcher>();
+    for (const [name, matcher] of Object.entries(params)) {
+      if (name === 'name') tool = policyMatcherFromRuntime(matcher);
+      else remaining[name] = matcher;
+    }
+    const nested = policyNestedParamsFromRuntime(remaining);
+    if (nested !== undefined) return { tool, params: nested };
+  }
+  return { tool, params: policyFlatParamsFromRuntime(remaining) };
+}
+
+function policyNestedParamsFromRuntime(
+  params: Record<string, RuntimeMatcher>,
+): Record<string, ParameterMatcherInit> | undefined {
+  // Parameter names are untrusted map keys. Null-prototype dictionaries keep
+  // names such as "__proto__" and "constructor" in the authored policy tree
+  // instead of resolving them through JavaScript's object prototype chain.
+  const root = nullPrototypeRecord<ParameterTree>();
+  for (const [name, matcher] of Object.entries(params)) {
+    const parts = name.split('.');
+    if (parts.some((part) => part.length === 0)) return undefined;
+    let current = root;
+    for (let index = 0; index < parts.length; index += 1) {
+      const part = parts[index];
+      if (part === undefined) return undefined;
+      const last = index === parts.length - 1;
+      const existing = Object.hasOwn(current, part) ? current[part] : undefined;
+      if (last) {
+        if (existing !== undefined) return undefined;
+        current[part] = { matcher };
+      } else {
+        if (existing?.matcher !== undefined) return undefined;
+        const node = existing ?? { children: nullPrototypeRecord<ParameterTree>() };
+        node.children ??= nullPrototypeRecord<ParameterTree>();
+        current[part] = node;
+        current = node.children;
+      }
+    }
+  }
+  return Object.fromEntries(Object.entries(root).map(([name, node]) => [name, policyParameterTree(node)]));
+}
+
+function policyParameterTree(node: ParameterTree): ParameterMatcherInit {
+  if (node.matcher !== undefined) {
+    return { kind: { case: 'matcher', value: policyMatcherFromRuntime(node.matcher) } };
+  }
+  return {
+    kind: {
+      case: 'object',
+      value: {
+        fields: Object.fromEntries(
+          Object.entries(node.children ?? {}).map(([name, child]) => [name, policyParameterTree(child)]),
+        ),
+      },
+    },
+  };
+}
+
+function policyFlatParamsFromRuntime(params: Record<string, RuntimeMatcher>): Record<string, ParameterMatcherInit> {
+  return Object.fromEntries(
+    Object.entries(params).map(([name, matcher]) => [
+      name,
+      { kind: { case: 'matcher', value: policyMatcherFromRuntime(matcher) } },
+    ]),
+  );
+}
+
+function runtimeTLSMode(mode: number): string {
+  if (mode === 1) return 'skip';
+  if (mode === 2) return 'terminate';
+  if (mode === 3) return 'passthrough';
+  return '';
+}
+
+function runtimeEnforcementMode(mode: number): string {
+  if (mode === 1) return 'enforce';
+  if (mode === 2) return 'audit';
+  return '';
+}
+
+function runtimeAccessPreset(preset: number): string {
+  if (preset === 1) return 'read-only';
+  if (preset === 2) return 'read-write';
+  if (preset === 3) return 'full';
+  return '';
 }
 
 function effectiveSetting(setting: EffectiveSetting): EffectiveSettingView {
@@ -871,6 +1168,7 @@ export class SandboxClient {
         tty: spec.tty ?? false,
       };
       if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
+      if (specInit.policy) specInit.policy = validatePolicyDocument(specInit.policy);
 
       const resp = await this.grpc.createSandbox({
         workspaceScope: workspaceScope(spec),
@@ -895,7 +1193,7 @@ export class SandboxClient {
           providers: spec.providers ?? [],
           command: spec.command ?? [],
           tty: spec.tty ?? false,
-          policy: spec.policy,
+          policy: spec.policy ? validatePolicyDocument(spec.policy) : undefined,
         },
         workloadTemplate: spec.workloadTemplate,
       });
@@ -1490,13 +1788,13 @@ export class SandboxClient {
   // applied policy hash is observed.
   async setPolicy(
     name: string,
-    policy: MessageInitShape<typeof SandboxPolicySchema>,
+    policy: MessageInitShape<typeof PolicyDocumentSchema>,
     options?: SetPolicyOptions | null,
   ): Promise<UpdateConfigResult> {
     try {
       const resp = await this.grpc.updateConfig({
         ...sandboxTarget(name, options),
-        policy,
+        policy: validatePolicyDocument(policy),
         global: false,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
       });

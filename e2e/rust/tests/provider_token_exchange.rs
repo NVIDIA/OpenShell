@@ -581,7 +581,7 @@ credentials:
         subject_token_type: {TOKEN_TYPE_ACCESS_TOKEN}
 endpoints:
   - host: host.openshell.internal
-    port: {target_port}
+    ports: [{target_port}]
     protocol: rest
     tls: none
     access: read-write
@@ -592,8 +592,8 @@ endpoints:
       - 172.0.0.0/8
       - 192.168.0.0/16
 binaries:
-  - /usr/bin/curl
-  - /usr/local/bin/curl
+  - path: /usr/bin/curl
+  - path: /usr/local/bin/curl
 "#
     );
     file.write_all(profile.as_bytes())

@@ -17,6 +17,8 @@ inputs:
       - ../../proto/sandbox.proto
       - ../../proto/datamodel.proto
       - ../../proto/options.proto
+      - ../../proto/policy.proto
+      - ../../proto/buf/validate/validate.proto
   # Standard rich gRPC error messages, pinned to an immutable Google APIs commit.
   - module: buf.build/googleapis/googleapis:c17df5b2beca46928cc87d5656bd5343
     paths:

@@ -342,15 +342,16 @@ impl super::ComputeRuntime {
             ObjectId,
             proto::{Sandbox, SandboxPhase},
         };
-        use prost::Message;
         let records = self
             .store
             .collect_records(Sandbox::object_type(), ObjectListQuery::AllWorkspaces)
             .await
             .map_err(|error| error.to_string())?;
         for record in records {
-            let candidate =
-                Sandbox::decode(record.payload.as_slice()).map_err(|error| error.to_string())?;
+            // `collect_records` returns the private durable envelope rather
+            // than the public API message used by `get_message`. Decode it at
+            // the storage boundary before inspecting lifecycle state.
+            let candidate = crate::storage_proto::decode_sandbox(record.payload.as_slice())?;
             if !matches!(
                 SandboxPhase::try_from(candidate.phase()),
                 Ok(SandboxPhase::Provisioning | SandboxPhase::Starting)
