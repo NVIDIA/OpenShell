@@ -910,12 +910,12 @@ guest_tls_key  = "/var/lib/openshell/guest-tls/client-key.pem"
 state_dir        = "/var/lib/openshell/vm"
 # Where the gateway looks for the openshell-driver-vm subprocess binary.
 driver_dir       = "/usr/local/libexec/openshell"
-default_image    = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+default_image    = "nvcr.io/nvidia/base/ubuntu:24.04"
 # Optional override. When omitted, the gateway derives
 # https://host.openshell.internal:<gateway-port> for the VM driver.
 grpc_endpoint    = "https://host.openshell.internal:17670"
 # Empty falls back to default_image.
-bootstrap_image  = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+bootstrap_image  = "nvcr.io/nvidia/base/ubuntu:24.04"
 krun_log_level   = 1
 vcpus            = 2
 mem_mib          = 2048

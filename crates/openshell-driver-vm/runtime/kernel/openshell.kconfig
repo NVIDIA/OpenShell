@@ -35,3 +35,11 @@ CONFIG_SECURITY_LANDLOCK=y
 CONFIG_LSM="landlock,lockdown,yama,loadpin,safesetid,ipe,bpf"
 CONFIG_SECCOMP=y
 CONFIG_SECCOMP_FILTER=y
+
+# Kernel memory hardening. Keep init-on-free disabled because its runtime cost
+# is too high for sandbox workloads.
+CONFIG_HARDENED_USERCOPY=y
+CONFIG_INIT_STACK_ALL_ZERO=y
+CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y
+# CONFIG_INIT_ON_FREE_DEFAULT_ON is not set
+CONFIG_SLAB_FREELIST_RANDOM=y

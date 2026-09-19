@@ -47,6 +47,7 @@ First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw
 By default `mise run gateway:vm`:
 
 - Listens on plaintext HTTP at `127.0.0.1:18081`.
+- Uses `nvcr.io/nvidia/base/ubuntu:24.04` as the sandbox and bootstrap image.
 - Configures the gateway installation name as `vm-dev` and registers the same
   name with the CLI by writing
   `~/.config/openshell/gateways/vm-dev/metadata.json`. It does not modify the

@@ -58,6 +58,7 @@ use tower::service_fn;
 const DRIVER_BIN_NAME: &str = "openshell-driver-vm";
 const COMPUTE_DRIVER_SOCKET_RUN_DIR: &str = "run";
 const COMPUTE_DRIVER_SOCKET_NAME: &str = "compute-driver.sock";
+const DEFAULT_VM_SANDBOX_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
 
 /// Configuration for launching and talking to the VM compute driver.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -233,7 +234,7 @@ impl Default for VmComputeConfig {
         Self {
             state_dir: Self::default_state_dir(),
             driver_dir: None,
-            default_image: openshell_core::image::default_sandbox_image(),
+            default_image: DEFAULT_VM_SANDBOX_IMAGE.to_string(),
             grpc_endpoint: String::new(),
             bootstrap_image: String::new(),
             krun_log_level: Self::default_krun_log_level(),
@@ -759,7 +760,7 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        VmComputeConfig, append_otlp_args, append_vm_identity_args,
+        DEFAULT_VM_SANDBOX_IMAGE, VmComputeConfig, append_otlp_args, append_vm_identity_args,
         append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args, compute_driver_guest_tls_paths,
         compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
         prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
@@ -771,6 +772,14 @@ mod tests {
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[test]
+    fn vm_uses_nvidia_ubuntu_default_image() {
+        assert_eq!(
+            VmComputeConfig::default().default_image,
+            DEFAULT_VM_SANDBOX_IMAGE
+        );
+    }
 
     #[test]
     fn vm_driver_command_includes_gateway_otlp_configuration() {
