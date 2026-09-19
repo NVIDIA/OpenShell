@@ -1,0 +1,113 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Capture the default rootless Podman user-namespace mapping
+  hosts: all
+  gather_facts: false
+  vars:
+    podman_reference_image: "{{ openshell_podman_reference_image }}"
+    podman_reference_uid_map: /var/lib/openshell-test-inputs/podman/reference-uid-map
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Read OpenShell gateway service user
+      become: true
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - openshell-gateway.service
+          - --property
+          - User
+          - --value
+      changed_when: false
+      register: openshell_gateway_service_user
+
+    - name: Require the rootless Podman gateway user
+      ansible.builtin.assert:
+        that:
+          - openshell_gateway_service_user.stdout == "tmachine"
+        fail_msg: >-
+          The Podman default-userns suite requires a rootless Podman gateway
+          running as tmachine, not {{ openshell_gateway_service_user.stdout | default("unknown") }}
+
+    - name: Read OpenShell gateway configuration
+      become: true
+      ansible.builtin.slurp:
+        src: /etc/openshell/gateway.toml
+      register: openshell_gateway_config
+
+    - name: Require unconfigured Podman user namespaces
+      ansible.builtin.assert:
+        that:
+          - >-
+            (openshell_gateway_config.content | b64decode)
+            is not regex('(?m)^\\s*(userns|uidmap|gidmap)\\s*=')
+        fail_msg: >-
+          The Podman default-userns suite requires gateway.toml to omit userns,
+          uidmap, and gidmap.
+
+    - name: Resolve tmachine UID
+      ansible.builtin.command:
+        argv:
+          - id
+          - -u
+          - tmachine
+      changed_when: false
+      register: tmachine_uid
+
+    - name: Create Podman test-input directory
+      become: true
+      ansible.builtin.file:
+        path: "{{ podman_reference_uid_map | dirname }}"
+        state: directory
+        owner: tmachine
+        group: tmachine
+        mode: "0700"
+
+    - name: Pull the Podman reference image
+      become: true
+      become_user: tmachine
+      ansible.builtin.command:
+        argv: [podman, pull, "{{ podman_reference_image }}"]
+      environment:
+        HOME: /home/tmachine
+        XDG_RUNTIME_DIR: "/run/user/{{ tmachine_uid.stdout }}"
+      changed_when: false
+
+    - name: Capture direct Podman default UID mapping
+      become: true
+      become_user: tmachine
+      ansible.builtin.command:
+        argv:
+          - podman
+          - run
+          - --rm
+          - --pull
+          - never
+          - --entrypoint
+          - /bin/cat
+          - "{{ podman_reference_image }}"
+          - /proc/self/uid_map
+      environment:
+        HOME: /home/tmachine
+        XDG_RUNTIME_DIR: "/run/user/{{ tmachine_uid.stdout }}"
+      changed_when: false
+      register: podman_default_uid_map
+
+    - name: Require a direct Podman UID mapping
+      ansible.builtin.assert:
+        that:
+          - podman_default_uid_map.stdout | trim | length > 0
+        fail_msg: Direct rootless Podman reference container returned no UID mapping
+
+    - name: Store direct Podman default UID mapping
+      become: true
+      ansible.builtin.copy:
+        content: "{{ podman_default_uid_map.stdout | trim }}\n"
+        dest: "{{ podman_reference_uid_map }}"
+        owner: tmachine
+        group: tmachine
+        mode: "0600"
