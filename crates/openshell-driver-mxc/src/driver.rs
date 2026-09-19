@@ -2363,6 +2363,8 @@ mod lifecycle_tests {
         NetworkMiddlewareConfig, NetworkPolicyRule, SandboxPolicy, StaticCredentialBinding,
         StaticCredentialEndpointBinding, UiClipboardAccess, UiPolicy,
     };
+    use openshell_policy::parse_sandbox_policy;
+    use std::path::Path;
     use std::time::Duration;
 
     fn driver_sandbox(id: &str) -> DriverSandbox {
@@ -2490,6 +2492,80 @@ mod lifecycle_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         None
+    }
+
+    fn shipped_demo_config(name: &str) -> MxcComputeConfig {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join(name);
+        let source = std::fs::read_to_string(&path).expect("read shipped demo config");
+        let document: toml::Value = toml::from_str(&source).expect("parse shipped demo config");
+        document["openshell"]["drivers"]["mxc"]
+            .clone()
+            .try_into()
+            .expect("deserialize shipped MXC driver config")
+    }
+
+    fn shipped_demo_policy(name: &str, share: &str) -> SandboxPolicy {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join(name);
+        let rendered = std::fs::read_to_string(&path)
+            .expect("read shipped demo policy")
+            .replace("__OPENSHELL_DEMO_SHARE__", share)
+            .replace("__OLLAMA_HOST__", "127.0.0.1")
+            .replace("__OLLAMA_PORT__", "11434")
+            .replace("__CMD_EXE__", r"C:\Windows\System32\cmd.exe");
+        parse_sandbox_policy(&rendered).expect("parse rendered shipped demo policy")
+    }
+
+    #[tokio::test]
+    async fn shipped_inference_examples_create_process_container_sandboxes() {
+        for (index, (config_name, policy_name)) in [
+            ("mxc-ollama.toml", "ollama.yaml"),
+            ("mxc-inference.toml", "inference.yaml"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let share = tmp.path().to_string_lossy().replace('\\', "/");
+            let proof = format!("{share}/demo-created.txt");
+            let sandbox_name = format!("shipped-demo-{index}");
+            let cmd = vec![
+                r"C:\Windows\System32\cmd.exe".into(),
+                "/d".into(),
+                "/c".into(),
+                format!(r#"echo PASS>"{proof}""#),
+            ];
+            let config = shipped_demo_config(config_name);
+            assert_eq!(config.backend, MxcBackend::ProcessContainer);
+            assert!(config.egress_proxy);
+            let backend = MxcComputeBackend::new_mocked(config);
+            let policy = shipped_demo_policy(policy_name, &share);
+            let sandbox = with_policy(
+                driver_sandbox_with_command(&sandbox_name, &share, cmd),
+                policy,
+            );
+
+            backend
+                .create_sandbox(&sandbox)
+                .await
+                .unwrap_or_else(|error| panic!("{config_name} create failed: {error}"));
+            let completed = wait_for(&backend, &sandbox_name, |sandbox| {
+                ready_condition(sandbox)
+                    .is_some_and(|condition| condition.reason == "AgentCompleted")
+            })
+            .await;
+            assert!(
+                completed.is_some(),
+                "{config_name} did not reach Ready/AgentCompleted"
+            );
+            assert!(
+                tmp.path().join("demo-created.txt").is_file(),
+                "{config_name} did not run its in-policy workload"
+            );
+        }
     }
 
     #[test]
