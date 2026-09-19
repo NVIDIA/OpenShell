@@ -1320,6 +1320,22 @@ impl ComputeRuntime {
         let generation_id = sandbox_runtime_generation(&starting)
             .map_err(Status::failed_precondition)?
             .into_string();
+        // Starts may need to replace a stopped local workload/supervisor pair.
+        // Always reconstruct that input from the gateway's durable record;
+        // never let a driver derive provisioning input from mutable runtime
+        // inspection output.
+        let driver_sandbox = match driver_sandbox_from_public(&starting, &self.driver_info.name) {
+            Ok(sandbox) => sandbox,
+            Err(error) => {
+                self.persist_invalid_start_snapshot(&starting, error.message())
+                    .await;
+                return Err(Status::failed_precondition(format!(
+                    "start sandbox failed: persisted sandbox cannot be converted for driver '{}': {}",
+                    self.driver_info.name,
+                    error.message()
+                )));
+            }
+        };
         let authentication_for_recreate = launch_authentication.clone();
         let mut result = self
             .await_provisioning_operation(
@@ -1330,6 +1346,7 @@ impl ComputeRuntime {
                     |driver| {
                         let sandbox_id = sandbox_id.clone();
                         let sandbox_name = sandbox_name.clone();
+                        let driver_sandbox = driver_sandbox.clone();
                         async move {
                             driver
                                 .start_sandbox(Request::new(StartSandboxRequest {
@@ -1337,6 +1354,7 @@ impl ComputeRuntime {
                                     name: sandbox_name,
                                     launch_authentication,
                                     generation_id,
+                                    sandbox: Some(driver_sandbox),
                                 }))
                                 .await
                         }
@@ -2377,13 +2395,14 @@ impl ComputeRuntime {
         authentication_failed: Failed,
     ) -> Result<(), String>
     where
-        Authentication: Fn(&Sandbox) -> AuthenticationFuture,
-        AuthenticationFuture: Future<Output = Result<Vec<u8>, String>>,
-        Committed: Fn(&str) -> CommittedFuture,
-        CommittedFuture: Future<Output = Result<(), String>>,
-        Failed: Fn(&str),
+        Authentication: Fn(&Sandbox) -> AuthenticationFuture + Send + Sync,
+        AuthenticationFuture: Future<Output = Result<Vec<u8>, String>> + Send,
+        Committed: Fn(&str) -> CommittedFuture + Send + Sync,
+        CommittedFuture: Future<Output = Result<(), String>> + Send,
+        Failed: Fn(&str) + Send + Sync,
     {
-        self.recover_persisted_lifecycle_transitions().await?;
+        self.recover_persisted_lifecycle_transitions(&launch_authentication_for)
+            .await?;
         if !self.driver_info.gateway_manages_lifecycle {
             return Ok(());
         }
@@ -2428,6 +2447,27 @@ impl ComputeRuntime {
                     continue;
                 }
             };
+            // Recovery is allowed to reconstruct provisioning inputs only
+            // from the persisted gateway record. A malformed durable record is
+            // terminal for this transition: retaining Running/Starting would
+            // risk a local driver reconstituting it from inspected runtime
+            // configuration instead.
+            let driver_sandbox = match driver_sandbox_from_public(&sandbox, &self.driver_info.name)
+            {
+                Ok(sandbox) => sandbox,
+                Err(error) => {
+                    warn!(
+                        sandbox_id = %sandbox.object_id(),
+                        sandbox_name = %sandbox.object_name(),
+                        error = %error.message(),
+                        "Persisted sandbox could not be converted during gateway startup"
+                    );
+                    self.persist_invalid_start_snapshot(&sandbox, error.message())
+                        .await;
+                    failed += 1;
+                    continue;
+                }
+            };
             let launch_authentication = match launch_authentication_for(&sandbox).await {
                 Ok(authentication) => authentication,
                 Err(err) => {
@@ -2461,6 +2501,7 @@ impl ComputeRuntime {
                             let sandbox_id = sandbox_id.clone();
                             let sandbox_name = sandbox_name.clone();
                             let launch_authentication = launch_authentication.clone();
+                            let driver_sandbox = driver_sandbox.clone();
                             async move {
                                 driver
                                     .start_sandbox(Request::new(StartSandboxRequest {
@@ -2468,6 +2509,7 @@ impl ComputeRuntime {
                                         name: sandbox_name,
                                         launch_authentication,
                                         generation_id,
+                                        sandbox: Some(driver_sandbox),
                                     }))
                                     .await
                             }
@@ -2559,7 +2601,14 @@ impl ComputeRuntime {
         Ok(())
     }
 
-    async fn recover_persisted_lifecycle_transitions(&self) -> Result<(), String> {
+    async fn recover_persisted_lifecycle_transitions<Authentication, AuthenticationFuture>(
+        &self,
+        launch_authentication_for: &Authentication,
+    ) -> Result<(), String>
+    where
+        Authentication: Fn(&Sandbox) -> AuthenticationFuture + Send + Sync,
+        AuthenticationFuture: Future<Output = Result<Vec<u8>, String>> + Send,
+    {
         let sandbox_ids = self
             .list_persisted_sandbox_ids("lifecycle recovery")
             .await?;
@@ -2644,6 +2693,30 @@ impl ComputeRuntime {
                         Ok(generation) => generation.into_string(),
                         Err(error) => {
                             warn!(sandbox_id, %error, "Persisted sandbox runtime identity is invalid");
+                            self.persist_invalid_start_snapshot(&sandbox, &error).await;
+                            continue;
+                        }
+                    };
+                    let driver_sandbox = match driver_sandbox_from_public(
+                        &sandbox,
+                        &self.driver_info.name,
+                    ) {
+                        Ok(sandbox) => sandbox,
+                        Err(error) => {
+                            warn!(sandbox_id, error = %error.message(), "Persisted sandbox could not be converted during lifecycle recovery");
+                            self.persist_invalid_start_snapshot(&sandbox, error.message())
+                                .await;
+                            continue;
+                        }
+                    };
+                    // A stopped-pair replacement needs a fresh gateway-issued
+                    // credential just as an ordinary persisted-start retry
+                    // does. It is intentionally not reconstructed from the
+                    // local driver's inspected containers.
+                    let launch_authentication = match launch_authentication_for(&sandbox).await {
+                        Ok(authentication) => authentication,
+                        Err(error) => {
+                            warn!(sandbox_id, %error, "Could not derive launch authentication during lifecycle recovery");
                             continue;
                         }
                     };
@@ -2652,15 +2725,20 @@ impl ComputeRuntime {
                         .call(
                             openshell_otel::rpc::START_SANDBOX,
                             Some(&sandbox_id),
-                            |driver| async move {
-                                driver
-                                    .start_sandbox(Request::new(StartSandboxRequest {
-                                        sandbox_id: driver_sandbox_id,
-                                        name: sandbox_name,
-                                        launch_authentication: Vec::new(),
-                                        generation_id,
-                                    }))
-                                    .await
+                            |driver| {
+                                let driver_sandbox = driver_sandbox.clone();
+                                let launch_authentication = launch_authentication.clone();
+                                async move {
+                                    driver
+                                        .start_sandbox(Request::new(StartSandboxRequest {
+                                            sandbox_id: driver_sandbox_id,
+                                            name: sandbox_name,
+                                            launch_authentication,
+                                            generation_id,
+                                            sandbox: Some(driver_sandbox),
+                                        }))
+                                        .await
+                                }
                             },
                         )
                         .await
@@ -2680,6 +2758,22 @@ impl ComputeRuntime {
             .await
             .map(|records| records.into_iter().map(|record| record.id).collect())
             .map_err(|err| format!("failed to list sandboxes for {operation}: {err}"))
+    }
+
+    /// Fail closed when a start/recovery cannot reconstruct a driver's durable
+    /// provisioning snapshot.  This is intentionally distinct from an
+    /// ambiguous transport failure: no start RPC has been issued, so keeping
+    /// `Starting` for a blind retry would allow a local reconciliation path to
+    /// fall back to mutable platform state.
+    async fn persist_invalid_start_snapshot(&self, sandbox: &Sandbox, error: &str) {
+        self.mark_sandbox_error(
+            sandbox,
+            "InvalidPersistedSandbox",
+            &format!(
+                "Sandbox lifecycle recovery requires a valid persisted driver snapshot: {error}"
+            ),
+        )
+        .await;
     }
 
     async fn mark_sandbox_error(&self, sandbox: &Sandbox, reason: &str, message: &str) {
@@ -11963,11 +12057,28 @@ mod tests {
         ));
 
         driver.clear_calls();
-        runtime.start_persisted_sandboxes().await.unwrap();
+        runtime
+            .start_persisted_sandboxes_with_authentication(
+                |_| async { Ok(b"test-launch-authentication".to_vec()) },
+                |_| async { Ok(()) },
+                |_| {},
+            )
+            .await
+            .unwrap();
         assert!(matches!(
             driver.calls().as_slice(),
-            [FakeComputeDriverCall::StartSandbox { sandbox_id, sandbox_name }]
-                if sandbox_id == "sb-uds" && sandbox_name == "uds-sandbox"
+            [FakeComputeDriverCall::StartSandbox {
+                sandbox_id,
+                sandbox_name,
+                launch_authentication,
+                sandbox: Some(durable),
+                ..
+            }]
+                if sandbox_id == "sb-uds"
+                    && sandbox_name == "uds-sandbox"
+                    && !launch_authentication.is_empty()
+                    && durable.id == "sb-uds"
+                    && durable.name == "uds-sandbox"
         ));
         driver.clear_calls();
         assert!(
@@ -11990,6 +12101,39 @@ mod tests {
             }
             other => panic!("expected DeleteSandbox call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn start_sandbox_request_uses_optional_wire_field_five_for_durable_snapshot() {
+        let legacy = StartSandboxRequest {
+            sandbox_id: "sandbox-id".into(),
+            name: "sandbox-name".into(),
+            launch_authentication: b"opaque-auth".to_vec(),
+            generation_id: "generation-id".into(),
+            sandbox: None,
+        };
+        let with_snapshot = StartSandboxRequest {
+            sandbox: Some(DriverSandbox {
+                id: "sandbox-id".into(),
+                name: "sandbox-name".into(),
+                ..Default::default()
+            }),
+            ..legacy.clone()
+        };
+        let legacy_wire = legacy.encode_to_vec();
+        let snapshot_wire = with_snapshot.encode_to_vec();
+        // Field 5 is length-delimited, hence its protobuf key is 0x2a. The
+        // legacy form does not emit it, preserving existing fields 1–4.
+        assert!(!legacy_wire.contains(&0x2a));
+        assert!(snapshot_wire.contains(&0x2a));
+        assert_eq!(
+            StartSandboxRequest::decode(snapshot_wire.as_slice())
+                .unwrap()
+                .sandbox
+                .as_ref()
+                .map(|sandbox| sandbox.id.as_str()),
+            Some("sandbox-id")
+        );
     }
 
     #[tokio::test]

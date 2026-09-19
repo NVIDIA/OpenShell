@@ -173,23 +173,26 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<StartSandboxResponse>, Status> {
-        self.rpc_tracer
-            .trace(openshell_otel::rpc::START_SANDBOX, async {
-                let request = request.into_inner();
-                if request.sandbox_id.is_empty() {
-                    return Err(Status::invalid_argument("sandbox_id is required"));
-                }
-                self.driver
-                    .start_sandbox(
-                        &request.sandbox_id,
-                        &request.generation_id,
-                        &request.launch_authentication,
-                    )
-                    .await
-                    .map_err(Status::from)?;
-                Ok(Response::new(StartSandboxResponse {}))
-            })
-            .await
+        Box::pin(
+            self.rpc_tracer
+                .trace(openshell_otel::rpc::START_SANDBOX, async {
+                    let request = request.into_inner();
+                    if request.sandbox_id.is_empty() {
+                        return Err(Status::invalid_argument("sandbox_id is required"));
+                    }
+                    self.driver
+                        .start_sandbox(
+                            &request.sandbox_id,
+                            &request.generation_id,
+                            &request.launch_authentication,
+                            request.sandbox.as_ref(),
+                        )
+                        .await
+                        .map_err(Status::from)?;
+                    Ok(Response::new(StartSandboxResponse {}))
+                }),
+        )
+        .await
     }
 
     async fn delete_sandbox(

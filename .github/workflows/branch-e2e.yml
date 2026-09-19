@@ -276,6 +276,20 @@ jobs:
       runner: linux-arm64-cpu8
       conformance-artifact-prefix: openshell-conformance
 
+  podman-additional-ca-e2e:
+    needs: [pr_metadata, build-binaries, build-images]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-podman-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      conformance-artifact-prefix: openshell-conformance
+      suite-matrix: >-
+        [{"suite":"additional-ca","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"OPENSHELL_E2E_PODMAN_TEST=additional_ca mise run --no-deps --skip-deps e2e:podman"}]
+
   vm-e2e:
     needs: [pr_metadata, build-binaries, build-vm-driver]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
@@ -285,6 +299,19 @@ jobs:
       packages: read
     uses: ./.github/workflows/e2e-vm-test.yml
     with:
+      conformance-artifact-prefix: openshell-conformance
+
+  vm-additional-ca-e2e:
+    needs: [pr_metadata, build-binaries, build-vm-driver]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-vm-test.yml
+    with:
+      suite-name: additional-ca
+      test-name: additional_ca
       conformance-artifact-prefix: openshell-conformance
 
   docker-external-driver-e2e:
@@ -355,8 +382,16 @@ jobs:
         include:
           - agent_sandbox_api: v1beta1
             agent_sandbox_version: v0.5.0
+            job_name: Kubernetes E2E (Rust smoke, Agent Sandbox v1beta1)
+            test_name: ""
           - agent_sandbox_api: v1alpha1
             agent_sandbox_version: v0.4.6
+            job_name: Kubernetes E2E (Rust smoke, Agent Sandbox v1alpha1)
+            test_name: ""
+          - agent_sandbox_api: v1beta1
+            agent_sandbox_version: v0.5.0
+            job_name: Kubernetes E2E (additional destination CA, Agent Sandbox v1beta1)
+            test_name: additional_ca
     permissions:
       actions: read
       contents: read
@@ -364,8 +399,9 @@ jobs:
     uses: ./.github/workflows/e2e-kubernetes-test.yml
     with:
       image-tag: ${{ github.sha }}
-      job-name: Kubernetes E2E (Rust smoke, Agent Sandbox ${{ matrix.agent_sandbox_api }})
+      job-name: ${{ matrix.job_name }}
       agent-sandbox-version: ${{ matrix.agent_sandbox_version }}
+      test-name: ${{ matrix.test_name }}
       conformance-artifact-prefix: openshell-conformance
 
   kubernetes-workspace-managed-e2e:
@@ -449,7 +485,9 @@ jobs:
       - conformance-integration
       - feature-specific-integration
       - docker-e2e
+      - podman-additional-ca-e2e
       - vm-e2e
+      - vm-additional-ca-e2e
       - docker-external-driver-e2e
       - podman-external-driver-e2e
       - vm-external-driver-e2e

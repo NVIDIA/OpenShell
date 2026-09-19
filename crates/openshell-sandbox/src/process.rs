@@ -478,6 +478,7 @@ impl ProcessHandle {
         interactive: bool,
         policy: &SandboxPolicy,
         ca_paths: Option<&(PathBuf, PathBuf)>,
+        tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         Self::spawn_impl(
@@ -488,6 +489,7 @@ impl ProcessHandle {
             interactive,
             policy,
             ca_paths,
+            tls_environment_mode,
             provider_env,
         )
     }
@@ -506,6 +508,7 @@ impl ProcessHandle {
         interactive: bool,
         policy: &SandboxPolicy,
         ca_paths: Option<&(PathBuf, PathBuf)>,
+        tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         Self::spawn_impl(
@@ -515,6 +518,7 @@ impl ProcessHandle {
             interactive,
             policy,
             ca_paths,
+            tls_environment_mode,
             provider_env,
         )
     }
@@ -529,6 +533,7 @@ impl ProcessHandle {
         interactive: bool,
         policy: &SandboxPolicy,
         ca_paths: Option<&(PathBuf, PathBuf)>,
+        tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
@@ -563,12 +568,13 @@ impl ProcessHandle {
         // inherited environment. The entrypoint drops to the sandbox user
         // before `exec`; without this strip, sandbox code could recover
         // supervisor credentials from its inherited environment.
+        let user_environment = configured_user_environment();
         apply_canonical_process_environment(
             &mut cmd,
             policy,
             workspace,
             interactive,
-            &configured_user_environment(),
+            &user_environment,
         );
         strip_supervisor_only_env(&mut cmd);
 
@@ -580,9 +586,28 @@ impl ProcessHandle {
 
         strip_proxy_env(&mut cmd);
 
-        // Set TLS trust store env vars so sandbox processes trust the ephemeral CA
+        // In interception mode OpenShell trust is authoritative. In direct
+        // additional-CA mode, retain all caller values and only fill gaps.
         if let Some((ca_cert_path, combined_bundle_path)) = ca_paths {
-            for (key, value) in child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
+            // Provider credentials are injected before this point. Reassert
+            // caller TLS values in additive mode so a provider environment
+            // cannot accidentally replace a caller-selected trust store.
+            if matches!(
+                tls_environment_mode,
+                child_env::TlsEnvironmentMode::FillMissing
+            ) {
+                for (key, value) in &user_environment {
+                    if child_env::is_tls_environment_variable(key) {
+                        cmd.env(key, value);
+                    }
+                }
+            }
+            for (key, value) in child_env::tls_env_vars_for_mode(
+                ca_cert_path,
+                combined_bundle_path,
+                tls_environment_mode,
+                &user_environment,
+            ) {
                 cmd.env(key, value);
             }
         }
@@ -694,6 +719,7 @@ impl ProcessHandle {
         interactive: bool,
         policy: &SandboxPolicy,
         ca_paths: Option<&(PathBuf, PathBuf)>,
+        tls_environment_mode: child_env::TlsEnvironmentMode,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
@@ -728,12 +754,13 @@ impl ProcessHandle {
 
         // Strip supervisor-only identity material from the entrypoint's
         // inherited environment.
+        let user_environment = configured_user_environment();
         apply_canonical_process_environment(
             &mut cmd,
             policy,
             workspace,
             interactive,
-            &configured_user_environment(),
+            &user_environment,
         );
         strip_supervisor_only_env(&mut cmd);
 
@@ -745,9 +772,28 @@ impl ProcessHandle {
 
         strip_proxy_env(&mut cmd);
 
-        // Set TLS trust store env vars so sandbox processes trust the ephemeral CA
+        // In interception mode OpenShell trust is authoritative. In direct
+        // additional-CA mode, retain all caller values and only fill gaps.
         if let Some((ca_cert_path, combined_bundle_path)) = ca_paths {
-            for (key, value) in child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
+            // Provider credentials are injected before this point. Reassert
+            // caller TLS values in additive mode so a provider environment
+            // cannot accidentally replace a caller-selected trust store.
+            if matches!(
+                tls_environment_mode,
+                child_env::TlsEnvironmentMode::FillMissing
+            ) {
+                for (key, value) in &user_environment {
+                    if child_env::is_tls_environment_variable(key) {
+                        cmd.env(key, value);
+                    }
+                }
+            }
+            for (key, value) in child_env::tls_env_vars_for_mode(
+                ca_cert_path,
+                combined_bundle_path,
+                tls_environment_mode,
+                &user_environment,
+            ) {
                 cmd.env(key, value);
             }
         }

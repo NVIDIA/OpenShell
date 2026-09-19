@@ -118,6 +118,12 @@ OPENSHIFT_ROUTE_HOST=""
 # Temp dir holding the client mTLS material extracted from openshell-client-tls
 # for the OpenShift Route transport. Removed by cleanup().
 OPENSHIFT_PKI_DIR="${WORKDIR}/openshift-pki"
+ADDITIONAL_CA_MODE="${OPENSHELL_E2E_ADDITIONAL_CA:-0}"
+ADDITIONAL_CA_SOURCE_CONFIG_MAP="openshell-e2e-additional-ca"
+ADDITIONAL_CA_SERVER_PID=""
+ADDITIONAL_CA_SERVER_LOG="${WORKDIR}/additional-ca-server.log"
+ADDITIONAL_CA_DIR="${WORKDIR}/additional-ca"
+ADDITIONAL_CA_SOURCE_CREATED=0
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -328,6 +334,15 @@ cleanup() {
   if [ -n "${PORTFORWARD_HEALTH_PID}" ]; then
     kill "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
     wait "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
+  fi
+  e2e_stop_process "${ADDITIONAL_CA_SERVER_PID}" "additional CA HTTPS fixture"
+
+  if [ "${ADDITIONAL_CA_SOURCE_CREATED}" = "1" ] \
+     && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ] \
+     && command -v kubectl >/dev/null 2>&1; then
+    kctl -n "${NAMESPACE}" delete configmap "${ADDITIONAL_CA_SOURCE_CONFIG_MAP}" \
+      --ignore-not-found >/dev/null 2>&1 || true
+    ADDITIONAL_CA_SOURCE_CREATED=0
   fi
 
   if [ "${exit_code}" -ne 0 ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
@@ -565,6 +580,12 @@ run_scenario() {
   export OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
+  if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_NAMESPACE="${NAMESPACE}"
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_RELEASE="${RELEASE_NAME}"
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_CHART="${ROOT}/deploy/helm/openshell"
+    export OPENSHELL_E2E_KUBE_GATEWAY_LOCAL_PORT="${LOCAL_PORT:-}"
+  fi
 
   e2e_import_example_provider_profiles \
     "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" "${ROOT}" || return 1
@@ -1000,6 +1021,29 @@ if kctl api-resources --api-group=route.openshift.io --no-headers 2>/dev/null | 
   fi
 fi
 
+start_additional_ca_fixture() {
+  [ "${ADDITIONAL_CA_MODE}" = "1" ] || return 0
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+    echo "ERROR: Kubernetes additional CA e2e requires the in-process Kubernetes driver." >&2
+    return 1
+  fi
+  if [ -z "${HOST_GATEWAY_IP}" ]; then
+    echo "ERROR: Kubernetes additional CA e2e requires a host gateway IP for host.openshell.internal." >&2
+    return 1
+  fi
+
+  e2e_start_additional_ca_fixture \
+    "${ADDITIONAL_CA_DIR}" "${ADDITIONAL_CA_SERVER_LOG}" \
+    ADDITIONAL_CA_SERVER_PID ADDITIONAL_CA_PORT
+  kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+  kctl -n "${NAMESPACE}" create configmap "${ADDITIONAL_CA_SOURCE_CONFIG_MAP}" \
+    --from-file="ca.crt=${ADDITIONAL_CA_DIR}/ca.crt" \
+    --dry-run=client -o yaml | kctl apply -f -
+  ADDITIONAL_CA_SOURCE_CREATED=1
+}
+
+start_additional_ca_fixture
+
 ACTIVE_CREDENTIAL_DRIVER="${OPENSHELL_E2E_CREDENTIAL_DRIVER:-kubernetes-secrets}"
 if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ] \
    && [ "${ACTIVE_CREDENTIAL_DRIVER}" = "vault" ]; then
@@ -1009,6 +1053,9 @@ fi
 helm_extra_args=()
 helm_post_renderer_args=()
 helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
+if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+  helm_extra_args+=(--set "supervisor.network.additionalCaConfigMapName=${ADDITIONAL_CA_SOURCE_CONFIG_MAP}")
+fi
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" != "1" ]; then
     echo "ERROR: external Kubernetes driver e2e requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=1." >&2
@@ -1211,6 +1258,12 @@ else
   export OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
+  if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_NAMESPACE="${NAMESPACE}"
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_RELEASE="${RELEASE_NAME}"
+    export OPENSHELL_E2E_ADDITIONAL_CA_HELM_CHART="${ROOT}/deploy/helm/openshell"
+    export OPENSHELL_E2E_KUBE_GATEWAY_LOCAL_PORT="${LOCAL_PORT:-}"
+  fi
 
   e2e_import_example_provider_profiles \
     "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" "${ROOT}" || exit 1
