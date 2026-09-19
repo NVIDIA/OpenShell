@@ -1033,6 +1033,80 @@ fn pc_oneshot_out_of_policy_write_denied() {
     );
 }
 
+/// Reading an unrelated root-level path remains denied when only the workload
+/// fixture is granted. This guards the `OpenClaw` Node.js workaround against
+/// accidentally granting broad access beneath `C:\`.
+#[test]
+#[ignore = "requires real wxc-exec"]
+fn pc_oneshot_unrelated_root_path_read_denied() {
+    let Some(wxc) = wxc_path() else {
+        eprintln!("SKIP: wxc-exec not found");
+        return;
+    };
+
+    if let Err(reason) = probe_processcontainer(&wxc) {
+        eprintln!("SKIP: processcontainer not live: {reason}");
+        return;
+    }
+
+    let granted_dir = tempfile::tempdir().expect("granted tempdir");
+    let denied_root_dir = tempfile::Builder::new()
+        .prefix("openshell-pc-denied-")
+        .tempdir_in(r"C:\")
+        .expect("root-level denied tempdir");
+    let denied_file = denied_root_dir.path().join("sentinel.txt");
+    std::fs::write(&denied_file, "root-level secret").expect("write denied sentinel");
+    let denied_file_str = denied_file.to_string_lossy().into_owned();
+    let granted_str = granted_dir.path().to_string_lossy().into_owned();
+    let diagnostic = granted_dir.path().join("root-read.txt");
+    let diagnostic_str = diagnostic.to_string_lossy().into_owned();
+    let config = serde_json::json!({
+        "version": "0.6.0-alpha",
+        "containerId": "pc-root-read-denied",
+        "containment": "processcontainer",
+        "process": {
+            "commandLine": format!("cmd /d /c type \"{denied_file_str}\" 1>\"{diagnostic_str}\" 2>&1"),
+            "cwd": granted_str,
+            "timeout": 30_000,
+        },
+        "filesystem": {
+            "readwritePaths": [granted_str],
+        },
+        "processContainer": {
+            "leastPrivilege": false,
+        },
+        "ui": {
+            "disable": false,
+            "clipboard": "none",
+            "injection": false,
+        },
+    });
+
+    let json = serde_json::to_string(&config).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+    let out = Command::new(&wxc)
+        .arg("--config-base64")
+        .arg(&b64)
+        .output()
+        .expect("wxc-exec spawn");
+    let code = out.status.code().unwrap_or(-1);
+    let root_read = std::fs::read_to_string(&diagnostic)
+        .expect("sandboxed cmd must run and write its drive-root diagnostic");
+
+    assert_ne!(
+        code, 0,
+        "unrelated root-level read must remain denied; diagnostic={root_read}"
+    );
+    assert!(
+        root_read.to_ascii_lowercase().contains("access is denied"),
+        "failure must specifically be the root-level access denial; diagnostic={root_read}"
+    );
+    assert!(
+        !root_read.contains("root-level secret"),
+        "root-level file contents must not be readable; diagnostic={root_read}"
+    );
+}
+
 // ── Isolation session enforcement tests ──────────────────────────────────────
 
 /// Full `isolation_session` round trip: provision → start → exec → stop →

@@ -6,6 +6,9 @@
 # allowLocalNetwork=true lets the AppContainer reach the host's loopback (the gateway
 # relay) without routing through the egress proxy, which breaks node.js DLL init.
 
+[openshell]
+version = 2
+
 [openshell.drivers.mxc]
 wxc_exec_path = "C:\\FromSenthil\\mxc-fixes-env-vars\\wxc-exec.exe"
 

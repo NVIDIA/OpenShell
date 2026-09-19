@@ -26,6 +26,9 @@
 # openshell-supervisor-relay.exe / the caller's OpenClaw install into
 # the sandbox's policy-authorized working directory before creating it.
 
+[openshell]
+version = 2
+
 [openshell.drivers.mxc]
 wxc_exec_path = "C:\\mxc-kit\\bin\\wxc-exec.exe"
 

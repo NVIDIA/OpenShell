@@ -63,7 +63,9 @@
 //!   Request:  `{"id": <N>, "op": "<op>", "data": <any>}`
 //!   Response: `{"id": <N>, "ok": true,  "data": <any>}`
 //!          or `{"id": <N>, "ok": false, "error": "<msg>"}`
-//!   Event (unsolicited, no id): `{"event": "<name>"}`
+//!   Event (unsolicited, no id): `{"event": "<name>"}` (startup also emits
+//!          either `target_ready` or `target_failed`; the latter includes an
+//!          `error` string with the target's exit and bounded stderr detail)
 //!
 //! Startup handshake: before spawning anything, this process emits
 //! `{"event":"ready","protocol_version":N}` on stdout (`N` = `PROTOCOL_VERSION`
@@ -93,8 +95,8 @@
 
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
@@ -108,7 +110,22 @@ use tokio_tungstenite::tungstenite::Message;
 /// out-of-sync peer can't safely ignore, so an independently staged, stale
 /// binary on either side fails fast with a clear version-mismatch error
 /// instead of hanging or misbehaving against a field/event it predates.
-const PROTOCOL_VERSION: u64 = 2;
+const PROTOCOL_VERSION: u64 = 3;
+
+const TARGET_STDERR_TAIL_LINES: usize = 20;
+const TARGET_STDERR_LINE_CHARS: usize = 1024;
+
+struct SpawnedTarget {
+    child: tokio::process::Child,
+    stderr_tail: Arc<StdMutex<VecDeque<String>>>,
+    stderr_forwarder: Option<tokio::task::JoinHandle<()>>,
+}
+
+enum StartupOutcome {
+    Ready(anyhow::Result<()>),
+    Exited(std::io::Result<std::process::ExitStatus>),
+    Shutdown,
+}
 
 struct ForwardSession {
     reader: tokio::sync::Mutex<tokio::net::tcp::OwnedReadHalf>,
@@ -134,16 +151,18 @@ pub async fn run() -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let shutdown_slot = Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx)));
     let forward_sessions = Arc::new(ForwardSessions::new(HashMap::new()));
-    // Lets main() ask run_control_channel's task to announce "target_ready"
-    // on stdout once the target is actually up (see below) -- routed
-    // through that task rather than a second independent stdout handle
-    // here, since concurrent writers to tokio's stdout can interleave.
-    let (target_ready_tx, target_ready_rx) = oneshot::channel::<()>();
+    // Lets main() ask run_control_channel's task to announce either
+    // "target_ready" or "target_failed" on stdout. The acknowledgement makes
+    // failure delivery deterministic: do not let this process exit until the
+    // real target diagnostic has been flushed into the pipe to the driver.
+    let (target_status_tx, target_status_rx) = oneshot::channel::<Result<(), String>>();
+    let (target_status_ack_tx, target_status_ack_rx) = oneshot::channel::<()>();
     tokio::spawn(run_control_channel(
         launch_slot,
         shutdown_slot,
         forward_sessions,
-        target_ready_rx,
+        target_status_rx,
+        target_status_ack_tx,
     ));
 
     eprintln!("[openshell-supervisor-relay] waiting for launch request from driver...");
@@ -151,7 +170,16 @@ pub async fn run() -> anyhow::Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("control channel closed before a launch request arrived"))?;
 
-    let mut child = spawn_target(command, env)?;
+    let mut target = match spawn_target(command, env) {
+        Ok(target) => target,
+        Err(error) => {
+            let message = format!("target process failed to start: {error:#}");
+            announce_target_status(target_status_tx, target_status_ack_rx, Err(message.clone()))
+                .await;
+            eprintln!("[openshell-supervisor-relay] {message}");
+            std::process::exit(1);
+        }
+    };
 
     eprintln!("[openshell-supervisor-relay] waiting for target on 127.0.0.1:{port} ...");
     // Race the (up to ~300s worst case) port-readiness wait against a
@@ -164,16 +192,37 @@ pub async fn run() -> anyhow::Result<()> {
     // (and the target it spawned) alive for up to the full port-readiness
     // budget after a caller was told shutdown succeeded.
     let mut shutdown_rx = shutdown_rx;
-    tokio::select! {
-        result = wait_for_port_ready(&mut child, port, PORT_READY_PER_TRY_TIMEOUT) => {
-            result?;
+    let startup = tokio::select! {
+        result = wait_for_port_ready(port, PORT_READY_PER_TRY_TIMEOUT) => {
+            StartupOutcome::Ready(result)
         }
-        _ = &mut shutdown_rx => {
+        status = target.child.wait() => StartupOutcome::Exited(status),
+        _ = &mut shutdown_rx => StartupOutcome::Shutdown,
+    };
+    match startup {
+        StartupOutcome::Ready(Ok(())) => {}
+        StartupOutcome::Ready(Err(error)) => {
+            let _ = target.child.kill().await;
+            let status = target.child.wait().await;
+            let message = target_failure_message(&mut target, port, status, Some(&error)).await;
+            announce_target_status(target_status_tx, target_status_ack_rx, Err(message.clone()))
+                .await;
+            eprintln!("[openshell-supervisor-relay] {message}");
+            std::process::exit(1);
+        }
+        StartupOutcome::Exited(status) => {
+            let message = target_failure_message(&mut target, port, status, None).await;
+            announce_target_status(target_status_tx, target_status_ack_rx, Err(message.clone()))
+                .await;
+            eprintln!("[openshell-supervisor-relay] {message}");
+            std::process::exit(1);
+        }
+        StartupOutcome::Shutdown => {
             eprintln!(
                 "[openshell-supervisor-relay] shutdown request -- stopping before target became ready"
             );
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = target.child.kill().await;
+            let _ = target.child.wait().await;
             eprintln!("[openshell-supervisor-relay] done");
             // Not `return Ok(())`: run_control_channel loops on
             // stdin.next_line() for this process's entire lifetime and
@@ -193,12 +242,12 @@ pub async fn run() -> anyhow::Result<()> {
     // target is actually reachable) -- driver.rs awaits this before
     // publishing the sandbox Ready=True. A send failure just means the
     // control-channel task already exited; nothing to do about that here.
-    let _ = target_ready_tx.send(());
+    announce_target_status(target_status_tx, target_status_ack_rx, Ok(())).await;
 
     // No bridge at startup -- relay bridging is entirely on-demand via the
     // control channel's "forward" op (see module docs). Just run the target
     // process's lifecycle from here.
-    run_lifecycle(child, shutdown_rx).await;
+    run_lifecycle(target, shutdown_rx).await;
 
     Ok(())
 }
@@ -244,7 +293,7 @@ fn byte_preview(data: &[u8]) -> String {
 /// because our stdout is reserved exclusively for the control-channel
 /// protocol with the driver. The child's stdin is closed; it isn't part of
 /// this channel.
-fn spawn_target(command: Vec<String>, env: Vec<String>) -> anyhow::Result<tokio::process::Child> {
+fn spawn_target(command: Vec<String>, env: Vec<String>) -> anyhow::Result<SpawnedTarget> {
     if command.is_empty() {
         anyhow::bail!("launch command must not be empty");
     }
@@ -284,24 +333,95 @@ fn spawn_target(command: Vec<String>, env: Vec<String>) -> anyhow::Result<tokio:
     let mut child = cmd.spawn()?;
 
     if let Some(stdout) = child.stdout.take() {
-        tokio::spawn(forward_tagged_lines(stdout, "target stdout"));
+        tokio::spawn(forward_tagged_lines(stdout, "target stdout", None));
     }
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(forward_tagged_lines(stderr, "target stderr"));
-    }
+    let stderr_tail = Arc::new(StdMutex::new(VecDeque::new()));
+    let stderr_forwarder = child.stderr.take().map(|stderr| {
+        tokio::spawn(forward_tagged_lines(
+            stderr,
+            "target stderr",
+            Some(stderr_tail.clone()),
+        ))
+    });
 
-    Ok(child)
+    Ok(SpawnedTarget {
+        child,
+        stderr_tail,
+        stderr_forwarder,
+    })
 }
 
 /// Read lines from `reader` and re-emit them on our own stderr, tagged, so
 /// the target's output stays visible in the gateway log without touching our
 /// stdout (reserved for the control channel).
-async fn forward_tagged_lines(reader: impl tokio::io::AsyncRead + Unpin, label: &'static str) {
+async fn forward_tagged_lines(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    label: &'static str,
+    capture_tail: Option<Arc<StdMutex<VecDeque<String>>>>,
+) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(tail) = &capture_tail {
+            let mut chars = line.chars();
+            let mut captured: String = chars.by_ref().take(TARGET_STDERR_LINE_CHARS).collect();
+            if chars.next().is_some() {
+                captured.push_str("...");
+            }
+            if let Ok(mut tail) = tail.lock() {
+                if tail.len() == TARGET_STDERR_TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(captured);
+            }
+        }
         eprintln!("[{label}] {line}");
     }
+}
+
+async fn announce_target_status(
+    sender: oneshot::Sender<Result<(), String>>,
+    announced: oneshot::Receiver<()>,
+    status: Result<(), String>,
+) {
+    if sender.send(status).is_err() {
+        return;
+    }
+    if tokio::time::timeout(Duration::from_secs(5), announced)
+        .await
+        .is_err()
+    {
+        eprintln!("[openshell-supervisor-relay] control channel did not flush target status");
+    }
+}
+
+async fn target_failure_message(
+    target: &mut SpawnedTarget,
+    port: u16,
+    status: std::io::Result<std::process::ExitStatus>,
+    readiness_error: Option<&anyhow::Error>,
+) -> String {
+    if let Some(forwarder) = target.stderr_forwarder.take() {
+        let _ = tokio::time::timeout(Duration::from_secs(2), forwarder).await;
+    }
+    let status = status.map_or_else(
+        |error| format!("status unavailable: {error}"),
+        |status| status.to_string(),
+    );
+    let stderr = target
+        .stderr_tail
+        .lock()
+        .map(|tail| tail.iter().cloned().collect::<Vec<_>>().join(" | "))
+        .unwrap_or_default();
+    let readiness = readiness_error
+        .map(|error| format!("; readiness error: {error:#}"))
+        .unwrap_or_default();
+    let stderr = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!("; stderr: {stderr}")
+    };
+    format!("target process exited before port {port} came up: {status}{readiness}{stderr}")
 }
 
 // ── Control channel ───────────────────────────────────────────────────────────
@@ -323,7 +443,8 @@ async fn run_control_channel(
     launch: Arc<LaunchSlot>,
     shutdown: Arc<ShutdownSlot>,
     forward_sessions: Arc<ForwardSessions>,
-    target_ready_rx: oneshot::Receiver<()>,
+    target_status_rx: oneshot::Receiver<Result<(), String>>,
+    target_status_ack: oneshot::Sender<()>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -344,11 +465,11 @@ async fn run_control_channel(
     }
     eprintln!("[openshell-supervisor-relay] control channel ready (stdin/stdout)");
 
-    // `None` once fired (or once main()'s sender is dropped without firing,
-    // e.g. wait_for_port_ready failed) -- the `if` guard below then disables
-    // that select arm instead of it firing repeatedly on every subsequent
-    // poll of an already-resolved oneshot.
-    let mut target_ready_rx = Some(target_ready_rx);
+    // `None` once fired (or once main()'s sender is dropped without firing) --
+    // the `if` guard below then disables that select arm instead of it firing
+    // repeatedly on every subsequent poll of an already-resolved oneshot.
+    let mut target_status_rx = Some(target_status_rx);
+    let mut target_status_ack = Some(target_status_ack);
 
     loop {
         tokio::select! {
@@ -395,19 +516,25 @@ async fn run_control_channel(
             // See module docs' startup handshake -- distinct from the
             // "launch" response, which only confirms the command/env
             // arrived. Unsolicited, like "ready" above.
-            result = async { target_ready_rx.as_mut().unwrap().await }, if target_ready_rx.is_some() => {
-                target_ready_rx = None;
-                if result.is_ok() {
-                    let event = serde_json::json!({"event": "target_ready"}).to_string() + "\n";
-                    if stdout.write_all(event.as_bytes()).await.is_err() || stdout.flush().await.is_err() {
-                        eprintln!("[openshell-supervisor-relay] control channel: failed to announce target_ready");
+            result = async { target_status_rx.as_mut().unwrap().await }, if target_status_rx.is_some() => {
+                target_status_rx = None;
+                let event = match result {
+                    Ok(Ok(())) => Some(serde_json::json!({"event": "target_ready"})),
+                    Ok(Err(error)) => Some(serde_json::json!({"event": "target_failed", "error": error})),
+                    Err(_) => None,
+                };
+                if let Some(event) = event {
+                    let out = event.to_string() + "\n";
+                    if stdout.write_all(out.as_bytes()).await.is_err() || stdout.flush().await.is_err() {
+                        eprintln!("[openshell-supervisor-relay] control channel: failed to announce target status");
+                    }
+                    if let Some(ack) = target_status_ack.take() {
+                        let _ = ack.send(());
                     }
                 }
-                // A dropped sender (main() bailed before the target ever
-                // came up, e.g. wait_for_port_ready's own error) means
-                // there's nothing to announce -- driver.rs's timeout on the
-                // corresponding event will surface that as a launch failure
-                // on its own.
+                // A dropped sender means main() exited before announcing
+                // target status. There is nothing to write in that case;
+                // driver.rs will observe control-channel EOF.
             }
         }
     }
@@ -722,28 +849,12 @@ where
 const PORT_READY_MAX_TRIES: u32 = 5;
 const PORT_READY_PER_TRY_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// Poll for the target port accepting TCP connections, bailing out early
-/// (rather than waiting out all tries) if the child process exits first — a
-/// dead child will never open the port, so there's no reason to wait. Makes
-/// up to `PORT_READY_MAX_TRIES` tries, each given the full `per_try_timeout`
-/// budget, logging the start of every try so a long cold-start wait (Node.js
-/// first-run JIT/module resolution, first-touch AV scan of freshly staged
-/// binaries, etc.) is visible rather than silent until success or final
-/// timeout.
-async fn wait_for_port_ready(
-    child: &mut tokio::process::Child,
-    port: u16,
-    per_try_timeout: Duration,
-) -> anyhow::Result<()> {
-    // Bound each individual connect attempt: on at least one observed
-    // wxc-exec build, a connect() against a not-yet-listening loopback port
-    // inside the AppContainer never resolved at all (no fast ECONNREFUSED,
-    // no error) instead of failing quickly like an ordinary closed-port
-    // connect. Without this, a single early attempt can hang forever and
-    // this function -- and the whole readiness wait -- never returns even
-    // after the target's port genuinely opens, since nothing ever retries.
-    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
-
+/// Poll for the target port accepting TCP connections. Target termination is
+/// observed independently by `run` through `Child::wait`, so this function
+/// never polls the process handle and cannot miss an exit while a connect is
+/// stuck. Makes up to `PORT_READY_MAX_TRIES` tries, each given the full
+/// `per_try_timeout` budget.
+async fn wait_for_port_ready(port: u16, per_try_timeout: Duration) -> anyhow::Result<()> {
     let overall_start = tokio::time::Instant::now();
     for try_num in 1..=PORT_READY_MAX_TRIES {
         eprintln!(
@@ -751,20 +862,23 @@ async fn wait_for_port_ready(
         );
         let try_deadline = tokio::time::Instant::now() + per_try_timeout;
         loop {
-            let attempt = tokio::time::timeout(
-                ATTEMPT_TIMEOUT,
-                tokio::net::TcpStream::connect(("127.0.0.1", port)),
-            )
+            // A ProcessContainer loopback connect has been observed to block
+            // inside the OS call long enough that Tokio's timer and every
+            // later `try_wait()` poll on this task were starved for ~300s.
+            // Isolate it on the blocking pool and use the socket API's own
+            // deadline. `run` continues awaiting the child handle in parallel,
+            // so an early crash is reported even if this worker remains stuck.
+            let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            let attempt = tokio::task::spawn_blocking(move || {
+                std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2))
+            })
             .await;
-            if let Ok(Ok(_)) = attempt {
+            if matches!(attempt, Ok(Ok(_))) {
                 eprintln!(
                     "[openshell-supervisor-relay] port {port} ready after {:?} (try {try_num}/{PORT_READY_MAX_TRIES})",
                     overall_start.elapsed()
                 );
                 return Ok(());
-            }
-            if let Ok(Some(status)) = child.try_wait() {
-                anyhow::bail!("target process exited before port {port} came up: {status}");
             }
             if tokio::time::Instant::now() >= try_deadline {
                 eprintln!(
@@ -998,17 +1112,17 @@ async fn run_relay_bridge(
 /// Any active dynamic relay bridges are tokio tasks in this same process, so
 /// `std::process::exit` below tears them down too -- no separate stop signal
 /// needed.
-async fn run_lifecycle(mut child: tokio::process::Child, shutdown_rx: oneshot::Receiver<()>) {
+async fn run_lifecycle(mut target: SpawnedTarget, shutdown_rx: oneshot::Receiver<()>) {
     tokio::select! {
-        status = child.wait() => {
+        status = target.child.wait() => {
             let code = status.map_or(1, |s| s.code().unwrap_or(1));
             eprintln!("[openshell-supervisor-relay] target exited with code {code}");
             std::process::exit(code);
         }
         _ = shutdown_rx => {
             eprintln!("[openshell-supervisor-relay] shutdown request -- stopping");
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = target.child.kill().await;
+            let _ = target.child.wait().await;
             eprintln!("[openshell-supervisor-relay] done");
             std::process::exit(0);
         }

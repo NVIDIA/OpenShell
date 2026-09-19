@@ -187,7 +187,7 @@ impl RelayProcess {
     async fn expect_ready(&mut self) {
         let v = self.next_json().await;
         assert_eq!(v["event"], "ready");
-        assert_eq!(v["protocol_version"], 2);
+        assert_eq!(v["protocol_version"], 3);
     }
 
     async fn launch(&mut self, id: u64, command: &[&str]) -> Value {
@@ -355,6 +355,45 @@ async fn launch_success_then_target_ready_ordering() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn early_child_crash_is_reported_promptly_with_its_stderr() {
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let mut relay = RelayProcess::spawn(port).await;
+    relay.expect_ready().await;
+
+    let ack = relay
+        .launch(
+            1,
+            &[
+                "cmd",
+                "/d",
+                "/c",
+                "echo early-child-crash-sentinel 1>&2 & exit /b 23",
+            ],
+        )
+        .await;
+    assert_eq!(ack["ok"], true, "launch ack: {ack}");
+
+    let failed = relay.next_json().await;
+    assert_eq!(failed["event"], "target_failed", "failure event: {failed}");
+    let error = failed["error"]
+        .as_str()
+        .expect("target_failed error string");
+    assert!(error.contains("23"), "exit status missing from: {error}");
+    assert!(
+        error.contains("early-child-crash-sentinel"),
+        "target stderr missing from: {error}"
+    );
+
+    tokio::time::timeout(TIMEOUT, relay.child.wait())
+        .await
+        .expect("relay must exit promptly after reporting an early target crash")
+        .expect("wait() failed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn shutdown_is_acked_and_the_process_exits() {
     let port = {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -445,11 +484,11 @@ async fn shutdown_during_port_wait_stops_promptly() {
     let mut relay = RelayProcess::spawn_capturing_stderr(port).await;
     relay.expect_ready().await;
     // A real target that never binds `port` -- port-readiness polling never
-    // succeeds on its own. cmd.exe rather than powershell.exe: smaller,
-    // simpler, and this test's target just needs to run for a while and
-    // never bind `port`, not do anything powershell-specific.
+    // succeeds on its own. Do not use `timeout.exe` here: it exits immediately
+    // when its stdin is not attached to a console, which is precisely how the
+    // relay launches targets.
     let ack = relay
-        .launch(1, &["cmd", "/c", "timeout /t 300 /nobreak >nul"])
+        .launch(1, &["cmd", "/d", "/c", "ping -n 301 127.0.0.1 >nul"])
         .await;
     assert_eq!(ack["ok"], true, "launch ack: {ack}");
 
