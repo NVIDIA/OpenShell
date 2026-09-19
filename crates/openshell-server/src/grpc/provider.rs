@@ -2506,6 +2506,21 @@ async fn authorize_and_resolve_profile_workspace(
     }
 }
 
+fn publish_provider_change(state: &Arc<ServerState>, workspace: &str) {
+    if workspace.is_empty() {
+        crate::config_delivery::publish_all_connected(
+            state,
+            crate::config_delivery::ConfigComponents::ALL,
+        );
+    } else {
+        crate::config_delivery::publish_workspace_components(
+            state,
+            workspace,
+            crate::config_delivery::ConfigComponents::ALL,
+        );
+    }
+}
+
 fn selected_profile_workspace(
     workspace_scope: Option<&openshell_core::proto::WorkspaceSelector>,
 ) -> Result<&str, Status> {
@@ -2573,6 +2588,7 @@ pub(super) async fn handle_create_provider(
                 LifecycleOperation::Create,
                 TelemetryOutcome::Success,
             );
+            publish_provider_change(state, &workspace);
             Ok(Response::new(ProviderResponse {
                 provider: Some(provider),
                 ..Default::default()
@@ -2839,6 +2855,7 @@ pub(super) async fn handle_import_provider_profiles(
             stored.profile.unwrap_or_default(),
             resource_version,
         ));
+        publish_provider_change(state, &workspace);
     }
 
     Ok(Response::new(ImportProviderProfilesResponse {
@@ -2971,6 +2988,7 @@ pub(super) async fn handle_update_provider_profiles(
     replay_facts.resource(&stored)?;
     let resource_version = stored_profile_resource_version(&stored);
     let profile = profile_response_payload(stored.profile.unwrap_or_default(), resource_version);
+    publish_provider_change(state, &workspace);
 
     Ok(Response::new(UpdateProviderProfilesResponse {
         diagnostics: Vec::new(),
@@ -3062,6 +3080,7 @@ pub(super) async fn handle_delete_provider_profile(
         .delete(StoredProviderProfile::object_type(), existing.object_id())
         .await
         .map_err(|e| Status::internal(format!("delete provider profile failed: {e}")))?;
+    publish_provider_change(state, &workspace);
 
     Ok(Response::new(DeleteProviderProfileResponse {
         outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
@@ -3892,6 +3911,7 @@ pub(super) async fn handle_update_provider(
                 LifecycleOperation::Update,
                 TelemetryOutcome::Success,
             );
+            publish_provider_change(state, &workspace);
             Ok(Response::new(ProviderResponse {
                 provider: Some(provider),
                 target_receipts,
@@ -4849,8 +4869,17 @@ pub(super) async fn handle_configure_provider_refresh(
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
-        update_provider_record_with_catalog(state.store.as_ref(), &catalog, &workspace, updated)
-            .await?;
+        let result = update_provider_record_with_catalog(
+            state.store.as_ref(),
+            &catalog,
+            &workspace,
+            updated,
+        )
+        .await;
+        publish_provider_change(state, &workspace);
+        result?;
+    } else {
+        publish_provider_change(state, &workspace);
     }
 
     replay_facts.refresh(&state_record)?;
@@ -4896,6 +4925,7 @@ pub(super) async fn handle_rotate_provider_credential(
         credential_key,
     )
     .await?;
+    publish_provider_change(state, &workspace);
 
     replay_facts.refresh(&refresh_state)?;
     Ok(Response::new(RotateProviderCredentialResponse {
@@ -4984,7 +5014,6 @@ pub(super) async fn handle_delete_provider_refresh(
         refresh_state.clone(),
     )
     .await?;
-
     // A refresh co-manages the expiry of its primary credential and every pinned
     // additional output. Clear each expiry this refresh still owns, leaving
     // independently updated ones in place. The equality check and removal run
@@ -5006,8 +5035,10 @@ pub(super) async fn handle_delete_provider_refresh(
                 Status::internal(format!(
                     "clear refresh-owned credential expiries failed: {e}"
                 ))
-            })?;
+            })
+            .map(|_| ())?;
     }
+    publish_provider_change(state, &workspace);
 
     Ok(Response::new(DeleteProviderRefreshResponse {
         outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
@@ -5048,6 +5079,9 @@ pub(super) async fn handle_delete_provider(
                 LifecycleOperation::Delete,
                 outcome,
             );
+            if deleted {
+                publish_provider_change(state, &workspace);
+            }
             Ok(Response::new(DeleteProviderResponse {
                 outcome: super::deletion_outcome(deleted, req.allow_missing, "provider")?,
             }))

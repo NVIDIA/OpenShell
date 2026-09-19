@@ -20,6 +20,12 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 `name` assigns an operator-facing identity to the gateway installation. Set it with `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`. It defaults to `openshell`; the Helm chart defaults it to the chart fullname so all replicas in one installation share a name. Chart fullnames are only unique within their Kubernetes namespace, so set `server.name` explicitly when one collector receives telemetry from multiple namespaces or clusters. This identity is independent of client-side gateway aliases, TLS names, and `gateway_jwt.gateway_id`.
 
+## Supervisor connections and policy recovery
+
+During supervisor reconnects, the gateway waits at most one second for the optional configuration bootstrap. If a credential backend stalls, the gateway accepts the session without that bootstrap so SSH, exec, and service connections can resume. Supervisor polling continues to supply configuration.
+
+On startup, the gateway repairs missing legacy policy history and skips invalid stored policies. A valid global policy can still override an invalid local policy; otherwise, that sandbox's configuration reads continue to report the validation failure.
+
 ## Package-Managed Locations
 
 Package-managed gateways use either built-in defaults or a package-seeded TOML file. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.
@@ -247,7 +253,10 @@ namespace              = "openshell"
 # Required in raw TOML; Helm derives this from the gateway Service.
 grpc_endpoint          = "https://openshell-gateway.openshell.svc:8080"
 default_image          = "ghcr.io/nvidia/openshell/sandbox:latest"
-# Defaults to the gateway version; override to pin a specific build.
+# Defaults to the gateway version. Custom builds must match the gateway's
+# internal supervisor protocol revision; mismatched peers reject the session.
+# Supervisors from releases before the handshake existed remain compatible for
+# one release.
 # supervisor_image     = "ghcr.io/nvidia/openshell/supervisor:<version>"
 client_tls_secret_name = "openshell-client-tls"
 service_account_name   = "openshell-sandbox"
@@ -555,7 +564,10 @@ image_pull_secrets             = ["regcred"]
 # Defaults to the gateway version; override to pin a specific build.
 # sandbox_runtime_image        = "ghcr.io/nvidia/openshell/sandbox:<version>"
 sandbox_runtime_image_pull_policy = "if_not_present"
-# Defaults to the gateway version; override to pin a specific build.
+# Defaults to the gateway version. Custom builds must match the gateway's
+# internal supervisor protocol revision; mismatched peers reject the session.
+# Supervisors from releases before the handshake existed remain compatible for
+# one release.
 # supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "if_not_present"
 
@@ -709,7 +721,10 @@ sandbox_label      = "docker-dev"
 grpc_endpoint      = "https://127.0.0.1:17670"
 # Workload-side runtime. Defaults to the gateway version.
 # sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
-# Supervisor runtime. Defaults to the gateway version.
+# Supervisor runtime defaults to the gateway version. Custom builds must match
+# the gateway's internal supervisor protocol revision; mismatched peers reject
+# the session. Supervisors from releases before the handshake existed remain
+# compatible for one release.
 # supervisor_image = "ghcr.io/nvidia/openshell/supervisor:<version>"
 # Unsafe operator override. Host bind mounts, including Docker local-driver
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
@@ -773,7 +788,10 @@ ssh_socket_path         = "/run/openshell/ssh.sock"
 stop_timeout_secs       = 45
 # Statically linked workload-side runtime. Defaults to the gateway version.
 # sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
-# Dynamically linked supervisor runtime. Defaults to the gateway version.
+# Dynamically linked supervisor runtime defaults to the gateway version. Custom
+# builds must match the gateway's internal supervisor protocol revision;
+# mismatched peers reject the session. Supervisors from releases before the
+# handshake existed remain compatible for one release.
 # supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 # Unsafe operator override. Host bind mounts, including Podman local-driver
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
