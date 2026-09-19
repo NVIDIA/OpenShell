@@ -15,6 +15,7 @@ pub const MAX_HEADER_MUTATION_BYTES: usize = 32 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderAuthority {
     Request,
+    RequestTrailers,
     Response,
     ResponseTrailers,
 }
@@ -140,10 +141,12 @@ pub fn apply(
             Some(header_mutation::Operation::Write(write)) => {
                 let name = validate_name(&write.name)?;
                 validate_authority(authority, MutationKind::Write, &write.name, &name)?;
-                if authority == HeaderAuthority::ResponseTrailers
-                    && !existing_headers
-                        .iter()
-                        .any(|existing| existing.name.eq_ignore_ascii_case(&name))
+                if matches!(
+                    authority,
+                    HeaderAuthority::RequestTrailers | HeaderAuthority::ResponseTrailers
+                ) && !existing_headers
+                    .iter()
+                    .any(|existing| existing.name.eq_ignore_ascii_case(&name))
                 {
                     return Err(HeaderMutationError::AbsentTrailerName {
                         name: write.name.clone(),
@@ -240,7 +243,9 @@ fn validate_authority(
     normalized_name: &str,
 ) -> Result<(), HeaderMutationError> {
     let protected = match authority {
-        HeaderAuthority::Request => is_request_protected(normalized_name),
+        HeaderAuthority::Request | HeaderAuthority::RequestTrailers => {
+            is_request_protected(normalized_name)
+        }
         HeaderAuthority::Response => {
             is_response_protected(normalized_name)
                 || (kind == MutationKind::Write && is_response_remove_only(normalized_name))

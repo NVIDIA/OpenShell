@@ -60,12 +60,13 @@ budgets as new activity.
 |---|---:|---|
 | Concurrent buffered work | 32 | Shared by HTTP requests, WebSocket messages, and WebSocket preflight. One permit covers one complete unit of work. |
 | Admission waiters | 64 | Additional work is shed when both the active budget and waiter budget are full. HTTP receives a complete 503 response before its body is buffered. |
-| Persistent middleware sessions | 32 | Shared process-wide session budget for streaming middleware protocols. WebSocket preflight uses immediate admission before opening streams and retains one permit while any stage remains active. |
-| HTTP body or WebSocket text message | 4 MiB | Platform maximum for input and replacement payloads. Service, operator, and stage limits may narrow it. |
+| Persistent middleware sessions | 32 | Shared process-wide session budget for HTTP request/response and WebSocket streams. Admission is retained while any stage remains active. |
+| Middleware payload or unit | 4 MiB | Platform maximum for a complete buffered payload, WebSocket text message, or advertised stream unit. Request stream units are further capped at 64 KiB. |
 | Middleware configs and stages | 10 | At most 10 configs in policy and 10 selected stages in one chain. |
 | Selector patterns | 32 | Combined include and exclude patterns per middleware config. |
 | Per-stage RPC | 500 ms default, 10 ms–30 s | An operator timeout caps a binding timeout. |
-| Complete message chain | 30 s | Starts after work admission; admission backpressure does not consume the chain budget. |
+| Middleware unit or message chain | 30 s | Bounds one HTTP exchange or one WebSocket message across selected stages. It is not an accepted-stream lifetime. |
+| HTTP request body processing | 2 min total | Bounds request-body receipt, middleware processing, and output delivery. STREAM may forward output during this interval; BUFFERED and body-aware policy use bounded RAM. Timeout cancels the session and terminates the request. |
 | WebSocket preflight | 1 s maximum | Caps handshake delay independently of the message RPC timeout. |
 | Remote service connect | 5 s | Applies while establishing a middleware gRPC channel. |
 
@@ -75,19 +76,19 @@ request headers totaling 64 KiB, 64 header mutations, 32 findings per stage,
 and 64 metadata entries. The detailed external contract lives in
 [Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx).
 
-The work semaphore bounds aggregate buffered middleware input to approximately
-`32 × 4 MiB`, plus bounded envelope and parser overhead. It is a concurrency
-safety valve, not rate limiting or a promise that 32 simultaneous maximum-size
-messages are inexpensive.
+The work semaphore bounds concurrent middleware progress and caps aggregate
+in-memory buffered or WebSocket input at approximately `32 × 4 MiB`, plus
+bounded envelope and parser overhead. Streaming HTTP bodies use bounded queues
+while middleware owns any processing storage. This is a concurrency safety valve, not rate
+limiting or a promise that maximum-sized work is inexpensive.
 
 The persistent session semaphore is independent from the work semaphore. One
-WebSocket middleware session consumes one permit regardless of its active-stage
-fan-out, which is separately capped at 10 stages. All-skip preflight releases
-the permit immediately. A retained session releases it at connection end or as
-soon as its last active stage is disabled. Session admission does not wait:
-capacity exhaustion follows each selected config's `on_error` behavior before
-any stream opens. The protocol-neutral registry ownership allows future
-streaming HTTP middleware to use the same process-wide budget.
+HTTP request or WebSocket middleware session consumes one permit regardless of
+its active-stage fan-out, which is separately capped at 10 stages. All-skip
+preflight releases the permit immediately. A retained session releases it at
+request or connection end, or as soon as its last active stage is disabled.
+WebSocket session admission does not wait; capacity exhaustion follows each
+selected config's `on_error` behavior before any stream opens.
 
 ## Egress Framing and Inspection
 
@@ -114,12 +115,14 @@ buffer only when it owns an explicit bound.
 
 Every parsed WebSocket text message acquires network-owned assembly capacity before payload allocation or reading, including relays used only for native policy, credential rewriting, compression, or a disabled fail-open middleware session. The process-lifetime budget survives policy reloads, and the assembly retains its permit through decompression, policy and middleware evaluation, credential rewriting, and upstream forwarding. Active middleware sessions additionally acquire shared middleware work before buffering. Input progress resets only the idle deadline. Forwarding uses one total deadline across the complete frame header, payload, and flush. Every timeout and terminal parser error releases both permits through ordinary ownership. Queue exhaustion emits a payload-free network denial event.
 
-The operator middleware `max_payload_bytes` ceiling applies to payloads exposed
-through HTTP-body and WebSocket text-message bindings. It does not replace the
-raw binary frame safety bound because binary messages are never delivered to V1
-middleware. A passed binary logical message still advances the active
-middleware session sequence and emits coverage telemetry, so a later text RPC
-can contain a valid sequence gap.
+The operator middleware `max_payload_bytes` ceiling applies to complete
+buffered payloads, stream units, and WebSocket text messages. The HTTP request
+runtime further caps units at 64 KiB and advertises bounded queue limits during
+preflight. Neither limit replaces the raw binary frame
+safety bound because binary messages are never delivered to V1 middleware. A
+passed binary logical message still advances the active middleware session
+sequence and emits coverage telemetry, so a later text RPC can contain a valid
+sequence gap.
 
 ## Network and Upstream Proxying
 

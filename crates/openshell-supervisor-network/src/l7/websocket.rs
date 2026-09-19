@@ -3569,6 +3569,7 @@ network_policies:
                         seconds: 1,
                         nanos: 0,
                     }),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
             }))
@@ -3585,14 +3586,6 @@ network_policies:
                     reason: String::new(),
                 },
             ))
-        }
-
-        async fn evaluate_http_request(
-            &self,
-            _request: Request<openshell_core::proto::HttpRequestEvaluation>,
-        ) -> std::result::Result<Response<openshell_core::proto::HttpRequestResult>, Status>
-        {
-            Err(Status::unimplemented("WebSocket-only test middleware"))
         }
 
         async fn evaluate_web_socket_session(

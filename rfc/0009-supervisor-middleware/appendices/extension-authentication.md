@@ -10,7 +10,7 @@ Related: [protocol-extensions.md](protocol-extensions.md#middleware-authenticati
 
 Transport is HTTPS with either platform trust roots or an operator-provided CA bundle, with normal certificate and endpoint-hostname verification. A middleware endpoint must be reachable from every sandbox supervisor as well as the gateway, so a gateway-local Unix socket is not an option for this mechanism.
 
-Caller identity is a short-lived Ed25519 JWT minted by the gateway's existing sandbox signing authority. The gateway attaches one to its own `Describe` and `ValidateConfig` calls; sandbox supervisors attach one to `Describe` and `EvaluateHttpRequest`. Both directions of the RFC's stated requirement are covered: TLS and the configured trust roots authenticate the middleware service to OpenShell, and the exact-audience JWT proves to the middleware that a gateway or a policy-authorized sandbox supervisor made the call.
+Caller identity is a short-lived Ed25519 JWT minted by the gateway's existing sandbox signing authority. The gateway attaches one to its own `Describe` and `ValidateConfig` calls; sandbox supervisors attach one to `Describe` and operation-specific stream RPCs such as `HttpRequestPreCredentials.EvaluateHttp`. Both directions of the RFC's stated requirement are covered: TLS and the configured trust roots authenticate the middleware service to OpenShell, and the exact-audience JWT proves to the middleware that a gateway or a policy-authorized sandbox supervisor made the call.
 
 ## Claim contract
 

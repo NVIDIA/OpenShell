@@ -3,14 +3,14 @@
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::middleware::{
-    HttpRequestView, HttpResponseResultStream, SupervisorMiddlewareEndpoint,
-    WebSocketResponseStream,
+    HttpResultStream, SupervisorMiddlewareEndpoint, WebSocketResponseStream,
 };
+use openshell_core::proto::middleware::v1::http_request_pre_credentials_client::HttpRequestPreCredentialsClient;
 use openshell_core::proto::middleware::v1::http_response_pre_return_client::HttpResponsePreReturnClient;
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
 use openshell_core::proto::{
-    HttpRequestEvaluation, HttpRequestResult, HttpResponseEvent, MiddlewareManifest,
-    ValidateConfigRequest, ValidateConfigResponse, WebSocketSessionEvent,
+    HttpEvent, MiddlewareManifest, ValidateConfigRequest, ValidateConfigResponse,
+    WebSocketSessionEvent,
 };
 use openshell_extension_core::{
     BearerTokenInterceptor, BearerTokenSlot, ExtensionChannelConfig, ExtensionServerTrust,
@@ -25,8 +25,7 @@ use crate::MIDDLEWARE_GRPC_MESSAGE_BYTES;
 
 type ExtensionChannel = InterceptedService<Channel, BearerTokenInterceptor>;
 
-/// Adapts the borrowed runtime request contract to the owned protobuf service
-/// contract only when dispatch crosses a gRPC-shaped boundary.
+/// Adapts transport-neutral middleware streams to a gRPC-shaped boundary.
 #[derive(Clone)]
 pub struct GrpcMiddlewareService {
     service: Arc<dyn SupervisorMiddlewareEndpoint>,
@@ -53,12 +52,6 @@ impl GrpcMiddlewareService {
         })
     }
 
-    /// Wrap a protobuf-shaped service used by transport-boundary tests.
-    #[cfg(test)]
-    pub fn from_service(service: Arc<dyn SupervisorMiddlewareEndpoint>) -> Self {
-        Self { service }
-    }
-
     /// Forward a manifest request through the protobuf service contract.
     pub async fn describe(&self) -> std::result::Result<Response<MiddlewareManifest>, Status> {
         self.service.describe(Request::new(())).await
@@ -78,21 +71,13 @@ impl GrpcMiddlewareService {
             .await
     }
 
-    /// Materialize an owned protobuf evaluation immediately before transport.
-    pub async fn evaluate_http_request(
+    /// Open a remote HTTP request pre-credentials stream through the adapter.
+    pub async fn open_http_request_pre_credentials(
         &self,
-        request: HttpRequestView<'_>,
-    ) -> std::result::Result<Response<HttpRequestResult>, Status> {
+        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
         self.service
-            .evaluate_http_request(Request::new(HttpRequestEvaluation {
-                phase: request.phase() as i32,
-                context: Some(request.context().clone()),
-                config: Some(request.config().clone()),
-                target: Some(request.target().clone()),
-                headers: request.headers().to_vec(),
-                body: request.body().to_vec(),
-                middleware_name: request.middleware_name().to_string(),
-            }))
+            .open_http_request_pre_credentials(receiver)
             .await
     }
 
@@ -107,8 +92,8 @@ impl GrpcMiddlewareService {
     /// Open a remote HTTP response pre-return stream through the gRPC adapter.
     pub async fn open_http_response_pre_return(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<HttpResponseEvent>,
-    ) -> std::result::Result<HttpResponseResultStream, Status> {
+        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
         self.service.open_http_response_pre_return(receiver).await
     }
 }
@@ -116,6 +101,7 @@ impl GrpcMiddlewareService {
 #[derive(Clone)]
 pub struct RemoteMiddlewareService {
     client: SupervisorMiddlewareClient<ExtensionChannel>,
+    request_client: HttpRequestPreCredentialsClient<ExtensionChannel>,
     response_client: HttpResponsePreReturnClient<ExtensionChannel>,
 }
 
@@ -147,6 +133,9 @@ impl RemoteMiddlewareService {
             client: SupervisorMiddlewareClient::new(channel.clone())
                 .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
+            request_client: HttpRequestPreCredentialsClient::new(channel.clone())
+                .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
             response_client: HttpResponsePreReturnClient::new(channel)
                 .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
@@ -172,12 +161,18 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
         client.validate_config(request).await
     }
 
-    async fn evaluate_http_request(
+    async fn open_http_request_pre_credentials(
         &self,
-        request: Request<HttpRequestEvaluation>,
-    ) -> std::result::Result<Response<HttpRequestResult>, Status> {
-        let mut client = self.client.clone();
-        client.evaluate_http_request(request).await
+        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
+        let mut client = self.request_client.clone();
+        let responses = client
+            .evaluate_http(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+            .await?
+            .into_inner();
+        Ok(Box::pin(responses))
     }
 
     async fn open_websocket_session(
@@ -196,11 +191,11 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
 
     async fn open_http_response_pre_return(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<HttpResponseEvent>,
-    ) -> std::result::Result<HttpResponseResultStream, Status> {
+        receiver: tokio::sync::mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
         let mut client = self.response_client.clone();
         let responses = client
-            .evaluate(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+            .evaluate_http(Request::new(tokio_stream::wrappers::ReceiverStream::new(
                 receiver,
             )))
             .await?

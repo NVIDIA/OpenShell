@@ -11,16 +11,13 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
-    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget, HttpResponseEvent,
-    HttpResponseEventResult, MiddlewareManifest, RequestContext, SupervisorMiddlewarePhase,
-    ValidateConfigRequest, ValidateConfigResponse, WebSocketSessionEvent,
-    WebSocketSessionEventResult,
+    HttpEvent, HttpResult, MiddlewareManifest, ValidateConfigRequest, ValidateConfigResponse,
+    WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
-/// Transport-neutral result stream for one HTTP response middleware stage.
-pub type HttpResponseResultStream = Pin<
-    Box<dyn tokio_stream::Stream<Item = Result<HttpResponseEventResult, Status>> + Send + 'static>,
->;
+/// Transport-neutral result stream for one HTTP middleware stage.
+pub type HttpResultStream =
+    Pin<Box<dyn tokio_stream::Stream<Item = Result<HttpResult, Status>> + Send + 'static>>;
 
 /// Transport-neutral response stream for one WebSocket middleware stage.
 pub type WebSocketResponseStream = Pin<
@@ -44,115 +41,39 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         request: Request<ValidateConfigRequest>,
     ) -> Result<Response<ValidateConfigResponse>, Status>;
 
-    async fn evaluate_http_request(
+    async fn open_http_request_pre_credentials(
         &self,
-        request: Request<HttpRequestEvaluation>,
-    ) -> Result<Response<HttpRequestResult>, Status>;
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> Result<HttpResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP request pre-credentials evaluation",
+        ))
+    }
 
     async fn open_websocket_session(
         &self,
-        requests: mpsc::Receiver<WebSocketSessionEvent>,
-    ) -> Result<WebSocketResponseStream, Status>;
+        _requests: mpsc::Receiver<WebSocketSessionEvent>,
+    ) -> Result<WebSocketResponseStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement WebSocket sessions",
+        ))
+    }
 
     async fn open_http_response_pre_return(
         &self,
-        _requests: mpsc::Receiver<HttpResponseEvent>,
-    ) -> Result<HttpResponseResultStream, Status> {
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> Result<HttpResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP response pre-return evaluation",
         ))
     }
 }
 
-/// Borrowed request state exposed to one in-process middleware invocation.
-///
-/// The view reflects every transformation applied by earlier stages. It is valid
-/// only for the current invocation and cannot be retained by the middleware.
-#[derive(Clone, Copy)]
-pub struct HttpRequestView<'a> {
-    phase: SupervisorMiddlewarePhase,
-    context: &'a RequestContext,
-    config: &'a prost_types::Struct,
-    target: &'a HttpRequestTarget,
-    headers: &'a [HttpHeader],
-    body: &'a [u8],
-    middleware_name: &'a str,
-}
-
-impl<'a> HttpRequestView<'a> {
-    /// Create a view over the chain's current request state for one stage.
-    #[must_use]
-    pub fn new(
-        phase: SupervisorMiddlewarePhase,
-        context: &'a RequestContext,
-        config: &'a prost_types::Struct,
-        target: &'a HttpRequestTarget,
-        headers: &'a [HttpHeader],
-        body: &'a [u8],
-        middleware_name: &'a str,
-    ) -> Self {
-        Self {
-            phase,
-            context,
-            config,
-            target,
-            headers,
-            body,
-            middleware_name,
-        }
-    }
-
-    /// Return the typed middleware phase selected for this invocation.
-    #[must_use]
-    pub fn phase(self) -> SupervisorMiddlewarePhase {
-        self.phase
-    }
-
-    /// Return the request and sandbox identity shared by every chain stage.
-    #[must_use]
-    pub fn context(self) -> &'a RequestContext {
-        self.context
-    }
-
-    /// Return the validated configuration for this policy-selected stage.
-    #[must_use]
-    pub fn config(self) -> &'a prost_types::Struct {
-        self.config
-    }
-
-    /// Return the admitted destination and HTTP request target.
-    #[must_use]
-    pub fn target(self) -> &'a HttpRequestTarget {
-        self.target
-    }
-
-    /// Return visible request headers in wire order, including repeated names.
-    #[must_use]
-    pub fn headers(self) -> &'a [HttpHeader] {
-        self.headers
-    }
-
-    /// Return the current body, including replacements made by earlier stages.
-    #[must_use]
-    pub fn body(self) -> &'a [u8] {
-        self.body
-    }
-
-    /// Return the in-process middleware manifest or attachment name selected by
-    /// policy, including custom implementation names.
-    #[must_use]
-    pub fn middleware_name(self) -> &'a str {
-        self.middleware_name
-    }
-}
-
 /// Asynchronous contract for supervisor middleware that runs in-process.
 ///
 /// Remote services use the protobuf `SupervisorMiddleware` contract instead.
-/// The borrowed view remains valid for the evaluation future, so implementations
-/// can yield without constructing an owned protobuf request envelope.
-/// WebSocket sessions already use bounded channel and stream ownership, so that
-/// operation is shared with the transport-neutral endpoint contract.
+/// HTTP and WebSocket operations use bounded channels and streams shared with
+/// the transport-neutral endpoint contract.
 ///
 /// Downstream implementations must apply `#[async_trait::async_trait]` to each
 /// `impl InProcessMiddleware` block. The macro's default expansion creates
@@ -171,10 +92,10 @@ impl<'a> HttpRequestView<'a> {
 /// use std::sync::Arc;
 ///
 /// use miette::Result;
-/// use openshell_core::middleware::{HttpRequestView, InProcessMiddleware};
+/// use openshell_core::middleware::InProcessMiddleware;
 /// use openshell_core::proto::{
-///     Decision, HttpRequestResult, MiddlewareBinding, MiddlewareManifest,
-///     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+///     HttpBodyMode, MiddlewareBinding, MiddlewareManifest, SupervisorMiddlewareOperation,
+///     SupervisorMiddlewarePhase,
 /// };
 /// use prost_types::Struct;
 ///
@@ -191,6 +112,8 @@ impl<'a> HttpRequestView<'a> {
 ///                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
 ///                 max_payload_bytes: 1024,
 ///                 request_timeout: None,
+///                 http_protocol_version: 1,
+///                 supported_http_body_modes: vec![HttpBodyMode::Buffered as i32],
 ///             }],
 ///             expected_audience: String::new(),
 ///         }
@@ -202,16 +125,6 @@ impl<'a> HttpRequestView<'a> {
 ///         _config: &Struct,
 ///     ) -> Result<()> {
 ///         Ok(())
-///     }
-///
-///     async fn evaluate_http_request(
-///         &self,
-///         _request: HttpRequestView<'_>,
-///     ) -> Result<HttpRequestResult> {
-///         Ok(HttpRequestResult {
-///             decision: Decision::Allow as i32,
-///             ..Default::default()
-///         })
 ///     }
 /// }
 ///
@@ -235,16 +148,15 @@ pub trait InProcessMiddleware: Send + Sync {
         config: &prost_types::Struct,
     ) -> Result<()>;
 
-    /// Evaluate one request using borrowed chain state.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the selected implementation cannot evaluate the
-    /// request or its validated configuration.
-    async fn evaluate_http_request(
+    /// Open one HTTP request pre-credentials stream.
+    async fn open_http_request_pre_credentials(
         &self,
-        request: HttpRequestView<'_>,
-    ) -> Result<HttpRequestResult>;
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP request pre-credentials evaluation",
+        ))
+    }
 
     /// Open one persistent WebSocket middleware session.
     ///
@@ -263,8 +175,8 @@ pub trait InProcessMiddleware: Send + Sync {
     /// Request-only implementations may keep the default unsupported response.
     async fn open_http_response_pre_return(
         &self,
-        _requests: mpsc::Receiver<HttpResponseEvent>,
-    ) -> std::result::Result<HttpResponseResultStream, Status> {
+        _requests: mpsc::Receiver<HttpEvent>,
+    ) -> std::result::Result<HttpResultStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement HTTP response pre-return evaluation",
         ))

@@ -111,12 +111,11 @@ with reason code `content_match`, which produces the canonical 403 response
 before delivery. The smoke suite recreates the sandbox in deny mode and checks
 both clean and matching responses through the external gRPC service.
 
-Every selected response requires `WHOLE_BODY_BYTES`. If that mode is unavailable,
-the service returns a middleware failure and the policy's `on_error` decides
-whether delivery fails open or closed. This includes encoded, partial,
-no-transform, bodyless, and known oversized responses. Unknown-length bodies can
-also exceed the runtime limit during collection. Invalid UTF-8 fails the same way.
-The example policy uses `fail_closed`.
+Every selected response requires `BUFFERED`. OpenShell does not offer body
+inspection for encoded, partial, `no-transform`, or bodyless responses, so the
+service continues after header inspection. Known oversized bodies are not
+offered; unknown-length bodies can still exceed the runtime limit during
+collection. Invalid UTF-8 and protocol failures fail closed.
 
 Clean bodies pass unchanged. Matching spans are merged and replaced in the
 complete body, so transport chunk boundaries do not affect matching. Trailers

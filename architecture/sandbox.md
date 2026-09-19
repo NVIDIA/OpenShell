@@ -283,12 +283,25 @@ host selectors choose the chain independently of the network rule that admitted
 the request. Policy-local map keys identify configs, while built-in names or
 operator-owned registration names identify implementations.
 
-Built-ins run in-process against a borrowed view of the chain's current HTTP
-request state. Operator services retain the bounded protobuf/gRPC contract, and
-the remote adapter materializes an owned HTTP evaluation only when a request
-crosses that transport boundary. Both paths support bounded bidirectional
-WebSocket sessions, so a manifest advertises capabilities independently of
-transport.
+Built-ins and operator services use the same event-oriented request contract.
+Each selected `HTTP_REQUEST/PRE_CREDENTIALS` stage opens a bidirectional stream,
+receives preflight, and continues without a body, rejects, or selects BUFFERED
+or STREAM processing. The HTTP/1 relay normalizes fixed and chunked bodies into
+bounded units. A chain made only of STREAM stages can forward output upstream
+immediately with bounded channel and socket backpressure.
+The relay switches the upstream request to chunked framing when transformations
+can change unit sizes and concurrently watches for an early upstream response.
+It cancels the middleware session and never replays the request if the upstream
+responds before upload completes. Chains containing BUFFERED stages,
+body-aware policy re-evaluation, or request-body credential rewriting retain a
+bounded in-memory hold barrier. OpenShell never creates a middleware body disk
+spool or recovery copy. STREAM uses independent input and output pumps, so the
+service can emit early, delay its output head, or own processing storage. Body
+receipt, middleware processing, and output delivery share a two-minute
+wall-clock deadline.
+All HTTP middleware is fail-closed. Body-aware GraphQL, JSON-RPC,
+and MCP paths retain a hold barrier so policy can re-evaluate every accepted
+replacement before later stages or upstream delivery.
 When a stage ends, the remote adapter sends its terminal event, half-closes the
 request stream, and briefly drains the response stream before releasing the
 transport. This keeps a queued terminal event from being canceled with the
@@ -306,8 +319,8 @@ registry and chain runner live in `openshell-supervisor-middleware`; first-party
 implementations live in `openshell-supervisor-middleware-builtins`.
 
 The selected middleware chain can also inspect the final HTTP response before
-it returns to the workload. Stages select header-only, whole-body, or streaming
-inspection independently. The relay owns response framing when body bytes can
+it returns to the workload. Request and response hooks share the same contract;
+the initial response rollout offers Continue and BUFFERED only. The relay owns response framing when body bytes can
 change. Preflight exposes upstream `Content-Length`, `Content-Encoding`, and
 `Content-Range` as read-only metadata, while the relay emits final framing
 separately from middleware-visible headers. Stage failures follow policy-local
@@ -531,9 +544,9 @@ intermediate token response, stored subject-token expiry, and supervisor SVID
 expiry.
 
 For AWS endpoints that require request-level signing, the proxy supports SigV4
-re-signing. When `credential_signing: sigv4` is set on an L7 endpoint, the proxy
-strips the client's placeholder-based AWS auth headers, re-signs with real
-credentials from the provider, and forwards the request upstream. The signing
+re-signing. When `credential_signing: sigv4` is set on an L7 endpoint, the proxy strips
+the client's placeholder-based AWS auth headers, re-signs with real credentials
+from the provider, and forwards the request upstream. The signing
 endpoint must have a credential source before the policy generation activates:
 an attached endpoint-bearing AWS profile whose boundary covers the endpoint, or
 an attached endpointless AWS profile explicitly named by the endpoint's
