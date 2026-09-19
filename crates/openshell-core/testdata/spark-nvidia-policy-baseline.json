@@ -1,0 +1,36 @@
+{
+  "device_node_paths": [
+    "/dev/dri/card0",
+    "/dev/dri/renderD128",
+    "/dev/nvidia-modeset",
+    "/dev/nvidia-uvm",
+    "/dev/nvidia-uvm-tools",
+    "/dev/nvidia0",
+    "/dev/nvidiactl"
+  ],
+  "read_only_paths": [
+    "/etc/vulkan/icd.d/nvidia_icd.json",
+    "/etc/vulkan/implicit_layer.d/nvidia_layers.json",
+    "/lib/firmware/nvidia/580.142/gsp_ga10x.bin",
+    "/lib/firmware/nvidia/580.142/gsp_tu10x.bin",
+    "/run/nvidia-persistenced/socket",
+    "/usr/bin/nvidia-cuda-mps-control",
+    "/usr/bin/nvidia-cuda-mps-server",
+    "/usr/bin/nvidia-debugdump",
+    "/usr/bin/nvidia-persistenced",
+    "/usr/bin/nvidia-smi",
+    "/usr/lib/aarch64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu/nvidia/xorg",
+    "/usr/lib/aarch64-linux-gnu/vdpau",
+    "/usr/share/X11/xorg.conf.d/10-nvidia.conf",
+    "/usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json",
+    "/usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json",
+    "/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
+    "/usr/share/nvidia/nvoptix.bin"
+  ],
+  "read_write_mount_paths": [],
+  "additional_gids": [
+    44,
+    993
+  ]
+}
