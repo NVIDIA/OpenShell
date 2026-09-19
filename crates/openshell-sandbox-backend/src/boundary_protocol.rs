@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
+pub const MAX_CONTROL_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const STREAM_STDIN: u8 = 0;
 pub const STREAM_STDOUT: u8 = 1;
 pub const STREAM_STDERR: u8 = 2;
@@ -1328,6 +1328,35 @@ mod tests {
             envelope.validate_payload_digest(),
             Err(FrameError::PayloadDigestMismatch)
         ));
+    }
+
+    #[test]
+    fn start_agent_with_large_ca_bundle_fits_in_frame_limit() {
+        let request = RequestEnvelope::new(Request::StartAgent {
+            sandbox_id: "sandbox-1".to_string(),
+            spec: AgentSpecWire {
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                workdir: None,
+                timeout_secs: 5,
+                interactive: false,
+            },
+            policy: Box::new(SandboxPolicyWire::from(SandboxPolicy {
+                version: 1,
+                filesystem: FilesystemPolicy::default(),
+                network: NetworkPolicy::default(),
+                landlock: LandlockPolicy::default(),
+                process: ProcessPolicy::default(),
+            })),
+            ca_cert: Some(vec![0xAB; 16 * 1024]),
+            ca_bundle: Some(vec![0xCD; 400 * 1024]),
+            provider_env_revision: 0,
+            provider_env: std::collections::HashMap::new(),
+        })
+        .expect("request envelope");
+        let frame = encode_frame(&request).expect("large CA bundle must fit in frame limit");
+        let decoded: RequestEnvelope = decode_frame(&frame).expect("round-trip");
+        assert_eq!(decoded, request);
     }
 
     #[test]
