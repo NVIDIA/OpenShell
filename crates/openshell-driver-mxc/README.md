@@ -156,11 +156,18 @@ process env. In curated-environment mode, the driver stages the public CA files
 under the authorized `<cwd>/.openshell-proxy/<sandbox-id>` directory. Other
 environment modes grant the sandbox's unique public-CA directory as an internal
 read-write share. The directory contains only public CA certificates;
-the ephemeral CA private key remains in the host proxy's memory. The driver
-seeds only `SYSTEMROOT`, `WINDIR`, `PATH`, `COMSPEC`, and `LOCALAPPDATA` from the
-gateway host before applying sandbox and TLS overrides, so required Windows
-bootstrap values remain available without exposing the gateway's full
-environment unless the gateway explicitly opts into another environment mode.
+the ephemeral CA private key remains in the host proxy's memory.
+
+Windows inbox `curl.exe` uses Schannel and ignores `CURL_CA_BUNDLE` as an
+environment variable, so workloads using it must pass
+`--cacert %CURL_CA_BUNDLE%` explicitly. Clients that honor the injected trust
+variables consume the same per-sandbox bundle directly.
+
+The driver seeds only `SYSTEMROOT`, `WINDIR`, `PATH`, `COMSPEC`, and
+`LOCALAPPDATA` from the gateway host before applying sandbox and TLS overrides,
+so required Windows bootstrap values remain available without exposing the
+gateway's full environment unless the gateway explicitly opts into another
+environment mode.
 
 When governed egress is disabled, any network rule fails closed during sandbox creation.
 
