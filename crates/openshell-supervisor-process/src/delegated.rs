@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use miette::Result;
 use openshell_isolation_interface::contract::{
-    BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess,
+    BackendError, BoundaryDuplexStream, BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess,
+    LoopbackTarget,
 };
 use openshell_ocsf::{ActivityId, AppLifecycleBuilder, SeverityId, StatusId, ocsf_emit};
 
@@ -25,6 +26,125 @@ pub struct BoundaryAccess {
     session_task: Option<tokio::task::JoinHandle<()>>,
     session_readiness: Option<tokio::sync::watch::Receiver<bool>>,
     main_session: Option<Arc<crate::main_session::MainSession>>,
+}
+
+#[derive(Default)]
+struct DeferredLoopbackConnector {
+    connector: tokio::sync::RwLock<Option<Arc<dyn BoundaryLoopbackConnector>>>,
+    ready: tokio::sync::Notify,
+}
+
+impl DeferredLoopbackConnector {
+    async fn install(&self, connector: Arc<dyn BoundaryLoopbackConnector>) {
+        *self.connector.write().await = Some(connector);
+        self.ready.notify_waiters();
+    }
+}
+
+#[async_trait::async_trait]
+impl BoundaryLoopbackConnector for DeferredLoopbackConnector {
+    async fn connect(&self, target: LoopbackTarget) -> Result<BoundaryDuplexStream, BackendError> {
+        loop {
+            let notified = self.ready.notified();
+            let connector = self.connector.read().await.clone();
+            if let Some(connector) = connector {
+                return connector.connect(target).await;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// A supervisor stream that has reported configuration admission while the
+/// boundary remains held in its confirmed, pre-workload state.
+pub struct PrestartedSupervisorSession {
+    terminating: Arc<AtomicBool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    readiness: tokio::sync::watch::Receiver<bool>,
+    loopback: Arc<DeferredLoopbackConnector>,
+    outbound: tokio::sync::mpsc::Sender<openshell_core::proto::SupervisorMessage>,
+    runtime_ready: Arc<AtomicBool>,
+}
+
+impl PrestartedSupervisorSession {
+    async fn report_runtime_ready(&self) -> Result<()> {
+        self.runtime_ready.store(true, Ordering::Release);
+        self.outbound
+            .send(openshell_core::proto::SupervisorMessage {
+                payload: Some(
+                    openshell_core::proto::supervisor_message::Payload::RuntimeReady(
+                        openshell_core::proto::SupervisorRuntimeReady {},
+                    ),
+                ),
+            })
+            .await
+            .map_err(|_| miette::miette!("supervisor session ended before runtime readiness"))
+    }
+}
+
+impl Drop for PrestartedSupervisorSession {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            self.terminating.store(true, Ordering::Release);
+            task.abort();
+        }
+    }
+}
+
+/// Resume a prepared supervisor stream and report its bootstrap result before
+/// workload activation. Relay requests wait until the running boundary installs
+/// its loopback connector.
+pub async fn start_prepared_supervisor_session(
+    prepared: crate::supervisor_session::PreparedSupervisorSession,
+    bootstrap_result: Option<openshell_core::proto::ConfigBootstrapResult>,
+    ssh_socket_path: Option<&str>,
+    config_apply_tx: tokio::sync::mpsc::Sender<crate::supervisor_session::ConfigApplyRequest>,
+    supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
+) -> Result<PrestartedSupervisorSession> {
+    let terminating = Arc::new(AtomicBool::new(false));
+    let loopback = Arc::new(DeferredLoopbackConnector::default());
+    let target = ssh_socket_path.map_or_else(
+        || std::path::PathBuf::from(openshell_core::container_paths::SSH_SOCKET_PATH),
+        std::path::PathBuf::from,
+    );
+    let (task, mut readiness, outbound, runtime_ready) = crate::supervisor_session::spawn_prepared(
+        prepared,
+        bootstrap_result,
+        target,
+        loopback.clone(),
+        None,
+        terminating.clone(),
+        config_apply_tx,
+        supervisor_session_updates,
+    );
+    let ready = tokio::time::timeout(
+        crate::supervisor_session::SESSION_PREPARE_TIMEOUT,
+        readiness.wait_for(|ready| *ready),
+    )
+    .await
+    .map(|result| result.map(|_| ()));
+    match ready {
+        Ok(Ok(())) => Ok(PrestartedSupervisorSession {
+            terminating,
+            task: Some(task),
+            readiness,
+            loopback,
+            outbound,
+            runtime_ready,
+        }),
+        Ok(Err(_)) => {
+            task.abort();
+            Err(miette::miette!(
+                "prepared supervisor session ended before bootstrap acknowledgement"
+            ))
+        }
+        Err(_) => {
+            task.abort();
+            Err(miette::miette!(
+                "prepared supervisor session did not receive accepted configuration admission before the provisioning deadline"
+            ))
+        }
+    }
 }
 
 impl BoundaryAccess {
@@ -78,6 +198,7 @@ impl Drop for BoundaryAccess {
 /// loopback-forwarding capabilities.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_boundary_access(
+    instance_id: String,
     sandbox_id: Option<&str>,
     openshell_endpoint: Option<&str>,
     ssh_socket_path: Option<&str>,
@@ -87,16 +208,32 @@ pub async fn start_boundary_access(
     port_forward: Arc<dyn BoundaryLoopbackConnector>,
     agent: Arc<dyn BoundaryProcess>,
     supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
+    mut prestarted_supervisor_session: Option<PrestartedSupervisorSession>,
+    config_apply_tx: Option<
+        tokio::sync::mpsc::Sender<crate::supervisor_session::ConfigApplyRequest>,
+    >,
 ) -> Result<BoundaryAccess> {
-    let instance_id = uuid::Uuid::new_v4().to_string();
-    let terminating = Arc::new(AtomicBool::new(false));
+    if let Some(prestarted) = prestarted_supervisor_session.as_ref() {
+        prestarted.loopback.install(port_forward.clone()).await;
+    }
+    let terminating = prestarted_supervisor_session.as_ref().map_or_else(
+        || Arc::new(AtomicBool::new(false)),
+        |prestarted| prestarted.terminating.clone(),
+    );
     let Some(ssh_socket_path) = ssh_socket_path.map(std::path::PathBuf::from) else {
+        if let Some(prestarted) = prestarted_supervisor_session.as_ref() {
+            prestarted.report_runtime_ready().await?;
+        }
+        let (session_task, session_readiness) = match prestarted_supervisor_session.as_mut() {
+            Some(prestarted) => (prestarted.task.take(), Some(prestarted.readiness.clone())),
+            None => (None, None),
+        };
         return Ok(BoundaryAccess {
             instance_id,
             terminating,
             ssh_task: None,
-            session_task: None,
-            session_readiness: None,
+            session_task,
+            session_readiness,
             main_session: None,
         });
     };
@@ -154,42 +291,52 @@ pub async fn start_boundary_access(
         }
     }
 
-    let (session_task, session_readiness) = match (openshell_endpoint, sandbox_id) {
-        (Some(endpoint), Some(id)) => {
-            let (task, mut accepted) = crate::supervisor_session::spawn_with_readiness(
-                endpoint.to_string(),
-                id.to_string(),
-                ssh_socket_path,
-                port_forward,
-                None,
-                terminating.clone(),
-                crate::supervisor_session::SessionRuntimeContext {
-                    instance_id: instance_id.clone(),
-                    session_id_updates: supervisor_session_updates,
-                },
-            );
-            let accepted_result =
-                tokio::time::timeout(Duration::from_secs(10), accepted.wait_for(|ready| *ready))
-                    .await
-                    .map(|result| result.map(|_| ()));
-            match accepted_result {
-                Ok(Ok(())) => (Some(task), Some(accepted)),
-                Ok(Err(_)) => {
-                    task.abort();
-                    return Err(miette::miette!(
-                        "supervisor session ended before gateway acceptance"
-                    ));
-                }
-                Err(_) => {
-                    task.abort();
-                    return Err(miette::miette!(
-                        "gateway did not accept supervisor session within 10 seconds"
-                    ));
+    let (session_task, session_readiness) = match prestarted_supervisor_session.as_mut() {
+        Some(prestarted) => (prestarted.task.take(), Some(prestarted.readiness.clone())),
+        None => match (openshell_endpoint, sandbox_id) {
+            (Some(endpoint), Some(id)) => {
+                let (task, mut accepted) = crate::supervisor_session::spawn_with_readiness(
+                    endpoint.to_string(),
+                    id.to_string(),
+                    ssh_socket_path,
+                    port_forward,
+                    None,
+                    terminating.clone(),
+                    crate::supervisor_session::SessionRuntimeContext {
+                        instance_id: instance_id.clone(),
+                        session_id_updates: supervisor_session_updates,
+                        config_apply_tx,
+                    },
+                );
+                let accepted_result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    accepted.wait_for(|ready| *ready),
+                )
+                .await
+                .map(|result| result.map(|_| ()));
+                match accepted_result {
+                    Ok(Ok(())) => (Some(task), Some(accepted)),
+                    Ok(Err(_)) => {
+                        task.abort();
+                        return Err(miette::miette!(
+                            "supervisor session ended before gateway acceptance"
+                        ));
+                    }
+                    Err(_) => {
+                        task.abort();
+                        return Err(miette::miette!(
+                            "gateway did not accept supervisor session within 10 seconds"
+                        ));
+                    }
                 }
             }
-        }
-        _ => (None, None),
+            _ => (None, None),
+        },
     };
+
+    if let Some(prestarted) = prestarted_supervisor_session.as_ref() {
+        prestarted.report_runtime_ready().await?;
+    }
 
     Ok(BoundaryAccess {
         instance_id,

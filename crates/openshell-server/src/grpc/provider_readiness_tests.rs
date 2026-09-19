@@ -73,6 +73,8 @@ fn hello() -> SupervisorHello {
         instance_id: Uuid::new_v4().to_string(),
         protocol_revision: SUPERVISOR_PROTOCOL_REVISION,
         supports_provider_readiness: true,
+        image_policy: None,
+        image_policy_discovery: None,
     }
 }
 

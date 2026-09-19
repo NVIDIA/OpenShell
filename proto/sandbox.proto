@@ -418,6 +418,7 @@ message SandboxConfigSnapshot {
   string provider_attachment_epoch = 14;
   string configuration_instance_id = 15;
   string configuration_error = 16;
+  uint64 settings_revision = 17;
 }
 
 // Response containing effective sandbox settings and policy.
@@ -465,6 +466,8 @@ message GetSandboxConfigResponse {
   string configuration_error = 16;
   // Registration fence for a new supervisor; capture once and retain on retry.
   string configuration_instance_id = 15;
+  // Monotonic revision of the sandbox-scoped settings row.
+  uint64 settings_revision = 17;
 }
 
 // Connection details for one operator-registered supervisor middleware service.

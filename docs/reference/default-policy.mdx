@@ -9,6 +9,24 @@ position: 2
 ---
 The default policy is the policy applied when you create an OpenShell sandbox without `--policy`. It is baked into the community base image ([`ghcr.io/nvidia/openshell-community/sandboxes/base`](https://github.com/NVIDIA/OpenShell-Community)) and defined in the community repo's `dev-sandbox-policy.yaml`.
 
+## How the Image Policy Becomes Active
+
+On the first supervisor connection, the supervisor offers the policy found in
+the sandbox image to the gateway. If the gateway already has a policy for the
+sandbox, the gateway policy takes precedence. Otherwise, the gateway uses the
+image policy as the initial candidate.
+
+The gateway sends the selected policy back to the supervisor on the same
+connection. The supervisor adds filesystem paths that exist in that image, then
+returns either the unchanged policy or the complete prepared policy. The
+gateway validates and persists the result before it accepts the supervisor
+session. An invalid image or prepared policy prevents sandbox startup.
+
+The accepted session contains a fresh gateway-owned configuration bootstrap.
+The supervisor initializes from that bootstrap. It does not initialize from
+the image policy or the preparation response. Reconnects skip image-policy
+preparation and use the current gateway configuration.
+
 ## Agent Compatibility
 
 The following table shows the coverage of the default policy for common agents.

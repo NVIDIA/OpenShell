@@ -67,15 +67,19 @@ replacement from granting authority.
 2. The sandbox consumes and unlinks bootstrap material, proves the admitted
    runtime posture, and listens on the protected driver channel. It does not
    run untrusted code yet.
-3. `openshell-supervisor` loads policy and runtime settings from the gateway,
-   attaches to the sandbox, and verifies the driver's generation and evidence.
+3. `openshell-supervisor` opens its gateway session and receives an
+   authoritative policy, settings, middleware, and provider bootstrap before
+   attaching to the sandbox. Compatibility protocol revisions continue to use
+   the polling APIs.
 4. The sandbox installs its seccomp notification broker and Landlock baseline,
    then reports measured confirmation. The supervisor must accept that evidence
 before it sends the launch permit.
 5. The sandbox starts the canonical process through its single workload
-   launcher. The supervisor starts SSH and registers its gateway session.
-6. Exec, signaling, PTY, DNS, TCP, and loopback-forwarding operations cross the
-   authenticated channel for the lifetime of the sandbox generation.
+   launcher. The supervisor starts SSH, acknowledges bootstrap application on
+   the prepared session, and exposes readiness only after gateway acceptance.
+6. Later desired-state snapshots arrive on that session. Exec, signaling, PTY,
+   DNS, TCP, and loopback-forwarding operations cross the authenticated
+   boundary channel for the lifetime of the sandbox generation.
 
 When the admitted main process exits, its status and retained terminal output
 remain available. The confirmed sandbox and supervisor-owned access plane continue
@@ -336,10 +340,10 @@ the registry. Public custom-CA PEM travels with the stable registration.
 
 The slots live in a supervisor-owned `ExtensionCredentialStore` shared by every
 gateway connection the supervisor opens, so the registry's clients and the
-polling loop that rotates them observe the same credentials. Configuration
-polling runs far more frequently than credentials expire, so the loop rotates
-only when a credential is missing or has passed four fifths of its lifetime,
-and bounds its sleep by the soonest rotation deadline.
+configuration loop that rotates them observe the same credentials. Its wakeup
+interval is far shorter than credential lifetimes, so the loop rotates only
+when a credential is missing or has passed four fifths of its lifetime, and
+bounds its sleep by the soonest rotation deadline.
 
 Middleware cannot observe injected credentials, introduce credential
 placeholders, or mutate supervisor-owned credential, routing, or framing
@@ -617,16 +621,67 @@ quickly.
 The gateway and supervisor must implement the same internal supervisor protocol
 revision. Peers built before the handshake existed report revision zero and are
 accepted for one release with a warning and a counter, because sandboxes keep
-their supervisor binary until they are recreated. The gateway includes a configuration bootstrap when it accepts a
-`ConnectSupervisor` session and can send complete component replacements on the
-same stream after policy, settings, or provider state changes.
-While polling remains authoritative, optional bootstrap construction has a
-one-second budget. The gateway accepts the session without a bootstrap when
-that budget expires, so slow credential backends do not block relay reconnects.
-These payloads describe the latest effective state rather than
-the mutation that produced it. The gateway assigns ordering sequences within
-each session and component, while each snapshot retains its own content
-revision.
+their supervisor binary until they are recreated.
+
+On the initial `ConnectSupervisor` stream, `SupervisorHello` carries an explicit
+workload image discovery result: missing, invalid, or a parsed policy. A gateway
+policy takes precedence when one exists. If the image policy is invalid and no
+gateway policy exists, the gateway keeps the stream pending for the provisioning
+repair window. A policy repair resumes that same stream and supervisor process.
+The gateway sends its selected full policy as `StartupConfigCandidate`, and the
+supervisor prepares that candidate against paths present in the local image. It
+returns either `unchanged`, a complete prepared policy, or a bounded failure.
+The gateway validates and persists any proposed change through the normal
+sandbox policy update path. Only then does it send `SessionAccepted` with a
+fresh, complete configuration bootstrap. The supervisor initializes runtime
+state from that bootstrap, never from the candidate or preparation response.
+Reconnects omit the image policy and receive the current authoritative
+bootstrap directly.
+
+```mermaid
+sequenceDiagram
+    participant SUP as Supervisor
+    participant GW as Gateway
+    participant DB as Gateway store
+
+    SUP->>GW: SupervisorHello(image_policy_discovery)
+    GW->>DB: Read current policy
+    alt Invalid image and no gateway policy
+        GW->>GW: Keep this stream pending
+        DB-->>GW: Operator policy repair
+    end
+    Note right of GW: Gateway policy wins, otherwise use the parsed image policy or restrictive default
+    GW->>SUP: StartupConfigCandidate(policy, candidate_id)
+    SUP->>SUP: Enrich for paths in this image
+    SUP->>GW: StartupConfigPrepared(unchanged | prepared_policy | failure)
+    GW->>GW: Validate the proposed difference
+    GW->>DB: Persist when required
+    GW->>DB: Build fresh authoritative bootstrap
+    GW->>SUP: SessionAccepted(bootstrap)
+    SUP->>SUP: Initialize from bootstrap
+    SUP->>GW: ConfigBootstrapResult(component outcomes, admission)
+    GW->>DB: Persist admission for the delivered generation
+    GW->>SUP: ConfigurationAdmission(durable state)
+    alt Configuration accepted
+        SUP->>SUP: Launch workload
+        SUP->>GW: SupervisorRuntimeReady
+        GW->>DB: Promote sandbox to Ready
+    else Configuration rejected
+        GW->>SUP: ConfigUpdate(repaired snapshot)
+        SUP->>GW: ConfigUpdateResult(component outcome, admission)
+        GW->>DB: Persist accepted repair
+        GW->>SUP: ConfigurationAdmission(accepted)
+        SUP->>SUP: Launch workload on the same supervisor
+        SUP->>GW: SupervisorRuntimeReady
+        GW->>DB: Promote sandbox to Ready
+    end
+```
+
+The gateway can send complete component replacements on the accepted stream
+after policy, settings, or provider state changes. These payloads describe the
+latest effective state rather than the mutation that produced it. The gateway
+assigns ordering sequences within each session and component, while each
+snapshot retains its own content revision.
 
 Bootstrap components are independent read projections, not one atomic database
 snapshot. The sandbox configuration carries the provider-environment revision
@@ -642,21 +697,26 @@ without changing publishers. Provider payloads can contain
 credentials, so the gateway does not persist or render complete stream
 messages in logs.
 
-The supervisor currently parses and ignores stream-delivered configuration.
-Polling remains the only path that changes runtime state and repairs dropped or
-unavailable delivery. The gateway serializes construction per sandbox and
-component, and coalesces repeated mutations into the latest full snapshot. An
-enqueue result means only that the local stream queue accepted the message. A
-bounded scope fanout scheduler coalesces repeated workspace and global changes,
-and semaphores sized from the database pool bound delivery workers and snapshot
-builds. Fanout waits for worker capacity before admitting each recipient, so a
-fleet-wide change cannot create a fleet-sized task backlog or saturate the store
-and credential backends. Snapshot construction has a deadline that starts once
-a build holds a permit, and the gateway rejects encoded stream messages that
-approach the transport decoder limit. A later migration will apply these
-payloads directly and acknowledge their exact revisions before removing
-supervisor polling. At that point, the gateway will require a valid bootstrap
-before marking a session ready.
+Current-protocol supervisors apply stream-delivered configuration and report
+both component outcomes and admission for the exact gateway-authored generation.
+The gateway validates generation identity, persists admission, and returns that
+durable state on the stream. The supervisor holds the workload boundary until
+it receives an accepted acknowledgement. Rejection leaves the stream and
+supervisor alive so a later complete replacement can repair the generation and
+release the same workload. After launch, the supervisor separately reports
+runtime readiness once its relay plane is usable; admission alone never promotes
+the sandbox to `Ready`. Compatibility protocol revisions continue using polling.
+
+The gateway serializes construction per sandbox and component, and coalesces
+repeated mutations into the latest full snapshot. An enqueue result means only
+that the local stream queue accepted the message. A bounded scope fanout
+scheduler coalesces repeated workspace and global changes, and semaphores sized
+from the database pool bound delivery workers and snapshot builds. Fanout waits
+for worker capacity before admitting each recipient, so a fleet-wide change
+cannot create a fleet-sized task backlog or saturate the store and credential
+backends. Snapshot construction has a deadline that starts once a build holds a
+permit, and the gateway rejects encoded stream messages that approach the
+transport decoder limit.
 
 ## Configuration Admission
 
@@ -745,12 +805,10 @@ If policy construction fails, it reports the captured revision as `FAILED` with
 the original construction error. It never infers revision identity by comparing
 policy structure.
 
-This holds even when the initial policy is enriched with baseline paths during
-startup: the enriched revision the supervisor synced back to the gateway is the
-revision it acknowledges, so a successfully constructed initial policy never
-remains `Pending`. If the first poll returns a different revision, the supervisor
-processes it through the normal reload path instead of treating it as already
-loaded.
+This holds when the initial policy is enriched with baseline paths during the
+startup stream exchange. The gateway validates and persists the prepared
+policy before building `SessionAccepted`, so the supervisor acknowledges the
+exact revision from the final bootstrap.
 
 A newer sandbox-scoped revision can carry the same non-empty effective policy
 hash as the currently loaded revision, for example when provenance changes
@@ -771,13 +829,16 @@ refreshes and cannot permanently lose the initial acknowledgement.
 Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than
 zero) use the policy revision acknowledgement API. Global policies use the
 configuration admission contract without a sandbox policy revision acknowledgement.
-Local Rego/data overrides remain available for standalone development; combining
-them with a gateway-managed sandbox is rejected because the gateway cannot admit
-the runtime policy it would enforce.
+The configuration stream separately acknowledges complete snapshot application
+for every component. Local Rego/data overrides remain available for standalone
+development; combining them with a gateway-managed sandbox is rejected because
+the gateway cannot admit the runtime policy it would enforce.
 
 ## Failure Behavior
 
-- If gateway config polling fails, the sandbox keeps its last-known-good policy.
+- If compatibility config polling fails, the supervisor keeps its
+  last-known-good policy. Current protocol sessions use complete streamed
+  snapshots and reconnect with a fresh bootstrap.
 - If a live policy or middleware-registry update is invalid, the supervisor
   rejects the update and keeps the current runtime pair.
 - If an operator-run middleware call fails, the selected config's `on_error`

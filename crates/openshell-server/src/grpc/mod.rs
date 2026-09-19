@@ -756,7 +756,11 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<tonic::Streaming<SupervisorMessage>>,
     ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
-        crate::supervisor_session::handle_connect_supervisor(&self.state, request).await
+        Box::pin(crate::supervisor_session::handle_connect_supervisor(
+            &self.state,
+            request,
+        ))
+        .await
     }
 
     async fn report_main_process_exit(
@@ -866,7 +870,9 @@ pub mod test_support {
 
     use crate::ServerState;
     use crate::auth::identity::{Identity, IdentityProvider};
-    use crate::auth::principal::{Principal, UserPrincipal};
+    use crate::auth::principal::{
+        Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
+    };
     use crate::compute::{
         NoopTestDriver, new_test_runtime, new_test_runtime_for_driver, new_test_runtime_with_driver,
     };
@@ -879,7 +885,7 @@ pub mod test_support {
     use openshell_core::proto::open_shell_client::OpenShellClient;
     use openshell_core::proto::open_shell_server::OpenShellServer;
     use openshell_core::proto::{
-        GatewayMessage, SupervisorHello, SupervisorMessage, supervisor_message,
+        GatewayMessage, SandboxPolicy, SupervisorHello, SupervisorMessage, supervisor_message,
     };
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
@@ -889,7 +895,7 @@ pub mod test_support {
     pub struct SupervisorStreamHarness {
         server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
         /// Held so the supervisor side of the stream stays open.
-        _outbound: mpsc::Sender<SupervisorMessage>,
+        pub outbound: mpsc::Sender<SupervisorMessage>,
         pub inbound: tonic::Streaming<GatewayMessage>,
     }
 
@@ -907,13 +913,95 @@ pub mod test_support {
         sandbox_id: &str,
         protocol_revision: u32,
     ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        connect_supervisor_stream_with_image_policy(state, sandbox_id, protocol_revision, None)
+            .await
+    }
+
+    pub async fn connect_supervisor_stream_with_image_policy(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        protocol_revision: u32,
+        image_policy: Option<SandboxPolicy>,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        let result = image_policy.clone().map_or(
+            openshell_core::proto::image_policy_discovery::Result::Missing(()),
+            openshell_core::proto::image_policy_discovery::Result::Policy,
+        );
+        connect_supervisor_stream_with_image_policy_discovery(
+            state,
+            sandbox_id,
+            protocol_revision,
+            openshell_core::proto::ImagePolicyDiscovery {
+                result: Some(result),
+            },
+        )
+        .await
+    }
+
+    pub async fn connect_supervisor_stream_with_image_policy_discovery(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        protocol_revision: u32,
+        image_policy_discovery: openshell_core::proto::ImagePolicyDiscovery,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        connect_supervisor_stream_with_optional_image_policy_discovery(
+            state,
+            sandbox_id,
+            protocol_revision,
+            Some(image_policy_discovery),
+        )
+        .await
+    }
+
+    /// Model a stock supervisor reconnect, which omits the one-shot image
+    /// policy discovery after its initial session has been prepared.
+    pub async fn reconnect_supervisor_stream(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        protocol_revision: u32,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        connect_supervisor_stream_with_optional_image_policy_discovery(
+            state,
+            sandbox_id,
+            protocol_revision,
+            None,
+        )
+        .await
+    }
+
+    async fn connect_supervisor_stream_with_optional_image_policy_discovery(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        protocol_revision: u32,
+        image_policy_discovery: Option<openshell_core::proto::ImagePolicyDiscovery>,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        let image_policy = image_policy_discovery
+            .as_ref()
+            .and_then(|discovery| discovery.result.as_ref())
+            .and_then(|result| match result {
+                openshell_core::proto::image_policy_discovery::Result::Policy(policy) => {
+                    Some(policy.clone())
+                }
+                _ => None,
+            });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let principal = Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: sandbox_id.to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+            },
+            trust_domain: Some("openshell".to_string()),
+        });
         let server = tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(OpenShellServer::new(super::OpenShellService::new(
-                    Arc::clone(state),
-                )))
+                .add_service(OpenShellServer::with_interceptor(
+                    super::OpenShellService::new(Arc::clone(state)),
+                    move |mut request: Request<()>| {
+                        request.extensions_mut().insert(principal.clone());
+                        Ok(request)
+                    },
+                ))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
         let mut client = OpenShellClient::connect(format!("http://{address}"))
@@ -926,6 +1014,8 @@ pub mod test_support {
                     sandbox_id: sandbox_id.into(),
                     instance_id: "instance".into(),
                     protocol_revision,
+                    image_policy,
+                    image_policy_discovery,
                     supports_provider_readiness: false,
                 })),
             })
@@ -940,7 +1030,7 @@ pub mod test_support {
         };
         Ok(SupervisorStreamHarness {
             server,
-            _outbound: outbound,
+            outbound,
             inbound,
         })
     }

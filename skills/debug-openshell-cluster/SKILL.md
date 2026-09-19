@@ -633,6 +633,24 @@ the sandbox over per-sandbox TLS with server-certificate verification plus
 bootstrap-token client authentication, and owns gateway policy, provider
 credentials, DNS, and mediated upstream connections.
 
+The supervisor opens `ConnectSupervisor` before attaching to the workload and
+offers the policy found in the workload image on its first connection. The
+gateway selects its stored policy when present, otherwise the image policy, and
+sends that candidate back for image-specific filesystem preparation. It
+validates and persists the prepared result before sending the authoritative
+bootstrap. The bootstrap must contain both sandbox configuration and provider
+environment. The supervisor acknowledges application only after boundary
+enforcement, the canonical process, and SSH are ready.
+
+If the supervisor Pod is running but the sandbox remains Starting, inspect
+gateway and supervisor logs for `StartupConfigCandidate` or
+`StartupConfigPrepared` failures, policy validation errors, bootstrap build
+failures, missing components, revision mismatches, apply failures, or the
+two-minute bootstrap timeout. A failed startup preparation rejects the session
+before runtime initialization. Reconnects skip preparation and use the current
+gateway bootstrap. Do not add gateway credentials to the workload Pod;
+configuration delivery terminates in the separate supervisor.
+
 Inspect all driver-managed resources when a Kubernetes sandbox remains Starting
 or loses readiness:
 

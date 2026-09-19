@@ -14,6 +14,7 @@
 )]
 
 include!(concat!(env!("OUT_DIR"), "/openshell.storage.v1.rs"));
+include!(concat!(env!("OUT_DIR"), "/openshell.storage.v2.rs"));
 
 pub(crate) const STORAGE_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/storage_descriptor.bin"));
@@ -107,6 +108,48 @@ impl ObjectWorkspace for StoredProviderCredentialRefreshStateV2 {
     }
 }
 
+impl ObjectId for StoredConfigComponentObservation {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for StoredConfigComponentObservation {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl ObjectLabels for StoredConfigComponentObservation {
+    fn object_labels(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_ref().map(|m| m.labels.clone())
+    }
+}
+
+impl SetResourceVersion for StoredConfigComponentObservation {
+    fn set_resource_version(&mut self, version: u64) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.resource_version = version;
+        }
+    }
+}
+
+impl GetResourceVersion for StoredConfigComponentObservation {
+    fn get_resource_version(&self) -> u64 {
+        self.metadata.as_ref().map_or(0, |m| m.resource_version)
+    }
+}
+
+impl ObjectWorkspace for StoredConfigComponentObservation {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+
+    fn requires_workspace() -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,9 +162,9 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "04c77ef201b45a7248307b2f1dfe3527e0a6135641646e37e041248c442ab879";
+        "aec69234398a97e094eaeb7214803dadd8beb38eeffce25b34f08a20a8108652";
     const DURABLE_SCHEMA_SHA256: &str =
-        "9eeaa29dfba187bff69fb7bc4f9a13a0f1d7be3f7049a38c8f0e20ce77ec7d8b";
+        "965a8a09fa80168906a4f9cc6169d3623b98f5281c367695f2f2898230915dd0";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "a6e97fdde30c439ffaa03c2952a43033f8ea338fed6b1456ebe2d7d8af14e834";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
@@ -168,6 +211,7 @@ mod tests {
         ".openshell.sandbox.v1.SandboxPolicy",
         ".openshell.storage.v1.DraftChunkPayload",
         ".openshell.storage.v1.PolicyRevisionPayload",
+        ".openshell.storage.v2.StoredConfigComponentObservation",
         ".openshell.storage.v1.StoredConfigUpdateOperation",
         ".openshell.storage.v1.StoredProviderCredentialRefreshStateV2",
         ".openshell.storage.v1.StoredProviderProfile",
@@ -575,8 +619,8 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (310, 25),
-                (92, 19),
+                (315, 25),
+                (93, 19),
                 (80, 19),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,

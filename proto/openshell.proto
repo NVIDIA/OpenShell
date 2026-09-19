@@ -7,6 +7,7 @@ package openshell.v1;
 
 import "datamodel.proto";
 import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 import "options.proto";
@@ -2860,8 +2861,14 @@ message SupervisorMessage {
     RelayClose relay_close = 4;
     ConfigUpdateResult config_update_result = 5;
     ConfigBootstrapResult config_bootstrap_result = 6;
+    StartupConfigPrepared startup_config_prepared = 7;
+    // Sent after accepted admission once the workload relay is usable.
+    SupervisorRuntimeReady runtime_ready = 8;
   }
 }
+
+// Confirms that the admitted workload and its gateway relay are usable.
+message SupervisorRuntimeReady {}
 
 // Envelope for gateway-to-supervisor messages on the ConnectSupervisor stream.
 message GatewayMessage {
@@ -2872,6 +2879,10 @@ message GatewayMessage {
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
     ConfigUpdate config_update = 6;
+    StartupConfigCandidate startup_config_candidate = 7;
+    // Durable gateway acknowledgement of streamed configuration admission.
+    // The supervisor must not launch the workload until this is ACCEPTED.
+    SandboxConfigurationAdmission configuration_admission = 8;
   }
 }
 
@@ -2886,6 +2897,48 @@ message SupervisorHello {
   uint32 protocol_revision = 3;
   // The supervisor can report credential, policy, and launch-environment installation.
   bool supports_provider_readiness = 4;
+  // Policy discovered in the sandbox image. The gateway considers it only
+  // when preparing the first authoritative bootstrap for this process.
+  // Kept for compatibility with revision-2 peers that predate
+  // image_policy_discovery.
+  openshell.sandbox.v1.SandboxPolicy image_policy = 5;
+  // Explicit result of inspecting the workload image policy. Unlike the
+  // legacy image_policy field, this distinguishes an absent policy from one
+  // that exists but cannot be parsed.
+  ImagePolicyDiscovery image_policy_discovery = 6;
+}
+
+message ImagePolicyDiscovery {
+  oneof result {
+    google.protobuf.Empty missing = 1;
+    google.protobuf.Empty invalid = 2;
+    openshell.sandbox.v1.SandboxPolicy policy = 3;
+  }
+}
+
+// Gateway-selected policy that the supervisor must prepare against the local
+// image before the session can be accepted. The candidate is not authoritative
+// runtime state; SessionAccepted carries the final gateway-owned bootstrap.
+message StartupConfigCandidate {
+  // Opaque identifier scoped to this ConnectSupervisor attempt.
+  string candidate_id = 1;
+  openshell.sandbox.v1.SandboxPolicy policy = 2;
+  string policy_hash = 3;
+  openshell.sandbox.v1.PolicySource policy_source = 4;
+  uint32 policy_version = 5;
+}
+
+// Supervisor preparation result for one StartupConfigCandidate.
+message StartupConfigPrepared {
+  string candidate_id = 1;
+  oneof result {
+    // The candidate needs no image-specific changes.
+    google.protobuf.Empty unchanged = 2;
+    // Complete prepared policy. The gateway validates its difference from the
+    // candidate and remains authoritative for persistence and composition.
+    openshell.sandbox.v1.SandboxPolicy prepared_policy = 3;
+    ConfigApplyFailure failure = 4;
+  }
 }
 
 // Gateway accepts the supervisor session.
@@ -2897,7 +2950,8 @@ message SessionAccepted {
   // Complete gateway-owned configuration. During the staged rollout this may
   // be omitted only when the gateway cannot build the projection.
   ConfigBootstrap bootstrap = 3;
-  // Exact internal stream protocol revision implemented by this gateway.
+  // Stream semantics negotiated from the supervisor's offered revision. The
+  // gateway echoes a supported compatibility revision during rollout.
   uint32 protocol_revision = 4;
   // Recommended heartbeat interval.
   google.protobuf.Duration heartbeat_interval = 102;
@@ -2948,11 +3002,16 @@ message ConfigUpdateResult {
   // Echoes ConfigUpdate.component_sequence.
   uint64 component_sequence = 2;
   ConfigComponentApplyResult result = 3;
+  // Admission state for a sandbox-configuration update. Omitted for provider
+  // environment updates and compatibility supervisors.
+  SandboxConfigurationAdmission admission = 4;
 }
 
 // Aggregate application result for the SessionAccepted bootstrap.
 message ConfigBootstrapResult {
   repeated ConfigComponentApplyResult results = 1;
+  // Admission state of the complete gateway-authored bootstrap generation.
+  SandboxConfigurationAdmission admission = 2;
 }
 
 // Gateway rejects the supervisor session.

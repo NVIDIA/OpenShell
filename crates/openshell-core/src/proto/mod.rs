@@ -100,7 +100,11 @@ pub fn all_workspaces_selector() -> WorkspaceSelector {
 /// The supervisor stream is an internal, version-locked deployment contract.
 /// Bump this when either peer can no longer honor the previous stream
 /// semantics.
-pub const SUPERVISOR_PROTOCOL_REVISION: u32 = 1;
+pub const SUPERVISOR_PROTOCOL_REVISION: u32 = 2;
+
+/// Stage 1 peers understand snapshot envelopes but do not apply them. They
+/// remain compatible while polling is retained for the rollout.
+pub const PREVIOUS_SUPERVISOR_PROTOCOL_REVISION: u32 = 1;
 
 /// Revision implied by peers built before the handshake existed. Proto3 leaves
 /// the field unset, so such peers report zero.

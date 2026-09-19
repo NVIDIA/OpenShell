@@ -9,8 +9,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage_proto_dir = manifest_dir.join("proto");
     let public_proto_dir = manifest_dir.join("../../proto");
     let storage_proto = storage_proto_dir.join("storage.proto");
+    let storage_v2_proto = storage_proto_dir.join("storage_v2.proto");
 
     println!("cargo:rerun-if-changed={}", storage_proto.display());
+    println!("cargo:rerun-if-changed={}", storage_v2_proto.display());
     for imported_proto in [
         "datamodel.proto",
         "openshell.proto",
@@ -44,7 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "::openshell_core::proto::sandbox::v1",
         )
         .file_descriptor_set_path(&descriptor_path)
-        .compile_protos(&[storage_proto], &[storage_proto_dir, public_proto_dir])?;
+        .compile_protos(
+            &[storage_proto, storage_v2_proto],
+            &[storage_proto_dir, public_proto_dir],
+        )?;
 
     Ok(())
 }

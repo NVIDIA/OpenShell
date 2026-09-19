@@ -1,0 +1,25 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.storage.v2;
+
+import "datamodel.proto";
+import "google/protobuf/timestamp.proto";
+import "openshell.proto";
+
+// Compact, non-secret record of the latest supervisor-observed state for one
+// gateway-owned configuration component. Full delivered snapshots never enter
+// durable storage.
+message StoredConfigComponentObservation {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  string sandbox_id = 2;
+  openshell.v1.ConfigComponent component = 3;
+  openshell.v1.ConfigSnapshotRevision requested_revision = 4;
+  openshell.v1.ConfigSnapshotRevision applied_revision = 5;
+  openshell.v1.ConfigApplyOutcome outcome = 6;
+  string effective_source = 7;
+  google.protobuf.Timestamp observed_at_time = 8;
+  string sanitized_error = 9;
+}

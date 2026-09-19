@@ -423,7 +423,7 @@ fn main() -> Result<()> {
                 };
                 let admitted_isolation_backend =
                     std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND).ok();
-                openshell_supervisor::run_sandbox(
+                Box::pin(openshell_supervisor::run_sandbox(
                     command,
                     workdir,
                     args.timeout,
@@ -442,7 +442,7 @@ fn main() -> Result<()> {
                     auth_bundle,
                     admitted_isolation_backend,
                     args.main_exit_marker,
-                )
+                ))
                 .await
             }
             SupervisorRole::NetworkProxy => {
