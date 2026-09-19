@@ -134,6 +134,7 @@ message StoredConfigUpdateOperation {
   openshell.v1.ProviderReadinessReason provider_snapshot_reason = 15;
 }
 
+
 // Stored payload for a policy revision row in the generic objects table.
 message PolicyRevisionPayload {
   // Serialized policy contents.

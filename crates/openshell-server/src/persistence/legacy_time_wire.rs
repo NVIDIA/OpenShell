@@ -40,6 +40,7 @@ pub(super) fn migrate(object_type: &str, payload: &[u8]) -> PersistenceResult<Ve
 
 fn root_message_name(object_type: &str) -> Option<&'static str> {
     match object_type {
+        "config_update_operation" => Some("openshell.storage.v1.StoredConfigUpdateOperation"),
         "sandbox" => Some("openshell.v1.Sandbox"),
         "provider" => Some("openshell.datamodel.v1.Provider"),
         "workspace" => Some("openshell.datamodel.v1.Workspace"),
@@ -223,8 +224,15 @@ fn conversion(message: &str, field: u32) -> Option<Conversion> {
         TimestampString as TS,
     };
     match (message, field) {
+        (
+            "openshell.storage.v1.StoredConfigUpdateOperation"
+            | "openshell.v1.ConfigUpdateOperation"
+            | "openshell.datamodel.v1.ObjectMeta",
+            8,
+        ) => Some(T { new_tag: 108 }),
+        ("openshell.v1.ConfigUpdateOperation", 9) => Some(T { new_tag: 109 }),
+        ("openshell.v1.ConfigUpdateOperation", 10) => Some(T { new_tag: 110 }),
         ("openshell.datamodel.v1.ObjectMeta", 3) => Some(T { new_tag: 103 }),
-        ("openshell.datamodel.v1.ObjectMeta", 8) => Some(T { new_tag: 108 }),
         ("openshell.v1.SshSession", 4) => Some(T { new_tag: 104 }),
         ("openshell.datamodel.v1.Provider", 5) => Some(M { new_tag: 105 }),
         ("openshell.v1.SandboxCondition", 5) => Some(TS { new_tag: 105 }),
@@ -410,6 +418,41 @@ mod tests {
     struct LegacySandboxWorkloadTemplate {
         #[prost(message, optional, tag = "1")]
         metadata: Option<LegacyObjectMeta>,
+    }
+
+    #[test]
+    fn legacy_configuration_operation_preserves_completion_and_retry_times() {
+        // Stage 3 before integration with the protobuf time migration:
+        // Applied, created=1000ms, updated=2000ms, completed=3000ms, retry=4000ms.
+        let payload = hex::decode("120b280240e80748d00f50b81740a01f").unwrap();
+        let migrated = migrate("config_update_operation", &payload).unwrap();
+        let record =
+            crate::storage_proto::StoredConfigUpdateOperation::decode(migrated.as_slice()).unwrap();
+        let operation = record.operation.as_ref().unwrap();
+        assert_eq!(
+            operation.state,
+            openshell_core::proto::ConfigUpdateOperationState::Applied as i32
+        );
+        assert_eq!(
+            openshell_core::time::timestamp_to_millis(operation.created_time.as_ref().unwrap())
+                .unwrap(),
+            1000
+        );
+        assert_eq!(
+            openshell_core::time::timestamp_to_millis(operation.updated_time.as_ref().unwrap())
+                .unwrap(),
+            2000
+        );
+        assert_eq!(
+            openshell_core::time::timestamp_to_millis(operation.completed_time.as_ref().unwrap())
+                .unwrap(),
+            3000
+        );
+        assert_eq!(record.next_attempt_at_ms(), 4000);
+        assert_eq!(
+            migrate("config_update_operation", &migrated).unwrap(),
+            migrated
+        );
     }
 
     #[test]

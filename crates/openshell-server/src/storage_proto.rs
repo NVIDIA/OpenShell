@@ -150,6 +150,57 @@ impl ObjectWorkspace for StoredConfigComponentObservation {
     }
 }
 
+impl StoredConfigUpdateOperation {
+    /// Missing retry time is immediately due; invalid stored time must never be claimed.
+    pub(crate) fn next_attempt_at_ms(&self) -> i64 {
+        self.next_attempt_time.as_ref().map_or(0, |time| {
+            openshell_core::time::timestamp_to_millis(time).unwrap_or(i64::MAX)
+        })
+    }
+}
+
+impl ObjectId for StoredConfigUpdateOperation {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for StoredConfigUpdateOperation {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl ObjectLabels for StoredConfigUpdateOperation {
+    fn object_labels(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_ref().map(|m| m.labels.clone())
+    }
+}
+
+impl SetResourceVersion for StoredConfigUpdateOperation {
+    fn set_resource_version(&mut self, version: u64) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.resource_version = version;
+        }
+    }
+}
+
+impl GetResourceVersion for StoredConfigUpdateOperation {
+    fn get_resource_version(&self) -> u64 {
+        self.metadata.as_ref().map_or(0, |m| m.resource_version)
+    }
+}
+
+impl ObjectWorkspace for StoredConfigUpdateOperation {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+
+    fn requires_workspace() -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,7 +213,7 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "aec69234398a97e094eaeb7214803dadd8beb38eeffce25b34f08a20a8108652";
+        "284412343e72b26b7252e727dd66f2cc530ab5b317eb1ada0b1c3e6fcb80082e";
     const DURABLE_SCHEMA_SHA256: &str =
         "965a8a09fa80168906a4f9cc6169d3623b98f5281c367695f2f2898230915dd0";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -562,12 +613,12 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            101 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
+            102 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            76 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
+            77 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -575,7 +626,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            76 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            77 + PROVIDER_READINESS_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -619,7 +670,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (315, 25),
+                (317, 26),
                 (93, 19),
                 (80, 19),
                 PUBLIC_RPC_SCHEMA_SHA256,

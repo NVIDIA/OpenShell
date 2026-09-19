@@ -3,6 +3,10 @@
 
 mod helpers;
 
+use openshell_core::proto::{
+    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
+};
+
 use helpers::{EnvVarGuard, build_ca, build_client_cert, build_server_cert};
 use openshell_bootstrap::{load_last_sandbox, save_last_sandbox};
 use openshell_cli::run;
@@ -17,14 +21,14 @@ use openshell_core::proto::{
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
+    GetSandboxRequest, HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
     ListSandboxesResponse, NetworkEndpoint, NetworkPolicyRule, PolicyStatus, ProviderResponse,
     Sandbox, SandboxPolicy, SandboxPolicyRevision, SandboxResponse, SandboxStreamEvent,
     ServiceStatus, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
@@ -38,6 +42,7 @@ use tonic::{Response, Status};
 #[derive(Clone, Default)]
 struct SandboxState {
     last_get_name: Arc<Mutex<Option<String>>>,
+    timeout_config_updates: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
@@ -470,10 +475,28 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    #[allow(unused_qualifications)]
+    async fn get_config_update_operation(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetConfigUpdateOperationRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::GetConfigUpdateOperationResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
     async fn update_config(
         &self,
         _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
     ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
+        if self.state.timeout_config_updates.load(Ordering::Relaxed) {
+            let mut status = Status::deadline_exceeded("update remains pending");
+            status
+                .metadata_mut()
+                .insert("operation-id", "operation-timeout-123".parse().unwrap());
+            return Err(status);
+        }
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -483,7 +506,7 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
         let req = request.into_inner();
         assert_eq!(req.sandbox, "my-sandbox");
-        assert_eq!(req.version, 3);
+        assert!(matches!(req.version, 0 | 3));
         assert!(!req.global);
 
         let policy = SandboxPolicy {
@@ -715,7 +738,7 @@ struct TestServer {
     endpoint: String,
     tls: TlsOptions,
     openshell: TestOpenShell,
-    _dir: TempDir,
+    dir: TempDir,
 }
 
 async fn run_server() -> TestServer {
@@ -762,7 +785,7 @@ async fn run_server() -> TestServer {
         endpoint,
         tls,
         openshell,
-        _dir: dir,
+        dir,
     }
 }
 
@@ -1001,4 +1024,66 @@ async fn explicit_name_takes_precedence_over_persisted() {
         Some("explicit-sandbox"),
         "explicit name should be used, not the persisted one"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_wait_timeouts_exit_124_for_set_and_update() {
+    let ts = run_server().await;
+    ts.openshell
+        .state
+        .timeout_config_updates
+        .store(true, Ordering::Relaxed);
+
+    let config_dir = tempfile::tempdir().unwrap();
+    let mtls_dir = config_dir
+        .path()
+        .join("openshell/gateways/timeout-test/mtls");
+    std::fs::create_dir_all(&mtls_dir).unwrap();
+    for name in ["ca.crt", "tls.crt", "tls.key"] {
+        std::fs::copy(ts.dir.path().join(name), mtls_dir.join(name)).unwrap();
+    }
+    let policy_dir = tempfile::tempdir().unwrap();
+    let policy_path = policy_dir.path().join("policy.yaml");
+    std::fs::write(&policy_path, "version: 1\n").unwrap();
+
+    let common = [
+        "--gateway",
+        "timeout-test",
+        "--gateway-endpoint",
+        ts.endpoint.as_str(),
+        "policy",
+    ];
+    let commands = [
+        vec![
+            "set",
+            "my-sandbox",
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--wait",
+            "--timeout",
+            "1",
+        ],
+        vec![
+            "update",
+            "my-sandbox",
+            "--add-endpoint",
+            "api.example.com:443",
+            "--wait",
+            "--timeout",
+            "1",
+        ],
+    ];
+
+    for args in commands {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_openshell"))
+            .args(common)
+            .args(args)
+            .env("XDG_CONFIG_HOME", config_dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(124), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("operation-timeout-123"), "{stderr}");
+        assert!(stderr.contains("remains committed"), "{stderr}");
+    }
 }

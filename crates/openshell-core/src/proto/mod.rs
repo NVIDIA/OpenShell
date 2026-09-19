@@ -100,19 +100,7 @@ pub fn all_workspaces_selector() -> WorkspaceSelector {
 /// The supervisor stream is an internal, version-locked deployment contract.
 /// Bump this when either peer can no longer honor the previous stream
 /// semantics.
-pub const SUPERVISOR_PROTOCOL_REVISION: u32 = 2;
-
-/// Stage 1 peers understand snapshot envelopes but do not apply them. They
-/// remain compatible while polling is retained for the rollout.
-pub const PREVIOUS_SUPERVISOR_PROTOCOL_REVISION: u32 = 1;
-
-/// Revision implied by peers built before the handshake existed. Proto3 leaves
-/// the field unset, so such peers report zero.
-///
-/// Sandboxes keep their supervisor binary until they are recreated, so a
-/// gateway upgrade must keep serving them for one release. Remove this
-/// allowance once every supported release sends an explicit revision.
-pub const LEGACY_SUPERVISOR_PROTOCOL_REVISION: u32 = 0;
+pub const SUPERVISOR_PROTOCOL_REVISION: u32 = 3;
 
 #[cfg(test)]
 mod tests {

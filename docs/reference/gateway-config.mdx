@@ -253,10 +253,9 @@ namespace              = "openshell"
 # Required in raw TOML; Helm derives this from the gateway Service.
 grpc_endpoint          = "https://openshell-gateway.openshell.svc:8080"
 default_image          = "ghcr.io/nvidia/openshell/sandbox:latest"
-# Defaults to the gateway version. The current internal supervisor protocol
-# streams authoritative configuration snapshots. The immediately previous
-# revision remains polling-compatible, and pre-handshake supervisors remain
-# compatible for one release. Other revisions reject the session.
+# Defaults to the gateway version. Gateway and supervisor require matching
+# protocol revision 3 and stream authoritative configuration snapshots.
+# Peers that require configuration polling are rejected.
 # supervisor_image     = "ghcr.io/nvidia/openshell/supervisor:<version>"
 client_tls_secret_name = "openshell-client-tls"
 service_account_name   = "openshell-sandbox"
@@ -566,8 +565,7 @@ image_pull_secrets             = ["regcred"]
 sandbox_runtime_image_pull_policy = "if_not_present"
 # Defaults to the gateway version. Custom builds must match the gateway's
 # internal supervisor protocol revision; mismatched peers reject the session.
-# Supervisors from releases before the handshake existed remain compatible for
-# one release.
+# Protocol revision 3 is required; older peers are rejected.
 # supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "if_not_present"
 
@@ -721,10 +719,8 @@ sandbox_label      = "docker-dev"
 grpc_endpoint      = "https://127.0.0.1:17670"
 # Workload-side runtime. Defaults to the gateway version.
 # sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
-# Supervisor runtime defaults to the gateway version. The current internal
-# protocol streams authoritative configuration snapshots; the immediately
-# previous revision uses polling compatibility. Pre-handshake supervisors
-# remain compatible for one release. Other revisions reject the session.
+# Supervisor runtime defaults to the gateway version. Both peers require
+# protocol revision 3 and stream authoritative configuration snapshots.
 # supervisor_image = "ghcr.io/nvidia/openshell/supervisor:<version>"
 # Unsafe operator override. Host bind mounts, including Docker local-driver
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
@@ -788,11 +784,9 @@ ssh_socket_path         = "/run/openshell/ssh.sock"
 stop_timeout_secs       = 45
 # Statically linked workload-side runtime. Defaults to the gateway version.
 # sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
-# Dynamically linked supervisor runtime defaults to the gateway version. The
-# current internal protocol streams authoritative configuration snapshots; the
-# immediately previous revision uses polling compatibility. Pre-handshake
-# supervisors remain compatible for one release. Other revisions reject the
-# session.
+# Dynamically linked supervisor runtime defaults to the gateway version.
+# Both peers require protocol revision 3 and stream authoritative configuration
+# snapshots.
 # supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 # Unsafe operator override. Host bind mounts, including Podman local-driver
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can

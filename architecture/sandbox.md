@@ -69,8 +69,7 @@ replacement from granting authority.
    run untrusted code yet.
 3. `openshell-supervisor` opens its gateway session and receives an
    authoritative policy, settings, middleware, and provider bootstrap before
-   attaching to the sandbox. Compatibility protocol revisions continue to use
-   the polling APIs.
+   attaching to the sandbox. Protocol revision 3 is required on both peers. Older peers are rejected.
 4. The sandbox installs its seccomp notification broker and Landlock baseline,
    then reports measured confirmation. The supervisor must accept that evidence
 before it sends the launch permit.
@@ -686,8 +685,8 @@ snapshot retains its own content revision.
 Bootstrap components are independent read projections, not one atomic database
 snapshot. The sandbox configuration carries the provider-environment revision
 it was built against. The gateway retries bootstrap construction when that
-revision does not match the provider snapshot. Later component updates and
-polling repair changes committed while the other projections were being built.
+revision does not match the provider snapshot. Later component updates and gateway reconciliation repair changes committed
+while the other projections were being built.
 
 Configuration delivery goes through a gateway-owned routing boundary rather
 than exposing local supervisor channels to mutation handlers. The current
@@ -705,7 +704,8 @@ it receives an accepted acknowledgement. Rejection leaves the stream and
 supervisor alive so a later complete replacement can repair the generation and
 release the same workload. After launch, the supervisor separately reports
 runtime readiness once its relay plane is usable; admission alone never promotes
-the sandbox to `Ready`. Compatibility protocol revisions continue using polling.
+the sandbox to `Ready`. Both peers require protocol revision 3; revisions that
+rely on polling are rejected.
 
 The gateway serializes construction per sandbox and component, and coalesces
 repeated mutations into the latest full snapshot. An enqueue result means only
@@ -823,7 +823,7 @@ Policy status delivery uses a FIFO background worker. Retryable delivery
 failures retain the ordered update and retry with capped exponential backoff;
 terminal errors are logged and discarded. The outbox is nonblocking and does
 not discard updates because of a fixed queue capacity, so status endpoint
-outages cannot block policy polling, enforcement, settings, or provider
+outages cannot block streamed configuration, enforcement, settings, or provider
 refreshes and cannot permanently lose the initial acknowledgement.
 
 Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than
@@ -836,9 +836,8 @@ the gateway cannot admit the runtime policy it would enforce.
 
 ## Failure Behavior
 
-- If compatibility config polling fails, the supervisor keeps its
-  last-known-good policy. Current protocol sessions use complete streamed
-  snapshots and reconnect with a fresh bootstrap.
+- If the configuration stream disconnects, the supervisor keeps its
+  last-known-good policy and reconnects with a fresh bootstrap.
 - If a live policy or middleware-registry update is invalid, the supervisor
   rejects the update and keeps the current runtime pair.
 - If an operator-run middleware call fails, the selected config's `on_error`

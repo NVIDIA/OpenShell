@@ -1,33 +1,134 @@
-// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Durable, exact-target configuration operations, independent of delivery transport.
-//!
-//! Provider receipts project the common operation resource. Live installation
-//! evidence remains session-bound; an applied operation records historical
-//! completion and never substitutes for a fresh provider readiness evaluation.
-
-#![allow(clippy::result_large_err)] // Internal operation helpers preserve gRPC error details.
+//! Durable completion tracking for sandbox-scoped desired-state updates.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use futures::{StreamExt as _, stream};
+use metrics::{counter, gauge, histogram};
+use openshell_core::ObjectId;
 use openshell_core::proto::{
-    ConfigApplyOutcome, ConfigComponent, ConfigSnapshotRevision, ConfigUpdateOperation,
-    ConfigUpdateOperationState, ObjectMeta, ProviderMutationKind, ProviderMutationReceipt,
-    ProviderReadinessReason, ProviderReadinessState, ProviderReadinessStatus,
-    config_snapshot_revision,
+    ConfigApplyOutcome, ConfigComponent, ConfigComponentApplyResult, ConfigSnapshotRevision,
+    ConfigUpdateOperation, ConfigUpdateOperationState, ObjectMeta, Sandbox, SandboxConfigRevision,
+    SandboxPhase, UpdateConfigResponse, config_snapshot_revision,
 };
-use openshell_core::rpc_error::{self, ErrorDetails, StatusExt};
-use prost::Message;
-use sha2::{Digest, Sha256};
-use tonic::{Code, Status};
+use tonic::Status;
+use tracing::{debug, info, warn};
+use uuid::Uuid;
 
-use crate::persistence::{ObjectRecord, ObjectType, PersistenceError, Store, WriteCondition};
+use crate::ServerState;
+use crate::persistence::{KnownVersionUpdate, ObjectType, current_time_ms};
 use crate::storage_proto::StoredConfigUpdateOperation;
 
-/// Object-store namespace shared by configuration completion resources.
+pub use crate::provider_config_operation::{
+    get_provider_operation, observe_provider_status, record_provider_operation,
+};
+
+fn timestamp(ms: i64) -> prost_types::Timestamp {
+    openshell_core::time::timestamp_from_millis(ms).expect("system clock fits protobuf timestamp")
+}
+
 pub const CONFIG_UPDATE_OPERATION_OBJECT_TYPE: &str = "config_update_operation";
+const OPERATION_SCAN_PAGE_SIZE: u32 = 250;
 const MAX_TRANSITION_RETRIES: usize = 8;
+const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_mins(1);
+const MAX_WAIT_TIMEOUT: Duration = Duration::from_hours(1);
+const MAX_SANITIZED_ERROR_BYTES: usize = 1_024;
+
+/// Gateway-local wakeups for callers waiting on one durable operation.
+#[derive(Debug, Clone)]
+pub struct OperationWatchBus {
+    inner: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<()>>>>,
+}
+
+struct OperationSubscription {
+    bus: OperationWatchBus,
+    operation_id: String,
+    sender: tokio::sync::broadcast::Sender<()>,
+    receiver: Option<tokio::sync::broadcast::Receiver<()>>,
+}
+
+impl OperationSubscription {
+    async fn recv(&mut self) -> Result<(), tokio::sync::broadcast::error::RecvError> {
+        self.receiver
+            .as_mut()
+            .expect("operation subscription receiver is available")
+            .recv()
+            .await
+    }
+}
+
+impl Drop for OperationSubscription {
+    fn drop(&mut self) {
+        // Receiver fields normally drop after this method returns. Drop ours
+        // first so concurrent teardown observes the actual remaining waiter
+        // count while deciding whether to remove the channel.
+        drop(self.receiver.take());
+        let mut inner = self
+            .bus
+            .inner
+            .lock()
+            .expect("operation watch bus lock poisoned");
+        let remove = inner.get(&self.operation_id).is_some_and(|current| {
+            current.same_channel(&self.sender) && self.sender.receiver_count() == 0
+        });
+        if remove {
+            inner.remove(&self.operation_id);
+        }
+    }
+}
+
+impl OperationWatchBus {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn sender_for(&self, operation_id: &str) -> tokio::sync::broadcast::Sender<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("operation watch bus lock poisoned");
+        inner
+            .entry(operation_id.to_string())
+            .or_insert_with(|| tokio::sync::broadcast::channel(16).0)
+            .clone()
+    }
+
+    fn subscribe(&self, operation_id: &str) -> OperationSubscription {
+        let sender = self.sender_for(operation_id);
+        OperationSubscription {
+            bus: self.clone(),
+            operation_id: operation_id.to_string(),
+            receiver: Some(sender.subscribe()),
+            sender,
+        }
+    }
+
+    pub fn notify(&self, operation_id: &str) {
+        let sender = self
+            .inner
+            .lock()
+            .expect("operation watch bus lock poisoned")
+            .remove(operation_id);
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("operation watch bus lock poisoned")
+            .len()
+    }
+}
 
 impl ObjectType for StoredConfigUpdateOperation {
     fn object_type() -> &'static str {
@@ -35,256 +136,208 @@ impl ObjectType for StoredConfigUpdateOperation {
     }
 }
 
-/// Provider-specific view of one common configuration operation.
-#[derive(Clone, Debug)]
-pub struct ProviderOperation {
-    /// Immutable desired authority captured for this operation.
-    pub(crate) receipt: ProviderMutationReceipt,
-    /// A failed initial snapshot is never reconstructed into another target.
-    pub(crate) snapshot_reason: ProviderReadinessReason,
-    /// Durable historical outcome; callers must separately evaluate live readiness.
-    pub(crate) operation: ConfigUpdateOperation,
+#[derive(Debug, Clone, Copy)]
+pub struct OperationTarget {
+    pub policy_version: u32,
+    pub settings_revision: u64,
 }
 
-fn storage_unavailable() -> Status {
-    // A provider mutation can already have committed when operation persistence
-    // fails. No retry hint is attached: repeating the mutation is not proven safe.
-    Status::with_error_details(
-        Code::Unavailable,
-        "configuration operation storage unavailable; the saved mutation may remain in effect",
-        ErrorDetails::with_error_info(
-            "CONFIG_OPERATION_STORAGE_UNCERTAIN",
-            rpc_error::ERROR_DOMAIN,
-            HashMap::new(),
-        ),
-    )
+#[derive(Debug, Clone, Default)]
+pub struct CommittedResponse {
+    pub policy_version: u32,
+    pub policy_hash: String,
+    pub settings_revision: u64,
+    pub deleted: bool,
+    pub annotations: HashMap<String, String>,
 }
 
-fn invalid_record() -> Status {
-    Status::with_error_details(
-        Code::Internal,
-        "configuration operation identity is inconsistent",
-        ErrorDetails::with_error_info(
-            "CONFIG_OPERATION_INVALID",
-            rpc_error::ERROR_DOMAIN,
-            HashMap::new(),
-        ),
-    )
-}
-
-fn persisted_time(receipt: &ProviderMutationReceipt) -> Result<prost_types::Timestamp, Status> {
-    // Receipt identity includes the full canonical timestamp. Absence is not
-    // the Unix epoch, and reducing nanos to milliseconds would merge identities.
-    let timestamp = receipt.persisted_time.ok_or_else(invalid_record)?;
-    openshell_core::time::validate_timestamp(&timestamp).map_err(|_| invalid_record())?;
-    Ok(timestamp)
-}
-
-fn observation_id(
-    receipt: &ProviderMutationReceipt,
-    snapshot_reason: ProviderReadinessReason,
-) -> Result<String, Status> {
-    let desired = receipt.desired.as_ref().ok_or_else(invalid_record)?;
-    let mut digest = Sha256::new();
-    digest.update(b"openshell/provider-observation/v1\0");
-    let target_bytes = desired.encode_to_vec();
-    // The target contains only public identity and opaque revision fields. Its
-    // protobuf has no maps, so encoding is canonical. Length framing prevents
-    // component concatenation ambiguities across workspaces and provider names.
-    for component in [
-        receipt.workspace.as_bytes(),
-        receipt.provider.as_bytes(),
-        target_bytes.as_slice(),
-    ] {
-        let length = u64::try_from(component.len()).map_err(|_| invalid_record())?;
-        digest.update(length.to_be_bytes());
-        digest.update(component);
+pub fn operation_name(sandbox_id: &str, idempotency_key: &str, operation_id: &str) -> String {
+    if idempotency_key.is_empty() {
+        operation_id.to_string()
+    } else {
+        format!("{sandbox_id}:{idempotency_key}")
     }
-    // A failed capture and its later successful repair are different targets;
-    // the original failed operation must remain immutable.
-    digest.update((snapshot_reason as i32).to_be_bytes());
-    let mut bytes = [0_u8; 16];
-    for (byte, hashed) in bytes.iter_mut().zip(digest.finalize()) {
-        *byte = hashed;
-    }
-    Ok(uuid::Builder::from_custom_bytes(bytes)
-        .into_uuid()
-        .to_string())
 }
 
-/// Record an exact provider target in the shared configuration-operation store.
-///
-/// The caller captures the snapshot only after its provider mutation finishes.
-/// This write does not roll back a preceding mutation on failure. An incomplete
-/// snapshot is persisted as failed, retaining its original non-secret reason.
-/// Observation-only requests reuse the original receipt for the same complete
-/// target; source mutations retain their distinct caller-created receipt IDs.
-pub async fn record_provider_operation(
-    store: &Store,
-    mut receipt: ProviderMutationReceipt,
-    snapshot_reason: ProviderReadinessReason,
-) -> Result<ProviderMutationReceipt, Status> {
-    let observation = receipt.kind == ProviderMutationKind::Observe as i32;
-    if observation {
-        receipt.receipt_id = observation_id(&receipt, snapshot_reason)?;
+fn initial_state(phase: SandboxPhase) -> ConfigUpdateOperationState {
+    match phase {
+        SandboxPhase::Stopped | SandboxPhase::Completed => ConfigUpdateOperationState::Inactive,
+        SandboxPhase::Deleting => ConfigUpdateOperationState::Cancelled,
+        SandboxPhase::Unspecified
+        | SandboxPhase::Provisioning
+        | SandboxPhase::Ready
+        | SandboxPhase::Error
+        | SandboxPhase::Unknown
+        | SandboxPhase::Stopping
+        | SandboxPhase::Starting => ConfigUpdateOperationState::Pending,
     }
-    let desired = receipt.desired.as_ref().ok_or_else(invalid_record)?;
-    if receipt.receipt_id.is_empty()
-        || receipt.workspace.is_empty()
-        || desired.sandbox_id.is_empty()
-    {
-        return Err(invalid_record());
-    }
-    let persisted_time = persisted_time(&receipt)?;
-    let failed = snapshot_reason != ProviderReadinessReason::Unspecified;
-    let operation = ConfigUpdateOperation {
-        operation_id: receipt.receipt_id.clone(),
-        sandbox_id: desired.sandbox_id.clone(),
-        component: ConfigComponent::ProviderEnvironment.into(),
-        target_revision: Some(ConfigSnapshotRevision {
-            component: Some(config_snapshot_revision::Component::ProviderTarget(
-                desired.clone(),
-            )),
-        }),
-        state: if failed {
-            ConfigUpdateOperationState::Failed.into()
-        } else {
-            ConfigUpdateOperationState::Pending.into()
-        },
-        outcome: if failed {
-            ConfigApplyOutcome::FailedClosed.into()
-        } else {
-            ConfigApplyOutcome::Unspecified.into()
-        },
-        sanitized_error: if failed {
-            snapshot_reason.as_str_name().to_string()
-        } else {
-            String::new()
-        },
-        created_time: Some(persisted_time),
-        updated_time: Some(persisted_time),
-        completed_time: failed.then_some(persisted_time),
-    };
-    let stored = StoredConfigUpdateOperation {
+}
+
+pub fn sandbox_phase(sandbox: &Sandbox) -> SandboxPhase {
+    sandbox
+        .status
+        .as_ref()
+        .and_then(|status| SandboxPhase::try_from(status.phase).ok())
+        .unwrap_or_default()
+}
+
+pub fn new_record(
+    sandbox: &Sandbox,
+    workspace: &str,
+    idempotency_key: &str,
+    target: OperationTarget,
+    response: CommittedResponse,
+) -> StoredConfigUpdateOperation {
+    let operation_id = Uuid::new_v4().to_string();
+    let now = current_time_ms();
+    let phase = sandbox_phase(sandbox);
+    let state = initial_state(phase);
+    let completed_time = terminal(state).then(|| timestamp(now));
+    StoredConfigUpdateOperation {
         metadata: Some(ObjectMeta {
-            id: receipt.receipt_id.clone(),
-            name: receipt.receipt_id.clone(),
-            workspace: receipt.workspace.clone(),
-            created_time: Some(persisted_time),
+            id: operation_id.clone(),
+            name: operation_name(sandbox.object_id(), idempotency_key, &operation_id),
+            created_time: Some(timestamp(now)),
+            workspace: workspace.to_string(),
             ..Default::default()
         }),
-        operation: Some(operation),
-        provider_receipt: Some(receipt.clone()),
-        provider_snapshot_reason: snapshot_reason.into(),
+        operation: Some(ConfigUpdateOperation {
+            operation_id,
+            sandbox_id: sandbox.object_id().to_string(),
+            component: ConfigComponent::SandboxConfig.into(),
+            target_revision: None,
+            state: state.into(),
+            outcome: ConfigApplyOutcome::Unspecified.into(),
+            sanitized_error: String::new(),
+            created_time: Some(timestamp(now)),
+            updated_time: Some(timestamp(now)),
+            completed_time,
+        }),
+        target_policy_version: target.policy_version,
+        target_settings_revision: target.settings_revision,
+        initial_phase: phase.into(),
+        idempotency_key: idempotency_key.to_string(),
+        attempt_count: 0,
+        next_attempt_time: Some(timestamp(now)),
+        response_policy_version: response.policy_version,
+        response_policy_hash: response.policy_hash,
+        response_settings_revision: response.settings_revision,
+        response_deleted: response.deleted,
+        response_annotations: response.annotations,
         ..Default::default()
-    };
-    let result = store
-        .put_if(
-            CONFIG_UPDATE_OPERATION_OBJECT_TYPE,
-            &receipt.receipt_id,
-            &receipt.receipt_id,
-            &receipt.workspace,
-            &stored.encode_to_vec(),
-            None,
-            WriteCondition::MustCreate,
+    }
+}
+
+pub async fn find_idempotent(
+    state: &ServerState,
+    workspace: &str,
+    sandbox_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<StoredConfigUpdateOperation>, Status> {
+    if idempotency_key.is_empty() {
+        return Ok(None);
+    }
+    state
+        .store
+        .get_message_by_name::<StoredConfigUpdateOperation>(
+            workspace,
+            &operation_name(sandbox_id, idempotency_key, ""),
         )
-        .await;
-    match result {
-        Ok(_) => Ok(receipt),
-        Err(PersistenceError::UniqueViolation { .. }) if observation => {
-            // Concurrent observers race only on the insert. A conflict never
-            // updates the winner's timestamp, mutation identity, or outcome.
-            // Exact comparison also fails closed on an ID collision/corruption.
-            let existing =
-                get_provider_operation(store, &receipt.receipt_id, &receipt.workspace).await?;
-            if existing.receipt.kind != receipt.kind
-                || existing.receipt.provider != receipt.provider
-                || existing.receipt.desired != receipt.desired
-                || existing.snapshot_reason != snapshot_reason
-            {
-                return Err(invalid_record());
-            }
-            Ok(existing.receipt)
-        }
-        Err(_) => Err(storage_unavailable()),
-    }
-}
-
-// The record ID, receipt ID, and operation ID deliberately name the same
-// durable identity; their distinct schema field names must compare equal.
-#[allow(clippy::suspicious_operation_groupings)]
-fn decode_provider_operation(
-    record: &ObjectRecord,
-) -> Result<(StoredConfigUpdateOperation, ProviderOperation), Status> {
-    let stored = StoredConfigUpdateOperation::decode(record.payload.as_slice())
-        .map_err(|_| invalid_record())?;
-    let receipt = stored
-        .provider_receipt
-        .as_ref()
-        .ok_or_else(invalid_record)?;
-    let operation = stored.operation.as_ref().ok_or_else(invalid_record)?;
-    let metadata = stored.metadata.as_ref().ok_or_else(invalid_record)?;
-    let desired = receipt.desired.as_ref().ok_or_else(invalid_record)?;
-    let persisted_time = persisted_time(receipt)?;
-    let snapshot_reason = ProviderReadinessReason::try_from(stored.provider_snapshot_reason)
-        .map_err(|_| invalid_record())?;
-    if record.id != receipt.receipt_id
-        || record.workspace != receipt.workspace
-        || metadata.id != record.id
-        || metadata.workspace != record.workspace
-        || operation.operation_id != record.id
-        || operation.sandbox_id != desired.sandbox_id
-        || operation.created_time != Some(persisted_time)
-        || metadata.created_time != Some(persisted_time)
-        || operation.component != ConfigComponent::ProviderEnvironment as i32
-        || operation
-            .target_revision
-            .as_ref()
-            .and_then(|revision| revision.component.as_ref())
-            != Some(&config_snapshot_revision::Component::ProviderTarget(
-                desired.clone(),
-            ))
-        || ConfigUpdateOperationState::try_from(operation.state).is_err()
-    {
-        return Err(invalid_record());
-    }
-    let provider = ProviderOperation {
-        receipt: receipt.clone(),
-        snapshot_reason,
-        operation: operation.clone(),
-    };
-    Ok((stored, provider))
-}
-
-async fn load_provider_operation(
-    store: &Store,
-    operation_id: &str,
-    workspace: &str,
-) -> Result<(ObjectRecord, StoredConfigUpdateOperation, ProviderOperation), Status> {
-    let record = store
-        .get(CONFIG_UPDATE_OPERATION_OBJECT_TYPE, operation_id)
         .await
-        .map_err(|_| storage_unavailable())?
-        .filter(|record| record.workspace == workspace)
-        .ok_or_else(|| Status::not_found("provider operation not found"))?;
-    let (stored, provider) = decode_provider_operation(&record)?;
-    Ok((record, stored, provider))
+        .map_err(|error| Status::internal(format!("fetch update operation failed: {error}")))
 }
 
-/// Read a provider projection after the RPC has authorized the workspace.
-///
-/// Looking up an operation from a different workspace returns the same result
-/// as a missing operation and never reveals its receipt or desired target.
-pub async fn get_provider_operation(
-    store: &Store,
+pub async fn get_record(
+    state: &ServerState,
     operation_id: &str,
-    workspace: &str,
-) -> Result<ProviderOperation, Status> {
-    let (_, _, provider) = load_provider_operation(store, operation_id, workspace).await?;
-    Ok(provider)
+) -> Result<Option<StoredConfigUpdateOperation>, Status> {
+    state
+        .store
+        .get_message::<StoredConfigUpdateOperation>(operation_id)
+        .await
+        .map_err(|error| Status::internal(format!("fetch update operation failed: {error}")))
 }
 
-fn terminal(state: ConfigUpdateOperationState) -> bool {
+/// Rebuild operation query columns from protobuf payloads before selective
+/// reconciliation starts. Re-running after an interrupted startup is safe.
+pub async fn repair_query_projections(state: &ServerState) -> Result<(), Status> {
+    let mut offset = 0;
+    let mut repaired = 0_u64;
+    loop {
+        let records = state
+            .store
+            .list_all_messages::<StoredConfigUpdateOperation>(OPERATION_SCAN_PAGE_SIZE, offset)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("list update operations for repair failed: {error}"))
+            })?;
+        let page_len = records.len();
+        for mut record in records {
+            if record.provider_receipt.is_some() {
+                continue;
+            }
+            for _ in 0..MAX_TRANSITION_RETRIES {
+                let Some(metadata) = record.metadata.as_ref() else {
+                    return Err(Status::internal("update operation metadata missing"));
+                };
+                let operation_id = metadata.id.clone();
+                let resource_version = metadata.resource_version;
+                if state
+                    .store
+                    .repair_config_operation_projection(&record, resource_version)
+                    .await
+                    .map_err(|error| {
+                        Status::internal(format!(
+                            "repair update operation projection failed: {error}"
+                        ))
+                    })?
+                {
+                    repaired = repaired.saturating_add(1);
+                    break;
+                }
+                let Some(current) = get_record(state, &operation_id).await? else {
+                    break;
+                };
+                record = current;
+            }
+        }
+        if page_len < OPERATION_SCAN_PAGE_SIZE as usize {
+            break;
+        }
+        offset = offset.saturating_add(OPERATION_SCAN_PAGE_SIZE);
+    }
+    if repaired > 0 {
+        info!(
+            repaired,
+            "configuration update operation projection repair complete"
+        );
+    }
+    Ok(())
+}
+
+pub fn public_operation(
+    record: &StoredConfigUpdateOperation,
+) -> Result<ConfigUpdateOperation, Status> {
+    record
+        .operation
+        .clone()
+        .ok_or_else(|| Status::internal("stored update operation payload missing"))
+}
+
+pub fn response_from_record(
+    record: &StoredConfigUpdateOperation,
+) -> Result<UpdateConfigResponse, Status> {
+    Ok(UpdateConfigResponse {
+        version: record.response_policy_version,
+        policy_hash: record.response_policy_hash.clone(),
+        settings_revision: record.response_settings_revision,
+        deleted: record.response_deleted,
+        annotations: record.response_annotations.clone(),
+        operation: Some(public_operation(record)?),
+    })
+}
+
+pub fn terminal(state: ConfigUpdateOperationState) -> bool {
     matches!(
         state,
         ConfigUpdateOperationState::Applied
@@ -295,469 +348,835 @@ fn terminal(state: ConfigUpdateOperationState) -> bool {
     )
 }
 
-fn completion(
-    status: &ProviderReadinessStatus,
-) -> Result<Option<(ConfigUpdateOperationState, ConfigApplyOutcome)>, Status> {
-    match ProviderReadinessState::try_from(status.state).map_err(|_| invalid_record())? {
-        ProviderReadinessState::Ready | ProviderReadinessState::Revoked => {
-            let desired = status
-                .receipt
-                .as_ref()
-                .and_then(|receipt| receipt.desired.as_ref())
-                .ok_or_else(invalid_record)?;
-            let observed = status.observed.as_ref().ok_or_else(invalid_record)?;
-            // The RPC validates current session ownership and freshness. Check
-            // the complete target again before converting its result into a
-            // durable terminal transition; a partial install is never applied.
-            if status.reason != ProviderReadinessReason::Unspecified as i32
-                || observed.reason != ProviderReadinessReason::Unspecified as i32
-                || observed.attachment_epoch != desired.attachment_epoch
-                || observed.provider_env_revision != desired.provider_env_revision
-                || observed.config_revision != desired.config_revision
-                || observed.policy_hash != desired.policy_hash
-                || !observed.credentials_installed
-                || !observed.policy_active
-                || !observed.launch_environment_installed
-                || observed.process_instance_id.is_empty()
-                || observed.session_id.is_empty()
-                || status.network_instance_id.is_empty()
-                || (status.state == ProviderReadinessState::Revoked as i32)
-                    != desired.provider_id.is_empty()
-            {
-                return Err(invalid_record());
-            }
-            Ok(Some((
-                ConfigUpdateOperationState::Applied,
-                ConfigApplyOutcome::Applied,
-            )))
+fn sanitize_error(value: &str) -> String {
+    let mut end = value.len().min(MAX_SANITIZED_ERROR_BYTES);
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value[..end].to_string()
+}
+
+async fn mutate_record<F>(
+    state: &ServerState,
+    operation_id: &str,
+    mut mutate: F,
+) -> Result<Option<(StoredConfigUpdateOperation, bool)>, Status>
+where
+    F: FnMut(&mut StoredConfigUpdateOperation) -> bool,
+{
+    for _ in 0..MAX_TRANSITION_RETRIES {
+        let Some(current) = get_record(state, operation_id).await? else {
+            return Ok(None);
+        };
+        let version = current
+            .metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.resource_version);
+        let mut candidate = current.clone();
+        let changed = mutate(&mut candidate);
+        if !changed {
+            return Ok(Some((current, false)));
         }
-        ProviderReadinessState::Superseded => Ok(Some((
-            ConfigUpdateOperationState::Superseded,
-            ConfigApplyOutcome::IgnoredStale,
-        ))),
-        // Live installation failures can recover without changing the desired
-        // revision. They remain visible in the provider projection but do not
-        // terminate the operation or authorize a retry of the source mutation.
-        _ => Ok(None),
+        let updated = state
+            .store
+            .update_config_operation_cas(&candidate, version)
+            .await;
+        match updated {
+            Ok(KnownVersionUpdate::Changed(updated)) => return Ok(Some((updated, true))),
+            Ok(KnownVersionUpdate::Conflict) => {}
+            Err(error) => {
+                return Err(Status::internal(format!(
+                    "persist update operation transition failed: {error}"
+                )));
+            }
+        }
+    }
+    Err(Status::aborted(
+        "update operation changed concurrently; retry the operation query",
+    ))
+}
+
+async fn finish(
+    state: &ServerState,
+    operation_id: &str,
+    terminal_state: ConfigUpdateOperationState,
+    outcome: ConfigApplyOutcome,
+    error: &str,
+) -> Result<(), Status> {
+    let now = current_time_ms();
+    let transition = mutate_record(state, operation_id, |record| {
+        let Some(operation) = record.operation.as_mut() else {
+            return false;
+        };
+        if ConfigUpdateOperationState::try_from(operation.state)
+            != Ok(ConfigUpdateOperationState::Pending)
+        {
+            return false;
+        }
+        operation.state = terminal_state.into();
+        operation.outcome = outcome.into();
+        operation.sanitized_error = sanitize_error(error);
+        operation.updated_time = Some(timestamp(now));
+        operation.completed_time = Some(timestamp(now));
+        true
+    })
+    .await?;
+    record_terminal_transition(state, transition, terminal_state);
+    Ok(())
+}
+
+async fn finish_if_target_matches(
+    state: &ServerState,
+    operation_id: &str,
+    requested_revision: &ConfigSnapshotRevision,
+    terminal_state: ConfigUpdateOperationState,
+    outcome: ConfigApplyOutcome,
+    error: &str,
+) -> Result<(), Status> {
+    let now = current_time_ms();
+    let transition = mutate_record(state, operation_id, |record| {
+        let Some(operation) = record.operation.as_mut() else {
+            return false;
+        };
+        if ConfigUpdateOperationState::try_from(operation.state)
+            != Ok(ConfigUpdateOperationState::Pending)
+            || operation.target_revision.as_ref() != Some(requested_revision)
+        {
+            return false;
+        }
+        operation.state = terminal_state.into();
+        operation.outcome = outcome.into();
+        operation.sanitized_error = sanitize_error(error);
+        operation.updated_time = Some(timestamp(now));
+        operation.completed_time = Some(timestamp(now));
+        true
+    })
+    .await?;
+    record_terminal_transition(state, transition, terminal_state);
+    Ok(())
+}
+
+fn record_terminal_transition(
+    state: &ServerState,
+    transition: Option<(StoredConfigUpdateOperation, bool)>,
+    terminal_state: ConfigUpdateOperationState,
+) {
+    if let Some((record, true)) = transition {
+        counter!(
+            "openshell_config_update_operations_terminal_total",
+            "state" => terminal_state.as_str_name()
+        )
+        .increment(1);
+        if let Some(operation) = record.operation.as_ref() {
+            state
+                .config_update_operation_watch_bus
+                .notify(&operation.operation_id);
+            state.sandbox_watch_bus.notify(&operation.sandbox_id);
+        }
     }
 }
 
-/// Persist exact completion by CAS and attach its historical resource to a view.
-///
-/// Call only after evaluating authenticated current-session evidence. The live
-/// status is never changed by this function: expired or superseded evidence
-/// cannot become ready because an earlier observation was durably applied.
-pub async fn observe_provider_status(
-    store: &Store,
-    status: &mut ProviderReadinessStatus,
+fn snapshot_revision(
+    snapshot: &openshell_core::proto::SandboxConfigSnapshot,
+) -> ConfigSnapshotRevision {
+    ConfigSnapshotRevision {
+        component: Some(config_snapshot_revision::Component::SandboxConfig(
+            SandboxConfigRevision {
+                config_revision: snapshot.config_revision,
+                policy_version: snapshot.version,
+                policy_source: snapshot.policy_source,
+                global_policy_version: snapshot.global_policy_version,
+                settings_revision: snapshot.settings_revision,
+            },
+        )),
+    }
+}
+
+fn target_relation(
+    record: &StoredConfigUpdateOperation,
+    snapshot: &openshell_core::proto::SandboxConfigSnapshot,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let policy = snapshot.version.cmp(&record.target_policy_version);
+    let settings = snapshot
+        .settings_revision
+        .cmp(&record.target_settings_revision);
+    if policy == Ordering::Equal && settings == Ordering::Equal {
+        Ordering::Equal
+    } else if policy == Ordering::Greater || settings == Ordering::Greater {
+        Ordering::Greater
+    } else {
+        Ordering::Less
+    }
+}
+
+pub async fn reconcile_one(state: &Arc<ServerState>, operation_id: &str) -> Result<(), Status> {
+    let Some(record) = get_record(state, operation_id).await? else {
+        return Ok(());
+    };
+    reconcile_records_for_sandbox(state, vec![record]).await
+}
+
+async fn reconcile_records_for_sandbox(
+    state: &Arc<ServerState>,
+    records: Vec<StoredConfigUpdateOperation>,
 ) -> Result<(), Status> {
-    let receipt = status.receipt.as_ref().ok_or_else(invalid_record)?.clone();
-    let completion = completion(status)?;
-    for _ in 0..MAX_TRANSITION_RETRIES {
-        let (record, mut stored, provider) =
-            load_provider_operation(store, &receipt.receipt_id, &receipt.workspace).await?;
-        if provider.receipt != receipt {
-            return Err(invalid_record());
-        }
-        let state = ConfigUpdateOperationState::try_from(provider.operation.state)
-            .map_err(|_| invalid_record())?;
-        let Some((terminal_state, outcome)) = completion.filter(|_| !terminal(state)) else {
-            status.operation = Some(provider.operation);
-            return Ok(());
-        };
-        // Capturing the desired snapshot failed permanently for this operation.
-        // A later read must not fabricate a different, successful target.
-        if provider.snapshot_reason != ProviderReadinessReason::Unspecified {
-            return Err(invalid_record());
-        }
-        let operation = stored.operation.as_mut().ok_or_else(invalid_record)?;
-        operation.state = terminal_state.into();
-        operation.outcome = outcome.into();
-        operation.sanitized_error = if terminal_state == ConfigUpdateOperationState::Superseded {
-            ProviderReadinessReason::DesiredStateChanged
-                .as_str_name()
-                .to_string()
-        } else {
-            String::new()
-        };
-        let completed_time =
-            openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
-                .map_err(|error| {
-                    Status::internal(format!("create operation completion timestamp: {error}"))
-                })?;
-        operation.updated_time = Some(completed_time);
-        operation.completed_time = Some(completed_time);
-        let result = store
-            .put_if(
-                CONFIG_UPDATE_OPERATION_OBJECT_TYPE,
-                &record.id,
-                &record.name,
-                &record.workspace,
-                &stored.encode_to_vec(),
-                record.labels.as_deref(),
-                WriteCondition::MatchResourceVersion(record.resource_version),
-            )
-            .await;
-        match result {
-            Ok(_) => {
-                status.operation = stored.operation;
-                return Ok(());
+    let Some(first_operation) = records.first().and_then(|record| record.operation.as_ref()) else {
+        return Ok(());
+    };
+    let sandbox_id = first_operation.sandbox_id.clone();
+
+    let Some(sandbox) = state
+        .store
+        .get_message::<Sandbox>(&sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("fetch operation sandbox failed: {error}")))?
+    else {
+        for record in records {
+            if let Some(operation) = record.operation.as_ref() {
+                finish(
+                    state,
+                    &operation.operation_id,
+                    ConfigUpdateOperationState::Cancelled,
+                    ConfigApplyOutcome::Unspecified,
+                    "sandbox no longer exists",
+                )
+                .await?;
             }
-            // A competing observer may have completed this operation. Reload
-            // the authoritative row; a terminal outcome is immutable.
-            Err(PersistenceError::Conflict { .. }) => {}
-            Err(_) => return Err(storage_unavailable()),
+        }
+        return Ok(());
+    };
+
+    match initial_state(sandbox_phase(&sandbox)) {
+        ConfigUpdateOperationState::Inactive => {
+            for record in records {
+                if let Some(operation) = record.operation.as_ref() {
+                    finish(
+                        state,
+                        &operation.operation_id,
+                        ConfigUpdateOperationState::Inactive,
+                        ConfigApplyOutcome::Unspecified,
+                        "",
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
+        }
+        ConfigUpdateOperationState::Cancelled => {
+            for record in records {
+                if let Some(operation) = record.operation.as_ref() {
+                    finish(
+                        state,
+                        &operation.operation_id,
+                        ConfigUpdateOperationState::Cancelled,
+                        ConfigApplyOutcome::Unspecified,
+                        "sandbox is deleting",
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let now = current_time_ms();
+    let mut claimed_records = Vec::new();
+    for record in records {
+        let operation = public_operation(&record)?;
+        let operation_state =
+            ConfigUpdateOperationState::try_from(operation.state).unwrap_or_default();
+        if terminal(operation_state) {
+            continue;
+        }
+        let claimed = mutate_record(state, &operation.operation_id, |stored| {
+            let next_attempt_at_ms = stored.next_attempt_at_ms();
+            let Some(operation) = stored.operation.as_mut() else {
+                return false;
+            };
+            if ConfigUpdateOperationState::try_from(operation.state)
+                != Ok(ConfigUpdateOperationState::Pending)
+                || next_attempt_at_ms > now
+            {
+                return false;
+            }
+            operation.updated_time = Some(timestamp(now));
+            stored.attempt_count = stored.attempt_count.saturating_add(1);
+            let exponent = stored.attempt_count.min(8);
+            let delay_ms = 250_i64.saturating_mul(1_i64 << exponent).min(30_000);
+            stored.next_attempt_time = Some(timestamp(now.saturating_add(delay_ms)));
+            true
+        })
+        .await?;
+        if let Some((claimed, true)) = claimed {
+            claimed_records.push(claimed);
         }
     }
-    Err(rpc_error::resource_version_conflict(
-        "configuration operation changed concurrently; query its status again",
-        None,
-    ))
+    if claimed_records.is_empty() {
+        return Ok(());
+    }
+
+    // Claims commit before admission to the bounded delivery queue. The queue
+    // builds the current snapshot once, records its exact revision on matching
+    // operations, then sends those same bytes. A failed admission remains
+    // recoverable when the claim's retry deadline expires.
+    let publish_provider_environment = claimed_records
+        .iter()
+        .any(|record| record.response_policy_version != 0);
+    let components = if publish_provider_environment {
+        crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER
+    } else {
+        crate::config_delivery::ConfigComponents::SANDBOX_CONFIG
+    };
+    crate::config_delivery::publish_sandbox_components(state, &sandbox_id, components);
+    Ok(())
+}
+
+/// Associate pending operations with the exact snapshot that the delivery
+/// worker is about to send. The caller must skip delivery if this fails.
+pub async fn associate_pending_with_snapshot(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    snapshot: &openshell_core::proto::SandboxConfigSnapshot,
+) -> Result<bool, Status> {
+    let records = state
+        .store
+        .list_pending_config_operations_for_scope(sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("list update operations failed: {error}")))?;
+    let target_revision = snapshot_revision(snapshot);
+    let now = current_time_ms();
+    let mut requires_acknowledgement = false;
+    for record in records {
+        let operation = public_operation(&record)?;
+        match target_relation(&record, snapshot) {
+            std::cmp::Ordering::Greater => {
+                finish(
+                    state,
+                    &operation.operation_id,
+                    ConfigUpdateOperationState::Superseded,
+                    ConfigApplyOutcome::IgnoredStale,
+                    "a newer desired revision replaced this update before application",
+                )
+                .await?;
+            }
+            std::cmp::Ordering::Less => {
+                debug!(
+                    operation_id = operation.operation_id,
+                    "desired revision has not reached update operation target"
+                );
+            }
+            std::cmp::Ordering::Equal => {
+                requires_acknowledgement = true;
+                let _ = mutate_record(state, &operation.operation_id, |stored| {
+                    let Some(operation) = stored.operation.as_mut() else {
+                        return false;
+                    };
+                    if ConfigUpdateOperationState::try_from(operation.state)
+                        != Ok(ConfigUpdateOperationState::Pending)
+                        || operation.target_revision.as_ref() == Some(&target_revision)
+                    {
+                        return false;
+                    }
+                    operation.target_revision = Some(target_revision.clone());
+                    operation.updated_time = Some(timestamp(now));
+                    true
+                })
+                .await?;
+            }
+        }
+    }
+    Ok(requires_acknowledgement)
+}
+
+pub async fn complete_from_apply_results(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    results: &[ConfigComponentApplyResult],
+) -> Result<(), Status> {
+    let relevant: Vec<_> = results
+        .iter()
+        .filter(|result| result.component != ConfigComponent::ProviderEnvironment as i32)
+        .collect();
+    if relevant.is_empty() {
+        return Ok(());
+    }
+    let operations = state
+        .store
+        .list_pending_config_operations_for_scope(sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("list update operations failed: {error}")))?;
+    for record in operations {
+        let Some(operation) = record.operation.as_ref() else {
+            continue;
+        };
+        for result in &relevant {
+            let requested = result
+                .requested_revision
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("configuration result revision missing"))?;
+            if operation.component != result.component
+                || operation.target_revision.as_ref() != Some(requested)
+            {
+                continue;
+            }
+            let outcome = ConfigApplyOutcome::try_from(result.outcome).unwrap_or_default();
+            let terminal_state = match outcome {
+                ConfigApplyOutcome::Applied
+                | ConfigApplyOutcome::IgnoredDuplicate
+                | ConfigApplyOutcome::Degraded => ConfigUpdateOperationState::Applied,
+                ConfigApplyOutcome::IgnoredStale => ConfigUpdateOperationState::Superseded,
+                ConfigApplyOutcome::RetainedLocalOverride
+                | ConfigApplyOutcome::FailedRetainedLastKnownGood
+                | ConfigApplyOutcome::FailedClosed
+                | ConfigApplyOutcome::Unsupported
+                | ConfigApplyOutcome::Unspecified => ConfigUpdateOperationState::Failed,
+            };
+            let failure = result
+                .failure
+                .as_ref()
+                .map_or("", |failure| failure.message.as_str());
+            finish_if_target_matches(
+                state,
+                &operation.operation_id,
+                requested,
+                terminal_state,
+                outcome,
+                failure,
+            )
+            .await?;
+            break;
+        }
+    }
+    Ok(())
+}
+
+pub async fn complete_from_apply_result(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    result: &ConfigComponentApplyResult,
+) -> Result<(), Status> {
+    complete_from_apply_results(state, sandbox_id, std::slice::from_ref(result)).await
+}
+
+pub async fn wait_for_terminal(
+    state: &Arc<ServerState>,
+    operation_id: &str,
+    timeout: Duration,
+) -> Result<ConfigUpdateOperation, Status> {
+    let timeout = if timeout.is_zero() {
+        DEFAULT_WAIT_TIMEOUT
+    } else {
+        timeout.min(MAX_WAIT_TIMEOUT)
+    };
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let record = get_record(state, operation_id)
+        .await?
+        .ok_or_else(|| Status::not_found("update operation not found"))?;
+    let operation = public_operation(&record)?;
+    let operation_state = ConfigUpdateOperationState::try_from(operation.state).unwrap_or_default();
+    if terminal(operation_state) {
+        histogram!("openshell_config_update_operation_wait_seconds")
+            .record(started.elapsed().as_secs_f64());
+        return Ok(operation);
+    }
+
+    // Subscribe before the second authoritative read so a transition between
+    // the two reads cannot be missed. A wakeup is only a hint; the fallback
+    // poll covers other replicas and process restarts.
+    let mut wake = state
+        .config_update_operation_watch_bus
+        .subscribe(operation_id);
+    loop {
+        let record = get_record(state, operation_id)
+            .await?
+            .ok_or_else(|| Status::not_found("update operation not found"))?;
+        let operation = public_operation(&record)?;
+        let operation_state =
+            ConfigUpdateOperationState::try_from(operation.state).unwrap_or_default();
+        if terminal(operation_state) {
+            histogram!("openshell_config_update_operation_wait_seconds")
+                .record(started.elapsed().as_secs_f64());
+            return Ok(operation);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let mut status = Status::deadline_exceeded(format!(
+                "timed out waiting for update operation {operation_id}"
+            ));
+            if let Ok(value) = operation_id.parse() {
+                status.metadata_mut().insert("operation-id", value);
+            }
+            return Err(status);
+        }
+        tokio::select! {
+            () = tokio::time::sleep_until((tokio::time::Instant::now() + Duration::from_secs(1)).min(deadline)) => {}
+            _ = wake.recv() => {}
+        }
+    }
+}
+
+async fn reconcile_sandbox(state: &Arc<ServerState>, sandbox_id: &str) -> Result<(), Status> {
+    let operations = state
+        .store
+        .list_pending_config_operations_for_scope(sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("list sandbox operations failed: {error}")))?;
+    reconcile_records_for_sandbox(state, operations).await
+}
+
+async fn reconcile_due_batch(state: &Arc<ServerState>) {
+    let now = current_time_ms();
+    match state
+        .store
+        .list_due_config_update_operations(now, OPERATION_SCAN_PAGE_SIZE)
+        .await
+    {
+        Ok(operations) => {
+            let mut sandbox_groups = std::collections::BTreeMap::<_, Vec<_>>::new();
+            for record in operations {
+                let Some(sandbox_id) = record
+                    .operation
+                    .as_ref()
+                    .map(|operation| operation.sandbox_id.clone())
+                else {
+                    continue;
+                };
+                sandbox_groups.entry(sandbox_id).or_default().push(record);
+            }
+            let concurrency = state.store.max_connections().saturating_sub(1).max(1) as usize;
+            stream::iter(sandbox_groups)
+                .for_each_concurrent(concurrency, |(sandbox_id, records)| {
+                    let state = state.clone();
+                    async move {
+                        if let Err(error) = reconcile_records_for_sandbox(&state, records).await {
+                            warn!(sandbox_id, error = %error, "update operation reconciliation failed");
+                        }
+                    }
+                })
+                .await;
+        }
+        Err(error) => warn!(error = %error, "failed to list due update operations"),
+    }
+    match state.store.count_pending_config_update_operations().await {
+        Ok(pending) => {
+            gauge!("openshell_config_update_operations_pending")
+                .set(u32::try_from(pending).unwrap_or(u32::MAX));
+        }
+        Err(error) => warn!(error = %error, "failed to count pending update operations"),
+    }
+}
+
+pub fn spawn_reconciler(state: Arc<ServerState>, interval: Duration) {
+    let mut changed_sandboxes = state.sandbox_watch_bus.subscribe_all();
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(interval);
+        timer.tick().await;
+        loop {
+            tokio::select! {
+                _ = timer.tick() => reconcile_due_batch(&state).await,
+                changed = changed_sandboxes.recv() => {
+                    match changed {
+                        Ok(sandbox_id) => {
+                            if let Err(error) = reconcile_sandbox(&state, &sandbox_id).await {
+                                warn!(sandbox_id, error = %error, "sandbox update operation reconciliation failed");
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            reconcile_due_batch(&state).await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::{
-        ProviderDesiredIdentity, ProviderMutationKind, ProviderReadinessObservation,
-    };
-    use uuid::Uuid;
+    use crate::grpc::test_support::test_server_state;
+    use openshell_core::proto::{SandboxConfigSnapshot, SandboxSpec};
 
-    fn receipt() -> ProviderMutationReceipt {
-        ProviderMutationReceipt {
-            receipt_id: Uuid::new_v4().to_string(),
-            mutation_id: Uuid::new_v4().to_string(),
-            provider: "provider".to_string(),
-            workspace: "default".to_string(),
-            kind: ProviderMutationKind::Update.into(),
-            desired: Some(ProviderDesiredIdentity {
-                sandbox_id: Uuid::new_v4().to_string(),
-                sandbox: "sandbox".to_string(),
-                attachment_epoch: Uuid::new_v4().to_string(),
-                provider_id: Uuid::new_v4().to_string(),
-                provider_resource_version: 3,
-                provider_env_revision: 5,
-                config_revision: 7,
-                policy_hash: "policy".to_string(),
+    async fn pending_test_operation() -> (Arc<ServerState>, StoredConfigUpdateOperation) {
+        let state = test_server_state().await;
+        let sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "operation-test-sandbox".to_string(),
+                name: "operation-test-sandbox".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
             }),
-            persisted_time: Some(prost_types::Timestamp {
-                seconds: 1_700_000_000,
-                nanos: 123_456_789,
-            }),
-        }
-    }
-
-    fn ready(receipt: &ProviderMutationReceipt) -> ProviderReadinessStatus {
-        let desired = receipt.desired.as_ref().unwrap();
-        ProviderReadinessStatus {
-            receipt: Some(receipt.clone()),
-            state: ProviderReadinessState::Ready.into(),
-            network_instance_id: Uuid::new_v4().to_string(),
-            observed: Some(ProviderReadinessObservation {
-                session_id: Uuid::new_v4().to_string(),
-                sequence: 1,
-                attachment_epoch: desired.attachment_epoch.clone(),
-                provider_env_revision: desired.provider_env_revision,
-                config_revision: desired.config_revision,
-                policy_hash: desired.policy_hash.clone(),
-                credentials_installed: true,
-                policy_active: true,
-                launch_environment_installed: true,
-                process_instance_id: Uuid::new_v4().to_string(),
-                reason: ProviderReadinessReason::Unspecified.into(),
-            }),
+            spec: Some(SandboxSpec::default()),
             ..Default::default()
-        }
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+        let record = new_record(
+            &sandbox,
+            "default",
+            "operation-test-request",
+            OperationTarget {
+                policy_version: 0,
+                settings_revision: 1,
+            },
+            CommittedResponse::default(),
+        );
+        state
+            .store
+            .put_if_with_operation(
+                crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
+                "operation-test-settings",
+                "operation-test-sandbox",
+                "default",
+                br#"{"revision":1,"settings":{}}"#,
+                crate::persistence::WriteCondition::MustCreate,
+                &record,
+                None,
+            )
+            .await
+            .unwrap();
+        let operation_id = &record.operation.as_ref().unwrap().operation_id;
+        (
+            state.clone(),
+            get_record(&state, operation_id).await.unwrap().unwrap(),
+        )
+    }
+
+    #[test]
+    fn authoritative_phase_classification_is_explicit() {
+        assert_eq!(
+            initial_state(SandboxPhase::Ready),
+            ConfigUpdateOperationState::Pending
+        );
+        assert_eq!(
+            initial_state(SandboxPhase::Provisioning),
+            ConfigUpdateOperationState::Pending
+        );
+        assert_eq!(
+            initial_state(SandboxPhase::Starting),
+            ConfigUpdateOperationState::Pending
+        );
+        assert_eq!(
+            initial_state(SandboxPhase::Stopping),
+            ConfigUpdateOperationState::Pending
+        );
+        assert_eq!(
+            initial_state(SandboxPhase::Error),
+            ConfigUpdateOperationState::Pending
+        );
+        assert_eq!(
+            initial_state(SandboxPhase::Stopped),
+            ConfigUpdateOperationState::Inactive
+        );
+        assert_eq!(
+            initial_state(SandboxPhase::Completed),
+            ConfigUpdateOperationState::Inactive
+        );
+        assert_eq!(
+            initial_state(SandboxPhase::Deleting),
+            ConfigUpdateOperationState::Cancelled
+        );
+    }
+
+    #[test]
+    fn target_relation_requires_exact_policy_and_settings_tuple() {
+        let record = StoredConfigUpdateOperation {
+            target_policy_version: 7,
+            target_settings_revision: 11,
+            ..Default::default()
+        };
+        let snapshot = |version, settings_revision| SandboxConfigSnapshot {
+            version,
+            settings_revision,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            target_relation(&record, &snapshot(7, 11)),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            target_relation(&record, &snapshot(8, 11)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            target_relation(&record, &snapshot(7, 12)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            target_relation(&record, &snapshot(6, 11)),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn sanitized_errors_are_bounded_on_utf8_boundaries() {
+        let value = "é".repeat(MAX_SANITIZED_ERROR_BYTES);
+        let sanitized = sanitize_error(&value);
+        assert!(sanitized.len() <= MAX_SANITIZED_ERROR_BYTES);
+        assert!(sanitized.is_char_boundary(sanitized.len()));
     }
 
     #[tokio::test]
-    async fn provider_receipt_uses_the_common_operation_namespace_and_exact_target() {
-        let store = crate::persistence::test_store().await;
-        let receipt = receipt();
-        record_provider_operation(
-            &store,
-            receipt.clone(),
-            ProviderReadinessReason::Unspecified,
+    async fn concurrent_claims_commit_once_and_noop_does_not_churn_version() {
+        let (state, record) = pending_test_operation().await;
+        let operation_id = record.operation.as_ref().unwrap().operation_id.clone();
+        let now = current_time_ms();
+        let claim = || async {
+            mutate_record(&state, &operation_id, |stored| {
+                if stored.next_attempt_at_ms() > now {
+                    return false;
+                }
+                stored.attempt_count = stored.attempt_count.saturating_add(1);
+                stored.next_attempt_time = Some(timestamp(now.saturating_add(1_000)));
+                stored.operation.as_mut().unwrap().updated_time = Some(timestamp(now));
+                true
+            })
+            .await
+            .unwrap()
+        };
+        let (first, second) = tokio::join!(claim(), claim());
+        let committed = usize::from(first.as_ref().is_some_and(|(_, changed)| *changed))
+            + usize::from(second.as_ref().is_some_and(|(_, changed)| *changed));
+        assert_eq!(committed, 1);
+
+        let claimed = get_record(&state, &operation_id).await.unwrap().unwrap();
+        assert_eq!(claimed.attempt_count, 1);
+        let version = claimed.metadata.as_ref().unwrap().resource_version;
+        let unchanged = mutate_record(&state, &operation_id, |_| false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!unchanged.1);
+        assert_eq!(
+            get_record(&state, &operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata
+                .unwrap()
+                .resource_version,
+            version
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_rechecks_exact_target_inside_cas_transition() {
+        let (state, record) = pending_test_operation().await;
+        let operation_id = record.operation.as_ref().unwrap().operation_id.clone();
+        let expected = ConfigSnapshotRevision {
+            component: Some(config_snapshot_revision::Component::SandboxConfig(
+                SandboxConfigRevision {
+                    config_revision: 1,
+                    policy_version: 1,
+                    settings_revision: 1,
+                    ..Default::default()
+                },
+            )),
+        };
+        mutate_record(&state, &operation_id, |stored| {
+            stored.operation.as_mut().unwrap().target_revision = Some(expected.clone());
+            true
+        })
+        .await
+        .unwrap();
+        let before = get_record(&state, &operation_id).await.unwrap().unwrap();
+
+        finish_if_target_matches(
+            &state,
+            &operation_id,
+            &ConfigSnapshotRevision::default(),
+            ConfigUpdateOperationState::Applied,
+            ConfigApplyOutcome::Applied,
+            "",
         )
         .await
         .unwrap();
-        let operation = get_provider_operation(&store, &receipt.receipt_id, "default")
-            .await
-            .unwrap();
-        assert_eq!(operation.receipt, receipt);
-        assert_eq!(operation.operation.operation_id, receipt.receipt_id);
-        assert_eq!(operation.operation.created_time, receipt.persisted_time);
-        assert_eq!(operation.operation.updated_time, receipt.persisted_time);
-        assert!(operation.operation.completed_time.is_none());
+
+        let after = get_record(&state, &operation_id).await.unwrap().unwrap();
         assert_eq!(
-            operation.operation.state,
-            ConfigUpdateOperationState::Pending as i32
+            after.metadata.as_ref().unwrap().resource_version,
+            before.metadata.as_ref().unwrap().resource_version
         );
+        assert_eq!(
+            ConfigUpdateOperationState::try_from(after.operation.unwrap().state).unwrap(),
+            ConfigUpdateOperationState::Pending
+        );
+    }
+
+    #[test]
+    fn watch_subscription_drop_removes_only_its_channel() {
+        let bus = OperationWatchBus::new();
+        let old = bus.subscribe("operation");
+        assert_eq!(bus.len(), 1);
+
+        bus.notify("operation");
+        let replacement = bus.subscribe("operation");
+        drop(old);
+        assert_eq!(bus.len(), 1);
+
+        drop(replacement);
+        assert_eq!(bus.len(), 0);
+    }
+
+    #[test]
+    fn concurrent_watch_subscription_drop_removes_empty_channel() {
+        let bus = OperationWatchBus::new();
+        let first = bus.subscribe("operation");
+        let second = bus.subscribe("operation");
+        let sender = first.sender.clone();
+        assert_eq!(sender.receiver_count(), 2);
+
+        // Keep both destructors outside the map lock until they have dropped
+        // their receivers. This makes the teardown overlap deterministic.
+        let guard = bus.inner.lock().expect("operation watch bus lock poisoned");
+        let first_drop = std::thread::spawn(move || drop(first));
+        let second_drop = std::thread::spawn(move || drop(second));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sender.receiver_count() != 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let receivers_dropped_before_lock = sender.receiver_count() == 0;
+        drop(guard);
+        first_drop.join().unwrap();
+        second_drop.join().unwrap();
+
         assert!(
-            store
-                .get("provider_mutation_receipt", &receipt.receipt_id)
-                .await
-                .unwrap()
-                .is_none()
+            receivers_dropped_before_lock,
+            "both receivers must drop before either teardown inspects the map"
         );
-        assert_eq!(
-            get_provider_operation(&store, &receipt.receipt_id, "other")
-                .await
-                .unwrap_err()
-                .code(),
-            Code::NotFound
-        );
+        assert_eq!(bus.len(), 0);
     }
 
     #[tokio::test]
-    async fn incomplete_provider_target_stays_failed_after_later_installation() {
-        let store = crate::persistence::test_store().await;
-        let receipt = receipt();
-        record_provider_operation(
-            &store,
-            receipt.clone(),
-            ProviderReadinessReason::SnapshotMismatch,
-        )
+    async fn terminal_wait_does_not_register_a_watch_channel() {
+        let (state, record) = pending_test_operation().await;
+        let operation_id = record.operation.as_ref().unwrap().operation_id.clone();
+        mutate_record(&state, &operation_id, |stored| {
+            stored.operation.as_mut().unwrap().state = ConfigUpdateOperationState::Inactive.into();
+            true
+        })
         .await
         .unwrap();
-        let mut status = ready(&receipt);
-        observe_provider_status(&store, &mut status).await.unwrap();
-        let operation = status.operation.unwrap();
-        assert_eq!(operation.state, ConfigUpdateOperationState::Failed as i32);
-        assert_eq!(operation.completed_time, receipt.persisted_time);
-    }
 
-    #[tokio::test]
-    async fn receipt_timestamp_requires_presence_and_canonical_nanos() {
-        let store = crate::persistence::test_store().await;
-        for invalid_time in [
-            None,
-            Some(prost_types::Timestamp {
-                seconds: 0,
-                nanos: -1,
-            }),
-            Some(prost_types::Timestamp {
-                seconds: openshell_core::time::MAX_TIMESTAMP_SECONDS + 1,
-                nanos: 0,
-            }),
-        ] {
-            let mut receipt = receipt();
-            receipt.persisted_time = invalid_time;
-            let error =
-                record_provider_operation(&store, receipt, ProviderReadinessReason::Unspecified)
-                    .await
-                    .unwrap_err();
-            assert_eq!(error.code(), Code::Internal);
-        }
-        assert_eq!(
-            store
-                .count_in_workspace(CONFIG_UPDATE_OPERATION_OBJECT_TYPE, "default")
-                .await
-                .unwrap(),
-            0
-        );
-
-        // The Unix epoch is a valid explicit timestamp, not missing data.
-        let mut epoch = receipt();
-        epoch.persisted_time = Some(prost_types::Timestamp::default());
-        let recorded =
-            record_provider_operation(&store, epoch.clone(), ProviderReadinessReason::Unspecified)
-                .await
-                .unwrap();
-        assert_eq!(recorded, epoch);
-        assert_eq!(
-            get_provider_operation(&store, &epoch.receipt_id, "default")
-                .await
-                .unwrap()
-                .receipt,
-            epoch
-        );
-    }
-
-    #[tokio::test]
-    async fn receipt_timestamp_nanos_are_part_of_exact_completion_identity() {
-        let store = crate::persistence::test_store().await;
-        let receipt = receipt();
-        record_provider_operation(
-            &store,
-            receipt.clone(),
-            ProviderReadinessReason::Unspecified,
-        )
-        .await
-        .unwrap();
-        let mut changed = ready(&receipt);
-        changed
-            .receipt
-            .as_mut()
-            .unwrap()
-            .persisted_time
-            .as_mut()
-            .unwrap()
-            .nanos += 1;
-        assert_eq!(
-            observe_provider_status(&store, &mut changed)
-                .await
-                .unwrap_err()
-                .code(),
-            Code::Internal
-        );
-        let stored = get_provider_operation(&store, &receipt.receipt_id, "default")
+        wait_for_terminal(&state, &operation_id, Duration::from_secs(1))
             .await
             .unwrap();
-        assert_eq!(stored.receipt, receipt);
-        assert_eq!(
-            stored.operation.state,
-            ConfigUpdateOperationState::Pending as i32
-        );
-        assert!(stored.operation.completed_time.is_none());
-
-        let mut exact = ready(&receipt);
-        observe_provider_status(&store, &mut exact).await.unwrap();
-        let completed = exact.operation.unwrap();
-        assert_eq!(completed.created_time, receipt.persisted_time);
-        assert!(completed.completed_time.is_some());
-        assert_eq!(completed.updated_time, completed.completed_time);
-        openshell_core::time::validate_timestamp(completed.completed_time.as_ref().unwrap())
-            .unwrap();
+        assert_eq!(state.config_update_operation_watch_bus.len(), 0);
     }
 
     #[tokio::test]
-    async fn stale_or_partial_provider_evidence_cannot_complete_an_operation() {
-        let store = crate::persistence::test_store().await;
-        let receipt = receipt();
-        record_provider_operation(
-            &store,
-            receipt.clone(),
-            ProviderReadinessReason::Unspecified,
-        )
-        .await
-        .unwrap();
-        let mut stale = ready(&receipt);
-        stale.observed.as_mut().unwrap().config_revision += 1;
-        assert!(observe_provider_status(&store, &mut stale).await.is_err());
-        let mut partial = ready(&receipt);
-        partial
-            .observed
-            .as_mut()
-            .unwrap()
-            .launch_environment_installed = false;
-        assert!(observe_provider_status(&store, &mut partial).await.is_err());
-        assert_eq!(
-            get_provider_operation(&store, &receipt.receipt_id, "default")
-                .await
-                .unwrap()
-                .operation
-                .state,
-            ConfigUpdateOperationState::Pending as i32
-        );
-    }
+    async fn timed_out_wait_removes_its_watch_channel() {
+        let (state, record) = pending_test_operation().await;
+        let operation_id = record.operation.as_ref().unwrap().operation_id.clone();
 
-    #[tokio::test]
-    async fn applied_history_never_upgrades_an_expired_live_view() {
-        let store = crate::persistence::test_store().await;
-        let receipt = receipt();
-        record_provider_operation(
-            &store,
-            receipt.clone(),
-            ProviderReadinessReason::Unspecified,
-        )
-        .await
-        .unwrap();
-        let mut status = ready(&receipt);
-        observe_provider_status(&store, &mut status).await.unwrap();
-        let before = store
-            .get(CONFIG_UPDATE_OPERATION_OBJECT_TYPE, &receipt.receipt_id)
+        let error = wait_for_terminal(&state, &operation_id, Duration::from_millis(1))
             .await
-            .unwrap()
-            .unwrap();
-        status.state = ProviderReadinessState::Pending.into();
-        status.reason = ProviderReadinessReason::SupervisorLeaseExpired.into();
-        observe_provider_status(&store, &mut status).await.unwrap();
-        assert_eq!(status.state, ProviderReadinessState::Pending as i32);
-        assert_eq!(
-            status.operation.unwrap().state,
-            ConfigUpdateOperationState::Applied as i32
-        );
-        let after = store
-            .get(CONFIG_UPDATE_OPERATION_OBJECT_TYPE, &receipt.receipt_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(before.resource_version, after.resource_version);
-    }
-
-    #[tokio::test]
-    async fn competing_terminal_observers_preserve_the_first_committed_outcome() {
-        let store = crate::persistence::test_store().await;
-        let receipt = receipt();
-        record_provider_operation(
-            &store,
-            receipt.clone(),
-            ProviderReadinessReason::Unspecified,
-        )
-        .await
-        .unwrap();
-        let mut applied = ready(&receipt);
-        let mut superseded = applied.clone();
-        superseded.state = ProviderReadinessState::Superseded.into();
-        superseded.reason = ProviderReadinessReason::DesiredStateChanged.into();
-        let (first, second) = tokio::join!(
-            observe_provider_status(&store, &mut applied),
-            observe_provider_status(&store, &mut superseded),
-        );
-        first.unwrap();
-        second.unwrap();
-        assert_eq!(applied.operation, superseded.operation);
-        let stored = get_provider_operation(&store, &receipt.receipt_id, "default")
-            .await
-            .unwrap();
-        assert!(matches!(
-            ConfigUpdateOperationState::try_from(stored.operation.state).unwrap(),
-            ConfigUpdateOperationState::Applied | ConfigUpdateOperationState::Superseded
-        ));
-    }
-
-    #[tokio::test]
-    async fn failed_observation_and_recovered_snapshot_have_distinct_immutable_receipts() {
-        let store = crate::persistence::test_store().await;
-        let mut observed = receipt();
-        observed.kind = ProviderMutationKind::Observe.into();
-        let failed = record_provider_operation(
-            &store,
-            observed.clone(),
-            ProviderReadinessReason::CredentialsWithheld,
-        )
-        .await
-        .unwrap();
-        observed.mutation_id = Uuid::new_v4().to_string();
-        observed.persisted_time.as_mut().unwrap().nanos += 1;
-        let repeated = record_provider_operation(
-            &store,
-            observed.clone(),
-            ProviderReadinessReason::CredentialsWithheld,
-        )
-        .await
-        .unwrap();
-        assert_eq!(repeated, failed);
-        let repaired =
-            record_provider_operation(&store, observed, ProviderReadinessReason::Unspecified)
-                .await
-                .unwrap();
-        assert_ne!(repaired.receipt_id, failed.receipt_id);
-        assert_eq!(
-            get_provider_operation(&store, &failed.receipt_id, "default")
-                .await
-                .unwrap()
-                .operation
-                .state,
-            ConfigUpdateOperationState::Failed as i32
-        );
-        assert_eq!(
-            store
-                .count_in_workspace(CONFIG_UPDATE_OPERATION_OBJECT_TYPE, "default")
-                .await
-                .unwrap(),
-            2
-        );
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(state.config_update_operation_watch_bus.len(), 0);
     }
 }

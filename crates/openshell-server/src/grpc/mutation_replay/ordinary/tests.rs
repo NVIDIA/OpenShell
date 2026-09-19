@@ -1155,3 +1155,101 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
     assert_eq!(approved.chunks_approved, 1);
     assert_eq!(replay(&state, all).await, approved);
 }
+
+#[tokio::test]
+async fn config_completion_timeout_preserves_replayable_committed_operation() {
+    use openshell_core::proto::open_shell_server::OpenShell;
+    use openshell_core::proto::{
+        ConfigUpdateConsistency, ConfigUpdateOperationState, Sandbox, SandboxPhase, SandboxSpec,
+        SandboxStatus, SettingValue, UpdateConfigRequest, setting_value,
+    };
+    let (_directory, state) = protected_state().await;
+    state
+        .store
+        .put_message(&Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "completion-sandbox-id".into(),
+                name: "completion-sandbox".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec::default()),
+            status: Some(SandboxStatus {
+                phase: SandboxPhase::Ready.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let service = crate::grpc::OpenShellService::new(state.clone());
+    let mut request = UpdateConfigRequest {
+        sandbox: "completion-sandbox".into(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        setting_key: "ocsf_json_enabled".into(),
+        setting_value: Some(SettingValue {
+            value: Some(setting_value::Value::BoolValue(true)),
+        }),
+        request_id: uuid::Uuid::new_v4().to_string(),
+        consistency: ConfigUpdateConsistency::WaitForCompletion.into(),
+        wait_timeout: Some(prost_types::Duration {
+            seconds: 1,
+            nanos: 0,
+        }),
+        ..Default::default()
+    };
+    let error = service
+        .update_config(authed_request(request.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::DeadlineExceeded, "{error:?}");
+    request.consistency = ConfigUpdateConsistency::CommitOnly.into();
+    request.wait_timeout = None;
+    let response = service
+        .update_config(authed_request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.settings_revision, 1);
+    let operation = response.operation.unwrap();
+    assert_eq!(operation.state, ConfigUpdateOperationState::Pending as i32);
+    let replay = service
+        .update_config(authed_request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        replay.operation.unwrap().operation_id,
+        operation.operation_id
+    );
+    assert_eq!(replay.settings_revision, 1);
+
+    // A new request for the unchanged value still tracks completion of that
+    // revision, without writing another settings revision.
+    request.request_id = uuid::Uuid::new_v4().to_string();
+    let unchanged = service
+        .update_config(authed_request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(unchanged.settings_revision, 1);
+    let unchanged_operation = unchanged.operation.unwrap();
+    assert_ne!(unchanged_operation.operation_id, operation.operation_id);
+    assert_eq!(
+        unchanged_operation.state,
+        ConfigUpdateOperationState::Pending as i32
+    );
+    let pending = state
+        .store
+        .list_pending_config_operations_for_scope("completion-sandbox-id")
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 2);
+
+    request.consistency = i32::MAX;
+    let error = service
+        .update_config(authed_request(request))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
+}

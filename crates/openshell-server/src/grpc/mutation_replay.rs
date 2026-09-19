@@ -384,6 +384,11 @@ fn fingerprint<M: Mutation>(request: &M) -> Result<String, Status> {
     let mut message = DynamicMessage::decode(descriptor, request.encode_to_vec().as_slice())
         .map_err(|_| Status::internal("decode mutation request"))?;
     message.clear_field_by_name("request_id");
+    if M::METHOD == "UpdateConfig" {
+        // Waiting changes response timing, never the admitted mutation identity.
+        message.clear_field_by_name("consistency");
+        message.clear_field_by_name("wait_timeout");
+    }
     let value = serde_json::to_value(message)
         .map_err(|_| Status::internal("canonicalize mutation request"))?;
     hash_json(&value)

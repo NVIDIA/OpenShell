@@ -1025,7 +1025,7 @@ The API's `operation` field records the common operation's historical outcome; i
 
 ### Runtime Limitations
 
-Running sandboxes periodically check for provider and policy changes. Use `--wait` or `sandbox provider status` to confirm when a saved change has taken effect.
+Provider attach and detach update the persisted sandbox provider list. Running sandboxes receive provider environment and effective policy revisions over the supervisor configuration stream. Use `--wait` or `sandbox provider status` to confirm when a saved change has taken effect.
 
 The policy effect applies to future effective policy reads after the sandbox observes the update. The credential environment effect applies only to new process launches after the update is observed, such as later SSH, exec, or SFTP sessions.
 

@@ -181,6 +181,8 @@ pub(in crate::grpc) enum Outcome {
     },
     Config {
         sandbox_id: Option<String>,
+        #[serde(default)]
+        operation_id: Option<String>,
         version: u32,
         policy_hash: String,
         settings_revision: u64,
@@ -868,7 +870,7 @@ mutation!(
     UpdateConfigRequest,
     UpdateConfigResponse,
     "UpdateConfig",
-    policy::handle_update_config,
+    policy::handle_update_config_commit,
     async |req: &UpdateConfigRequest, state: &ServerState, principal: &Principal| {
         if req.global {
             if req.workspace_scope.is_some() {
@@ -896,6 +898,7 @@ mutation!(
         }
         Ok(Outcome::Config {
             sandbox_id: references.first().map(|r| r.id.clone()),
+            operation_id: value.operation.as_ref().map(|op| op.operation_id.clone()),
             version: value.version,
             policy_hash: value.policy_hash.clone(),
             settings_revision: value.settings_revision,
@@ -906,6 +909,7 @@ mutation!(
     async |store: &Store, outcome: Outcome| {
         let Outcome::Config {
             sandbox_id,
+            operation_id,
             version,
             policy_hash,
             settings_revision,
@@ -918,7 +922,20 @@ mutation!(
         if let Some(id) = sandbox_id {
             let _: Sandbox = live(store, &id).await?;
         }
+        let operation = if let Some(id) = operation_id {
+            Some(
+                store
+                    .get_message::<crate::storage_proto::StoredConfigUpdateOperation>(&id)
+                    .await
+                    .map_err(|_| replay_unavailable())?
+                    .and_then(|record| record.operation)
+                    .ok_or_else(replay_unavailable)?,
+            )
+        } else {
+            None
+        };
         Ok(UpdateConfigResponse {
+            operation,
             version,
             policy_hash,
             settings_revision,

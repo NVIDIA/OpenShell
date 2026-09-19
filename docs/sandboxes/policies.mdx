@@ -375,10 +375,12 @@ The incremental update surface is split into endpoint-level operations and metho
 | `--any-binary` | Explicitly acknowledges an existing rule that authorizes every binary. | Use for L7 appends instead of `--binary` when the target rule has no binary restriction. |
 | `--endpoint-path <PATH>` | Selects an exact existing endpoint path for L7 appends. | Resolve path ambiguity; pass `''` to select an endpoint without a path scope. |
 | `--dry-run` | Shows the merged policy locally and does not call the gateway. | Review the result before persisting it. |
-| `--wait` | Polls until the sandbox reports that the new revision loaded. | Confirm the change took effect before continuing. |
-| `--timeout <SECS>` | Sets the timeout for `--wait`. | Extend the wait window for slower sandboxes. |
+| `--wait` | Asks the gateway to wait on the durable update operation until the exact revision is applied or reaches another terminal state. | Confirm the change took effect before continuing. |
+| `--timeout <SECS>` | Sets the server-side timeout for `--wait`. A timeout does not roll back the committed update. | Extend the wait window for slower sandboxes. |
 
 `--wait` and `--dry-run` cannot be used together.
+If the wait times out, the error includes the durable operation ID so a client
+can query its later result without resubmitting the mutation.
 
 ### Add Endpoint Compared to Allow and Deny
 
@@ -979,3 +981,16 @@ Explore related topics:
 - To learn about the built-in sandbox policy, refer to [Default Policy](/reference/default-policy).
 - To view the full field-by-field YAML definition, refer to the [Policy Schema Reference](/reference/policy-schema).
 - To review the default policy breakdown, refer to [Default Policy](/reference/default-policy).
+
+### Waiting for completion
+
+`openshell policy set --wait` waits for the durable update operation to finish.
+Completion can mean applied, inactive, failed, superseded, or cancelled. An
+applied operation can have a degraded outcome; the CLI reports that separately.
+A wait timeout does not cancel the update or undo the saved policy.
+
+API clients select `WAIT_FOR_COMPLETION` and set `wait_timeout` to a protobuf
+`Duration`. Inspect the returned operation's state and outcome before treating
+it as successful application. Save its operation ID for later lookup. When using
+`request_id`, retrying the same mutation with a different wait preference returns
+the original operation without creating another policy revision.

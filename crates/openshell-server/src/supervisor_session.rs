@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 #[cfg(test)]
 use openshell_core::proto::ConfigBootstrapResult;
+use openshell_core::proto::SUPERVISOR_PROTOCOL_REVISION;
 use openshell_core::proto::{
     ConfigApplyOutcome, ConfigBootstrap, ConfigComponent, ConfigComponentApplyResult,
     ConfigSnapshotRevision, ConfigUpdate, ConfigUpdateResult, GatewayMessage, PolicySource,
@@ -25,10 +26,6 @@ use openshell_core::proto::{
     SessionAccepted, SessionRejected, SshRelayTarget, StartupConfigCandidate, SupervisorMessage,
     config_snapshot_revision, config_update, gateway_message, relay_open, startup_config_prepared,
     supervisor_message,
-};
-use openshell_core::proto::{
-    LEGACY_SUPERVISOR_PROTOCOL_REVISION, PREVIOUS_SUPERVISOR_PROTOCOL_REVISION,
-    SUPERVISOR_PROTOCOL_REVISION,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
 use openshell_core::{ObjectId, ObjectWorkspace};
@@ -614,6 +611,7 @@ impl SupervisorSessionRegistry {
         &self,
         sandbox_id: &str,
         message: SupervisorConfigMessage,
+        require_acknowledgement: bool,
     ) -> DeliveryDisposition {
         let component_name = message.component_name();
         let mut sessions = self.sessions.lock().unwrap();
@@ -628,7 +626,8 @@ impl SupervisorSessionRegistry {
                 &mut session.config_sequences.provider_environment
             }
         };
-        if delivery_state.in_flight.is_none()
+        if !require_acknowledgement
+            && delivery_state.in_flight.is_none()
             && delivery_state.last_acknowledged_fingerprint.as_ref()
                 == Some(&config_message_fingerprint(&message))
         {
@@ -1750,15 +1749,10 @@ pub async fn handle_connect_supervisor(
         crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
     }
     let sandbox = require_persisted_sandbox(&state.store, &sandbox_id).await?;
-    // Validate readiness identities before replacing a healthy session. Older
-    // supervisors remain usable but cannot assert provider installation.
+    // Validate readiness identities before replacing a healthy session.
     let provider_readiness = ProviderReadinessEvidence::from_hello(&hello)?;
 
-    let bootstrap_timeout = if stream_applies_config {
-        crate::config_delivery::REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT
-    } else {
-        crate::config_delivery::OPTIONAL_CONFIG_BOOTSTRAP_BUILD_TIMEOUT
-    };
+    let bootstrap_timeout = crate::config_delivery::REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT;
     let mut repair_updates = matches!(image_policy_admission, ImagePolicyAdmission::Invalid)
         .then(|| state.sandbox_watch_bus.subscribe(&sandbox_id));
     let repair_deadline = tokio::time::Instant::now() + STARTUP_POLICY_REPAIR_TIMEOUT;
@@ -2002,28 +1996,13 @@ pub async fn handle_connect_supervisor(
     Ok(Response::new(stream))
 }
 
-fn validate_protocol_revision(sandbox_id: &str, supervisor_revision: u32) -> Result<(), Status> {
-    match supervisor_revision {
-        SUPERVISOR_PROTOCOL_REVISION => Ok(()),
-        PREVIOUS_SUPERVISOR_PROTOCOL_REVISION => {
-            counter!("openshell_supervisor_protocol_previous_sessions_total").increment(1);
-            warn!(
-                sandbox_id = %sandbox_id,
-                "supervisor session: Stage 1 supervisor is using polling compatibility"
-            );
-            Ok(())
-        }
-        LEGACY_SUPERVISOR_PROTOCOL_REVISION => {
-            counter!("openshell_supervisor_protocol_legacy_sessions_total").increment(1);
-            warn!(
-                sandbox_id = %sandbox_id,
-                "supervisor session: supervisor predates the protocol handshake; recreate the sandbox before the next gateway upgrade"
-            );
-            Ok(())
-        }
-        other => Err(Status::failed_precondition(format!(
-            "supervisor protocol revision mismatch: gateway requires {SUPERVISOR_PROTOCOL_REVISION}, supervisor offered {other}"
-        ))),
+fn validate_protocol_revision(_sandbox_id: &str, supervisor_revision: u32) -> Result<(), Status> {
+    if supervisor_revision == SUPERVISOR_PROTOCOL_REVISION {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(format!(
+            "supervisor protocol revision mismatch: gateway requires {SUPERVISOR_PROTOCOL_REVISION}, supervisor offered {supervisor_revision}"
+        )))
     }
 }
 
@@ -2622,6 +2601,7 @@ async fn record_component_apply_result(
     )
     .increment(1);
     record_config_component_observation(state, sandbox_id, component, outcome, result).await?;
+    crate::config_update_operation::complete_from_apply_result(state, sandbox_id, result).await?;
     if component != ConfigComponent::SandboxConfig {
         return Ok(());
     }
@@ -2838,10 +2818,10 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_protocol_revision_accepts_current_and_legacy_peers() {
+    fn supervisor_protocol_revision_accepts_only_current_peer() {
         assert!(validate_protocol_revision("sb-1", SUPERVISOR_PROTOCOL_REVISION).is_ok());
-        assert!(validate_protocol_revision("sb-1", PREVIOUS_SUPERVISOR_PROTOCOL_REVISION).is_ok());
-        assert!(validate_protocol_revision("sb-1", LEGACY_SUPERVISOR_PROTOCOL_REVISION).is_ok());
+        assert!(validate_protocol_revision("sb-1", 1).is_err());
+        assert!(validate_protocol_revision("sb-1", 0).is_err());
     }
 
     #[test]
@@ -3030,6 +3010,7 @@ mod tests {
             state.supervisor_sessions.deliver_config(
                 "sb-bootstrap-ack",
                 SupervisorConfigMessage::ProviderEnvironment(snapshot),
+                false
             ),
             DeliveryDisposition::SuppressedUnchanged
         );
@@ -3061,7 +3042,7 @@ mod tests {
         assert_eq!(
             state
                 .supervisor_sessions
-                .deliver_config(sandbox_id, message.clone()),
+                .deliver_config(sandbox_id, message.clone(), false),
             DeliveryDisposition::Enqueued
         );
         let Some(gateway_message::Payload::ConfigUpdate(update)) =
@@ -3102,7 +3083,7 @@ mod tests {
         assert_eq!(
             state
                 .supervisor_sessions
-                .deliver_config(sandbox_id, message),
+                .deliver_config(sandbox_id, message, false),
             DeliveryDisposition::Enqueued,
             "a non-durable admission must leave the revision eligible for repair"
         );
@@ -3147,7 +3128,7 @@ mod tests {
         assert_eq!(
             state
                 .supervisor_sessions
-                .deliver_config(sandbox_id, message.clone()),
+                .deliver_config(sandbox_id, message.clone(), false),
             DeliveryDisposition::Enqueued
         );
         let Some(gateway_message::Payload::ConfigUpdate(update)) =
@@ -3372,57 +3353,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_supervisor_without_protocol_revision_is_accepted() {
+    async fn rejects_supervisors_that_require_configuration_polling() {
         let state = state_with_sandbox("sb-legacy").await;
-        let mut harness = crate::grpc::test_support::connect_supervisor_stream(
-            &state,
-            "sb-legacy",
-            LEGACY_SUPERVISOR_PROTOCOL_REVISION,
-        )
-        .await
-        .expect("legacy supervisor must connect");
-
-        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
-            first_gateway_message(&mut harness).await.payload
-        else {
-            panic!("expected SessionAccepted");
-        };
-        assert_eq!(
-            accepted.protocol_revision,
-            LEGACY_SUPERVISOR_PROTOCOL_REVISION
-        );
-        assert!(
-            state
-                .supervisor_sessions
-                .is_current_session("sb-legacy", &accepted.session_id)
-        );
-    }
-
-    #[tokio::test]
-    async fn stage_one_supervisor_uses_polling_compatibility() {
-        let state = state_with_sandbox("sb-stage-one").await;
-        let mut harness = crate::grpc::test_support::connect_supervisor_stream(
-            &state,
-            "sb-stage-one",
-            PREVIOUS_SUPERVISOR_PROTOCOL_REVISION,
-        )
-        .await
-        .expect("Stage 1 supervisor must connect");
-
-        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
-            first_gateway_message(&mut harness).await.payload
-        else {
-            panic!("expected SessionAccepted");
-        };
-        assert_eq!(
-            accepted.protocol_revision,
-            PREVIOUS_SUPERVISOR_PROTOCOL_REVISION
-        );
-        assert!(
-            state
-                .supervisor_sessions
-                .is_current_session("sb-stage-one", &accepted.session_id)
-        );
+        for revision in [0, 1, 2] {
+            let result =
+                crate::grpc::test_support::connect_supervisor_stream(&state, "sb-legacy", revision)
+                    .await;
+            assert!(
+                matches!(result, Err(ref status) if status.code() == tonic::Code::FailedPrecondition)
+            );
+        }
     }
 
     #[tokio::test]
@@ -3779,6 +3719,7 @@ mod tests {
                 .deliver(
                     "missing",
                     SupervisorConfigMessage::SandboxConfig(Box::default()),
+                    false
                 )
                 .await,
             DeliveryDisposition::NoActiveSession
@@ -3830,11 +3771,23 @@ mod tests {
         assert_eq!(
             registry.deliver_config(
                 "sb-1",
-                SupervisorConfigMessage::SandboxConfig(Box::new(snapshot)),
+                SupervisorConfigMessage::SandboxConfig(Box::new(snapshot.clone())),
+                false
             ),
             DeliveryDisposition::SuppressedUnchanged
         );
         assert!(rx.try_recv().is_err());
+        // A newly committed operation needs a result even when the current
+        // session has already acknowledged this exact snapshot.
+        assert_eq!(
+            registry.deliver_config(
+                "sb-1",
+                SupervisorConfigMessage::SandboxConfig(Box::new(snapshot)),
+                true,
+            ),
+            DeliveryDisposition::Enqueued
+        );
+        assert!(rx.try_recv().is_ok());
     }
 
     #[test]
@@ -3859,6 +3812,7 @@ mod tests {
                     provider_env_revision: 8,
                     ..Default::default()
                 }),
+                false
             ),
             DeliveryDisposition::Enqueued
         );
@@ -3949,7 +3903,7 @@ mod tests {
             &config_message_fingerprint(&message),
         ));
         assert_eq!(
-            registry.deliver_config("sb-1", message),
+            registry.deliver_config("sb-1", message, false),
             DeliveryDisposition::SuppressedUnchanged
         );
         assert_eq!(
@@ -3959,6 +3913,7 @@ mod tests {
                     provider_env_revision: 12,
                     ..snapshot
                 })),
+                false,
             ),
             DeliveryDisposition::Enqueued
         );
@@ -3993,7 +3948,7 @@ mod tests {
             &fingerprint,
         ));
         assert_eq!(
-            registry.deliver_config("sb-1", message),
+            registry.deliver_config("sb-1", message, false),
             DeliveryDisposition::SuppressedUnchanged
         );
 
@@ -4003,7 +3958,7 @@ mod tests {
                 ..snapshot.clone()
             });
         assert_eq!(
-            registry.deliver_config("sb-1", policy_changed),
+            registry.deliver_config("sb-1", policy_changed, false),
             DeliveryDisposition::Enqueued
         );
         assert!(rx.try_recv().is_ok());
@@ -4042,6 +3997,7 @@ mod tests {
                     provider_attachment_epoch: "epoch-2".into(),
                     ..snapshot
                 }),
+                false,
             ),
             DeliveryDisposition::Enqueued
         );
@@ -4064,6 +4020,7 @@ mod tests {
                         config_revision: 2,
                         ..Default::default()
                     })),
+                    false
                 )
                 .await,
             DeliveryDisposition::Enqueued
@@ -4073,6 +4030,7 @@ mod tests {
                 .deliver(
                     "sb-1",
                     SupervisorConfigMessage::SandboxConfig(Box::default()),
+                    false
                 )
                 .await,
             DeliveryDisposition::Coalesced
@@ -4084,6 +4042,7 @@ mod tests {
                     SupervisorConfigMessage::ProviderEnvironment(
                         ProviderEnvironmentSnapshot::default(),
                     ),
+                    false
                 )
                 .await,
             DeliveryDisposition::Enqueued
@@ -4147,6 +4106,7 @@ mod tests {
                 .deliver(
                     "sb-1",
                     SupervisorConfigMessage::SandboxConfig(Box::default()),
+                    false
                 )
                 .await,
             DeliveryDisposition::Enqueued
@@ -4166,6 +4126,7 @@ mod tests {
                 .deliver(
                     "sb-1",
                     SupervisorConfigMessage::SandboxConfig(Box::default()),
+                    false
                 )
                 .await,
             DeliveryDisposition::Enqueued
@@ -4191,6 +4152,7 @@ mod tests {
                 .deliver(
                     "sb-1",
                     SupervisorConfigMessage::SandboxConfig(Box::default()),
+                    false
                 )
                 .await,
             DeliveryDisposition::QueueFull
@@ -4202,6 +4164,7 @@ mod tests {
                 .deliver(
                     "sb-1",
                     SupervisorConfigMessage::SandboxConfig(Box::default()),
+                    false
                 )
                 .await,
             DeliveryDisposition::SessionClosed
@@ -4229,6 +4192,7 @@ mod tests {
                 .deliver(
                     "sb-1",
                     SupervisorConfigMessage::ProviderEnvironment(snapshot),
+                    false
                 )
                 .await,
             DeliveryDisposition::PayloadTooLarge
