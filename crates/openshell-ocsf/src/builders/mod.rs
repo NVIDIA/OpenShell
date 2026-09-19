@@ -134,20 +134,6 @@ macro_rules! impl_src_endpoint_addr_setter {
     };
 }
 
-/// Generate the `firewall_rule` setter shared by network and HTTP builders.
-macro_rules! impl_firewall_rule_setter {
-    ($builder:ident) => {
-        impl<'a> $builder<'a> {
-            /// Set the firewall rule that matched this event.
-            #[must_use]
-            pub fn firewall_rule(mut self, name: &str, rule_type: &str) -> Self {
-                self.firewall_rule = Some($crate::objects::FirewallRule::new(name, rule_type));
-                self
-            }
-        }
-    };
-}
-
 mod api_activity;
 mod base;
 mod config;
