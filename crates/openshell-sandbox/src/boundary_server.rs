@@ -39,7 +39,6 @@ mod linux {
         BoundaryConfirmation, BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess,
         BoundaryTerminal, ExecSession, LoopbackTarget, ResolvedWorkloadIdentity,
     };
-    use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
     use openshell_sandbox_backend::mediation::{
         self, DnsQueryWire, MediationFrame, MediationFrameKind,
     };
@@ -52,6 +51,9 @@ mod linux {
     use openshell_sandbox_backend::sandbox_auth::{
         SandboxConnectionId, SandboxConnectionRegistry, SandboxProtocolAuthenticator,
         SandboxProtocolPrincipal,
+    };
+    use openshell_sandbox_backend::{
+        ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM, GPU_RESOURCE_CLAIM,
     };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_stream::wrappers::ReceiverStream;
@@ -389,6 +391,10 @@ mod linux {
             .resource_claims
             .get(GPU_RESOURCE_CLAIM)
             .is_some_and(|value| value == "true")
+            || config
+                .resource_claims
+                .get(ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM)
+                .is_some_and(|value| value == "true")
     }
 
     fn supplementary_groups_match(actual: &[u32], expected: &[u32], allow_extra: bool) -> bool {
@@ -3832,6 +3838,33 @@ mod linux {
         fn gpu_runtime_groups_may_extend_but_not_replace_expected_groups() {
             assert!(supplementary_groups_match(&[44, 992, 1001], &[1001], true));
             assert!(!supplementary_groups_match(&[44, 992], &[1001], true));
+        }
+
+        #[test]
+        fn generic_identity_claim_allows_runtime_supplementary_groups() {
+            let config = BoundaryConfig {
+                boundary_id: "sandbox-1".to_string(),
+                generation: "generation-1".to_string(),
+                session_id: test_session_id(),
+                session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                    .expect("session rotation"),
+                auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+                gateway_id: "test-gateway".to_string(),
+                verification_keys: vec![],
+                listener: BoundaryListenerConfig::Vsock {
+                    control_port: 5500,
+                    tls: placeholder_server_tls(),
+                },
+                resource_claims: std::collections::BTreeMap::from([(
+                    ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM.to_string(),
+                    "true".to_string(),
+                )]),
+                resource_claim_files: std::collections::BTreeMap::new(),
+                workload_identity: test_workload_identity(),
+                outer_fence: test_outer_fence(),
+                child_env: std::collections::HashMap::new(),
+            };
+            assert!(allows_runtime_supplementary_groups(&config));
         }
 
         #[test]

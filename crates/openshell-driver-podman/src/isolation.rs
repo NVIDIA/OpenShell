@@ -13,6 +13,7 @@ use openshell_core::proto::compute::v1::DriverSandbox;
 use openshell_isolation_interface::contract::{
     OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
 };
+use openshell_sandbox_backend::ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
@@ -68,6 +69,12 @@ pub fn supervisor_name(id: &str) -> String {
 }
 pub fn channel_volume_name(id: &str) -> String {
     format!("openshell-channel-{id}")
+}
+
+/// `keep-id` may retain the gateway user's supplementary groups in the
+/// container. Other user-namespace modes, including `auto`, do not.
+pub fn userns_preserves_host_groups(userns: Option<&str>) -> bool {
+    userns.is_some_and(|mode| mode.split(':').next() == Some("keep-id"))
 }
 
 fn invalid(error: impl std::fmt::Display) -> ComputeDriverError {
@@ -195,19 +202,26 @@ pub fn bootstrap_archives(
     container_id: &str,
     generation: &str,
     identity: &ResolvedWorkloadIdentity,
+    allow_extra_supplementary_groups: bool,
     child_env: HashMap<String, String>,
     launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
 ) -> Result<BootstrapArchives, ComputeDriverError> {
     launch_authentication.validate().map_err(invalid)?;
     let session_id = launch_authentication.supervisor.session_id;
     let tls = generate_sandbox_tls_material(session_id).map_err(invalid)?;
-    let resource_claims = BTreeMap::from([
+    let mut resource_claims = BTreeMap::from([
         ("podman.container_id".into(), container_id.into()),
         (
             "podman.image_identity".into(),
             identity.resource_digest.clone(),
         ),
     ]);
+    if allow_extra_supplementary_groups {
+        resource_claims.insert(
+            ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM.into(),
+            "true".into(),
+        );
+    }
     let runtime_generation = launch_authentication
         .supervisor
         .runtime_generation
@@ -496,6 +510,7 @@ mod tests {
             "container",
             "generation-1",
             &identity,
+            false,
             child_env.clone(),
             &authentication,
         )
@@ -541,6 +556,11 @@ mod tests {
             .outer_fence
             .validate(&runtime_descriptor.generation)
             .unwrap();
+        assert!(
+            !config
+                .resource_claims
+                .contains_key(ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM)
+        );
         let restart_metadata: RestartMetadata = serde_json::from_slice(
             supervisor
                 .get(&PathBuf::from(
@@ -557,5 +577,16 @@ mod tests {
                 .windows(b"PRIVATE KEY".len())
                 .any(|window| window == b"PRIVATE KEY")
         );
+    }
+
+    #[test]
+    fn keep_id_is_the_only_userns_mode_that_preserves_host_groups() {
+        assert!(userns_preserves_host_groups(Some("keep-id")));
+        assert!(userns_preserves_host_groups(Some(
+            "keep-id:uid=1000,gid=1000"
+        )));
+        assert!(!userns_preserves_host_groups(Some("auto")));
+        assert!(!userns_preserves_host_groups(Some("private")));
+        assert!(!userns_preserves_host_groups(None));
     }
 }

@@ -19,8 +19,8 @@ const PODMAN_TEST_IMAGE_ENV: &str = "OPENSHELL_PODMAN_TEST_IMAGE";
 /// Verify that the gateway's user-namespace configuration matches Podman's
 /// direct behavior for the same profile.
 ///
-/// The test creates a sandbox and compares its user-namespace mapping with the
-/// direct-Podman reference stored at
+/// The test runs a short-lived sandbox command and compares its user-namespace
+/// mapping with the direct-Podman reference stored at
 /// `OPENSHELL_TEST_INPUT_DIR/reference-uid-map`. The tmachine pre-test
 /// playbook creates that reference in the same gateway-user context. This deliberately
 /// avoids baking a particular Podman mapping into OpenShell's test contract.
@@ -59,38 +59,21 @@ async fn configured_userns_matches_podman_reference() {
         if let Some(image) = workload_image.as_deref() {
             create_args.extend(["--from", image]);
         }
-        create_args.extend(["--detach", "--", "sleep", "infinity"]);
-        let create = runner
-            .step("userns/create")
-            .description("sandbox from the configured test image is created")
+        create_args.extend(["--no-tty", "--", "cat", "/proc/self/uid_map"]);
+        let run = runner
+            .step("userns/uid-map")
+            .description("sandbox exposes its UID map")
             .with_timeout(SANDBOX_TIMEOUT)
             .run(&create_args)
             .await
             .map_err(|error| error.to_string())?;
-        create.require_success()?;
-        let exec = runner
-            .step("userns/uid-map")
-            .description("sandbox exposes its UID map")
-            .with_timeout(SANDBOX_TIMEOUT)
-            .run(&[
-                "sandbox",
-                "exec",
-                "--name",
-                &sandbox_name,
-                "--no-tty",
-                "--",
-                "cat",
-                "/proc/self/uid_map",
-            ])
-            .await
-            .map_err(|error| error.to_string())?;
-        exec.require_success()?;
-        let sandbox_uid_map = normalize_uid_map(exec.stdout()).ok_or_else(|| {
-            exec.failure_diagnostic("sandbox returns a non-empty UID map")
+        run.require_success()?;
+        let sandbox_uid_map = normalize_uid_map(run.stdout()).ok_or_else(|| {
+            run.failure_diagnostic("sandbox returns a non-empty UID map")
         })?;
         if sandbox_uid_map != expected_uid_map {
             return Err(format!(
-                "sandbox UID map differs from direct Podman default:\nexpected:\n{expected_uid_map}\nactual:\n{sandbox_uid_map}"
+                "sandbox UID map differs from the direct Podman reference:\nexpected:\n{expected_uid_map}\nactual:\n{sandbox_uid_map}"
             ));
         }
         Ok(())
