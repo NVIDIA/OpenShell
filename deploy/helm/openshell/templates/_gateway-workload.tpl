@@ -5,6 +5,16 @@
 Gateway pod template shared by the StatefulSet and Deployment workload shapes.
 */}}
 {{- define "openshell.gatewayPodTemplate" -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- $gatewayRuntimeConfig := get $gatewayConfig "openshell.gateway" | default dict -}}
+{{- $oidcRuntimeConfig := get $gatewayConfig "openshell.gateway.oidc" | default dict -}}
+{{- $kubernetesRuntimeConfig := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
+{{- $spiffeSocketPath := get $kubernetesRuntimeConfig "provider_spiffe_workload_api_socket_path" -}}
+{{- $hasExternalCredentialDriver := or (eq (include "openshell.credentialDriverEnabled" (list . "kubernetes-secrets")) "true") (eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true") -}}
+{{- $vaultCredentialDriverEnabled := eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true" -}}
+{{- $credentialDrivers := .Values.credentialDrivers | default dict -}}
+{{- $vaultResources := get $credentialDrivers "vault" | default dict -}}
+{{- $vaultCaConfigMapName := get $vaultResources "caConfigMapName" -}}
 metadata:
   annotations:
     # Roll the gateway workload when the rendered gateway TOML changes - the
@@ -52,7 +62,7 @@ spec:
         - {{ .Values.server.dbUrl | quote }}
         {{- end }}
       env:
-        {{- if not (or .Values.server.credentialDrivers.kubernetesSecrets.enabled .Values.server.credentialDrivers.vault.enabled) }}
+        {{- if not $hasExternalCredentialDriver }}
         - name: {{ include "openshell.credentialStorageKeyEncryptionKeyEnvName" . }}
           valueFrom:
             secretKeyRef:
@@ -70,7 +80,7 @@ spec:
         # mounted at /etc/openshell/gateway.toml. Secret-bearing settings use
         # env vars that the TOML references by name. Some process-level
         # settings consumed by libraries outside gateway code also remain here.
-        {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+        {{- if and (get $oidcRuntimeConfig "issuer") .Values.oidc.caConfigMapName }}
         # OIDC issuer custom-CA: rustls/reqwest read SSL_CERT_FILE for
         # outbound TLS verification. This is a process-level env var
         # consumed by the TLS stack itself, not by gateway code, so it
@@ -80,9 +90,9 @@ spec:
         {{- end }}
         - name: OPENSHELL_TELEMETRY_ENABLED
           value: {{ .Values.server.telemetryEnabled | quote }}
-        {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
+        {{- if $spiffeSocketPath }}
         - name: OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET
-          value: {{ .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
+          value: {{ $spiffeSocketPath | quote }}
         {{- end }}
       volumeMounts:
         {{- if eq (include "openshell.workloadKind" .) "statefulset" }}
@@ -114,19 +124,19 @@ spec:
           readOnly: true
         {{- end }}
         {{- end }}
-        {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+        {{- if and (get $oidcRuntimeConfig "issuer") .Values.oidc.caConfigMapName }}
         - name: oidc-ca
           mountPath: /etc/openshell-tls/oidc-ca
           readOnly: true
         {{- end }}
-        {{- if and .Values.server.credentialDrivers.vault.enabled .Values.server.credentialDrivers.vault.caConfigMapName }}
+        {{- if and $vaultCredentialDriverEnabled $vaultCaConfigMapName }}
         - name: vault-ca
-          mountPath: /etc/openshell-tls/vault-ca
+          mountPath: /etc/openshell-tls/vault
           readOnly: true
         {{- end }}
-        {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
+        {{- if $spiffeSocketPath }}
         - name: spiffe-workload-api
-          mountPath: {{ dir .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
+          mountPath: {{ dir $spiffeSocketPath | quote }}
           readOnly: true
         {{- end }}
       ports:
@@ -196,20 +206,20 @@ spec:
         {{- end }}
     {{- end }}
     {{- end }}
-    {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+    {{- if and (get $oidcRuntimeConfig "issuer") .Values.oidc.caConfigMapName }}
     - name: oidc-ca
       configMap:
-        name: {{ .Values.server.oidc.caConfigMapName }}
+        name: {{ .Values.oidc.caConfigMapName }}
     {{- end }}
-    {{- if and .Values.server.credentialDrivers.vault.enabled .Values.server.credentialDrivers.vault.caConfigMapName }}
+    {{- if and $vaultCredentialDriverEnabled $vaultCaConfigMapName }}
     - name: vault-ca
       configMap:
-        name: {{ .Values.server.credentialDrivers.vault.caConfigMapName }}
+        name: {{ $vaultCaConfigMapName }}
         items:
           - key: ca.crt
             path: ca.crt
     {{- end }}
-    {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
+    {{- if $spiffeSocketPath }}
     - name: spiffe-workload-api
       csi:
         driver: csi.spiffe.io

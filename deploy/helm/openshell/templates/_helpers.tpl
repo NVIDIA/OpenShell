@@ -94,30 +94,6 @@ so a released chart automatically pulls the matching image without extra overrid
 {{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) }}
 {{- end }}
 
-{{/* Official sandbox runtime repository used by the gateway's built-in default. */}}
-{{- define "openshell.defaultSandboxRuntimeRepository" -}}
-ghcr.io/nvidia/openshell/sandbox
-{{- end }}
-
-{{/* Whether Helm must propagate a sandbox runtime image override. */}}
-{{- define "openshell.sandboxRuntimeImageOverrideEnabled" -}}
-{{- $defaultRepository := include "openshell.defaultSandboxRuntimeRepository" . -}}
-{{- $repository := .Values.sandboxRuntime.image.repository | default $defaultRepository -}}
-{{- if or (ne $repository $defaultRepository) .Values.sandboxRuntime.image.tag -}}true{{- end -}}
-{{- end }}
-
-{{/* Sandbox runtime image override. */}}
-{{- define "openshell.sandboxRuntimeImage" -}}
-{{- $repository := .Values.sandboxRuntime.image.repository | default (include "openshell.defaultSandboxRuntimeRepository" .) -}}
-{{- $tag := .Values.sandboxRuntime.image.tag | default .Values.image.tag | default .Chart.AppVersion -}}
-{{- printf "%s:%s" $repository $tag }}
-{{- end }}
-
-{{/* Official supervisor repository used by the gateway's built-in default. */}}
-{{- define "openshell.defaultSupervisorRepository" -}}
-ghcr.io/nvidia/openshell/supervisor
-{{- end }}
-
 {{/*
 Whether the gateway listener should verify client certificates (mTLS).
 An explicit empty server.tls.clientCaSecretName disables client-CA wiring in
@@ -132,26 +108,6 @@ defaults.
 true
 {{- end -}}
 {{- end -}}
-
-{{/*
-Whether Helm must propagate a supervisor image override into gateway.toml.
-The chart's documented repository and empty tag are the gateway-owned default.
-*/}}
-{{- define "openshell.supervisorImageOverrideEnabled" -}}
-{{- $defaultRepository := include "openshell.defaultSupervisorRepository" . -}}
-{{- $repository := .Values.supervisor.image.repository | default $defaultRepository -}}
-{{- if or (ne $repository $defaultRepository) .Values.supervisor.image.tag -}}true{{- end -}}
-{{- end }}
-
-{{/*
-Supervisor image override. A tag-only override uses the official repository;
-a repository-only override uses the effective gateway image tag.
-*/}}
-{{- define "openshell.supervisorImage" -}}
-{{- $repository := .Values.supervisor.image.repository | default (include "openshell.defaultSupervisorRepository" .) -}}
-{{- $tag := .Values.supervisor.image.tag | default .Values.image.tag | default .Chart.AppVersion -}}
-{{- printf "%s:%s" $repository $tag }}
-{{- end }}
 
 {{/*
 Namespaced Issuer (selfSigned) for cert-manager CA bootstrap.
@@ -173,7 +129,18 @@ Namespace where sandbox pods are created. An explicit
 Namespace where Kubernetes Secret-backed provider credentials live.
 */}}
 {{- define "openshell.credentialKubernetesSecretsNamespace" -}}
-{{- .Values.server.credentialDrivers.kubernetesSecrets.namespace | default .Release.Namespace -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- $config := get $gatewayConfig "openshell.credential_drivers.kubernetes-secrets" | default dict -}}
+{{- get $config "namespace" | default .Release.Namespace -}}
+{{- end }}
+
+{{/* Whether a credential driver is enabled in the generic gateway config. */}}
+{{- define "openshell.credentialDriverEnabled" -}}
+{{- $root := index . 0 -}}
+{{- $driver := index . 1 -}}
+{{- $gatewayConfig := $root.Values.gatewayConfig | default dict -}}
+{{- $gateway := get $gatewayConfig "openshell.gateway" | default dict -}}
+{{- if has $driver (get $gateway "credential_drivers" | default list) -}}true{{- end -}}
 {{- end }}
 
 {{/*
@@ -210,20 +177,10 @@ Name of the Secret holding gateway-minted sandbox JWT signing material.
 {{- .Values.server.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) -}}
 {{- end }}
 
-{{/*
-gRPC endpoint sandbox pods use to call back into the gateway. An explicit
-.Values.server.grpcEndpoint is used verbatim. Otherwise it is derived from
-the in-cluster Service DNS, release namespace, service port, and disableTls
-flag — so the default value works for any release name or namespace without
-override.
-*/}}
+{{/* Derive the in-cluster callback endpoint from the chart-owned TLS state. */}}
 {{- define "openshell.grpcEndpoint" -}}
-{{- if .Values.server.grpcEndpoint -}}
-{{- .Values.server.grpcEndpoint -}}
-{{- else -}}
 {{- $scheme := ternary "http" "https" (default false .Values.server.disableTls) -}}
 {{- printf "%s://%s.%s.svc.cluster.local:%d" $scheme (include "openshell.fullname" .) .Release.Namespace (int .Values.service.port) -}}
-{{- end -}}
 {{- end }}
 
 {{/*
@@ -284,6 +241,26 @@ never
 {{- end }}
 
 {{/*
+Validate a non-empty, user-provided Kubernetes Secret name. Secret data never
+passes through Helm values into gateway.toml; only this reference is rendered.
+*/}}
+{{- define "openshell.validateSecretReference" -}}
+{{- $path := index . 0 -}}
+{{- $name := index . 1 -}}
+{{- if and (ne $name nil) (ne $name "") -}}
+{{- if not (kindIs "string" $name) -}}
+{{- fail (printf "%s must be a Kubernetes Secret name, got %s" $path (kindOf $name)) -}}
+{{- end -}}
+{{- if gt (len $name) 253 -}}
+{{- fail (printf "%s must be no more than 253 characters" $path) -}}
+{{- end -}}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $name) -}}
+{{- fail (printf "%s must be a valid Kubernetes Secret name" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Validate chart values that Helm would otherwise accept silently.
 */}}
 {{- define "openshell.validateValues" -}}
@@ -292,6 +269,9 @@ Validate chart values that Helm would otherwise accept silently.
 {{- $replicaCount := int (default 1 .Values.replicaCount) -}}
 {{- if and (hasKey .Values "postgres") (kindIs "map" .Values.postgres) (hasKey .Values.postgres "enabled") -}}
 {{- fail "postgres.enabled was removed; the OpenShell chart no longer deploys PostgreSQL. Provision PostgreSQL separately and set server.externalDbSecret to a Secret containing a PostgreSQL URI." -}}
+{{- end -}}
+{{- if and .Values.certManager.serverIssuerRef.name (not .Values.certManager.enabled) -}}
+{{- fail "certManager.serverIssuerRef.name is set but certManager.enabled is false — the external server certificate, its Secret mount, and the gateway TLS configuration all require cert-manager to be enabled. Set certManager.enabled=true or remove certManager.serverIssuerRef.name." -}}
 {{- end -}}
 {{- if not (or (eq $workloadKind "statefulset") (eq $workloadKind "deployment")) -}}
 {{- fail "workload.kind must be one of: statefulset, deployment." -}}
@@ -305,19 +285,15 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if and (eq $workloadKind "statefulset") (gt $replicaCount 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
 {{- fail "replicaCount > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." -}}
 {{- end -}}
-{{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
+{{- include "openshell.validateSecretReference" (list "server.externalDbSecret" .Values.server.externalDbSecret) -}}
+{{- include "openshell.validateSecretReference" (list "server.credentialStorage.existingSecret" .Values.server.credentialStorage.existingSecret) -}}
+{{- include "openshell.validateSecretReference" (list "server.sandboxJwt.signingSecretName" .Values.server.sandboxJwt.signingSecretName) -}}
+{{- include "openshell.validateSecretReference" (list "server.tls.certSecretName" .Values.server.tls.certSecretName) -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- $kubernetesConfig := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
+{{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
 {{- if not (has $workspaceMode (list "shared" "managed" "operator")) -}}
-{{- fail "server.drivers.kubernetes.workspaceMode must be one of: shared, managed, operator." -}}
-{{- end -}}
-{{- $credentialDrivers := list -}}
-{{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled -}}
-{{- $credentialDrivers = append $credentialDrivers "kubernetes-secrets" -}}
-{{- end -}}
-{{- if .Values.server.credentialDrivers.vault.enabled -}}
-{{- $credentialDrivers = append $credentialDrivers "vault" -}}
-{{- end -}}
-{{- if gt (len $credentialDrivers) 1 -}}
-{{- fail "only one external server.credentialDrivers backend can be enabled at a time." -}}
+{{- fail "gatewayConfig.openshell.drivers.kubernetes.workspace_mode must be one of: shared, managed, operator." -}}
 {{- end -}}
 {{- if kindIs "invalid" .Values.server.tls.clientCaSecretName -}}
 {{- fail "server.tls.clientCaSecretName cannot be null; omit the key to use the chart default (openshell-server-client-ca), or set to \"\" to disable client certificate verification for HTTPS-only mode" -}}

@@ -55,6 +55,70 @@ the gateway listener uses TLS; package-managed local TLS can supply that bundle.
 Kubernetes instead projects guest credentials through its configured Secret.
 The gateway validates this requirement before constructing the selected driver.
 
+### Helm configuration boundary
+
+The Kubernetes Helm chart exposes `gatewayConfig` as its non-secret gateway
+application-configuration boundary. Each top-level map key names a TOML table,
+and the chart serializes its fields into the mounted `gateway.toml` ConfigMap.
+This keeps the chart independent of individual gateway fields: a new non-secret
+gateway option does not require a chart template change.
+
+Secret material never belongs in `gatewayConfig` or the ConfigMap. Database
+URLs, credentials, private keys, and equivalent values use Kubernetes Secrets
+through the chart's supported environment-variable, file, or volume wiring.
+Helm serializes unknown fields generically, so it cannot determine whether an
+arbitrary string such as `api_token` is confidential. It rejects
+`database_url`, inline URL credentials, and PEM private keys, but is not a
+general secret scanner; operators must keep all secret material out of this
+map.
+The gateway's normal precedence still applies: CLI flags and `OPENSHELL_*`
+environment variables override the mounted TOML file.
+
+The chart rejects the gateway's `database_url` file field and unambiguous
+inline credential or PEM private-key strings before rendering a ConfigMap.
+It validates Secret references as Kubernetes Secret names, but never reads or
+copies referenced Secret data into `gateway.toml`.
+
+The serializer has a deterministic YAML-to-TOML contract. YAML `null` fields
+are omitted; `null` array members are rejected because TOML has no equivalent.
+Strings, booleans, integers, and floats preserve their types. Scalar arrays
+become TOML arrays, maps become inline tables, and arrays of maps become arrays
+of inline tables. Keys are ordered alphabetically, so equivalent input produces
+the same ConfigMap checksum. Helm `tpl` expressions are evaluated only in
+string values, never in keys or YAML structure.
+
+The implementation intentionally uses only long-standing Helm 3 template and
+Sprig functions (tpl, kindIs, keys, sortAlpha, splitList, quote, and toJson);
+it does not rely on a Helm-specific TOML encoder. This preserves the chart's
+documented Helm 3 compatibility while making the serialization rules explicit
+in the chart itself.
+
+Helm retains ownership of values that create or modify Kubernetes resources,
+including Services, workloads, probes, Secrets, certificate resources, Routes,
+RBAC, NetworkPolicies, and mounts. When one of those inputs also determines a
+gateway runtime value, the chart derives one from the other rather than
+exposing two independently configurable settings.
+
+### Legacy Helm value inventory
+
+The former hand-written ConfigMap template read the following values. This
+inventory is the migration boundary for `gatewayConfig`; it prevents a legacy
+knob from silently surviving as a second source of truth.
+
+| Classification | Legacy values read by the ConfigMap | Migration |
+| --- | --- | --- |
+| Application-only | `server.name`, `server.logLevel`, `server.enableLoopbackServiceHttp`, `server.policyValidationFailureMode`, `server.grpcRateLimit.requests`, `server.grpcRateLimit.windowSeconds` | `openshell.gateway`; defaulted runtime values are now in `gatewayConfig`, optional values are omitted unless the operator adds them. |
+| Application-only | `server.otlp.endpoint`, `server.otlp.serviceName`, `server.auth.allowUnauthenticatedUsers`, `server.oidc.{issuer,audience,jwksTtl,rolesClaim,adminRole,userRole,scopesClaim}` | `openshell.gateway.{otlp,auth,oidc}`. Empty optional tables are not rendered. |
+| Application-only | `server.sandboxImage`, `server.sandboxImagePullPolicy`, `server.sandboxImagePullSecrets`, `server.workspaceDefaultStorageSize`, `server.workspaceStorageClass`, `server.defaultRuntimeClassName`, `server.enableUserNamespaces` | `openshell.drivers.kubernetes`; `server.appArmorProfile` is removed by RFC 0012. |
+| Application-only | `server.drivers.kubernetes.{workspaceMode,operatorNamespaceLabel,operatorNamespaceFile}`, `server.sandboxJwt.{gatewayId,ttlSecs,k8sSaTokenTtlSecs}` | `openshell.drivers.kubernetes`, `.managed_ssh_ingress`, and `openshell.gateway.gateway_jwt`. `supervisor.topology` and `supervisor.sidecar.*` are removed by RFC 0012. |
+| Application-only | `server.credentialDrivers.kubernetesSecrets.allowReferenceNamespace`, `server.credentialDrivers.vault.{address,mount,kvVersion,authMethod,role,kubernetesAuthMount,serviceAccountTokenPath,tokenPath,timeoutSecs}`, `server.providerTokenGrants.spiffe.{enabled,workloadApiSocketPath}` | The corresponding `openshell.drivers.kubernetes` or `openshell.credential_drivers.*` table. Credential-driver and SPIFFE runtime configuration selects any required Helm resources; Secret names and keys remain references, never Secret data. |
+| Application-only | `upstreamProxy.{url,noProxy,authSecret.name,authSecret.key,authAllowInsecure,connectByHostname}`, `sandboxRuntime.image.*`, `supervisor.image.*`, `supervisor.sandboxRuntime.*` | `openshell.drivers.kubernetes.{https_proxy,no_proxy,proxy_auth_*,sandbox_runtime_image,supervisor_image,sandbox_runtime}`. |
+| Deployment-only | `server.dbUrl`, `server.externalDbSecret` | Gateway process args and `OPENSHELL_DB_URL` Secret reference. They are never TOML. |
+| Deployment-only | `server.credentialStorage.existingSecret`, `server.sandboxJwt.signingSecretName`, `server.tls.certSecretName`, `server.tls.clientCaSecretName` | Secret creation, mounting, and environment wiring. TOML contains only stable paths or an environment-variable name. |
+| Dual-use | `service.{port,healthPort,metricsPort}`, `server.disableTls`, `server.tls.clientTlsSecretName` | The chart owns the Service, workload ports, mounts, and Secret references; `gatewayConfig` derives listener addresses and runtime references from them. |
+| Dual-use | `certManager.{enabled,serverIssuerRef.name,serverDnsNames}`, `pkiInitJob.{enabled,serverDnsNames}` | Certificate resources and mounts remain chart-owned; the TLS table and server SANs are derived from their selected certificate source. |
+| Dual-use | `networkPolicy.enabled`, `server.hostGatewayIP` | The chart owns NetworkPolicies and pod host aliases. `server.hostGatewayIP` is the sole input for both host aliases and the derived `host_gateway_ip` runtime field. |
+
 ## Protocol and Auth
 
 Gateway validation and concurrency errors use the standard rich gRPC error

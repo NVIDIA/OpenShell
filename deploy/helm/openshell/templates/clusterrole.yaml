@@ -1,7 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-{{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" }}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- $kubernetesConfig := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
+{{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" }}
+{{- $managedSshIngress := get $gatewayConfig "openshell.drivers.kubernetes.managed_ssh_ingress" | default dict -}}
+{{- $managedSshIngressEnabled := true -}}
+{{- if hasKey $managedSshIngress "enabled" -}}
+{{- $managedSshIngressEnabled = get $managedSshIngress "enabled" -}}
+{{- end }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -83,9 +90,9 @@ rules:
   {{- $copiedSecretNames = append $copiedSecretNames .Values.server.tls.clientTlsSecretName }}
   {{- end }}
   {{- if eq $workspaceMode "managed" }}
-  {{- range .Values.server.sandboxImagePullSecrets }}
-  {{- if .name }}
-  {{- $copiedSecretNames = append $copiedSecretNames .name }}
+  {{- range (get $kubernetesConfig "image_pull_secrets" | default list) }}
+  {{- if . }}
+  {{- $copiedSecretNames = append $copiedSecretNames . }}
   {{- end }}
   {{- end }}
   {{- end }}
@@ -130,7 +137,7 @@ rules:
     verbs:
       - create
   {{- end }}
-  {{- if and (ne $workspaceMode "shared") .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
+  {{- if and (ne $workspaceMode "shared") (eq (include "openshell.credentialDriverEnabled" (list . "kubernetes-secrets")) "true") }}
   # The kubernetes-secrets credential driver uses dynamic hashed names in
   # workspace namespaces, so Kubernetes RBAC cannot restrict resourceNames.
   - apiGroups:
@@ -152,7 +159,7 @@ rules:
     verbs:
       - create
       - get
-  {{- if .Values.networkPolicy.enabled }}
+  {{- if $managedSshIngressEnabled }}
   # Apply gateway-only SSH ingress isolation in managed namespaces.
   - apiGroups:
       - networking.k8s.io
