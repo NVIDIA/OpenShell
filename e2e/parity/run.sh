@@ -94,7 +94,7 @@ if ! [[ "${BASELINE_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
   echo "ERROR: manifest baseline_commit must be a full 40-character SHA: ${MANIFEST}" >&2
   exit 2
 fi
-BASELINE_SHA="${BASELINE_SHA,,}"
+BASELINE_SHA="$(echo "$BASELINE_SHA" | tr '[:upper:]' '[:lower:]')"
 EXPECTED_CANDIDATE_SHA="$(git -C "${ROOT}" rev-parse HEAD)"
 if [ ! -d "${CANDIDATE_WORKTREE}" ]; then
   echo "ERROR: candidate worktree does not exist: ${CANDIDATE_WORKTREE}" >&2
