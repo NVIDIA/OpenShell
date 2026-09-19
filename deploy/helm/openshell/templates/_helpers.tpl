@@ -276,7 +276,10 @@ Validate chart values that Helm would otherwise accept silently.
 {{- end -}}
 {{- $servicePortValue := toString .Values.service.port -}}
 {{- $healthPortValue := toString .Values.service.healthPort -}}
-{{- $metricsPortValue := toString (default 0 .Values.service.metricsPort) -}}
+{{- $metricsPortValue := "0" -}}
+{{- if hasKey .Values.service "metricsPort" -}}
+{{- $metricsPortValue = toString (get .Values.service "metricsPort") -}}
+{{- end -}}
 {{- if not (regexMatch `^-?[0-9]+$` $servicePortValue) -}}
 {{- fail "service.port must be an integer." -}}
 {{- end -}}

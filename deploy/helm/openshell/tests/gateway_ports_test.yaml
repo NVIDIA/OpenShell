@@ -95,6 +95,14 @@ tests:
       - failedTemplate:
           errorPattern: "service.metricsPort must be an integer"
 
+  - it: rejects false instead of treating it as a disabled metrics port
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: false
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.metricsPort must be an integer"
+
   - it: rejects a fractional metrics port
     template: templates/statefulset.yaml
     set:
