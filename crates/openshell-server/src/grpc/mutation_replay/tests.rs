@@ -6,8 +6,8 @@ use crate::grpc::test_support::{authed_request, test_server_state};
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::open_shell_server::OpenShell;
 use openshell_core::proto::{
-    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, WorkspaceMember,
-    WorkspaceRole,
+    CreateSandboxRequest, SandboxServiceExposure, SandboxSpec, SandboxWorkloadConfig,
+    SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec, WorkspaceMember, WorkspaceRole,
 };
 use openshell_core::rpc_error::StatusExt;
 use std::collections::HashMap;
@@ -89,6 +89,48 @@ fn canonical_payload_ignores_map_order_and_id_but_preserves_presence() {
     let absent = fingerprint(&template).unwrap();
     template.template = Some(SandboxWorkloadTemplate::default());
     assert_ne!(absent, fingerprint(&template).unwrap());
+}
+
+#[tokio::test]
+async fn create_sandbox_replay_preserves_service_urls() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = directory.path().join("private-key");
+    std::fs::write(&key, b"test-only stable private fingerprint material").unwrap();
+    let mut state = test_server_state().await;
+    Arc::get_mut(&mut state).unwrap().config.gateway_jwt =
+        Some(openshell_core::config::GatewayJwtConfig {
+            signing_key_path: key,
+            public_key_path: directory.path().join("public"),
+            kid_path: directory.path().join("kid"),
+            gateway_id: "test".into(),
+            ttl_secs: None,
+        });
+    let service = crate::grpc::OpenShellService::new(state);
+    let request = CreateSandboxRequest {
+        name: "replay-services".into(),
+        spec: Some(SandboxSpec::default()),
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        service_exposures: vec![SandboxServiceExposure {
+            service: "web".into(),
+            target_port: 8080,
+        }],
+        request_id: uuid::Uuid::new_v4().to_string(),
+        ..Default::default()
+    };
+
+    let original = service
+        .create_sandbox(authed_request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let replay = service
+        .create_sandbox(authed_request(request))
+        .await
+        .unwrap();
+
+    assert_eq!(replay.metadata().get("openshell-replayed").unwrap(), "true");
+    assert_eq!(replay.get_ref().service_urls, original.service_urls);
+    assert_eq!(replay.into_inner(), original);
 }
 
 async fn exercise_backend(url: &str) {
