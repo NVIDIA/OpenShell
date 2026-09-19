@@ -59,7 +59,7 @@ use openshell_core::proto::{
 };
 use openshell_core::proto::{
     L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
-    SandboxPolicy as ProtoSandboxPolicy, StaticCredentialEndpointBinding,
+    SandboxPhase, SandboxPolicy as ProtoSandboxPolicy, StaticCredentialEndpointBinding,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, PolicyDecisionOperation, TelemetryOutcome,
@@ -3529,6 +3529,31 @@ pub(super) async fn handle_update_config(
     result
 }
 
+fn reject_live_mxc_policy_update(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    is_policy_update: bool,
+) -> Result<(), Status> {
+    if !is_policy_update || state.compute.configured_driver_name() != "mxc" {
+        return Ok(());
+    }
+
+    let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    if matches!(
+        phase,
+        SandboxPhase::Provisioning
+            | SandboxPhase::Starting
+            | SandboxPhase::Ready
+            | SandboxPhase::Stopping
+    ) {
+        return Err(Status::failed_precondition(
+            "live MXC sandboxes do not support policy updates; delete and recreate the sandbox to apply a different policy",
+        ));
+    }
+
+    Ok(())
+}
+
 async fn handle_update_config_inner(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
@@ -3784,6 +3809,8 @@ async fn handle_update_config_inner(
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
     let mut response_annotations = sandbox_metadata_annotations(&sandbox);
+
+    reject_live_mxc_policy_update(state, &sandbox, has_policy || has_merge_ops)?;
 
     if has_setting {
         let _settings_guard = state.settings_mutex.lock().await;
@@ -7484,7 +7511,9 @@ mod tests {
     use crate::auth::principal::{
         Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
     };
-    use crate::grpc::test_support::{authed_request, test_server_state};
+    use crate::grpc::test_support::{
+        authed_request, test_server_state, test_server_state_with_driver,
+    };
 
     /// An in-memory store with the example profiles imported at platform scope.
     ///
@@ -22716,5 +22745,88 @@ mod tests {
             "GetGatewayConfig must not require Platform Admin; got {:?}",
             response.unwrap_err()
         );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn update_config_rejects_live_mxc_policy_updates_before_persisting() {
+        use openshell_core::proto::FilesystemPolicy;
+
+        let state = test_server_state_with_driver("mxc").await;
+        let sandbox_id = "sb-live-mxc-policy";
+        let sandbox_name = "live-mxc-policy";
+        let baseline = ProtoSandboxPolicy {
+            filesystem: Some(FilesystemPolicy {
+                read_write: vec!["C:/work/nvbug-6782891/a".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                baseline.clone(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "policy-live-mxc-v1",
+                sandbox_id,
+                "default",
+                1,
+                &baseline.encode_to_vec(),
+                &deterministic_policy_hash(&baseline),
+            )
+            .await
+            .unwrap();
+
+        let before = state
+            .store
+            .get_message_by_name::<Sandbox>("default", sandbox_name)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut replacement = baseline.clone();
+        replacement
+            .filesystem
+            .as_mut()
+            .unwrap()
+            .read_only
+            .push("C:/work/nvbug-6782891/a".to_string());
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: sandbox_name.to_string(),
+                policy: Some(replacement),
+                expected_resource_version: before.metadata.as_ref().unwrap().resource_version,
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("a live MXC policy replacement must be rejected");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("live MXC sandboxes"));
+        let after = state
+            .store
+            .get_message_by_name::<Sandbox>("default", sandbox_name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.metadata.as_ref().unwrap().resource_version,
+            before.metadata.as_ref().unwrap().resource_version
+        );
+        assert_eq!(after.spec.as_ref().unwrap().policy, Some(baseline));
+        let revisions = state.store.list_policies(sandbox_id, 10, 0).await.unwrap();
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].version, 1);
     }
 }
