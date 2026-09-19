@@ -1087,6 +1087,7 @@ mod tests {
             )),
             await_main_process_attachment: false,
             workload_template: String::new(),
+            service_exposures: Vec::new(),
         };
 
         let bytes = request.encode_to_vec();

@@ -1618,6 +1618,25 @@ impl ComputeRuntime {
             sandbox_id: candidate.object_id().to_string(),
             sandbox_name: candidate.object_name().to_string(),
         };
+        self.delete_sandbox_target(target).await
+    }
+
+    pub(crate) async fn delete_sandbox_by_id(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+    ) -> Result<DeleteSandboxResult, Status> {
+        self.delete_sandbox_target(SandboxDeleteTarget {
+            sandbox_id: sandbox_id.to_string(),
+            sandbox_name: sandbox_name.to_string(),
+        })
+        .await
+    }
+
+    async fn delete_sandbox_target(
+        &self,
+        target: SandboxDeleteTarget,
+    ) -> Result<DeleteSandboxResult, Status> {
         let delete_guard = self.lifecycle_gates.lock_for(&target.sandbox_id).await;
         let global_guard = self.lock_global_for_lifecycle(&delete_guard).await;
 

@@ -64,6 +64,7 @@ struct SandboxState {
     fail_list_provider_profiles: Arc<AtomicBool>,
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
+    expose_service_requests: Arc<Mutex<Vec<openshell_core::proto::ExposeServiceRequest>>>,
     fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
     vm_error_after_started: Arc<AtomicBool>,
     vm_error_with_observed_exit: Arc<AtomicBool>,
@@ -142,6 +143,16 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<SandboxResponse>, Status> {
         let request = request.into_inner();
         let name = request.name.clone();
+        let service_urls = request
+            .service_exposures
+            .iter()
+            .map(|exposure| {
+                (
+                    exposure.service.clone(),
+                    "https://default--sandbox.openshell.localhost:17670/".to_string(),
+                )
+            })
+            .collect();
         self.state.create_requests.lock().await.push(request);
         let sandbox_name = if name.is_empty() {
             "test-sandbox".to_string()
@@ -165,6 +176,7 @@ impl OpenShell for TestOpenShell {
         sandbox.set_phase(SandboxPhase::Provisioning as i32);
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
+            service_urls,
         }))
     }
 
@@ -204,6 +216,7 @@ impl OpenShell for TestOpenShell {
         sandbox.set_phase(SandboxPhase::Ready as i32);
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
+            service_urls: HashMap::new(),
         }))
     }
 
@@ -429,10 +442,18 @@ impl OpenShell for TestOpenShell {
 
     async fn expose_service(
         &self,
-        _request: tonic::Request<openshell_core::proto::ExposeServiceRequest>,
+        request: tonic::Request<openshell_core::proto::ExposeServiceRequest>,
     ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        self.state
+            .expose_service_requests
+            .lock()
+            .await
+            .push(request.into_inner());
         Ok(Response::new(
-            openshell_core::proto::ServiceEndpointResponse::default(),
+            openshell_core::proto::ServiceEndpointResponse {
+                url: "https://default--sandbox.openshell.localhost:17670/".to_string(),
+                ..Default::default()
+            },
         ))
     }
 
@@ -440,7 +461,12 @@ impl OpenShell for TestOpenShell {
         &self,
         _: tonic::Request<openshell_core::proto::GetServiceRequest>,
     ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
-        Err(Status::unimplemented("unused"))
+        Ok(Response::new(
+            openshell_core::proto::ServiceEndpointResponse {
+                url: "https://default--sandbox.openshell.localhost:17670/".to_string(),
+                ..Default::default()
+            },
+        ))
     }
 
     async fn list_services(
@@ -1435,6 +1461,18 @@ async fn deleted_names(server: &TestServer) -> Vec<Vec<String>> {
 
 async fn create_requests(server: &TestServer) -> Vec<CreateSandboxRequest> {
     server.openshell.state.create_requests.lock().await.clone()
+}
+
+async fn expose_service_requests(
+    server: &TestServer,
+) -> Vec<openshell_core::proto::ExposeServiceRequest> {
+    server
+        .openshell
+        .state
+        .expose_service_requests
+        .lock()
+        .await
+        .clone()
 }
 
 async fn template_create_requests(server: &TestServer) -> Vec<CreateSandboxTemplateRequest> {
@@ -2687,6 +2725,39 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
 }
 
 #[tokio::test]
+async fn sandbox_create_exposes_service_after_ready_and_keeps_sandbox() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("sandbox"),
+            keep: false,
+            expose: Some(4500),
+            detach: true,
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("sandbox create with service exposure should succeed");
+
+    assert!(deleted_names(&server).await.is_empty());
+    let create_requests = create_requests(&server).await;
+    assert_eq!(create_requests.len(), 1);
+    assert_eq!(create_requests[0].service_exposures.len(), 1);
+    assert_eq!(create_requests[0].service_exposures[0].service, "");
+    assert_eq!(create_requests[0].service_exposures[0].target_port, 4500);
+    assert!(expose_service_requests(&server).await.is_empty());
+}
+
+#[tokio::test]
 async fn sandbox_forward_background_tracks_owned_child_when_pid_discovery_fails() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
@@ -3149,15 +3220,30 @@ async fn sandbox_create_continues_with_unexpired_cached_token_when_refresh_fails
 async fn sandbox_create_json_stdout_is_parseable() {
     let server = run_server().await;
 
-    let result = run_cli_sandbox_create(&server, "json-clean", &["--output=json"]).await;
+    let result = run_cli_sandbox_create(
+        &server,
+        "json-clean",
+        &["--output=json", "--expose=4500", "--detach"],
+    )
+    .await;
     assert!(
         result.status.success(),
         "sandbox create failed:\n{}",
         String::from_utf8_lossy(&result.stderr)
     );
     let stdout = String::from_utf8(result.stdout).expect("stdout should be UTF-8");
-    serde_json::from_str::<serde_json::Value>(&stdout)
+    let value = serde_json::from_str::<serde_json::Value>(&stdout)
         .unwrap_or_else(|err| panic!("stdout should contain only JSON: {err}\n{stdout}"));
+    let gateway_port = url::Url::parse(&server.endpoint)
+        .expect("test gateway endpoint should be a URL")
+        .port()
+        .expect("test gateway endpoint should include a port");
+    assert_eq!(
+        value["service_urls"],
+        serde_json::json!({
+            "": format!("https://default--sandbox.openshell.localhost:{gateway_port}/")
+        })
+    );
 }
 
 #[tokio::test]

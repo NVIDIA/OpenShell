@@ -822,6 +822,14 @@ openshell forward start 127.0.0.1:8080 my-app -d
 # gRPC relay to a loopback TCP service, with an optional dynamic local port.
 openshell forward service my-app --target-port 8000 --local 127.0.0.1:0
 
+# Create a sandbox with its unnamed HTTP or WebSocket service exposed.
+openshell sandbox create \
+  --name my-app \
+  --from my-app:latest \
+  --expose 8080 \
+  --detach \
+  -- ./start-server.sh
+
 # Expose and manage an HTTP service through the gateway.
 openshell service expose my-app 8080 web
 openshell service list my-app
@@ -832,6 +840,11 @@ openshell service delete my-app web
 
 Use `openshell service list --all-workspaces` for a Platform Admin view across
 workspaces. A sandbox name and `--all-workspaces` are mutually exclusive.
+
+`sandbox create --expose PORT` registers the unnamed endpoint in the create
+request and keeps the sandbox running. Add `--output json` for automation; the
+result contains a `service_urls` map whose empty key is the unnamed endpoint.
+Use `openshell service expose` after creation to add or update named endpoints.
 
 Prefer loopback binds unless the user explicitly needs LAN-visible local access.
 

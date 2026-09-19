@@ -35,7 +35,9 @@ const client = await OpenShellClient.connect({
 
 const sandbox = await client.sandbox.create({
   image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
+  serviceExposures: [{ targetPort: 8080 }],
 })
+console.log(sandbox.serviceUrls[''])
 await client.sandbox.waitReady(sandbox.name, 120)
 
 const result = await client.sandbox.exec(sandbox.name, ['/bin/sh', '-c', 'echo hello'])

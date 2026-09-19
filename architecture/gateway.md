@@ -403,6 +403,15 @@ Allow and deny append requests carry `L7RuleTarget` to declare the rule, endpoin
 
 `GetSandboxProviderStatus` and `ReportProviderReadiness` are unary public gateway RPCs. The first lets authorized users inspect a provider change; the second accepts installation reports only from the sandbox's current authenticated supervisor session.
 
+`CreateSandboxRequest.service_exposures` is an additive public API field. Its
+`SandboxServiceExposure` entries register service endpoints as part of sandbox
+creation and are represented in the Rust, Python, TypeScript, and Go SDK create
+options. The request-only exposure description is not durable; the gateway
+persists the resulting `ServiceEndpoint` objects through the existing endpoint
+store after it persists the sandbox. `SandboxResponse.service_urls` returns the
+routed URLs keyed by service name for `CreateSandbox`; the empty key represents
+the unnamed endpoint, and other sandbox operations leave the map empty.
+
 The removed `NetworkBinary.harness` field remains reserved by number and name,
 so protobuf implementations cannot reuse its wire slot or source identifier.
 The durable-policy compatibility decoder reads the former boolean before Prost

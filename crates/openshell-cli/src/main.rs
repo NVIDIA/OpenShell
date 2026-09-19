@@ -1316,7 +1316,7 @@ enum SandboxCommands {
         keep: bool,
 
         /// Delete the sandbox after the initial command or shell exits.
-        #[arg(long, conflicts_with_all = ["keep", "editor", "forward"])]
+        #[arg(long, conflicts_with_all = ["keep", "editor", "forward", "expose"])]
         no_keep: bool,
 
         /// Launch a remote editor after the sandbox is ready.
@@ -1362,6 +1362,16 @@ enum SandboxCommands {
         /// Accepts [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
         #[arg(long, conflicts_with = "no_keep")]
         forward: Option<String>,
+
+        /// Expose a loopback HTTP or WebSocket service after the sandbox is ready.
+        /// Keeps the sandbox alive. Use `openshell service expose` to add a named service.
+        #[arg(
+            long,
+            value_name = "PORT",
+            value_parser = clap::value_parser!(u16).range(1..),
+            conflicts_with = "no_keep"
+        )]
+        expose: Option<u16>,
 
         /// Allocate a pseudo-terminal for the remote command.
         /// Defaults to auto-detection (on when stdin and stdout are terminals).
@@ -1416,7 +1426,7 @@ enum SandboxCommands {
         approval_mode: String,
 
         /// Output format.
-        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["editor", "command", "no_keep", "forward"])]
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["editor", "no_keep", "forward"])]
         output: OutputFormat,
 
         /// Command to run after "--" (defaults to an interactive shell).
@@ -3144,6 +3154,7 @@ async fn run_async() -> Result<()> {
                     providers,
                     policy,
                     forward,
+                    expose,
                     tty,
                     no_tty,
                     detach,
@@ -3211,7 +3222,11 @@ async fn run_async() -> Result<()> {
                     let forward = forward
                         .map(|s| openshell_core::forward::ForwardSpec::parse(&s))
                         .transpose()?;
-                    let keep = keep || !no_keep || editor.is_some() || forward.is_some();
+                    let keep = keep
+                        || !no_keep
+                        || editor.is_some()
+                        || forward.is_some()
+                        || expose.is_some();
                     let gpu_requirements: Option<GpuResourceRequirements> = gpu.map(Into::into);
 
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
@@ -3235,6 +3250,7 @@ async fn run_async() -> Result<()> {
                             providers: &providers,
                             policy: policy.as_deref(),
                             forward,
+                            expose,
                             command: &command,
                             tty_override,
                             auto_providers_override,
@@ -5837,7 +5853,6 @@ mod tests {
     fn sandbox_create_output_conflicts_with_side_effect_args() {
         for (label, extra_args) in [
             ("--editor", &["--editor", "code"][..]),
-            ("trailing command", &["--", "claude"][..]),
             ("--no-keep", &["--no-keep"][..]),
             ("--forward", &["--forward", "8080"][..]),
         ] {
@@ -5850,6 +5865,22 @@ mod tests {
                 "structured output should conflict with {label}"
             );
         }
+    }
+
+    #[test]
+    fn sandbox_create_detached_command_accepts_structured_output() {
+        Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--detach",
+            "--output",
+            "json",
+            "--",
+            "codex",
+            "app-server",
+        ])
+        .expect("a detached command should support structured create output");
     }
 
     #[test]
@@ -6237,6 +6268,50 @@ mod tests {
             result.is_err(),
             "sandbox create --gpu many should be rejected"
         );
+    }
+
+    #[test]
+    fn sandbox_create_accepts_service_exposure() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--expose",
+            "4500",
+            "--detach",
+        ])
+        .expect("sandbox create --expose should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { expose, detach, .. }),
+            }) => {
+                assert_eq!(expose, Some(4500));
+                assert!(detach);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_rejects_service_exposure_with_no_keep() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--expose",
+            "4500",
+            "--no-keep",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sandbox_create_rejects_zero_service_port() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--expose", "0"]);
+
+        assert!(result.is_err());
     }
 
     #[test]

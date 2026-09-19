@@ -453,6 +453,69 @@ with SandboxClient.from_active_cluster(client_credentials=auth) as client:
 
 Service forwarding makes a long-running process inside a sandbox reachable through a gateway-managed URL. Use it for development servers, notebooks, dashboards, or other services that keep listening after the sandbox starts. Run the service on loopback inside the sandbox, expose its port, then open the URL printed by OpenShell.
 
+Expose the unnamed service as part of sandbox creation when the sandbox's main
+process starts the server:
+
+```shell
+openshell sandbox create \
+  --name my-sandbox \
+  --expose 8080 \
+  --detach \
+  -- python -m http.server 8080 --bind 127.0.0.1
+```
+
+The CLI includes the unnamed endpoint in the sandbox create request and prints
+its URL after the sandbox reaches `Ready`. `--expose` keeps the sandbox after
+the create command returns and cannot be combined with `--no-keep`. Use
+`openshell service expose` to add or update an endpoint later.
+
+SDK create methods accept named or unnamed service exposures. An empty service
+name selects the unnamed endpoint. The returned sandbox includes a service URL
+map keyed by those names; use the empty key for the unnamed endpoint:
+
+```python
+from openshell import SandboxClient, ServiceExposure
+
+with SandboxClient.from_active_cluster() as client:
+    sandbox = client.create(
+        workspace="default",
+        name="app-server",
+        service_exposures=[ServiceExposure(target_port=4500)],
+    )
+    print(sandbox.service_urls[""])
+```
+
+```ts
+const sandbox = await client.sandbox.create({
+  name: 'app-server',
+  image: 'base',
+  serviceExposures: [{ targetPort: 4500 }],
+})
+console.log(sandbox.serviceUrls[''])
+```
+
+```go
+sandbox, err := client.Sandboxes().Create(
+    ctx, "default", "app-server", spec, nil,
+    v1.CreateOptions{ServiceExposures: []v1.ServiceExposure{
+        {TargetPort: 4500},
+    }},
+)
+fmt.Println(sandbox.ServiceURLs[""])
+```
+
+```rust
+let sandbox = client.create_sandbox(openshell_sdk::SandboxSpec {
+    name: Some("app-server".into()),
+    service_exposures: vec![openshell_sdk::ServiceExposure {
+        service: String::new(),
+        target_port: 4500,
+    }],
+    ..Default::default()
+}).await?;
+println!("{}", sandbox.service_urls[""]);
+```
+
 Expose a service that listens on loopback inside the sandbox:
 
 ```shell

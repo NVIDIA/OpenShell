@@ -274,6 +274,36 @@ describe('exec / execStream', () => {
 });
 
 describe('create', () => {
+  it('sends create-time service exposures', async () => {
+    let created: { serviceExposures?: Array<{ service?: string; targetPort?: number }> } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return {
+          ...readySandbox('sb', 'sb-id'),
+          serviceUrls: {
+            '': 'https://sb.example.test/',
+            metrics: 'https://metrics.sb.example.test/',
+          },
+        };
+      },
+    });
+
+    const result = await sandbox.create({
+      image: 'img',
+      serviceExposures: [{ targetPort: 4500 }, { service: 'metrics', targetPort: 9090 }],
+    });
+
+    expect(created.serviceExposures?.map(({ service, targetPort }) => ({ service, targetPort }))).toEqual([
+      { service: '', targetPort: 4500 },
+      { service: 'metrics', targetPort: 9090 },
+    ]);
+    expect(result.serviceUrls).toEqual({
+      '': 'https://sb.example.test/',
+      metrics: 'https://metrics.sb.example.test/',
+    });
+  });
+
   it('sends the curated policy through spec.policy', async () => {
     let created: { spec?: { policy?: { version?: number } } } = {};
     const sandbox = client({

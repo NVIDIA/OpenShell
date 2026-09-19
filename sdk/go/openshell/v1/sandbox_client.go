@@ -41,12 +41,17 @@ func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec
 	}
 	if len(opts) > 0 {
 		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
+		req.ServiceExposures = serviceExposuresToProto(opts[0].ServiceExposures)
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
-	return converter.SandboxFromProto(resp.GetSandbox()), nil
+	sandbox := converter.SandboxFromProto(resp.GetSandbox())
+	if sandbox != nil {
+		sandbox.ServiceURLs = converter.CopyStringMap(resp.GetServiceUrls())
+	}
+	return sandbox, nil
 }
 
 func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
@@ -69,12 +74,28 @@ func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name,
 	}
 	if len(opts) > 0 {
 		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
+		req.ServiceExposures = serviceExposuresToProto(opts[0].ServiceExposures)
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
-	return converter.SandboxFromProto(resp.GetSandbox()), nil
+	sandbox := converter.SandboxFromProto(resp.GetSandbox())
+	if sandbox != nil {
+		sandbox.ServiceURLs = converter.CopyStringMap(resp.GetServiceUrls())
+	}
+	return sandbox, nil
+}
+
+func serviceExposuresToProto(exposures []types.ServiceExposure) []*pb.SandboxServiceExposure {
+	result := make([]*pb.SandboxServiceExposure, 0, len(exposures))
+	for _, exposure := range exposures {
+		result = append(result, &pb.SandboxServiceExposure{
+			Service:    exposure.Service,
+			TargetPort: exposure.TargetPort,
+		})
+	}
+	return result
 }
 
 func validateTemplateCreateSpec(spec *SandboxSpec) error {

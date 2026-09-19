@@ -13,7 +13,7 @@ use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_sdk::{
     AuthConfig, ClientConfig, ExecOptions, ListOptions, OpenShellClient, Refresh, RefreshError,
     RefreshedToken, SandboxPhase, SandboxSpec, SandboxTemplateCreateSpec,
-    SandboxTemplateListOptions, ServiceStatus as SdkServiceStatus,
+    SandboxTemplateListOptions, ServiceExposure, ServiceStatus as SdkServiceStatus,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -246,9 +246,20 @@ impl OpenShell for TestOpenShell {
         } else {
             req.name.clone()
         };
+        let service_urls = req
+            .service_exposures
+            .iter()
+            .map(|exposure| {
+                (
+                    exposure.service.clone(),
+                    format!("https://{}.example.test/", exposure.service),
+                )
+            })
+            .collect();
         *self.state.last_create.lock().await = Some(req);
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox_with_phase(&name, proto::SandboxPhase::Provisioning)),
+            service_urls,
         }))
     }
 
@@ -318,6 +329,7 @@ impl OpenShell for TestOpenShell {
         *self.state.last_stop.lock().await = Some(request);
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
+            service_urls: HashMap::new(),
         }))
     }
 
@@ -334,6 +346,7 @@ impl OpenShell for TestOpenShell {
         *self.state.last_start.lock().await = Some(request);
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
+            service_urls: HashMap::new(),
         }))
     }
 
@@ -374,6 +387,7 @@ impl OpenShell for TestOpenShell {
         }
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
+            service_urls: HashMap::new(),
         }))
     }
 
@@ -983,17 +997,28 @@ async fn create_sandbox_passes_spec_through() {
         image: Some("ghcr.io/foo:bar".to_string()),
         labels: labels.clone(),
         gpu: true,
+        service_exposures: vec![ServiceExposure {
+            service: "web".to_string(),
+            target_port: 8080,
+        }],
         ..Default::default()
     };
 
     let result = client.create_sandbox(spec).await.unwrap();
     assert_eq!(result.name, "my-box");
     assert_eq!(result.phase, SandboxPhase::Provisioning);
+    assert_eq!(
+        result.service_urls.get("web").map(String::as_str),
+        Some("https://web.example.test/")
+    );
 
     let observed = state.last_create.lock().await.clone().unwrap();
     assert_eq!(observed.name, "my-box");
     assert_eq!(observed.labels, labels);
     assert!(observed.annotations.is_empty());
+    assert_eq!(observed.service_exposures.len(), 1);
+    assert_eq!(observed.service_exposures[0].service, "web");
+    assert_eq!(observed.service_exposures[0].target_port, 8080);
     let observed_spec = observed.spec.unwrap();
     assert!(
         observed_spec

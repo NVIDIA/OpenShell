@@ -55,6 +55,11 @@ integers where practical. Reusable template resources are exposed as
 portable workload shape and driver config. Failures map to a typed `SdkError`
 with a discriminable kind.
 
+Set `SandboxSpec::service_exposures` to register named or unnamed loopback HTTP
+services during creation. Each `ServiceExposure` contains a service name and a
+target port; an empty name selects the unnamed endpoint. The returned
+`SandboxRef::service_urls` map contains each routed URL under the same name.
+
 Curated calls without a workspace argument explicitly select the `default`
 workspace. Cross-workspace listing uses the separate `*_all_workspaces`
 methods and requires Platform Admin access.

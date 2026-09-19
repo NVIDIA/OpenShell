@@ -55,8 +55,8 @@ use openshell_core::proto::{
     ListSandboxPoliciesRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
     RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
-    SandboxResources, SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate,
-    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
+    SandboxResources, SandboxServiceExposure, SandboxServiceLevel, SandboxSpec, SandboxStartup,
+    SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
     ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, WatchSandboxRequest,
     exec_sandbox_event, tcp_forward_init,
@@ -249,8 +249,8 @@ pub fn doctor_check() -> Result<()> {
     Err(miette::miette!("docker info failed: {}", stderr.trim()))
 }
 
-fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>) -> bool {
-    keep || forward.is_some()
+fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>, expose: Option<u16>) -> bool {
+    keep || forward.is_some() || expose.is_some()
 }
 
 fn has_main_process_result(sandbox: &Sandbox) -> bool {
@@ -440,6 +440,7 @@ pub struct SandboxCreateConfig<'a> {
     pub providers: &'a [String],
     pub policy: Option<&'a str>,
     pub forward: Option<ForwardSpec>,
+    pub expose: Option<u16>,
     pub command: &'a [String],
     pub tty_override: Option<bool>,
     pub auto_providers_override: Option<bool>,
@@ -467,6 +468,7 @@ impl Default for SandboxCreateConfig<'_> {
             providers: &[],
             policy: None,
             forward: None,
+            expose: None,
             command: &[],
             tty_override: None,
             auto_providers_override: None,
@@ -502,6 +504,7 @@ pub async fn sandbox_create(
         providers,
         policy,
         forward,
+        expose,
         command,
         tty_override,
         auto_providers_override,
@@ -527,6 +530,9 @@ pub async fn sandbox_create(
         return Err(miette::miette!(
             "structured output cannot be combined with an attached trailing command; use table output to stream the command or add --detach"
         ));
+    }
+    if expose == Some(0) {
+        return Err(miette::miette!("--expose port must be in 1..=65535"));
     }
 
     // Check port availability *before* creating the sandbox so we don't
@@ -634,7 +640,7 @@ pub async fn sandbox_create(
     // (bash when present, otherwise /bin/sh on minimal images like Alpine).
     // Baking a shell here would force a shell the image may not ship.
     let main_command = command.to_vec();
-    let persist = sandbox_should_persist(keep, forward.as_ref());
+    let persist = sandbox_should_persist(keep, forward.as_ref(), expose);
     let create_detaches = detach
         || (persist
             && command.is_empty()
@@ -672,6 +678,13 @@ pub async fn sandbox_create(
         )),
         await_main_process_attachment,
         workload_template: template.unwrap_or_default().to_string(),
+        service_exposures: expose
+            .map(|target_port| SandboxServiceExposure {
+                service: String::new(),
+                target_port: u32::from(target_port),
+            })
+            .into_iter()
+            .collect(),
     };
 
     let response = match client.create_sandbox(request).await {
@@ -684,8 +697,13 @@ pub async fn sandbox_create(
         }
         Err(status) => return Err(miette::miette!(status.to_string())),
     };
+    let response = response.into_inner();
+    let service_urls = response
+        .service_urls
+        .into_iter()
+        .map(|(service, url)| (service, service_url_for_gateway(&url, &effective_server)))
+        .collect::<HashMap<_, _>>();
     let sandbox = response
-        .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
@@ -1095,8 +1113,27 @@ pub async fn sandbox_create(
                 );
             }
 
+            if let Some(target_port) = expose
+                && !structured_output
+            {
+                eprintln!(
+                    "  {} Exposed sandbox {sandbox_name} service on 127.0.0.1:{target_port}",
+                    "\u{2713}".green().bold(),
+                );
+                if let Some(url) = service_urls.get("").filter(|url| !url.is_empty()) {
+                    eprintln!(
+                        "  Access at: {}",
+                        service_url_for_gateway(url, &effective_server)
+                    );
+                }
+            }
+
             if structured_output {
-                crate::output::print_output_single(output, &last_sandbox, sandbox_to_json)?;
+                let mut value = sandbox_to_json(&last_sandbox);
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("service_urls".to_string(), serde_json::json!(service_urls));
+                }
+                crate::output::print_output_single(output, &value, Clone::clone)?;
                 return Ok(0);
             }
 
@@ -3627,21 +3664,8 @@ pub async fn service_expose(
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .expose_service(ExposeServiceRequest {
-            request_id: String::new(),
-            sandbox: (sandbox).to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                workspace.to_string(),
-            )),
-            name: service.to_string(),
-            target_port: u32::from(target_port),
-            domain: true,
-        })
-        .await
-        .map_err(service_expose_status_error)?
-        .into_inner();
+    let response =
+        expose_service_endpoint(server, sandbox, service, target_port, workspace, tls).await?;
 
     if service.is_empty() {
         println!(
@@ -3664,6 +3688,31 @@ pub async fn service_expose(
         println!("  URL: {}", url.cyan());
     }
     Ok(())
+}
+
+async fn expose_service_endpoint(
+    server: &str,
+    sandbox: &str,
+    service: &str,
+    target_port: u16,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<ServiceEndpointResponse> {
+    let mut client = grpc_client(server, tls).await?;
+    client
+        .expose_service(ExposeServiceRequest {
+            request_id: String::new(),
+            sandbox: sandbox.to_string(),
+            name: service.to_string(),
+            target_port: u32::from(target_port),
+            domain: true,
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
+        .await
+        .map_err(service_expose_status_error)
+        .map(tonic::Response::into_inner)
 }
 
 fn service_expose_status_error(status: Status) -> miette::Report {
@@ -6745,18 +6794,23 @@ mod tests {
 
     #[test]
     fn sandbox_should_persist_defaults_to_persistent() {
-        assert!(sandbox_should_persist(true, None));
+        assert!(sandbox_should_persist(true, None, None));
     }
 
     #[test]
     fn sandbox_should_not_persist_when_no_keep_is_set() {
-        assert!(!sandbox_should_persist(false, None));
+        assert!(!sandbox_should_persist(false, None, None));
     }
 
     #[test]
     fn sandbox_should_persist_when_forward_is_requested() {
         let spec = openshell_core::forward::ForwardSpec::new(8080);
-        assert!(sandbox_should_persist(false, Some(&spec)));
+        assert!(sandbox_should_persist(false, Some(&spec), None));
+    }
+
+    #[test]
+    fn sandbox_should_persist_when_service_exposure_is_requested() {
+        assert!(sandbox_should_persist(false, None, Some(8080)));
     }
 
     #[test]
