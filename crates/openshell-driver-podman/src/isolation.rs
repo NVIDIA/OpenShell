@@ -197,6 +197,7 @@ pub fn bootstrap_archives(
         },
         resource_claims: resource_claims.clone(),
         resource_claim_files: BTreeMap::new(),
+        cdi_context: None,
         workload_identity: identity.clone(),
         driver_fence: driver_fence.clone(),
         child_env: child_env.clone(),

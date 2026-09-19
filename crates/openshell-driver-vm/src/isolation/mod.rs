@@ -76,6 +76,7 @@ impl VmBoundarySpec {
                 },
                 resource_claims: resource_claims.clone(),
                 resource_claim_files: BTreeMap::new(),
+                cdi_context: None,
                 workload_identity: workload_identity.clone(),
                 driver_fence: driver_fence.clone(),
                 child_env: self.child_env,

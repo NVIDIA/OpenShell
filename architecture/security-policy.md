@@ -41,12 +41,30 @@ before any consumer-specific projection runs. There is no permissive parsing
 profile: unsupported policy fields always invalidate the document. Middleware `config`, query and persisted-query names, and recursive MCP
 parameter names are open user-data maps rather than schema extensions.
 
-Before applying Landlock, the supervisor enriches baseline filesystem paths that
-the runtime needs. Missing baseline paths are skipped so one absent runtime path
-does not weaken the whole ruleset. When GPU devices are present, GPU baseline
-enrichment adds existing GPU device nodes as read-write paths and promotes
-`/proc` to read-write because CUDA workloads write thread metadata under
-`/proc/<pid>/task/<tid>/comm`.
+Before applying Landlock, trusted runtime components enrich baseline filesystem
+paths that the workload needs. Missing optional baseline paths are skipped so
+one absent runtime path does not weaken the whole ruleset. The workload-side
+sandbox runtime performs GPU enrichment in the workload mount namespace. GPU
+sandboxes without CDI context use the legacy device baseline; CDI sandboxes use
+requirements derived from the selected CDI specs. Both paths grant read-only
+access to the existing container sysfs view and promote `/proc` to read-write.
+
+A compute driver can place a protected CDI context and read-only CDI spec
+projection in the workload boundary. Before agent exec, `openshell-sandbox`
+resolves the selected CDI IDs and validates all derived entities against the
+workload namespace. It adds device nodes, exact destinations of non-library
+read-only mounts, parent directories of shared-library mounts, and supplemental
+GIDs. CDI host paths are ignored for policy. Library filenames must end in
+`.so` or a numeric SONAME suffix with any number of dot-separated components,
+such as `.so.1`, `.so.1.2`, or `.so.1.2.3`. A derived library directory or
+non-library mount is omitted when an existing read-only or read-write ancestor
+already covers it. Writable CDI single-file mounts require an exact
+`filesystem_policy.read_write` opt-in, and writable CDI directory mounts fail
+closed. CDI resolution errors fail agent startup.
+
+The `/sys` grant is a runtime-owned GPU compatibility baseline, not a
+CDI-derived permission. CDI specs remain unable to request broad `/sys` access,
+and non-GPU sandboxes do not receive the grant.
 
 Landlock rules are tailored to the inode type reported by the already-opened
 path descriptor. Directories retain the requested directory and file rights;

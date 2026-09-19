@@ -105,6 +105,8 @@ pub enum CdiError {
     WritableMountNotFile { path: String, kind: String },
     #[error("CDI device node '{path}' must target a character or block device, found {kind}")]
     DeviceNodeNotDevice { path: String, kind: String },
+    #[error("CDI read-only path '{path}' does not exist in the workload namespace")]
+    ReadOnlyPathMissing { path: String },
     #[error("CDI additionalGids must not contain root GID 0")]
     RootAdditionalGid,
     #[error("CDI mount '{path}' has conflicting ro/rw options")]
