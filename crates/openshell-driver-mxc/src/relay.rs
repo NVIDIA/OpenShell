@@ -3,16 +3,17 @@
 
 //! WebSocket relay embedded in the gateway for MXC `ProcessContainer` sandboxes.
 //!
-//! When `egress_proxy = true` the `AppContainer` has outbound TCP via the
-//! `OpenShell` host CONNECT proxy. The driver binds a relay listener on demand
-//! (`start_relay`, e.g. from `ForwardSink::open_dynamic_forward`) and tells
-//! the in-sandbox spawner its address over the stdin/stdout control channel;
-//! the spawner connects outward to it as a WebSocket CLIENT (Phase A). Host
-//! clients connect as raw TCP (Phase B); the relay tunnels their bytes
-//! through Phase A so the in-sandbox agent can pipe them directly to the
-//! target service. Each relay is per-request and short-lived — bound fresh
-//! for each `openshell forward service` call, torn down when that forward
-//! ends.
+//! The `AppContainer` needs private-network client access (for example, the
+//! `privateNetworkClientServer` capability used by the qualification profile).
+//! The driver binds a relay listener on demand (`start_relay`, e.g. from
+//! `ForwardSink::open_dynamic_forward`) and tells the in-sandbox spawner its
+//! address over the stdin/stdout control channel; the spawner connects directly
+//! to it as a WebSocket CLIENT (Phase A). Governed egress and its host CONNECT
+//! proxy are not part of this relay path. Host clients connect as raw TCP
+//! (Phase B); the relay tunnels their bytes through Phase A so the in-sandbox
+//! agent can pipe them directly to the target service. Each relay is
+//! per-request and short-lived — bound fresh for each `openshell forward
+//! service` call, torn down when that forward ends.
 //!
 //! ```text
 //! host TCP client  ->  relay (gateway, raw TCP accept)

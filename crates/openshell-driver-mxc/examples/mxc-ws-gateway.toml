@@ -48,11 +48,10 @@ pc_capabilities = ["privateNetworkClientServer"]
 # process_container only: keep standard privilege level (not LPA).
 pc_least_privilege = false
 
-# Egress proxy for outbound TCP connectivity -- required for
-# openshell-supervisor-relay to dial out to the driver's on-demand relay
-# (see mxc-openclaw-gateway.toml, which uses the same pattern).
-egress_proxy      = true
-egress_proxy_addr = "127.0.0.1:18080"
+# No governed Internet egress is needed. The relay reaches the driver's
+# on-demand private-interface listener through privateNetworkClientServer above.
+egress_proxy      = false
+egress_proxy_addr = ""
 
 # The workload command and cwd are supplied per sandbox by
 # run-ws-agent-test.ps1 through `sandbox create --driver-config-json`.
