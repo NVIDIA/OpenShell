@@ -49,7 +49,7 @@ pc_capabilities = ["privateNetworkClientServer"]
 pc_least_privilege = false
 
 # No governed Internet egress is needed. The relay reaches the driver's
-# on-demand loopback listener through privateNetworkClientServer above.
+# on-demand private-interface listener through privateNetworkClientServer above.
 egress_proxy      = false
 egress_proxy_addr = ""
 

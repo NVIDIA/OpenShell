@@ -82,7 +82,10 @@ pub struct MxcComputeConfig {
     /// `processContainer` only: inject a network section with
     /// `defaultPolicy: "allow"` so the `AppContainer` has unrestricted outbound
     /// TCP access.  Required when `pc_capabilities` alone is insufficient to
-    /// enable network access in the target wxc-exec build.
+    /// enable network access in the target wxc-exec build. When `egress_proxy`
+    /// is also enabled, sandbox policies without explicit network rules are
+    /// rejected instead of falling back from governed egress to unrestricted
+    /// access.
     pub pc_network_allow: bool,
     /// `processContainer` only: include `"allowLocalNetwork": true` in the
     /// MXC network section.  Required for node.js (and other runtimes that
@@ -475,7 +478,13 @@ fn governed_egress_addr(
     policy: Option<&SandboxPolicy>,
 ) -> Result<Option<SocketAddr>, tonic::Status> {
     let configured = configured_egress_addr(config)?;
-    Ok(configured.filter(|_| policy_activates_governed_egress(policy)))
+    let policy_activates_egress = policy_activates_governed_egress(policy);
+    if configured.is_some() && !policy_activates_egress && config.pc_network_allow {
+        return Err(tonic::Status::invalid_argument(
+            "mxc egress_proxy cannot be combined with pc_network_allow for a sandbox policy without explicit network rules; refusing unrestricted egress fallback",
+        ));
+    }
+    Ok(configured.filter(|_| policy_activates_egress))
 }
 
 fn allocate_sandbox_proxy_addr(
@@ -3111,15 +3120,16 @@ mod lifecycle_tests {
 
     #[tokio::test]
     async fn explicit_network_policies_start_and_cleanup_host_proxy() {
-        for (sandbox_id, host) in [
-            ("sb-egress-allow", "example.com"),
-            ("sb-egress-no-match", "allowed.invalid"),
+        for (sandbox_id, host, pc_network_allow) in [
+            ("sb-egress-allow", "example.com", false),
+            ("sb-egress-no-match", "allowed.invalid", true),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let share = tmp.path().to_string_lossy().replace('\\', "/");
             let (shell, command) = long_running_command(&share);
             let config = MxcComputeConfig {
                 backend: MxcBackend::ProcessContainer,
+                pc_network_allow,
                 egress_proxy: true,
                 egress_proxy_addr: "127.0.0.1:18080".into(),
                 ..Default::default()
@@ -3275,6 +3285,29 @@ mod lifecycle_tests {
                 .await
                 .expect("delete after stop")
         );
+    }
+
+    #[test]
+    fn empty_network_policy_rejects_unrestricted_fallback() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig {
+            backend: MxcBackend::ProcessContainer,
+            pc_network_allow: true,
+            egress_proxy: true,
+            egress_proxy_addr: "127.0.0.1:18080".into(),
+            ..Default::default()
+        });
+        let sandbox = with_policy(
+            driver_sandbox("sb-egress-unrestricted-fallback"),
+            fs_policy(&[]),
+        );
+
+        let error = backend
+            .validate_sandbox_create(&sandbox)
+            .expect_err("mixed egress configuration must fail closed without network rules");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("egress_proxy"));
+        assert!(error.message().contains("pc_network_allow"));
+        assert!(error.message().contains("unrestricted egress fallback"));
     }
 
     #[tokio::test]

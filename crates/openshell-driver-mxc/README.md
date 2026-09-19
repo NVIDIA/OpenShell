@@ -60,6 +60,10 @@ pc_relay_target_port  = 0
 # (SYSTEMROOT/WINDIR/PATH/COMSPEC/LOCALAPPDATA); pc_minimal_env starts from an
 # EMPTY env for runtimes that need a fully curated per-sandbox environment.
 pc_minimal_env = false
+# processContainer only: compatibility fallback for unrestricted outbound TCP.
+# A sandbox with egress_proxy enabled but no explicit network rules rejects
+# this fallback instead of silently changing governed egress to allow-all.
+pc_network_allow = false
 # processContainer only: include "allowLocalNetwork": true in the MXC
 # network section. This compatibility setting broadens network access and is
 # not required by the BaseContainer qualification profile.
@@ -75,6 +79,11 @@ When `egress_proxy` is enabled, `egress_proxy_addr` must be a loopback
 `IP:PORT` seed. For policies with explicit network rules, the driver preserves
 the configured IP and allocates a unique ephemeral port for that sandbox's
 authenticated host CONNECT proxy.
+
+`pc_network_allow = true` is an explicit unrestricted-egress compatibility
+fallback. If it is combined with `egress_proxy = true`, a sandbox policy
+without explicit network rules is rejected synchronously rather than falling
+through from governed egress to `defaultPolicy = "allow"`.
 
 Supply workload settings for each sandbox. The public config is keyed by driver name; the gateway forwards only the inner `mxc` object to the driver:
 
