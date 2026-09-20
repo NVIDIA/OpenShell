@@ -60,9 +60,10 @@ FILE_COMMENT_STYLES: dict[str, str] = {
     "scripts/bin/openshell": "#",
 }
 
-# Strict JSON does not support comments. Keep SPDX data in REUSE-compatible
-# sidecars so these files remain valid inputs to their consumers.
+# Some consumer formats do not support comments. Keep SPDX data in
+# REUSE-compatible sidecars so these files remain valid inputs.
 SIDECAR_LICENSE_FILES: set[str] = {
+    "deploy/deb/control.in",
     "scripts/keycloak-realm.json",
     "sdk/conformance/oauth-client-credentials.json",
     "sdk/typescript/biome.json",

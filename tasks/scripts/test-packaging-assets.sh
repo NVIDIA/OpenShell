@@ -38,10 +38,24 @@ assert_file_exists() {
 }
 
 service="${ROOT}/deploy/deb/openshell-gateway.service"
+control="${ROOT}/deploy/deb/control.in"
 spec="${ROOT}/openshell.spec"
 
 assert_file_exists "$service"
+assert_file_exists "$control"
 assert_file_exists "$spec"
+
+# Debian control files are RFC822-style metadata. Older dpkg-deb releases
+# reject comment lines as malformed fields, so keep SPDX metadata in the
+# adjacent .license sidecar instead of emitting it into DEBIAN/control.
+if grep -Eq '^[[:space:]]*#' "$control"; then
+  echo "FAIL: Debian control template contains a comment field" >&2
+  exit 1
+fi
+if [[ $(sed -n '/[^[:space:]]/ { p; q; }' "$control") != "Package: openshell" ]]; then
+  echo "FAIL: Debian control template must begin with the Package field" >&2
+  exit 1
+fi
 
 assert_contains \
   "$service" \
