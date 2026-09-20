@@ -62,4 +62,8 @@ endpoints:
     protocol: rest
     access: read-write
     enforcement: enforce
-binaries: [/usr/bin/codex, /usr/local/bin/codex, /usr/lib/node_modules/@openai/**]
+binaries:
+  - /usr/bin/codex
+  - /usr/local/bin/codex
+  - /usr/lib/node_modules/@openai/**
+  - /usr/local/lib/node_modules/@openai/**
