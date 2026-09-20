@@ -171,6 +171,7 @@ mod traced_driver {
 }
 
 const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
+const START_PHASE_CAS_RETRY_LIMIT: usize = 3;
 const SUPERVISOR_SESSION_CAS_RETRY_LIMIT: usize = 3;
 
 /// Serializes request-side lifecycle mutations for the same stable sandbox ID.
@@ -1161,7 +1162,7 @@ impl ComputeRuntime {
         workspace: &str,
         name: &str,
     ) -> Result<Sandbox, Status> {
-        self.start_sandbox_authenticated(workspace, name, Vec::new())
+        self.start_sandbox_authenticated(workspace, name, None)
             .await
     }
 
@@ -1169,7 +1170,7 @@ impl ComputeRuntime {
         &self,
         workspace: &str,
         name: &str,
-        launch_authentication: Vec<u8>,
+        authority: Option<&crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>,
     ) -> Result<Sandbox, Status> {
         let candidate = self
             .store
@@ -1192,7 +1193,7 @@ impl ComputeRuntime {
         let sandbox_name = candidate.object_name().to_string();
         let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
         let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
-        let current = self
+        let mut current = self
             .store
             .get_message::<Sandbox>(&sandbox_id)
             .await
@@ -1204,57 +1205,120 @@ impl ComputeRuntime {
             ));
         }
 
-        let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
-        if phase == SandboxPhase::Ready {
-            return Ok(current);
-        }
-        let provisioning_timeout =
-            phase == SandboxPhase::Error && provisioning_deadline::timed_out(&current);
-        if provisioning_timeout
-            && current
-                .status
-                .as_ref()
-                .and_then(|status| status.provisioning.as_ref())
-                .is_some_and(|record| record.cleanup_completed_time.is_none())
-        {
-            return Err(Status::failed_precondition(
-                "provisioning timeout cleanup is still pending; retry start after compute is reclaimed",
-            ));
-        }
-        if !matches!(
-            phase,
-            SandboxPhase::Stopped | SandboxPhase::Completed | SandboxPhase::Starting
-        ) && !is_failed_main_process_result(&current)
-            && !provisioning_timeout
-        {
-            return Err(Status::failed_precondition(format!(
-                "sandbox must be Stopped, Completed, or a failed main-process Error to start (current phase: {phase:?})"
-            )));
-        }
+        let mut attempts = 0;
+        let (previous, starting, launch_authentication) = loop {
+            let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
+            if phase == SandboxPhase::Ready {
+                return Ok(current);
+            }
+            let provisioning_timeout =
+                phase == SandboxPhase::Error && provisioning_deadline::timed_out(&current);
+            if provisioning_timeout
+                && current
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.provisioning.as_ref())
+                    .is_some_and(|record| record.cleanup_completed_time.is_none())
+            {
+                return Err(Status::failed_precondition(
+                    "provisioning timeout cleanup is still pending; retry start after compute is reclaimed",
+                ));
+            }
+            if !matches!(
+                phase,
+                SandboxPhase::Stopped | SandboxPhase::Completed | SandboxPhase::Starting
+            ) && !is_failed_main_process_result(&current)
+                && !provisioning_timeout
+            {
+                return Err(Status::failed_precondition(format!(
+                    "sandbox must be Stopped, Completed, or a failed main-process Error to start (current phase: {phase:?})"
+                )));
+            }
 
-        if phase == SandboxPhase::Completed || is_failed_main_process_result(&current) {
-            self.cleanup_stopped_sandbox_sessions(&current)
-                .await
-                .map_err(Status::internal)?;
-        }
+            if phase == SandboxPhase::Completed || is_failed_main_process_result(&current) {
+                self.cleanup_stopped_sandbox_sessions(&current)
+                    .await
+                    .map_err(Status::internal)?;
+            }
 
-        let (previous, starting) = if phase == SandboxPhase::Starting {
-            // Acquiring the lifecycle gate proves that no local worker still
-            // owns this transition. Retry the idempotent driver operation.
-            (current.clone(), current)
-        } else {
+            if phase == SandboxPhase::Starting {
+                // Acquiring the lifecycle gate proves that no local worker still
+                // owns this transition. Retry the idempotent driver operation
+                // with the identity committed by the original transition.
+                let authentication =
+                    serialize_persisted_launch_authentication(authority, &current)?;
+                break (current.clone(), current, authentication);
+            }
+
             let previous = current.clone();
-            let starting = self
-                .write_lifecycle_phase(
-                    &current,
-                    SandboxPhase::Starting,
-                    "Starting",
-                    "Sandbox start requested",
+            let next_identity = if authority.is_some()
+                && matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
+            {
+                Some(next_runtime_identity(&current)?)
+            } else {
+                None
+            };
+            let launch_authentication =
+                if let (Some(authority), Some(identity)) = (authority, next_identity.as_ref()) {
+                    serialize_launch_authentication(
+                        authority.mint_persisted_launch(current.object_id(), identity)?,
+                    )?
+                } else {
+                    serialize_persisted_launch_authentication(authority, &current)?
+                };
+            let expected_resource_version = sandbox_resource_version(&current);
+            let next_identity_for_update = next_identity.clone();
+            match self
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    &sandbox_id,
+                    expected_resource_version,
+                    move |sandbox| {
+                        if let Some(identity) = &next_identity_for_update
+                            && let Some(metadata) = sandbox.metadata.as_mut()
+                        {
+                            identity.write(&mut metadata.annotations);
+                        }
+                        apply_lifecycle_phase(
+                            sandbox,
+                            SandboxPhase::Starting,
+                            "Starting",
+                            "Sandbox start requested",
+                        );
+                    },
                 )
-                .await?;
-            self.sandbox_index.update_from_sandbox(&starting);
-            self.sandbox_watch_bus.notify(&sandbox_id);
-            (previous, starting)
+                .await
+            {
+                Ok(starting) => {
+                    self.sandbox_index.update_from_sandbox(&starting);
+                    self.sandbox_watch_bus.notify(&sandbox_id);
+                    break (previous, starting, launch_authentication);
+                }
+                Err(crate::persistence::PersistenceError::Conflict { .. })
+                    if attempts < START_PHASE_CAS_RETRY_LIMIT =>
+                {
+                    attempts += 1;
+                    current = self
+                        .store
+                        .get_message::<Sandbox>(&sandbox_id)
+                        .await
+                        .map_err(|error| {
+                            Status::internal(format!("fetch sandbox after start conflict: {error}"))
+                        })?
+                        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+                    if current.object_name() != sandbox_name {
+                        return Err(Status::aborted(
+                            "sandbox name changed during start; retry explicitly",
+                        ));
+                    }
+                }
+                Err(error) => {
+                    return Err(crate::grpc::persistence_error_to_status(
+                        error,
+                        "update sandbox lifecycle",
+                    ));
+                }
+            }
         };
         drop(global_guard);
 
@@ -1523,37 +1587,7 @@ impl ComputeRuntime {
                 &sandbox_id,
                 expected_resource_version,
                 move |sandbox| {
-                    sandbox.set_phase(phase as i32);
-                    if matches!(phase, SandboxPhase::Stopping | SandboxPhase::Starting) {
-                        let status = sandbox.status.get_or_insert_with(Default::default);
-                        // Retain the previous instance id as a tombstone until
-                        // the restarted supervisor registers its new id.
-                        status.exit_code = None;
-                        if phase == SandboxPhase::Starting {
-                            status.provisioning = Some(provisioning_deadline::new_record(
-                                openshell_core::time::now_ms(),
-                            ));
-                            status.configuration_admission =
-                                Some(openshell_core::proto::SandboxConfigurationAdmission {
-                                    // Fence delayed registrations from the previous runtime.
-                                    instance_id: uuid::Uuid::new_v4().to_string(),
-                                    state:
-                                        openshell_core::proto::ConfigurationAdmissionState::Pending
-                                            .into(),
-                                    ..Default::default()
-                                });
-                        }
-                    }
-                    upsert_ready_condition(
-                        &mut sandbox.status,
-                        SandboxCondition {
-                            r#type: "Ready".to_string(),
-                            status: "False".to_string(),
-                            reason: reason.clone(),
-                            message: message.clone(),
-                            transition_time: None,
-                        },
-                    );
+                    apply_lifecycle_phase(sandbox, phase, &reason, &message);
                 },
             )
             .await
@@ -5089,6 +5123,88 @@ fn is_recoverable_error_reason(sandbox: &Sandbox) -> bool {
         .is_some_and(|c| c.reason == CONDITION_RUNTIME_RESTART || c.reason == CONDITION_STOPPED)
 }
 
+fn apply_lifecycle_phase(sandbox: &mut Sandbox, phase: SandboxPhase, reason: &str, message: &str) {
+    sandbox.set_phase(phase as i32);
+    if matches!(phase, SandboxPhase::Stopping | SandboxPhase::Starting) {
+        let status = sandbox.status.get_or_insert_with(Default::default);
+        // Retain the previous instance id as a tombstone until the restarted
+        // supervisor registers its new id.
+        status.exit_code = None;
+        if phase == SandboxPhase::Starting {
+            status.provisioning = Some(provisioning_deadline::new_record(
+                openshell_core::time::now_ms(),
+            ));
+            status.configuration_admission =
+                Some(openshell_core::proto::SandboxConfigurationAdmission {
+                    // Fence delayed registrations from the previous runtime.
+                    instance_id: uuid::Uuid::new_v4().to_string(),
+                    state: openshell_core::proto::ConfigurationAdmissionState::Pending.into(),
+                    ..Default::default()
+                });
+        }
+    }
+    upsert_ready_condition(
+        &mut sandbox.status,
+        SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: reason.to_string(),
+            message: message.to_string(),
+            transition_time: None,
+        },
+    );
+}
+
+fn next_runtime_identity(
+    sandbox: &Sandbox,
+) -> Result<crate::auth::sandbox_session::PersistedSandboxIdentity, Status> {
+    let metadata = sandbox
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition("sandbox metadata is missing"))?;
+    let current =
+        crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    let next_epoch = current
+        .auth_epoch
+        .get()
+        .checked_add(1)
+        .and_then(|epoch| openshell_core::jwt::CredentialEpoch::new(epoch).ok())
+        .ok_or_else(|| Status::internal("sandbox authorization epoch overflow"))?;
+    Ok(crate::auth::sandbox_session::PersistedSandboxIdentity {
+        runtime_generation: current.runtime_generation,
+        auth_epoch: next_epoch,
+        gateway_token_id: uuid::Uuid::new_v4(),
+        refresh_replay: None,
+    })
+}
+
+fn serialize_persisted_launch_authentication(
+    authority: Option<&crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>,
+    sandbox: &Sandbox,
+) -> Result<Vec<u8>, Status> {
+    let Some(authority) = authority else {
+        return Ok(Vec::new());
+    };
+    let metadata = sandbox
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition("sandbox metadata is missing"))?;
+    let identity =
+        crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    serialize_launch_authentication(
+        authority.mint_persisted_launch(sandbox.object_id(), &identity)?,
+    )
+}
+
+fn serialize_launch_authentication(
+    authentication: openshell_core::jwt::SandboxLaunchAuthentication,
+) -> Result<Vec<u8>, Status> {
+    serde_json::to_vec(&authentication)
+        .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))
+}
+
 fn is_terminal_failure_reason(reason: &str) -> bool {
     let reason = reason.to_ascii_lowercase();
     let transient_reasons = [
@@ -6354,6 +6470,18 @@ mod tests {
         };
         sandbox.set_phase(phase as i32);
         sandbox
+    }
+
+    fn test_session_authority() -> crate::auth::sandbox_jwt::SandboxSessionJwtAuthority {
+        let material = openshell_bootstrap::jwt::generate_jwt_key().expect("test jwt key");
+        crate::auth::sandbox_jwt::SandboxSessionJwtAuthority::from_pem(
+            material.signing_key_pem.as_bytes(),
+            material.public_key_pem.as_bytes(),
+            material.kid,
+            "test-gateway",
+            Duration::from_mins(15),
+        )
+        .expect("test session authority")
     }
 
     #[test]
@@ -8046,6 +8174,83 @@ mod tests {
         assert_eq!(
             stored.status.unwrap().conditions[0].reason,
             "ContainerRuntimeRestart"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_start_commits_identity_with_starting_phase() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-auth-start", "sandbox-auth-start", SandboxPhase::Stopped);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let before = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let authority = test_session_authority();
+
+        runtime
+            .start_sandbox_authenticated(
+                sandbox.object_workspace(),
+                sandbox.object_name(),
+                Some(&authority),
+            )
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &stored.metadata.as_ref().unwrap().annotations,
+        )
+        .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
+        assert_eq!(stored_identity.auth_epoch.get(), 2);
+        assert_eq!(
+            sandbox_resource_version(&stored),
+            sandbox_resource_version(&before) + 1,
+            "identity rotation and Starting must be one CAS write"
+        );
+
+        runtime
+            .start_sandbox_authenticated(
+                sandbox.object_workspace(),
+                sandbox.object_name(),
+                Some(&authority),
+            )
+            .await
+            .unwrap();
+
+        let authentications = driver.start_authentications();
+        assert_eq!(authentications.len(), 2);
+        for encoded in authentications {
+            let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
+                serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(
+                authentication.supervisor.auth_epoch,
+                stored_identity.auth_epoch
+            );
+            assert_eq!(
+                authentication.supervisor.runtime_generation,
+                stored_identity.runtime_generation
+            );
+        }
+        let after_retry = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sandbox_resource_version(&after_retry),
+            sandbox_resource_version(&stored),
+            "idempotent Starting retry must reuse the persisted identity"
         );
     }
 

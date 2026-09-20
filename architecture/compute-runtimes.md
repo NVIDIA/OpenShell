@@ -182,6 +182,10 @@ supervisor or Sandbox Runtime process replacement does not resume a running
 generation. Planned upgrades stop the sandbox first; the following start mints
 a fresh session, TLS identity, and credential pair. An unexpected replacement
 leaves the old workload on the normal fail-closed disconnect path.
+The gateway commits the new authorization identity and the durable `Starting`
+phase in one resource-version update. A concurrent start that loses that update
+reuses the winning identity, so every idempotent driver retry receives credentials
+that match the persisted sandbox.
 
 A driver stop operation does not complete while its backend still reports an
 in-progress stop. This prevents an immediate start from racing the previous
