@@ -282,7 +282,8 @@ async fn run_relay_proxy(relay_url: String, local_url: String, mut stop_rx: ones
     const LOCAL_CONNECT_ATTEMPTS: u32 = 15;
     const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
     const LOCAL_CONNECT_BACKOFF: Duration = Duration::from_millis(300);
-    // Connect to the gateway relay (outbound via egress_proxy).
+    // Connect directly to the gateway relay over the private network access
+    // granted by the qualification profile's privateNetworkClientServer capability.
     let relay_ws = match tokio_tungstenite::connect_async(&relay_url).await {
         Ok((ws, _)) => {
             eprintln!("[spawner] relay connected: {relay_url}");
