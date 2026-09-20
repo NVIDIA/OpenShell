@@ -452,6 +452,7 @@ fn b_tls_skip_warning() {
 
 /// endpoint.tls = "full" (any non-skip) → "error".
 #[test]
+#[allow(deprecated)]
 fn b_tls_non_skip_error() {
     let policy = net_policy(
         "r",
