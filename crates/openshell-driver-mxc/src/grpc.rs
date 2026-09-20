@@ -67,14 +67,14 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
         let req = request.into_inner();
-        if req.sandbox_name.is_empty() {
-            return Err(Status::invalid_argument("sandbox_name is required"));
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
         }
         let sandbox = self
             .backend
-            .get_sandbox(&req.sandbox_name)
+            .get_sandbox(&req.name)
             .await
-            .ok_or_else(|| Status::not_found(format!("sandbox {} not found", req.sandbox_name)))?;
+            .ok_or_else(|| Status::not_found(format!("sandbox {} not found", req.name)))?;
         if !req.sandbox_id.is_empty() && req.sandbox_id != sandbox.id {
             return Err(Status::failed_precondition(
                 "sandbox_id did not match the fetched sandbox",
@@ -110,10 +110,10 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
         let req = request.into_inner();
-        if req.sandbox_name.is_empty() {
-            return Err(Status::invalid_argument("sandbox_name is required"));
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
         }
-        self.backend.stop_sandbox(&req.sandbox_name).await?;
+        self.backend.stop_sandbox(&req.name).await?;
         Ok(Response::new(StopSandboxResponse {}))
     }
 
@@ -134,12 +134,12 @@ impl ComputeDriver for ComputeDriverService {
         if req.sandbox_id.is_empty() {
             return Err(Status::invalid_argument("sandbox_id is required"));
         }
-        if req.sandbox_name.is_empty() {
-            return Err(Status::invalid_argument("sandbox_name is required"));
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
         }
         let deleted = self
             .backend
-            .delete_sandbox(&req.sandbox_id, &req.sandbox_name)
+            .delete_sandbox(&req.sandbox_id, &req.name)
             .await?;
         Ok(Response::new(DeleteSandboxResponse { deleted }))
     }
