@@ -161,6 +161,19 @@ def test_runner_hash_binds_a_versioned_openclaw_package() -> None:
     assert "openclaw_package_json_sha256" in source
 
 
+def test_runner_supports_an_external_qualification_bundle() -> None:
+    source = (QUALIFICATION_DIR / "run-gb300-woa.ps1").read_text(encoding="utf-8")
+
+    assert "OPENSHELL_GB300_REPO_ROOT" in source
+    assert '"--repo-root", $RepoRoot' in source
+
+
+def test_portable_bundle_does_not_require_qualification_files_in_target() -> None:
+    assert not any(
+        "qualification" in relative for relative in VALIDATOR.REQUIRED_REPOSITORY_PATHS
+    )
+
+
 def test_repository_contract_is_valid() -> None:
     errors = VALIDATOR.validate_contract(_load_contract(), repo_root=REPO_ROOT)
     assert errors == []

@@ -6,6 +6,7 @@
 
 [CmdletBinding()]
 param(
+    [string] $RepoRoot = $env:OPENSHELL_GB300_REPO_ROOT,
     [string] $ExpectedBaseSha = $env:OPENSHELL_GB300_BASE_SHA,
     [string] $WxcExecPath = $env:OPENSHELL_WXC_EXEC_PATH,
     [string] $NodeExePath = $env:OPENSHELL_GB300_NODE_PATH,
@@ -19,7 +20,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
 
-$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
+if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $RepoRoot = Join-Path $PSScriptRoot "..\..\.."
+}
+$RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
 $ManifestPath = Join-Path $PSScriptRoot "gb300-woa.json"
 $ValidatorPath = Join-Path $PSScriptRoot "validate.py"
 $WindowsWrapper = Join-Path $RepoRoot "tasks\scripts\windows-msvc.ps1"
@@ -242,7 +246,7 @@ $Durations["source-provenance"] = [Math]::Round($sourceTimer.Elapsed.TotalSecond
 
 $uv = Get-Command uv -ErrorAction Stop
 Invoke-LoggedProcess "contract-integrity" "contract-validation.log" $uv.Source @(
-    "run", "python", $ValidatorPath, "contract"
+    "run", "python", $ValidatorPath, "--repo-root", $RepoRoot, "contract"
 )
 
 $probePath = Join-Path $ExampleSource "probe-mxc-host.ps1"
@@ -481,7 +485,8 @@ $record = [ordered]@{
 }
 Write-Json $record $recordPath
 Invoke-LoggedProcess "evidence-validation" "evidence-validation.log" $uv.Source @(
-    "run", "python", $ValidatorPath, "evidence", "--record", $recordPath,
+    "run", "python", $ValidatorPath, "--repo-root", $RepoRoot,
+    "evidence", "--record", $recordPath,
     "--artifact-root", $EvidenceDir, "--expected-base-sha", $ExpectedBaseSha
 )
 

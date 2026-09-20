@@ -84,3 +84,33 @@ and OpenClaw bundles, `evidence.json`, and the final validation log. Do not put
 provider credentials in command lines or retained files. Optional credential
 coverage must use a scoped non-production credential and prove that retained
 artifacts contain no secret value.
+
+## Build a portable collector
+
+Build one hash-manifested ZIP from a clean qualification revision:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File crates/openshell-driver-mxc/qualification/package-gb300-woa.ps1
+```
+
+The archive contains `Run-Qualification.ps1`, the contract, validator, concise
+instructions, and a manifest that identifies and hashes the collector. Keep the
+extracted directory outside the checkout. Point it at the clean OpenShell branch
+being tested without copying qualification files into that branch:
+
+```powershell
+$env:OPENSHELL_GB300_REPO_ROOT = 'C:\path\to\OpenShell'
+$env:OPENSHELL_GB300_BASE_SHA = '<full reviewed origin/windows SHA>'
+$env:OPENSHELL_GB300_HARDWARE_ATTESTATION = 'GB300'
+$env:OPENSHELL_WXC_EXEC_PATH = 'C:\mxc-kit\bin\wxc-exec.exe'
+$env:OPENSHELL_GB300_NODE_PATH = 'C:\path\to\arm64\node.exe'
+$env:OPENSHELL_GB300_OPENCLAW_DIR = 'C:\path\to\node_modules\openclaw'
+$env:OPENSHELL_GB300_EVIDENCE_DIR = 'D:\evidence\openshell-gb300-<run-id>'
+
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Run-Qualification.ps1
+```
+
+The target checkout does not need to contain this qualification directory, but
+it must have canonical `origin`, descend directly from the reviewed `windows`
+SHA, and be clean. Share the ZIP's SHA256 out of band with the tester.
