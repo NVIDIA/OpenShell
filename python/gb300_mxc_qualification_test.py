@@ -8,8 +8,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
-import subprocess
-import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
@@ -161,41 +159,6 @@ def test_runner_hash_binds_a_versioned_openclaw_package() -> None:
     assert "package.json must declare a non-empty version" in source
     assert "openclaw_package_sha256" in source
     assert "openclaw_package_json_sha256" in source
-
-
-def test_runner_supports_an_external_qualification_bundle() -> None:
-    source = (QUALIFICATION_DIR / "run-gb300-woa.ps1").read_text(encoding="utf-8")
-
-    assert "OPENSHELL_GB300_REPO_ROOT" in source
-    assert '"--repo-root", $RepoRoot' in source
-
-
-def test_portable_bundle_does_not_require_qualification_files_in_target() -> None:
-    assert not any(
-        "qualification" in relative for relative in VALIDATOR.REQUIRED_REPOSITORY_PATHS
-    )
-
-
-def test_validator_cli_honors_external_repo_root(tmp_path: Path) -> None:
-    for relative in VALIDATOR.REQUIRED_REPOSITORY_PATHS:
-        path = tmp_path / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("fixture\n", encoding="utf-8")
-
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(QUALIFICATION_DIR / "validate.py"),
-            "--repo-root",
-            str(tmp_path),
-            "contract",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 0, result.stderr
 
 
 def test_repository_contract_is_valid() -> None:

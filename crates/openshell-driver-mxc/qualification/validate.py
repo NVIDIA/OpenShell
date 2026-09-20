@@ -37,6 +37,7 @@ REQUIRED_REPOSITORY_PATHS = {
     "crates/openshell-driver-mxc/examples/probe-mxc-host.ps1",
     "crates/openshell-driver-mxc/examples/run-mxc-e2e.ps1",
     "crates/openshell-driver-mxc/examples/run-openclaw-forward-test.ps1",
+    "crates/openshell-driver-mxc/qualification/gb300-woa.json",
     "tasks/scripts/windows-msvc.ps1",
     "tasks/windows.toml",
 }
@@ -270,10 +271,9 @@ def validate_evidence(
     record: dict[str, Any],
     artifact_root: Path,
     expected_base_sha: str,
-    repo_root: Path | None = None,
 ) -> list[str]:
     """Validate one retained evidence record against the static matrix."""
-    errors = validate_contract(contract, repo_root=repo_root)
+    errors = validate_contract(contract, repo_root=None)
     if not SHA_PATTERN.fullmatch(expected_base_sha):
         errors.append("expected base SHA must be 40 lowercase hexadecimal characters")
     if record.get("schema_version") != 1:
@@ -485,12 +485,6 @@ def main(argv: list[str] | None = None) -> int:
         default=script_dir / "gb300-woa.json",
         help="Path to the qualification contract",
     )
-    parser.add_argument(
-        "--repo-root",
-        type=Path,
-        default=repo_root,
-        help="OpenShell checkout to validate (required for an external bundle)",
-    )
     subparsers = parser.add_subparsers(dest="mode", required=True)
     subparsers.add_parser("contract", help="Validate the static scope contract")
     evidence = subparsers.add_parser(
@@ -504,7 +498,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         contract = load_json(args.manifest)
         if args.mode == "contract":
-            errors = validate_contract(contract, repo_root=args.repo_root)
+            errors = validate_contract(contract, repo_root=repo_root)
         else:
             record = load_json(args.record)
             errors = validate_evidence(
@@ -512,7 +506,6 @@ def main(argv: list[str] | None = None) -> int:
                 record,
                 args.artifact_root,
                 args.expected_base_sha,
-                repo_root=args.repo_root,
             )
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
