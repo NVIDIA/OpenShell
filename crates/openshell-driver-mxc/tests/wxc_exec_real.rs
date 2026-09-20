@@ -885,10 +885,7 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
                     access: "read-only".to_string(),
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: cmd_string,
-                    ..Default::default()
-                }],
+                binaries: vec![NetworkBinary { path: cmd_string }],
             },
         )]),
         ..Default::default()
