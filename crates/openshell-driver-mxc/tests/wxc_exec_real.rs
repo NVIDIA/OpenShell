@@ -97,7 +97,7 @@ mod token_probe {
         ok != 0 && !unsafe { ptr::read_unaligned(buf.as_ptr().cast::<*const c_void>()) }.is_null()
     }
 
-    fn service_manager_create_access() -> (bool, u32) {
+    pub fn service_manager_create_access() -> (bool, u32) {
         let manager = unsafe {
             OpenSCManagerW(
                 ptr::null(),
@@ -914,6 +914,13 @@ fn pc_oneshot_token_is_appcontainer_without_admin_access() {
         eprintln!("SKIP: wxc-exec not found");
         return;
     };
+    let (host_can_create_service, host_error) = token_probe::service_manager_create_access();
+    if !host_can_create_service {
+        eprintln!(
+            "SKIP: host test runner lacks SC_MANAGER_CREATE_SERVICE (Win32 error {host_error}); sandboxed denial would not prove isolation"
+        );
+        return;
+    }
     if let Err(reason) = probe_processcontainer(&wxc) {
         eprintln!("SKIP: processcontainer not live: {reason}");
         return;
