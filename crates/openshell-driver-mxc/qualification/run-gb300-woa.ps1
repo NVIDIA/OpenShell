@@ -129,6 +129,29 @@ function Get-Sha256([string] $Path) {
     }
 }
 
+function Get-DirectorySha256([string] $Path) {
+    $root = (Resolve-Path -LiteralPath $Path).Path.TrimEnd('\') + '\'
+    $entries = @(
+        Get-ChildItem -LiteralPath $Path -File -Recurse | ForEach-Object {
+            [pscustomobject]@{
+                RelativePath = $_.FullName.Substring($root.Length).Replace('\', '/')
+                Sha256 = Get-Sha256 $_.FullName
+            }
+        } | Sort-Object RelativePath
+    )
+    if ($entries.Count -eq 0) {
+        throw "Package directory contains no files: $Path"
+    }
+    $manifest = (($entries | ForEach-Object { "$($_.RelativePath)`0$($_.Sha256)" }) -join "`n") + "`n"
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($manifest)
+        return [BitConverter]::ToString($sha256.ComputeHash($bytes)).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+    }
+}
+
 function New-EvidenceArtifact([string] $Role, [string] $Path) {
     $resolved = (Resolve-Path -LiteralPath $Path).Path
     $evidencePrefix = $EvidenceDir.TrimEnd('\') + '\'
@@ -183,14 +206,25 @@ Assert-Arm64Pe $WxcExecPath "wxc-exec"
 Assert-Arm64Pe $NodeExePath "Node.js"
 
 $sourceTimer = [System.Diagnostics.Stopwatch]::StartNew()
-Invoke-Git @("fetch", "--prune", "origin", "windows") | ForEach-Object { Write-Host $_ }
-$fetchedBaseSha = (@(Invoke-Git @("rev-parse", "refs/remotes/origin/windows")))[0].Trim()
 if ([string]::IsNullOrWhiteSpace($ExpectedBaseSha)) {
-    $ExpectedBaseSha = $fetchedBaseSha
+    throw "ExpectedBaseSha is required. Set OPENSHELL_GB300_BASE_SHA to the reviewed origin/windows commit."
 }
 if ($ExpectedBaseSha -notmatch '^[0-9a-f]{40}$') {
     throw "ExpectedBaseSha must be a full lowercase Git SHA."
 }
+$originUrl = (@(Invoke-Git @("remote", "get-url", "origin")))[0].Trim()
+$normalizedOriginUrl = $originUrl.TrimEnd('/').ToLowerInvariant()
+$canonicalOriginUrls = @(
+    "https://github.com/nvidia/openshell.git",
+    "https://github.com/nvidia/openshell",
+    "git@github.com:nvidia/openshell.git",
+    "ssh://git@github.com/nvidia/openshell.git"
+)
+if ($canonicalOriginUrls -notcontains $normalizedOriginUrl) {
+    throw "origin must be the canonical NVIDIA/OpenShell GitHub repository; found: $originUrl"
+}
+Invoke-Git @("fetch", "--prune", "origin", "windows") | ForEach-Object { Write-Host $_ }
+$fetchedBaseSha = (@(Invoke-Git @("rev-parse", "refs/remotes/origin/windows")))[0].Trim()
 if ($fetchedBaseSha -ne $ExpectedBaseSha) {
     throw "origin/windows moved: expected $ExpectedBaseSha, fetched $fetchedBaseSha"
 }
@@ -203,7 +237,6 @@ $worktreeStatus = @(Invoke-Git @("status", "--porcelain=v1"))
 if ($worktreeStatus.Count -gt 0 -and ($worktreeStatus -join '').Trim()) {
     throw "Qualification requires a clean worktree. Commit or preserve changes first."
 }
-$originUrl = (@(Invoke-Git @("remote", "get-url", "origin")))[0].Trim()
 $sourceTimer.Stop()
 $Durations["source-provenance"] = [Math]::Round($sourceTimer.Elapsed.TotalSeconds, 3)
 
@@ -224,10 +257,19 @@ if ($probe.verdicts.processcontainer -ne "live" -or $probe.verdicts.dryRun -ne "
 }
 
 $packageJsonPath = Join-Path $OpenClawInstallDir "package.json"
-$openClawVersion = "unavailable"
-if (Test-Path -LiteralPath $packageJsonPath -PathType Leaf) {
-    $openClawVersion = (Get-Content -LiteralPath $packageJsonPath -Raw | ConvertFrom-Json).version
+if (-not (Test-Path -LiteralPath $packageJsonPath -PathType Leaf)) {
+    throw "OpenClawInstallDir must contain a versioned package.json: $OpenClawInstallDir"
 }
+try {
+    $openClawPackage = Get-Content -LiteralPath $packageJsonPath -Raw | ConvertFrom-Json
+    $openClawVersion = [string]$openClawPackage.version
+} catch {
+    throw "OpenClaw package.json is invalid or has no version: $packageJsonPath"
+}
+if ([string]::IsNullOrWhiteSpace($openClawVersion)) {
+    throw "OpenClaw package.json must declare a non-empty version: $packageJsonPath"
+}
+$openClawPackageSha256 = Get-DirectorySha256 $OpenClawInstallDir
 $environmentPath = Join-Path $EvidenceDir "environment.json"
 $environment = [ordered]@{
     contract_id = "nvbug-6643699-gb300-woa-mxc"
@@ -249,6 +291,8 @@ $environment = [ordered]@{
     rust_version = (& rustc --version).ToString()
     node_version = (& $NodeExePath --version).ToString()
     openclaw_version = $openClawVersion
+    openclaw_package_sha256 = $openClawPackageSha256
+    openclaw_package_json_sha256 = Get-Sha256 $packageJsonPath
     wxc_exec_path = $WxcExecPath
     wxc_exec_sha256 = Get-Sha256 $WxcExecPath
     node_path = $NodeExePath

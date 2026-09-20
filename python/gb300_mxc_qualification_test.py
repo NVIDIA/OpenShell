@@ -9,7 +9,7 @@ import copy
 import hashlib
 import importlib.util
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict, cast
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -17,6 +17,48 @@ if TYPE_CHECKING:
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 QUALIFICATION_DIR = REPO_ROOT / "crates" / "openshell-driver-mxc" / "qualification"
+
+
+class ContractRow(TypedDict, total=False):
+    id: str
+    disposition: str
+    allow_skip: bool
+    architecture: str
+    commands: list[str]
+    artifact_roles: list[str]
+    reason: str
+
+
+class Contract(TypedDict):
+    matrix: list[ContractRow]
+
+
+class EvidenceArtifact(TypedDict):
+    role: str
+    path: str
+    sha256: str
+
+
+class EvidenceResult(TypedDict, total=False):
+    coverage_id: str
+    status: str
+    architecture: str
+    command: str
+    exit_code: int
+    skip_count: int
+    duration_seconds: float
+    artifacts: list[EvidenceArtifact]
+    reason: str
+
+
+class EvidenceRecord(TypedDict):
+    schema_version: int
+    contract_id: str
+    base_sha: str
+    head_sha: str
+    generated_at: str
+    environment: dict[str, object]
+    results: list[EvidenceResult]
 
 
 def _load_validator() -> ModuleType:
@@ -31,19 +73,17 @@ def _load_validator() -> ModuleType:
 VALIDATOR = _load_validator()
 
 
-def _load_contract() -> dict[str, object]:
-    return VALIDATOR.load_json(QUALIFICATION_DIR / "gb300-woa.json")
+def _load_contract() -> Contract:
+    return cast("Contract", VALIDATOR.load_json(QUALIFICATION_DIR / "gb300-woa.json"))
 
 
-def _valid_evidence(
-    contract: dict[str, object], artifact_root: Path
-) -> dict[str, object]:
-    results: list[dict[str, object]] = []
+def _valid_evidence(contract: Contract, artifact_root: Path) -> EvidenceRecord:
+    results: list[EvidenceResult] = []
     for row in contract["matrix"]:
         row_id = row["id"]
         disposition = row["disposition"]
         if disposition == "required":
-            artifacts = []
+            artifacts: list[EvidenceArtifact] = []
             for role in row["artifact_roles"]:
                 artifact_path = artifact_root / f"{row_id}-{role}.txt"
                 artifact_path.write_text(f"evidence for {row_id}\n", encoding="utf-8")
@@ -102,6 +142,23 @@ def _valid_evidence(
         },
         "results": results,
     }
+
+
+def test_runner_requires_explicit_canonical_source_provenance() -> None:
+    source = (QUALIFICATION_DIR / "run-gb300-woa.ps1").read_text(encoding="utf-8")
+
+    assert "ExpectedBaseSha is required" in source
+    assert "$ExpectedBaseSha = $fetchedBaseSha" not in source
+    assert "https://github.com/nvidia/openshell.git" in source.lower()
+    assert "origin must be the canonical NVIDIA/OpenShell" in source
+
+
+def test_runner_hash_binds_a_versioned_openclaw_package() -> None:
+    source = (QUALIFICATION_DIR / "run-gb300-woa.ps1").read_text(encoding="utf-8")
+
+    assert "package.json must declare a non-empty version" in source
+    assert "openclaw_package_sha256" in source
+    assert "openclaw_package_json_sha256" in source
 
 
 def test_repository_contract_is_valid() -> None:

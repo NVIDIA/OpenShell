@@ -54,7 +54,7 @@ Static validation and regression tests do not require Windows or MXC hardware:
 
 ```text
 uv run python crates/openshell-driver-mxc/qualification/validate.py contract
-uv run pytest python/openshell/gb300_mxc_qualification_test.py
+uv run pytest python/gb300_mxc_qualification_test.py
 ```
 
 ## Execute on GB300
