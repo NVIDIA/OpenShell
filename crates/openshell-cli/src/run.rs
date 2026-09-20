@@ -5172,10 +5172,12 @@ where
         config.version
     };
     let (status, active_version) = if policy_source == PolicySource::Global {
-        // Global policy writes are validated and marked loaded synchronously.
-        // Do not query the global history endpoint here: policy get on a
-        // sandbox is workspace-readable, while global history is platform-admin
-        // scoped.
+        // Drivers without live policy updates reject global policy mutations
+        // while any sandbox exists, so this sandbox necessarily received the
+        // reported global version at startup. Other drivers retain the
+        // synchronous global-policy contract. Do not query global history here:
+        // sandbox policy reads are workspace-readable, while that endpoint is
+        // platform-admin scoped.
         (PolicyStatus::Loaded, version)
     } else {
         let status_response = client

@@ -1646,7 +1646,7 @@ async fn auto_approve_chunk(
     .await?;
     let credential_binding_context = merge_validation.credential_binding_context();
     let merge_result = merge_chunk_into_policy_with_validation(
-        state.store.as_ref(),
+        state,
         sandbox_id,
         context.workspace,
         &chunk,
@@ -2321,6 +2321,34 @@ async fn validate_provider_composition_for_existing_sandboxes(
         };
         cursor = Some(next_cursor);
     }
+}
+
+fn require_live_policy_update_support(state: &ServerState) -> Result<(), Status> {
+    if state.compute.supports_live_policy_updates() {
+        return Ok(());
+    }
+
+    Err(Status::failed_precondition(format!(
+        "compute driver '{}' cannot apply policy updates to an existing sandbox; delete and recreate the sandbox with the requested policy",
+        state.compute.configured_driver_name()
+    )))
+}
+
+async fn require_global_policy_update_support(state: &ServerState) -> Result<(), Status> {
+    if state.compute.supports_live_policy_updates() {
+        return Ok(());
+    }
+
+    let page = state
+        .store
+        .list_message_page::<Sandbox>(ObjectListQuery::AllWorkspaces, None, 1)
+        .await
+        .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+    if page.messages.is_empty() {
+        return Ok(());
+    }
+
+    require_live_policy_update_support(state)
 }
 
 pub async fn validate_provider_composition_startup_preflight(
@@ -3677,6 +3705,7 @@ async fn handle_update_config_inner(
             // Serialize its writes after validation so a report cannot commit
             // evidence derived from the policy this update has replaced.
             let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+            require_global_policy_update_support(state).await?;
             let latest = state
                 .store
                 .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
@@ -3782,6 +3811,12 @@ async fn handle_update_config_inner(
             None
         };
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
+        if key == POLICY_SETTING_KEY
+            && req.delete_setting
+            && global_settings.settings.contains_key(POLICY_SETTING_KEY)
+        {
+            require_global_policy_update_support(state).await?;
+        }
         let provider_composition_was_enabled =
             provider_policy_composition_enabled_in(&global_settings)?;
         let changed = if req.delete_setting {
@@ -3844,14 +3879,8 @@ async fn handle_update_config_inner(
     let sandbox_id = sandbox.object_id().to_string();
     let mut response_annotations = sandbox_metadata_annotations(&sandbox);
 
-    if !sandbox_caller
-        && (has_policy || has_merge_ops)
-        && !state.compute.supports_live_policy_updates()
-    {
-        return Err(Status::failed_precondition(format!(
-            "compute driver '{}' cannot apply policy updates to an existing sandbox; delete and recreate the sandbox with the requested policy",
-            state.compute.configured_driver_name()
-        )));
+    if !sandbox_caller && (has_policy || has_merge_ops) {
+        require_live_policy_update_support(state)?;
     }
 
     if has_setting {
@@ -3975,7 +4004,7 @@ async fn handle_update_config_inner(
         };
         let baseline_policy = spec.policy.clone();
         let (version, hash, updated_sandbox) = apply_merge_operations_with_retry(
-            state.store.as_ref(),
+            state,
             &sandbox_id,
             &workspace,
             baseline_policy.as_ref(),
@@ -5257,7 +5286,7 @@ async fn handle_approve_draft_chunk_inner(
         sandbox_policy_merge_validation_data(state, &workspace, &sandbox, provider_names).await?;
     let credential_binding_context = merge_validation.credential_binding_context();
     let merge_result = merge_chunk_into_policy_with_validation(
-        state.store.as_ref(),
+        state,
         &sandbox_id,
         &workspace,
         &chunk,
@@ -5668,7 +5697,7 @@ async fn handle_approve_all_draft_chunks_inner(
             Status::failed_precondition("bulk approval has no reviewed policy snapshot")
         })?;
         match apply_merge_operations_with_retry(
-            state.store.as_ref(),
+            state,
             &sandbox_id,
             &workspace,
             Some(&final_base),
@@ -6768,6 +6797,31 @@ fn stage_validated_merge_operation(
 
 #[allow(clippy::too_many_arguments)]
 async fn apply_merge_operations_with_retry(
+    state: &ServerState,
+    sandbox_id: &str,
+    workspace: &str,
+    baseline_policy: Option<&ProtoSandboxPolicy>,
+    operations: &[PolicyMergeOp],
+    validation_context: PolicyMergeValidationContext<'_>,
+    expected_current_effective_hash: Option<&str>,
+    atomic_context: Option<&AtomicPolicyWriteContext<'_>>,
+) -> Result<(i64, String, Option<Sandbox>), Status> {
+    require_live_policy_update_support(state)?;
+    apply_merge_operations_with_retry_in_store(
+        state.store.as_ref(),
+        sandbox_id,
+        workspace,
+        baseline_policy,
+        operations,
+        validation_context,
+        expected_current_effective_hash,
+        atomic_context,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_merge_operations_with_retry_in_store(
     store: &Store,
     sandbox_id: &str,
     workspace: &str,
@@ -6926,7 +6980,7 @@ async fn apply_merge_operations_with_retry(
 }
 
 async fn merge_chunk_into_policy_with_validation(
-    store: &Store,
+    state: &ServerState,
     sandbox_id: &str,
     workspace: &str,
     chunk: &DraftChunkRecord,
@@ -6945,7 +6999,7 @@ async fn merge_chunk_into_policy_with_validation(
         clear_provider_credentialed_markers(policy);
     }
     apply_merge_operations_with_retry(
-        store,
+        state,
         sandbox_id,
         workspace,
         baseline_policy.as_ref(),
@@ -6967,17 +7021,34 @@ async fn merge_chunk_into_policy(
     chunk: &DraftChunkRecord,
     provider_layers: &[ProviderPolicyLayer],
 ) -> Result<(i64, String), Status> {
-    merge_chunk_into_policy_with_validation(
+    let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
+        .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
+    let operations = [PolicyMergeOp::AddRule {
+        rule_name: chunk.rule_name.clone(),
+        rule,
+    }];
+    validate_merge_operations_for_server(&operations)?;
+    let mut baseline_policy = chunk.current_effective_policy.clone();
+    if let Some(policy) = &mut baseline_policy {
+        strip_provider_rule_names(policy);
+        clear_provider_credentialed_markers(policy);
+    }
+    apply_merge_operations_with_retry_in_store(
         store,
         sandbox_id,
         workspace,
-        chunk,
+        baseline_policy.as_ref(),
+        &operations,
         PolicyMergeValidationContext {
             provider_layers,
             credential_binding: None,
         },
+        (!chunk.current_effective_policy_hash.is_empty())
+            .then_some(chunk.current_effective_policy_hash.as_str()),
+        None,
     )
     .await
+    .map(|(version, hash, _)| (version, hash))
 }
 
 async fn remove_chunk_from_policy(
@@ -6987,7 +7058,7 @@ async fn remove_chunk_from_policy(
     chunk: &DraftChunkRecord,
 ) -> Result<(i64, String), Status> {
     apply_merge_operations_with_retry(
-        state.store.as_ref(),
+        state,
         sandbox_id,
         workspace,
         None,
@@ -8514,6 +8585,264 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mxc_rejects_global_policy_changes_while_a_sandbox_exists() {
+        let state = test_server_state_with_driver("mxc").await;
+        let initial = test_policy_with_rule("initial", "initial.example.com");
+        let created = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(initial.clone()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("MXC may configure global policy before any sandbox exists")
+        .into_inner();
+        assert_eq!(created.version, 1);
+
+        state
+            .store
+            .put_message(&test_sandbox(
+                "mxc-global-policy",
+                "mxc-global-policy",
+                ProtoSandboxPolicy::default(),
+                Vec::new(),
+            ))
+            .await
+            .expect("store MXC sandbox");
+
+        let replace_error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(test_policy_with_rule("replacement", "new.example.com")),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("MXC must reject a global policy replacement for an existing sandbox");
+        assert_eq!(replace_error.code(), Code::FailedPrecondition);
+
+        let delete_error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                setting_key: POLICY_SETTING_KEY.to_string(),
+                delete_setting: true,
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("MXC must reject deleting global policy for an existing sandbox");
+        assert_eq!(delete_error.code(), Code::FailedPrecondition);
+
+        let revisions = state
+            .store
+            .list_policies(GLOBAL_POLICY_SANDBOX_ID, 10, 0)
+            .await
+            .expect("list global policy revisions");
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].version, 1);
+        let settings = load_global_settings(state.store.as_ref())
+            .await
+            .expect("load global settings");
+        assert_eq!(
+            decode_policy_from_global_settings(&settings)
+                .expect("decode global policy")
+                .expect("global policy remains configured"),
+            initial
+        );
+    }
+
+    #[tokio::test]
+    async fn mxc_rejects_all_advisor_policy_mutation_paths_before_persistence() {
+        let state = test_server_state_with_driver("mxc").await;
+        let sandbox_id = "mxc-advisor-policy";
+        let sandbox_name = "mxc-advisor-policy";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                Vec::new(),
+            ))
+            .await
+            .expect("store MXC sandbox");
+
+        let proposal = |name: &str, host: &str| PolicyChunk {
+            rule_name: name.to_string(),
+            proposed_rule: Some(NetworkPolicyRule {
+                name: name.to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: host.to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: r"C:\Windows\System32\curl.exe".to_string(),
+                }],
+            }),
+            ..Default::default()
+        };
+        let submitted = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![proposal("manual", "manual.example.com")],
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("store pending proposal")
+        .into_inner();
+        let chunk_id = &submitted.accepted_chunk_ids[0];
+        let chunk = state
+            .store
+            .get_draft_chunk(chunk_id)
+            .await
+            .expect("fetch proposal")
+            .expect("stored proposal");
+        assert_eq!(chunk.status, "pending");
+
+        let manual_error = handle_approve_draft_chunk(
+            &state,
+            with_user(Request::new(ApproveDraftChunkRequest {
+                name: sandbox_name.to_string(),
+                chunk_id: chunk.id.clone(),
+                review_token: chunk.review_token.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            })),
+        )
+        .await
+        .expect_err("manual approval must not mutate MXC policy");
+        assert_eq!(manual_error.code(), Code::FailedPrecondition);
+
+        let bulk_error = handle_approve_all_draft_chunks(
+            &state,
+            with_user(Request::new(ApproveAllDraftChunksRequest {
+                name: sandbox_name.to_string(),
+                include_security_flagged: true,
+                approvals: vec![openshell_core::proto::DraftChunkApproval {
+                    chunk_id: chunk.id.clone(),
+                    review_token: chunk.review_token.clone(),
+                }],
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            })),
+        )
+        .await
+        .expect_err("bulk approval must not mutate MXC policy");
+        assert_eq!(bulk_error.code(), Code::FailedPrecondition);
+        assert!(
+            state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .expect("policy history lookup")
+                .is_none()
+        );
+
+        seed_sandbox_approval_mode(&state, sandbox_name, "auto").await;
+        let auto_submitted = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![proposal("automatic", "automatic.example.com")],
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("automatic approval failure leaves the proposal pending")
+        .into_inner();
+        let automatic = state
+            .store
+            .get_draft_chunk(&auto_submitted.accepted_chunk_ids[0])
+            .await
+            .expect("fetch automatic proposal")
+            .expect("stored automatic proposal");
+        assert_eq!(automatic.status, "pending");
+        assert!(automatic.application_error.contains("delete and recreate"));
+        assert!(
+            state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .expect("policy history lookup")
+                .is_none()
+        );
+
+        let approved_rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
+            .expect("decode proposed rule");
+        let mut approved_policy = ProtoSandboxPolicy::default();
+        approved_policy
+            .network_policies
+            .insert(chunk.rule_name.clone(), approved_rule);
+        state
+            .store
+            .put_policy_revision(
+                "mxc-existing-policy",
+                sandbox_id,
+                "default",
+                1,
+                &approved_policy.encode_to_vec(),
+                &deterministic_policy_hash(&approved_policy),
+            )
+            .await
+            .expect("seed policy applied at sandbox startup");
+        state
+            .store
+            .update_draft_chunk_status(chunk_id, "approved", Some(current_time_ms()), None)
+            .await
+            .expect("mark startup policy proposal approved");
+
+        let undo_error = handle_undo_draft_chunk(
+            &state,
+            with_user(Request::new(UndoDraftChunkRequest {
+                name: sandbox_name.to_string(),
+                chunk_id: chunk.id.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            })),
+        )
+        .await
+        .expect_err("undo must not mutate MXC policy");
+        assert_eq!(undo_error.code(), Code::FailedPrecondition);
+
+        let reject_error = handle_reject_draft_chunk(
+            &state,
+            with_user(Request::new(RejectDraftChunkRequest {
+                name: sandbox_name.to_string(),
+                chunk_id: chunk.id.clone(),
+                reason: "reject approved proposal".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            })),
+        )
+        .await
+        .expect_err("rejecting an approved proposal must not mutate MXC policy");
+        assert_eq!(reject_error.code(), Code::FailedPrecondition);
+
+        let stored_chunk = state
+            .store
+            .get_draft_chunk(chunk_id)
+            .await
+            .expect("fetch approved proposal")
+            .expect("stored approved proposal");
+        assert_eq!(stored_chunk.status, "approved");
+        assert_eq!(
+            state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .expect("policy history lookup")
+                .expect("startup policy revision")
+                .version,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn mxc_allows_sandbox_authored_policy_sync() {
         let state = test_server_state_with_driver("mxc").await;
         let sandbox_id = "mxc-policy-sync";
@@ -8693,7 +9022,7 @@ mod tests {
                 .await
                 .expect("store legacy merge base");
 
-            let (version, hash, _) = apply_merge_operations_with_retry(
+            let (version, hash, _) = apply_merge_operations_with_retry_in_store(
                 &store,
                 &sandbox_id,
                 "default",
@@ -11280,7 +11609,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let error = apply_merge_operations_with_retry(
-            state.store.as_ref(),
+            state.as_ref(),
             "sb-ambiguous-merge",
             "default",
             None,
@@ -13662,7 +13991,7 @@ mod tests {
             },
         ];
         let error = apply_merge_operations_with_retry(
-            state.store.as_ref(),
+            state.as_ref(),
             sandbox_id,
             "default",
             Some(&reviewed_policy),
@@ -18297,7 +18626,7 @@ mod tests {
         }];
 
         let (left, right) = tokio::join!(
-            apply_merge_operations_with_retry(
+            apply_merge_operations_with_retry_in_store(
                 &store,
                 sandbox_id,
                 "default",
@@ -18310,7 +18639,7 @@ mod tests {
                 None,
                 None
             ),
-            apply_merge_operations_with_retry(
+            apply_merge_operations_with_retry_in_store(
                 &store,
                 sandbox_id,
                 "default",
