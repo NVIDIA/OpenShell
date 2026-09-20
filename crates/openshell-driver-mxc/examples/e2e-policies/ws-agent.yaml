@@ -10,9 +10,8 @@
 #     system paths and share_dir).
 #   - TCP socket binding on port 22000 (governed by pc_capabilities in the
 #     gateway TOML, not by filesystem policy here).
-#   - Outbound TCP through the egress proxy, for openshell-supervisor-relay
-#     to dial the driver's on-demand relay — governed by egress_proxy in the
-#     TOML.
+#   - Private/loopback client access for openshell-supervisor-relay to dial
+#     the driver's on-demand relay — granted by pc_capabilities in the TOML.
 #   - No writes to the host filesystem.
 #
 # workload directory (passed by run-ws-agent-test.ps1, default C:\work\openshell-mxc-ws)
@@ -24,15 +23,9 @@
 # patches this path and the per-sandbox driver config when -AgentDir overrides
 # the default below.
 #
-# This example intentionally omits network_policies, not because the driver
-# would reject it: with egress_proxy = true (set in mxc-ws-gateway.toml), the
-# driver takes the lossless split path (policy_map::split_policy) and
-# delegates network_policies verbatim to the OpenShell host CONNECT proxy for
-# enforcement -- an "info" loss item, not an error, so it would be accepted.
-# (Only the no-proxy coarse path, or an unsupported rule shape, can turn a
-# network_policies entry into a rejected "error" loss item -- see
-# policy_map/map.rs.) This scenario just doesn't need host-enforced network
-# rules beyond the loopback/pc_capabilities grant above.
+# This example intentionally omits network_policies because it does not need
+# governed Internet egress. The driver therefore does not start a host CONNECT
+# proxy or inject proxy environment variables for this sandbox.
 version: 1
 
 filesystem_policy:

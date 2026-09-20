@@ -82,7 +82,10 @@ pub struct MxcComputeConfig {
     /// `processContainer` only: inject a network section with
     /// `defaultPolicy: "allow"` so the `AppContainer` has unrestricted outbound
     /// TCP access.  Required when `pc_capabilities` alone is insufficient to
-    /// enable network access in the target wxc-exec build.
+    /// enable network access in the target wxc-exec build. When `egress_proxy`
+    /// is also enabled, sandbox policies without explicit network rules are
+    /// rejected instead of falling back from governed egress to unrestricted
+    /// access.
     pub pc_network_allow: bool,
     /// `processContainer` only: include `"allowLocalNetwork": true` in the
     /// MXC network section.  Required for node.js (and other runtimes that
@@ -123,9 +126,11 @@ pub struct MxcComputeConfig {
     /// MXC `configurationId` for isolation session. Default: `"composable"`.
     /// Never use `"small"` (known OS bug).
     pub default_configuration_id: String,
-    /// Enable Pattern-C governed egress. When true, MXC permits loopback-only
-    /// egress, the driver injects proxy environment variables, and the host
-    /// CONNECT proxy receives the full network policy.
+    /// Enable Pattern-C governed egress for sandbox policies that contain
+    /// explicit network rules. MXC permits loopback-only egress, the driver
+    /// injects proxy environment variables, and the host CONNECT proxy receives
+    /// the full network policy. Policies without network rules do not start a
+    /// listener or receive proxy environment variables.
     pub egress_proxy: bool,
     /// Loopback `IP:PORT` seed for MXC `network.proxy` while governed egress is
     /// enabled. The driver preserves the loopback IP and allocates a unique
@@ -460,6 +465,26 @@ fn configured_egress_addr(config: &MxcComputeConfig) -> Result<Option<SocketAddr
         )));
     }
     Ok(Some(addr))
+}
+
+fn policy_activates_governed_egress(policy: Option<&SandboxPolicy>) -> bool {
+    policy.is_some_and(|policy| {
+        !policy.network_policies.is_empty() || !policy.network_middlewares.is_empty()
+    })
+}
+
+fn governed_egress_addr(
+    config: &MxcComputeConfig,
+    policy: Option<&SandboxPolicy>,
+) -> Result<Option<SocketAddr>, tonic::Status> {
+    let configured = configured_egress_addr(config)?;
+    let policy_activates_egress = policy_activates_governed_egress(policy);
+    if configured.is_some() && !policy_activates_egress && config.pc_network_allow {
+        return Err(tonic::Status::invalid_argument(
+            "mxc egress_proxy cannot be combined with pc_network_allow for a sandbox policy without explicit network rules; refusing unrestricted egress fallback",
+        ));
+    }
+    Ok(configured.filter(|_| policy_activates_egress))
 }
 
 fn allocate_sandbox_proxy_addr(
@@ -816,7 +841,7 @@ impl MxcComputeBackend {
         }
     }
 
-    fn validate_sandbox_fields(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
+    fn validate_sandbox_fields(sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
         if let Some(spec) = &sandbox.spec {
             if effective_driver_gpu_count(driver_gpu_requirements(
                 spec.resource_requirements.as_ref(),
@@ -859,9 +884,9 @@ impl MxcComputeBackend {
     }
 
     pub fn validate_sandbox_create(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
-        self.validate_sandbox_fields(sandbox)?;
+        Self::validate_sandbox_fields(sandbox)?;
         let policy = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref());
-        let egress_addr = configured_egress_addr(&self.config)?;
+        let egress_addr = governed_egress_addr(&self.config, policy)?;
         self.map_sandbox_policy(&sandbox.id, policy, egress_addr)?;
         Ok(())
     }
@@ -890,9 +915,13 @@ impl MxcComputeBackend {
             .remove(&sandbox_id);
         validate_provider_child_env_keys(provider_credentials.as_ref())?;
 
-        self.validate_sandbox_fields(sandbox)?;
+        Self::validate_sandbox_fields(sandbox)?;
         let sandbox_config = sandbox_config(sandbox)?;
-        let (egress_addr, reserved_proxy_listener) = match configured_egress_addr(&self.config)? {
+        let policy = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref());
+        let (egress_addr, reserved_proxy_listener) = match governed_egress_addr(
+            &self.config,
+            policy,
+        )? {
             Some(configured_addr) => {
                 let (addr, reservation) = allocate_sandbox_proxy_addr(configured_addr).map_err(
                     |error| {
@@ -909,7 +938,6 @@ impl MxcComputeBackend {
         // Policy translation is deterministic and side-effect free. Do it before
         // inserting the registry entry or launching MXC so invalid requests fail
         // synchronously at the CreateSandbox boundary.
-        let policy = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref());
         let mapped = self.map_sandbox_policy(&sandbox_id, policy, egress_addr)?;
         if provider_credentials
             .as_ref()
@@ -917,7 +945,7 @@ impl MxcComputeBackend {
             && egress_addr.is_none()
         {
             return Err(tonic::Status::failed_precondition(
-                "mxc provider credentials require governed egress; enable egress_proxy so placeholders can be resolved by the host proxy",
+                "mxc provider credentials require governed egress; enable egress_proxy and configure at least one network policy so placeholders can be resolved by the host proxy",
             ));
         }
 
@@ -1425,9 +1453,8 @@ async fn run_lifecycle(
     let proxy_addr = mapped.proxy_addr;
     let proxy_auth = proxy_addr.map(|_| SandboxProxyAuth::generate());
     let trimmed_policy = mapped.trimmed_policy.clone();
-    let host_proxy = if !invoker.is_mock()
-        && let (Some(addr), Some(proxy_policy), Some(proxy_auth)) =
-            (proxy_addr, trimmed_policy.clone(), proxy_auth.as_ref())
+    let host_proxy = if let (Some(addr), Some(proxy_policy), Some(proxy_auth)) =
+        (proxy_addr, trimmed_policy.clone(), proxy_auth.as_ref())
     {
         drop(reserved_proxy_listener.take());
         match openshell_supervisor_network::host::start_host_proxy(
@@ -1447,7 +1474,14 @@ async fn run_lifecycle(
         )
         .await
         {
-            Ok(handle) => Some(handle),
+            Ok(handle) => {
+                info!(
+                    sandbox = %sandbox_name,
+                    address = %addr,
+                    "MXC host egress proxy started"
+                );
+                Some(handle)
+            }
             Err(error) => {
                 set_failed(
                     &registry,
@@ -2366,7 +2400,9 @@ mod lifecycle_tests {
     use std::time::Duration;
 
     fn driver_sandbox(id: &str) -> DriverSandbox {
-        driver_sandbox_with_command(id, "", vec!["cmd".into(), "/c".into(), "exit 0".into()])
+        let shell =
+            std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+        driver_sandbox_with_command(id, "", vec![shell, "/c".into(), "exit 0".into()])
     }
 
     #[tokio::test]
@@ -2430,6 +2466,19 @@ mod lifecycle_tests {
             }),
             ..Default::default()
         }
+    }
+
+    fn long_running_command(share: &str) -> (String, Vec<String>) {
+        let shell =
+            std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+        let command = vec![
+            shell.clone(),
+            "/d".into(),
+            "/s".into(),
+            "/c".into(),
+            format!(r#"cd /d "{share}" && ping -n 61 127.0.0.1 >nul"#),
+        ];
+        (shell, command)
     }
 
     fn github_provider_credentials() -> ProviderCredentialState {
@@ -2659,6 +2708,8 @@ mod lifecycle_tests {
             .expect("provider credential staging lock poisoned")
             .insert("sb-provider-env".to_string(), credentials);
 
+        let shell =
+            std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
         let mut policy = fs_policy(&[]);
         policy.network_policies.insert(
             "github".to_string(),
@@ -2668,13 +2719,12 @@ mod lifecycle_tests {
                     host: "api.github.com".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
+                    enforcement: "enforce".to_string(),
+                    access: "full".to_string(),
                     provider_credentialed: true,
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: "cmd".to_string(),
-                    ..Default::default()
-                }],
+                binaries: vec![NetworkBinary { path: shell }],
             },
         );
         let mut sandbox = with_policy(driver_sandbox("sb-provider-env"), policy);
@@ -2695,11 +2745,15 @@ mod lifecycle_tests {
             .create_sandbox(&sandbox)
             .await
             .expect("create accepted");
-        wait_for(&backend, "sb-provider-env", |_| {
+        let recorded = wait_for(&backend, "sb-provider-env", |_| {
             crate::mxc::mock_recorded_config("sb-provider-env").is_some()
         })
-        .await
-        .expect("MXC config should be recorded");
+        .await;
+        assert!(
+            recorded.is_some(),
+            "MXC config should be recorded; sandbox: {:#?}",
+            backend.get_sandbox("sb-provider-env").await
+        );
 
         let recorded =
             crate::mxc::mock_recorded_config("sb-provider-env").expect("mock recorded config");
@@ -3065,121 +3119,195 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn split_path_provisions_with_proxy_redirect() {
-        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+    async fn explicit_network_policies_start_and_cleanup_host_proxy() {
+        for (sandbox_id, host, pc_network_allow) in [
+            ("sb-egress-allow", "example.com", false),
+            ("sb-egress-no-match", "allowed.invalid", true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let share = tmp.path().to_string_lossy().replace('\\', "/");
+            let (shell, command) = long_running_command(&share);
+            let config = MxcComputeConfig {
+                backend: MxcBackend::ProcessContainer,
+                pc_network_allow,
+                egress_proxy: true,
+                egress_proxy_addr: "127.0.0.1:18080".into(),
+                ..Default::default()
+            };
+            let backend = MxcComputeBackend::new_mocked(config);
 
+            let mut policy = fs_policy(&[&share]);
+            policy.network_policies.insert(
+                "explicit".into(),
+                NetworkPolicyRule {
+                    name: "explicit".into(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: host.into(),
+                        ports: vec![443],
+                        protocol: "tcp".into(),
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary { path: shell }],
+                },
+            );
+            let sandbox = with_policy(
+                driver_sandbox_with_command(sandbox_id, &share, command),
+                policy.clone(),
+            );
+
+            backend
+                .create_sandbox(&sandbox)
+                .await
+                .expect("create accepted");
+            wait_for(&backend, sandbox_id, |sandbox| {
+                ready_condition(sandbox).is_some_and(|condition| condition.reason == "AgentRunning")
+            })
+            .await
+            .expect("explicit network policy sandbox should reach Ready=True");
+
+            let recorded =
+                crate::mxc::mock_recorded_config(sandbox_id).expect("mock recorded config");
+            assert_eq!(recorded["network"]["egress"]["default"], "deny");
+            assert_eq!(
+                recorded["network"]["egress"]["allow"],
+                serde_json::json!([{"to": [{"cidr": "127.0.0.1/32"}]}])
+            );
+            assert!(recorded["network"].get("proxy").is_none());
+
+            let proxy_addr = {
+                let registry = backend.registry.lock().await;
+                let entry = registry.get(sandbox_id).expect("registry entry");
+                assert!(
+                    entry.host_proxy.is_some(),
+                    "{sandbox_id}: governed egress must hold a live host proxy"
+                );
+                assert_eq!(
+                    entry.trimmed_policy.as_ref().unwrap().network_policies,
+                    policy.network_policies
+                );
+                entry.proxy_addr.expect("proxy address")
+            };
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::net::TcpStream::connect(proxy_addr),
+            )
+            .await
+            .expect("proxy listener connect timed out")
+            .expect("proxy listener must accept connections");
+
+            let child_env = recorded["process"]["env"].as_array().expect("child env");
+            let proxy_env = child_env
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .find_map(|entry| entry.strip_prefix("HTTP_PROXY="))
+                .expect("HTTP_PROXY must direct clients to the authenticated proxy");
+            let (credentials, address) = proxy_env
+                .strip_prefix("http://openshell:")
+                .and_then(|value| value.split_once('@'))
+                .expect("proxy URL must contain the per-sandbox credential");
+            assert!(!credentials.is_empty());
+            assert_eq!(address, proxy_addr.to_string());
+
+            backend
+                .stop_sandbox(sandbox_id)
+                .await
+                .expect("stop should clean up the governed egress proxy");
+            assert!(
+                backend
+                    .registry
+                    .lock()
+                    .await
+                    .get(sandbox_id)
+                    .is_some_and(|entry| entry.host_proxy.is_none()),
+                "{sandbox_id}: stop must drop the host proxy handle"
+            );
+            assert!(
+                backend
+                    .delete_sandbox(&sandbox.id, &sandbox.name)
+                    .await
+                    .expect("delete after stop"),
+                "sandbox should be removed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_network_policy_does_not_activate_host_proxy() {
         let tmp = tempfile::tempdir().unwrap();
         let share = tmp.path().to_string_lossy().replace('\\', "/");
-        let hello = format!("{share}/hello.txt");
-        let cmd = vec![
-            "powershell".into(),
-            "-NoProfile".into(),
-            "-Command".into(),
-            format!("Set-Content -LiteralPath {hello} -Value hi"),
-        ];
-        let config = MxcComputeConfig {
+        let (_shell, command) = long_running_command(&share);
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig {
             backend: MxcBackend::ProcessContainer,
             egress_proxy: true,
             egress_proxy_addr: "127.0.0.1:18080".into(),
             ..Default::default()
-        };
-        let backend = MxcComputeBackend::new_mocked(config);
-        let mut stream = backend.watch_sandboxes().await;
-
-        let mut policy = fs_policy(&[&share]);
-        policy.network_policies.insert(
-            "api".into(),
-            NetworkPolicyRule {
-                name: "api".into(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "example.com".into(),
-                    ports: vec![443],
-                    protocol: "rest".into(),
-                    ..Default::default()
-                }],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/curl".into(),
-                    ..Default::default()
-                }],
-            },
-        );
+        });
         let sandbox = with_policy(
-            driver_sandbox_with_command("sb-egress", &share, cmd),
-            policy.clone(),
+            driver_sandbox_with_command("sb-egress-default", &share, command),
+            fs_policy(&[&share]),
         );
 
         backend
             .create_sandbox(&sandbox)
             .await
             .expect("create accepted");
-
-        let ready = wait_for(&backend, "sb-egress", |s| {
-            ready_condition(s).is_some_and(|c| c.status == "True" && c.reason == "AgentRunning")
+        wait_for(&backend, &sandbox.name, |sandbox| {
+            ready_condition(sandbox).is_some_and(|condition| condition.reason == "AgentRunning")
         })
-        .await;
+        .await
+        .expect("default-policy sandbox should reach Ready=True");
+
+        let recorded = crate::mxc::mock_recorded_config(&sandbox.id).expect("mock recorded config");
+        let registry = backend.registry.lock().await;
+        let entry = registry.get(&sandbox.id).expect("registry entry");
+        assert!(entry.proxy_addr.is_none());
+        assert!(entry.host_proxy.is_none());
+        assert!(entry.trimmed_policy.is_none());
+        drop(registry);
+        assert!(recorded.get("network").is_none());
         assert!(
-            ready.is_some(),
-            "egress split sandbox should reach Ready=True"
+            recorded["process"]["env"]
+                .as_array()
+                .expect("child env")
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .all(|entry| !PROXY_ENV_KEYS.iter().any(|key| {
+                    entry
+                        .split_once('=')
+                        .is_some_and(|(entry_key, _)| entry_key.eq_ignore_ascii_case(key))
+                }))
         );
 
-        let recorded = crate::mxc::mock_recorded_config("sb-egress").expect("mock recorded config");
-        assert_eq!(recorded["version"], "0.8.0-alpha");
-        assert_eq!(recorded["network"]["egress"]["default"], "deny");
-        assert_eq!(
-            recorded["network"]["egress"]["allow"],
-            serde_json::json!([{"to": [{"cidr": "127.0.0.1/32"}]}])
+        backend.stop_sandbox(&sandbox.name).await.expect("stop");
+        assert!(
+            backend
+                .delete_sandbox(&sandbox.id, &sandbox.name)
+                .await
+                .expect("delete after stop")
         );
-        assert!(recorded["network"].get("allowedHosts").is_none());
-        assert!(recorded["network"].get("blockedHosts").is_none());
-        assert!(recorded["network"].get("proxy").is_none());
-        assert!(recorded.get("networkProxy").is_none());
+    }
 
-        let reg = backend.registry.lock().await;
-        let entry = reg.get("sb-egress").expect("registry entry");
-        let entry_proxy_addr = entry.proxy_addr.expect("proxy addr");
-        assert_eq!(
-            entry_proxy_addr.ip(),
-            std::net::IpAddr::from([127, 0, 0, 1])
+    #[test]
+    fn empty_network_policy_rejects_unrestricted_fallback() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig {
+            backend: MxcBackend::ProcessContainer,
+            pc_network_allow: true,
+            egress_proxy: true,
+            egress_proxy_addr: "127.0.0.1:18080".into(),
+            ..Default::default()
+        });
+        let sandbox = with_policy(
+            driver_sandbox("sb-egress-unrestricted-fallback"),
+            fs_policy(&[]),
         );
-        assert_ne!(entry_proxy_addr.port(), 0);
-        let child_env = recorded["process"]["env"].as_array().expect("child env");
-        let proxy_env = child_env
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .find_map(|entry| entry.strip_prefix("HTTP_PROXY="))
-            .expect("HTTP_PROXY must direct clients to the authenticated proxy");
-        let (credentials, address) = proxy_env
-            .strip_prefix("http://openshell:")
-            .and_then(|value| value.split_once('@'))
-            .expect("proxy URL must contain the per-sandbox credential");
-        assert!(!credentials.is_empty());
-        assert_eq!(address, entry_proxy_addr.to_string());
-        assert_eq!(
-            entry.trimmed_policy.as_ref().unwrap().network_policies,
-            policy.network_policies
-        );
-        drop(reg);
 
-        let mut saw_redirect = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
-                Ok(Some(Ok(ev))) => {
-                    if let Some(watch_sandboxes_event::Payload::PlatformEvent(pe)) = ev.payload
-                        && pe
-                            .event
-                            .as_ref()
-                            .is_some_and(|e| e.reason == "EgressRedirect")
-                    {
-                        saw_redirect = true;
-                        break;
-                    }
-                }
-                Ok(_) => break,
-                Err(_) => {}
-            }
-        }
-        assert!(saw_redirect, "expected EgressRedirect platform event");
+        let error = backend
+            .validate_sandbox_create(&sandbox)
+            .expect_err("mixed egress configuration must fail closed without network rules");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("egress_proxy"));
+        assert!(error.message().contains("pc_network_allow"));
+        assert!(error.message().contains("unrestricted egress fallback"));
     }
 
     #[tokio::test]

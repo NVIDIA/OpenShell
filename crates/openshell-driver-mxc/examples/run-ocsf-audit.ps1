@@ -144,6 +144,9 @@ try {
   $shareDirPolicy = $ShareDir.Replace('\', '/')
   $shareDirJson = ConvertTo-Json $shareDirPolicy -Compress
   $policyText = Get-Content $policySrc -Raw
+  if (-not $proxyOn) {
+    $policyText = [regex]::Replace($policyText, '(?ms)^network_policies:\s*.*\z', '')
+  }
   $defaultGrant = '    - "C:/work/openshell-mxc-demo"'
   if (-not $policyText.Contains($defaultGrant)) {
     throw "policy template does not contain the expected default ShareDir grant"
