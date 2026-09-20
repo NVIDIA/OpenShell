@@ -508,14 +508,6 @@ fn allocate_sandbox_proxy_addr(
 const MINIMAL_WINDOWS_BOOTSTRAP_ENV: [&str; 5] =
     ["SYSTEMROOT", "WINDIR", "PATH", "COMSPEC", "LOCALAPPDATA"];
 
-fn host_proxy_binary_path(config: &MxcSandboxConfig) -> PathBuf {
-    config
-        .command
-        .first()
-        .filter(|command| !command.trim().is_empty())
-        .map_or_else(|| PathBuf::from("mxc-agent"), PathBuf::from)
-}
-
 const TLS_ENV_KEYS: [&str; 6] = [
     "NODE_EXTRA_CA_CERTS",
     "DENO_CERT",
@@ -1461,7 +1453,6 @@ async fn run_lifecycle(
             openshell_supervisor_network::host::HostProxyConfig {
                 bind_addr: addr,
                 policy: proxy_policy,
-                binary_path: host_proxy_binary_path(&sandbox_config),
                 client_auth: proxy_auth.host_client_auth(),
                 sandbox_id: Some(sandbox_id.clone()),
                 sandbox_name: Some(sandbox_name.clone()),

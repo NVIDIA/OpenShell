@@ -163,7 +163,7 @@ pub struct Networking {
     _transparent_tcp: Option<crate::proxy::TransparentTcpHandle>,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn current_exe_static_identity_path() -> Result<std::path::PathBuf> {
     std::env::current_exe().map_err(|e| {
         miette::miette!("failed to resolve supervisor executable for static proxy identity: {e}")
@@ -441,7 +441,7 @@ pub async fn run_networking(
             ProxyIdentityMode::procfs(cache, entrypoint_pid.clone())
         };
         #[cfg(target_os = "windows")]
-        let identity_mode = ProxyIdentityMode::static_binary(current_exe_static_identity_path()?)?;
+        let identity_mode = ProxyIdentityMode::windows_with_client_auth(None);
         #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
         let identity_mode = ProxyIdentityMode::static_binary(current_exe_static_identity_path()?)?;
 

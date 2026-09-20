@@ -61,10 +61,6 @@ pub struct HostProxyConfig {
     pub bind_addr: SocketAddr,
     /// Network-only policy produced by the compute driver's policy split.
     pub policy: ProtoSandboxPolicy,
-    /// Static process identity used when the platform cannot recover the
-    /// socket-owning sandbox process. Policy binaries must match this path for
-    /// L4/L7 allow rules to pass.
-    pub binary_path: PathBuf,
     /// Per-sandbox client authentication. Host-side MXC proxies must set this
     /// so another sandbox cannot borrow this proxy's identity and policy.
     pub client_auth: HostProxyClientAuth,
@@ -215,10 +211,9 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
             (None, None, None)
         }
     };
-    let identity_mode = ProxyIdentityMode::static_binary_with_client_auth(
-        config.binary_path,
-        Some(config.client_auth.expected_proxy_authorization),
-    )?;
+    let identity_mode = ProxyIdentityMode::windows_with_client_auth(Some(
+        config.client_auth.expected_proxy_authorization,
+    ));
     let proxy = ProxyHandle::start_with_bind_addr(
         &proxy_policy,
         Some(config.bind_addr),
@@ -256,14 +251,13 @@ mod tests {
 
     use super::*;
 
-    fn test_config(bind_addr: SocketAddr, binary_path: PathBuf) -> HostProxyConfig {
+    fn test_config(bind_addr: SocketAddr) -> HostProxyConfig {
         HostProxyConfig {
             bind_addr,
             policy: ProtoSandboxPolicy {
                 version: 1,
                 ..Default::default()
             },
-            binary_path,
             client_auth: HostProxyClientAuth::basic("openshell", "test-secret"),
             sandbox_id: Some("sandbox-123".to_string()),
             sandbox_name: Some("agent-box".to_string()),
@@ -307,7 +301,9 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+        // The first authenticated CONNECT performs a full executable hash for
+        // TOFU identity binding; debug test binaries can be hundreds of MB.
+        tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut response))
             .await
             .unwrap()
             .unwrap();
@@ -316,11 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_non_loopback_bind_addr() {
-        let result = start_host_proxy(test_config(
-            ([192, 0, 2, 1], 0).into(),
-            PathBuf::from("missing-agent.exe"),
-        ))
-        .await;
+        let result = start_host_proxy(test_config(([192, 0, 2, 1], 0).into())).await;
 
         let Err(err) = result else {
             panic!("host proxy should reject non-loopback bind addresses");
@@ -333,10 +325,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_middleware_policy_without_registry() {
-        let mut config = test_config(
-            ([127, 0, 0, 1], 0).into(),
-            PathBuf::from("missing-agent.exe"),
-        );
+        let mut config = test_config(([127, 0, 0, 1], 0).into());
         config.policy.network_middlewares.insert(
             "redactor".into(),
             NetworkMiddlewareConfig {
@@ -365,15 +354,9 @@ mod tests {
     #[tokio::test]
     async fn starts_loopback_proxy_and_serves_policy_local() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let binary = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(binary.path(), b"agent").unwrap();
-
-        let handle = start_host_proxy(test_config(
-            ([127, 0, 0, 1], 0).into(),
-            binary.path().to_path_buf(),
-        ))
-        .await
-        .unwrap();
+        let handle = start_host_proxy(test_config(([127, 0, 0, 1], 0).into()))
+            .await
+            .unwrap();
 
         let addr = handle.http_addr().expect("proxy should report bound addr");
         assert!(addr.ip().is_loopback());
@@ -413,9 +396,6 @@ mod tests {
 
     #[tokio::test]
     async fn per_sandbox_credentials_reject_missing_wrong_cross_and_duplicate_auth() {
-        let binary = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(binary.path(), b"agent").unwrap();
-
         let auth_a = HostProxyClientAuth::basic("openshell", "sandbox-a-secret");
         let auth_b = HostProxyClientAuth::basic("openshell", "sandbox-b-secret");
         // Node's EnvHttpProxyAgent currently emits the field name in lower
@@ -429,11 +409,11 @@ mod tests {
             auth_b.expected_proxy_authorization
         );
 
-        let mut config_a = test_config(([127, 0, 0, 1], 0).into(), binary.path().to_path_buf());
+        let mut config_a = test_config(([127, 0, 0, 1], 0).into());
         config_a.client_auth = auth_a;
         let proxy_a = start_host_proxy(config_a).await.unwrap();
 
-        let mut config_b = test_config(([127, 0, 0, 1], 0).into(), binary.path().to_path_buf());
+        let mut config_b = test_config(([127, 0, 0, 1], 0).into());
         config_b.client_auth = auth_b;
         let proxy_b = start_host_proxy(config_b).await.unwrap();
 

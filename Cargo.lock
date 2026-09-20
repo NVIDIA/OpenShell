@@ -4684,6 +4684,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-roots",
+ "windows",
 ]
 
 [[package]]

@@ -961,6 +961,171 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
     );
 }
 
+/// Prove that host-proxy binary policy follows the process that owns each TCP
+/// connection, rather than the sandbox entry command. This deliberately uses
+/// L4 CONNECT policy so the assertion is independent of TLS/L7 enforcement.
+#[tokio::test]
+#[ignore = "requires real wxc-exec and outbound HTTPS"]
+async fn pc_proxy_scopes_network_policy_to_socket_owner() {
+    let Some(wxc) = wxc_path() else {
+        eprintln!("SKIP: wxc-exec not found");
+        return;
+    };
+    if let Err(reason) = probe_processcontainer(&wxc) {
+        eprintln!("SKIP: processcontainer not live: {reason}");
+        return;
+    }
+
+    // QueryFullProcessImageNameW returns this Win32 spelling on the Windows
+    // test image. Keep the spelling exact here; path and case normalization
+    // are covered separately.
+    let cmd = PathBuf::from(r"C:\Windows\System32\cmd.exe");
+    let curl = PathBuf::from(r"C:\Windows\System32\curl.exe");
+    if !cmd.exists() || !curl.exists() {
+        eprintln!(
+            "SKIP: expected Windows binaries are absent (cmd={}, curl={})",
+            cmd.display(),
+            curl.display()
+        );
+        return;
+    }
+
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    run_proxy_binary_scope_case(&wxc, "pc-owner-allow-child", &cmd, &curl, &curl, true).await;
+    run_proxy_binary_scope_case(&wxc, "pc-owner-deny-child", &cmd, &curl, &cmd, false).await;
+}
+
+async fn run_proxy_binary_scope_case(
+    wxc: &Path,
+    sandbox_id: &str,
+    cmd: &Path,
+    curl: &Path,
+    allowed_binary: &Path,
+    expect_allowed: bool,
+) {
+    let output_dir = tempfile::tempdir().expect("proxy scope output directory");
+    let output_path = output_dir.path().join("example.html");
+    let diagnostic_path = output_dir.path().join("curl-diagnostic.txt");
+    let output_dir_string = output_dir.path().to_string_lossy().into_owned();
+    let command = vec![
+        cmd.to_string_lossy().into_owned(),
+        "/d".to_string(),
+        "/c".to_string(),
+        format!(
+            "echo proxy-scope 1>\"{}\" && \"{}\" --fail --silent --show-error --ssl-no-revoke --cacert \"%CURL_CA_BUNDLE%\" https://example.com/ --output \"{}\" 2>>\"{}\"",
+            diagnostic_path.display(),
+            curl.display(),
+            output_path.display(),
+            diagnostic_path.display()
+        ),
+    ];
+    let serde_json::Value::Object(driver_config) = serde_json::json!({
+        "command": command,
+        "cwd": output_dir_string,
+    }) else {
+        unreachable!();
+    };
+    let policy = SandboxPolicy {
+        version: 1,
+        filesystem: Some(FilesystemPolicy {
+            include_workdir: false,
+            read_only: Vec::new(),
+            read_write: vec![output_dir_string],
+        }),
+        network_policies: std::collections::HashMap::from([(
+            "https_example".to_string(),
+            NetworkPolicyRule {
+                name: "https-example".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.com".to_string(),
+                    ports: vec![443],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: allowed_binary.to_string_lossy().into_owned(),
+                }],
+            },
+        )]),
+        ..Default::default()
+    };
+    let sandbox = DriverSandbox {
+        id: sandbox_id.to_string(),
+        name: sandbox_id.to_string(),
+        spec: Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(
+                    openshell_core::proto_struct::json_object_to_struct(driver_config)
+                        .expect("driver config"),
+                ),
+                ..Default::default()
+            }),
+            policy: Some(policy),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let backend = MxcComputeBackend::new(MxcComputeConfig {
+        wxc_exec_path: wxc.to_string_lossy().into_owned(),
+        egress_proxy: true,
+        egress_proxy_addr: "127.0.0.1:18080".to_string(),
+        ..Default::default()
+    });
+    backend
+        .create_sandbox(&sandbox)
+        .await
+        .expect("real proxy-scope sandbox create accepted");
+
+    let mut terminal_condition = None;
+    for _ in 0..600 {
+        if let Some(observed) = backend.get_sandbox(sandbox_id).await
+            && let Some(condition) = observed
+                .status
+                .and_then(|status| status.conditions.into_iter().find(|c| c.r#type == "Ready"))
+            && matches!(
+                condition.reason.as_str(),
+                "AgentCompleted" | "ExecFailed" | "ProvisionFailed"
+            )
+        {
+            terminal_condition = Some(condition);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let condition = terminal_condition.expect("proxy-scope sandbox should terminate");
+    let diagnostic = std::fs::read_to_string(&diagnostic_path)
+        .unwrap_or_else(|error| format!("failed to read curl diagnostic: {error}"));
+    backend
+        .delete_sandbox(sandbox_id, sandbox_id)
+        .await
+        .expect("delete completed proxy-scope sandbox");
+
+    if expect_allowed {
+        assert_eq!(
+            condition.reason, "AgentCompleted",
+            "declared child binary must be allowed: {}; diagnostic: {diagnostic}",
+            condition.message
+        );
+        assert!(
+            std::fs::metadata(&output_path).is_ok_and(|metadata| metadata.len() > 0),
+            "allowed curl response should be non-empty; diagnostic: {diagnostic}"
+        );
+    } else {
+        assert_eq!(
+            condition.reason, "ExecFailed",
+            "entry-command grant must not be inherited by curl: {}; diagnostic: {diagnostic}",
+            condition.message
+        );
+        assert!(
+            diagnostic.contains("403"),
+            "undeclared curl child should receive proxy 403; diagnostic: {diagnostic}"
+        );
+        assert!(
+            !output_path.exists(),
+            "denied curl child must not write an HTTPS response"
+        );
+    }
+}
+
 /// Write to a path OUTSIDE the granted dir; assert exit non-zero and file absent.
 /// This is the genuine OS default-deny proof — the `AppContainer` blocks the write
 /// without requiring any host ACL lockdown. The mock can only fake this.

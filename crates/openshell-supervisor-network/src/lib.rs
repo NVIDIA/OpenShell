@@ -21,6 +21,8 @@ pub mod run;
 pub mod sigv4;
 mod token_grant;
 pub mod upstream_proxy;
+#[cfg(target_os = "windows")]
+pub(crate) mod windows_process;
 
 #[cfg(test)]
 pub(crate) mod test_alloc {
