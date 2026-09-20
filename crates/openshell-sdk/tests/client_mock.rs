@@ -878,11 +878,22 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<proto::WatchSandboxRequest>,
     ) -> Result<Response<Self::WatchSandboxStream>, Status> {
         let dial = self.state.watch_calls.fetch_add(1, Ordering::SeqCst) as usize;
-        self.state
-            .last_watch_requests
-            .lock()
-            .await
-            .push(request.into_inner());
+        let req = request.into_inner();
+
+        // The gateway resolves `sandbox` as a workspace-scoped canonical name,
+        // so an object ID here is NOT_FOUND rather than a silent no-op stream.
+        // Mirrored so every watch test fails on ID-addressed requests.
+        let resolved = self.state.last_get_name.lock().await.clone();
+        if let Some(resolved) = resolved
+            && req.sandbox != resolved
+        {
+            return Err(Status::not_found(format!(
+                "sandbox '{}' not found",
+                req.sandbox
+            )));
+        }
+
+        self.state.last_watch_requests.lock().await.push(req);
 
         let script = self.state.watch_script.get(dial).cloned();
         if let Some(WatchDial {
@@ -2314,4 +2325,47 @@ async fn watch_logs_gap_terminates_out_of_range() {
     // for -- a trimmed cursor or one from a retired cursor space -- because
     // reconnecting would silently paper over events that are already lost.
     assert_eq!(state.last_watch_requests.lock().await.len(), 1);
+}
+
+// `sandbox` addresses a workspace-scoped canonical name, and the mock's
+// `id-{name}` ids differ from the names, so sending a resolved object id here
+// reaches the gateway as NOT_FOUND and the watch never streams.
+#[tokio::test]
+async fn watch_logs_addresses_the_sandbox_by_canonical_name() {
+    for workspace in ["default", "production"] {
+        let state = Arc::new(MockState {
+            phase_sequence: vec![proto::SandboxPhase::Ready],
+            watch_script: vec![WatchDial {
+                events: vec![log_event(1, "a")],
+                end: DialEnd::Clean,
+            }],
+            ..Default::default()
+        });
+        let endpoint = start_mock(state.clone()).await;
+        let client = connect(&endpoint).await;
+
+        let scoped = client.workspace(workspace);
+        let mut stream: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = _>>> =
+            if workspace == "default" {
+                Box::pin(client.watch_logs("watched", watch_opts()))
+            } else {
+                Box::pin(scoped.watch_logs("watched", watch_opts()))
+            };
+
+        assert!(
+            matches!(
+                stream.next().await.unwrap().unwrap(),
+                WatchEvent::Log { ref cursor, .. } if *cursor == test_cursor(1)
+            ),
+            "{workspace}: first event must stream"
+        );
+
+        let reqs = state.last_watch_requests.lock().await;
+        assert_eq!(reqs.len(), 1, "{workspace}");
+        assert_eq!(reqs[0].sandbox, "watched", "{workspace}: name, not id");
+        assert_eq!(
+            selected_workspace(&reqs[0].workspace_scope),
+            Some(workspace)
+        );
+    }
 }
