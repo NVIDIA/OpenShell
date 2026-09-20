@@ -39,7 +39,7 @@ fn read_example(name: &str) -> String {
 }
 
 #[test]
-fn shipped_inference_configs_follow_current_gateway_contract() {
+fn shipped_inference_configs_declare_required_mxc_settings() {
     for name in ["mxc-ollama.toml", "mxc-inference.toml"] {
         let source = read_example(name);
         let parsed: Value = toml::from_str(&source)
@@ -83,18 +83,18 @@ fn shipped_inference_configs_follow_current_gateway_contract() {
 
 #[test]
 fn shipped_inference_policies_are_narrow_and_valid_after_rendering() {
+    let share = if cfg!(windows) {
+        "C:/portable/demo"
+    } else {
+        "/portable/demo"
+    };
     let fixtures = [
-        (
-            "ollama.yaml",
-            "local_ollama",
-            "127.0.0.1",
-            "C:/portable/demo",
-        ),
+        ("ollama.yaml", "local_ollama", "127.0.0.1", share),
         (
             "inference.yaml",
             "nvidia_inference",
             "integrate.api.nvidia.com",
-            "C:/portable/demo",
+            share,
         ),
     ];
     for (name, rule_name, endpoint, share) in fixtures {
@@ -152,6 +152,8 @@ fn shipped_runners_supply_sandbox_scoped_workload_configuration() {
     let cloud = read_example("run-inference-test.ps1");
     assert!(cloud.contains("--env-from"));
     assert!(cloud.contains("NV_API_KEY"));
+    assert!(!cloud.contains("[string] $ApiKey"));
+    assert!(!cloud.contains("pass -ApiKey"));
     assert!(cloud.contains("nvidia/nemotron-3.5-lightning-30b-a3b"));
     assert!(!cloud.contains("nvidia/nvidia-nemotron-nano-9b-v2"));
 }

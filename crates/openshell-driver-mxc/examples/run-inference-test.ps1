@@ -5,7 +5,6 @@
 
 [CmdletBinding()]
 param(
-    [string] $ApiKey = $env:NV_API_KEY,
     [string] $WxcExecPath,
     [string] $GatewayPath,
     [string] $CliPath,
@@ -135,10 +134,11 @@ $failure = $null
 $oldGatewayConfig = $env:OPENSHELL_GATEWAY_CONFIG
 $oldComputeDriver = $env:OPENSHELL_COMPUTE_DRIVER
 $oldApiKey = $env:NV_API_KEY
+$apiKey = $env:NV_API_KEY
 
 try {
-    if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-        throw "NV_API_KEY is missing. Set `$env:NV_API_KEY or pass -ApiKey; the key is forwarded with --env-from and is never written to disk."
+    if ([string]::IsNullOrWhiteSpace($apiKey)) {
+        throw "NV_API_KEY is missing. Set `$env:NV_API_KEY; the key is forwarded with --env-from and is never written to disk or placed in argv."
     }
     $gateway = Resolve-Executable $GatewayPath "openshell-gateway.exe" ""
     $cli = Resolve-Executable $CliPath "openshell.exe" ""
@@ -219,7 +219,7 @@ try {
     try {
         $gatewayProcess = Start-Process -FilePath $gateway -ArgumentList @("--disable-tls", "--db-url", "sqlite::memory:", "--port", "$Port", "--log-level", "info") -WorkingDirectory $here -PassThru -WindowStyle Hidden -RedirectStandardOutput $gwLog -RedirectStandardError $gwErrLog
     } finally {
-        $env:NV_API_KEY = $ApiKey
+        $env:NV_API_KEY = $apiKey
     }
     $deadline = (Get-Date).AddSeconds(30)
     while ((Get-Date) -lt $deadline -and -not (Test-Port $Port)) {
@@ -252,7 +252,7 @@ try {
             }
             $curlDetail = if (Test-Path -LiteralPath $errorPath) { ([System.IO.File]::ReadAllText($errorPath)).Trim() } else { "no curl diagnostic was produced" }
             $diagnostic = "sandbox was created, but cloud inference failed (HTTP $httpStatus): $apiDetail $curlDetail".Trim()
-            throw $diagnostic.Replace($ApiKey, "***REDACTED***")
+            throw $diagnostic.Replace($apiKey, "***REDACTED***")
         }
         Start-Sleep -Milliseconds 500
     }
