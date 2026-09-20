@@ -524,10 +524,7 @@ fn report_endpoint_l7_losses(endpoint: &NetworkEndpoint, path: &str, items: &mut
             items,
             &format!("{path}.tls"),
             severity,
-            &format!(
-                "MXC has no OpenShell TLS inspection mode equivalent for '{}'.",
-                tls
-            ),
+            &format!("MXC has no OpenShell TLS inspection mode equivalent for '{tls}'."),
             "TLS inspection mode",
             "MXC network policy is host-level only.",
         );
@@ -563,7 +560,7 @@ fn report_endpoint_l7_losses(endpoint: &NetworkEndpoint, path: &str, items: &mut
             items,
             &format!("{path}.access"),
             "error",
-            &format!("MXC has no access preset equivalent for '{}'.", access),
+            &format!("MXC has no access preset equivalent for '{access}'."),
             "REST/WebSocket/GraphQL access preset",
             "MXC cannot enforce method or operation-level access.",
         );
