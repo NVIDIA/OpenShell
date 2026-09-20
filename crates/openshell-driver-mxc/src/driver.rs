@@ -841,7 +841,7 @@ impl MxcComputeBackend {
         }
     }
 
-    fn validate_sandbox_fields(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
+    fn validate_sandbox_fields(sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
         if let Some(spec) = &sandbox.spec {
             if effective_driver_gpu_count(driver_gpu_requirements(
                 spec.resource_requirements.as_ref(),
@@ -884,7 +884,7 @@ impl MxcComputeBackend {
     }
 
     pub fn validate_sandbox_create(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
-        self.validate_sandbox_fields(sandbox)?;
+        Self::validate_sandbox_fields(sandbox)?;
         let policy = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref());
         let egress_addr = governed_egress_addr(&self.config, policy)?;
         self.map_sandbox_policy(&sandbox.id, policy, egress_addr)?;
@@ -915,7 +915,7 @@ impl MxcComputeBackend {
             .remove(&sandbox_id);
         validate_provider_child_env_keys(provider_credentials.as_ref())?;
 
-        self.validate_sandbox_fields(sandbox)?;
+        Self::validate_sandbox_fields(sandbox)?;
         let sandbox_config = sandbox_config(sandbox)?;
         let policy = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref());
         let (egress_addr, reserved_proxy_listener) = match governed_egress_addr(
