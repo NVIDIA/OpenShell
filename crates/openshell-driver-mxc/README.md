@@ -23,7 +23,7 @@ it does not implement the Linux `ConnectSupervisor` protocol.
 |---|---|
 | Filesystem policy | Read-only/read-write grants come only from `SandboxPolicy`. `process_container` enforces default-deny; `isolation_session` is an explicit grant-only compatibility mode. |
 | UI policy | `process_container` advertises complete support and maps portable graphical UI, clipboard-direction, and input-injection controls to MXC; omitted fields inside an explicit section deny. `isolation_session` advertises no support, so the gateway rejects any explicit section before provisioning. |
-| Network policy | With `egress_proxy = true` on `process_container`, split into MXC 0.8 loopback-only egress plus the full policy enforced by a per-sandbox OpenShell host CONNECT proxy. The driver injects proxy environment variables for proxy-aware clients; direct Internet access remains denied by MXC. Otherwise rejected synchronously. `isolation_session` remains fail-closed. |
+| Network policy | With `egress_proxy = true` on `process_container`, an explicit `network_policies` rule activates MXC 0.8 loopback-only egress plus the full policy enforced by a per-sandbox OpenShell host CONNECT proxy. The driver injects proxy environment variables for proxy-aware clients; direct Internet access remains denied by MXC. A policy without network rules does not activate the proxy. Otherwise rejected synchronously. `isolation_session` remains fail-closed. |
 | Provider credentials | The child receives revision-scoped placeholders and non-secret provider environment only. The per-sandbox host proxy retains the resolver and substitutes credentials only for their bound endpoints. |
 | Process policy | Unsupported; MXC supplies OS isolation only. |
 | Dynamic forwarding | Supported through `openshell-supervisor-relay`; interactive exec/connect remain unsupported. |
@@ -60,6 +60,10 @@ pc_relay_target_port  = 0
 # (SYSTEMROOT/WINDIR/PATH/COMSPEC/LOCALAPPDATA); pc_minimal_env starts from an
 # EMPTY env for runtimes that need a fully curated per-sandbox environment.
 pc_minimal_env = false
+# processContainer only: compatibility fallback for unrestricted outbound TCP.
+# A sandbox with egress_proxy enabled but no explicit network rules rejects
+# this fallback instead of silently changing governed egress to allow-all.
+pc_network_allow = false
 # processContainer only: include "allowLocalNetwork": true in the MXC
 # network section. This compatibility setting broadens network access and is
 # not required by the BaseContainer qualification profile.
@@ -72,8 +76,14 @@ etw_audit = false
 ```
 
 When `egress_proxy` is enabled, `egress_proxy_addr` must be a loopback
-`IP:PORT` seed. The driver preserves the configured IP and allocates a unique
-ephemeral port for each sandbox's authenticated host CONNECT proxy.
+`IP:PORT` seed. For policies with explicit network rules, the driver preserves
+the configured IP and allocates a unique ephemeral port for that sandbox's
+authenticated host CONNECT proxy.
+
+`pc_network_allow = true` is an explicit unrestricted-egress compatibility
+fallback. If it is combined with `egress_proxy = true`, a sandbox policy
+without explicit network rules is rejected synchronously rather than falling
+through from governed egress to `defaultPolicy = "allow"`.
 
 Supply workload settings for each sandbox. The public config is keyed by driver name; the gateway forwards only the inner `mxc` object to the driver:
 
@@ -87,7 +97,7 @@ The `command` array is required and preserves Windows argument boundaries. `cwd`
 
 UI capability (Win32k syscalls, clipboard, input injection) is a `SandboxPolicy` concern, not gateway TOML -- see the Capability Matrix above and `docs/reference/policy-schema.mdx`'s `ui` section. Defaults to disabled (Win32k syscall lockdown) when a policy has no explicit `ui:` section; set `allow_graphical_ui: true` for agents that touch user32/gdi32 at startup even without opening a real window (e.g. Node.js-based targets like OpenClaw's gateway -- see `examples/e2e-policies/openclaw-gateway.yaml`).
 
-`egress_proxy_addr` must be a `127.0.0.1:PORT` address. The port acts only as a configuration seed: the driver reserves a unique ephemeral loopback port for every sandbox. MXC 0.8 denies direct Internet egress and permits `127.0.0.1/32`; the driver points proxy-aware clients at the per-sandbox listener using environment variables. The current policy permits all loopback ports, so sandboxes can also reach unrelated host services bound to loopback. Control-channel forwarding does not require the legacy reverse-WebSocket connections to fresh host ports; restricting the generated policy is separate hardening work. Do not treat this path as loopback-service isolation. Live policy replacement or merge updates remain unsupported; delete and recreate the sandbox to apply a different policy.
+`egress_proxy_addr` must be a `127.0.0.1:PORT` address. The port acts only as a configuration seed: for a sandbox policy with explicit network rules, the driver reserves a unique ephemeral loopback port. MXC 0.8 denies direct Internet egress and permits `127.0.0.1/32`; the driver points proxy-aware clients at the per-sandbox listener using environment variables. A policy without network rules keeps MXC's default network posture and receives neither a host listener nor proxy environment variables. The current governed-egress policy permits all loopback ports, so governed sandboxes can also reach unrelated host services bound to loopback. Control-channel forwarding does not require the legacy reverse-WebSocket connections to fresh host ports; restricting the generated policy is separate hardening work. Do not treat this path as loopback-service isolation. Live policy replacement or merge updates remain unsupported; delete and recreate the sandbox to apply a different policy.
 
 When `etw_audit` is enabled, each gateway process owns a distinct real-time ETW
 session named from the stable `OpenShell-MXC-ETW` prefix, its process ID, and a
@@ -142,8 +152,9 @@ or MXC-specific gateway composition variant. Provider resolver state uses a
 separate, create-scoped in-process handoff because it intentionally cannot be
 represented in the public compute-driver protobuf.
 
-When `egress_proxy` is enabled, `EmbeddedPolicyMapper` uses `split_policy`
-instead: MXC receives filesystem grants plus loopback-only egress,
+When `egress_proxy` is enabled and the policy contains explicit network rules,
+`EmbeddedPolicyMapper` uses `split_policy` instead: MXC receives filesystem
+grants plus loopback-only egress,
 and the driver starts a host CONNECT proxy from the trimmed
 network-only `SandboxPolicy`. Policies containing `network_middlewares` are
 rejected synchronously until this host-proxy path can receive the gateway's
