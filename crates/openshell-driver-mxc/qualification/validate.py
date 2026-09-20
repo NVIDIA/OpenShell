@@ -504,7 +504,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         contract = load_json(args.manifest)
         if args.mode == "contract":
-            errors = validate_contract(contract, repo_root=repo_root)
+            errors = validate_contract(contract, repo_root=args.repo_root)
         else:
             record = load_json(args.record)
             errors = validate_evidence(
