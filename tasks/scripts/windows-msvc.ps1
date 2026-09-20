@@ -518,6 +518,29 @@ function Invoke-Build([string] $RustTarget) {
         -RustTarget $RustTarget `
         -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell --bin openshell-supervisor-relay $Z3GatewayFeatures" `
         -LogName "build-$RustTarget-release.log"
+
+    $z3Runtime = if ([string]::IsNullOrWhiteSpace($env:Z3_LIBRARY_PATH_OVERRIDE)) {
+        $buildRoot = Join-Path $TargetDir "$RustTarget\release\build"
+        $candidates = @(
+            Get-ChildItem -Path $buildRoot -Filter "libz3.dll" -File -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -like "*\z3-$PrebuiltZ3Version\bin\libz3.dll" } |
+                Sort-Object LastWriteTimeUtc -Descending
+        )
+        if ($candidates.Count -eq 0) {
+            throw "The prebuilt Z3 runtime was not found under: $buildRoot"
+        }
+        $candidates[0].FullName
+    } else {
+        $path = Join-Path $env:Z3_LIBRARY_PATH_OVERRIDE "libz3.dll"
+        if (-not (Test-Path $path -PathType Leaf)) {
+            throw "Z3_LIBRARY_PATH_OVERRIDE is set but libz3.dll was not found at: $path"
+        }
+        $path
+    }
+
+    $z3RuntimeDestination = Join-Path $TargetDir "$RustTarget\release\libz3.dll"
+    Copy-Item -LiteralPath $z3Runtime -Destination $z3RuntimeDestination -Force
+    Write-Host "==> Staged Z3 runtime: $z3RuntimeDestination"
 }
 
 function Invoke-Test([string] $RustTarget) {
@@ -555,7 +578,7 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
         $variant = if ($features) { $features.Replace(",", "-") } else { "protocol-only" }
         Invoke-VsCargo `
             -RustTarget $RustTarget `
-            -CargoArgs "cargo test -p openshell-gateway --lib --target $RustTarget --no-default-features $featureArgs $Z3ServerFeatures" `
+            -CargoArgs "cargo test -p openshell-gateway --lib --target $RustTarget --no-default-features $featureArgs $Z3GatewayFeatures" `
             -LogName "test-$RustTarget-selective-$variant.log"
     }
 }
@@ -585,7 +608,7 @@ function Get-Sha256([string] $Path) {
 function Show-Artifacts([string[]] $RustTargets) {
     $rows = @()
     foreach ($rustTarget in $RustTargets) {
-        foreach ($binary in @("openshell-gateway.exe", "openshell.exe", "openshell-supervisor-relay.exe")) {
+        foreach ($binary in @("openshell-gateway.exe", "openshell.exe", "openshell-supervisor-relay.exe", "libz3.dll")) {
             $path = Join-Path $TargetDir "$rustTarget\release\$binary"
             if (-not (Test-Path $path)) {
                 continue

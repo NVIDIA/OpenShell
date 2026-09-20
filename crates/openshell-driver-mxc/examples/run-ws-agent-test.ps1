@@ -359,15 +359,12 @@ try {
         }
         Ok "wxc-exec: $WxcExecPath"
 
-        # A real run exercises process_container with egress_proxy = true
-        # (mxc-ws-gateway.toml). MXC schema 0.8.0-alpha's network_json()
-        # (mxc.rs) now emits a direct egress.allow rule for 127.0.0.0/8
-        # instead of runtimeConfig.networkProxy when a proxy is configured,
-        # so the driver no longer calls the elevation-only
-        # NetworkIsolationSetAppContainerConfig -- process_container +
-        # egress_proxy selects the BaseContainer/PSEC tier and runs
-        # non-elevated. Elevation is therefore no longer required here; keep
-        # logging the elevation state for diagnostics only.
+        # A real run exercises process_container with egress_proxy disabled
+        # (mxc-ws-gateway.toml). The sandbox connects directly to the driver's
+        # route-selected private-interface relay listener through the
+        # privateNetworkClientServer capability; the governed host CONNECT
+        # proxy is not part of this qualification path. Elevation is not
+        # required here; keep logging the elevation state for diagnostics only.
         $wid   = [Security.Principal.WindowsIdentity]::GetCurrent()
         $wp    = New-Object Security.Principal.WindowsPrincipal($wid)
         $admin = $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)

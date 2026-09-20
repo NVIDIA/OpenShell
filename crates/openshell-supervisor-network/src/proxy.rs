@@ -6544,6 +6544,10 @@ network_policies:
             .expect("bind MCP upstream listener");
         let upstream_port = upstream_listener.local_addr().unwrap().port();
         let executable = std::env::current_exe().expect("current executable");
+        // JSON strings are valid YAML scalars and correctly escape Windows
+        // path separators such as `C:\\...`.
+        let executable_yaml =
+            serde_json::to_string(&executable.to_string_lossy()).expect("encode executable");
         let data = format!(
             r#"version: 1
 network_policies:
@@ -6559,9 +6563,8 @@ network_policies:
               method: tools/call
               tool: echo
     binaries:
-      - {{ path: "{executable}" }}
+      - {{ path: {executable_yaml} }}
 "#,
-            executable = executable.display(),
         );
         let mut policy = openshell_policy::parse_sandbox_policy(&data).expect("parse MCP policy");
         let endpoint = &mut policy

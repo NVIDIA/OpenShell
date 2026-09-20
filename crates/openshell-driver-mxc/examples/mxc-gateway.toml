@@ -7,6 +7,9 @@
 # Supply command and cwd through --driver-config-json when creating a sandbox,
 # and environment variables through the standard sandbox --env option.
 
+[openshell]
+version = 2
+
 [openshell.drivers.mxc]
 # Path to wxc-exec.exe. Required for live runs. Leave the default for mock-mode
 # smoke tests (set OPENSHELL_MXC_MOCK_WXC=1 instead).
