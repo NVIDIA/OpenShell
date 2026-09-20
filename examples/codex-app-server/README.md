@@ -29,12 +29,25 @@ client current as well to avoid app-server protocol incompatibilities.
 docker build --pull --no-cache --tag openshell/codex-app-server:local --file Dockerfile .
 ```
 
-## 2. Create the provider
+## 2. Import the provider profile
+
+The gateway starts with an empty provider-profile catalog. Validate and import
+the profile included with this example before creating the provider:
+
+```shell
+openshell provider profile lint --file codex.yaml
+```
+
+```shell
+openshell provider profile import --file codex.yaml
+```
+
+## 3. Create the provider
 
 These commands create a provider from the current host login, move the refresh
 token into gateway-only refresh material, and rotate the access token once. The
 sandbox receives opaque handles for only the access token and account ID; it
-never receives the refresh token. Run these commands once per gateway.
+never receives the refresh token. Run these commands once per workspace.
 
 ```shell
 openshell provider create \
@@ -58,7 +71,7 @@ openshell provider refresh rotate codex \
   --credential-key CODEX_AUTH_ACCESS_TOKEN
 ```
 
-## 3. Launch the sandbox
+## 4. Launch the sandbox
 
 ```shell
 openshell sandbox create \
@@ -94,5 +107,6 @@ codex --remote ws://default--codex-app-server.openshell.localhost:<gateway-port>
 ```shell
 openshell sandbox delete codex-app-server
 openshell provider delete codex
+openshell provider profile delete codex
 docker image rm openshell/codex-app-server:local
 ```

@@ -30,27 +30,13 @@ category: agent
 inference_capable: true
 credentials:
   - name: access_token
-    description: Codex OAuth access token refreshed by the gateway
+    description: Codex OAuth access token
     env_vars: [CODEX_AUTH_ACCESS_TOKEN]
     required: true
-    auth_style: bearer
-    header_name: authorization
-    refresh:
-      strategy: oauth2_refresh_token
-      token_url: https://auth.openai.com/oauth/token
-      refresh_before_seconds: 300
-      max_lifetime_seconds: 3600
-      material:
-        - name: client_id
-          description: Codex OAuth client ID
-          required: true
-        - name: refresh_token
-          description: Codex OAuth refresh token
-          required: true
-          secret: true
   - name: refresh_token
-    description: Codex OAuth refresh token for clients that manage their own refresh
+    description: Codex OAuth refresh token
     env_vars: [CODEX_AUTH_REFRESH_TOKEN]
+    required: true
   - name: account_id
     description: Codex account identifier
     env_vars: [CODEX_AUTH_ACCOUNT_ID]
