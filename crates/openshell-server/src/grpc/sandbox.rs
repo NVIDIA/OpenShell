@@ -75,6 +75,7 @@ use crate::persistence::current_time_ms;
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
 const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
 const MAX_TEMPLATES_PER_WORKSPACE: u32 = 1000;
+const SANDBOX_CAS_RETRY_LIMIT: usize = 16;
 
 #[derive(Debug)]
 pub struct WatchSandboxStream {
@@ -1255,38 +1256,37 @@ pub(super) async fn handle_attach_sandbox_provider(
     let attached_clone = attached.clone();
     let mutation_id = uuid::Uuid::new_v4().to_string();
 
-    let sandbox = state
-        .store
-        .update_message_cas::<Sandbox, _>(
-            &sandbox_id,
-            request.expected_resource_version,
-            |sandbox| {
-                attached_clone.store(false, Ordering::Relaxed);
-                let Some(ref mut spec) = sandbox.spec else {
-                    // Spec should always exist post-creation; if missing, fail CAS to surface error
-                    return;
-                };
+    let sandbox = update_sandbox_cas(
+        state,
+        &sandbox_id,
+        request.expected_resource_version,
+        |sandbox| {
+            attached_clone.store(false, Ordering::Relaxed);
+            let Some(ref mut spec) = sandbox.spec else {
+                // Spec should always exist post-creation; if missing, fail CAS to surface error
+                return;
+            };
 
-                if spec.provider_attachment_epoch.is_empty() {
-                    spec.provider_attachment_epoch.clone_from(&mutation_id);
-                }
+            if spec.provider_attachment_epoch.is_empty() {
+                spec.provider_attachment_epoch.clone_from(&mutation_id);
+            }
 
-                dedupe_provider_names(&mut spec.providers);
-                if !spec.providers.iter().any(|name| name == &provider_name)
-                    && spec.providers.len() < MAX_PROVIDERS
-                {
-                    spec.providers.push(provider_name.clone());
-                    spec.provider_attachment_epoch.clone_from(&mutation_id);
-                    attached_clone.store(true, Ordering::Relaxed);
-                    crate::compute::provisioning_deadline::attachments_changed(
-                        sandbox,
-                        current_time_ms(),
-                    );
-                }
-            },
-        )
-        .await
-        .map_err(|e| super::persistence_error_to_status(e, "attach sandbox provider"))?;
+            dedupe_provider_names(&mut spec.providers);
+            if !spec.providers.iter().any(|name| name == &provider_name)
+                && spec.providers.len() < MAX_PROVIDERS
+            {
+                spec.providers.push(provider_name.clone());
+                spec.provider_attachment_epoch.clone_from(&mutation_id);
+                attached_clone.store(true, Ordering::Relaxed);
+                crate::compute::provisioning_deadline::attachments_changed(
+                    sandbox,
+                    current_time_ms(),
+                );
+            }
+        },
+    )
+    .await
+    .map_err(|e| super::persistence_error_to_status(e, "attach sandbox provider"))?;
 
     let attached = attached.load(Ordering::Relaxed);
     let receipt = super::provider_readiness::record_provider_mutation(
@@ -1376,38 +1376,37 @@ pub(super) async fn handle_detach_sandbox_provider(
     let detached_clone = detached.clone();
     let mutation_id = uuid::Uuid::new_v4().to_string();
 
-    let sandbox = state
-        .store
-        .update_message_cas::<Sandbox, _>(
-            &sandbox_id,
-            request.expected_resource_version,
-            |sandbox| {
-                detached_clone.store(false, Ordering::Relaxed);
-                let Some(ref mut spec) = sandbox.spec else {
-                    // Spec should always exist post-creation; if missing, fail CAS to surface error
-                    return;
-                };
+    let sandbox = update_sandbox_cas(
+        state,
+        &sandbox_id,
+        request.expected_resource_version,
+        |sandbox| {
+            detached_clone.store(false, Ordering::Relaxed);
+            let Some(ref mut spec) = sandbox.spec else {
+                // Spec should always exist post-creation; if missing, fail CAS to surface error
+                return;
+            };
 
-                if spec.provider_attachment_epoch.is_empty() {
-                    spec.provider_attachment_epoch.clone_from(&mutation_id);
-                }
+            if spec.provider_attachment_epoch.is_empty() {
+                spec.provider_attachment_epoch.clone_from(&mutation_id);
+            }
 
-                let before_len = spec.providers.len();
-                spec.providers.retain(|name| name != &provider_name);
-                if spec.providers.len() != before_len {
-                    spec.provider_attachment_epoch.clone_from(&mutation_id);
-                    detached_clone.store(true, Ordering::Relaxed);
-                    // Only dedupe after making a change
-                    dedupe_provider_names(&mut spec.providers);
-                    crate::compute::provisioning_deadline::attachments_changed(
-                        sandbox,
-                        current_time_ms(),
-                    );
-                }
-            },
-        )
-        .await
-        .map_err(|e| super::persistence_error_to_status(e, "detach sandbox provider"))?;
+            let before_len = spec.providers.len();
+            spec.providers.retain(|name| name != &provider_name);
+            if spec.providers.len() != before_len {
+                spec.provider_attachment_epoch.clone_from(&mutation_id);
+                detached_clone.store(true, Ordering::Relaxed);
+                // Only dedupe after making a change
+                dedupe_provider_names(&mut spec.providers);
+                crate::compute::provisioning_deadline::attachments_changed(
+                    sandbox,
+                    current_time_ms(),
+                );
+            }
+        },
+    )
+    .await
+    .map_err(|e| super::persistence_error_to_status(e, "detach sandbox provider"))?;
 
     let detached = detached.load(Ordering::Relaxed);
     let receipt = super::provider_readiness::record_provider_mutation(
@@ -1638,26 +1637,78 @@ async fn mint_next_runtime_authentication(
         .and_then(|epoch| openshell_core::jwt::CredentialEpoch::new(epoch).ok())
         .ok_or_else(|| Status::internal("sandbox authorization epoch overflow"))?;
     let next = crate::auth::sandbox_session::PersistedSandboxIdentity {
-        runtime_generation: current.runtime_generation,
+        runtime_generation: current.runtime_generation.clone(),
         auth_epoch: next_epoch,
         gateway_token_id: uuid::Uuid::new_v4(),
         refresh_replay: None,
     };
     let authentication = authority.mint_persisted_launch(sandbox.object_id(), &next)?;
-    state
-        .store
-        .update_message_cas::<Sandbox, _>(
-            sandbox.object_id(),
-            metadata.resource_version,
-            |updated| {
+    persist_next_runtime_identity(
+        state,
+        sandbox.object_id(),
+        metadata.resource_version,
+        &current,
+        &next,
+    )
+    .await?;
+    Ok(authentication)
+}
+
+async fn persist_next_runtime_identity(
+    state: &ServerState,
+    sandbox_id: &str,
+    mut expected_resource_version: u64,
+    current: &crate::auth::sandbox_session::PersistedSandboxIdentity,
+    next: &crate::auth::sandbox_session::PersistedSandboxIdentity,
+) -> Result<(), Status> {
+    for attempt in 1..=SANDBOX_CAS_RETRY_LIMIT {
+        match state
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |updated| {
                 if let Some(metadata) = updated.metadata.as_mut() {
                     next.write(&mut metadata.annotations);
                 }
-            },
-        )
-        .await
-        .map_err(|error| Status::aborted(format!("persist sandbox runtime identity: {error}")))?;
-    Ok(authentication)
+            })
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(crate::persistence::PersistenceError::Conflict { .. })
+                if attempt < SANDBOX_CAS_RETRY_LIMIT =>
+            {
+                let latest = state
+                    .store
+                    .get_message::<Sandbox>(sandbox_id)
+                    .await
+                    .map_err(|error| {
+                        Status::internal(format!("fetch sandbox runtime identity: {error}"))
+                    })?
+                    .ok_or_else(|| Status::not_found("sandbox not found"))?;
+                let metadata = latest
+                    .metadata
+                    .as_ref()
+                    .ok_or_else(|| Status::failed_precondition("sandbox metadata is missing"))?;
+                let latest_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+                    &metadata.annotations,
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                if latest_identity != *current {
+                    return Err(Status::aborted(
+                        "sandbox runtime identity changed concurrently; retry start",
+                    ));
+                }
+                expected_resource_version = metadata.resource_version;
+            }
+            Err(error) => {
+                return Err(Status::aborted(format!(
+                    "persist sandbox runtime identity: {error}"
+                )));
+            }
+        }
+    }
+
+    Err(Status::aborted(
+        "persist sandbox runtime identity: retry limit exceeded",
+    ))
 }
 
 async fn providers_for_sandbox(
@@ -1685,6 +1736,34 @@ async fn providers_for_sandbox(
         providers.push(provider);
     }
     Ok(providers)
+}
+
+/// Apply a sandbox mutation with bounded retries when the server owns the
+/// resource version. Explicit client versions preserve fail-fast CAS behavior.
+/// The mutation may run more than once and must not perform external effects.
+async fn update_sandbox_cas<F>(
+    state: &ServerState,
+    sandbox_id: &str,
+    expected_resource_version: u64,
+    mut mutate: F,
+) -> crate::persistence::PersistenceResult<Sandbox>
+where
+    F: FnMut(&mut Sandbox),
+{
+    for attempt in 1..=SANDBOX_CAS_RETRY_LIMIT {
+        match state
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, &mut mutate)
+            .await
+        {
+            Ok(sandbox) => return Ok(sandbox),
+            Err(crate::persistence::PersistenceError::Conflict { .. })
+                if expected_resource_version == 0 && attempt < SANDBOX_CAS_RETRY_LIMIT => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("sandbox CAS retry loop always returns on its final attempt")
 }
 
 fn dedupe_provider_names(provider_names: &mut Vec<String>) {
@@ -6561,6 +6640,170 @@ mod tests {
     }
 
     // ---- CAS (Client-driven optimistic concurrency) tests ----
+
+    fn next_runtime_identity(
+        current: &crate::auth::sandbox_session::PersistedSandboxIdentity,
+    ) -> crate::auth::sandbox_session::PersistedSandboxIdentity {
+        crate::auth::sandbox_session::PersistedSandboxIdentity {
+            runtime_generation: current.runtime_generation.clone(),
+            auth_epoch: openshell_core::jwt::CredentialEpoch::new(current.auth_epoch.get() + 1)
+                .unwrap(),
+            gateway_token_id: uuid::Uuid::new_v4(),
+            refresh_replay: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn server_managed_sandbox_cas_retries_concurrent_updates() {
+        use std::sync::Barrier;
+
+        const WRITERS: usize = 5;
+
+        let state = Arc::new(test_server_state().await);
+        let sandbox = test_sandbox("server-cas-retry", Vec::new());
+        let sandbox_id = sandbox.object_id().to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let mut handles = Vec::with_capacity(WRITERS);
+        for _ in 0..WRITERS {
+            let state = Arc::clone(&state);
+            let barrier = Arc::clone(&barrier);
+            let sandbox_id = sandbox_id.clone();
+            handles.push(tokio::spawn(async move {
+                let mut first_attempt = true;
+                update_sandbox_cas(&state, &sandbox_id, 0, |sandbox| {
+                    if first_attempt {
+                        first_attempt = false;
+                        barrier.wait();
+                    }
+                    let annotations = &mut sandbox.metadata.as_mut().unwrap().annotations;
+                    let count = annotations
+                        .get("internal-update-count")
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or_default();
+                    annotations
+                        .insert("internal-update-count".to_string(), (count + 1).to_string());
+                })
+                .await
+            }));
+        }
+
+        for result in future::join_all(handles).await {
+            result.unwrap().unwrap();
+        }
+
+        let updated = state
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.metadata.as_ref().unwrap().annotations["internal-update-count"],
+            WRITERS.to_string()
+        );
+        assert_eq!(updated.get_resource_version(), WRITERS as u64 + 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_identity_rotation_retries_unrelated_sandbox_updates() {
+        let state = test_server_state().await;
+        let current = crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap();
+        let next = next_runtime_identity(&current);
+        let mut sandbox = test_sandbox("runtime-identity-retry", Vec::new());
+        current.write(&mut sandbox.metadata.as_mut().unwrap().annotations);
+        state.store.put_message(&sandbox).await.unwrap();
+        let stale_sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+
+        state
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox.object_id(), 0, |updated| {
+                updated.set_current_policy_version(8);
+            })
+            .await
+            .unwrap();
+
+        persist_next_runtime_identity(
+            &state,
+            sandbox.object_id(),
+            stale_sandbox.get_resource_version(),
+            &current,
+            &next,
+        )
+        .await
+        .unwrap();
+
+        let updated = state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.current_policy_version(), 8);
+        assert_eq!(
+            crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+                &updated.metadata.unwrap().annotations,
+            )
+            .unwrap(),
+            next
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_identity_rotation_rejects_concurrent_rotation() {
+        let state = test_server_state().await;
+        let current = crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap();
+        let next = next_runtime_identity(&current);
+        let concurrent = next_runtime_identity(&current);
+        let mut sandbox = test_sandbox("runtime-identity-fence", Vec::new());
+        current.write(&mut sandbox.metadata.as_mut().unwrap().annotations);
+        state.store.put_message(&sandbox).await.unwrap();
+        let stale_sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+
+        state
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox.object_id(), 0, |updated| {
+                concurrent.write(&mut updated.metadata.as_mut().unwrap().annotations);
+            })
+            .await
+            .unwrap();
+
+        let error = persist_next_runtime_identity(
+            &state,
+            sandbox.object_id(),
+            stale_sandbox.get_resource_version(),
+            &current,
+            &next,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Aborted);
+
+        let updated = state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+                &updated.metadata.unwrap().annotations,
+            )
+            .unwrap(),
+            concurrent
+        );
+    }
 
     #[tokio::test]
     async fn attach_sandbox_provider_client_driven_cas_succeeds_with_correct_version() {
