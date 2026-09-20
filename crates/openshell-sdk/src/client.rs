@@ -684,21 +684,22 @@ impl OpenShellClient {
         let name = name.to_string();
         async_stream::try_stream!(
             let sandbox = self.get_sandbox(&name).await?;
-            for await event in self.watch_logs_by_id(sandbox.id, opts) {
+            for await event in self.watch_logs_by_name(sandbox.name, "default".to_string(), opts) {
                 yield event?;
             }
         )
     }
 
-    /// Shared watch loop over an already-resolved sandbox id.
+    /// Shared watch loop over an already-resolved canonical sandbox name.
     ///
     /// Both [`OpenShellClient::watch_logs`] and
-    /// [`WorkspaceScopedClient::watch_logs`] resolve a name to an id under their
-    /// own workspace, then delegate here so the reconnect/resume logic lives in
-    /// one place.
-    fn watch_logs_by_id(
+    /// [`WorkspaceScopedClient::watch_logs`] resolve and re-confirm a name under
+    /// their own workspace, then delegate here so the reconnect/resume logic
+    /// lives in one place.
+    fn watch_logs_by_name(
         &self,
-        sandbox_id: String,
+        sandbox_name: String,
+        workspace: String,
         opts: WatchOptions,
     ) -> impl Stream<Item = Result<WatchEvent>> + '_ {
         async_stream::try_stream!(
@@ -706,7 +707,8 @@ impl OpenShellClient {
             let mut backoff = Duration::from_millis(100);
             loop {
                 let request = proto::WatchSandboxRequest {
-                    id: sandbox_id.clone(),
+                    sandbox: sandbox_name.clone(),
+                    workspace_scope: Some(proto::workspace_selector(&workspace)),
                     follow_status: false,
                     follow_logs: opts.follow_logs,
                     follow_events: opts.follow_events,
@@ -1257,7 +1259,7 @@ impl WorkspaceScopedClient {
         let name = name.to_string();
         async_stream::try_stream!(
             let sandbox = self.get_sandbox(&name).await?;
-            for await event in self.client.watch_logs_by_id(sandbox.id, opts) {
+            for await event in self.client.watch_logs_by_name(sandbox.name, self.workspace.clone(), opts) {
                 yield event?;
             }
         )
