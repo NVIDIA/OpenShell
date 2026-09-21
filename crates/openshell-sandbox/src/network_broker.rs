@@ -28,8 +28,7 @@ use openshell_isolation_interface::linux::task_memory;
 use tokio::sync::{mpsc, oneshot};
 
 const SOCKET_CAPACITY: usize = 4_096;
-const SOCKET_FD_HEADROOM_DIVISOR: usize = 2;
-const SOCKET_FD_MIN_HEADROOM: usize = 64;
+const SOCKET_FD_HEADROOM: usize = 64;
 const OPEN_QUEUE_CAPACITY: usize = 256;
 const ACCEPT_WORKER_CAPACITY: usize = 64;
 const DNS_QUEUE_CAPACITY: usize = 256;
@@ -198,6 +197,7 @@ struct NotificationQueues {
     dns_relay: DnsRelay,
     active_opens: Arc<AtomicUsize>,
     active_accepts: Arc<AtomicUsize>,
+    retained_socket_capacity: usize,
     decision_timeout: Duration,
 }
 
@@ -254,10 +254,8 @@ impl NetworkBroker {
         })?);
         let (pending_tx, pending_rx) = mpsc::channel(OPEN_QUEUE_CAPACITY);
         let (pending_dns_tx, pending_dns_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
-        let registry = Arc::new(Mutex::new(SocketRegistry::new(
-            1,
-            socket_registry_capacity()?,
-        )?));
+        let retained_socket_capacity = retained_socket_capacity()?;
+        let registry = Arc::new(Mutex::new(SocketRegistry::new(1, SOCKET_CAPACITY)?));
         let active_opens = Arc::new(AtomicUsize::new(0));
         let active_accepts = Arc::new(AtomicUsize::new(0));
         let dns_relay = start_dns_relay(dns_address, pending_dns_tx)?;
@@ -270,6 +268,7 @@ impl NetworkBroker {
             dns_relay,
             active_opens,
             active_accepts,
+            retained_socket_capacity,
             decision_timeout,
         };
         let healthy = Arc::new(AtomicBool::new(true));
@@ -544,7 +543,12 @@ fn dispatch_notification(
         );
     }
     if syscall == libc::SYS_socket {
-        return create_socket(&registry, &listener, notification);
+        return create_socket(
+            &registry,
+            &listener,
+            notification,
+            queues.retained_socket_capacity,
+        );
     }
     if syscall == libc::SYS_connect {
         return connect_socket(registry, listener, notification, queues);
@@ -592,6 +596,7 @@ fn create_socket(
     registry: &Mutex<SocketRegistry>,
     listener: &NotificationListener,
     notification: Notification,
+    retained_socket_capacity: usize,
 ) -> io::Result<()> {
     let domain = i32::try_from(notification.args[0])
         .map_err(|_| io::Error::from_raw_os_error(libc::EAFNOSUPPORT))?;
@@ -613,11 +618,10 @@ fn create_socket(
     } else {
         InetFamily::V6
     };
-    // Reclaim stale retained descriptors before opening another socket. The
-    // registry capacity leaves descriptor headroom below RLIMIT_NOFILE so the
-    // procfs scan can still open directories while it collects closed
-    // workload sockets.
-    if let Err(error) = prepare_registry_for_socket(registry) {
+    // Reclaim stale descriptors before the broker exhausts its process limit.
+    // Connected sockets remain in the metadata registry without consuming
+    // this broker-owned descriptor budget.
+    if let Err(error) = prepare_registry_for_socket(registry, retained_socket_capacity) {
         return listener.respond_errno(notification.id, error_to_errno(&error));
     }
     // SAFETY: arguments were reduced to the supported native INET matrix. A
@@ -655,7 +659,7 @@ fn create_socket(
     Ok(())
 }
 
-fn socket_registry_capacity() -> io::Result<usize> {
+fn retained_socket_capacity() -> io::Result<usize> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -665,22 +669,24 @@ fn socket_registry_capacity() -> io::Result<usize> {
         return Err(io::Error::last_os_error());
     }
     let soft_limit = usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX);
-    Ok(socket_registry_capacity_for_limit(soft_limit))
+    Ok(retained_socket_capacity_for_limit(soft_limit))
 }
 
-fn socket_registry_capacity_for_limit(soft_limit: usize) -> usize {
-    let headroom = (soft_limit / SOCKET_FD_HEADROOM_DIVISOR).max(SOCKET_FD_MIN_HEADROOM);
+fn retained_socket_capacity_for_limit(soft_limit: usize) -> usize {
     soft_limit
-        .saturating_sub(headroom)
+        .saturating_sub(SOCKET_FD_HEADROOM)
         .clamp(1, SOCKET_CAPACITY)
 }
 
-fn prepare_registry_for_socket(registry: &Mutex<SocketRegistry>) -> io::Result<()> {
+fn prepare_registry_for_socket(
+    registry: &Mutex<SocketRegistry>,
+    retained_socket_capacity: usize,
+) -> io::Result<()> {
     let mut registry = lock(registry);
-    if registry.is_full() {
+    if registry.is_full() || registry.retained_preconnect_count() >= retained_socket_capacity {
         collect_closed_socket_entries_locked(&mut registry)?;
     }
-    if registry.is_full() {
+    if registry.is_full() || registry.retained_preconnect_count() >= retained_socket_capacity {
         return Err(io::Error::from_raw_os_error(libc::EMFILE));
     }
     Ok(())
@@ -1807,18 +1813,18 @@ mod tests {
     use std::os::unix::net::{UnixListener, UnixStream};
 
     #[test]
-    fn socket_registry_capacity_reserves_process_descriptor_headroom() {
-        assert_eq!(socket_registry_capacity_for_limit(1_024), 512);
-        assert_eq!(socket_registry_capacity_for_limit(128), 64);
-        assert_eq!(socket_registry_capacity_for_limit(64), 1);
+    fn retained_socket_capacity_reserves_process_descriptor_headroom() {
+        assert_eq!(retained_socket_capacity_for_limit(1_024), 960);
+        assert_eq!(retained_socket_capacity_for_limit(128), 64);
+        assert_eq!(retained_socket_capacity_for_limit(64), 1);
         assert_eq!(
-            socket_registry_capacity_for_limit(usize::MAX),
+            retained_socket_capacity_for_limit(usize::MAX),
             SOCKET_CAPACITY
         );
     }
 
     #[test]
-    fn socket_registry_reclaims_stale_entry_before_opening_another_socket() {
+    fn retained_socket_limit_reclaims_stale_entry_before_opening_another_socket() {
         // SAFETY: socket returns one newly owned descriptor on success.
         let fd = unsafe {
             libc::socket(
@@ -1837,15 +1843,55 @@ mod tests {
             nonblocking: false,
             creator_generation: 1,
         };
-        let mut registry = SocketRegistry::new(1, 1).unwrap();
+        let mut registry = SocketRegistry::new(1, 2).unwrap();
         let tentative = registry.stage(socket, metadata).unwrap();
         registry.commit(tentative).unwrap();
-        assert!(registry.is_full());
+        assert!(!registry.is_full());
+        assert_eq!(registry.retained_preconnect_count(), 1);
 
         let registry = Mutex::new(registry);
-        prepare_registry_for_socket(&registry).unwrap();
+        prepare_registry_for_socket(&registry, 1).unwrap();
 
         assert!(lock(&registry).is_empty());
+    }
+
+    #[test]
+    fn retained_socket_limit_does_not_cap_connected_metadata() {
+        // SAFETY: socket returns one newly owned descriptor on success.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                libc::IPPROTO_TCP,
+            )
+        };
+        assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+        // SAFETY: successful socket returned one owned descriptor.
+        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+        let metadata = SocketMetadata {
+            family: InetFamily::V4,
+            kind: InetKind::Tcp,
+            close_on_exec: true,
+            nonblocking: false,
+            creator_generation: 1,
+        };
+        let mut registry = SocketRegistry::new(1, 2).unwrap();
+        let tentative = registry.stage(socket, metadata).unwrap();
+        registry
+            .commit_with_state(
+                tentative,
+                SocketState::Connected {
+                    original_peer: "127.0.0.1:443".parse().unwrap(),
+                },
+            )
+            .unwrap();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.retained_preconnect_count(), 0);
+
+        let registry = Mutex::new(registry);
+        prepare_registry_for_socket(&registry, 1).unwrap();
+
+        assert_eq!(lock(&registry).len(), 1);
     }
 
     #[test]
