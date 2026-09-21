@@ -752,6 +752,7 @@ impl KubernetesComputeDriver {
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication: true,
+            supports_runtime_identity_binding: true,
             driver_reports_runtime_readiness: false,
             resource_capabilities: Some(ResourceCapabilities {
                 cpu: Some(CpuResourceCapabilities {

@@ -458,6 +458,7 @@ impl MxcComputeBackend {
             default_image: DEFAULT_IMAGE_SENTINEL.to_string(),
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication: false,
+            supports_runtime_identity_binding: false,
             driver_reports_runtime_readiness: true,
             resource_capabilities: None,
             rootfs_tar_staging_dir: String::new(),

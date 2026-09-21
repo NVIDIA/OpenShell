@@ -508,9 +508,13 @@ The Kubernetes driver's `AuthenticateSandbox` implementation applies its named
 It validates the projected token with Kubernetes `TokenReview`, checks the live
 pod UID, and verifies the pod's controlling Sandbox CR UID and sandbox ID. The
 driver returns both the sandbox ID and an opaque runtime identity derived from
-the namespace, immutable Sandbox CR UID, and authenticated supervisor Pod UID. The gateway records that runtime
-identity when provisioning succeeds and requires an exact match before issuing
-a sandbox JWT. This correlates credential authentication with the durable
+the namespace, immutable Sandbox CR UID, and authenticated supervisor Pod UID.
+Drivers that authenticate sandboxes must advertise this runtime-binding
+contract; the gateway rejects incompatible drivers during initialization. The
+gateway records the runtime identity when provisioning succeeds and requires
+an exact match before issuing a sandbox JWT. If binding validation or storage
+fails after a lifecycle call succeeds, the gateway compensates that call before
+returning the error. This correlates credential authentication with the durable
 runtime record rather than authorizing from the sandbox ID alone.
 
 Shared and managed modes still reserve the sandbox namespace, Sandbox CRs,

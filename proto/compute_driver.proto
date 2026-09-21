@@ -85,6 +85,9 @@ message GetCapabilitiesResponse {
   bool gateway_manages_lifecycle = 6;
   // Whether AuthenticateSandbox is implemented by this driver.
   bool supports_sandbox_authentication = 7;
+  // Whether successful create, start, and authentication responses include a
+  // stable runtime identity suitable for gateway-side binding checks.
+  bool supports_runtime_identity_binding = 13;
   // Whether the driver reports runtime readiness itself. When false, the
   // gateway waits for the standard OpenShell supervisor session in addition
   // to the driver's platform-ready observation.

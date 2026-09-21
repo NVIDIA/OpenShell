@@ -1026,6 +1026,32 @@ pub mod test_support {
         test_server_state_for_driver(driver_name, true).await
     }
 
+    pub async fn test_server_state_with_compute_driver(
+        driver_name: &str,
+        driver: Arc<NoopTestDriver>,
+    ) -> Arc<ServerState> {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        crate::ensure_default_workspace(&store).await.unwrap();
+        seed_example_provider_profiles(&store).await;
+        let compute = new_test_runtime_with_driver(store.clone(), driver_name, driver);
+        with_test_provider_profile_sources(Arc::new(ServerState::new(
+            Config::new(None)
+                .with_database_url("sqlite::memory:?cache=shared")
+                .with_credential_drivers(["test-static"]),
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+        )))
+    }
+
     async fn test_server_state_for_driver(
         driver_name: &str,
         seed_profiles: bool,

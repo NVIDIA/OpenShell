@@ -962,6 +962,7 @@ impl DockerComputeDriver {
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
+            supports_runtime_identity_binding: false,
             driver_reports_runtime_readiness: false,
             resource_capabilities: Some(ResourceCapabilities {
                 cpu: Some(CpuResourceCapabilities {
