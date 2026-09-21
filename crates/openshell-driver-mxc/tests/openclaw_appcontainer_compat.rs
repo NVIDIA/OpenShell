@@ -100,11 +100,21 @@ fn runner_uses_lifecycle_readiness_and_preserves_failure_diagnostics() {
 
 #[test]
 fn openclaw_gateway_configs_declare_the_current_schema() {
-    for config in [
-        PROCESS_CONTAINER_CONFIG,
-        ISOLATION_CONFIG,
-        LOCAL_NETWORK_CONFIG,
+    for (name, config) in [
+        ("process-container", PROCESS_CONTAINER_CONFIG),
+        ("isolation", ISOLATION_CONFIG),
+        ("local-network", LOCAL_NETWORK_CONFIG),
     ] {
-        assert!(config.contains("[openshell]\nversion = 2"));
+        let config = config
+            .parse::<toml::Value>()
+            .unwrap_or_else(|error| panic!("{name} config must be valid TOML: {error}"));
+        assert_eq!(
+            config
+                .get("openshell")
+                .and_then(|openshell| openshell.get("version"))
+                .and_then(toml::Value::as_integer),
+            Some(2),
+            "{name} config must declare the current OpenShell schema",
+        );
     }
 }
