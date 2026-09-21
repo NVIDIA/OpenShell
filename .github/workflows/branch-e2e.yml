@@ -26,6 +26,7 @@ jobs:
       run_integration: ${{ steps.labels.outputs.run_core_e2e }}
       run_core_e2e: ${{ steps.labels.outputs.run_core_e2e }}
       run_gpu_e2e: ${{ steps.labels.outputs.run_gpu_e2e }}
+      run_integration_upgrades: ${{ steps.labels.outputs.run_integration_upgrades }}
       run_kubernetes_ha_e2e: ${{ steps.labels.outputs.run_kubernetes_ha_e2e }}
       run_kubernetes_credential_drivers_e2e: ${{ steps.labels.outputs.run_kubernetes_credential_drivers_e2e }}
       run_any_e2e: ${{ steps.labels.outputs.run_any_e2e }}
@@ -47,8 +48,14 @@ jobs:
             push)
               run_core_e2e="$(jq -r 'index("test:e2e") != null' <<< "$LABELS_JSON")"
               run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
+<<<<<<< HEAD
               run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
               run_kubernetes_credential_drivers_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
+=======
+              run_integration_upgrades="$(jq -r 'index("test:upgrade") != null' <<< "$LABELS_JSON")"
+              run_kubernetes_ha_e2e=false
+              run_kubernetes_credential_drivers_e2e=false
+>>>>>>> bedd141c0 (test(ci): add label-gated upgrade qualification)
               ;;
             merge_group)
               # Merge groups have no PR labels. When GPU E2E is required as documented
@@ -56,17 +63,19 @@ jobs:
               # and ejects the PR. HA stays off until stable.
               run_core_e2e=true
               run_gpu_e2e=true
+              run_integration_upgrades=false
               run_kubernetes_ha_e2e=false
               run_kubernetes_credential_drivers_e2e=false
               ;;
             *)
               run_core_e2e=true
               run_gpu_e2e=true
+              run_integration_upgrades=false
               run_kubernetes_ha_e2e=false
               run_kubernetes_credential_drivers_e2e=false
               ;;
           esac
-          if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ] || [ "$run_kubernetes_credential_drivers_e2e" = "true" ]; then
+          if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_integration_upgrades" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ] || [ "$run_kubernetes_credential_drivers_e2e" = "true" ]; then
             run_any_e2e=true
           else
             run_any_e2e=false
@@ -75,6 +84,7 @@ jobs:
           {
             echo "run_core_e2e=$run_core_e2e"
             echo "run_gpu_e2e=$run_gpu_e2e"
+            echo "run_integration_upgrades=$run_integration_upgrades"
             echo "run_kubernetes_ha_e2e=$run_kubernetes_ha_e2e"
             echo "run_kubernetes_credential_drivers_e2e=$run_kubernetes_credential_drivers_e2e"
             echo "run_any_e2e=$run_any_e2e"
@@ -196,7 +206,7 @@ jobs:
 
   build-vm-driver:
     needs: [pr_metadata, version, build-binaries]
-    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true' || needs.pr_metadata.outputs.run_integration_upgrades == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/build-vm-driver.yml
@@ -250,6 +260,49 @@ jobs:
     with:
       deb-artifact-name: deb-linux-amd64
       rpm-artifact-name: rpm-linux-x86_64
+
+  build-deb-upgrade:
+    name: Build Debian package for upgrade qualification
+    needs: [pr_metadata, version, build-binaries, build-vm-driver]
+    if: needs.pr_metadata.outputs.run_integration_upgrades == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/deb-package.yml
+    with:
+      deb-version: ${{ needs.version.outputs.deb_version }}
+      checkout-ref: ${{ github.sha }}
+
+  prepare-integration-upgrades:
+    name: Prepare upgrade qualification inputs
+    needs: [pr_metadata, build-binaries, build-images, build-deb-upgrade]
+    if: needs.pr_metadata.outputs.run_integration_upgrades == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/prepare-integration-inputs.yml
+    with:
+      deb-artifact-name: deb-linux-amd64
+      include-deb-upgrade-source: true
+
+  integration-upgrades:
+    name: Integration upgrades
+    needs: prepare-integration-upgrades
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/integration-runner.yml
+    with:
+      category: upgrades
+      source-sha: ${{ needs.prepare-integration-upgrades.outputs.source_sha }}
+      integration-inputs-artifact-id: ${{ needs.prepare-integration-upgrades.outputs.integration_inputs_artifact_id }}
+      test-matrix: >-
+        [
+          {"environment":"ubuntu-docker-rootful","installer":"deb-upgrade-source","testsuite":"deb-upgrade"}
+        ]
 
   # Run driver-independent conformance tests.
   conformance-integration:
