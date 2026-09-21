@@ -42,6 +42,18 @@ use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_server::ComputeDriverRegistration;
 use openshell_server::ComputeDriverRegistry;
 
+#[cfg(all(
+    not(target_os = "windows"),
+    any(
+        feature = "compute-driver-docker",
+        feature = "compute-driver-kubernetes",
+        feature = "compute-driver-podman"
+    )
+))]
+fn prefer_environment<T>(configured: T, environment: Option<T>) -> T {
+    environment.unwrap_or(configured)
+}
+
 /// Install every first-party compute driver linked into the standard gateway.
 #[must_use]
 pub fn install_default_compute_drivers() -> ComputeDriverRegistry {
@@ -272,6 +284,14 @@ fn kubernetes_config(
 ) -> openshell_core::Result<openshell_driver_kubernetes::KubernetesComputeConfig> {
     let mut config: openshell_driver_kubernetes::KubernetesComputeConfig =
         context.driver_config()?;
+    config.sandbox_runtime_image = prefer_environment(
+        config.sandbox_runtime_image,
+        std::env::var(openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV).ok(),
+    );
+    config.supervisor_image = prefer_environment(
+        config.supervisor_image,
+        std::env::var(openshell_core::config::SUPERVISOR_IMAGE_ENV).ok(),
+    );
     if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
         config.workspace_default_storage_size = size;
     }
@@ -296,7 +316,7 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
     ) -> openshell_core::Result<()> {
-        let config: openshell_driver_docker::DockerComputeConfig = context.driver_config()?;
+        let config = docker_config(context)?;
         config.validate_configuration(context.gateway_bind_address())
     }
 
@@ -304,7 +324,7 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let mut config: openshell_driver_docker::DockerComputeConfig = context.driver_config()?;
+        let mut config = docker_config(context.config_context())?;
         require_guest_tls_for_local_driver(&context, "docker")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
         let driver = openshell_driver_docker::DockerComputeDriver::new(
@@ -319,6 +339,26 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
             std::sync::Arc::new(driver),
         ))
     }
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-docker"))]
+fn docker_config(
+    context: openshell_server::ComputeDriverConfigContext<'_>,
+) -> openshell_core::Result<openshell_driver_docker::DockerComputeConfig> {
+    let mut config: openshell_driver_docker::DockerComputeConfig = context.driver_config()?;
+    config.sandbox_runtime_image = prefer_environment(
+        config.sandbox_runtime_image,
+        std::env::var(openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)
+            .ok()
+            .map(Some),
+    );
+    config.supervisor_image = prefer_environment(
+        config.supervisor_image,
+        std::env::var(openshell_core::config::SUPERVISOR_IMAGE_ENV)
+            .ok()
+            .map(Some),
+    );
+    Ok(config)
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
@@ -364,6 +404,14 @@ fn podman_config(
 ) -> openshell_core::Result<openshell_driver_podman::PodmanComputeConfig> {
     let mut config: openshell_driver_podman::PodmanComputeConfig = context.driver_config()?;
     config.gateway_port = context.gateway_port();
+    config.sandbox_runtime_image = prefer_environment(
+        config.sandbox_runtime_image,
+        std::env::var(openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV).ok(),
+    );
+    config.supervisor_image = prefer_environment(
+        config.supervisor_image,
+        std::env::var(openshell_core::config::SUPERVISOR_IMAGE_ENV).ok(),
+    );
     if let Ok(path) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
         config.socket_path = Some(path.into());
     }
@@ -564,6 +612,23 @@ mod windows_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(all(
+        not(target_os = "windows"),
+        any(
+            feature = "compute-driver-docker",
+            feature = "compute-driver-kubernetes",
+            feature = "compute-driver-podman"
+        )
+    ))]
+    fn runtime_image_environment_overrides_configured_value() {
+        assert_eq!(
+            prefer_environment("driver-toml", Some("process-environment")),
+            "process-environment"
+        );
+        assert_eq!(prefer_environment("driver-toml", None), "driver-toml");
+    }
 
     #[test]
     fn default_registry_contains_exactly_the_enabled_compute_drivers() {
