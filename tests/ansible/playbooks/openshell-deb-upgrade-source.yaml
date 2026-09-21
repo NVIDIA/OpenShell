@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Install prerelease OpenShell Debian upgrade source
+  ansible.builtin.import_playbook: openshell-deb.yaml
+
+- name: Record OpenShell Debian upgrade source
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Copy upgrade source version metadata
+      become: true
+      ansible.builtin.copy:
+        src: "{{ openshell_upgrade_source_version }}"
+        dest: /var/lib/openshell-qualification/upgrade-source-version
+        owner: root
+        group: root
+        mode: "0644"
