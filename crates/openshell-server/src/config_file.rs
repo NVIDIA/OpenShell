@@ -136,10 +136,6 @@ pub struct GatewayFileSection {
     // ── Sandbox client TLS ───────────────────────────────────────────────
     #[serde(default)]
     pub guest_tls_ca: Option<PathBuf>,
-    #[serde(default)]
-    pub guest_tls_cert: Option<PathBuf>,
-    #[serde(default)]
-    pub guest_tls_key: Option<PathBuf>,
 
     // ── TLS toggle ───────────────────────────────────────────────────────
     /// When `true`, the gateway listens on plaintext HTTP and ignores any

@@ -1116,7 +1116,6 @@ pub struct ComputeDriverRegistration {
     factory: Arc<dyn ComputeDriverFactory>,
     telemetry_category: TelemetryComputeDriver,
     local_singleplayer: bool,
-    supports_mtls_user_auth: bool,
     in_process_tracing: Option<openshell_otel::ComputeDriverTracing>,
 }
 
@@ -1148,7 +1147,6 @@ impl ComputeDriverRegistration {
             factory: Arc::new(factory),
             telemetry_category: TelemetryComputeDriver::custom(),
             local_singleplayer: false,
-            supports_mtls_user_auth: true,
             in_process_tracing: None,
         })
     }
@@ -1181,13 +1179,6 @@ impl ComputeDriverRegistration {
         self
     }
 
-    /// Mark a backend that requires user authentication other than mTLS.
-    #[must_use]
-    pub fn without_mtls_user_auth(mut self) -> Self {
-        self.supports_mtls_user_auth = false;
-        self
-    }
-
     /// Attach process-wide tracing for this in-process compiled driver.
     #[must_use]
     pub fn with_in_process_tracing(
@@ -1201,11 +1192,6 @@ impl ComputeDriverRegistration {
     #[must_use]
     pub(crate) fn is_local_singleplayer(&self) -> bool {
         self.local_singleplayer
-    }
-
-    #[must_use]
-    pub(crate) fn supports_mtls_user_auth(&self) -> bool {
-        self.supports_mtls_user_auth
     }
 
     #[must_use]
@@ -1440,13 +1426,13 @@ impl ComputeDriverBuildContext<'_> {
         self.config.gateway_tls_enabled()
     }
 
-    /// Gateway client credentials that a local driver may mount into guests.
+    /// Gateway CA certificate that a local driver may provide to supervisors.
     #[must_use]
-    pub fn guest_tls_paths(&self) -> Option<(&Path, &Path, &Path)> {
+    pub fn guest_tls_ca(&self) -> Option<&Path> {
         self.config
             .driver_startup
             .guest_tls
-            .map(compute::driver_config::GuestTlsPaths::as_paths)
+            .map(compute::driver_config::GuestTlsPaths::as_path)
     }
 
     /// Deserialize the selected driver's merged TOML table.

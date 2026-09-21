@@ -154,10 +154,6 @@ const GUEST_SSH_SOCKET_PATH: &str = openshell_core::container_paths::SSH_SOCKET_
 #[allow(dead_code)]
 const GUEST_TLS_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CA_PATH;
 #[allow(dead_code)]
-const GUEST_TLS_CERT_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CERT_PATH;
-#[allow(dead_code)]
-const GUEST_TLS_KEY_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_KEY_PATH;
-#[allow(dead_code)]
 const GUEST_SANDBOX_TOKEN_PATH: &str = openshell_core::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH;
 const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_INIT_DROPIN_DIR;
 const GUEST_BOUNDARY_CONFIG_DIR: &str = "/.openshell/state";
@@ -212,8 +208,6 @@ static OWNER_STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone)]
 struct VmDriverTlsPaths {
     ca: PathBuf,
-    cert: PathBuf,
-    key: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -475,15 +469,16 @@ impl VmDriverConfig {
     }
 
     fn tls_paths(&self) -> Result<Option<VmDriverTlsPaths>, String> {
-        let provided = [
-            self.guest_tls_ca.as_ref(),
-            self.guest_tls_cert.as_ref(),
-            self.guest_tls_key.as_ref(),
-        ];
-        if provided.iter().all(Option::is_none) {
+        if self.guest_tls_cert.is_some() || self.guest_tls_key.is_some() {
+            return Err(
+                "sandbox client certificates are no longer supported; remove OPENSHELL_VM_TLS_CERT and OPENSHELL_VM_TLS_KEY"
+                    .to_string(),
+            );
+        }
+        if self.guest_tls_ca.is_none() {
             return if self.requires_tls_materials() {
                 Err(
-                    "https:// openshell endpoint requires OPENSHELL_VM_TLS_CA, OPENSHELL_VM_TLS_CERT, and OPENSHELL_VM_TLS_KEY so the host supervisor can authenticate to the gateway"
+                    "https:// openshell endpoint requires OPENSHELL_VM_TLS_CA so the host supervisor can authenticate the gateway"
                         .to_string(),
                 )
             } else {
@@ -496,18 +491,7 @@ impl VmDriverConfig {
                 "OPENSHELL_VM_TLS_CA is required when TLS materials are configured".to_string(),
             );
         };
-        let Some(cert) = self.guest_tls_cert.clone() else {
-            return Err(
-                "OPENSHELL_VM_TLS_CERT is required when TLS materials are configured".to_string(),
-            );
-        };
-        let Some(key) = self.guest_tls_key.clone() else {
-            return Err(
-                "OPENSHELL_VM_TLS_KEY is required when TLS materials are configured".to_string(),
-            );
-        };
-
-        for path in [&ca, &cert, &key] {
+        for path in [&ca] {
             if !path.is_file() {
                 return Err(format!(
                     "TLS material '{}' does not exist or is not a file",
@@ -516,7 +500,7 @@ impl VmDriverConfig {
             }
         }
 
-        Ok(Some(VmDriverTlsPaths { ca, cert, key }))
+        Ok(Some(VmDriverTlsPaths { ca }))
     }
 }
 
@@ -923,10 +907,7 @@ impl VmDriver {
         }
         configure_main_exit_marker(&mut command, state_dir);
         if let Some(tls) = tls_paths {
-            command
-                .env(openshell_core::sandbox_env::TLS_CA, &tls.ca)
-                .env(openshell_core::sandbox_env::TLS_CERT, &tls.cert)
-                .env(openshell_core::sandbox_env::TLS_KEY, &tls.key);
+            command.env(openshell_core::sandbox_env::TLS_CA, &tls.ca);
         }
         #[cfg(unix)]
         let (liveness_read, liveness_write) = nix::unistd::pipe().map_err(|error| {
@@ -9261,8 +9242,6 @@ mod tests {
         let config = VmDriverConfig {
             grpc_endpoint: "https://127.0.0.1:8443".to_string(),
             guest_tls_ca: Some(PathBuf::from("/host/ca.crt")),
-            guest_tls_cert: Some(PathBuf::from("/host/tls.crt")),
-            guest_tls_key: Some(PathBuf::from("/host/tls.key")),
             ..Default::default()
         };
         let sandbox = Sandbox {

@@ -93,10 +93,8 @@ enable_loopback_service_http = true
 # plaintext listener; guest TLS fields must then be omitted.
 disable_tls           = false
 
-# Gateway-owned TLS bundle injected into the selected local driver.
+# Gateway-owned CA injected into the selected local driver for supervisor TLS.
 guest_tls_ca          = "/etc/openshell/certs/ca.pem"
-guest_tls_cert        = "/etc/openshell/certs/client.pem"
-guest_tls_key         = "/etc/openshell/certs/client-key.pem"
 
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
@@ -162,7 +160,7 @@ krun_log_level  = 1
 Each `[openshell.drivers.<name>]` table is extracted from the parsed file and handed to the driver's initialization function as a raw TOML value. The driver is then responsible for:
 
 1. **Parsing** — deserializing the table into its own typed config struct (e.g. `KubernetesComputeConfig`, `DockerComputeConfig`, `PodmanComputeConfig`, `VmComputeConfig`).
-2. **Validation** — applying cross-field checks specific to that driver. Gateway-owned guest TLS paths are validated as one bundle and injected only into the selected local driver before this step.
+2. **Validation** — applying cross-field checks specific to that driver. The gateway-owned CA path is validated and injected only into the selected local driver before this step; supervisor identity uses sandbox bearer tokens.
 3. **Consumption** — using the resulting struct to initialize internal state.
 
 Driver authors define and own their config schema. Adding a new driver does not require changes to the gateway's core `Config` struct or to this RFC.

@@ -666,7 +666,6 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
                 "source".to_string(),
                 match &sandbox.source {
                     SandboxIdentitySource::BootstrapJwt { .. } => "bootstrap_jwt",
-                    SandboxIdentitySource::BootstrapCert { .. } => "bootstrap_cert",
                     SandboxIdentitySource::ComputeDriver { .. } => "compute_driver",
                 }
                 .to_string(),
@@ -857,8 +856,9 @@ where
 /// Once sandbox authentication is configured, callers must present an
 /// explicit credential for authenticated gRPC methods. Missing bearer auth
 /// is promoted to an mTLS user only when `mtls_auth.enabled` is configured
-/// for local single-user gateways, or to an unsafe local developer user when
-/// `auth.allow_unauthenticated_users` is explicitly enabled.
+/// and the connection presents a verified client certificate, or to an unsafe
+/// local developer user when `auth.allow_unauthenticated_users` is explicitly
+/// enabled.
 ///
 /// When neither OIDC nor sandbox credentials are configured (a barebones
 /// dev gateway), the chain is left as `None` so the router short-circuits

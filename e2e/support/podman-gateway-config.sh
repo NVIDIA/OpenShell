@@ -141,8 +141,6 @@ e2e_write_podman_gateway_config() {
       while IFS= read -r line; do
         if [ "${line}" = "[openshell.drivers.podman]" ]; then
           printf 'guest_tls_ca = %s\n' "$(e2e_podman_toml_string "${pki_dir}/ca.crt")"
-          printf 'guest_tls_cert = %s\n' "$(e2e_podman_toml_string "${pki_dir}/client/tls.crt")"
-          printf 'guest_tls_key = %s\n\n' "$(e2e_podman_toml_string "${pki_dir}/client/tls.key")"
         fi
         printf '%s\n' "${line}"
       done <"${output}" >"${configured_with_tls}"

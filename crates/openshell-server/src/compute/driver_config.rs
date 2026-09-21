@@ -17,56 +17,28 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestTlsPaths {
     ca: PathBuf,
-    cert: PathBuf,
-    key: PathBuf,
 }
 
 impl GuestTlsPaths {
-    pub(crate) fn as_paths(&self) -> (&std::path::Path, &std::path::Path, &std::path::Path) {
-        (&self.ca, &self.cert, &self.key)
-    }
-}
-
-impl GuestTlsPaths {
-    fn configured_paths(
-        gateway: &config_file::GatewayFileSection,
-    ) -> (Option<&PathBuf>, Option<&PathBuf>, Option<&PathBuf>) {
-        (
-            gateway.guest_tls_ca.as_ref(),
-            gateway.guest_tls_cert.as_ref(),
-            gateway.guest_tls_key.as_ref(),
-        )
+    pub(crate) fn as_path(&self) -> &std::path::Path {
+        &self.ca
     }
 
-    /// Validate guest TLS relationships without reading certificate files.
+    /// Validate gateway CA configuration without reading certificate files.
     pub(crate) fn validate_configuration(
         gateway: Option<&config_file::GatewayFileSection>,
         tls_disabled: bool,
     ) -> std::result::Result<(), String> {
-        let configured = gateway.map(Self::configured_paths);
-        let provided = configured
-            .is_some_and(|(ca, cert, key)| ca.is_some() || cert.is_some() || key.is_some());
-        if tls_disabled && provided {
+        if tls_disabled && gateway.is_some_and(|gateway| gateway.guest_tls_ca.is_some()) {
             return Err(
-                "guest_tls_ca, guest_tls_cert, and guest_tls_key require gateway TLS; remove them or omit --disable-tls"
-                    .to_string(),
-            );
-        }
-        if let Some((ca, cert, key)) = configured
-            && (ca.is_some() || cert.is_some() || key.is_some())
-            && (ca.is_none() || cert.is_none() || key.is_none())
-        {
-            return Err(
-                "guest TLS requires one complete bundle: guest_tls_ca, guest_tls_cert, and guest_tls_key"
-                    .to_string(),
+                "guest_tls_ca requires gateway TLS; remove it or omit --disable-tls".to_string(),
             );
         }
         Ok(())
     }
 
-    /// Resolve gateway-owned guest TLS inputs. Explicit TOML values take
-    /// precedence over the package-managed local bundle; partial bundles are
-    /// rejected before any driver is deserialized or constructed.
+    /// Explicit gateway CA configuration takes precedence over the
+    /// package-managed local CA. User client credentials stay on the host.
     pub(crate) fn resolve(
         gateway: Option<&config_file::GatewayFileSection>,
         local: Option<&LocalTlsPaths>,
@@ -76,31 +48,17 @@ impl GuestTlsPaths {
         if tls_disabled {
             return Ok(None);
         }
-
-        if let Some((Some(ca), Some(cert), Some(key))) = gateway.map(Self::configured_paths) {
-            for (field, path) in [
-                ("guest_tls_ca", ca),
-                ("guest_tls_cert", cert),
-                ("guest_tls_key", key),
-            ] {
-                if !path.is_file() {
-                    return Err(format!(
-                        "{field} '{}' does not exist or is not a file",
-                        path.display()
-                    ));
-                }
+        if let Some(ca) = gateway.and_then(|gateway| gateway.guest_tls_ca.as_ref()) {
+            if !ca.is_file() {
+                return Err(format!(
+                    "guest_tls_ca '{}' does not exist or is not a file",
+                    ca.display()
+                ));
             }
-            return Ok(Some(Self {
-                ca: ca.clone(),
-                cert: cert.clone(),
-                key: key.clone(),
-            }));
+            return Ok(Some(Self { ca: ca.clone() }));
         }
-
         Ok(local.map(|paths| Self {
             ca: paths.ca.clone(),
-            cert: paths.client_cert.clone(),
-            key: paths.client_key.clone(),
         }))
     }
 }
@@ -174,18 +132,23 @@ where
     })
 }
 
-/// Reject TLS paths in gateway driver tables. These credentials are gateway
-/// inputs and are injected only into the selected local driver after the
-/// gateway has validated the complete bundle.
+/// Reject TLS paths in gateway driver tables. The gateway CA is injected
+/// into the selected local driver after gateway validation.
 fn reject_driver_owned_guest_tls_fields(table: &toml::Value) -> Result<()> {
     let Some(table) = table.as_table() else {
         return Ok(());
     };
     for field in ["guest_tls_ca", "guest_tls_cert", "guest_tls_key"] {
         if table.contains_key(field) {
-            return Err(Error::config(format!(
-                "{field} belongs in [openshell.gateway], not a [openshell.drivers.*] table"
-            )));
+            let message = if field == "guest_tls_ca" {
+                "guest_tls_ca belongs in [openshell.gateway], not a [openshell.drivers.*] table"
+                    .to_string()
+            } else {
+                format!(
+                    "{field} is no longer supported; remove it because supervisors authenticate with bearer tokens"
+                )
+            };
+            return Err(Error::config(message));
         }
     }
     Ok(())
@@ -236,18 +199,12 @@ mod tests {
     }
 
     #[test]
-    fn gateway_guest_tls_resolves_explicit_complete_bundle() {
+    fn gateway_guest_tls_resolves_explicit_ca() {
         let dir = tempfile::tempdir().expect("temp dir");
         let ca = dir.path().join("ca.pem");
-        let cert = dir.path().join("cert.pem");
-        let key = dir.path().join("key.pem");
-        for path in [&ca, &cert, &key] {
-            std::fs::write(path, b"test").expect("write TLS fixture");
-        }
+        std::fs::write(&ca, b"test").expect("write TLS fixture");
         let gateway = config_file::GatewayFileSection {
             guest_tls_ca: Some(ca.clone()),
-            guest_tls_cert: Some(cert.clone()),
-            guest_tls_key: Some(key.clone()),
             ..Default::default()
         };
 
@@ -255,33 +212,7 @@ mod tests {
             .expect("complete guest TLS should resolve")
             .expect("guest TLS bundle");
 
-        assert_eq!(
-            resolved.as_paths(),
-            (ca.as_path(), cert.as_path(), key.as_path())
-        );
-    }
-
-    #[test]
-    fn gateway_guest_tls_rejects_every_partial_bundle() {
-        let path = PathBuf::from("/tmp/guest-tls.pem");
-        for (ca, cert, key) in [
-            (Some(path.clone()), None, None),
-            (None, Some(path.clone()), None),
-            (None, None, Some(path.clone())),
-            (Some(path.clone()), Some(path.clone()), None),
-            (Some(path.clone()), None, Some(path.clone())),
-            (None, Some(path.clone()), Some(path)),
-        ] {
-            let gateway = config_file::GatewayFileSection {
-                guest_tls_ca: ca,
-                guest_tls_cert: cert,
-                guest_tls_key: key,
-                ..Default::default()
-            };
-            let error = GuestTlsPaths::resolve(Some(&gateway), None, false)
-                .expect_err("partial guest TLS must fail");
-            assert!(error.contains("one complete bundle"));
-        }
+        assert_eq!(resolved.as_path(), ca.as_path());
     }
 
     #[test]
@@ -289,8 +220,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let gateway = config_file::GatewayFileSection {
             guest_tls_ca: Some(dir.path().join("missing-ca.pem")),
-            guest_tls_cert: Some(dir.path().join("missing-cert.pem")),
-            guest_tls_key: Some(dir.path().join("missing-key.pem")),
             ..Default::default()
         };
         let error = GuestTlsPaths::resolve(Some(&gateway), None, false)
@@ -311,14 +240,7 @@ mod tests {
         let resolved = GuestTlsPaths::resolve(None, Some(&local), false)
             .expect("managed bundle should resolve")
             .expect("guest TLS bundle");
-        assert_eq!(
-            resolved.as_paths(),
-            (
-                Path::new("/managed/ca.pem"),
-                Path::new("/managed/client-cert.pem"),
-                Path::new("/managed/client-key.pem"),
-            )
-        );
+        assert_eq!(resolved.as_path(), Path::new("/managed/ca.pem"));
     }
 
     #[test]
@@ -331,13 +253,11 @@ mod tests {
     fn gateway_guest_tls_rejects_plaintext_gateway() {
         let gateway = config_file::GatewayFileSection {
             guest_tls_ca: Some(PathBuf::from("/tmp/ca.pem")),
-            guest_tls_cert: Some(PathBuf::from("/tmp/cert.pem")),
-            guest_tls_key: Some(PathBuf::from("/tmp/key.pem")),
             ..Default::default()
         };
         let error = GuestTlsPaths::resolve(Some(&gateway), None, true)
             .expect_err("guest TLS and plaintext gateway conflict");
-        assert!(error.contains("require gateway TLS"));
+        assert!(error.contains("requires gateway TLS"));
     }
 
     #[derive(Debug, Default, Deserialize)]
@@ -362,30 +282,29 @@ socket_path = "/run/openshell/kyma.sock"
                 driver_config_from_context::<EmptyDriverConfig>(test_context(Some(&file)), "kyma")
                     .expect_err("local driver TLS field must be rejected");
             assert!(local_error.to_string().contains(field));
-            assert!(local_error.to_string().contains("[openshell.gateway]"));
+            let guidance = if field == "guest_tls_ca" {
+                "[openshell.gateway]"
+            } else {
+                "no longer supported; remove it"
+            };
+            assert!(local_error.to_string().contains(guidance));
 
             let remote_error = remote_driver_config_from_context(test_context(Some(&file)), "kyma")
                 .expect_err("remote driver TLS field must be rejected");
             assert!(remote_error.to_string().contains(field));
-            assert!(remote_error.to_string().contains("[openshell.gateway]"));
+            assert!(remote_error.to_string().contains(guidance));
         }
     }
 
     #[test]
     fn explicit_gateway_guest_tls_takes_precedence_over_package_bundle() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let explicit = [
-            dir.path().join("explicit-ca.pem"),
-            dir.path().join("explicit-cert.pem"),
-            dir.path().join("explicit-key.pem"),
-        ];
+        let explicit = [dir.path().join("explicit-ca.pem")];
         for path in &explicit {
             std::fs::write(path, b"explicit").expect("write explicit TLS fixture");
         }
         let gateway = config_file::GatewayFileSection {
             guest_tls_ca: Some(explicit[0].clone()),
-            guest_tls_cert: Some(explicit[1].clone()),
-            guest_tls_key: Some(explicit[2].clone()),
             ..Default::default()
         };
         let package = LocalTlsPaths {
@@ -399,24 +318,13 @@ socket_path = "/run/openshell/kyma.sock"
         let resolved = GuestTlsPaths::resolve(Some(&gateway), Some(&package), false)
             .expect("explicit bundle resolves")
             .expect("guest bundle");
-        assert_eq!(
-            resolved.as_paths(),
-            (
-                explicit[0].as_path(),
-                explicit[1].as_path(),
-                explicit[2].as_path()
-            )
-        );
+        assert_eq!(resolved.as_path(), explicit[0].as_path());
     }
 
     #[test]
-    fn gateway_guest_tls_rejects_directories_for_every_bundle_member() {
+    fn gateway_guest_tls_rejects_ca_directory() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let files = [
-            dir.path().join("ca.pem"),
-            dir.path().join("cert.pem"),
-            dir.path().join("key.pem"),
-        ];
+        let files = [dir.path().join("ca.pem")];
         for path in &files {
             std::fs::write(path, b"fixture").expect("write TLS fixture");
         }
@@ -426,8 +334,6 @@ socket_path = "/run/openshell/kyma.sock"
             paths[index] = dir.path().to_path_buf();
             let gateway = config_file::GatewayFileSection {
                 guest_tls_ca: Some(paths[0].clone()),
-                guest_tls_cert: Some(paths[1].clone()),
-                guest_tls_key: Some(paths[2].clone()),
                 ..Default::default()
             };
             let error = GuestTlsPaths::resolve(Some(&gateway), None, false)

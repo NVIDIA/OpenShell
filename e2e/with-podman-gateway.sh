@@ -714,6 +714,14 @@ EXTERNAL_DRIVER_ENABLE_BIND_MOUNTS=true
 EXTERNAL_DRIVER_TLS_CA="${PKI_DIR}/ca.crt"
 EXTERNAL_DRIVER_TLS_CERT="${PKI_DIR}/client/tls.crt"
 EXTERNAL_DRIVER_TLS_KEY="${PKI_DIR}/client/tls.key"
+# The frozen schema-v1 baseline still requires a gateway client identity.
+external_driver_legacy_tls_env=()
+if [ "${CONFIG_SCHEMA_VERSION}" = "1" ]; then
+  external_driver_legacy_tls_env=(
+    "OPENSHELL_PODMAN_TLS_CERT=${EXTERNAL_DRIVER_TLS_CERT}"
+    "OPENSHELL_PODMAN_TLS_KEY=${EXTERNAL_DRIVER_TLS_KEY}"
+  )
+fi
 if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
   driver_transport=in_tree
   external_driver_grpc_endpoint=null
@@ -728,9 +736,15 @@ if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
     external_driver_grpc_endpoint="\"${EXTERNAL_DRIVER_GRPC_ENDPOINT}\""
     external_driver_host_gateway_ip='"host-gateway"'
     driver_tls_ca_sha256="$(sha256sum "${EXTERNAL_DRIVER_TLS_CA}" | cut -d' ' -f1)"
-    driver_tls_cert_sha256="$(sha256sum "${EXTERNAL_DRIVER_TLS_CERT}" | cut -d' ' -f1)"
-    driver_tls_key_sha256="$(sha256sum "${EXTERNAL_DRIVER_TLS_KEY}" | cut -d' ' -f1)"
-    external_driver_environment="$(printf '{\"XDG_DATA_HOME\":\"%s\",\"OPENSHELL_COMPUTE_DRIVER_SOCKET\":\"%s\",\"OPENSHELL_PODMAN_SOCKET\":\"%s\",\"OPENSHELL_SANDBOX_IMAGE\":\"%s\",\"OPENSHELL_SANDBOX_IMAGE_PULL_POLICY\":\"%s\",\"OPENSHELL_HEALTH_CHECK_INTERVAL_SECS\":%s,\"OPENSHELL_GRPC_ENDPOINT\":\"%s\",\"OPENSHELL_GATEWAY_PORT\":%s,\"OPENSHELL_NETWORK_NAME\":\"%s\",\"OPENSHELL_STOP_TIMEOUT\":%s,\"OPENSHELL_SANDBOX_RUNTIME_IMAGE\":\"%s\",\"OPENSHELL_SUPERVISOR_IMAGE\":\"%s\",\"OPENSHELL_PODMAN_TLS_CA\":{\"path\":\"%s\",\"sha256\":\"%s\"},\"OPENSHELL_PODMAN_TLS_CERT\":{\"path\":\"%s\",\"sha256\":\"%s\"},\"OPENSHELL_PODMAN_TLS_KEY\":{\"path\":\"%s\",\"sha256\":\"%s\"},\"OPENSHELL_ENABLE_BIND_MOUNTS\":%s}' \
+    legacy_tls_manifest=""
+    if [ "${CONFIG_SCHEMA_VERSION}" = "1" ]; then
+      driver_tls_cert_sha256="$(sha256sum "${EXTERNAL_DRIVER_TLS_CERT}" | cut -d' ' -f1)"
+      driver_tls_key_sha256="$(sha256sum "${EXTERNAL_DRIVER_TLS_KEY}" | cut -d' ' -f1)"
+      legacy_tls_manifest="$(printf ',"OPENSHELL_PODMAN_TLS_CERT":{"path":"%s","sha256":"%s"},"OPENSHELL_PODMAN_TLS_KEY":{"path":"%s","sha256":"%s"}' \
+        "${EXTERNAL_DRIVER_TLS_CERT}" "${driver_tls_cert_sha256}" \
+        "${EXTERNAL_DRIVER_TLS_KEY}" "${driver_tls_key_sha256}")"
+    fi
+    external_driver_environment="$(printf '{\"XDG_DATA_HOME\":\"%s\",\"OPENSHELL_COMPUTE_DRIVER_SOCKET\":\"%s\",\"OPENSHELL_PODMAN_SOCKET\":\"%s\",\"OPENSHELL_SANDBOX_IMAGE\":\"%s\",\"OPENSHELL_SANDBOX_IMAGE_PULL_POLICY\":\"%s\",\"OPENSHELL_HEALTH_CHECK_INTERVAL_SECS\":%s,\"OPENSHELL_GRPC_ENDPOINT\":\"%s\",\"OPENSHELL_GATEWAY_PORT\":%s,\"OPENSHELL_NETWORK_NAME\":\"%s\",\"OPENSHELL_STOP_TIMEOUT\":%s,\"OPENSHELL_SANDBOX_RUNTIME_IMAGE\":\"%s\",\"OPENSHELL_SUPERVISOR_IMAGE\":\"%s\",\"OPENSHELL_PODMAN_TLS_CA\":{\"path\":\"%s\",\"sha256\":\"%s\"}%s,\"OPENSHELL_ENABLE_BIND_MOUNTS\":%s}' \
       "${DRIVER_DATA_HOME}" \
       "${DRIVER_SOCKET}" \
       "${OPENSHELL_PODMAN_SOCKET:-}" \
@@ -745,10 +759,7 @@ if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
       "${SUPERVISOR_RUNTIME_IMAGE}" \
       "${EXTERNAL_DRIVER_TLS_CA}" \
       "${driver_tls_ca_sha256}" \
-      "${EXTERNAL_DRIVER_TLS_CERT}" \
-      "${driver_tls_cert_sha256}" \
-      "${EXTERNAL_DRIVER_TLS_KEY}" \
-      "${driver_tls_key_sha256}" \
+      "${legacy_tls_manifest}" \
       "${EXTERNAL_DRIVER_ENABLE_BIND_MOUNTS}")"
   fi
   printf '{"schema_version":%s,"gateway_port":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s","supervisor_image":"%s","supervisor_image_id":"%s","supervisor_image_digest":"%s","supervisor_runtime_image":"%s","supervisor_base_image":"%s","supervisor_base_image_id":"%s","supervisor_base_image_digest":"%s","supervisor_base_runtime_image":"%s","supervisor_package_manifest_sha256":"%s","sandbox_image_request":"%s","sandbox_image_id":"%s","sandbox_image_digest":"%s","sandbox_runtime_image":"%s","sandbox_boundary_image":"%s","sandbox_client_image_alias":"%s","sandbox_client_image_alias_id":"%s","gateway_sha256_before_execution":"%s","cli_sha256_before_execution":"%s","conformance_sha256_before_execution":"%s","external_driver_sha256_before_execution":"%s","supervisor_sha256_before_execution":"%s","supervisor_dockerfile_sha256_before_execution":"%s","cli_trace_wrapper_sha256_before_execution":"%s","external_driver_grpc_endpoint":%s,"external_driver_host_gateway_ip":%s,"external_driver_userns":%s,"external_driver_spiffe":%s,"external_driver_proxy":%s,"external_driver_app_armor":%s,"external_driver_environment":%s}\n' \
@@ -807,8 +818,7 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   OPENSHELL_SANDBOX_RUNTIME_IMAGE="${SANDBOX_BOUNDARY_IMAGE}" \
   OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_RUNTIME_IMAGE}" \
   OPENSHELL_PODMAN_TLS_CA="${EXTERNAL_DRIVER_TLS_CA}" \
-  OPENSHELL_PODMAN_TLS_CERT="${EXTERNAL_DRIVER_TLS_CERT}" \
-  OPENSHELL_PODMAN_TLS_KEY="${EXTERNAL_DRIVER_TLS_KEY}" \
+  "${external_driver_legacy_tls_env[@]}" \
   OPENSHELL_ENABLE_BIND_MOUNTS="${EXTERNAL_DRIVER_ENABLE_BIND_MOUNTS}" \
     "${DRIVER_BIN}" >"${DRIVER_LOG}" 2>&1 &
   DRIVER_PID=$!

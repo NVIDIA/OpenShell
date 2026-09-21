@@ -142,7 +142,9 @@ Both Pods set `automountServiceAccountToken: false`. The supervisor receives an
 explicit audience-bound projected token for the one-shot `IssueSandboxToken`
 exchange. The driver verifies that token and the gateway returns the
 sandbox-scoped JWT used by the supervisor session. The sandbox Pod receives
-neither token.
+neither token. For HTTPS gateway connections, the supervisor projects only
+`ca.crt` from the configured TLS Secret. User client certificates and private
+keys are not mounted into either Pod.
 
 The gateway uses the supervisor relay for connect, exec, logs, and file sync.
 Sandbox Pods do not need direct external ingress for SSH.

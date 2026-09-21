@@ -75,7 +75,10 @@ capability-free workload Pod and a directly managed capability-free supervisor
 Pod. One namespace-wide NetworkPolicy denies direct egress from every OpenShell
 workload Pod. The
 `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway generate-certs`)
-generates mTLS secrets on first install. The default Skaffold values export
+generates gateway and CLI TLS secrets on first install. Supervisor Pods project
+only `ca.crt` and authenticate gateway RPCs with sandbox bearer tokens. User
+client certificates and private keys remain outside supervisor and workload Pods.
+The default Skaffold values export
 gateway and Kubernetes-driver traces to the collector service installed by
 `helm:k3s:create`. Envoy Gateway is opt-in; see the Optional Add-ons section.
 

@@ -144,6 +144,10 @@ The driver publishes host loopback as the backend address for
 mediated path, so policies can reach host services without a Docker bridge,
 container DNS alias, or another gateway listener.
 
+For HTTPS endpoints, the supervisor receives only the gateway CA and
+uses its sandbox-scoped bearer token to authenticate RPCs. User client
+certificates and private keys are not delivered to either container.
+
 Docker Engine on Linux supports host networking directly. Docker Desktop
 requires host networking to be enabled in Settings and does not support it
 when Enhanced Container Isolation is enabled.
@@ -156,7 +160,7 @@ The supervisor owns these security-critical variables:
 - `OPENSHELL_SANDBOX_TOKEN_FILE`
 - `OPENSHELL_SSH_SOCKET_PATH`
 - `OPENSHELL_MAIN_PROCESS_SPEC`
-- TLS path variables when HTTPS is enabled
+- `OPENSHELL_TLS_CA` when HTTPS is enabled
 
 Template and sandbox environment is encoded in the protected bootstrap and
 exposed only to workload children. Workload input cannot override

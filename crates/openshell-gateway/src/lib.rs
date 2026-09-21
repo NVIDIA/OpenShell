@@ -187,7 +187,6 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
         .map(|registration| {
             registration
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("kubernetes"))
-                .without_mtls_user_auth()
                 .with_in_process_tracing(openshell_driver_kubernetes::otel_tracing::TRACING)
         }),
         #[cfg(feature = "compute-driver-podman")]
@@ -307,12 +306,7 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config: openshell_driver_docker::DockerComputeConfig = context.driver_config()?;
         require_guest_tls_for_local_driver(&context, "docker")?;
-        apply_guest_tls(
-            &mut config.guest_tls_ca,
-            &mut config.guest_tls_cert,
-            &mut config.guest_tls_key,
-            context.guest_tls_paths(),
-        );
+        apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
         let driver = openshell_driver_docker::DockerComputeDriver::new(
             context.gateway_bind_address(),
             context.gateway_log_level(),
@@ -353,12 +347,7 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config = podman_config(context.config_context())?;
         require_guest_tls_for_local_driver(&context, "podman")?;
-        apply_guest_tls(
-            &mut config.guest_tls_ca,
-            &mut config.guest_tls_cert,
-            &mut config.guest_tls_key,
-            context.guest_tls_paths(),
-        );
+        apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
         let driver = openshell_driver_podman::PodmanComputeDriver::new(config)
             .await
             .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
@@ -421,7 +410,7 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
         let mut config = vm_config(context.config_context())?;
         require_guest_tls_for_local_driver(&context, "vm")?;
         if config.grpc_endpoint.trim().is_empty()
-            && (!context.gateway_tls_enabled() || context.guest_tls_paths().is_some())
+            && (!context.gateway_tls_enabled() || context.guest_tls_ca().is_some())
         {
             let scheme = if context.gateway_tls_enabled() {
                 "https"
@@ -430,12 +419,7 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
             };
             config.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", context.gateway_port());
         }
-        apply_guest_tls(
-            &mut config.guest_tls_ca,
-            &mut config.guest_tls_cert,
-            &mut config.guest_tls_key,
-            context.guest_tls_paths(),
-        );
+        apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
         let endpoint = vm::spawn(
             context.gateway_log_level(),
             context.gateway_name(),
@@ -474,7 +458,7 @@ fn require_guest_tls_for_local_driver(
 ) -> openshell_core::Result<()> {
     validate_local_driver_guest_tls(
         context.gateway_tls_enabled(),
-        context.guest_tls_paths().is_some(),
+        context.guest_tls_ca().is_some(),
         driver_name,
     )
 }
@@ -494,7 +478,7 @@ fn validate_local_driver_guest_tls(
 ) -> openshell_core::Result<()> {
     if gateway_tls_enabled && !has_guest_tls {
         return Err(openshell_core::Error::config(format!(
-            "gateway TLS requires guest_tls_ca, guest_tls_cert, and guest_tls_key in [openshell.gateway] when using the {driver_name} compute driver"
+            "gateway TLS requires guest_tls_ca in [openshell.gateway] when using the {driver_name} compute driver"
         )));
     }
     Ok(())
@@ -508,20 +492,11 @@ fn validate_local_driver_guest_tls(
         feature = "compute-driver-vm"
     )
 ))]
-fn apply_guest_tls(
-    ca: &mut Option<std::path::PathBuf>,
-    cert: &mut Option<std::path::PathBuf>,
-    key: &mut Option<std::path::PathBuf>,
-    defaults: Option<(&std::path::Path, &std::path::Path, &std::path::Path)>,
-) {
+fn apply_guest_tls(ca: &mut Option<std::path::PathBuf>, default_ca: Option<&std::path::Path>) {
     if ca.is_none()
-        && cert.is_none()
-        && key.is_none()
-        && let Some((default_ca, default_cert, default_key)) = defaults
+        && let Some(default_ca) = default_ca
     {
         *ca = Some(default_ca.to_owned());
-        *cert = Some(default_cert.to_owned());
-        *key = Some(default_key.to_owned());
     }
 }
 
@@ -550,7 +525,7 @@ mod local_driver_tests {
     }
 
     #[test]
-    fn tls_enabled_local_drivers_require_a_guest_bundle() {
+    fn tls_enabled_local_drivers_require_a_gateway_ca() {
         for driver_name in ["docker", "podman", "vm"] {
             let error = validate_local_driver_guest_tls(true, false, driver_name)
                 .expect_err("TLS-enabled local driver must require guest TLS");
@@ -559,29 +534,16 @@ mod local_driver_tests {
             assert!(message.contains("guest_tls_ca"));
         }
         validate_local_driver_guest_tls(true, true, "docker")
-            .expect("a complete guest bundle satisfies the requirement");
+            .expect("a gateway CA satisfies the requirement");
         validate_local_driver_guest_tls(false, false, "docker")
             .expect("plaintext gateways do not require guest TLS");
     }
 
     #[test]
-    fn package_managed_guest_bundle_is_injected_when_driver_paths_are_absent() {
+    fn package_managed_gateway_ca_is_injected_when_driver_path_is_absent() {
         let mut ca = None;
-        let mut cert = None;
-        let mut key = None;
-        apply_guest_tls(
-            &mut ca,
-            &mut cert,
-            &mut key,
-            Some((
-                Path::new("/managed/ca.pem"),
-                Path::new("/managed/client.pem"),
-                Path::new("/managed/client-key.pem"),
-            )),
-        );
+        apply_guest_tls(&mut ca, Some(Path::new("/managed/ca.pem")));
         assert_eq!(ca, Some(PathBuf::from("/managed/ca.pem")));
-        assert_eq!(cert, Some(PathBuf::from("/managed/client.pem")));
-        assert_eq!(key, Some(PathBuf::from("/managed/client-key.pem")));
     }
 }
 

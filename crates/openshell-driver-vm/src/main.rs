@@ -112,9 +112,11 @@ struct Args {
     #[arg(long = "guest-tls-ca", env = "OPENSHELL_VM_TLS_CA")]
     guest_tls_ca: Option<PathBuf>,
 
+    /// Deprecated; client certificates are rejected.
     #[arg(long = "guest-tls-cert", env = "OPENSHELL_VM_TLS_CERT")]
     guest_tls_cert: Option<PathBuf>,
 
+    /// Deprecated; client private keys are rejected.
     #[arg(long = "guest-tls-key", env = "OPENSHELL_VM_TLS_KEY")]
     guest_tls_key: Option<PathBuf>,
 

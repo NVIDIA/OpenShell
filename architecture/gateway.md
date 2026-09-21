@@ -50,9 +50,9 @@ Package lifecycle code may replace an exact package-generated v1 default, but
 it preserves edited configurations for explicit operator migration.
 
 Gateway listener TLS and sandbox supervisor TLS are separate inputs. A selected
-local Docker, Podman, or VM driver requires a complete guest bundle whenever
-the gateway listener uses TLS; package-managed local TLS can supply that bundle.
-Kubernetes instead projects guest credentials through its configured Secret.
+local Docker, Podman, or VM driver requires the gateway CA whenever
+the gateway listener uses TLS; package-managed local TLS can supply that CA.
+Kubernetes projects only the CA from its configured Secret into supervisor Pods.
 The gateway validates this requirement before constructing the selected driver.
 
 ## Protocol and Auth
@@ -98,12 +98,12 @@ post-commit observation, which remains best-effort rather than an outbox.
 Credential capabilities and streaming execution require separate contracts.
 
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
-The default local single-user deployment mode is mTLS user authentication:
-clients present a certificate signed by the local deployment CA, and the
-gateway maps the verified certificate subject to a user principal. Kubernetes
-deployments use mTLS for transport only and require OIDC or a trusted access
-proxy for user authentication unless the explicit unsafe local-development
-`allow_unauthenticated_users` switch is enabled.
+When a client CA is configured without OIDC, mTLS user authentication defaults
+on independently of the compute driver. Clients present a certificate signed
+by the deployment CA, and the gateway maps the verified certificate subject to
+a user principal. Workloads and supervisors do not receive that user client
+certificate. Supervisors authenticate the gateway with the CA and their own
+RPCs with gateway-minted bearer tokens.
 When that service port is bound to loopback, the listener can also accept
 plaintext HTTP on the same port for sandbox service subdomains only. That local
 browser path is enabled by default and disabled with
@@ -269,7 +269,7 @@ Supported auth modes:
 
 | Mode | Use |
 |---|---|
-| mTLS user auth | Local single-user Docker, Podman, and VM gateway access. |
+| mTLS user auth | Gateway user access with verified client certificates. |
 | Plaintext | Local development or a trusted reverse proxy boundary. |
 | Unauthenticated local users | Trusted Kubernetes dev or fully trusted proxy deployments only. |
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
@@ -298,8 +298,8 @@ the capability query's admin authorization check. The CLI combines the health
 and capability results so a reachable gateway with an expired or rejected
 token is reported as connected but unauthenticated.
 
-Sandbox supervisor RPCs authenticate with explicit sandbox credentials; mTLS
-does not grant sandbox identity. Kubernetes deployments use the
+Sandbox supervisor RPCs authenticate with explicit sandbox credentials; TLS
+authenticates the gateway and does not grant sandbox identity. Kubernetes deployments use the
 gateway-minted JWT bootstrap path: the supervisor starts with a projected
 ServiceAccount token, exchanges it for a gateway-minted sandbox JWT, and uses
 that JWT on subsequent gateway RPCs.

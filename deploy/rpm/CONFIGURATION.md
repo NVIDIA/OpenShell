@@ -66,8 +66,8 @@ systemctl --user edit openshell-gateway
 
 ## TLS (mTLS)
 
-The RPM enables mutual TLS by default. The gateway requires a valid
-client certificate for all API connections. Its primary listener uses
+The RPM enables mTLS user authentication by default. CLI clients present a valid
+client certificate; supervisors use the gateway CA and sandbox-scoped bearer tokens. Its primary listener uses
 `127.0.0.1:17670`; Podman supervisor sessions use that same listener.
 
 ### Auto-generated certificates
@@ -176,25 +176,20 @@ To disable TLS (not recommended for production):
 
 ## Sandbox TLS
 
-When mTLS is enabled, the Podman driver bind-mounts the client
-certificates into each sandbox container so the supervisor process can
-establish an mTLS connection back to the gateway.
+When TLS is enabled, the Podman driver bind-mounts the gateway CA into each
+supervisor container to authenticate the gateway. Supervisors authenticate their
+RPCs with sandbox-scoped bearer tokens. The user client certificate and private
+key are not mounted into supervisor or workload containers.
 
-The following TOML fields control the host-side paths of the client
-certificates that are mounted into sandbox containers:
+The following TOML field controls the host-side CA path:
 
 ```toml
 [openshell.gateway]
 guest_tls_ca = "/home/user/.local/state/openshell/tls/ca.crt"
-guest_tls_cert = "/home/user/.local/state/openshell/tls/client/tls.crt"
-guest_tls_key = "/home/user/.local/state/openshell/tls/client/tls.key"
 ```
 
-Inside the container, the supervisor reads them from:
-
-- `/etc/openshell/tls/client/ca.crt`
-- `/etc/openshell/tls/client/tls.crt`
-- `/etc/openshell/tls/client/tls.key`
+Inside the supervisor container, the CA is mounted at
+`/etc/openshell/tls/client/ca.crt`.
 
 On SELinux-enabled systems, the Podman driver automatically applies the
 `:z` relabel option to these bind mounts. No manual SELinux
@@ -223,7 +218,7 @@ overrides that persist across package upgrades.
 | `[openshell.drivers.podman].default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
 | `[openshell.drivers.podman].sandbox_runtime_image` | `ghcr.io/nvidia/openshell/sandbox:latest` | Static musl sandbox runtime image mounted into Podman workloads. |
 | `[openshell.drivers.podman].supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Dynamic glibc supervisor image used outside the workload. |
-| `[openshell.gateway].guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Gateway-owned client TLS material injected into the selected local driver and mounted into sandbox containers. |
+| `[openshell.gateway].guest_tls_ca` | auto-generated path | Gateway CA injected into the selected local driver for supervisor-to-gateway TLS. Sandbox identity uses a bearer token. |
 | `[openshell.gateway.tls]` paths | auto-generated paths | Server TLS certificate, key, and client CA. |
 | `disable_tls` | unset | Set to `true` to disable TLS. |
 

@@ -133,9 +133,9 @@ validation_capability_ids = ["podman-runtime-security-and-health"]
 id = "guest-tls-centralized"
 category = "ownership"
 origin_main_contract = "Local driver tables may override guest_tls_ca, guest_tls_cert, and guest_tls_key inherited from gateway scope."
-schema_v2_contract = "One complete guest TLS bundle is gateway-owned and injected into the selected Docker, Podman, or VM driver; driver-local fields are rejected."
-migration = "Keep guest_tls_ca, guest_tls_cert, and guest_tls_key under [openshell.gateway] only."
-rationale = "A single active local driver needs one callback client identity, and centralized validation prevents partial or conflicting bundles."
+schema_v2_contract = "The gateway CA is gateway-owned and injected into the selected Docker, Podman, or VM driver for supervisor TLS; legacy client certificate fields and driver-local guest TLS fields are rejected."
+migration = "Keep guest_tls_ca under [openshell.gateway] only and remove guest_tls_cert and guest_tls_key. Supervisors authenticate gateway RPCs with sandbox bearer credentials."
+rationale = "Gateway TLS trust is separate from sandbox identity. Centralized CA validation supplies supervisor trust without exposing a user client certificate or private key."
 parity_disposition = "intentional_change"
 validation_capability_ids = ["guest-callback-tls-ownership"]
 

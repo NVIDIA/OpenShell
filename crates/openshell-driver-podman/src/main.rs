@@ -109,15 +109,15 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
     supervisor_image: Option<String>,
 
-    /// Host path to the CA certificate for sandbox mTLS.
+    /// Host path to the CA certificate for supervisor-to-gateway TLS.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_CA")]
     podman_tls_ca: Option<PathBuf>,
 
-    /// Host path to the client certificate for sandbox mTLS.
+    /// Deprecated; client certificates are rejected.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_CERT")]
     podman_tls_cert: Option<PathBuf>,
 
-    /// Host path to the client private key for sandbox mTLS.
+    /// Deprecated; client private keys are rejected.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_KEY")]
     podman_tls_key: Option<PathBuf>,
 

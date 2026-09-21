@@ -160,8 +160,6 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | `overlay_disk_mib` | `4096` | Sparse writable overlay disk size per sandbox, in MiB. |
 | `krun_log_level` | `1` | libkrun verbosity (0-5). |
 | `guest_tls_ca` | unset | Historical key name for the host supervisor's gateway CA certificate. Required when `grpc_endpoint` uses `https://`; never copied into the guest. |
-| `guest_tls_cert` | unset | Historical key name for the host supervisor's client certificate; never copied into the guest. |
-| `guest_tls_key` | unset | Historical key name for the host supervisor's client private key; never copied into the guest. |
 | `https_proxy` | unset | Corporate forward proxy (`http://host:port` or `https://host:port`) that host control chains policy-approved TLS CONNECT egress through. Host-loopback proxy URLs work because control runs on the gateway host. |
 | `no_proxy` | unset | Comma-separated bypass list for the corporate proxy only. OpenShell policy evaluation still applies. |
 | `proxy_auth_file` | unset | Gateway-host path to a validated `user:pass` credential file. Staged root-only into the per-sandbox overlay and removed with the sandbox; credentials never enter logs or process arguments. |

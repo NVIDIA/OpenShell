@@ -67,9 +67,8 @@ On first start, the gateway automatically generates:
 
 > **Note:** The primary gateway listener uses the loopback default,
 > `127.0.0.1:17670`. Host-networked Podman supervisors use this same listener.
-> Mutual TLS (mTLS) is
-> enabled automatically on first start, requiring a valid client certificate
-> for every connection. See CONFIGURATION.md for details.
+> mTLS user authentication is enabled automatically on first start.
+> Supervisor connections use the gateway CA and sandbox-scoped bearer tokens. See CONFIGURATION.md for details.
 
 Verify the service is running:
 

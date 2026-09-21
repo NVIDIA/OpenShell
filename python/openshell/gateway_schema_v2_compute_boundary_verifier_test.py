@@ -107,6 +107,18 @@ socket_path = "/tmp/{variant}.sock"
     policy = "missing" if schema_version == 1 else "if_not_present"
     package_hash = verifier.sha256(artifact_dir / "supervisor.packages.txt")
     result = json.loads((results_dir / f"{variant}.json").read_text(encoding="utf-8"))
+    legacy_tls_environment = {}
+    if schema_version == 1:
+        legacy_tls_environment = {
+            "OPENSHELL_PODMAN_TLS_CERT": {
+                "path": f"/tmp/{variant}-pki/tls.crt",
+                "sha256": "9" * 64,
+            },
+            "OPENSHELL_PODMAN_TLS_KEY": {
+                "path": f"/tmp/{variant}-pki/tls.key",
+                "sha256": "a" * 64,
+            },
+        }
     write_json(
         results_dir / f"{variant}.launch.json",
         {
@@ -164,14 +176,7 @@ socket_path = "/tmp/{variant}.sock"
                     "path": f"/tmp/{variant}-pki/ca.crt",
                     "sha256": "8" * 64,
                 },
-                "OPENSHELL_PODMAN_TLS_CERT": {
-                    "path": f"/tmp/{variant}-pki/tls.crt",
-                    "sha256": "9" * 64,
-                },
-                "OPENSHELL_PODMAN_TLS_KEY": {
-                    "path": f"/tmp/{variant}-pki/tls.key",
-                    "sha256": "a" * 64,
-                },
+                **legacy_tls_environment,
                 "OPENSHELL_ENABLE_BIND_MOUNTS": True,
             },
         },

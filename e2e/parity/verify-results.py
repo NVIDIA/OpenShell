@@ -387,10 +387,12 @@ def verify_variant(
             "OPENSHELL_SANDBOX_RUNTIME_IMAGE",
             "OPENSHELL_SUPERVISOR_IMAGE",
             "OPENSHELL_PODMAN_TLS_CA",
-            "OPENSHELL_PODMAN_TLS_CERT",
-            "OPENSHELL_PODMAN_TLS_KEY",
             "OPENSHELL_ENABLE_BIND_MOUNTS",
         }
+        tls_fields = {"OPENSHELL_PODMAN_TLS_CA"}
+        if schema_version == 1:
+            tls_fields.update({"OPENSHELL_PODMAN_TLS_CERT", "OPENSHELL_PODMAN_TLS_KEY"})
+        expected_environment_keys.update(tls_fields)
         require(
             isinstance(driver_environment, dict)
             and set(driver_environment) == expected_environment_keys,
@@ -430,11 +432,7 @@ def verify_variant(
             f"{launch_path}: external driver allowlisted runtime inputs differ",
         )
         tls_paths: set[str] = set()
-        for field in (
-            "OPENSHELL_PODMAN_TLS_CA",
-            "OPENSHELL_PODMAN_TLS_CERT",
-            "OPENSHELL_PODMAN_TLS_KEY",
-        ):
+        for field in tls_fields:
             tls_input = driver_environment[field]
             require(
                 isinstance(tls_input, dict)
@@ -447,7 +445,7 @@ def verify_variant(
             )
             tls_paths.add(tls_input["path"])
         require(
-            len(tls_paths) == 3,
+            len(tls_paths) == len(tls_fields),
             f"{launch_path}: external driver TLS paths are not distinct",
         )
     else:
@@ -648,8 +646,6 @@ def verify_topology(
             )
         for field in (
             "OPENSHELL_PODMAN_TLS_CA",
-            "OPENSHELL_PODMAN_TLS_CERT",
-            "OPENSHELL_PODMAN_TLS_KEY",
         ):
             require(
                 baseline_env[field]["path"] != candidate_env[field]["path"],

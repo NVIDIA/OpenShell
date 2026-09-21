@@ -79,11 +79,11 @@ future version. To migrate an existing file:
    removed `--driver` and `--drivers` flags remain unsupported.
 3. Move every compute-driver option into `[openshell.drivers.<name>]`. Schema
    version 2 does not inherit driver defaults from `[openshell.gateway]`.
-   Keep only `guest_tls_ca`, `guest_tls_cert`, and `guest_tls_key` at gateway
-   scope. A TLS-enabled Docker, Podman, or VM gateway requires one complete
-   guest bundle. Set all three paths unless the package-managed local TLS
-   bundle supplies them. When TLS is disabled, omit all three. Kubernetes
-   projects sandbox TLS through `client_tls_secret_name` instead.
+   Keep `guest_tls_ca` at gateway scope and remove `guest_tls_cert` and
+   `guest_tls_key`. A TLS-enabled Docker, Podman, or VM gateway requires the
+   gateway CA unless package-managed local TLS supplies it. When TLS is
+   disabled, omit it. Kubernetes projects the gateway CA into supervisor Pods
+   through `client_tls_secret_name` instead.
 4. Rename Docker `sandbox_namespace` to `sandbox_label`, Podman
    `sandbox_ssh_socket_path` to `ssh_socket_path`, and VM
    `openshell_endpoint` to `grpc_endpoint`.
@@ -150,14 +150,11 @@ enable_loopback_service_http = true
 # Set true only for local plaintext gateways or trusted TLS termination.
 disable_tls = false
 
-# Guest TLS paths remain gateway settings. TLS-enabled Docker, Podman, and VM
-# gateways require a complete bundle unless package-managed local TLS supplies
-# it automatically. Omit all three when TLS is disabled. Kubernetes projects
-# sandbox TLS from client_tls_secret_name instead. Driver tables must not repeat
-# these fields.
+# The supervisor gateway CA remains a gateway setting. TLS-enabled Docker,
+# Podman, and VM gateways require it unless package-managed local TLS supplies
+# it automatically. Omit it when TLS is disabled. Kubernetes projects the CA
+# from client_tls_secret_name instead. Driver tables must not repeat this field.
 guest_tls_ca            = "/etc/openshell/certs/ca.pem"
-guest_tls_cert          = "/etc/openshell/certs/client.pem"
-guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 
 # Optional gRPC rate limit. Both values must be positive to enable the limit.
 # Set either value to 0, or omit both, to disable rate limiting.
@@ -180,7 +177,7 @@ audience = "urn:openshell:middleware:local-content-guard"
 max_payload_bytes = 262144
 timeout = "500ms"
 
-# Gateway listener TLS (distinct from the per-driver guest_tls_*).
+# Gateway listener TLS (distinct from the supervisor gateway CA).
 # client_ca_path is optional; omit it for HTTPS-only listeners that do not
 # verify client certificates.
 [openshell.gateway.tls]
@@ -260,9 +257,9 @@ namespace = "openshell"
 allow_reference_namespace = false
 ```
 
-Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to map a verified client certificate to a CLI user identity. This application-layer identity switch does not control the TLS handshake. When `client_ca_path` is set without OIDC, the listener requires a valid client certificate. When OIDC is configured, bearer-only clients may connect; the listener still validates any client certificate they present against the configured CA. Kubernetes deployments must leave `mtls_auth.enabled` unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
+Set `[openshell.gateway.mtls_auth] enabled = true` to map a verified client certificate to a CLI user identity. This gateway policy is independent of the compute driver and defaults on when a client CA is configured without OIDC. The listener allows bearer-only clients and validates any client certificate presented against the configured CA. Supervisors use `guest_tls_ca` to authenticate the gateway and sandbox bearer tokens to authenticate their RPCs.
 
-The client-certificate handshake policy is derived and has no `require_client_auth` TOML field. This preserves bearer-only OIDC clients and prevents a file setting from silently weakening CA-only gateways.
+The client-certificate handshake policy has no `require_client_auth` TOML field. Client certificates are optional at the transport layer; gateway RPC authorization enforces the configured user or sandbox identity.
 
 `[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
 
@@ -517,7 +514,7 @@ Kubernetes configurations set `namespace`, `service_account_name`, and `enable_u
 
 ### Kubernetes
 
-The gateway runs as a Pod and creates sandbox Pods in another namespace. mTLS material for sandboxes is delivered through a Kubernetes Secret rather than host-side file paths.
+The gateway runs as a Pod and creates paired workload and supervisor Pods in another namespace. The gateway CA is projected from a Kubernetes Secret into supervisor Pods; user client certificate and key entries in that Secret are not exposed to either Pod.
 
 ```toml
 [openshell]
@@ -686,7 +683,7 @@ output.
 
 ### Docker
 
-Sandboxes run as containers on a local bridge network. The supervisor binary is bind-mounted from the host (no in-cluster image pull required). Configure guest mTLS paths once under `[openshell.gateway]`; the gateway validates and injects the bundle into the selected local driver.
+Each Docker sandbox uses a workload container with networking disabled and a host-networked supervisor container. Configure the supervisor gateway CA once under `[openshell.gateway]`; the gateway validates and injects it into the selected local driver. The supervisor authenticates RPCs with a sandbox bearer token.
 
 ```toml
 [openshell]
@@ -696,10 +693,8 @@ version = 2
 bind_address    = "127.0.0.1:17670"
 log_level       = "info"
 compute_driver = "docker"
-# Gateway-owned bundle injected into the selected local driver.
+# Gateway-owned CA injected into the selected local driver.
 guest_tls_ca  = "/etc/openshell/certs/ca.pem"
-guest_tls_cert = "/etc/openshell/certs/client.pem"
-guest_tls_key  = "/etc/openshell/certs/client-key.pem"
 
 [openshell.drivers.docker]
 socket_path        = "/var/run/docker.sock"
@@ -741,7 +736,7 @@ Use `sandbox_label` for Docker configurations. The legacy
 
 ### Podman
 
-Each Podman sandbox uses two containers. The workload container runs `openshell-sandbox` with `network=none`; the supervisor container runs on the host network and initiates policy-approved upstream connections. A private volume carries their authenticated Unix-domain socket. Configure guest mTLS paths once under `[openshell.gateway]`; the gateway validates and injects the bundle into the selected local driver.
+Each Podman sandbox uses two containers. The workload container runs `openshell-sandbox` with `network=none`; the supervisor container runs on the host network and initiates policy-approved upstream connections. A private volume carries their authenticated Unix-domain socket. Configure the supervisor gateway CA once under `[openshell.gateway]`; the gateway validates and injects it into the selected local driver. The supervisor authenticates RPCs with a sandbox bearer token.
 
 ```toml
 [openshell]
@@ -751,10 +746,8 @@ version = 2
 bind_address    = "127.0.0.1:17670"
 log_level       = "info"
 compute_driver = "podman"
-# Gateway-owned bundle injected into the selected local driver.
+# Gateway-owned CA injected into the selected local driver.
 guest_tls_ca  = "/etc/openshell/certs/ca.pem"
-guest_tls_cert = "/etc/openshell/certs/client.pem"
-guest_tls_key  = "/etc/openshell/certs/client-key.pem"
 
 [openshell.drivers.podman]
 network_name            = "openshell"
@@ -905,10 +898,8 @@ bind_address    = "127.0.0.1:17670"
 log_level       = "info"
 # VM is never auto-detected; an explicit entry here is required.
 compute_driver = "vm"
-# Gateway-owned bundle injected into the selected local driver.
+# Gateway-owned CA injected into the selected local driver.
 guest_tls_ca  = "/var/lib/openshell/guest-tls/ca.pem"
-guest_tls_cert = "/var/lib/openshell/guest-tls/client.pem"
-guest_tls_key  = "/var/lib/openshell/guest-tls/client-key.pem"
 
 [openshell.drivers.vm]
 state_dir        = "/var/lib/openshell/vm"

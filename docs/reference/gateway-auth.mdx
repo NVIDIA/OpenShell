@@ -32,9 +32,9 @@ The CLI uses one of these authentication modes depending on the gateway's config
 
 ### mTLS
 
-The default mode for local Docker, Podman, and VM gateways without OIDC. The CLI presents a client certificate during the TLS handshake, and the gateway can map the verified certificate subject to a local user principal when mTLS user authentication is enabled.
+The default mode for gateways with a client CA and no OIDC issuer. The CLI presents a client certificate during the TLS handshake, and the gateway can map the verified certificate subject to a local user principal when mTLS user authentication is enabled.
 
-mTLS user authentication is for local single-user gateways. Kubernetes deployments must use OIDC or a trusted access proxy for user authentication; the Helm chart does not render `mtls_auth`.
+mTLS user authentication is gateway policy and is independent of the compute driver. Shared deployments can prefer OIDC or a trusted access proxy for user identity and lifecycle management.
 
 Set these environment variables before starting the gateway:
 
@@ -43,13 +43,13 @@ Set these environment variables before starting the gateway:
 | `OPENSHELL_TLS_CERT` | Path to the gateway server certificate. |
 | `OPENSHELL_TLS_KEY` | Path to the gateway server private key. |
 | `OPENSHELL_TLS_CLIENT_CA` | Path to the CA certificate that verifies CLI client certificates. |
-| `OPENSHELL_ENABLE_MTLS_AUTH` | Set to `true` to authenticate CLI callers from verified client certificates. Defaults on for local Docker, Podman, and VM gateways with no OIDC issuer. |
+| `OPENSHELL_ENABLE_MTLS_AUTH` | Set to `true` to authenticate CLI callers from verified client certificates. Defaults on when a client CA is configured and no OIDC issuer is present. |
 
 For local access, the server certificate must be valid for the endpoint the CLI uses. Include `localhost`, `127.0.0.1`, and `::1` in the certificate SANs when users connect to a local gateway through loopback.
 
 Package-managed local gateways generate this bundle automatically for the `openshell` gateway name. Homebrew registers `https://localhost:17670`; Debian and RPM use `https://127.0.0.1:17670`.
 When you register a package-managed local gateway with `openshell gateway add <endpoint> --local --name openshell`, the CLI refreshes its mTLS bundle from the package-managed TLS directory.
-On Homebrew, the gateway service also mirrors the Docker sandbox client bundle into `$HOME/.local/state/openshell/homebrew/tls` before startup so Docker Desktop can bind-mount the files into sandbox containers.
+On Homebrew, the gateway service also mirrors the gateway CA into `$HOME/.local/state/openshell/homebrew/tls` before startup so Docker Desktop can bind-mount gateway trust into supervisor containers. The driver does not mount the user client certificate or private key.
 
 The CLI loads its mTLS bundle from `~/.config/openshell/gateways/<name>/mtls/`:
 
@@ -72,7 +72,7 @@ The connection flow:
 
 Gateways can validate OpenID Connect access tokens on gRPC requests. Configure OIDC when you want users, operators, or automation to authenticate with an identity provider such as Keycloak, Entra ID, or Okta.
 
-OIDC is application-layer authentication. TLS still controls the transport. If TLS client certificates remain required, the CLI must also have an mTLS bundle for the gateway.
+OIDC is application-layer authentication. TLS authenticates the gateway and protects the transport; OIDC clients do not need a TLS client certificate. The gateway validates any client certificate they present against the configured client CA.
 
 Configure the gateway with an issuer and audience:
 
@@ -222,7 +222,7 @@ Common identity providers such as Keycloak (RS256), Microsoft Entra ID (RSA), an
 
 If `OPENSHELL_OIDC_SCOPES_CLAIM` is set, the gateway also enforces scopes. It accepts space-delimited scope strings such as `scope: "openid sandbox:read"` and JSON arrays such as `scp: ["sandbox:read"]`. Standard OIDC scopes such as `openid`, `profile`, `email`, and `offline_access` are ignored for authorization. `openshell:all` grants access to all scoped methods.
 
-Supervisor-to-gateway RPCs do not use user OIDC tokens or mTLS user identity. Each sandbox supervisor presents a gateway-minted `Authorization: Bearer` token scoped to its sandbox ID. On Kubernetes, the Kubernetes compute driver validates the projected ServiceAccount token with TokenReview, verifies the live pod UID and controlling `Sandbox` ownerReference, and returns the authenticated sandbox ID to the gateway. The gateway verifies that sandbox still exists before minting its JWT. Log upload, policy status, provider environment lookup, and sandbox config sync run with sandbox-restricted scope, while CLI users authenticate with OIDC, edge auth, local mTLS user authentication, or an explicitly enabled unauthenticated local developer mode. Provider environment responses expose only the credentials and configuration attached to that sandbox, subject to endpoint binding and credential expiry checks.
+Supervisor-to-gateway RPCs do not use user OIDC tokens or mTLS user identity. TLS authenticates the gateway using the configured CA; user client certificates and private keys are not mounted into supervisor or workload containers. Each sandbox supervisor presents a gateway-minted `Authorization: Bearer` token scoped to its sandbox ID. On Kubernetes, the Kubernetes compute driver validates the projected ServiceAccount token with TokenReview, verifies the live pod UID and controlling `Sandbox` ownerReference, and returns the authenticated sandbox ID to the gateway. The gateway verifies that sandbox still exists before minting its JWT. Log upload, policy status, provider environment lookup, and sandbox config sync run with sandbox-restricted scope, while CLI users authenticate with OIDC, edge auth, local mTLS user authentication, or an explicitly enabled unauthenticated local developer mode. Provider environment responses expose only the credentials and configuration attached to that sandbox, subject to endpoint binding and credential expiry checks.
 
 Re-authenticate an OIDC gateway with:
 

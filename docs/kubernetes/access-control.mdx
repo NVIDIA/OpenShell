@@ -8,14 +8,15 @@ keywords: "Generative AI, Cybersecurity, Kubernetes, Authentication, mTLS, OIDC,
 position: 5
 ---
 
-The OpenShell gateway supports two access-control models for human callers on Kubernetes:
+The OpenShell gateway supports these access-control models for human callers on Kubernetes:
 
 | Model | When to use |
 |---|---|
+| mTLS | Gateways with a configured client CA and no OIDC issuer. The gateway maps a verified client certificate to a user identity. |
 | OIDC (recommended) | Production deployments. Integrates with an existing identity provider, supports role-based access control, and gives each user their own identity without distributing certificates. |
 | Reverse-proxy auth termination | An access proxy (Cloudflare Access, ngrok, corporate SSO) authenticates callers in front of the gateway. The gateway trusts the proxy and skips its own client-cert check. |
 
-The Helm chart always generates mTLS certificates at install time. The gateway uses them for transport-layer security regardless of which access-control model you choose. The client bundle in the `openshell-client-tls` secret is used internally by sandbox supervisors, not for granting access to individual users.
+The Helm chart generates a gateway TLS certificate and a user client certificate at install time. Supervisor Pods project only `ca.crt` from the client Secret so they can authenticate the gateway; the client certificate and private key are not exposed to sandboxes. Supervisors authenticate their RPCs with gateway-minted sandbox JWTs.
 
 For how the CLI resolves gateways and stores credentials, refer to [Gateway Authentication](/reference/gateway-auth).
 
@@ -43,7 +44,7 @@ helm upgrade openshell \
   --set server.tls.clientCaSecretName=""
 ```
 
-Set `server.tls.clientCaSecretName=""` when the gateway terminates TLS directly and browsers or CLI clients connect without client certificates. The chart omits `client_ca_path` from `gateway.toml` and does not mount the client-CA volume, leaving HTTPS-only transport with OIDC for user authentication. Do not set the value to `null`; omit the key to use the chart default, or set it to `""` to disable client certificate verification.
+Client certificates are optional at the TLS handshake, so OIDC callers can connect without them. Set `server.tls.clientCaSecretName=""` to disable client-certificate verification entirely. The chart omits `client_ca_path` from `gateway.toml` and does not mount the client-CA volume, leaving HTTPS-only transport with OIDC for user authentication. Do not set the value to `null`; omit the key to use the chart default, or set it to `""` to disable client certificate verification.
 
 The `audience` value must match the client ID configured in your identity provider for the OpenShell resource server.
 
@@ -112,7 +113,7 @@ helm upgrade openshell \
 
 The gateway still serves TLS and sandbox supervisors still authenticate with gateway-minted sandbox JWTs. User-facing CLI/API calls without OIDC or mTLS credentials are accepted as an unauthenticated local developer principal. The proxy is responsible for authenticating callers and forwarding only authorized traffic.
 
-When the gateway terminates TLS directly and callers connect without client certificates, also set `server.tls.clientCaSecretName=""` as described in the OIDC section above.
+To disable client-certificate verification entirely, set `server.tls.clientCaSecretName=""` as described in the OIDC section above.
 
 To also disable TLS entirely (when the proxy terminates TLS before the request reaches the gateway):
 

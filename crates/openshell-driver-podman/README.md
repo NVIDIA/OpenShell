@@ -62,8 +62,9 @@ Landlock denies agent access to the top-level `/.openshell` control hierarchy.
 The driver verifies Podman's reported `network=none` fence before launch and
 restart. Host networking applies to the supervisor, not the agent.
 
-Gateway sessions use the existing sandbox JWT and optional configured mTLS
-bundle. The sandbox/supervisor channel always uses its separate, per-sandbox
+Gateway sessions use the sandbox JWT and optional server-authenticated TLS.
+Only the gateway CA is delivered to the supervisor; user client certificates
+and private keys are not mounted into either container. The sandbox/supervisor channel always uses its separate, per-sandbox
 mutual TLS material. These are distinct authentication relationships.
 
 ## Identity and trusted binaries

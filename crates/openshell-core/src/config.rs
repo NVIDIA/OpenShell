@@ -374,13 +374,13 @@ pub struct OidcConfig {
     pub scopes_claim: String,
 }
 
-/// mTLS user authentication for local, single-user gateways.
+/// mTLS user authentication for gateway users.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MtlsAuthConfig {
     /// When true, the gateway maps a verified TLS client certificate into a
-    /// user principal. Keep disabled for Kubernetes deployments because
-    /// Kubernetes sandbox pods and external users must not share user auth.
+    /// user principal. Sandbox and supervisor clients use bearer identity, so
+    /// this setting is independent of the selected compute driver.
     #[serde(default)]
     pub enabled: bool,
 }

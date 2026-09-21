@@ -250,23 +250,24 @@ pub fn supervisor_pod(
         empty_dir_volume("logs"),
     ];
     if !client_tls_secret_name.is_empty() {
-        environment.extend([
-            env_var("OPENSHELL_TLS_CA", "/var/run/secrets/openshell-tls/ca.crt"),
-            env_var(
-                "OPENSHELL_TLS_CERT",
-                "/var/run/secrets/openshell-tls/tls.crt",
-            ),
-            env_var(
-                "OPENSHELL_TLS_KEY",
-                "/var/run/secrets/openshell-tls/tls.key",
-            ),
-        ]);
+        environment.push(env_var(
+            "OPENSHELL_TLS_CA",
+            "/var/run/secrets/openshell-tls/ca.crt",
+        ));
         volume_mounts.push(volume_mount(
             "client-tls",
             "/var/run/secrets/openshell-tls",
             true,
         ));
-        volumes.push(secret_volume("client-tls", client_tls_secret_name, None));
+        volumes.push(secret_volume(
+            "client-tls",
+            client_tls_secret_name,
+            Some(KeyToPath {
+                key: "ca.crt".to_string(),
+                path: "ca.crt".to_string(),
+                ..Default::default()
+            }),
+        ));
     }
     let mut command = vec![
         "/openshell-supervisor".to_string(),
@@ -655,6 +656,31 @@ mod tests {
             None
         );
         let container = &pod_spec.containers[0];
+        let environment = container.env.as_ref().expect("supervisor environment");
+        assert!(
+            environment
+                .iter()
+                .any(|entry| entry.name == "OPENSHELL_TLS_CA")
+        );
+        assert!(!environment.iter().any(|entry| matches!(
+            entry.name.as_str(),
+            "OPENSHELL_TLS_CERT" | "OPENSHELL_TLS_KEY"
+        )));
+        let gateway_tls = pod_spec
+            .volumes
+            .as_ref()
+            .expect("supervisor volumes")
+            .iter()
+            .find(|volume| volume.name == "client-tls")
+            .and_then(|volume| volume.secret.as_ref())
+            .expect("gateway CA secret");
+        let items = gateway_tls
+            .items
+            .as_ref()
+            .expect("CA-only secret projection");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key, "ca.crt");
+        assert_eq!(items[0].path, "ca.crt");
         assert_eq!(container.image_pull_policy.as_deref(), Some("IfNotPresent"));
         assert_eq!(pod_spec.automount_service_account_token, Some(false));
         assert_eq!(pod_spec.restart_policy.as_deref(), Some("Never"));

@@ -71,7 +71,7 @@ Common findings:
 
 - `No active gateway`: register one with `openshell gateway add <endpoint>`.
 - Connection refused: gateway process is not running, service exposure is wrong, or a port-forward/proxy is not active.
-- TLS/certificate errors: the endpoint scheme or trust chain is wrong, a local mTLS bundle does not match the gateway CA, or TLS termination does not match the gateway listener.
+- TLS/certificate errors: the endpoint scheme or trust chain is wrong, a CLI mTLS bundle does not match the gateway CA, a supervisor is missing the gateway CA, or TLS termination does not match the gateway listener. Workloads and supervisors should not contain a user TLS client certificate or private key.
 - `Unauthenticated` from an edge or OIDC gateway: refresh stored credentials with `openshell gateway login [name]`, then retry. Use `gateway logout` only when intentionally clearing local credentials.
 - A direct development endpoint with a private or self-signed certificate can be isolated with `--gateway-endpoint <url> --gateway-insecure`; do not persist or recommend insecure verification for shared gateways.
 
@@ -111,11 +111,13 @@ Empty, invalid, comma-delimited, or conflicting values fail startup. Homebrew
 and RPM package startup migrates only exact package-generated v1 defaults. If
 an upgraded package still reports an unsupported version, inspect the active prefix or `~/.config/openshell/gateway.toml`; an edited v1 file must
 follow the published schema-v2 migration steps and must not be overwritten.
-Guest TLS CA, certificate, and key paths are the exception to driver ownership:
-configure the complete bundle under `[openshell.gateway]`, and the gateway
-injects it only into the selected local driver. TLS-enabled Docker, Podman, and
-VM drivers fail startup when neither those paths nor the package-managed local
-bundle is available; Kubernetes projects its bundle through a Secret.
+The supervisor gateway CA is the exception to driver ownership: configure
+`guest_tls_ca` under `[openshell.gateway]`, and the gateway injects it only into
+the selected local driver. Remove the retired `guest_tls_cert` and
+`guest_tls_key` fields. TLS-enabled Docker, Podman, and VM drivers fail startup
+when neither that CA nor the package-managed local CA is available. Kubernetes
+projects only the gateway CA from a Secret into supervisor Pods; supervisors
+authenticate gateway RPCs with sandbox bearer tokens.
 
 Custom names use `[openshell.drivers.<name>].socket_path`. A launch-time `--compute-driver-socket` override may also use `docker`, `podman`, `kubernetes`, or `vm`; the endpoint then takes precedence over built-in construction. First-party standalone drivers require the socket parent directory to be owned by the driver's effective UID, force its mode to `0700`, create the socket with mode `0600`, and accept only peers with that same UID. Check the parent and socket separately with `stat`; a gateway running under a different UID cannot connect even when filesystem permissions or group membership would otherwise allow it. Operator-supplied drivers must provide equivalent access control appropriate to their implementation. Check gateway logs for connection errors, `GetCapabilities` failures, missing peer metadata, protocol-major mismatch, unmet required capabilities, or an unexpected advertised driver name. `openshell gateway info` reports successful startup negotiations. The advertised name is diagnostic metadata; negotiated features control optional behavior. The gateway does not create or supervise operator-supplied driver processes or sockets.
 
@@ -447,7 +449,9 @@ Less commonly, `UnknownCA` can occur if the gateway's client-verification CA
 is misconfigured.  The default `clientCaFromServerTlsSecret=true` is correct
 for all configurations — the internal server certificate is always signed by
 the chart CA (the same CA that signs the client cert), so its `ca.crt` is
-the right trust anchor.  Only override this if you intentionally mount a
+the right trust anchor. Supervisor Pods project only `ca.crt` from the copied
+Secret; `tls.crt` and `tls.key` are reserved for user clients and must not be
+visible in a sandbox. Only override this if you intentionally mount a
 separate client CA via `server.tls.clientCaSecretName`.  Verify the mounted
 client CA matches the CA that signed the client certificate:
 
