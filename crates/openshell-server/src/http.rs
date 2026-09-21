@@ -178,12 +178,21 @@ async fn render_metrics(State(handle): State<PrometheusHandle>) -> impl IntoResp
 }
 
 /// Create the HTTP router served on the multiplexed gateway port.
-pub fn http_router(state: Arc<crate::ServerState>) -> Router {
+pub fn http_router(
+    state: Arc<crate::ServerState>,
+    peer_identity: Option<crate::auth::identity::Identity>,
+) -> Router {
     crate::ws_tunnel::router(state.clone())
         .merge(crate::auth::router(state.clone()))
         .layer(middleware::from_fn_with_state(
             state,
             sandbox_service_routing_first,
+        ))
+        .layer(axum::Extension(
+            crate::service_routing::ServiceRequestAuthContext {
+                peer_identity,
+                trusted_local: false,
+            },
         ))
 }
 
@@ -194,6 +203,12 @@ pub fn http_router(state: Arc<crate::ServerState>) -> Router {
 pub fn service_http_router(state: Arc<crate::ServerState>) -> Router {
     Router::new()
         .fallback(sandbox_service_routing_only)
+        .layer(axum::Extension(
+            crate::service_routing::ServiceRequestAuthContext {
+                peer_identity: None,
+                trusted_local: true,
+            },
+        ))
         .with_state(state)
 }
 
@@ -217,7 +232,7 @@ async fn sandbox_service_routing_only(
     if !crate::service_routing::is_sandbox_service_request(&req, &state.config.service_routing) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if !browser_context_allows_plaintext_service_request(&req) {
+    if !browser_context_allows_service_request(&req, "http") {
         crate::service_routing::emit_cross_origin_service_http_rejection(&state, &req);
         return crate::service_routing::service_error_response(
             StatusCode::FORBIDDEN,
@@ -229,7 +244,7 @@ async fn sandbox_service_routing_only(
         .into_response()
 }
 
-fn browser_context_allows_plaintext_service_request(req: &Request) -> bool {
+pub fn browser_context_allows_service_request(req: &Request, scheme: &str) -> bool {
     if let Some(fetch_site) = header_str(req.headers(), "sec-fetch-site")
         && !matches!(
             fetch_site.to_ascii_lowercase().as_str(),
@@ -240,14 +255,14 @@ fn browser_context_allows_plaintext_service_request(req: &Request) -> bool {
     }
 
     if let Some(origin) = header_str(req.headers(), header::ORIGIN.as_str()) {
-        let Some(request_origin) = request_origin(req) else {
+        let Some(request_origin) = request_origin(req, scheme) else {
             return false;
         };
         return parse_origin(origin).is_some_and(|origin| origin == request_origin);
     }
 
     if let Some(referer) = header_str(req.headers(), header::REFERER.as_str()) {
-        let Some(request_origin) = request_origin(req) else {
+        let Some(request_origin) = request_origin(req, scheme) else {
             return false;
         };
         return parse_origin(referer).is_some_and(|origin| origin == request_origin);
@@ -267,9 +282,9 @@ struct Origin {
     port: u16,
 }
 
-fn request_origin(req: &Request) -> Option<Origin> {
+fn request_origin(req: &Request, scheme: &str) -> Option<Origin> {
     let host = crate::service_routing::request_host(req)?;
-    parse_origin_authority("http", host)
+    parse_origin_authority(scheme, host)
 }
 
 fn parse_origin(value: &str) -> Option<Origin> {
@@ -330,6 +345,7 @@ fn normalize_host(host: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
 
     fn service_request(headers: &[(&str, &str)]) -> Request {
         let mut builder = Request::builder()
@@ -345,35 +361,35 @@ mod tests {
     fn plaintext_service_browser_context_allows_direct_tools() {
         let req = service_request(&[]);
 
-        assert!(browser_context_allows_plaintext_service_request(&req));
+        assert!(browser_context_allows_service_request(&req, "http"));
     }
 
     #[test]
     fn plaintext_service_browser_context_allows_same_origin_fetch_metadata() {
         let req = service_request(&[("sec-fetch-site", "same-origin")]);
 
-        assert!(browser_context_allows_plaintext_service_request(&req));
+        assert!(browser_context_allows_service_request(&req, "http"));
     }
 
     #[test]
     fn plaintext_service_browser_context_allows_direct_navigation_fetch_metadata() {
         let req = service_request(&[("sec-fetch-site", "none")]);
 
-        assert!(browser_context_allows_plaintext_service_request(&req));
+        assert!(browser_context_allows_service_request(&req, "http"));
     }
 
     #[test]
     fn plaintext_service_browser_context_rejects_cross_site_fetch_metadata() {
         let req = service_request(&[("sec-fetch-site", "cross-site")]);
 
-        assert!(!browser_context_allows_plaintext_service_request(&req));
+        assert!(!browser_context_allows_service_request(&req, "http"));
     }
 
     #[test]
     fn plaintext_service_browser_context_rejects_same_site_sibling_requests() {
         let req = service_request(&[("sec-fetch-site", "same-site")]);
 
-        assert!(!browser_context_allows_plaintext_service_request(&req));
+        assert!(!browser_context_allows_service_request(&req, "http"));
     }
 
     #[test]
@@ -381,14 +397,14 @@ mod tests {
         let req =
             service_request(&[("origin", "http://sandbox--web.dev.openshell.localhost:8080")]);
 
-        assert!(browser_context_allows_plaintext_service_request(&req));
+        assert!(browser_context_allows_service_request(&req, "http"));
 
         let req = service_request(&[(
             "origin",
             "http://sandbox--other.dev.openshell.localhost:8080",
         )]);
 
-        assert!(!browser_context_allows_plaintext_service_request(&req));
+        assert!(!browser_context_allows_service_request(&req, "http"));
     }
 
     #[test]
@@ -398,14 +414,14 @@ mod tests {
             "http://sandbox--web.dev.openshell.localhost:8080/page",
         )]);
 
-        assert!(browser_context_allows_plaintext_service_request(&req));
+        assert!(browser_context_allows_service_request(&req, "http"));
 
         let req = service_request(&[(
             "referer",
             "http://sandbox--other.dev.openshell.localhost:8080/page",
         )]);
 
-        assert!(!browser_context_allows_plaintext_service_request(&req));
+        assert!(!browser_context_allows_service_request(&req, "http"));
     }
 
     #[test]
@@ -415,7 +431,23 @@ mod tests {
             "https://sandbox--web.dev.openshell.localhost:8080",
         )]);
 
-        assert!(!browser_context_allows_plaintext_service_request(&req));
+        assert!(!browser_context_allows_service_request(&req, "http"));
+        assert!(browser_context_allows_service_request(&req, "https"));
+    }
+
+    #[tokio::test]
+    async fn multiplexed_service_route_requires_remote_authentication() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let response = http_router(state, None)
+            .oneshot(service_request(&[]))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers()[header::WWW_AUTHENTICATE],
+            "Bearer realm=\"openshell-service\""
+        );
     }
 }
 

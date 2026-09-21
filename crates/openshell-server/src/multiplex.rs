@@ -252,14 +252,22 @@ impl MultiplexService {
                 .config
                 .mtls_auth
                 .enabled
-                .then_some(peer_identity)
+                .then_some(peer_identity.clone())
                 .flatten(),
             self.state.config.mtls_auth.enabled,
             self.state.config.auth.allow_unauthenticated_users,
         );
         let grpc_service =
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
-        let http_service = http_router(self.state.clone());
+        let http_service = http_router(
+            self.state.clone(),
+            self.state
+                .config
+                .mtls_auth
+                .enabled
+                .then_some(peer_identity)
+                .flatten(),
+        );
 
         let grpc_service = request_id_middleware!(grpc_service);
         let http_service = request_id_middleware!(http_service);
@@ -863,7 +871,7 @@ where
 /// When neither OIDC nor sandbox credentials are configured (a barebones
 /// dev gateway), the chain is left as `None` so the router short-circuits
 /// to pass-through unless mTLS or local unauthenticated users are enabled.
-fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
+pub fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
     if let Some(driver) = state.compute_driver_authenticator.clone() {
         authenticators.push(driver);
@@ -941,7 +949,7 @@ impl<S> AuthGrpcRouter<S> {
     }
 }
 
-fn unauthenticated_dev_user_principal() -> Principal {
+pub fn unauthenticated_dev_user_principal() -> Principal {
     Principal::User(UserPrincipal {
         identity: Identity {
             subject: "unauthenticated-local-dev".to_string(),

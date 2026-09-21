@@ -24,6 +24,10 @@ use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 
 use crate::ServerState;
+use crate::auth::authz::AuthzPolicy;
+use crate::auth::identity::Identity;
+use crate::auth::principal::{Principal, UserPrincipal};
+use crate::auth::workspace_authz::{MinWorkspaceRole, authorize_workspace};
 use crate::persistence::{ObjectType, Store};
 
 const ENDPOINT_OBJECT_TYPE: &str = "service_endpoint";
@@ -31,6 +35,31 @@ const ROUTING_RULE_NAME: &str = "sandbox_service_routing";
 const ROUTING_RULE_TYPE: &str = "gateway";
 const RELAY_RULE_NAME: &str = "sandbox_service_relay";
 const RELAY_TARGET_HOST: &str = "127.0.0.1";
+const SERVICE_AUTHORIZATION_HEADER: &str = "openshell-service-authorization";
+const SERVICE_AUTHORIZATION_COOKIE: &str = "__Host-OpenShell-Service-Authorization";
+const SERVICE_AUTHORIZATION_PATH: &str = "/openshell.v1.OpenShell/GetService";
+
+#[derive(Clone, Debug)]
+pub struct ServiceRequestAuthContext {
+    pub peer_identity: Option<Identity>,
+    pub trusted_local: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceCredentialSource {
+    DedicatedHeader,
+    Cookie,
+    AuthorizationHeader,
+    Mtls,
+    TrustedLocal,
+    DevelopmentOverride,
+}
+
+#[derive(Clone, Debug)]
+struct ServiceRequestAuthorization {
+    source: ServiceCredentialSource,
+    session_token: Option<String>,
+}
 
 impl ObjectType for ServiceEndpoint {
     fn object_type() -> &'static str {
@@ -128,7 +157,7 @@ pub fn is_sandbox_service_request<B>(req: &Request<B>, config: &ServiceRoutingCo
 
 pub async fn proxy_sandbox_service_request(
     state: Arc<ServerState>,
-    req: Request<Body>,
+    mut req: Request<Body>,
 ) -> impl IntoResponse {
     let Some(host) = request_host(&req) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -139,10 +168,186 @@ pub async fn proxy_sandbox_service_request(
         return StatusCode::NOT_FOUND.into_response();
     };
 
+    let auth_context = req
+        .extensions()
+        .get::<ServiceRequestAuthContext>()
+        .cloned()
+        .unwrap_or(ServiceRequestAuthContext {
+            peer_identity: None,
+            trusted_local: false,
+        });
+    let authorization =
+        match authorize_service_request(&state, req.headers().clone(), auth_context, &workspace)
+            .await
+        {
+            Ok(authorization) => authorization,
+            Err(err) => {
+                emit_service_http_failure(&state, &req, &sandbox_name, &service_name, None, &err);
+                return err.into_response();
+            }
+        };
+    req.extensions_mut().insert(authorization.clone());
+    let secure_service = endpoint_scheme(&state.config) == "https";
+    if authorization.source == ServiceCredentialSource::Cookie
+        && !crate::http::browser_context_allows_service_request(
+            &req,
+            if secure_service { "https" } else { "http" },
+        )
+    {
+        let err = ServiceRouteError::cross_origin();
+        emit_service_http_failure(&state, &req, &sandbox_name, &service_name, None, &err);
+        return err.into_response();
+    }
+
     match proxy_to_endpoint(state, req, &workspace, sandbox_name, service_name).await {
-        Ok(response) => response.into_response(),
+        Ok(mut response) => {
+            sanitize_upstream_set_cookie_headers(response.headers_mut());
+            if secure_service
+                && let Some(token) = authorization.session_token
+                && let Ok(value) = HeaderValue::from_str(&format!(
+                    "{SERVICE_AUTHORIZATION_COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Lax"
+                ))
+            {
+                response.headers_mut().append(header::SET_COOKIE, value);
+            }
+            response.into_response()
+        }
         Err(err) => err.into_response(),
     }
+}
+
+async fn authorize_service_request(
+    state: &ServerState,
+    headers: HeaderMap,
+    context: ServiceRequestAuthContext,
+    workspace: &str,
+) -> Result<ServiceRequestAuthorization, ServiceRouteError> {
+    let credential = service_request_credential(&headers)?;
+    let (principal, source, session_token) = if let Some((source, token)) = credential {
+        let session_token =
+            (source == ServiceCredentialSource::DedicatedHeader).then(|| token.clone());
+        (
+            authenticate_service_token(state, &token).await?,
+            source,
+            session_token,
+        )
+    } else if context.trusted_local {
+        (
+            crate::multiplex::unauthenticated_dev_user_principal(),
+            ServiceCredentialSource::TrustedLocal,
+            None,
+        )
+    } else if state.config.mtls_auth.enabled
+        && let Some(identity) = context.peer_identity
+    {
+        (
+            Principal::User(UserPrincipal { identity }),
+            ServiceCredentialSource::Mtls,
+            None,
+        )
+    } else if state.config.auth.allow_unauthenticated_users {
+        (
+            crate::multiplex::unauthenticated_dev_user_principal(),
+            ServiceCredentialSource::DevelopmentOverride,
+            None,
+        )
+    } else {
+        return Err(ServiceRouteError::authentication_required());
+    };
+
+    let Principal::User(user) = &principal else {
+        return Err(ServiceRouteError::authentication_required());
+    };
+    if let Some(oidc) = &state.config.oidc {
+        AuthzPolicy {
+            admin_role: oidc.admin_role.clone(),
+            user_role: oidc.user_role.clone(),
+            scopes_enabled: !oidc.scopes_claim.is_empty(),
+        }
+        .check(&user.identity, SERVICE_AUTHORIZATION_PATH)
+        .map_err(ServiceRouteError::from_auth_status)?;
+    }
+    authorize_workspace(
+        state.store.as_ref(),
+        &state.admin_role,
+        &principal,
+        workspace,
+        MinWorkspaceRole::User,
+    )
+    .await
+    .map_err(ServiceRouteError::from_auth_status)?;
+
+    Ok(ServiceRequestAuthorization {
+        source,
+        session_token,
+    })
+}
+
+fn service_request_credential(
+    headers: &HeaderMap,
+) -> Result<Option<(ServiceCredentialSource, String)>, ServiceRouteError> {
+    if let Some(token) = bearer_token(headers, SERVICE_AUTHORIZATION_HEADER)? {
+        return Ok(Some((ServiceCredentialSource::DedicatedHeader, token)));
+    }
+    if let Some(token) = bearer_token(headers, header::AUTHORIZATION.as_str())? {
+        return Ok(Some((ServiceCredentialSource::AuthorizationHeader, token)));
+    }
+    if let Some(token) = service_authorization_cookie(headers)? {
+        return Ok(Some((ServiceCredentialSource::Cookie, token)));
+    }
+    Ok(None)
+}
+
+async fn authenticate_service_token(
+    state: &ServerState,
+    token: &str,
+) -> Result<Principal, ServiceRouteError> {
+    let Some(chain) = crate::multiplex::build_authenticator_chain(state) else {
+        return Err(ServiceRouteError::authentication_required());
+    };
+    let mut headers = HeaderMap::new();
+    let value = HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| ServiceRouteError::invalid_authentication())?;
+    headers.insert(header::AUTHORIZATION, value);
+    chain
+        .authenticate(&headers, SERVICE_AUTHORIZATION_PATH)
+        .await
+        .map_err(ServiceRouteError::from_auth_status)?
+        .ok_or_else(ServiceRouteError::authentication_required)
+}
+
+fn bearer_token(headers: &HeaderMap, name: &str) -> Result<Option<String>, ServiceRouteError> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| ServiceRouteError::invalid_authentication())?;
+    let token = value
+        .strip_prefix("Bearer ")
+        .filter(|token| !token.is_empty())
+        .ok_or_else(ServiceRouteError::invalid_authentication)?;
+    Ok(Some(token.to_string()))
+}
+
+fn service_authorization_cookie(headers: &HeaderMap) -> Result<Option<String>, ServiceRouteError> {
+    let mut token = None;
+    for value in headers.get_all(header::COOKIE) {
+        let value = value
+            .to_str()
+            .map_err(|_| ServiceRouteError::invalid_authentication())?;
+        for cookie in value.split(';') {
+            let Some((name, value)) = cookie.trim().split_once('=') else {
+                continue;
+            };
+            if name == SERVICE_AUTHORIZATION_COOKIE
+                && (value.is_empty() || token.replace(value.to_string()).is_some())
+            {
+                return Err(ServiceRouteError::invalid_authentication());
+            }
+        }
+    }
+    Ok(token)
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +406,43 @@ impl ServiceRouteError {
         )
     }
 
+    const fn authentication_required() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "Service authentication required",
+            "service authentication required",
+        )
+    }
+
+    const fn invalid_authentication() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid service authentication",
+            "invalid service authentication",
+        )
+    }
+
+    const fn cross_origin() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "Cross-origin service request rejected",
+            "cross-origin service request rejected",
+        )
+    }
+
+    fn from_auth_status(status: tonic::Status) -> Self {
+        match status.code() {
+            tonic::Code::Unauthenticated => Self::authentication_required(),
+            tonic::Code::PermissionDenied => Self::new(
+                StatusCode::FORBIDDEN,
+                "Service access denied",
+                "service access denied",
+            ),
+            tonic::Code::InvalidArgument => Self::invalid_authentication(),
+            _ => Self::internal_error(),
+        }
+    }
+
     const fn internal_error() -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -212,7 +454,14 @@ impl ServiceRouteError {
 
 impl IntoResponse for ServiceRouteError {
     fn into_response(self) -> AxumResponse {
-        service_error_response(self.status, self.message)
+        let mut response = service_error_response(self.status, self.message);
+        if self.status == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"openshell-service\""),
+            );
+        }
+        response
     }
 }
 
@@ -460,6 +709,12 @@ fn build_upstream_request(
         .method(parts.method)
         .uri(uri)
         .version(http::Version::HTTP_11);
+    let strip_authorization = parts
+        .extensions
+        .get::<ServiceRequestAuthorization>()
+        .is_some_and(|authorization| {
+            authorization.source == ServiceCredentialSource::AuthorizationHeader
+        });
 
     let headers = builder
         .headers_mut()
@@ -467,7 +722,7 @@ fn build_upstream_request(
     for (name, value) in &parts.headers {
         if (is_hop_by_hop_header(name)
             && !(preserve_upgrade_headers && is_websocket_hop_by_hop_header(name)))
-            || is_gateway_auth_header(name)
+            || is_gateway_auth_header(name, strip_authorization)
         {
             continue;
         }
@@ -547,15 +802,15 @@ fn is_websocket_hop_by_hop_header(name: &header::HeaderName) -> bool {
     matches!(name.as_str(), "connection" | "upgrade")
 }
 
-fn is_gateway_auth_header(name: &header::HeaderName) -> bool {
+fn is_gateway_auth_header(name: &header::HeaderName, strip_authorization: bool) -> bool {
     matches!(
         name.as_str(),
-        "authorization"
+        SERVICE_AUTHORIZATION_HEADER
             | "cf-access-jwt-assertion"
             | "x-forwarded-client-cert"
             | "x-ssl-client-cert"
             | "x-client-cert"
-    )
+    ) || (strip_authorization && name == header::AUTHORIZATION)
 }
 
 fn sanitize_cookie_header(value: &HeaderValue) -> Option<HeaderValue> {
@@ -577,7 +832,29 @@ fn sanitize_cookie_header(value: &HeaderValue) -> Option<HeaderValue> {
 }
 
 fn is_gateway_auth_cookie(name: &str) -> bool {
-    name.eq_ignore_ascii_case("CF_Authorization") || name.eq_ignore_ascii_case("cf-authorization")
+    name.eq_ignore_ascii_case("CF_Authorization")
+        || name.eq_ignore_ascii_case("cf-authorization")
+        || name == SERVICE_AUTHORIZATION_COOKIE
+}
+
+fn sanitize_upstream_set_cookie_headers(headers: &mut HeaderMap) {
+    let retained = headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.split(';').next())
+                .and_then(|cookie| cookie.trim().split_once('='))
+                .is_none_or(|(name, _)| !is_gateway_auth_cookie(name.trim()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    headers.remove(header::SET_COOKIE);
+    for value in retained {
+        headers.append(header::SET_COOKIE, value);
+    }
 }
 
 pub fn emit_service_endpoint_config_event(endpoint: &ServiceEndpoint, url: &str, created: bool) {
@@ -1062,6 +1339,13 @@ mod tests {
             response.headers()[header::CONTENT_TYPE],
             "text/plain; charset=utf-8"
         );
+
+        let response = ServiceRouteError::authentication_required().into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers()[header::WWW_AUTHENTICATE],
+            "Bearer realm=\"openshell-service\""
+        );
     }
 
     #[test]
@@ -1137,23 +1421,40 @@ mod tests {
 
     #[test]
     fn strips_gateway_auth_headers_from_upstream_request() {
-        let request = Request::builder()
+        let mut request = Request::builder()
             .uri("https://my-sandbox--web.dev.openshell.localhost/path")
             .header(header::AUTHORIZATION, "Bearer gateway-token")
+            .header(
+                SERVICE_AUTHORIZATION_HEADER,
+                "Bearer dedicated-gateway-token",
+            )
             .header("cf-access-jwt-assertion", "edge-token")
             .header("x-forwarded-client-cert", "cert")
             .header(
                 header::COOKIE,
-                "theme=dark; CF_Authorization=edge-cookie; app=session",
+                format!(
+                    "theme=dark; CF_Authorization=edge-cookie; {SERVICE_AUTHORIZATION_COOKIE}=service-cookie; app=session"
+                ),
             )
             .header("x-app-header", "kept")
             .body(Body::empty())
             .unwrap();
+        request
+            .extensions_mut()
+            .insert(ServiceRequestAuthorization {
+                source: ServiceCredentialSource::AuthorizationHeader,
+                session_token: None,
+            });
 
         let upstream = build_upstream_request(request, 8080, false).unwrap();
 
         assert_eq!(upstream.uri(), "/path");
         assert!(!upstream.headers().contains_key(header::AUTHORIZATION));
+        assert!(
+            !upstream
+                .headers()
+                .contains_key(SERVICE_AUTHORIZATION_HEADER)
+        );
         assert!(!upstream.headers().contains_key("cf-access-jwt-assertion"));
         assert!(!upstream.headers().contains_key("x-forwarded-client-cert"));
         assert_eq!(
@@ -1161,6 +1462,145 @@ mod tests {
             "theme=dark; app=session"
         );
         assert_eq!(upstream.headers()["x-app-header"], "kept");
+    }
+
+    #[test]
+    fn dedicated_gateway_auth_preserves_application_authorization() {
+        let mut request = Request::builder()
+            .uri("https://my-sandbox--web.dev.openshell.localhost/path")
+            .header(header::AUTHORIZATION, "Bearer application-token")
+            .header(SERVICE_AUTHORIZATION_HEADER, "Bearer gateway-token")
+            .header(
+                header::COOKIE,
+                format!("{SERVICE_AUTHORIZATION_COOKIE}=old-gateway-token"),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let (source, token) = service_request_credential(request.headers())
+            .unwrap()
+            .unwrap();
+        assert_eq!(source, ServiceCredentialSource::DedicatedHeader);
+        assert_eq!(token, "gateway-token");
+        request
+            .extensions_mut()
+            .insert(ServiceRequestAuthorization {
+                source,
+                session_token: Some(token),
+            });
+
+        let upstream = build_upstream_request(request, 8080, false).unwrap();
+
+        assert_eq!(
+            upstream.headers()[header::AUTHORIZATION],
+            "Bearer application-token"
+        );
+        assert!(
+            !upstream
+                .headers()
+                .contains_key(SERVICE_AUTHORIZATION_HEADER)
+        );
+        assert!(!upstream.headers().contains_key(header::COOKIE));
+    }
+
+    #[test]
+    fn standard_gateway_authorization_precedes_cookie_and_is_stripped() {
+        let mut request = Request::builder()
+            .uri("https://my-sandbox--web.dev.openshell.localhost/path")
+            .header(header::AUTHORIZATION, "Bearer gateway-token")
+            .header(
+                header::COOKIE,
+                format!("{SERVICE_AUTHORIZATION_COOKIE}=old-gateway-token"),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let (source, token) = service_request_credential(request.headers())
+            .unwrap()
+            .unwrap();
+        assert_eq!(source, ServiceCredentialSource::AuthorizationHeader);
+        assert_eq!(token, "gateway-token");
+        request
+            .extensions_mut()
+            .insert(ServiceRequestAuthorization {
+                source,
+                session_token: None,
+            });
+
+        let upstream = build_upstream_request(request, 8080, false).unwrap();
+
+        assert!(!upstream.headers().contains_key(header::AUTHORIZATION));
+        assert!(!upstream.headers().contains_key(header::COOKIE));
+    }
+
+    #[test]
+    fn rejects_malformed_service_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SERVICE_AUTHORIZATION_HEADER,
+            HeaderValue::from_static("Basic wrong"),
+        );
+        assert!(bearer_token(&headers, SERVICE_AUTHORIZATION_HEADER).is_err());
+
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static(
+                "__Host-OpenShell-Service-Authorization=one; __Host-OpenShell-Service-Authorization=two",
+            ),
+        );
+        assert!(service_authorization_cookie(&headers).is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_service_requires_authentication_but_loopback_is_trusted() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let remote = authorize_service_request(
+            &state,
+            HeaderMap::new(),
+            ServiceRequestAuthContext {
+                peer_identity: None,
+                trusted_local: false,
+            },
+            "default",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(remote.status, StatusCode::UNAUTHORIZED);
+
+        let local = authorize_service_request(
+            &state,
+            HeaderMap::new(),
+            ServiceRequestAuthContext {
+                peer_identity: None,
+                trusted_local: true,
+            },
+            "default",
+        )
+        .await
+        .unwrap();
+        assert_eq!(local.source, ServiceCredentialSource::TrustedLocal);
+    }
+
+    #[test]
+    fn strips_reserved_gateway_set_cookies_from_upstream_response() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::SET_COOKIE,
+            HeaderValue::from_static("app=session; Path=/"),
+        );
+        headers.append(
+            header::SET_COOKIE,
+            HeaderValue::from_static(
+                "__Host-OpenShell-Service-Authorization=forged; Path=/; Secure",
+            ),
+        );
+
+        sanitize_upstream_set_cookie_headers(&mut headers);
+
+        let values = headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec!["app=session; Path=/"]);
     }
 
     #[test]

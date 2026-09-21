@@ -50,7 +50,19 @@ Disable the local browser path with `--enable-loopback-service-http=false` or `O
 
 Custom HTTPS service domains use the gateway server SAN configuration. Add a wildcard DNS SAN such as `*.apps.example.com` to the gateway certificate and pass the same SAN to the gateway with `--server-san` or `OPENSHELL_SERVER_SAN`.
 
-For remote or non-loopback gateways, browser service URLs remain HTTPS and require normal gateway authentication.
+For remote or non-loopback gateways, service URLs remain HTTPS and require an authenticated user with access to the service's workspace. Service exposure has no public or anonymous visibility mode.
+
+Non-browser clients can authenticate with a dedicated header:
+
+```shell
+curl \
+  --header "OpenShell-Service-Authorization: Bearer $OPENSHELL_TOKEN" \
+  https://default--sandbox--web.apps.example.com/
+```
+
+Standard `Authorization: Bearer <token>` also authenticates clients that cannot select a custom header. The gateway consumes that header before proxying. When the dedicated header or the OpenShell browser cookie authenticates the request, the gateway preserves an application-specific `Authorization` header for the sandbox service.
+
+After a successful HTTPS request authenticated by the dedicated header, the gateway sets an exact-host, secure, HTTP-only `__Host-OpenShell-Service-Authorization` session cookie. The dedicated header takes precedence over an existing cookie so clients can rotate the session safely. Standard `Authorization` authentication never creates a service cookie. Browsers include the cookie automatically on later HTTP and WebSocket requests. The gateway strips its header and cookie before proxying and prevents sandbox responses from replacing the reserved cookie.
 
 ## Register an Existing Gateway
 
