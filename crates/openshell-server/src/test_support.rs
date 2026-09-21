@@ -154,6 +154,12 @@ impl FakeComputeDriver {
                     resource_capabilities: None,
                     rootfs_tar_staging_dir: String::new(),
                     rootfs_tar_max_bytes: 0,
+                    extension: Some(openshell_core::extension_protocol::extension_metadata(
+                        openshell_core::extension_protocol::ExtensionFamily::Compute,
+                        "openshell/fake-compute-driver",
+                        "test",
+                        [],
+                    )),
                 },
                 sandboxes: HashMap::new(),
                 calls: Vec::new(),

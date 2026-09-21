@@ -4,9 +4,6 @@
 name: Codex Security Release Qualification
 
 on:
-  push:
-    tags:
-      - "v*.*.*-pre.*"
   workflow_call:
     inputs:
       candidate_ref:

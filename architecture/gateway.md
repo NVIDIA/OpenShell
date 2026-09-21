@@ -254,6 +254,8 @@ IDs fail instead of creating source precedence. The gateway treats configured
 interceptors as trusted sources and does not verify signature annotations in
 their profile payloads.
 
+The CLI exposes reusable profile definitions through `openshell profile`, with `list` and `describe` reading the same effective catalog used by provider creation. Export, import, update, lint, and delete share that top-level command group. Workspace selection and explicit platform scope apply at the existing profile API boundary; `openshell provider` manages credential-bearing instances.
+
 Each logical gateway request captures the selected sources into one validated,
 immutable effective catalog before deriving provider behavior. Policy layers,
 credential scope, injected environment material, dynamic token grants, and
@@ -843,6 +845,15 @@ Provider credential expiry is enforced during gateway-to-sandbox credential
 resolution and again by the sandbox placeholder resolver. This keeps expired
 credentials from resolving even when a running sandbox still has retained
 placeholder generations from an earlier provider credential snapshot.
+
+All gateway-owned extension registries negotiate the same peer metadata envelope
+before accepting work. Compute drivers, credential drivers, gateway interceptors,
+and supervisor middleware retain their typed family manifests. Both the gateway
+and extension run the shared validator against the startup exchange, enforcing
+protocol-major compatibility and mutual required-capability sets before either
+peer accepts the other. The gateway aggregates immutable, non-secret startup
+snapshots for the protected gateway-info API; it does not publish transport,
+authentication, or backend configuration.
 
 Static credential delivery is capability-negotiated and endpoint-bound. The
 gateway classifies each returned environment entry as either a credential or

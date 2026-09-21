@@ -738,10 +738,20 @@ async fn vm_corporate_proxy_routes_approved_tls_egress() {
     // ── Run the workload ──────────────────────────────────────────────
     let (_policy, policy_path) = temp_file_with(&policy_yaml(&ports), "policy file");
     let script = workload_script(&ports);
-    let mut sandbox =
-        SandboxGuard::create(&["--policy", &policy_path, "--", "python3", "-c", &script])
-            .await
-            .expect("create VM sandbox behind the corporate proxy");
+    // The workload runs python3, which the VM driver's default
+    // nvcr.io/nvidia/base/ubuntu image does not ship.
+    let mut sandbox = SandboxGuard::create(&[
+        "--from",
+        "base",
+        "--policy",
+        &policy_path,
+        "--",
+        "python3",
+        "-c",
+        &script,
+    ])
+    .await
+    .expect("create VM sandbox behind the corporate proxy");
 
     assert_proxied_egress(
         &sandbox.create_output,
@@ -805,10 +815,18 @@ async fn vm_corporate_proxy_trusts_ca_bundle_for_https_proxy() {
 
     let (_policy, policy_path) = temp_file_with(&policy_yaml(&ports), "policy file");
     let script = workload_script(&ports);
-    let mut sandbox =
-        SandboxGuard::create(&["--policy", &policy_path, "--", "python3", "-c", &script])
-            .await
-            .expect("create VM sandbox behind the https corporate proxy");
+    let mut sandbox = SandboxGuard::create(&[
+        "--from",
+        "base",
+        "--policy",
+        &policy_path,
+        "--",
+        "python3",
+        "-c",
+        &script,
+    ])
+    .await
+    .expect("create VM sandbox behind the https corporate proxy");
 
     let proxy_logs = proxy.logs().expect("read https proxy logs");
     assert!(

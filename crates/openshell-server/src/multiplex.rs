@@ -1342,6 +1342,12 @@ mod tests {
                 }],
                 provider_profiles: false,
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
+                    "openshell/post-commit-test",
+                    "test",
+                    [],
+                )),
             }))
         }
 

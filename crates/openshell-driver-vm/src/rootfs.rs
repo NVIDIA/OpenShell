@@ -879,6 +879,60 @@ pub fn sandbox_guest_user_ids_from_overlay_image(
     sandbox_guest_user_ids_from_image_path(image_path, "/upper/etc/passwd")
 }
 
+/// Check, without mounting, whether an ext4 image has a directory at
+/// `guest_path`. Symlinks are not followed.
+pub fn ext4_image_has_directory(image_path: &Path, guest_path: &str) -> Result<bool, String> {
+    let quoted_path = debugfs_quote_absolute_path(guest_path)
+        .ok_or_else(|| format!("invalid debugfs guest path '{guest_path}'"))?;
+    let command = format!("stat {quoted_path}");
+    let mut last_error = None;
+
+    for candidate in e2fs_tool_candidates("debugfs") {
+        let label = candidate.display().to_string();
+        match Command::new(&candidate)
+            .arg("-R")
+            .arg(&command)
+            .arg(image_path)
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                // debugfs exits 0 whether or not the path exists; the answer
+                // is only in its output.
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stdout.contains("Type: directory") {
+                    return Ok(true);
+                }
+                if stdout.contains("Type: ") || stderr.contains("File not found") {
+                    return Ok(false);
+                }
+                return Err(format!(
+                    "debugfs command '{command}' produced unrecognized output for {}\nstdout: {stdout}\nstderr: {stderr}",
+                    image_path.display()
+                ));
+            }
+            Ok(output) => {
+                last_error = Some(format!(
+                    "{label} failed with status {}\nstdout: {}\nstderr: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                last_error = Some(format!("{label} not found"));
+            }
+            Err(error) => last_error = Some(format!("run {label}: {error}")),
+        }
+    }
+
+    Err(format!(
+        "debugfs command '{command}' failed for {}: {}. Install e2fsprogs (debugfs) and retry",
+        image_path.display(),
+        last_error.unwrap_or_else(|| "debugfs not found".to_string())
+    ))
+}
+
 fn sandbox_guest_user_ids_from_image_path(
     image_path: &Path,
     guest_path: &str,
@@ -1520,6 +1574,35 @@ mod tests {
             .expect("create ext4 image");
 
         recover_rootfs_image(&image).expect("recover clean ext4 image");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ext4_image_has_directory_distinguishes_directories_files_and_missing_paths() {
+        if !e2fs_tool_candidates("debugfs")
+            .iter()
+            .any(|candidate| Command::new(candidate).arg("-V").output().is_ok())
+        {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let source = dir.join("source");
+        let image = dir.join("prepared.ext4");
+        fs::create_dir_all(source.join("image-rootfs/bin")).expect("create image rootfs");
+        fs::write(source.join("regular"), "file\n").expect("write regular file");
+        create_ext4_image_from_dir_with_size(&source, &image, 64 * 1024 * 1024)
+            .expect("create ext4 image");
+
+        assert!(ext4_image_has_directory(&image, "/image-rootfs").expect("stat directory"));
+        assert!(!ext4_image_has_directory(&image, "/regular").expect("stat regular file"));
+        assert!(!ext4_image_has_directory(&image, "/missing").expect("stat missing path"));
+        assert!(ext4_image_has_directory(&image, "relative").is_err());
+
+        let not_ext4 = dir.join("not-ext4.img");
+        fs::write(&not_ext4, vec![0_u8; 64 * 1024]).expect("write non-ext4 image");
+        assert!(ext4_image_has_directory(&not_ext4, "/image-rootfs").is_err());
 
         let _ = fs::remove_dir_all(&dir);
     }

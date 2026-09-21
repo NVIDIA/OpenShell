@@ -246,8 +246,7 @@ async fn delete_provider(name: &str) {
 
 async fn delete_provider_profile(id: &str) {
     let mut cmd = openshell_cmd();
-    cmd.arg("provider")
-        .arg("profile")
+    cmd.arg("profile")
         .arg("delete")
         .arg(id)
         .stdout(Stdio::null())
@@ -316,7 +315,11 @@ async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
         .expect("temp policy path should be utf-8")
         .to_string();
 
+    // The workload needs curl, which minimal default images such as the VM
+    // driver's nvcr.io/nvidia/base/ubuntu do not ship.
     let guard = SandboxGuard::create(&[
+        "--from",
+        "base",
         "--policy",
         &policy_path,
         "--",
@@ -369,10 +372,10 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
     delete_provider(BINDING_PROVIDER_B_NAME).await;
     delete_provider_profile(BINDING_PROFILE_A_ID).await;
     delete_provider_profile(BINDING_PROFILE_B_ID).await;
-    run_cli(&["provider", "profile", "import", "--file", &profile_a_path])
+    run_cli(&["profile", "import", "--file", &profile_a_path])
         .await
         .expect("import provider A endpoint-binding profile");
-    run_cli(&["provider", "profile", "import", "--file", &profile_b_path])
+    run_cli(&["profile", "import", "--file", &profile_b_path])
         .await
         .expect("import provider B endpoint-binding profile");
     run_cli(&[
@@ -405,6 +408,8 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
         server.port, server.port, server.port
     );
     let mut guard = SandboxGuard::create(&[
+        "--from",
+        "base",
         "--policy",
         &policy_path,
         "--provider",

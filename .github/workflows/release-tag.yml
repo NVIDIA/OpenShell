@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*.*.*"
+      - "!v*.*.*-pre.*"
   workflow_dispatch:
     inputs:
       tag:
@@ -128,6 +129,26 @@ jobs:
     with:
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+
+  security:
+    name: Security Scan
+    needs: [compute-versions, build-images]
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+      security-events: write
+    uses: ./.github/workflows/security-scan.yml
+    with:
+      candidate_ref: ${{ inputs.tag || github.ref_name }}
+      allow-high-critical: false
+      images: |
+        ghcr.io/nvidia/openshell/gateway:${{ needs.compute-versions.outputs.source_sha }}
+        ghcr.io/nvidia/openshell/sandbox:${{ needs.compute-versions.outputs.source_sha }}
+        ghcr.io/nvidia/openshell/supervisor:${{ needs.compute-versions.outputs.source_sha }}
+    secrets:
+      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   prepare-integration:
     needs: [compute-versions, build-binaries, build-deb, build-images]
@@ -308,6 +329,7 @@ jobs:
       - feature-specific-integration
       - docker-e2e
       - vm-e2e
+      - security
       - build-deb
       - build-rpm
       - build-snap

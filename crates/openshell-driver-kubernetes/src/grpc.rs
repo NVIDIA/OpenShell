@@ -70,14 +70,19 @@ impl ComputeDriver for ComputeDriverService {
 
     async fn get_capabilities(
         &self,
-        _request: Request<GetCapabilitiesRequest>,
+        request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         self.rpc_tracer
             .trace(openshell_otel::rpc::GET_CAPABILITIES, async {
-                self.driver
-                    .capabilities()
-                    .map(Response::new)
-                    .map_err(Status::internal)
+                let capabilities = self.driver.capabilities().map_err(Status::internal)?;
+                openshell_core::extension_protocol::validate_gateway_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::Compute,
+                    "kubernetes",
+                    capabilities.extension.as_ref(),
+                    request.into_inner().gateway,
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                Ok(Response::new(capabilities))
             })
             .await
     }
@@ -359,9 +364,16 @@ mod tests {
                 otel.name = "openshell.compute.v1.ComputeDriver/GetCapabilities",
                 otel.kind = "client"
             );
-            ComputeDriver::get_capabilities(&service, Request::new(GetCapabilitiesRequest {}))
-                .instrument(gateway_span)
-                .await?;
+            ComputeDriver::get_capabilities(
+                &service,
+                Request::new(GetCapabilitiesRequest {
+                    gateway: Some(openshell_core::extension_protocol::gateway_metadata(
+                        openshell_core::extension_protocol::ExtensionFamily::Compute,
+                    )),
+                }),
+            )
+            .instrument(gateway_span)
+            .await?;
 
             ComputeDriver::validate_sandbox_create(
                 &service,

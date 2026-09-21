@@ -368,8 +368,9 @@ Triggers differ by workflow: `.github/workflows/workflow-security.yml` runs on
 `merge_group` only, because it needs a base and head commit to compare;
 `.github/workflows/codeql.yml` runs nightly on the default branch (`main`) via
 `schedule`, with `workflow_dispatch` kept for manual diagnostics; and
-`.github/workflows/codex-security.yml` runs on pushed `v*.*.*-pre.*` tags, and is
-also callable through `workflow_call` and `workflow_dispatch`. CodeQL does
+`.github/workflows/codex-security.yml` is called by the aggregate release scan
+for pre-release tags and is also callable through `workflow_call` and
+`workflow_dispatch`. CodeQL does
 not run on `pull_request`, `merge_group`, or pushes to `main`, so it reports
 repository-level Code Scanning state on the default branch instead of per-PR
 results, and its four-language matrix stays off the per-change critical path.
@@ -479,6 +480,13 @@ Codex Security findings are informational during the observation phase, and the
 workflow only reports on candidates that already exist. Gating stable promotion
 on qualification results remains proposed in
 [RFC 0014](../rfc/0014-release-stability/release-qualification.md).
+
+The tagged release workflow calls the aggregate Security Scan after publishing
+the candidate's commit-addressed gateway, sandbox, and supervisor images. CodeQL,
+Trivy, Cargo Deny, and Actionlint/Zizmor run for every release tag; Codex Security
+also runs for pre-release tags. The release job depends on the aggregate result,
+which fails on scanner errors, Cargo Deny advisories, and unexcepted High or
+Critical findings.
 
 `release-auto-tag.yml` runs at 14:00 Europe/Zurich on weekdays (including daylight
 saving time changes) and supports manual dispatch. Maintainers start weekday

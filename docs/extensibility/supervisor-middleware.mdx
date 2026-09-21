@@ -84,6 +84,8 @@ Each binding returned by `Describe` may advertise a shorter `timeout` using the 
 
 The gateway connects to every registered service and verifies its capabilities before accepting traffic. Gateway startup fails when a service is unavailable, reports an invalid capability, or exposes more than one binding for the same operation and phase. The manifest `name` is diagnostic metadata and does not need to match the operator registration name. Operator-run registration names cannot claim the reserved `openshell/` namespace.
 
+`MiddlewareDescribeRequest` carries the caller's common protocol metadata, and `MiddlewareManifest.extension` returns the service's protocol and implementation metadata. This replaces the former empty `Describe` request. Regenerate service bindings and return protocol `1.0` plus `openshell.supervisor-middleware.contract`. Legacy gateways and current middleware cannot interoperate, so upgrade both peers during a coordinated outage. See [Extension Protocol Negotiation](/extensibility/extension-negotiation) for the skew policy and migration sequence.
+
 Registration is static. Restart the gateway after adding, removing, or changing a service. See [Gateway Configuration](/reference/gateway-config#supervisor-middleware-services) for the complete gateway TOML context.
 
 ### Authenticate OpenShell Callers
