@@ -269,14 +269,26 @@ independent from binary or package installation and lets multiple installers
 reuse the same prepared setup disk. The `none` installer skips OpenShell
 installation and boots the prepared environment directly.
 
+### Interactive tmachine shell
+
 The test command is `tmachine test <environment> <installer> <testsuite>`. The
 `shell` testsuite prepares the selected environment and installer, then opens an
-interactive SSH session in the disposable guest for manual debugging. For
-example, start an Ubuntu Docker guest without installing OpenShell:
+interactive SSH session in the disposable guest for manual debugging.
+
+Start an Ubuntu Docker guest without installing OpenShell:
 
 ```shell
 nix run .#tmachine -- test ubuntu-docker-rootful none shell
 ```
+
+Replace `none` with `deb` to install the locally staged Debian package before
+opening the shell:
+
+```shell
+nix run .#tmachine -- test ubuntu-docker-rootful deb shell
+```
+
+Exit the SSH session to shut down and discard the disposable guest.
 
 The `tests/tmachine` setup and install caches include a digest of the
 entire directory containing `ANSIBLE_CONFIG`, including local roles, task
