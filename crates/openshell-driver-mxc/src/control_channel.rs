@@ -50,7 +50,7 @@ pub type ReadySlot = Mutex<Option<oneshot::Sender<Result<(), String>>>>;
 /// "forward", or the `"target_ready"` event itself) -- an independently
 /// staged, stale relay binary then fails fast with a clear error instead of
 /// hanging or misbehaving against fields/events it doesn't understand.
-const REQUIRED_SUPERVISOR_RELAY_PROTOCOL_VERSION: u64 = 3;
+const REQUIRED_SUPERVISOR_RELAY_PROTOCOL_VERSION: u64 = 4;
 
 /// One control channel per sandboxed process. `request()` is safe to call
 /// concurrently — each call gets its own correlation id and awaits only its
@@ -284,7 +284,7 @@ mod tests {
         let (slot, rx) = armed_ready_slot();
 
         let consumed =
-            ControlChannel::try_route_ready(&slot, r#"{"event":"ready","protocol_version":3}"#)
+            ControlChannel::try_route_ready(&slot, r#"{"event":"ready","protocol_version":4}"#)
                 .await;
 
         assert!(consumed);
@@ -309,7 +309,7 @@ mod tests {
             "error should name the offending version: {err}"
         );
         assert!(
-            err.contains('3'),
+            err.contains('4'),
             "error should name the required version: {err}"
         );
     }
@@ -363,7 +363,7 @@ mod tests {
         // other's slot.
         let consumed = ControlChannel::try_route_target_status(
             &slot,
-            r#"{"event":"ready","protocol_version":3}"#,
+            r#"{"event":"ready","protocol_version":4}"#,
         )
         .await;
 

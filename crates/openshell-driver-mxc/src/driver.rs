@@ -21,6 +21,7 @@ use openshell_core::proto_struct::struct_to_json_value;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -30,12 +31,119 @@ use tokio::process::Child;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
+use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+use windows::Win32::NetworkManagement::IpHelper::{
+    GetExtendedTcpTable, MIB_TCP_STATE_LISTEN, MIB_TCPROW_LH, MIB_TCPTABLE,
+    TCP_TABLE_BASIC_LISTENER,
+};
+use windows::Win32::Networking::WinSock::AF_INET;
 
 const DRIVER_NAME: &str = "mxc";
 const DRIVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Sentinel image name — MXC has no OCI image; this string must be non-empty
 /// so the gateway's `default_image` cache is satisfied, but it is not pullable.
 const DEFAULT_IMAGE_SENTINEL: &str = "mxc:process-container";
+const TARGET_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
+const TARGET_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
+#[allow(unsafe_code)]
+fn tcp_listener_is_present(port: u16) -> std::io::Result<bool> {
+    let mut byte_count = 0_u32;
+    // SAFETY: The null-buffer call only asks Windows for the required size;
+    // `byte_count` points to initialized writable storage.
+    let status = unsafe {
+        GetExtendedTcpTable(
+            None,
+            &raw mut byte_count,
+            false,
+            u32::from(AF_INET.0),
+            TCP_TABLE_BASIC_LISTENER,
+            0,
+        )
+    };
+    if status != ERROR_INSUFFICIENT_BUFFER.0 && status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status.cast_signed()));
+    }
+    if (byte_count as usize) < size_of::<u32>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows returned an invalid TCP listener table size",
+        ));
+    }
+
+    let mut buffer;
+    loop {
+        let word_count = (byte_count as usize).div_ceil(size_of::<u32>());
+        buffer = vec![0_u32; word_count];
+        // SAFETY: `buffer` has the returned table's alignment and at least
+        // the requested byte count. Windows updates `byte_count` if the table
+        // grows concurrently.
+        let status = unsafe {
+            GetExtendedTcpTable(
+                Some(buffer.as_mut_ptr().cast()),
+                &raw mut byte_count,
+                false,
+                u32::from(AF_INET.0),
+                TCP_TABLE_BASIC_LISTENER,
+                0,
+            )
+        };
+        if status == ERROR_INSUFFICIENT_BUFFER.0 {
+            continue;
+        }
+        if status != 0 {
+            return Err(std::io::Error::from_raw_os_error(status.cast_signed()));
+        }
+        break;
+    }
+
+    let table = buffer.as_ptr().cast::<MIB_TCPTABLE>();
+    // SAFETY: A successful call writes a `MIB_TCPTABLE` header followed by
+    // `dwNumEntries` rows into the caller-provided buffer.
+    let entry_count = unsafe { (*table).dwNumEntries as usize };
+    let row_offset = std::mem::offset_of!(MIB_TCPTABLE, table);
+    let available_rows = (byte_count as usize)
+        .saturating_sub(row_offset)
+        .checked_div(size_of::<MIB_TCPROW_LH>())
+        .unwrap_or_default();
+    if entry_count > available_rows {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows returned a truncated TCP listener table",
+        ));
+    }
+    // SAFETY: The bounds check proves every row lies within `buffer`.
+    let rows = unsafe { std::slice::from_raw_parts((*table).table.as_ptr(), entry_count) };
+    Ok(rows.iter().any(|row| {
+        let port_bytes = row.dwLocalPort.to_ne_bytes();
+        let listener_port = u16::from_be_bytes([port_bytes[0], port_bytes[1]]);
+        // SAFETY: `dwState` and `State` are views of the same SDK union field,
+        // and Windows initialized every returned row.
+        let state = unsafe { row.Anonymous.dwState };
+        state == MIB_TCP_STATE_LISTEN.0.cast_unsigned() && listener_port == port
+    }))
+}
+
+async fn wait_for_target_listener(port: u16) -> std::io::Result<()> {
+    let start = tokio::time::Instant::now();
+    let deadline = start + TARGET_READY_TIMEOUT;
+    info!(port, timeout = ?TARGET_READY_TIMEOUT, "waiting for target listener in host TCP table");
+    loop {
+        if tcp_listener_is_present(port)? {
+            info!(port, elapsed = ?start.elapsed(), "target listener observed in host TCP table");
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep_until(std::cmp::min(now + TARGET_READY_POLL_INTERVAL, deadline)).await;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("timed out after {TARGET_READY_TIMEOUT:?} waiting for port {port}"),
+    ))
+}
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -1802,9 +1910,10 @@ async fn run_lifecycle(
         (None, None)
     };
     // Target-status signal from the spawner (see control_channel.rs's
-    // try_route_target_status): Ok once the target port accepts connections,
-    // or Err with the target's real exit/stderr diagnostic. Distinct from the
-    // "launch" response below, which only confirms the command/env arrived.
+    // try_route_target_status): Ok once the host observes the target listener
+    // and the relay confirms the target has not exited, or Err with the
+    // target's real exit/stderr diagnostic. Distinct from the "launch"
+    // response below, which only confirms the command/env arrived.
     let (target_ready_slot, target_ready_rx) = if spawner_wrapping_active {
         let (tx, rx) = oneshot::channel::<Result<(), String>>();
         (Some(Arc::new(Mutex::new(Some(tx)))), Some(rx))
@@ -1886,14 +1995,14 @@ async fn run_lifecycle(
     // Publish a cancellable handle (exec_child, and for ProcessContainer
     // shutdown_tx/terminated_rx too) and release the startup gate now,
     // rather than holding it until the target-readiness wait below (up to
-    // ~430s worst case: 120s ready + 310s target_ready) completes or times
+    // ~430s worst case: 120s relay-ready + 300s listener + handshakes) completes or times
     // out. stop_sandbox/delete_sandbox block on lifecycle_gate before doing
     // anything else, so holding it this long meant a stop/delete arriving
     // while a target is slow to (or never does) come up had no way to
     // interrupt that wait -- it just queued up behind it. See also imp.rs's
-    // matching fix: openshell-supervisor-relay now races its own
-    // port-readiness wait against a "shutdown" request instead of only
-    // observing shutdown once that wait finishes.
+    // matching fix: openshell-supervisor-relay now races the host-readiness
+    // confirmation against a "shutdown" request instead of only observing
+    // shutdown once startup finishes.
     let shutdown_rx = {
         let mut reg = registry.lock().await;
         let Some(entry) = reg.get_mut(&sandbox_id) else {
@@ -2019,51 +2128,100 @@ async fn run_lifecycle(
         let launch_err = if let Some(e) = ready_err {
             Some(e)
         } else {
-            let launch_data = serde_json::json!({
-                "command": sandbox_config.command,
-                "env": env,
-            });
-            match channel
-                .request("launch", launch_data, std::time::Duration::from_mins(2))
-                .await
-            {
-                Ok(resp) if resp.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => {
-                    info!(sandbox = %sandbox_name, "control-channel launch acknowledged");
-                    // The "launch" response above only confirms the
-                    // command/env reached the spawner -- it still needs
-                    // to spawn the target and confirm its configured
-                    // port is accepting connections
-                    // (openshell-supervisor-relay's own
-                    // wait_for_port_ready, up to ~300s worst case across
-                    // its own retries). Await that distinct
-                    // "target_ready" event before treating launch as
-                    // successful, so a caller acting on Ready=True below
-                    // can never race a target that hasn't bound its port
-                    // yet.
-                    let target_ready_timeout = std::time::Duration::from_secs(310);
-                    match tokio::time::timeout(target_ready_timeout, target_ready_rx).await {
-                        Ok(Ok(Ok(()))) => {
-                            info!(sandbox = %sandbox_name, "control-channel target ready");
-                            None
+            let target_port = config.pc_relay_target_port;
+            match tcp_listener_is_present(target_port) {
+                Ok(true) => Some(format!(
+                    "target port {target_port} is already listening before launch"
+                )),
+                Err(error) => Some(format!(
+                    "failed to inspect target port {target_port} before launch: {error}"
+                )),
+                Ok(false) => {
+                    let launch_data = serde_json::json!({
+                        "command": sandbox_config.command,
+                        "env": env,
+                    });
+                    match channel
+                        .request("launch", launch_data, std::time::Duration::from_mins(2))
+                        .await
+                    {
+                        Ok(resp)
+                            if resp.get("ok").and_then(serde_json::Value::as_bool)
+                                == Some(true) =>
+                        {
+                            info!(sandbox = %sandbox_name, "control-channel launch acknowledged");
+                            // The AppContainer cannot safely probe its own
+                            // pre-listener loopback port or inspect the TCP
+                            // table. Observe the listener from the host while
+                            // racing the relay's early-exit diagnostic.
+                            let mut target_ready_rx = target_ready_rx;
+                            let listener_error = tokio::select! {
+                                result = wait_for_target_listener(target_port) => {
+                                    result.err().map(|error| error.to_string())
+                                }
+                                status = &mut target_ready_rx => {
+                                    Some(match status {
+                                        Ok(Err(target_err)) => target_err,
+                                        Ok(Ok(())) => "spawner reported target ready before host confirmation".to_string(),
+                                        Err(_) => "spawner exited before its target became ready".to_string(),
+                                    })
+                                }
+                            };
+                            if let Some(error) = listener_error {
+                                Some(error)
+                            } else {
+                                let confirm_timeout = std::time::Duration::from_secs(10);
+                                match channel
+                                    .request(
+                                        "target_ready",
+                                        serde_json::Value::Null,
+                                        confirm_timeout,
+                                    )
+                                    .await
+                                {
+                                    Ok(resp)
+                                        if resp.get("ok").and_then(serde_json::Value::as_bool)
+                                            == Some(true) =>
+                                    {
+                                        match tokio::time::timeout(
+                                            confirm_timeout,
+                                            &mut target_ready_rx,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(Ok(()))) => {
+                                                info!(sandbox = %sandbox_name, "control-channel target ready");
+                                                None
+                                            }
+                                            Ok(Ok(Err(target_err))) => Some(target_err),
+                                            Ok(Err(_)) => Some(
+                                                "spawner exited before confirming target readiness"
+                                                    .to_string(),
+                                            ),
+                                            Err(_) => Some(format!(
+                                                "timed out after {confirm_timeout:?} waiting for target readiness confirmation"
+                                            )),
+                                        }
+                                    }
+                                    Ok(resp) => Some(
+                                        resp.get("error")
+                                            .and_then(|value| value.as_str())
+                                            .unwrap_or("target readiness confirmation rejected")
+                                            .to_string(),
+                                    ),
+                                    Err(error) => Some(error.to_string()),
+                                }
+                            }
                         }
-                        // `target_failed` carries the bounded target stderr
-                        // diagnostic supplied by openshell-supervisor-relay.
-                        Ok(Ok(Err(target_err))) => Some(target_err),
-                        Ok(Err(_)) => {
-                            Some("spawner exited before its target became ready".to_string())
-                        }
-                        Err(_) => Some(format!(
-                            "timed out after {target_ready_timeout:?} waiting for target to become ready"
-                        )),
+                        Ok(resp) => Some(
+                            resp.get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("launch rejected")
+                                .to_string(),
+                        ),
+                        Err(e) => Some(e.to_string()),
                     }
                 }
-                Ok(resp) => Some(
-                    resp.get("error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("launch rejected")
-                        .to_string(),
-                ),
-                Err(e) => Some(e.to_string()),
             }
         };
         if let Some(err) = launch_err {
@@ -2393,6 +2551,18 @@ mod lifecycle_tests {
         StaticCredentialEndpointBinding, UiClipboardAccess, UiPolicy,
     };
     use std::time::Duration;
+
+    #[test]
+    fn target_ready_budget_remains_five_minutes() {
+        assert_eq!(TARGET_READY_TIMEOUT, Duration::from_mins(5));
+    }
+
+    #[tokio::test]
+    async fn host_tcp_table_observes_loopback_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(tcp_listener_is_present(port).unwrap());
+    }
 
     fn driver_sandbox(id: &str) -> DriverSandbox {
         let shell =
