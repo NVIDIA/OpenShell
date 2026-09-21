@@ -1613,7 +1613,11 @@ impl AttributionIndex {
             if now.duration_since(front.at) > PENDING_TTL {
                 let stale = self.pending.pop_front();
                 if let Some(p) = stale {
-                    tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (aged out) {}", p.ev.summary());
+                    // A permanently dropped event is an audit-trail gap (the
+                    // OS action it represents will never appear in the OCSF
+                    // log), so it's worth surfacing above debug level by
+                    // default rather than only under `--log-level debug`.
+                    tracing::warn!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (aged out) {}", p.ev.summary());
                 }
             } else {
                 break;
@@ -1622,7 +1626,7 @@ impl AttributionIndex {
         if self.pending.len() >= PENDING_MAX
             && let Some(p) = self.pending.pop_front()
         {
-            tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (buffer full) {}", p.ev.summary());
+            tracing::warn!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (buffer full) {}", p.ev.summary());
         }
         self.pending.push_back(PendingEvent { at: now, ev });
     }
@@ -1642,7 +1646,7 @@ impl AttributionIndex {
         let mut keep = VecDeque::with_capacity(drained.len());
         for p in drained {
             if now.duration_since(p.at) > PENDING_TTL {
-                tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (aged out) {}", p.ev.summary());
+                tracing::warn!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (aged out) {}", p.ev.summary());
                 continue;
             }
             match self.resolve(&p.ev) {
