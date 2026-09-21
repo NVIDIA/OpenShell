@@ -47,6 +47,8 @@ pub struct Testsuite {
     pub name: String,
     pub playbooks: Vec<PathBuf>,
     pub inputs: BTreeMap<String, PathBuf>,
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 impl Config {

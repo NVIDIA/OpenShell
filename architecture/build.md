@@ -267,7 +267,9 @@ Tmachine environments define the guest machine and runtime setup, while named
 installers define how OpenShell is installed. This keeps the runtime mode
 independent from binary or package installation and lets multiple installers
 reuse the same prepared setup disk. The test command is
-`tmachine test <environment> <installer> <testsuite>`.
+`tmachine test <environment> <installer> <testsuite>`. The `shell` testsuite
+prepares the selected environment and installer, then opens an interactive SSH
+session in the disposable guest for manual debugging.
 
 The `tests/tmachine` setup and install caches include a digest of the
 entire directory containing `ANSIBLE_CONFIG`, including local roles, task

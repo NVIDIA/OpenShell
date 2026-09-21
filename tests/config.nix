@@ -100,6 +100,12 @@ let
 
     testsuites = [
       {
+        name = "shell";
+        playbooks = [ "ansible/playbooks/shell.yaml" ];
+        inputs = { };
+        interactive = true;
+      }
+      {
         name = "conformance";
         playbooks = [ "ansible/playbooks/conformance/cli.yaml" ];
         inputs = {
