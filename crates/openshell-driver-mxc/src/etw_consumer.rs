@@ -475,15 +475,16 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
                         consumer_health
                             .events_matched
                             .fetch_add(1, Ordering::Relaxed);
-                        match decode_raw(&mut raw) {
-                            Some(ev) => process_event(&index, ev),
-                            None => tracing::debug!(
+                        if let Some(ev) = decode_raw(&mut raw) {
+                            process_event(&index, ev);
+                        } else {
+                            tracing::debug!(
                                 target: "mxc_etw",
                                 id = raw.header.EventDescriptor.Id,
                                 opcode = raw.header.EventDescriptor.Opcode,
                                 pid = raw.header.ProcessId,
                                 "TDH decode failed for event"
-                            ),
+                            );
                         }
                         drain_and_emit(&index);
                         overload_reporter.report_if_due(&consumer_health, false);
@@ -1922,7 +1923,7 @@ fn warn_zero_events_received() {
     tracing::warn!(
         target: "mxc_etw",
         provider = ?SANDBOXING_PROVIDER_GUID,
-        session = SESSION_NAME,
+        session = SESSION_NAME_PREFIX,
         "MXC ETW->OCSF consumer has received zero events from the Sandboxing \
          provider despite sandbox activity; the OS-sourced audit trail is \
          empty for this session. EnableTraceEx2 succeeding does not prove the \
