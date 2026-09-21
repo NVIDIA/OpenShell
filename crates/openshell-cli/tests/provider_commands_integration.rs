@@ -64,7 +64,7 @@ const SYNTHETIC_PROFILE_BACKEND_ERROR: &str = "TESTLEAK";
 const SYNTHETIC_MUTATION_ERROR_METADATA: &str = "fixture-mutation-error-metadata";
 const STORAGE_UNCERTAIN_REASON: &str = "CONFIG_OPERATION_STORAGE_UNCERTAIN";
 
-fn selected_workspace(scope: &Option<openshell_core::proto::WorkspaceSelector>) -> Option<&str> {
+fn selected_workspace(scope: &Option<WorkspaceSelector>) -> Option<&str> {
     scope
         .as_ref()
         .and_then(|scope| match scope.selection.as_ref() {
