@@ -67,6 +67,12 @@ async fn max_middleware_body_bytes() -> usize {
     chain[0].max_payload_bytes()
 }
 const RELAY_BUF_SIZE: usize = 8192;
+/// Maximum aggregate chunk framing relayed for one body. Framing includes
+/// chunk-size lines, the CRLF after each chunk payload, and trailers. Unknown
+/// length framing lines must be read to their boundary one byte at a time so a
+/// pipelined request is not consumed; bounding their aggregate size also bounds
+/// the resulting read/write amplification for tiny chunks.
+const MAX_CHUNKED_FRAMING_BYTES: usize = 32 * 1024;
 const RESPONSE_UNIT_COALESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2);
 const HTTP_METHOD_PREFIXES: &[&[u8]] = &[
     b"GET ",
@@ -3131,6 +3137,7 @@ where
     let mut pos = 0usize;
     let mut chunk_count = 0usize;
     let mut chunk_payload_bytes = 0usize;
+    let mut framing_bytes = 0usize;
 
     // Parse chunk-size lines + chunk payloads until final 0-size chunk, then
     // parse trailers until the terminating empty trailer line.
@@ -3140,6 +3147,10 @@ where
             if let Some(end) = find_crlf(&parse_buf, pos) {
                 break end;
             }
+            ensure_chunked_framing_capacity(
+                framing_bytes,
+                parse_buf.len().saturating_sub(pos).saturating_add(1),
+            )?;
             let target_len = parse_buf
                 .len()
                 .checked_add(1)
@@ -3155,6 +3166,7 @@ where
             )
             .await?;
         };
+        add_chunked_framing_bytes(&mut framing_bytes, size_line_end + 2 - pos)?;
 
         let size_line = std::str::from_utf8(&parse_buf[pos..size_line_end])
             .into_diagnostic()
@@ -3177,6 +3189,10 @@ where
                     if let Some(end) = find_crlf(&parse_buf, pos) {
                         break end;
                     }
+                    ensure_chunked_framing_capacity(
+                        framing_bytes,
+                        parse_buf.len().saturating_sub(pos).saturating_add(1),
+                    )?;
                     let target_len = parse_buf
                         .len()
                         .checked_add(1)
@@ -3194,6 +3210,7 @@ where
                 };
 
                 let trailer_line = &parse_buf[pos..trailer_end];
+                add_chunked_framing_bytes(&mut framing_bytes, trailer_end + 2 - pos)?;
                 pos = trailer_end + 2;
                 if trailer_line.is_empty() {
                     debug!(
@@ -3217,6 +3234,7 @@ where
             .checked_add(2)
             .ok_or_else(|| miette!("Chunk size overflow"))?;
 
+        ensure_chunked_framing_capacity(framing_bytes, 2)?;
         relay_chunked_until_len(
             reader,
             writer,
@@ -3230,6 +3248,7 @@ where
         if &parse_buf[chunk_end..chunk_with_crlf_end] != b"\r\n" {
             return Err(miette!("Chunk missing terminating CRLF"));
         }
+        add_chunked_framing_bytes(&mut framing_bytes, 2)?;
         pos = chunk_with_crlf_end;
         chunk_count += 1;
         chunk_payload_bytes = chunk_payload_bytes.saturating_add(chunk_size);
@@ -3240,6 +3259,21 @@ where
             pos = 0;
         }
     }
+}
+
+fn ensure_chunked_framing_capacity(current: usize, additional: usize) -> Result<()> {
+    if additional > MAX_CHUNKED_FRAMING_BYTES.saturating_sub(current) {
+        return Err(miette!(
+            "Chunked body framing exceeds {MAX_CHUNKED_FRAMING_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn add_chunked_framing_bytes(current: &mut usize, additional: usize) -> Result<()> {
+    ensure_chunked_framing_capacity(*current, additional)?;
+    *current += additional;
+    Ok(())
 }
 
 /// Read and forward only the bytes needed to reach `target_len`.
@@ -3899,6 +3933,36 @@ mod tests {
             let end = self.position + amount;
             buffer.put_slice(&self.bytes[self.position..end]);
             self.position = end;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
     }
@@ -4664,6 +4728,37 @@ mod tests {
         let mut expected = already_forwarded.to_vec();
         expected.extend_from_slice(body_remainder);
         assert_eq!(forwarded, expected);
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_bounds_tiny_chunk_io_amplification() {
+        let mut wire = Vec::new();
+        for _ in 0..10_000 {
+            wire.extend_from_slice(b"1\r\na\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+
+        let mut reader = CountingReader::new(wire);
+        let mut writer = CountingWriter::default();
+        let error = relay_chunked(&mut reader, &mut writer, &[], None)
+            .await
+            .expect_err("excessive aggregate chunk framing must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Chunked body framing exceeds 32768 bytes")
+        );
+        assert!(
+            reader.reads < 40_000,
+            "framing limit allowed {} socket reads",
+            reader.reads
+        );
+        assert!(
+            writer.writes < 40_000,
+            "framing limit allowed {} upstream writes",
+            writer.writes
+        );
     }
 
     #[test]
