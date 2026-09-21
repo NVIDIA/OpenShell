@@ -928,3 +928,14 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?image_pull_policy\\s*=\\s*\\\"never\\\".*?supervisor_image_pull_policy\\s*=\\s*\\\"never\\\""
+
+  - it: enables warm pooling by default with bounded preparation settings
+    template: templates/gateway-config.yaml
+    set:
+      server.drivers.kubernetes.warmPool.maxPairs: 3
+      server.drivers.kubernetes.warmPool.preparationTimeoutSeconds: 120
+      server.drivers.kubernetes.warmPool.maxIdleSeconds: 900
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.warm_pool\]\s*enabled = true\s*max_pairs = 3\s*preparation_timeout_seconds = 120\s*max_idle_seconds = 900'

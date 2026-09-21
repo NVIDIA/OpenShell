@@ -174,6 +174,8 @@ mod session {
         runtime_generation: SandboxGenerationId,
         auth_epoch: CredentialEpoch,
         component: SessionComponent,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        resource_binding: BTreeMap<String, String>,
     }
 
     /// Durable identity shared by every short-lived token for one sandbox runtime.
@@ -583,6 +585,32 @@ mod session {
             token_id: Uuid,
             issued_at: i64,
         ) -> Result<MintedSessionToken, SessionJwtError> {
+            self.mint_bound(profile, identity, token_id, issued_at, BTreeMap::new())
+        }
+
+        /// Authorize initial assignment to an exact driver-provisioned runtime.
+        pub fn mint_bound_sandbox_token(
+            &self,
+            identity: &SandboxRuntimeIdentity,
+            resource_binding: BTreeMap<String, String>,
+        ) -> Result<MintedSessionToken, SessionJwtError> {
+            self.mint_bound(
+                SessionTokenProfile::Sandbox,
+                identity,
+                Uuid::new_v4(),
+                self.clock.now_unix_seconds(),
+                resource_binding,
+            )
+        }
+
+        fn mint_bound(
+            &self,
+            profile: SessionTokenProfile,
+            identity: &SandboxRuntimeIdentity,
+            token_id: Uuid,
+            issued_at: i64,
+            resource_binding: BTreeMap<String, String>,
+        ) -> Result<MintedSessionToken, SessionJwtError> {
             let expires_at = issued_at.saturating_add(
                 i64::try_from(self.ttl.as_secs()).map_err(|_| SessionJwtError::InvalidLifetime)?,
             );
@@ -597,6 +625,7 @@ mod session {
                 runtime_generation: identity.runtime_generation.clone(),
                 auth_epoch: identity.auth_epoch,
                 component: SessionComponent::OpenShellSupervisor,
+                resource_binding,
             };
             let mut header = Header::new(Algorithm::EdDSA);
             header.kid = Some(self.key_id.clone());
@@ -640,6 +669,8 @@ mod session {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct AuthenticatedSandboxSession {
+        /// Signed physical-runtime binding, required for initial late assignment.
+        pub resource_binding: BTreeMap<String, String>,
         pub sandbox_id: SandboxId,
         pub runtime_generation: SandboxGenerationId,
         pub auth_epoch: CredentialEpoch,
@@ -734,6 +765,7 @@ mod session {
                 return Err(SessionJwtError::Expired);
             }
             Ok(AuthenticatedSandboxSession {
+                resource_binding: claims.resource_binding,
                 sandbox_id: claims.sandbox_id,
                 runtime_generation: claims.runtime_generation,
                 auth_epoch: claims.auth_epoch,

@@ -23,6 +23,13 @@ import "sandbox.proto";
 //   fields so independently versioned external drivers remain
 //   forward-compatible.
 service ComputeDriver {
+  // Discover an eligible pair without claiming it; persist the candidate before CreateSandbox.
+  // Unsupported drivers return Unimplemented.
+  rpc SelectWarmPair(SelectWarmPairRequest) returns (SelectWarmPairResponse);
+  // Replace the desired inventory snapshot. Unsupported drivers return Unimplemented.
+  // Contains public preparation trust only; never operational credentials.
+  rpc SyncWarmPools(SyncWarmPoolsRequest) returns (SyncWarmPoolsResponse);
+
   // Report driver capabilities and defaults.
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
 
@@ -105,11 +112,27 @@ message GetCapabilitiesResponse {
 message AuthenticateSandboxRequest {
   // Opaque credential whose format and verification are owned by the driver.
   string credential = 1 [(openshell.options.v1.secret) = true];
+  // Request a live prepared-pair identity for registration, not tenant authority.
+  bool supervisor_registration = 2;
 }
 
 message AuthenticateSandboxResponse {
   // Stable gateway-assigned sandbox ID authenticated by the driver.
   string sandbox_id = 1;
+  SupervisorRegistration registration = 2;
+}
+
+// Driver-verified registration coordinates. Never accepted from the proxy itself.
+message SupervisorRegistration {
+  string instance_id = 1;
+  string sandbox_resource_uid = 2;
+  string workload_pod_uid = 3;
+  // Protected physical runtime descriptor, without operational credentials.
+  bytes backend_descriptor = 4;
+  string main_process_spec = 5;
+  string runtime_generation = 6;
+  string session_id = 7;
+  map<string, string> resource_binding = 8;
 }
 
 // Static portable resource request forms supported by a compute driver.
@@ -379,6 +402,7 @@ message ListSandboxesResponse {
 }
 
 message CreateSandboxRequest {
+  WarmPairCandidate warm_pair = 2;
   // Sandbox configuration to provision on the compute platform.
   DriverSandbox sandbox = 1;
 }
@@ -410,6 +434,10 @@ message StartSandboxRequest {
 message StartSandboxResponse {}
 
 message DeleteSandboxRequest {
+  // Allocation recovery must never retire a candidate already claimed by this sandbox.
+  bool only_unassigned_pair = 4;
+  // Fence a persisted candidate even if the claim has not completed.
+  WarmPairCandidate warm_pair = 3;
   // Stable sandbox ID stored by the gateway.
   string sandbox_id = 1;
   // Compute-runtime name used by the driver.
@@ -464,3 +492,39 @@ message DeleteWorkspaceRequest {
 }
 
 message DeleteWorkspaceResponse {}
+
+// Complete gateway-owned template snapshot; an empty list retires spare inventory.
+message SyncWarmPoolsRequest {
+  repeated WarmPoolTarget pools = 1;
+  string gateway_id = 2;
+  // JSON array of SessionVerificationKey public verification keys.
+  bytes verification_keys = 3;
+}
+message WarmPoolTarget {
+  string template_id = 1;
+  string workspace = 2;
+  uint32 target = 3;
+  DriverSandboxSpec spec = 4;
+  // Display metadata only; template_id remains the stable pool identity.
+  string template_name = 5;
+}
+message SyncWarmPoolsResponse {}
+
+// Physical handle, never an authorization credential.
+message WarmPairCandidate {
+  string namespace = 1;
+  string name = 2;
+  string uid = 3;
+  string template_id = 4;
+  string fingerprint = 5;
+  string runtime_generation = 6;
+}
+message SelectWarmPairRequest {
+  string template_id = 1;
+  DriverSandbox sandbox = 2;
+  // Physical UIDs already rejected or reserved by another allocation in this retry.
+  repeated string excluded_candidate_uids = 3;
+}
+message SelectWarmPairResponse {
+  WarmPairCandidate candidate = 1;
+}

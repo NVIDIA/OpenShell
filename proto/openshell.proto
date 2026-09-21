@@ -689,6 +689,13 @@ service OpenShell {
     };
   }
 
+  // Wait for the driver-verified proxy's durable assignment before activation.
+  rpc RegisterSupervisor(RegisterSupervisorRequest) returns (RegisterSupervisorResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
   // Exchange a sandbox-bootstrap credential (e.g. a Kubernetes projected
   // ServiceAccount token) for a gateway-minted JWT bound to the calling
   // sandbox's UUID. Used by the Kubernetes driver path; singleplayer
@@ -779,6 +786,17 @@ service OpenShell {
       workspace_role: "user"
     };
   }
+}
+
+// Identity is established by the projected credential in the request headers.
+message RegisterSupervisorRequest {}
+
+message RegisterSupervisorResponse {
+  string sandbox_id = 1;
+  string sandbox_name = 2;
+  bytes backend_descriptor = 3;
+  bytes auth_bundle = 4 [(openshell.options.v1.secret) = true];
+  string main_process_spec = 5;
 }
 
 // IssueSandboxToken request. Empty body; identity is established by the

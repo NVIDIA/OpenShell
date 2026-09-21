@@ -10,6 +10,9 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
   - apiGroups:
       - agents.x-k8s.io
     resources:
@@ -53,9 +56,8 @@ rules:
     verbs: ["create", "get"]
   - apiGroups: [""]
     resources: ["secrets"]
-    # Bootstrap Secrets are generation-scoped. Recovery lists them by label and
-    # deletes stale generations with UID preconditions before retrying creation.
-    verbs: ["create", "list", "delete"]
+    # Registration reads bootstrap material; stop/rollback lists and deletes it.
+    verbs: ["create", "get", "list", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get"]

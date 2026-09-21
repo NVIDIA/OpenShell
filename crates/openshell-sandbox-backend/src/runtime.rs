@@ -52,6 +52,9 @@ const ATTACH_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// callers retry whole calls above this; past boot, exhausting this window
 /// means the remote boundary (or its launcher) is gone rather than still starting.
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Retry fresh connections promptly when an early boot connection is blackholed.
+/// This bounds both transport establishment and the TLS handshake.
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn begin_recovery_window(
     deadline: &mut Option<tokio::time::Instant>,
@@ -1632,12 +1635,43 @@ impl BoundaryClient {
 async fn connect_boundary_with_retry(
     runtime_descriptor: &SandboxRuntimeDescriptor,
 ) -> Result<BoundaryDuplexStream, BackendError> {
-    let deadline = tokio::time::Instant::now() + CONNECT_RETRY_TIMEOUT;
+    connect_boundary_with_timeouts(
+        runtime_descriptor,
+        CONNECT_RETRY_TIMEOUT,
+        CONNECT_ATTEMPT_TIMEOUT,
+    )
+    .await
+}
+
+async fn connect_boundary_with_timeouts(
+    runtime_descriptor: &SandboxRuntimeDescriptor,
+    retry_timeout: Duration,
+    attempt_timeout: Duration,
+) -> Result<BoundaryDuplexStream, BackendError> {
+    let deadline = tokio::time::Instant::now() + retry_timeout;
     loop {
-        match connect_boundary_once(runtime_descriptor).await {
+        let attempt_deadline = (tokio::time::Instant::now() + attempt_timeout).min(deadline);
+        let result =
+            tokio::time::timeout_at(attempt_deadline, connect_boundary_once(runtime_descriptor))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(BackendError::Unavailable(
+                        "boundary transport connection or TLS handshake timed out".to_string(),
+                    ))
+                });
+        match result {
             Ok(stream) => return Ok(stream),
             Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
-            Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            Err(error) => {
+                tracing::debug!(%error, "boundary connection attempt failed; retrying");
+                tokio::time::sleep_until(
+                    (tokio::time::Instant::now() + Duration::from_millis(25)).min(deadline),
+                )
+                .await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(error);
+                }
+            }
         }
     }
 }
@@ -1929,6 +1963,57 @@ mod tests {
             generation: "test-generation".to_string(),
             network_device_count: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn boundary_connect_retries_a_stalled_tls_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let certificate = test_certificate();
+        let descriptor = tls_runtime_descriptor(address, certificate.client_tls);
+        let server = tokio::spawn(async move {
+            // Keep the first socket open without answering its TLS handshake.
+            let (stalled, _) = listener.accept().await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let accepted = tokio_rustls::TlsAcceptor::from(certificate.server_config)
+                .accept(stream)
+                .await
+                .unwrap();
+            (stalled, accepted)
+        });
+        let connected = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_boundary_with_retry(&descriptor),
+        )
+        .await
+        .expect("a stalled handshake must not delay the next attempt indefinitely")
+        .expect("the next TLS connection should succeed");
+        let _server_streams = server.await.unwrap();
+        drop(connected);
+    }
+
+    #[tokio::test]
+    async fn boundary_connect_deadline_caps_an_inflight_attempt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let descriptor = tls_runtime_descriptor(
+            listener.local_addr().unwrap(),
+            test_certificate().client_tls,
+        );
+        // The listening socket accepts TCP in the kernel but never answers TLS.
+        // The overall deadline must cancel an attempt with a longer timeout.
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            connect_boundary_with_timeouts(
+                &descriptor,
+                Duration::from_millis(100),
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("the overall retry deadline must interrupt a pending attempt");
+        assert!(
+            matches!(result, Err(BackendError::Unavailable(message)) if message.contains("timed out"))
+        );
     }
 
     #[tokio::test]

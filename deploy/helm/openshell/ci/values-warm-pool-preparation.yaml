@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+server:
+  drivers:
+    kubernetes:
+      warmPool:
+        enabled: true
+        maxPairs: 2
+        preparationTimeoutSeconds: 240
+        maxIdleSeconds: 3600

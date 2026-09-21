@@ -29,7 +29,6 @@ pub const BOUNDARY_CONFIG_KEY: &str = "boundary.json";
 pub const BACKEND_DESCRIPTOR_KEY: &str = "runtime-descriptor.json";
 pub const BOUNDARY_CERTIFICATE_KEY: &str = "tls.crt";
 pub const BOUNDARY_PRIVATE_KEY: &str = "tls.key";
-pub const SUPERVISOR_AUTH_BUNDLE_KEY: &str = "auth.json";
 pub const PROXY_CA_CERTIFICATE_KEY: &str = "proxy-ca.crt";
 pub const PROXY_CA_PRIVATE_KEY: &str = "proxy-ca.key";
 pub const SANDBOX_BOOTSTRAP_INPUT_PATH: &str = "/.openshell/bootstrap-input";
@@ -37,7 +36,6 @@ pub const BOUNDARY_CONFIG_PATH: &str = "/.openshell/state/bootstrap/boundary.jso
 pub const BOUNDARY_CERTIFICATE_PATH: &str = "/.openshell/state/bootstrap/tls.crt";
 pub const BOUNDARY_PRIVATE_KEY_PATH: &str = "/.openshell/state/bootstrap/tls.key";
 pub const BACKEND_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descriptor.json";
-pub const SUPERVISOR_AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
 pub const PROXY_CA_CERTIFICATE_PATH: &str = "/.openshell/supervisor/proxy-ca.crt";
 pub const PROXY_CA_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/proxy-ca.key";
 pub const CONTROL_HEALTH_SOCKET_PATH: &str = "/run/openshell/health.sock";
@@ -272,8 +270,7 @@ pub fn supervisor_pod(
         "/openshell-supervisor".to_string(),
         "--backend-descriptor-file".to_string(),
         BACKEND_DESCRIPTOR_PATH.to_string(),
-        "--auth-bundle-file".to_string(),
-        SUPERVISOR_AUTH_BUNDLE_PATH.to_string(),
+        "--register-supervisor".to_string(),
         "--workdir".to_string(),
         "/sandbox".to_string(),
         "--health-socket-path".to_string(),
@@ -463,7 +460,6 @@ pub fn supervisor_bootstrap_secret(
     names: &SandboxRuntimeNames,
     sandbox_id: &str,
     backend_descriptor: Vec<u8>,
-    supervisor_auth_bundle: Vec<u8>,
     proxy_ca_certificate: Vec<u8>,
     proxy_ca_private_key: Vec<u8>,
     owner: OwnerReference,
@@ -480,10 +476,6 @@ pub fn supervisor_bootstrap_secret(
             (
                 BACKEND_DESCRIPTOR_KEY.to_string(),
                 ByteString(backend_descriptor),
-            ),
-            (
-                SUPERVISOR_AUTH_BUNDLE_KEY.to_string(),
-                ByteString(supervisor_auth_bundle),
             ),
             (
                 PROXY_CA_CERTIFICATE_KEY.to_string(),
@@ -791,7 +783,6 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-            Vec::new(),
             owner(),
         );
         assert_eq!(
@@ -809,7 +800,6 @@ mod tests {
             std::collections::BTreeSet::from([
                 PROXY_CA_CERTIFICATE_KEY.to_string(),
                 PROXY_CA_PRIVATE_KEY.to_string(),
-                SUPERVISOR_AUTH_BUNDLE_KEY.to_string(),
                 BACKEND_DESCRIPTOR_KEY.to_string(),
             ])
         );

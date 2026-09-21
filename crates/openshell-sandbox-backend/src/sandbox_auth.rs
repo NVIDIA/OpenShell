@@ -54,7 +54,8 @@ impl SandboxProtocolPrincipal {
 /// Validates Sandbox Protocol metadata without depending on its byte transport.
 pub struct SandboxProtocolAuthenticator {
     verifier: SessionJwtVerifier,
-    expected_sandbox_id: SandboxId,
+    expected_sandbox_id: Mutex<Option<SandboxId>>,
+    resource_binding: std::collections::BTreeMap<String, String>,
     expected_runtime_generation: SandboxGenerationId,
     expected_auth_epoch: CredentialEpoch,
 }
@@ -84,7 +85,29 @@ impl SandboxProtocolAuthenticator {
     ) -> Self {
         Self {
             verifier,
-            expected_sandbox_id,
+            expected_sandbox_id: Mutex::new(Some(expected_sandbox_id)),
+            resource_binding: std::collections::BTreeMap::new(),
+            expected_runtime_generation,
+            expected_auth_epoch,
+        }
+    }
+
+    /// Wait for a gateway-signed assignment to the protected physical runtime.
+    /// Transport authentication alone must never select a logical sandbox.
+    pub fn unassigned(
+        verifier: SessionJwtVerifier,
+        resource_binding: std::collections::BTreeMap<String, String>,
+        expected_runtime_generation: SandboxGenerationId,
+        expected_auth_epoch: CredentialEpoch,
+    ) -> Self {
+        assert!(
+            !resource_binding.is_empty(),
+            "assignment requires a runtime binding"
+        );
+        Self {
+            verifier,
+            expected_sandbox_id: Mutex::new(None),
+            resource_binding,
             expected_runtime_generation,
             expected_auth_epoch,
         }
@@ -108,14 +131,25 @@ impl SandboxProtocolAuthenticator {
             .filter(|token| !token.is_empty() && !token.chars().any(char::is_whitespace))
             .ok_or(SandboxAuthError::InvalidBearer)?;
         let session = self.verifier.verify(token)?;
-        if session.sandbox_id != self.expected_sandbox_id {
-            return Err(SandboxAuthError::WrongSandbox);
-        }
         if session.runtime_generation != self.expected_runtime_generation {
             return Err(SandboxAuthError::WrongRuntimeGeneration);
         }
         if session.auth_epoch != self.expected_auth_epoch {
             return Err(SandboxAuthError::StaleCredentialEpoch);
+        }
+        let mut assigned = self
+            .expected_sandbox_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(expected) = assigned.as_ref() {
+            if &session.sandbox_id != expected {
+                return Err(SandboxAuthError::WrongSandbox);
+            }
+        } else {
+            if session.resource_binding != self.resource_binding {
+                return Err(SandboxAuthError::WrongSandbox);
+            }
+            *assigned = Some(session.sandbox_id.clone());
         }
         Ok(SandboxProtocolPrincipal {
             connection_id,
@@ -415,6 +449,95 @@ mod tests {
             ),
             token,
         )
+    }
+
+    #[test]
+    fn late_assignment_requires_signed_binding_and_is_permanent() {
+        use std::collections::BTreeMap;
+        let key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let clock: Arc<dyn JwtClock> = Arc::new(FixedClock);
+        let issuer = SessionJwtIssuer::from_ed25519_pem(
+            key.serialize_pem().as_bytes(),
+            "key",
+            "gateway",
+            DEFAULT_SESSION_TOKEN_TTL,
+            clock.clone(),
+        )
+        .unwrap();
+        let verifier = SessionJwtVerifier::new(
+            "gateway",
+            SessionTokenProfile::Sandbox,
+            [SessionVerificationKey {
+                key_id: "key".into(),
+                public_key_pem: key.public_key_pem().into_bytes(),
+            }],
+            clock,
+        )
+        .unwrap();
+        let binding = BTreeMap::from([
+            (
+                "kubernetes.sandbox_resource_uid".into(),
+                "sandbox-uid".into(),
+            ),
+            ("kubernetes.workload_pod_uid".into(), "pod-uid".into()),
+        ]);
+        let identity = SandboxRuntimeIdentity {
+            sandbox_id: SandboxId::parse("logical-a").unwrap(),
+            runtime_generation: SandboxGenerationId::parse("generation-a").unwrap(),
+            auth_epoch: CredentialEpoch::new(1).unwrap(),
+        };
+        let auth = SandboxProtocolAuthenticator::unassigned(
+            verifier,
+            binding.clone(),
+            identity.runtime_generation.clone(),
+            identity.auth_epoch,
+        );
+        let authenticate = |token: &openshell_core::jwt::MintedSessionToken| {
+            auth.authenticate(
+                SandboxConnectionId::new(),
+                &metadata(token.token.expose_secret()),
+            )
+        };
+        // Even a valid gateway-issued operational token cannot win first assignment.
+        assert!(authenticate(&issuer.mint_pair(&identity).unwrap().sandbox).is_err());
+        for field in binding.keys() {
+            let mut wrong = binding.clone();
+            wrong.insert(field.clone(), "replacement-uid".into());
+            assert!(
+                authenticate(&issuer.mint_bound_sandbox_token(&identity, wrong).unwrap()).is_err()
+            );
+        }
+        let mut wrong = identity.clone();
+        wrong.runtime_generation = SandboxGenerationId::parse("old-generation").unwrap();
+        assert!(
+            authenticate(
+                &issuer
+                    .mint_bound_sandbox_token(&wrong, binding.clone())
+                    .unwrap()
+            )
+            .is_err()
+        );
+        wrong = identity.clone();
+        wrong.auth_epoch = CredentialEpoch::new(2).unwrap();
+        assert!(
+            authenticate(
+                &issuer
+                    .mint_bound_sandbox_token(&wrong, binding.clone())
+                    .unwrap()
+            )
+            .is_err()
+        );
+        let token = issuer
+            .mint_bound_sandbox_token(&identity, binding.clone())
+            .unwrap();
+        let first = authenticate(&token).unwrap();
+        assert_eq!(first.session().sandbox_id, identity.sandbox_id);
+        assert!(authenticate(&token).is_ok());
+        // Ordinary refreshed tokens work only after the identity was assigned.
+        assert!(authenticate(&issuer.mint_pair(&identity).unwrap().sandbox).is_ok());
+        wrong = identity;
+        wrong.sandbox_id = SandboxId::parse("logical-b").unwrap();
+        assert!(authenticate(&issuer.mint_bound_sandbox_token(&wrong, binding).unwrap()).is_err());
     }
 
     fn registry_for(_principal: &SandboxProtocolPrincipal) -> SandboxConnectionRegistry {
