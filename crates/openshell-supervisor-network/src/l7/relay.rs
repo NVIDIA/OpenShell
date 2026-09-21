@@ -35,6 +35,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
+const CONNECTION_READ_AHEAD_BYTES: usize = 8 * 1024;
+
 /// Context for L7 request policy evaluation.
 #[derive(Clone)]
 #[cfg_attr(test, derive(Default))]
@@ -754,6 +756,17 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // Keep read-ahead state for the lifetime of the inspected connection. An
+    // HTTP parser may fetch bytes from the next pipelined request while
+    // finishing the current one; retaining them here ensures the next request
+    // still passes through its own policy decision.
+    let mut client_buffer =
+        tokio::io::BufReader::with_capacity(CONNECTION_READ_AHEAD_BYTES, client);
+    let mut upstream_buffer =
+        tokio::io::BufReader::with_capacity(CONNECTION_READ_AHEAD_BYTES, upstream);
+    let client = &mut client_buffer;
+    let upstream = &mut upstream_buffer;
+
     match config.protocol {
         L7Protocol::Rest | L7Protocol::Websocket => {
             relay_rest(config, &engine, client, upstream, ctx).await
@@ -813,6 +826,15 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // Route selection also owns the full keep-alive loop, so buffered bytes
+    // remain available across per-request parsing and authorization.
+    let mut client_buffer =
+        tokio::io::BufReader::with_capacity(CONNECTION_READ_AHEAD_BYTES, client);
+    let mut upstream_buffer =
+        tokio::io::BufReader::with_capacity(CONNECTION_READ_AHEAD_BYTES, upstream);
+    let client = &mut client_buffer;
+    let upstream = &mut upstream_buffer;
+
     let provider =
         crate::l7::rest::RestProvider::with_options(crate::l7::path::CanonicalizeOptions {
             allow_encoded_slash: configs.iter().any(|config| config.allow_encoded_slash),

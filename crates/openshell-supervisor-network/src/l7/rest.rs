@@ -67,12 +67,6 @@ async fn max_middleware_body_bytes() -> usize {
     chain[0].max_payload_bytes()
 }
 const RELAY_BUF_SIZE: usize = 8192;
-/// Maximum aggregate chunk framing relayed for one body. Framing includes
-/// chunk-size lines, the CRLF after each chunk payload, and trailers. Unknown
-/// length framing lines must be read to their boundary one byte at a time so a
-/// pipelined request is not consumed; bounding their aggregate size also bounds
-/// the resulting read/write amplification for tiny chunks.
-const MAX_CHUNKED_FRAMING_BYTES: usize = 32 * 1024;
 const RESPONSE_UNIT_COALESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2);
 const HTTP_METHOD_PREFIXES: &[&[u8]] = &[
     b"GET ",
@@ -3134,10 +3128,10 @@ where
     let started_at = std::time::Instant::now();
     let mut read_buf = [0u8; RELAY_BUF_SIZE];
     let mut parse_buf = Vec::from(already_forwarded);
+    let mut forwarded_len = already_forwarded.len();
     let mut pos = 0usize;
     let mut chunk_count = 0usize;
     let mut chunk_payload_bytes = 0usize;
-    let mut framing_bytes = 0usize;
 
     // Parse chunk-size lines + chunk payloads until final 0-size chunk, then
     // parse trailers until the terminating empty trailer line.
@@ -3147,17 +3141,15 @@ where
             if let Some(end) = find_crlf(&parse_buf, pos) {
                 break end;
             }
-            ensure_chunked_framing_capacity(
-                framing_bytes,
-                parse_buf.len().saturating_sub(pos).saturating_add(1),
-            )?;
+            if parse_buf.len().saturating_sub(pos) >= MAX_HEADER_BYTES {
+                return Err(miette!("Chunk-size line exceeds limit"));
+            }
             let target_len = parse_buf
                 .len()
                 .checked_add(1)
                 .ok_or_else(|| miette!("Chunked body size overflow"))?;
             relay_chunked_until_len(
                 reader,
-                writer,
                 &mut read_buf,
                 &mut parse_buf,
                 target_len,
@@ -3166,7 +3158,9 @@ where
             )
             .await?;
         };
-        add_chunked_framing_bytes(&mut framing_bytes, size_line_end + 2 - pos)?;
+        if size_line_end.saturating_add(2).saturating_sub(pos) > MAX_HEADER_BYTES {
+            return Err(miette!("Chunk-size line exceeds limit"));
+        }
 
         let size_line = std::str::from_utf8(&parse_buf[pos..size_line_end])
             .into_diagnostic()
@@ -3180,6 +3174,15 @@ where
             .into_diagnostic()
             .map_err(|_| miette!("Invalid chunk size token: {size_token:?}"))?;
         pos = size_line_end + 2;
+        flush_validated_chunked_bytes(
+            writer,
+            &parse_buf,
+            &mut forwarded_len,
+            pos,
+            false,
+            generation_guard,
+        )
+        .await?;
 
         if chunk_size == 0 {
             // Parse trailers (if any). Terminates on empty trailer line.
@@ -3189,17 +3192,15 @@ where
                     if let Some(end) = find_crlf(&parse_buf, pos) {
                         break end;
                     }
-                    ensure_chunked_framing_capacity(
-                        framing_bytes,
-                        parse_buf.len().saturating_sub(pos).saturating_add(1),
-                    )?;
+                    if parse_buf.len().saturating_sub(pos) >= MAX_HEADER_BYTES {
+                        return Err(miette!("Chunk trailer line exceeds limit"));
+                    }
                     let target_len = parse_buf
                         .len()
                         .checked_add(1)
                         .ok_or_else(|| miette!("Chunked trailer size overflow"))?;
                     relay_chunked_until_len(
                         reader,
-                        writer,
                         &mut read_buf,
                         &mut parse_buf,
                         target_len,
@@ -3208,11 +3209,23 @@ where
                     )
                     .await?;
                 };
+                if trailer_end.saturating_add(2).saturating_sub(pos) > MAX_HEADER_BYTES {
+                    return Err(miette!("Chunk trailer line exceeds limit"));
+                }
 
                 let trailer_line = &parse_buf[pos..trailer_end];
-                add_chunked_framing_bytes(&mut framing_bytes, trailer_end + 2 - pos)?;
+                let trailer_is_empty = trailer_line.is_empty();
                 pos = trailer_end + 2;
-                if trailer_line.is_empty() {
+                flush_validated_chunked_bytes(
+                    writer,
+                    &parse_buf,
+                    &mut forwarded_len,
+                    pos,
+                    trailer_is_empty,
+                    generation_guard,
+                )
+                .await?;
+                if trailer_is_empty {
                     debug!(
                         chunk_count,
                         chunk_payload_bytes,
@@ -3223,6 +3236,11 @@ where
                     return Ok(());
                 }
                 trailer_count += 1;
+                if pos > RELAY_BUF_SIZE * 4 && forwarded_len >= pos {
+                    parse_buf.drain(..pos);
+                    forwarded_len -= pos;
+                    pos = 0;
+                }
             }
         }
 
@@ -3234,10 +3252,8 @@ where
             .checked_add(2)
             .ok_or_else(|| miette!("Chunk size overflow"))?;
 
-        ensure_chunked_framing_capacity(framing_bytes, 2)?;
         relay_chunked_until_len(
             reader,
-            writer,
             &mut read_buf,
             &mut parse_buf,
             chunk_with_crlf_end,
@@ -3248,42 +3264,35 @@ where
         if &parse_buf[chunk_end..chunk_with_crlf_end] != b"\r\n" {
             return Err(miette!("Chunk missing terminating CRLF"));
         }
-        add_chunked_framing_bytes(&mut framing_bytes, 2)?;
         pos = chunk_with_crlf_end;
+        flush_validated_chunked_bytes(
+            writer,
+            &parse_buf,
+            &mut forwarded_len,
+            pos,
+            false,
+            generation_guard,
+        )
+        .await?;
         chunk_count += 1;
         chunk_payload_bytes = chunk_payload_bytes.saturating_add(chunk_size);
 
         // Keep parser memory bounded for long streams.
-        if pos > RELAY_BUF_SIZE * 4 {
+        if pos > RELAY_BUF_SIZE * 4 && forwarded_len >= pos {
             parse_buf.drain(..pos);
+            forwarded_len -= pos;
             pos = 0;
         }
     }
 }
 
-fn ensure_chunked_framing_capacity(current: usize, additional: usize) -> Result<()> {
-    if additional > MAX_CHUNKED_FRAMING_BYTES.saturating_sub(current) {
-        return Err(miette!(
-            "Chunked body framing exceeds {MAX_CHUNKED_FRAMING_BYTES} bytes"
-        ));
-    }
-    Ok(())
-}
-
-fn add_chunked_framing_bytes(current: &mut usize, additional: usize) -> Result<()> {
-    ensure_chunked_framing_capacity(*current, additional)?;
-    *current += additional;
-    Ok(())
-}
-
-/// Read and forward only the bytes needed to reach `target_len`.
+/// Read only the bytes needed to reach `target_len`.
 ///
-/// Limiting each socket read to the current chunked framing boundary prevents
-/// a pipelined request from being consumed and written upstream as part of the
-/// authorized request body.
-async fn relay_chunked_until_len<R, W>(
+/// The connection-scoped buffered reader may fetch more data from the socket,
+/// but this parser consumes only the current body. Any read-ahead remains in
+/// that reader for the next request's policy decision.
+async fn relay_chunked_until_len<R>(
     reader: &mut R,
-    writer: &mut W,
     read_buf: &mut [u8; RELAY_BUF_SIZE],
     parse_buf: &mut Vec<u8>,
     target_len: usize,
@@ -3292,7 +3301,6 @@ async fn relay_chunked_until_len<R, W>(
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
 {
     while parse_buf.len() < target_len {
         let remaining = target_len - parse_buf.len();
@@ -3307,9 +3315,39 @@ where
         if let Some(guard) = generation_guard {
             guard.ensure_current()?;
         }
-        writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
         parse_buf.extend_from_slice(&read_buf[..n]);
     }
+    Ok(())
+}
+
+/// Forward complete, validated chunk framing in relay-sized batches.
+///
+/// Tiny chunks no longer cause one upstream write per framing byte, while the
+/// final forced flush guarantees the complete body reaches upstream before the
+/// response relay starts.
+async fn flush_validated_chunked_bytes<W>(
+    writer: &mut W,
+    parse_buf: &[u8],
+    forwarded_len: &mut usize,
+    validated_len: usize,
+    force: bool,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let pending = validated_len.saturating_sub(*forwarded_len);
+    if pending == 0 || (!force && pending < RELAY_BUF_SIZE) {
+        return Ok(());
+    }
+    if let Some(guard) = generation_guard {
+        guard.ensure_current()?;
+    }
+    writer
+        .write_all(&parse_buf[*forwarded_len..validated_len])
+        .await
+        .into_diagnostic()?;
+    *forwarded_len = validated_len;
     Ok(())
 }
 
@@ -3940,6 +3978,7 @@ mod tests {
     #[derive(Default)]
     struct CountingWriter {
         writes: usize,
+        bytes: Vec<u8>,
     }
 
     impl AsyncWrite for CountingWriter {
@@ -3949,6 +3988,7 @@ mod tests {
             buffer: &[u8],
         ) -> Poll<std::io::Result<usize>> {
             self.writes += 1;
+            self.bytes.extend_from_slice(buffer);
             Poll::Ready(Ok(buffer.len()))
         }
 
@@ -4677,8 +4717,9 @@ mod tests {
         let mut wire = chunked_body.to_vec();
         wire.extend_from_slice(pipelined_request);
 
-        let (mut relay_reader, mut client_writer) = tokio::io::duplex(4096);
+        let (relay_reader, mut client_writer) = tokio::io::duplex(4096);
         client_writer.write_all(&wire).await.unwrap();
+        let mut relay_reader = tokio::io::BufReader::with_capacity(4096, relay_reader);
         let (mut relay_writer, mut upstream_reader) = tokio::io::duplex(4096);
 
         relay_chunked(&mut relay_reader, &mut relay_writer, &[], None)
@@ -4704,8 +4745,9 @@ mod tests {
         let mut later_read = body_remainder.to_vec();
         later_read.extend_from_slice(pipelined_request);
 
-        let (mut relay_reader, mut client_writer) = tokio::io::duplex(4096);
+        let (relay_reader, mut client_writer) = tokio::io::duplex(4096);
         client_writer.write_all(&later_read).await.unwrap();
+        let mut relay_reader = tokio::io::BufReader::with_capacity(4096, relay_reader);
         let (mut relay_writer, mut upstream_reader) = tokio::io::duplex(4096);
         relay_writer.write_all(already_forwarded).await.unwrap();
 
@@ -4731,32 +4773,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_chunked_bounds_tiny_chunk_io_amplification() {
-        let mut wire = Vec::new();
+    async fn relay_chunked_buffers_tiny_chunks_without_an_aggregate_framing_limit() {
+        let mut chunked_body = Vec::new();
         for _ in 0..10_000 {
-            wire.extend_from_slice(b"1\r\na\r\n");
+            chunked_body.extend_from_slice(b"1\r\na\r\n");
         }
-        wire.extend_from_slice(b"0\r\n\r\n");
+        chunked_body.extend_from_slice(b"0\r\n\r\n");
+        let pipelined_request = b"DELETE /blocked HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut wire = chunked_body.clone();
+        wire.extend_from_slice(pipelined_request);
 
-        let mut reader = CountingReader::new(wire);
+        let mut reader =
+            tokio::io::BufReader::with_capacity(RELAY_BUF_SIZE, CountingReader::new(wire));
         let mut writer = CountingWriter::default();
-        let error = relay_chunked(&mut reader, &mut writer, &[], None)
+        relay_chunked(&mut reader, &mut writer, &[], None)
             .await
-            .expect_err("excessive aggregate chunk framing must be rejected");
+            .expect("valid tiny chunks must not be rejected by an aggregate framing limit");
 
+        let reads_after_body = reader.get_ref().reads;
+        let mut remaining = vec![0; pipelined_request.len()];
+        reader.read_exact(&mut remaining).await.unwrap();
+        assert_eq!(remaining, pipelined_request);
+        assert_eq!(writer.bytes, chunked_body);
         assert!(
-            error
-                .to_string()
-                .contains("Chunked body framing exceeds 32768 bytes")
+            reads_after_body < 100,
+            "connection buffering required {reads_after_body} underlying reads"
         );
         assert!(
-            reader.reads < 40_000,
-            "framing limit allowed {} socket reads",
-            reader.reads
-        );
-        assert!(
-            writer.writes < 40_000,
-            "framing limit allowed {} upstream writes",
+            writer.writes < 100,
+            "framing coalescing required {} upstream writes",
             writer.writes
         );
     }
