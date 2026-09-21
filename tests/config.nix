@@ -71,6 +71,12 @@ let
 
     installers = [
       {
+        name = "none";
+        use_galaxy = false;
+        playbooks = [ ];
+        inputs = { };
+      }
+      {
         name = "binaries";
         use_galaxy = false;
         playbooks = [
