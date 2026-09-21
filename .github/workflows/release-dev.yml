@@ -110,6 +110,7 @@ jobs:
     uses: ./.github/workflows/prepare-integration-inputs.yml
     with:
       deb-artifact-name: deb-linux-amd64
+      include-deb-upgrade-source: true
 
   conformance-integration:
     needs: prepare-integration
@@ -122,6 +123,13 @@ jobs:
       category: conformance
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+      test-matrix: >-
+        [
+          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
+          {"environment":"ubuntu-docker-rootful","installer":"deb-upgrade-source","testsuite":"deb-upgrade"},
+          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"conformance"}
+        ]
 
   feature-specific-integration:
     needs: prepare-integration
