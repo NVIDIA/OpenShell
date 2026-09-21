@@ -1111,7 +1111,12 @@ describe('exec done settlement', () => {
       if ('type' in event) expect(await session.done).toBe(3);
       else chunks.push(event.data);
     }
-    expect(Buffer.concat(chunks)).toEqual(Buffer.concat([data, Buffer.from('last')]));
+    const actual = Buffer.concat(chunks);
+    const expected = Buffer.concat([data, Buffer.from('last')]);
+    expect(actual.length).toBe(expected.length);
+    // Compare bytes natively: deep equality on a multi-MiB Buffer can exhaust
+    // the test timeout on CI even when the stream drains promptly.
+    expect(actual.equals(expected)).toBe(true);
   });
 
   it('retains the exit code but rejects completion on a later transport error', async () => {
