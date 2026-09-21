@@ -102,7 +102,7 @@ jobs:
       checkout-ref: ${{ github.sha }}
 
   prepare-integration:
-    needs: [build-binaries, build-deb, build-images]
+    needs: [build-binaries, build-deb, build-images, build-rpm]
     permissions:
       actions: read
       contents: read
@@ -110,7 +110,9 @@ jobs:
     uses: ./.github/workflows/prepare-integration-inputs.yml
     with:
       deb-artifact-name: deb-linux-amd64
+      rpm-artifact-name: rpm-linux-x86_64
       include-deb-upgrade-source: true
+      include-rpm-upgrade-source: true
 
   conformance-integration:
     needs: prepare-integration
@@ -127,6 +129,7 @@ jobs:
         [
           {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
           {"environment":"ubuntu-docker-rootful","installer":"deb-upgrade-source","testsuite":"deb-upgrade"},
+          {"environment":"fedora-podman-rootless","installer":"rpm-upgrade-source","testsuite":"rpm-upgrade"},
           {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"conformance"},
           {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"conformance"}
         ]

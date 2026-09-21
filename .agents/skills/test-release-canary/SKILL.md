@@ -29,12 +29,13 @@ rolling dev release produced by the triggering workflow. Kubernetes pins the
 matching `0.0.0-dev` chart and `:dev` images.
 
 The host-package jobs exercise fresh installs, not upgrades from persisted
-gateway state. Release Dev and Release Tag additionally run the tmachine Ubuntu
-DEB upgrade lane: it installs the latest retained prerelease source, upgrades
-to the candidate DEB, verifies an existing sandbox survives, and creates a new
-sandbox. That lane is part of the release conformance matrix, not this canary.
-Validate Homebrew and RPM exact-default migration with the release-tooling and
-package lifecycle tests before relying on the canary.
+gateway state. Release Dev and Release Tag additionally run tmachine Ubuntu DEB
+and Fedora RPM upgrade lanes: they install the latest retained prerelease
+packages and matching runtime images, upgrade to the candidate packages, verify
+an existing sandbox survives, and create a new sandbox. Those lanes are part of
+the release conformance matrix, not this canary. Validate Homebrew exact-default
+migration with the release-tooling and package lifecycle tests before relying
+on the canary.
 
 The canary does not install or import `@nvidia/openshell-sdk`. TypeScript SDK
 validation lives in the `TypeScript SDK` branch check, including a publish

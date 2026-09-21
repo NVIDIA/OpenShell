@@ -95,6 +95,8 @@ jobs:
     outputs:
       cargo: ${{ steps.version.outputs.cargo }}
       deb: ${{ steps.version.outputs.deb }}
+      rpm_version: ${{ steps.version.outputs.rpm_version }}
+      rpm_release: ${{ steps.version.outputs.rpm_release }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -106,9 +108,13 @@ jobs:
         run: |
           cargo="$(python3 tasks/scripts/release.py get-version --cargo)"
           deb="$(python3 tasks/scripts/release.py get-version --dev --deb)"
+          rpm_version="$(python3 tasks/scripts/release.py get-version --dev --rpm-version)"
+          rpm_release="$(python3 tasks/scripts/release.py get-version --dev --rpm-release)"
           {
             echo "cargo=$cargo"
             echo "deb=$deb"
+            echo "rpm_version=$rpm_version"
+            echo "rpm_release=$rpm_release"
           } >> "$GITHUB_OUTPUT"
 
   build-binaries:
@@ -232,9 +238,23 @@ jobs:
       deb-version: ${{ needs.version.outputs.deb }}
       checkout-ref: ${{ github.sha }}
 
+  build-rpm-upgrade:
+    name: Build RPM packages for upgrade qualification
+    needs: [pr_metadata, version, build-binaries]
+    if: needs.pr_metadata.outputs.run_integration_upgrades == 'true'
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/rpm-package.yml
+    with:
+      checkout-ref: ${{ github.sha }}
+      rpm-version: ${{ needs.version.outputs.rpm_version }}
+      rpm-release: ${{ needs.version.outputs.rpm_release }}
+      cargo-version: ${{ needs.version.outputs.cargo }}
+
   prepare-integration-upgrades:
     name: Prepare upgrade qualification inputs
-    needs: [pr_metadata, build-binaries, build-images, build-deb-upgrade]
+    needs: [pr_metadata, build-binaries, build-images, build-deb-upgrade, build-rpm-upgrade]
     if: needs.pr_metadata.outputs.run_integration_upgrades == 'true'
     permissions:
       actions: read
@@ -243,7 +263,9 @@ jobs:
     uses: ./.github/workflows/prepare-integration-inputs.yml
     with:
       deb-artifact-name: deb-linux-amd64
+      rpm-artifact-name: rpm-linux-x86_64
       include-deb-upgrade-source: true
+      include-rpm-upgrade-source: true
 
   integration-upgrades:
     name: Integration upgrades
@@ -259,7 +281,8 @@ jobs:
       integration-inputs-artifact-id: ${{ needs.prepare-integration-upgrades.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
-          {"environment":"ubuntu-docker-rootful","installer":"deb-upgrade-source","testsuite":"deb-upgrade"}
+          {"environment":"ubuntu-docker-rootful","installer":"deb-upgrade-source","testsuite":"deb-upgrade"},
+          {"environment":"fedora-podman-rootless","installer":"rpm-upgrade-source","testsuite":"rpm-upgrade"}
         ]
 
   # Run driver-independent conformance tests.
