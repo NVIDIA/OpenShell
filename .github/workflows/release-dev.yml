@@ -111,6 +111,7 @@ jobs:
     with:
       deb-artifact-name: deb-linux-amd64
       rpm-artifact-name: rpm-linux-x86_64
+      include-deb-upgrade-source: true
 
   conformance-integration:
     needs: prepare-integration
@@ -126,6 +127,7 @@ jobs:
       test-matrix: >-
         [
           {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
+          {"environment":"ubuntu-docker-rootful","installer":"deb-upgrade-source","testsuite":"deb-upgrade"},
           {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
           {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
           {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
