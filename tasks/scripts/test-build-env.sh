@@ -38,28 +38,14 @@ if [ "${os}" != "Darwin" ]; then
   exit 0
 fi
 
-# Darwin below.
-if ! command -v cargo-zigbuild >/dev/null 2>&1; then
-  # Without cargo-zigbuild the helper must be a no-op even on macOS.
-  (
-    ulimit -Sn 256 2>/dev/null || true
-    before="$(ulimit -n)"
-    ensure_build_nofile_limit >/dev/null
-    after="$(ulimit -n)"
-    [ "${before}" = "${after}" ] || fail "limit changed on macOS without cargo-zigbuild (${before} -> ${after})"
-  )
-  pass "no-op on macOS without cargo-zigbuild"
-  echo "All build-env tests passed."
-  exit 0
-fi
-
-# Darwin + cargo-zigbuild: the helper should raise a low soft limit.
+# Darwin native Cargo builds need the same protection even when
+# cargo-zigbuild is unavailable.
 (
   if ! ulimit -Sn 256 2>/dev/null; then
     echo "SKIP: unable to lower soft limit to 256 for test"
     exit 0
   fi
-  ensure_build_nofile_limit >/dev/null
+  PATH="/usr/bin:/bin" ensure_build_nofile_limit >/dev/null
   after="$(ulimit -n)"
   hard="$(ulimit -Hn 2>/dev/null || echo unlimited)"
   case "${hard}" in
@@ -76,7 +62,7 @@ fi
       ;;
   esac
 )
-pass "raises low soft limit on macOS with cargo-zigbuild"
+pass "raises low soft limit for native Cargo builds on macOS"
 
 # Idempotent: when the current limit already meets the desired value, the helper
 # leaves it unchanged (drive this via the env override so it holds regardless of
