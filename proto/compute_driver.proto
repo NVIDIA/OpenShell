@@ -110,6 +110,10 @@ message AuthenticateSandboxRequest {
 message AuthenticateSandboxResponse {
   // Stable gateway-assigned sandbox ID authenticated by the driver.
   string sandbox_id = 1;
+  // Opaque, stable identity of the compute resource presenting the credential.
+  // The gateway compares this with the identity recorded when the sandbox was
+  // created to authorize the bootstrap exchange.
+  string runtime_identity = 2;
 }
 
 // Static portable resource request forms supported by a compute driver.
@@ -383,7 +387,11 @@ message CreateSandboxRequest {
   DriverSandbox sandbox = 1;
 }
 
-message CreateSandboxResponse {}
+message CreateSandboxResponse {
+  // Opaque, stable identity of the compute resource created for the sandbox.
+  // Required when the driver advertises sandbox authentication support.
+  string runtime_identity = 1;
+}
 
 message StopSandboxRequest {
   // Stable sandbox ID stored by the gateway.
@@ -407,7 +415,11 @@ message StartSandboxRequest {
   string generation_id = 4;
 }
 
-message StartSandboxResponse {}
+message StartSandboxResponse {
+  // Updated opaque runtime identity after a successful start. Required when
+  // the driver advertises sandbox authentication support.
+  string runtime_identity = 1;
+}
 
 message DeleteSandboxRequest {
   // Stable sandbox ID stored by the gateway.

@@ -506,19 +506,19 @@ The Kubernetes driver's `AuthenticateSandbox` implementation applies its named
   until the first watcher update.
 
 It validates the projected token with Kubernetes `TokenReview`, checks the live
-pod UID, and verifies the pod's controlling Sandbox CR UID and sandbox ID before
-returning the identity to the gateway. These checks rely on an ownership
-invariant. In shared and managed modes, the Kubernetes driver and its trusted
-Agent Sandbox controller exclusively administer the sandbox namespace, Sandbox
-CRs, sandbox pods, and configured sandbox ServiceAccount. Other principals must
-not create or mutate those resources or use that ServiceAccount. In operator
-mode, the platform operator retains
-namespace lifecycle ownership, but must preserve the same exclusive control of
-Sandbox CRs and the pods and ServiceAccount used for sandbox token bootstrap.
-An allowlisted namespace is therefore a trust grant, not a tenant isolation
-boundary. Kubernetes owner references alone do not prove which controller
-created a pod, so admitting principals that can fabricate that resource chain
-would allow them to claim an existing sandbox identity.
+pod UID, and verifies the pod's controlling Sandbox CR UID and sandbox ID. The
+driver returns both the sandbox ID and an opaque runtime identity derived from
+the namespace, immutable Sandbox CR UID, and authenticated supervisor Pod UID. The gateway records that runtime
+identity when provisioning succeeds and requires an exact match before issuing
+a sandbox JWT. This correlates credential authentication with the durable
+runtime record rather than authorizing from the sandbox ID alone.
+
+Shared and managed modes still reserve the sandbox namespace, Sandbox CRs,
+sandbox pods, and configured sandbox ServiceAccount for the Kubernetes driver
+and trusted Agent Sandbox controller. In operator mode, the platform operator
+retains namespace lifecycle ownership and must preserve the same control of
+those resources. An allowlisted namespace is a trust grant, not a tenant
+isolation boundary.
 
 ### Credential Driver Integration
 

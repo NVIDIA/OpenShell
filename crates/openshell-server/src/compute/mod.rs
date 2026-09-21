@@ -58,6 +58,10 @@ use tonic::transport::Channel;
 #[cfg(unix)]
 use tonic::transport::Endpoint;
 use tonic::{Code, Request, Status};
+
+pub const COMPUTE_DRIVER_ANNOTATION: &str = "internal.openshell.ai/compute-driver";
+pub const COMPUTE_RUNTIME_IDENTITY_ANNOTATION: &str =
+    "internal.openshell.ai/compute-runtime-identity";
 #[cfg(unix)]
 use tower::service_fn;
 use tracing::{Instrument as _, debug, info, warn};
@@ -782,7 +786,10 @@ impl ComputeRuntime {
         self.driver_info.supports_sandbox_authentication
     }
 
-    pub(crate) async fn authenticate_sandbox(&self, credential: &str) -> Result<String, Status> {
+    pub(crate) async fn authenticate_sandbox(
+        &self,
+        credential: &str,
+    ) -> Result<openshell_core::proto::compute::v1::AuthenticateSandboxResponse, Status> {
         if !self.supports_sandbox_authentication() {
             return Err(Status::unimplemented(
                 "selected compute driver does not authenticate sandbox credentials",
@@ -798,7 +805,7 @@ impl ComputeRuntime {
                 |driver| async move { driver.authenticate_sandbox(Request::new(request)).await },
             )
             .await
-            .map(|response| response.into_inner().sandbox_id)
+            .map(tonic::Response::into_inner)
     }
 
     #[must_use]
@@ -983,17 +990,46 @@ impl ComputeRuntime {
             )
             .await
         {
-            Ok(_) => {
+            Ok(response) => {
+                let runtime_identity = response.into_inner().runtime_identity;
+                if self.supports_sandbox_authentication() && runtime_identity.is_empty() {
+                    return Err(Status::internal(
+                        "compute driver did not return a runtime identity",
+                    ));
+                }
                 // The driver now owns the staged archive and removes the
                 // request directory once it has built the disk. Every other
                 // arm lets the guard drop and clean up.
                 if let Some(staged) = staged.as_mut() {
                     staged.disarm();
                 }
-                self.sandbox_watch_bus.notify(sandbox.object_id());
-                if let Some(metadata) = sandbox.metadata.as_mut() {
+                if self.supports_sandbox_authentication() {
+                    let driver_name = self.configured_driver_name().to_string();
+                    sandbox = self
+                        .store
+                        .update_message_cas::<Sandbox, _>(&sandbox_id, 0, move |sandbox| {
+                            if let Some(metadata) = sandbox.metadata.as_mut() {
+                                metadata.annotations.insert(
+                                    COMPUTE_DRIVER_ANNOTATION.to_string(),
+                                    driver_name.clone(),
+                                );
+                                metadata.annotations.insert(
+                                    COMPUTE_RUNTIME_IDENTITY_ANNOTATION.to_string(),
+                                    runtime_identity.clone(),
+                                );
+                            }
+                        })
+                        .await
+                        .map_err(|error| {
+                            Status::internal(format!(
+                                "persist compute runtime identity failed: {error}"
+                            ))
+                        })?;
+                } else if let Some(metadata) = sandbox.metadata.as_mut() {
                     metadata.resource_version = result.resource_version;
                 }
+                self.sandbox_index.update_from_sandbox(&sandbox);
+                self.sandbox_watch_bus.notify(sandbox.object_id());
                 Ok(sandbox)
             }
             Err(status) if status.code() == Code::AlreadyExists => {
@@ -1461,9 +1497,13 @@ impl ComputeRuntime {
                                     sandbox: Some(driver_sandbox),
                                 }))
                                 .await
-                                .map(|_| {
+                                .map(|response| {
                                     tonic::Response::new(
-                                        openshell_core::proto::compute::v1::StartSandboxResponse {},
+                                        openshell_core::proto::compute::v1::StartSandboxResponse {
+                                            runtime_identity: response
+                                                .into_inner()
+                                                .runtime_identity,
+                                        },
                                     )
                                 })
                         },
@@ -1473,14 +1513,44 @@ impl ComputeRuntime {
         }
 
         match result {
-            Ok(_) => {
+            Ok(response) => {
                 let _global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
-                let latest = self
-                    .store
-                    .get_message::<Sandbox>(&sandbox_id)
-                    .await
-                    .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-                    .ok_or_else(|| Status::not_found("sandbox not found"))?;
+                let runtime_identity = response.into_inner().runtime_identity;
+                if self.supports_sandbox_authentication() && runtime_identity.is_empty() {
+                    return Err(Status::internal(
+                        "compute driver did not return a runtime identity",
+                    ));
+                }
+                let latest = if self.supports_sandbox_authentication() {
+                    let driver_name = self.configured_driver_name().to_string();
+                    self.store
+                        .update_message_cas::<Sandbox, _>(&sandbox_id, 0, move |sandbox| {
+                            if let Some(metadata) = sandbox.metadata.as_mut() {
+                                metadata.annotations.insert(
+                                    COMPUTE_DRIVER_ANNOTATION.to_string(),
+                                    driver_name.clone(),
+                                );
+                                metadata.annotations.insert(
+                                    COMPUTE_RUNTIME_IDENTITY_ANNOTATION.to_string(),
+                                    runtime_identity.clone(),
+                                );
+                            }
+                        })
+                        .await
+                        .map_err(|error| {
+                            Status::internal(format!(
+                                "persist compute runtime identity failed: {error}"
+                            ))
+                        })?
+                } else {
+                    self.store
+                        .get_message::<Sandbox>(&sandbox_id)
+                        .await
+                        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                        .ok_or_else(|| Status::not_found("sandbox not found"))?
+                };
+                self.sandbox_index.update_from_sandbox(&latest);
+                self.sandbox_watch_bus.notify(&sandbox_id);
                 Ok(latest)
             }
             Err(err) => {
@@ -5355,7 +5425,7 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
 #[derive(Debug)]
 pub struct NoopTestDriver {
     workspace_delete_failures: std::sync::atomic::AtomicUsize,
-    sandbox_authentication: Option<Result<String, (Code, String)>>,
+    sandbox_authentication: Option<Result<(String, String), (Code, String)>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -5372,7 +5442,18 @@ impl NoopTestDriver {
     pub fn authenticating_sandbox(sandbox_id: impl Into<String>) -> Self {
         Self {
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
-            sandbox_authentication: Some(Ok(sandbox_id.into())),
+            sandbox_authentication: Some(Ok((sandbox_id.into(), "test-runtime".to_string()))),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn authenticating_sandbox_with_runtime(
+        sandbox_id: impl Into<String>,
+        runtime_identity: impl Into<String>,
+    ) -> Self {
+        Self {
+            workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
+            sandbox_authentication: Some(Ok((sandbox_id.into(), runtime_identity.into()))),
         }
     }
 
@@ -5406,9 +5487,10 @@ impl ComputeDriver for NoopTestDriver {
         Status,
     > {
         match &self.sandbox_authentication {
-            Some(Ok(sandbox_id)) => Ok(tonic::Response::new(
+            Some(Ok((sandbox_id, runtime_identity))) => Ok(tonic::Response::new(
                 openshell_core::proto::compute::v1::AuthenticateSandboxResponse {
                     sandbox_id: sandbox_id.clone(),
+                    runtime_identity: runtime_identity.clone(),
                 },
             )),
             Some(Err((code, message))) => Err(Status::new(*code, message.clone())),
@@ -5484,7 +5566,15 @@ impl ComputeDriver for NoopTestDriver {
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::CreateSandboxResponse>, Status>
     {
         Ok(tonic::Response::new(
-            openshell_core::proto::compute::v1::CreateSandboxResponse {},
+            openshell_core::proto::compute::v1::CreateSandboxResponse {
+                runtime_identity: self
+                    .sandbox_authentication
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .map_or_else(String::new, |(_, runtime_identity)| {
+                        runtime_identity.clone()
+                    }),
+            },
         ))
     }
 
@@ -5504,7 +5594,15 @@ impl ComputeDriver for NoopTestDriver {
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::StartSandboxResponse>, Status>
     {
         Ok(tonic::Response::new(
-            openshell_core::proto::compute::v1::StartSandboxResponse {},
+            openshell_core::proto::compute::v1::StartSandboxResponse {
+                runtime_identity: self
+                    .sandbox_authentication
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .map_or_else(String::new, |(_, runtime_identity)| {
+                        runtime_identity.clone()
+                    }),
+            },
         ))
     }
 
@@ -6077,7 +6175,7 @@ mod tests {
             &self,
             _request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
-            Ok(tonic::Response::new(CreateSandboxResponse {}))
+            Ok(tonic::Response::new(CreateSandboxResponse::default()))
         }
 
         async fn stop_sandbox(
@@ -6091,7 +6189,7 @@ mod tests {
             &self,
             _request: Request<StartSandboxRequest>,
         ) -> Result<tonic::Response<StartSandboxResponse>, Status> {
-            Ok(tonic::Response::new(StartSandboxResponse {}))
+            Ok(tonic::Response::new(StartSandboxResponse::default()))
         }
 
         async fn delete_sandbox(
@@ -6425,7 +6523,7 @@ mod tests {
             &self,
             _request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
-            Ok(tonic::Response::new(CreateSandboxResponse {}))
+            Ok(tonic::Response::new(CreateSandboxResponse::default()))
         }
 
         async fn stop_sandbox(
@@ -6488,7 +6586,9 @@ mod tests {
                 .expect("start outcome lock poisoned")
                 .clone();
             match outcome {
-                ControlledLifecycleOutcome::Ok => Ok(tonic::Response::new(StartSandboxResponse {})),
+                ControlledLifecycleOutcome::Ok => {
+                    Ok(tonic::Response::new(StartSandboxResponse::default()))
+                }
                 ControlledLifecycleOutcome::NotFound => Err(Status::not_found("sandbox not found")),
                 ControlledLifecycleOutcome::Error(message) => Err(Status::internal(message)),
             }

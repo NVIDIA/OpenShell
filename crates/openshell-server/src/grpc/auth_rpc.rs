@@ -75,7 +75,11 @@ pub async fn handle_issue_sandbox_token(
 
     // Only a selected compute driver may establish the bootstrap sandbox
     // identity. Sandboxes already holding a gateway JWT use refresh instead.
-    if !matches!(sandbox.source, SandboxIdentitySource::ComputeDriver { .. }) {
+    let SandboxIdentitySource::ComputeDriver {
+        driver_name,
+        runtime_identity,
+    } = &sandbox.source
+    else {
         debug!(
             sandbox_id = %sandbox.sandbox_id,
             "IssueSandboxToken rejected: non-bootstrap principal source"
@@ -83,7 +87,7 @@ pub async fn handle_issue_sandbox_token(
         return Err(Status::permission_denied(
             "this principal cannot mint a sandbox token; use RefreshSandboxToken",
         ));
-    }
+    };
 
     let issuer = state.sandbox_jwt_issuer.as_ref().ok_or_else(|| {
         warn!(
@@ -93,7 +97,27 @@ pub async fn handle_issue_sandbox_token(
         Status::unavailable("sandbox JWT minting is not configured on this gateway")
     })?;
 
-    let _ = ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
+    let sandbox_record = ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
+    let metadata = sandbox_record
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::permission_denied("sandbox runtime identity is unavailable"))?;
+    let expected_driver = metadata
+        .annotations
+        .get(crate::compute::COMPUTE_DRIVER_ANNOTATION);
+    let expected_runtime_identity = metadata
+        .annotations
+        .get(crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION);
+    if expected_driver != Some(driver_name) || expected_runtime_identity != Some(runtime_identity) {
+        warn!(
+            sandbox_id = %sandbox.sandbox_id,
+            driver_name,
+            "IssueSandboxToken rejected: compute runtime identity mismatch"
+        );
+        return Err(Status::permission_denied(
+            "compute runtime identity does not match the sandbox",
+        ));
+    }
 
     let minted = issuer.mint(&sandbox.sandbox_id)?;
     info!(
@@ -484,6 +508,15 @@ mod tests {
             ..Default::default()
         };
         identity.write(&mut sandbox.metadata.as_mut().expect("metadata").annotations);
+        let annotations = &mut sandbox.metadata.as_mut().expect("metadata").annotations;
+        annotations.insert(
+            crate::compute::COMPUTE_DRIVER_ANNOTATION.to_string(),
+            "kubernetes".to_string(),
+        );
+        annotations.insert(
+            crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION.to_string(),
+            "test-runtime".to_string(),
+        );
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
     }
@@ -776,6 +809,7 @@ mod tests {
                 sandbox_id: "sandbox-a".to_string(),
                 source: SandboxIdentitySource::ComputeDriver {
                     driver_name: "kubernetes".to_string(),
+                    runtime_identity: "test-runtime".to_string(),
                 },
                 trust_domain: Some("openshell".to_string()),
             }));
@@ -785,6 +819,28 @@ mod tests {
             .into_inner();
         assert!(!resp.token.is_empty());
         assert!(resp.expiration_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn issue_rejects_mismatched_compute_runtime_identity() {
+        use crate::auth::principal::SandboxIdentitySource;
+
+        let state = state_with_issuer().await;
+        let mut req = Request::new(IssueSandboxTokenRequest {});
+        req.extensions_mut()
+            .insert(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: "sandbox-a".to_string(),
+                source: SandboxIdentitySource::ComputeDriver {
+                    driver_name: "kubernetes".to_string(),
+                    runtime_identity: "replacement-runtime".to_string(),
+                },
+                trust_domain: Some("openshell".to_string()),
+            }));
+
+        let err = handle_issue_sandbox_token(&state, req)
+            .await
+            .expect_err("mismatched runtime must not receive a token");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
@@ -798,6 +854,7 @@ mod tests {
                 sandbox_id: "sandbox-deleted".to_string(),
                 source: SandboxIdentitySource::ComputeDriver {
                     driver_name: "kubernetes".to_string(),
+                    runtime_identity: "test-runtime".to_string(),
                 },
                 trust_domain: Some("openshell".to_string()),
             }));
@@ -844,6 +901,7 @@ mod tests {
                 sandbox_id: "sandbox-a".to_string(),
                 source: SandboxIdentitySource::ComputeDriver {
                     driver_name: "kubernetes".to_string(),
+                    runtime_identity: "test-runtime".to_string(),
                 },
                 trust_domain: Some("openshell".to_string()),
             }));

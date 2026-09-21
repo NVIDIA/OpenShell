@@ -110,7 +110,7 @@ impl ComputeDriver for ComputeDriverService {
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.backend.create_sandbox(&sandbox).await?;
-        Ok(Response::new(CreateSandboxResponse {}))
+        Ok(Response::new(CreateSandboxResponse::default()))
     }
 
     async fn stop_sandbox(

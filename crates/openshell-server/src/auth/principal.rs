@@ -83,6 +83,10 @@ pub enum SandboxIdentitySource {
     BootstrapCert { fingerprint: String },
     /// Driver-native credential used to bootstrap a gateway-minted JWT via
     /// `IssueSandboxToken`. The named compute driver authenticated only the
-    /// sandbox identity; the gateway still authorizes the exchange.
-    ComputeDriver { driver_name: String },
+    /// sandbox identity and its concrete runtime binding; the gateway still
+    /// authorizes the exchange against the binding recorded at creation.
+    ComputeDriver {
+        driver_name: String,
+        runtime_identity: String,
+    },
 }
