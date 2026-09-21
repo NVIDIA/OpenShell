@@ -1,0 +1,196 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Upgrade OpenShell Debian package while preserving state
+  hosts: all
+  gather_facts: false
+  vars:
+    upgrade_sandbox: tmachine-upgrade-existing
+    post_upgrade_sandbox: tmachine-upgrade-new
+    user_systemd_environment:
+      XDG_RUNTIME_DIR: /run/user/1000
+      DBUS_SESSION_BUS_ADDRESS: unix:path=/run/user/1000/bus
+  tasks:
+    - name: Exercise prerelease baseline and upgrade candidate
+      block:
+        - name: Read expected source package version
+          become: true
+          ansible.builtin.slurp:
+            src: /var/lib/openshell-qualification/upgrade-source-version
+          register: upgrade_source_version_file
+
+        - name: Record expected source package version
+          ansible.builtin.set_fact:
+            upgrade_source_version: "{{ upgrade_source_version_file.content | b64decode | trim }}"
+
+        - name: Read installed source package version
+          ansible.builtin.command:
+            argv: [dpkg-query, --show, "--showformat=${Version}", openshell]
+          register: installed_source_version
+          changed_when: false
+
+        - name: Require exact prerelease source package
+          ansible.builtin.assert:
+            that: installed_source_version.stdout == upgrade_source_version
+            fail_msg: >-
+              Expected prerelease source {{ upgrade_source_version }}, found
+              {{ installed_source_version.stdout }}.
+
+        - name: Check source gateway status
+          ansible.builtin.command:
+            argv: [openshell, status]
+          changed_when: false
+
+        - name: Remove stale upgrade sandboxes
+          ansible.builtin.command:
+            argv: [openshell, sandbox, delete, "{{ item }}"]
+          loop: ["{{ upgrade_sandbox }}", "{{ post_upgrade_sandbox }}"]
+          failed_when: false
+          changed_when: false
+
+        - name: Create source sandbox
+          ansible.builtin.command:
+            argv: [openshell, sandbox, create, --name, "{{ upgrade_sandbox }}", --detach]
+
+        - name: Write marker in source sandbox
+          ansible.builtin.command:
+            argv:
+              - openshell
+              - sandbox
+              - exec
+              - --name
+              - "{{ upgrade_sandbox }}"
+              - --no-tty
+              - --
+              - sh
+              - -c
+              - "printf 'survived-upgrade\\n' > /tmp/openshell-upgrade-marker"
+
+        - name: Copy candidate Debian package
+          become: true
+          ansible.builtin.copy:
+            src: "{{ openshell_deb }}"
+            dest: /var/tmp/openshell-upgrade-target.deb
+            mode: "0644"
+
+        - name: Copy candidate runtime images
+          become: true
+          ansible.builtin.copy:
+            src: "{{ item.src }}"
+            dest: "/var/tmp/{{ item.name }}.tar"
+            mode: "0644"
+          loop:
+            - { name: openshell-sandbox-upgrade-target, src: "{{ openshell_sandbox_image }}" }
+            - { name: openshell-supervisor-upgrade-target, src: "{{ openshell_supervisor_image }}" }
+
+        - name: Load candidate runtime images
+          become: true
+          ansible.builtin.command:
+            argv: [docker, load, --input, "/var/tmp/{{ item }}.tar"]
+          loop: [openshell-sandbox-upgrade-target, openshell-supervisor-upgrade-target]
+
+        - name: Install candidate Debian package with APT
+          become: true
+          ansible.builtin.apt:
+            deb: /var/tmp/openshell-upgrade-target.deb
+            allow_downgrade: true
+
+        - name: Restart packaged OpenShell gateway service
+          ansible.builtin.systemd_service:
+            name: openshell-gateway.service
+            scope: user
+            daemon_reload: true
+            state: restarted
+          environment: "{{ user_systemd_environment }}"
+
+        - name: Wait for upgraded OpenShell gateway
+          ansible.builtin.wait_for:
+            host: 127.0.0.1
+            port: 17670
+            timeout: 60
+
+        - name: Read installed target package version
+          ansible.builtin.command:
+            argv: [dpkg-query, --show, "--showformat=${Version}", openshell]
+          register: installed_target_version
+          changed_when: false
+
+        - name: Require package version to change
+          ansible.builtin.assert:
+            that: installed_target_version.stdout != upgrade_source_version
+            fail_msg: >-
+              Candidate package did not replace prerelease source
+              {{ upgrade_source_version }}.
+
+        - name: Wait for upgraded gateway status
+          ansible.builtin.command:
+            argv: [openshell, status]
+          register: upgraded_gateway_status
+          retries: 30
+          delay: 1
+          until: upgraded_gateway_status.rc == 0
+          changed_when: false
+
+        - name: Read marker from source sandbox after upgrade
+          ansible.builtin.command:
+            argv:
+              - openshell
+              - sandbox
+              - exec
+              - --name
+              - "{{ upgrade_sandbox }}"
+              - --no-tty
+              - --
+              - cat
+              - /tmp/openshell-upgrade-marker
+          register: upgrade_marker
+          changed_when: false
+
+        - name: Require source sandbox marker to survive
+          ansible.builtin.assert:
+            that: upgrade_marker.stdout | trim == 'survived-upgrade'
+
+        - name: Create sandbox with upgraded gateway
+          ansible.builtin.command:
+            argv: [openshell, sandbox, create, --name, "{{ post_upgrade_sandbox }}", --detach]
+
+        - name: Execute in sandbox created after upgrade
+          ansible.builtin.command:
+            argv: [openshell, sandbox, exec, --name, "{{ post_upgrade_sandbox }}", --no-tty, --, "true"]
+
+      rescue:
+        - name: Collect Debian upgrade diagnostics
+          ansible.builtin.shell: |
+            set +e
+            dpkg-query --show --showformat='${Package} ${Version}\n' openshell
+            openshell --version
+            openshell status
+            openshell sandbox list --all-workspaces
+            systemctl --user status openshell-gateway.service --no-pager
+            journalctl --user -u openshell-gateway.service --no-pager -n 200
+            sudo docker ps -a
+            sudo docker images
+            sudo cat /var/lib/openshell-qualification/gateway.toml
+          args:
+            executable: /bin/bash
+          environment: "{{ user_systemd_environment }}"
+          register: upgrade_diagnostics
+          changed_when: false
+          failed_when: false
+
+        - name: Show Debian upgrade diagnostics
+          ansible.builtin.debug:
+            var: upgrade_diagnostics.stdout_lines
+
+        - name: Fail Debian upgrade test
+          ansible.builtin.fail:
+            msg: Ubuntu Debian package upgrade test failed.
+
+      always:
+        - name: Delete upgrade test sandboxes
+          ansible.builtin.command:
+            argv: [openshell, sandbox, delete, "{{ item }}"]
+          loop: ["{{ post_upgrade_sandbox }}", "{{ upgrade_sandbox }}"]
+          failed_when: false
+          changed_when: false
