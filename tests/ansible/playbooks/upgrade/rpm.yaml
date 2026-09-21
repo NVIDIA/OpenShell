@@ -1,0 +1,239 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Upgrade OpenShell RPM packages while preserving state
+  hosts: all
+  gather_facts: false
+  vars:
+    upgrade_sandbox: tmachine-upgrade-existing
+    post_upgrade_sandbox: tmachine-upgrade-new
+    user_systemd_environment:
+      HOME: /home/tmachine
+      XDG_RUNTIME_DIR: /run/user/1000
+      DBUS_SESSION_BUS_ADDRESS: unix:path=/run/user/1000/bus
+  tasks:
+    - name: Exercise prerelease baseline and RPM upgrade candidate
+      block:
+        - name: Read expected source package versions
+          become: true
+          ansible.builtin.slurp:
+            src: /var/lib/openshell-qualification/upgrade-source-versions
+          register: upgrade_source_versions_file
+
+        - name: Record expected source package versions
+          ansible.builtin.set_fact:
+            upgrade_source_versions: "{{ upgrade_source_versions_file.content | b64decode | trim }}"
+
+        - name: Read installed source package versions
+          ansible.builtin.command:
+            argv:
+              - rpm
+              - --query
+              - --queryformat
+              - "%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n"
+              - openshell
+              - openshell-gateway
+          register: installed_source_versions
+          changed_when: false
+
+        - name: Require exact prerelease source packages
+          ansible.builtin.assert:
+            that: installed_source_versions.stdout | trim == upgrade_source_versions
+            fail_msg: >-
+              Expected prerelease source packages {{ upgrade_source_versions }},
+              found {{ installed_source_versions.stdout | trim }}.
+
+        - name: Check source gateway status
+          ansible.builtin.command:
+            argv: [openshell, status]
+          changed_when: false
+
+        - name: Remove stale upgrade sandboxes
+          ansible.builtin.command:
+            argv: [openshell, sandbox, delete, "{{ item }}"]
+          loop: ["{{ upgrade_sandbox }}", "{{ post_upgrade_sandbox }}"]
+          failed_when: false
+          changed_when: false
+
+        - name: Create source sandbox
+          ansible.builtin.command:
+            argv: [openshell, sandbox, create, --name, "{{ upgrade_sandbox }}", --detach]
+
+        - name: Write marker in source sandbox
+          ansible.builtin.command:
+            argv:
+              - openshell
+              - sandbox
+              - exec
+              - --name
+              - "{{ upgrade_sandbox }}"
+              - --no-tty
+              - --
+              - sh
+              - -c
+              - "printf 'survived-upgrade\\n' > /tmp/openshell-upgrade-marker"
+
+        - name: Copy candidate RPM packages
+          become: true
+          ansible.builtin.copy:
+            src: "{{ item.src }}"
+            dest: "/var/tmp/{{ item.name }}.rpm"
+            mode: "0644"
+          loop:
+            - { name: openshell-upgrade-target, src: "{{ openshell_rpm }}" }
+            - { name: openshell-gateway-upgrade-target, src: "{{ openshell_gateway_rpm }}" }
+
+        - name: Read candidate RPM package versions
+          ansible.builtin.command:
+            argv:
+              - rpm
+              - --query
+              - --package
+              - --queryformat
+              - "%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n"
+              - /var/tmp/openshell-upgrade-target.rpm
+              - /var/tmp/openshell-gateway-upgrade-target.rpm
+          register: candidate_package_versions
+          changed_when: false
+
+        - name: Require candidate RPM packages to replace source packages
+          ansible.builtin.assert:
+            that: candidate_package_versions.stdout | trim != upgrade_source_versions
+            fail_msg: Candidate RPM versions match the retained prerelease source.
+
+        - name: Copy candidate runtime images
+          become: true
+          ansible.builtin.copy:
+            src: "{{ item.src }}"
+            dest: "/var/tmp/{{ item.name }}.tar"
+            owner: tmachine
+            group: tmachine
+            mode: "0600"
+          loop:
+            - { name: openshell-sandbox-upgrade-target, src: "{{ openshell_sandbox_image }}" }
+            - { name: openshell-supervisor-upgrade-target, src: "{{ openshell_supervisor_image }}" }
+
+        - name: Load candidate runtime images
+          become: true
+          become_user: tmachine
+          ansible.builtin.command:
+            argv: [podman, load, --input, "/var/tmp/{{ item }}.tar"]
+          loop: [openshell-sandbox-upgrade-target, openshell-supervisor-upgrade-target]
+          environment: "{{ user_systemd_environment }}"
+
+        - name: Install candidate RPM packages with DNF
+          become: true
+          ansible.builtin.dnf:
+            name:
+              - /var/tmp/openshell-upgrade-target.rpm
+              - /var/tmp/openshell-gateway-upgrade-target.rpm
+            state: present
+            disable_gpg_check: true
+            allow_downgrade: true
+
+        - name: Restart packaged OpenShell gateway service
+          ansible.builtin.systemd_service:
+            name: openshell-gateway.service
+            scope: user
+            daemon_reload: true
+            state: restarted
+          environment: "{{ user_systemd_environment }}"
+
+        - name: Wait for upgraded OpenShell gateway
+          ansible.builtin.wait_for:
+            host: 127.0.0.1
+            port: 17670
+            timeout: 60
+
+        - name: Read installed target package versions
+          ansible.builtin.command:
+            argv:
+              - rpm
+              - --query
+              - --queryformat
+              - "%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n"
+              - openshell
+              - openshell-gateway
+          register: installed_target_versions
+          changed_when: false
+
+        - name: Require exact candidate RPM packages
+          ansible.builtin.assert:
+            that: installed_target_versions.stdout | trim == candidate_package_versions.stdout | trim
+            fail_msg: >-
+              Candidate packages {{ candidate_package_versions.stdout | trim }}
+              did not replace source packages; installed
+              {{ installed_target_versions.stdout | trim }}.
+
+        - name: Wait for upgraded gateway status
+          ansible.builtin.command:
+            argv: [openshell, status]
+          register: upgraded_gateway_status
+          retries: 30
+          delay: 1
+          until: upgraded_gateway_status.rc == 0
+          changed_when: false
+
+        - name: Read marker from source sandbox after upgrade
+          ansible.builtin.command:
+            argv:
+              - openshell
+              - sandbox
+              - exec
+              - --name
+              - "{{ upgrade_sandbox }}"
+              - --no-tty
+              - --
+              - cat
+              - /tmp/openshell-upgrade-marker
+          register: upgrade_marker
+          changed_when: false
+
+        - name: Require source sandbox marker to survive
+          ansible.builtin.assert:
+            that: upgrade_marker.stdout | trim == 'survived-upgrade'
+
+        - name: Create sandbox with upgraded gateway
+          ansible.builtin.command:
+            argv: [openshell, sandbox, create, --name, "{{ post_upgrade_sandbox }}", --detach]
+
+        - name: Execute in sandbox created after upgrade
+          ansible.builtin.command:
+            argv: [openshell, sandbox, exec, --name, "{{ post_upgrade_sandbox }}", --no-tty, --, "true"]
+
+      rescue:
+        - name: Collect RPM upgrade diagnostics
+          ansible.builtin.shell: |
+            set +e
+            rpm --query --queryformat '%{NAME} %{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' openshell openshell-gateway
+            openshell --version
+            openshell status
+            openshell sandbox list --all-workspaces
+            systemctl --user status openshell-gateway.service --no-pager
+            journalctl --user -u openshell-gateway.service --no-pager -n 200
+            podman ps -a
+            podman images
+            sudo cat /var/lib/openshell-qualification/gateway.toml
+          args:
+            executable: /bin/bash
+          environment: "{{ user_systemd_environment }}"
+          register: upgrade_diagnostics
+          changed_when: false
+          failed_when: false
+
+        - name: Show RPM upgrade diagnostics
+          ansible.builtin.debug:
+            var: upgrade_diagnostics.stdout_lines
+
+        - name: Fail RPM upgrade test
+          ansible.builtin.fail:
+            msg: Fedora RPM package upgrade test failed.
+
+      always:
+        - name: Delete upgrade test sandboxes
+          ansible.builtin.command:
+            argv: [openshell, sandbox, delete, "{{ item }}"]
+          loop: ["{{ post_upgrade_sandbox }}", "{{ upgrade_sandbox }}"]
+          failed_when: false
+          changed_when: false
