@@ -843,6 +843,27 @@ impl OpenShell for OpenShellService {
     ) -> Result<Response<Self::PeerRelayStream>, Status> {
         crate::supervisor_session::handle_peer_relay(&self.state, request).await
     }
+
+    async fn peer_report_provider_readiness(
+        &self,
+        request: Request<ReportProviderReadinessRequest>,
+    ) -> Result<Response<ReportProviderReadinessResponse>, Status> {
+        provider_readiness::handle_peer_report_provider_readiness(&self.state, request).await
+    }
+
+    async fn peer_report_endpoint_status(
+        &self,
+        request: Request<ReportEndpointStatusRequest>,
+    ) -> Result<Response<ReportEndpointStatusResponse>, Status> {
+        policy::handle_peer_report_endpoint_status(&self.state, request).await
+    }
+
+    async fn peer_get_sandbox_provider_status(
+        &self,
+        request: Request<GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
+        provider_readiness::handle_peer_get_sandbox_provider_status(&self.state, request).await
+    }
 }
 
 fn public_resource_capabilities(

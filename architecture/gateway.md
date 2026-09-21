@@ -378,6 +378,11 @@ the serving gateway retries ownership lookup until the normal relay wait
 deadline. Each retry re-reads the owner record, so a supervisor reconnect or
 heartbeat can surface a new owner; if no fresh reachable owner appears before
 the deadline, the client operation fails rather than electing an owner itself.
+Provider-readiness reports, endpoint-status reports, and provider-status reads
+also follow the durable owner record through unary peer RPCs. The owning replica
+validates the current supervisor session and keeps the in-memory evidence; a
+non-owner never accepts evidence from a stale local session or projects a
+remote session as disconnected.
 
 Nothing redistributes established sessions, so after a rolling restart the last
 surviving replica holds most sessions and a new replica serves none until
@@ -393,7 +398,7 @@ Gateway peer RPCs authenticate with Kubernetes ServiceAccount identity rather
 than a shared secret. Helm mounts a projected, pod-bound token with audience
 `openshell-gateway-peer`; the receiving gateway validates it through
 TokenReview, checks the live pod UID and chart selector labels, and authorizes
-only the internal peer relay method. When gateway TLS is enabled, peer clients
+only the internal peer RPC methods. When gateway TLS is enabled, peer clients
 also trust the chart CA, present the chart-generated client certificate for
 mTLS, and verify the stable gateway Service DNS name even when connecting to a
 Deployment pod IP.
@@ -867,7 +872,13 @@ Provider receipts, installation status, and common operations represent absolute
 
 Provider installation reports belong to the existing `ConnectSupervisor` session. Each report names that session, has an increasing sequence, and expires unless the supervisor reports again. Reconnection or disconnect invalidates prior observations; stored change records survive a gateway restart, but runtime evidence does not. Replaying an identical report cannot extend its lifetime.
 
-Reports and status also compare the supervisor instance with the sandbox's persisted current instance. A different supervisor becoming current invalidates an older connection, including one retained by another gateway replica. Observations stay local to the gateway holding the supervisor session; a status request reaching a replica without that session returns pending. Multi-replica deployments therefore retain the existing supervisor-session routing requirement.
+Reports and status also compare the supervisor instance with the sandbox's
+persisted current instance. A different supervisor becoming current invalidates
+an older connection, including one retained by another gateway replica.
+Observations stay local to the gateway holding the supervisor session. A status
+request or report reaching another replica follows the shared owner record to
+that gateway, which remains the sole authority for accepting and projecting the
+session's evidence.
 
 The supervisor reports success only after it installs the matching credentials, activates the effective policy, and receives an acknowledgment from the authenticated workload boundary that it installed the environment for future processes. Environment synchronization shares the process-launch lock, and its acknowledgment identifies the exact publication, including retries at the same provider revision. Failed policy installation cannot reuse evidence for a different installed policy. Ready and revoked statuses also recheck the requested sandbox, provider, attachment and configuration identities; revision fingerprints are compared only for equality. Revocation applies to future credential resolution and future processes. Requests already forwarded upstream can still finish.
 

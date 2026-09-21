@@ -119,7 +119,7 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "567f060e7b4f5ead636817ee7c41728688b39de16d2ef00396d1b562bdb83045";
+        "60ae9faddbc4e8ebb7e22d8aa61cdb8362d4cb7ac8602e2bbc178080fdf566ec";
     const DURABLE_SCHEMA_SHA256: &str =
         "9eeaa29dfba187bff69fb7bc4f9a13a0f1d7be3f7049a38c8f0e20ce77ec7d8b";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -157,6 +157,11 @@ mod tests {
     const PROVIDER_READINESS_RPC_SIGNATURES: [&str; 2] = [
         "openshell.v1.OpenShell/GetSandboxProviderStatus|.openshell.v1.GetSandboxProviderStatusRequest|.openshell.v1.GetSandboxProviderStatusResponse|false|false",
         "openshell.v1.OpenShell/ReportProviderReadiness|.openshell.v1.ReportProviderReadinessRequest|.openshell.v1.ReportProviderReadinessResponse|false|false",
+    ];
+    const PEER_OWNER_RPC_SIGNATURES: [&str; 3] = [
+        "openshell.v1.OpenShell/PeerGetSandboxProviderStatus|.openshell.v1.GetSandboxProviderStatusRequest|.openshell.v1.GetSandboxProviderStatusResponse|false|false",
+        "openshell.v1.OpenShell/PeerReportEndpointStatus|.openshell.v1.ReportEndpointStatusRequest|.openshell.v1.ReportEndpointStatusResponse|false|false",
+        "openshell.v1.OpenShell/PeerReportProviderReadiness|.openshell.v1.ReportProviderReadinessRequest|.openshell.v1.ReportProviderReadinessResponse|false|false",
     ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.
@@ -516,14 +521,20 @@ mod tests {
                 "provider readiness RPC is missing or changed: {signature}"
             );
         }
+        for signature in PEER_OWNER_RPC_SIGNATURES {
+            assert!(
+                methods.iter().any(|method| method == signature),
+                "peer owner RPC is missing or changed: {signature}"
+            );
+        }
         assert_eq!(
             compiled_method_count,
-            102 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
+            102 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            77 + PROVIDER_READINESS_RPC_SIGNATURES.len(),
+            77 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -531,7 +542,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            77 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            77 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 

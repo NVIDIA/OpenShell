@@ -449,19 +449,30 @@ async fn proxy_to_endpoint(
 
     let upstream = build_upstream_request(req, target_port, websocket_upgrade)?;
     let replay = reused.then(|| replayable_request(&upstream)).flatten();
-    let mut response = match sender.send_request(upstream).await {
+    let first_attempt = if reused {
+        sender.try_send_request(upstream).await.map_err(|mut err| {
+            let request = err.take_message();
+            (err.into_error(), request)
+        })
+    } else {
+        sender
+            .send_request(upstream)
+            .await
+            .map_err(|err| (err, None))
+    };
+    let mut response = match first_attempt {
         Ok(response) => response,
-        Err(err) => {
+        Err((err, recovered)) => {
             warn!(error = %err, "sandbox service routing: upstream HTTP request failed");
             state.service_upstreams.evict(&pool_key);
-            let Some(replay) = replay else {
+            let Some(retry_request) = recovered.or(replay) else {
                 let route_err = ServiceRouteError::service_unreachable();
                 emit_service_relay_failure(&endpoint, target_port, route_err.reason);
                 return Err(route_err);
             };
             sender =
                 open_upstream(&state, &sandbox, &endpoint, target_port, websocket_upgrade).await?;
-            sender.send_request(replay).await.map_err(|err| {
+            sender.send_request(retry_request).await.map_err(|err| {
                 warn!(error = %err, "sandbox service routing: upstream HTTP retry failed");
                 let route_err = ServiceRouteError::service_unreachable();
                 emit_service_relay_failure(&endpoint, target_port, route_err.reason);
@@ -1502,6 +1513,27 @@ mod tests {
             pool.take("ep-a|8080").is_none(),
             "a closed upstream must never be reused"
         );
+    }
+
+    #[tokio::test]
+    async fn closed_upstream_recovers_an_unsent_post_for_retry() {
+        let (mut sender, sandbox) = test_upstream().await;
+        drop(sandbox);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut request = Request::new(Body::from("payload"));
+        *request.method_mut() = Method::POST;
+        *request.uri_mut() = "/write".parse().unwrap();
+        let mut error = sender
+            .try_send_request(request)
+            .await
+            .expect_err("a closed connection must reject the request");
+        let recovered = error
+            .take_message()
+            .expect("an unsent request must be recoverable for a fresh connection");
+
+        assert_eq!(recovered.method(), Method::POST);
+        assert_eq!(recovered.uri().path(), "/write");
     }
 
     #[tokio::test]

@@ -307,6 +307,26 @@ pub(super) async fn handle_get_sandbox_provider_status(
         MinWorkspaceRole::User,
     )
     .await?;
+    if let Some(owner) =
+        crate::supervisor_session::remote_supervisor_owner(state, sandbox.object_id()).await?
+    {
+        let response = crate::supervisor_session::forward_provider_status_query_to_owner(
+            state,
+            &owner,
+            sandbox.object_id(),
+            request,
+        )
+        .await?;
+        return Ok(Response::new(response));
+    }
+    handle_get_sandbox_provider_status_resolved(state, request, sandbox).await
+}
+
+async fn handle_get_sandbox_provider_status_resolved(
+    state: &Arc<ServerState>,
+    request: GetSandboxProviderStatusRequest,
+    sandbox: Sandbox,
+) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
     let workspace = sandbox.object_workspace().to_string();
     // Validate the selector before it can contribute to a durable observation.
     if request.provider.len() > super::MAX_NAME_LEN {
@@ -406,6 +426,31 @@ pub(super) async fn handle_get_sandbox_provider_status(
     Ok(Response::new(GetSandboxProviderStatusResponse {
         status: Some(status),
     }))
+}
+
+pub(super) async fn handle_peer_get_sandbox_provider_status(
+    state: &Arc<ServerState>,
+    request: Request<GetSandboxProviderStatusRequest>,
+) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
+    ensure_peer_request(&request)?;
+    let request = request.into_inner();
+    let workspace =
+        crate::auth::workspace_authz::selected_workspace_name(request.workspace_scope.as_ref())?;
+    if request.sandbox.is_empty() {
+        return Err(Status::invalid_argument("sandbox is required"));
+    }
+    let sandbox = state
+        .store
+        .get_message_by_name::<Sandbox>(workspace, &request.sandbox)
+        .await
+        .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    if !state.supervisor_sessions.has_session(sandbox.object_id()) {
+        return Err(Status::failed_precondition(
+            "gateway peer does not own the sandbox supervisor session",
+        ));
+    }
+    handle_get_sandbox_provider_status_resolved(state, request, sandbox).await
 }
 
 fn observation_matches(
@@ -568,9 +613,33 @@ pub(super) async fn handle_report_provider_readiness(
 ) -> Result<Response<ReportProviderReadinessResponse>, Status> {
     let sandbox_id = request.get_ref().sandbox_id.clone();
     authorize_provider_readiness(&request, &sandbox_id)?;
+    let request = request.into_inner();
+    if let Some(owner) =
+        crate::supervisor_session::remote_supervisor_owner(state, &sandbox_id).await?
+    {
+        let response =
+            crate::supervisor_session::forward_provider_readiness_to_owner(state, &owner, request)
+                .await?;
+        return Ok(Response::new(response));
+    }
+    handle_report_provider_readiness_inner(state, request).await
+}
+
+pub(super) async fn handle_peer_report_provider_readiness(
+    state: &Arc<ServerState>,
+    request: Request<ReportProviderReadinessRequest>,
+) -> Result<Response<ReportProviderReadinessResponse>, Status> {
+    ensure_peer_request(&request)?;
+    handle_report_provider_readiness_inner(state, request.into_inner()).await
+}
+
+async fn handle_report_provider_readiness_inner(
+    state: &Arc<ServerState>,
+    request: ReportProviderReadinessRequest,
+) -> Result<Response<ReportProviderReadinessResponse>, Status> {
+    let sandbox_id = request.sandbox_id.clone();
     canonical_uuid(&sandbox_id)?;
     let observation = request
-        .into_inner()
         .observation
         .ok_or_else(|| Status::invalid_argument("provider readiness observation is required"))?;
     canonical_uuid(&observation.session_id)?;
@@ -613,6 +682,21 @@ pub(super) async fn handle_report_provider_readiness(
             .map_err(|error| Status::internal(format!("create observation TTL: {error}")))?,
         ),
     }))
+}
+
+fn ensure_peer_request<T>(request: &Request<T>) -> Result<(), Status> {
+    if matches!(
+        request
+            .extensions()
+            .get::<crate::auth::principal::Principal>(),
+        Some(crate::auth::principal::Principal::Peer(_))
+    ) {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(
+            "gateway peer principal is required",
+        ))
+    }
 }
 
 #[cfg(test)]

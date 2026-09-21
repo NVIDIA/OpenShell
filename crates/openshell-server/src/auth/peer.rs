@@ -27,6 +27,7 @@ use tonic::Status;
 use tracing::{debug, info, warn};
 
 /// gRPC path for internal gateway relay forwarding.
+#[cfg(test)]
 pub const PEER_RELAY_PATH: &str = "/openshell.v1.OpenShell/PeerRelay";
 /// Audience used for gateway-to-gateway projected `ServiceAccount` tokens.
 pub const DEFAULT_PEER_TOKEN_AUDIENCE: &str = "openshell-gateway-peer";
@@ -88,7 +89,7 @@ impl Authenticator for PeerServiceAccountAuthenticator {
         headers: &http::HeaderMap,
         path: &str,
     ) -> Result<Option<Principal>, Status> {
-        if path != PEER_RELAY_PATH {
+        if !crate::auth::method_authz::is_peer_callable(path) {
             return Ok(None);
         }
 
@@ -696,6 +697,37 @@ mod tests {
         };
         assert_eq!(peer.replica_id, "openshell-0");
         assert_eq!(peer.pod_uid, "uid-a");
+    }
+
+    #[tokio::test]
+    async fn authenticator_accepts_each_peer_rpc_and_ignores_non_peer_rpcs() {
+        let resolver = Arc::new(FakeGatewayPeerResolver::returning(Ok(Some(
+            ResolvedGatewayPeerIdentity {
+                pod_name: "openshell-0".to_string(),
+                pod_uid: "uid-a".to_string(),
+            },
+        ))));
+        let auth = PeerServiceAccountAuthenticator::new(resolver.clone());
+        let headers = bearer_headers("token-a");
+
+        for path in [
+            PEER_RELAY_PATH,
+            "/openshell.v1.OpenShell/PeerReportProviderReadiness",
+            "/openshell.v1.OpenShell/PeerReportEndpointStatus",
+            "/openshell.v1.OpenShell/PeerGetSandboxProviderStatus",
+        ] {
+            assert!(matches!(
+                auth.authenticate(&headers, path).await.unwrap(),
+                Some(Principal::Peer(_))
+            ));
+        }
+        assert!(
+            auth.authenticate(&headers, "/openshell.v1.OpenShell/ListSandboxes")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(resolver.seen_tokens.lock().unwrap().len(), 4);
     }
 
     fn identity() -> ResolvedGatewayPeerIdentity {

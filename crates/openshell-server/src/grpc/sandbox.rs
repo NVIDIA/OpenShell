@@ -1235,7 +1235,10 @@ pub(super) async fn handle_attach_sandbox_provider(
     if let Some(probe) = attach_wait_probe {
         probe.notify_one();
     }
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard =
+        state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire sandbox mutation lock")
+        })?;
     let provider_record = get_provider_record(state.store.as_ref(), &workspace, &request.provider)
         .await
         .map_err(|err| {
@@ -1405,7 +1408,10 @@ pub(super) async fn handle_detach_sandbox_provider(
         )));
     }
 
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard =
+        state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire sandbox mutation lock")
+        })?;
     let sandbox_name = sandbox.object_name().to_string();
     let sandbox_id = sandbox
         .metadata
@@ -1637,9 +1643,13 @@ async fn handle_start_sandbox_inner(
             state.sandbox_session_jwt_authority.as_deref(),
         )
         .await?;
+    let remote_authority =
+        crate::supervisor_session::remote_supervisor_owner(state, sandbox.object_id())
+            .await?
+            .is_some();
     state
         .supervisor_sessions
-        .project_endpoint_status(&mut sandbox);
+        .project_endpoint_status(&mut sandbox, remote_authority);
     info!(sandbox_name = %name, "StartSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),

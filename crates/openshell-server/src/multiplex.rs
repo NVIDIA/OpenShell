@@ -860,7 +860,7 @@ where
 /// Assemble the authenticator chain for the gateway.
 ///
 /// Chain order (first-match-wins):
-/// 1. `PeerServiceAccountAuthenticator` (path-scoped to `PeerRelay`)
+/// 1. `PeerServiceAccountAuthenticator` (path-scoped to peer RPCs)
 ///    — validates gateway replica projected `ServiceAccount` tokens with
 ///    `TokenReview` for internal peer relay calls. No-op on every other path.
 /// 2. `ComputeDriverAuthenticator` (path-scoped to `IssueSandboxToken`)

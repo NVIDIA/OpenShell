@@ -16,9 +16,11 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    GatewayMessage, PeerRelayFrame, PeerRelayInit, ProviderReadinessObservation, RelayFrame,
-    RelayInit, RelayOpen, ReportMainProcessExitRequest, ReportMainProcessExitResponse, Sandbox,
-    SandboxPhase, SessionAccepted, SshRelayTarget, SupervisorMessage, gateway_message,
+    GatewayMessage, GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse,
+    PeerRelayFrame, PeerRelayInit, ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen,
+    ReportEndpointStatusRequest, ReportEndpointStatusResponse, ReportMainProcessExitRequest,
+    ReportMainProcessExitResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
+    Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget, SupervisorMessage, gateway_message,
     open_shell_client, peer_relay_frame, relay_open, supervisor_message,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
@@ -30,6 +32,7 @@ use crate::persistence::ObjectId;
 use crate::supervisor_owner::{OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwnerIndex};
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
+const OWNER_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 /// Initial backoff between session-availability polls in `wait_for_session`.
 const SESSION_WAIT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
@@ -594,7 +597,7 @@ impl SupervisorSessionRegistry {
 
     /// Fail closed when projecting persisted endpoint status without a live,
     /// initialized observation authority in the current gateway process.
-    pub(crate) fn project_endpoint_status(&self, sandbox: &mut Sandbox) {
+    pub(crate) fn project_endpoint_status(&self, sandbox: &mut Sandbox, remote_authority: bool) {
         let sandbox_id = sandbox.object_id();
         let has_authority = self
             .sessions
@@ -602,7 +605,7 @@ impl SupervisorSessionRegistry {
             .unwrap()
             .get(sandbox_id)
             .is_some_and(|session| session.endpoint_status_initialized);
-        if has_authority {
+        if has_authority || remote_authority {
             return;
         }
         let Some(status) = sandbox.status.as_mut() else {
@@ -1215,6 +1218,109 @@ async fn build_peer_channel(endpoint: &str) -> Result<Channel, Status> {
         .map_err(|err| Status::unavailable(format!("gateway peer connection failed: {err}")))
 }
 
+async fn peer_rpc_client(
+    state: &Arc<ServerState>,
+    endpoint: &str,
+) -> Result<
+    open_shell_client::OpenShellClient<
+        tonic::service::interceptor::InterceptedService<Channel, PeerAuthInterceptor>,
+    >,
+    Status,
+> {
+    let token = state.peer_routes.peer_token().await?;
+    let channel = state.peer_routes.channel(endpoint).await?;
+    let interceptor = PeerAuthInterceptor::new(&token, &state.replica_id)?;
+    Ok(open_shell_client::OpenShellClient::with_interceptor(
+        channel,
+        interceptor,
+    ))
+}
+
+pub(crate) async fn remote_supervisor_owner(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+) -> Result<Option<crate::supervisor_owner::OwnerRecord>, Status> {
+    let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+    // Supervisor-bound state must follow the durable owner record. A cached
+    // local owner can remain valid for relay discovery while ownership has
+    // already moved, but it must never authorize a stale local session to
+    // publish readiness or endpoint observations.
+    let Some(owner) = owner_index
+        .read(sandbox_id)
+        .await
+        .map_err(owner_error_to_status)?
+    else {
+        state.peer_routes.evict_owner(sandbox_id);
+        return Ok(None);
+    };
+    if !owner_is_fresh(&owner) {
+        state.peer_routes.evict_owner(sandbox_id);
+        return Ok(None);
+    }
+    state.peer_routes.store_owner(sandbox_id, &owner);
+    if owner.owner_replica_id == state.replica_id {
+        return Ok(None);
+    }
+    if owner_endpoint_is_local_only(&owner.owner_peer_endpoint) {
+        return Err(Status::failed_precondition(format!(
+            "sandbox is owned by gateway replica {} which advertises no peer endpoint",
+            owner.owner_replica_id
+        )));
+    }
+    Ok(Some(owner))
+}
+
+pub(crate) async fn forward_provider_readiness_to_owner(
+    state: &Arc<ServerState>,
+    owner: &crate::supervisor_owner::OwnerRecord,
+    request: ReportProviderReadinessRequest,
+) -> Result<ReportProviderReadinessResponse, Status> {
+    let sandbox_id = request.sandbox_id.clone();
+    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint).await?;
+    client
+        .peer_report_provider_readiness(request)
+        .await
+        .map(Response::into_inner)
+        .inspect_err(|_| {
+            state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
+            state.peer_routes.evict_owner(&sandbox_id);
+        })
+}
+
+pub(crate) async fn forward_endpoint_status_to_owner(
+    state: &Arc<ServerState>,
+    owner: &crate::supervisor_owner::OwnerRecord,
+    request: ReportEndpointStatusRequest,
+) -> Result<ReportEndpointStatusResponse, Status> {
+    let sandbox_id = request.sandbox_id.clone();
+    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint).await?;
+    client
+        .peer_report_endpoint_status(request)
+        .await
+        .map(Response::into_inner)
+        .inspect_err(|_| {
+            state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
+            state.peer_routes.evict_owner(&sandbox_id);
+        })
+}
+
+pub(crate) async fn forward_provider_status_query_to_owner(
+    state: &Arc<ServerState>,
+    owner: &crate::supervisor_owner::OwnerRecord,
+    sandbox_id: &str,
+    request: GetSandboxProviderStatusRequest,
+) -> Result<GetSandboxProviderStatusResponse, Status> {
+    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint).await?;
+    client
+        .peer_get_sandbox_provider_status(request)
+        .await
+        .map(Response::into_inner)
+        .inspect_err(|_| {
+            state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
+            state.peer_routes.evict_owner(sandbox_id);
+        })
+}
+
 pub async fn open_routed_relay_with_target(
     state: &Arc<ServerState>,
     sandbox_id: &str,
@@ -1711,12 +1817,18 @@ pub async fn handle_connect_supervisor(
         state
             .supervisor_sessions
             .remove_if_current(&sandbox_id, &session_id);
+        if let Err(err) = owner_index.release_if_current(&owner_guard).await {
+            warn!(sandbox_id, session_id, error = %err, "supervisor session: failed to release owner after endpoint status initialization failure");
+        }
         return Err(error);
     }
     if !state
         .supervisor_sessions
         .initialize_endpoint_status_authority(&sandbox_id, &session_id)
     {
+        if let Err(err) = owner_index.release_if_current(&owner_guard).await {
+            warn!(sandbox_id, session_id, error = %err, "supervisor session: failed to release superseded owner during endpoint status initialization");
+        }
         return Err(Status::failed_precondition(
             "supervisor session was replaced during endpoint status initialization",
         ));
@@ -1729,6 +1841,9 @@ pub async fn handle_connect_supervisor(
         state
             .supervisor_sessions
             .remove_if_current(&sandbox_id, &session_id);
+        if let Err(err) = owner_index.release_if_current(&owner_guard).await {
+            warn!(sandbox_id, session_id, error = %err, "supervisor session: failed to release owner after provider readiness initialization failure");
+        }
         return Err(error);
     }
 
@@ -1767,6 +1882,9 @@ pub async fn handle_connect_supervisor(
         state
             .supervisor_sessions
             .remove_if_current(&sandbox_id, &session_id);
+        if let Err(release_error) = owner_index.release_if_current(&owner_guard).await {
+            warn!(sandbox_id, session_id, error = %release_error, "supervisor session: failed to release owner after lifecycle persistence failure");
+        }
         warn!(
             sandbox_id = %sandbox_id,
             session_id = %session_id,
@@ -1981,12 +2099,12 @@ async fn handle_supervisor_message(
     match msg.payload {
         Some(supervisor_message::Payload::Heartbeat(_)) => {
             let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
-            match owner_index.renew(owner_guard).await {
-                Ok(()) => {}
+            match tokio::time::timeout(OWNER_RENEW_TIMEOUT, owner_index.renew(owner_guard)).await {
+                Ok(Ok(())) => {}
                 // Only a real ownership change ends the session. A store error
                 // means the database did not answer, and closing on that would
                 // drop every session heartbeating during the outage.
-                Err(err) if err.is_ownership_lost() => {
+                Ok(Err(err)) if err.is_ownership_lost() => {
                     warn!(
                         sandbox_id = %sandbox_id,
                         session_id = %session_id,
@@ -1998,7 +2116,7 @@ async fn handle_supervisor_message(
                 // Past the TTL our record is stale, so another replica may
                 // already have superseded it. Close rather than serve a
                 // session we can no longer claim.
-                Err(err) if owner_guard.claim_expired(OWNER_TTL) => {
+                Ok(Err(err)) if owner_guard.claim_expired(OWNER_TTL) => {
                     warn!(
                         sandbox_id = %sandbox_id,
                         session_id = %session_id,
@@ -2008,11 +2126,26 @@ async fn handle_supervisor_message(
                     );
                     return false;
                 }
-                Err(err) => warn!(
+                Ok(Err(err)) => warn!(
                     sandbox_id = %sandbox_id,
                     session_id = %session_id,
                     error = %err,
                     "supervisor session: owner renewal failed; retrying on next heartbeat"
+                ),
+                Err(_) if owner_guard.claim_expired(OWNER_TTL) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        session_id = %session_id,
+                        timeout_ms = OWNER_RENEW_TIMEOUT.as_millis(),
+                        "supervisor session: owner renewal timed out past the ownership TTL; closing session"
+                    );
+                    return false;
+                }
+                Err(_) => warn!(
+                    sandbox_id = %sandbox_id,
+                    session_id = %session_id,
+                    timeout_ms = OWNER_RENEW_TIMEOUT.as_millis(),
+                    "supervisor session: owner renewal timed out; retrying on next heartbeat"
                 ),
             }
         }
@@ -2183,10 +2316,16 @@ mod tests {
         };
 
         let mut without_session = sandbox.clone();
-        registry.project_endpoint_status(&mut without_session);
+        registry.project_endpoint_status(&mut without_session, false);
         let projected_status = without_session.status.expect("status");
         assert_eq!(projected_status.endpoint_statuses, vec![unknown.clone()]);
         assert_eq!(projected_status.conditions, vec![ready.clone()]);
+
+        let mut remotely_owned = sandbox.clone();
+        registry.project_endpoint_status(&mut remotely_owned, true);
+        let remote_status = remotely_owned.status.expect("status");
+        assert_eq!(remote_status.endpoint_statuses, vec![endpoint.clone()]);
+        assert_eq!(remote_status.conditions, vec![ready.clone()]);
 
         let (session_tx, _session_rx) = mpsc::channel(1);
         registry.register(
@@ -2196,13 +2335,13 @@ mod tests {
             make_shutdown(),
         );
         let mut before_initialization = sandbox.clone();
-        registry.project_endpoint_status(&mut before_initialization);
+        registry.project_endpoint_status(&mut before_initialization, false);
         let uninitialized_status = before_initialization.status.expect("status");
         assert_eq!(uninitialized_status.endpoint_statuses, vec![unknown]);
         assert_eq!(uninitialized_status.conditions, vec![ready.clone()]);
 
         assert!(registry.initialize_endpoint_status_authority("sandbox-1", "session-1"));
-        registry.project_endpoint_status(&mut sandbox);
+        registry.project_endpoint_status(&mut sandbox, false);
         let initialized_status = sandbox.status.expect("status");
         assert_eq!(initialized_status.endpoint_statuses, vec![endpoint]);
         assert_eq!(initialized_status.conditions, vec![ready]);

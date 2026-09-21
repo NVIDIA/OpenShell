@@ -161,6 +161,27 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn peer_report_provider_readiness(
+        &self,
+        _request: tonic::Request<proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_report_endpoint_status(
+        &self,
+        _request: tonic::Request<proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<proto::ReportEndpointStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_endpoint_status(
         &self,
         _request: tonic::Request<proto::ReportEndpointStatusRequest>,

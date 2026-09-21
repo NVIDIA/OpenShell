@@ -150,8 +150,15 @@ mod tests {
             "/openshell.v1.OpenShell/ConnectSupervisor"
         ));
         assert!(!is_user_callable("/openshell.v1.OpenShell/RelayStream"));
-        assert!(!is_user_callable("/openshell.v1.OpenShell/PeerRelay"));
-        assert!(is_peer_callable("/openshell.v1.OpenShell/PeerRelay"));
+        for path in [
+            "/openshell.v1.OpenShell/PeerRelay",
+            "/openshell.v1.OpenShell/PeerReportProviderReadiness",
+            "/openshell.v1.OpenShell/PeerReportEndpointStatus",
+            "/openshell.v1.OpenShell/PeerGetSandboxProviderStatus",
+        ] {
+            assert!(!is_user_callable(path));
+            assert!(is_peer_callable(path));
+        }
         // Unauthenticated methods are not "user callable" — they're
         // intercepted before principal evaluation.
         assert!(!is_user_callable("/openshell.v1.OpenShell/Health"));
