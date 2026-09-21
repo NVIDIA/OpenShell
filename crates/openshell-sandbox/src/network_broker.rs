@@ -28,6 +28,8 @@ use openshell_isolation_interface::linux::task_memory;
 use tokio::sync::{mpsc, oneshot};
 
 const SOCKET_CAPACITY: usize = 4_096;
+const SOCKET_FD_HEADROOM_DIVISOR: usize = 2;
+const SOCKET_FD_MIN_HEADROOM: usize = 64;
 const OPEN_QUEUE_CAPACITY: usize = 256;
 const ACCEPT_WORKER_CAPACITY: usize = 64;
 const DNS_QUEUE_CAPACITY: usize = 256;
@@ -252,7 +254,10 @@ impl NetworkBroker {
         })?);
         let (pending_tx, pending_rx) = mpsc::channel(OPEN_QUEUE_CAPACITY);
         let (pending_dns_tx, pending_dns_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
-        let registry = Arc::new(Mutex::new(SocketRegistry::new(1, SOCKET_CAPACITY)?));
+        let registry = Arc::new(Mutex::new(SocketRegistry::new(
+            1,
+            socket_registry_capacity()?,
+        )?));
         let active_opens = Arc::new(AtomicUsize::new(0));
         let active_accepts = Arc::new(AtomicUsize::new(0));
         let dns_relay = start_dns_relay(dns_address, pending_dns_tx)?;
@@ -608,6 +613,13 @@ fn create_socket(
     } else {
         InetFamily::V6
     };
+    // Reclaim stale retained descriptors before opening another socket. The
+    // registry capacity leaves descriptor headroom below RLIMIT_NOFILE so the
+    // procfs scan can still open directories while it collects closed
+    // workload sockets.
+    if let Err(error) = prepare_registry_for_socket(registry) {
+        return listener.respond_errno(notification.id, error_to_errno(&error));
+    }
     // SAFETY: arguments were reduced to the supported native INET matrix. A
     // successful call returns one newly owned descriptor.
     let mut source = unsafe { libc::socket(domain, raw_kind, protocol) };
@@ -640,6 +652,37 @@ fn create_socket(
         metadata.close_on_exec,
     )?;
     registry.commit(tentative)?;
+    Ok(())
+}
+
+fn socket_registry_capacity() -> io::Result<usize> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limit points to writable storage for one rlimit value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let soft_limit = usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX);
+    Ok(socket_registry_capacity_for_limit(soft_limit))
+}
+
+fn socket_registry_capacity_for_limit(soft_limit: usize) -> usize {
+    let headroom = (soft_limit / SOCKET_FD_HEADROOM_DIVISOR).max(SOCKET_FD_MIN_HEADROOM);
+    soft_limit
+        .saturating_sub(headroom)
+        .clamp(1, SOCKET_CAPACITY)
+}
+
+fn prepare_registry_for_socket(registry: &Mutex<SocketRegistry>) -> io::Result<()> {
+    let mut registry = lock(registry);
+    if registry.is_full() {
+        collect_closed_socket_entries_locked(&mut registry)?;
+    }
+    if registry.is_full() {
+        return Err(io::Error::from_raw_os_error(libc::EMFILE));
+    }
     Ok(())
 }
 
@@ -1762,6 +1805,48 @@ mod tests {
     use super::*;
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::{UnixListener, UnixStream};
+
+    #[test]
+    fn socket_registry_capacity_reserves_process_descriptor_headroom() {
+        assert_eq!(socket_registry_capacity_for_limit(1_024), 512);
+        assert_eq!(socket_registry_capacity_for_limit(128), 64);
+        assert_eq!(socket_registry_capacity_for_limit(64), 1);
+        assert_eq!(
+            socket_registry_capacity_for_limit(usize::MAX),
+            SOCKET_CAPACITY
+        );
+    }
+
+    #[test]
+    fn socket_registry_reclaims_stale_entry_before_opening_another_socket() {
+        // SAFETY: socket returns one newly owned descriptor on success.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                libc::IPPROTO_TCP,
+            )
+        };
+        assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+        // SAFETY: successful socket returned one owned descriptor.
+        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+        let metadata = SocketMetadata {
+            family: InetFamily::V4,
+            kind: InetKind::Tcp,
+            close_on_exec: true,
+            nonblocking: false,
+            creator_generation: 1,
+        };
+        let mut registry = SocketRegistry::new(1, 1).unwrap();
+        let tentative = registry.stage(socket, metadata).unwrap();
+        registry.commit(tentative).unwrap();
+        assert!(registry.is_full());
+
+        let registry = Mutex::new(registry);
+        prepare_registry_for_socket(&registry).unwrap();
+
+        assert!(lock(&registry).is_empty());
+    }
 
     #[test]
     fn notification_receive_retries_interrupted_and_disappeared_targets() {
