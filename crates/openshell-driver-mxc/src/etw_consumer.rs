@@ -1316,6 +1316,15 @@ pub(crate) struct AttributionIndex {
     by_identity: HashMap<String, String>,
     by_activity: HashMap<String, String>,
     by_cv: HashMap<String, String>,
+    /// Launches registered via [`Self::register_launch`] that haven't yet been
+    /// bound to an `identity`/CV. Unlike the PID, `wxc-exec` never reports its
+    /// OS-generated `identity`/`__TlgCV__` back to the driver ahead of time, so
+    /// there's nothing to pre-seed `by_identity` with at registration. This
+    /// queue lets [`Self::resolve`] bind the first identity/CV-bearing event
+    /// to the sole pending launch when exactly one is outstanding -- the only
+    /// case where "which launch produced this event" isn't ambiguous. Entries
+    /// older than [`PENDING_TTL`] are dropped unclaimed.
+    pending_launches: VecDeque<(String, Instant)>,
     /// Sandboxes whose driver-owned `wxc-exec` process has exited. Their strong
     /// correlations remain authoritative only until the recorded instant plus
     /// [`RETIRED_CORRELATION_TTL`].
@@ -1392,6 +1401,8 @@ impl AttributionIndex {
 
         self.names
             .insert(sandbox_id.to_string(), sandbox_name.to_string());
+        self.pending_launches
+            .push_back((sandbox_id.to_string(), now));
     }
 
     /// Retire a driver-owned PID after its monitored child exits. The exact
@@ -1439,8 +1450,24 @@ impl AttributionIndex {
         self.by_activity.retain(|_, v| v != sandbox_id);
         self.by_cv.retain(|_, v| v != sandbox_id);
         self.retired_sandboxes.remove(sandbox_id);
+        self.pending_launches.retain(|(sid, _)| sid != sandbox_id);
         self.names.remove(sandbox_id);
         self.lifecycle_emitted.remove(sandbox_id);
+    }
+
+    /// Drop launches that never got a first identity/CV within [`PENDING_TTL`]
+    /// of [`Self::register_launch`] (e.g. the Sandboxing provider never fired
+    /// for them, or their events aged out of the unresolved-event buffer
+    /// first). Keeps the queue from growing unbounded and stops a long-dead
+    /// launch from later soaking up an unrelated event.
+    fn purge_expired_pending_launches(&mut self, now: Instant) {
+        while let Some(&(_, at)) = self.pending_launches.front() {
+            if now.duration_since(at) > PENDING_TTL {
+                self.pending_launches.pop_front();
+            } else {
+                break;
+            }
+        }
     }
 
     fn purge_expired_retirements(&mut self, now: Instant) {
@@ -1488,7 +1515,8 @@ impl AttributionIndex {
     /// accepted only when ETW's process start key equals the key queried from
     /// the live driver-owned child handle.
     fn resolve(&mut self, ev: &DecodedEtwEvent) -> Option<String> {
-        self.purge_expired_retirements(Instant::now());
+        let now = Instant::now();
+        self.purge_expired_retirements(now);
         let identity = ev.identity();
         let cv = ev.cv_base();
         let activity = guid_key(&ev.activity_id);
@@ -1506,8 +1534,53 @@ impl AttributionIndex {
                 self.by_pid.get(&ev.process_id).and_then(|r| {
                     (ev.process_start_key == Some(r.process_start_key)).then(|| r.sid.clone())
                 })
+            })
+            .or_else(|| {
+                // `wxc-exec` never reports its OS-generated `identity`/CV back
+                // to the driver, so nothing pre-seeds `by_identity` the way
+                // `by_pid` is pre-seeded at `register_launch`. Bind
+                // opportunistically instead: if this event carries a key we've
+                // never seen *and* exactly one launch is still waiting for its
+                // first event, it can only be that launch's burst -- claim it.
+                // With zero or >=2 pending launches the match is ambiguous (no
+                // launch to claim it, or which one fired this event?), so
+                // refuse to guess and fall through to the unresolved-event
+                // buffer instead; misattributing an audit event to the wrong
+                // sandbox_id is worse than dropping it. This can still
+                // misattribute on a host where unrelated, non-OpenShell
+                // AppContainer/UAC activity shares this same OS Sandboxing
+                // provider while exactly one OpenShell launch happens to be
+                // pending -- eliminating that requires wxc-exec/the relay to
+                // report `identity`/CV back to the driver directly instead of
+                // being inferred here.
+                //
+                // Only applies when this event's PID has no `by_pid` entry at
+                // all (the real-world case: the shared OS broker PID that
+                // fires most Sandboxing events is never registered there in
+                // the first place). If a registration *does* exist for this
+                // PID -- even a generation-mismatched or since-displaced one
+                // -- that's positive evidence this event belongs to a PID
+                // race the generation-key check already deliberately refused,
+                // and guessing via pending-launch count must not override
+                // that refusal.
+                if self.by_pid.contains_key(&ev.process_id) {
+                    return None;
+                }
+                if identity.is_none() && cv.is_none() {
+                    return None;
+                }
+                self.purge_expired_pending_launches(now);
+                if self.pending_launches.len() != 1 {
+                    return None;
+                }
+                self.pending_launches.pop_front().map(|(sid, _)| sid)
             })?;
 
+        // Whichever path resolved this event, the launch no longer needs the
+        // opportunistic identity binding above -- drop its pending-launch
+        // entry so it can't inflate a later "exactly one pending" count.
+        self.pending_launches
+            .retain(|(pending_sid, _)| pending_sid != &sid);
         self.cross_link(&sid, identity, cv, activity);
         Some(sid)
     }
@@ -2592,5 +2665,108 @@ mod tests {
             .push(("commandLine".into(), "\"agent --unique\"".into()));
 
         assert!(idx.resolve(&only_cmd).is_none());
+    }
+
+    // wxc-exec never reports its OS-generated `identity`/CV back to the
+    // driver ahead of time, so events fired under a shared, non-driver-owned
+    // PID (e.g. the broker service hosting the OS Sandboxing provider) can
+    // only resolve opportunistically: exactly one still-pending launch and an
+    // identity/CV never seen before.
+    #[test]
+    fn single_pending_launch_binds_via_identity_when_event_pid_is_unregistered() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "s1", 1000, 1000);
+
+        // Event fired under a PID the driver never registered (e.g. the
+        // shared broker service), carrying an identity never seen before.
+        let mut ev = mk_event(6980, "SandboxCreateWithPolicyEnforcement");
+        ev.process_start_key = None;
+        ev.props.push(("identity".into(), "sandbox-abc123".into()));
+
+        assert_eq!(
+            idx.resolve(&ev).as_deref(),
+            Some("sbx-1"),
+            "the sole pending launch is the only possible source of a fresh identity"
+        );
+
+        // The identity is now cross-linked, so a later keyless-PID event
+        // carrying the same identity resolves without consulting the
+        // pending-launch queue (which is now empty for this sandbox).
+        let mut same_identity = mk_event(6980, "EnforceOsPolicy");
+        same_identity.process_start_key = None;
+        same_identity
+            .props
+            .push(("identity".into(), "sandbox-abc123".into()));
+        assert_eq!(idx.resolve(&same_identity).as_deref(), Some("sbx-1"));
+    }
+
+    #[test]
+    fn ambiguous_pending_launches_refuse_to_guess_via_identity() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "s1", 1000, 1000);
+        idx.register_launch("sbx-2", "s2", 2000, 2000);
+
+        let mut ev = mk_event(6980, "SandboxCreateWithPolicyEnforcement");
+        ev.process_start_key = None;
+        ev.props.push(("identity".into(), "sandbox-abc123".into()));
+
+        assert!(
+            idx.resolve(&ev).is_none(),
+            "two candidate launches make the event's true owner ambiguous"
+        );
+    }
+
+    #[test]
+    fn pending_launch_does_not_bind_when_a_pid_registration_exists_for_the_event() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "s1", 1000, 1000);
+
+        // The event's PID (1000) does have a `by_pid` registration, just a
+        // generation-mismatched one -- that is positive evidence pointing at
+        // a PID-reuse race the generation-key check deliberately refused, not
+        // "no evidence at all". The opportunistic identity fallback must not
+        // override that refusal even though exactly one launch is pending.
+        let mut ev = mk_event(1000, "SandboxCreateWithPolicyEnforcement");
+        ev.process_start_key = Some(9999);
+        ev.props.push(("identity".into(), "sandbox-abc123".into()));
+
+        assert!(idx.resolve(&ev).is_none());
+    }
+
+    #[test]
+    fn resolved_launch_no_longer_counts_toward_pending_ambiguity() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "s1", 1000, 1000);
+        idx.register_launch("sbx-2", "s2", 2000, 2000);
+
+        // sbx-1 resolves normally via its own registered PID, which must
+        // clear its pending-launch entry.
+        let seed = mk_event(1000, "CreateProcessInSandbox");
+        assert_eq!(idx.resolve(&seed).as_deref(), Some("sbx-1"));
+
+        // Only sbx-2 is still pending now, so a broker-PID event with a fresh
+        // identity is unambiguous and binds to it.
+        let mut ev = mk_event(6980, "SandboxCreateWithPolicyEnforcement");
+        ev.process_start_key = None;
+        ev.props.push(("identity".into(), "sandbox-xyz789".into()));
+        assert_eq!(idx.resolve(&ev).as_deref(), Some("sbx-2"));
+    }
+
+    #[test]
+    fn stale_pending_launch_expires_and_stops_claiming_events() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "s1", 1000, 1000);
+        idx.pending_launches.back_mut().expect("pending launch").1 = Instant::now()
+            .checked_sub(PENDING_TTL + Duration::from_millis(1))
+            .expect("test duration is shorter than the monotonic clock epoch");
+
+        let mut ev = mk_event(6980, "SandboxCreateWithPolicyEnforcement");
+        ev.process_start_key = None;
+        ev.props.push(("identity".into(), "sandbox-abc123".into()));
+
+        assert!(
+            idx.resolve(&ev).is_none(),
+            "a launch that never got a first event within PENDING_TTL must not be claimable later"
+        );
     }
 }
