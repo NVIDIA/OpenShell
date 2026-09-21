@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn host_proxy_event_context_uses_configured_sandbox_identity() {
         let bind_addr = "127.0.0.1:18080".parse().unwrap();
-        let config = test_config(bind_addr, PathBuf::from("agent.exe"));
+        let config = test_config(bind_addr);
 
         let context = host_proxy_event_context(&config).unwrap();
 
@@ -320,10 +320,7 @@ mod tests {
 
     #[test]
     fn host_proxy_event_context_rejects_missing_sandbox_identity() {
-        let mut config = test_config(
-            "127.0.0.1:18080".parse().unwrap(),
-            PathBuf::from("agent.exe"),
-        );
+        let mut config = test_config("127.0.0.1:18080".parse().unwrap());
         config.sandbox_id = Some(" ".to_string());
 
         let error = host_proxy_event_context(&config).unwrap_err();

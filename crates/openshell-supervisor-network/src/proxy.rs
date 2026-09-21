@@ -172,6 +172,9 @@ pub(crate) enum ProxyIdentityMode {
     Windows {
         identity_cache: Arc<BinaryIdentityCache>,
         required_proxy_authorization: Option<Arc<str>>,
+        /// Per-sandbox context for host-side proxies. The process-wide OCSF
+        /// context cannot identify one sandbox when a gateway hosts many.
+        event_context: Option<Arc<EventContext>>,
     },
     /// Static fallback for platforms without socket-owner resolution and for
     /// tests that need to inject a deterministic identity.
@@ -203,6 +206,7 @@ impl ProxyIdentityMode {
         Self::Windows {
             identity_cache: Arc::new(BinaryIdentityCache::new()),
             required_proxy_authorization,
+            event_context: None,
         }
     }
 
@@ -229,8 +233,10 @@ impl ProxyIdentityMode {
     #[cfg(target_os = "windows")]
     pub(super) fn with_event_context(mut self, context: EventContext) -> Self {
         match &mut self {
-            #[cfg(target_os = "linux")]
-            Self::Procfs { .. } => {}
+            Self::Windows { event_context, .. } => {
+                *event_context = Some(Arc::new(context));
+            }
+            #[cfg(test)]
             Self::Static { event_context, .. } => {
                 *event_context = Some(Arc::new(context));
             }
@@ -240,7 +246,12 @@ impl ProxyIdentityMode {
 
     fn event_context(&self) -> &EventContext {
         match self {
-            #[cfg(any(not(target_os = "linux"), test))]
+            #[cfg(target_os = "windows")]
+            Self::Windows {
+                event_context: Some(context),
+                ..
+            } => context,
+            #[cfg(any(not(any(target_os = "linux", target_os = "windows")), test))]
             Self::Static {
                 event_context: Some(context),
                 ..
@@ -7415,6 +7426,16 @@ network_policies:
         let schema = load_class_schema("http_activity");
         validate_required_fields(&sandbox_a, &schema);
         validate_required_fields(&sandbox_b, &schema);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_socket_owner_identity_keeps_per_proxy_sandbox_attribution() {
+        let identity = ProxyIdentityMode::windows_with_client_auth(None)
+            .with_event_context(proxy_event_context("sandbox-a-id", "sandbox-a"));
+
+        assert_eq!(identity.event_context().sandbox_id, "sandbox-a-id");
+        assert_eq!(identity.event_context().sandbox_name, "sandbox-a");
     }
 
     #[test]
