@@ -68,10 +68,17 @@ pub fn network_access_preset_to_str(value: i32) -> Option<&'static str> {
     }
 }
 
+fn unknown_tls_value(tls: &str) -> Option<String> {
+    (!matches!(tls, "" | "skip")).then(|| {
+        format!("unknown tls value '{tls}'; omit the field to keep automatic TLS termination")
+    })
+}
+
 pub fn validate_endpoint_mode_values(tls: i32, enforcement: i32, access: i32) -> Vec<String> {
     let mut errors = Vec::new();
-    if network_tls_mode_to_str(tls).is_none() {
-        errors.push(format!("unknown tls enum value {tls}"));
+    match network_tls_mode_to_str(tls) {
+        Some(value) => errors.extend(unknown_tls_value(value)),
+        None => errors.push(format!("unknown tls enum value {tls}")),
     }
     if network_enforcement_mode_to_str(enforcement).is_none() {
         errors.push(format!("unknown enforcement enum value {enforcement}"));
@@ -174,7 +181,7 @@ mod agent_transport_tests {
     #[test]
     fn agent_cannot_request_native_tcp_or_skip_tls_inspection() {
         assert!(agent_authored_transport_rejection("tcp", "").is_some());
-        assert!(agent_authored_transport_rejection("TCP", "terminate").is_some());
+        assert!(agent_authored_transport_rejection("TCP", "").is_some());
         assert!(agent_authored_transport_rejection("", "skip").is_some());
         assert!(agent_authored_transport_rejection("rest", "SKIP").is_some());
     }
@@ -185,11 +192,7 @@ mod agent_transport_tests {
 pub fn validate_endpoint_modes(tls: &str, enforcement: &str, access: &str) -> Vec<String> {
     let mut errors = Vec::new();
 
-    if !matches!(tls, "" | "skip" | "terminate" | "passthrough") {
-        errors.push(format!(
-            "unknown tls value '{tls}' (expected skip, terminate, or passthrough)"
-        ));
-    }
+    errors.extend(unknown_tls_value(tls));
     if !matches!(enforcement, "" | "enforce" | "audit") {
         errors.push(format!(
             "unknown enforcement value '{enforcement}' (expected enforce or audit)"
@@ -358,8 +361,17 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_mode_values_reject_removed_tls_enums() {
+        for legacy in [2, 3] {
+            let errors = validate_endpoint_mode_values(legacy, 0, 0);
+            assert_eq!(errors.len(), 1, "tls: {legacy}");
+            assert!(errors[0].contains("unknown tls value"));
+        }
+    }
+
+    #[test]
     fn endpoint_modes_accept_documented_values_and_defaults() {
-        for tls in ["", "skip", "terminate", "passthrough"] {
+        for tls in ["", "skip"] {
             for enforcement in ["", "enforce", "audit"] {
                 for access in ["", "read-only", "read-write", "full"] {
                     assert!(validate_endpoint_modes(tls, enforcement, access).is_empty());

@@ -21,9 +21,9 @@ const (
 	NetworkTLSModeUnspecified NetworkTLSMode = 0
 	// NetworkTLSModeSkip disables TLS inspection.
 	NetworkTLSModeSkip NetworkTLSMode = 1
-	// NetworkTLSModeTerminate is retained for wire compatibility; prefer unspecified.
+	// NetworkTLSModeTerminate is rejected by policy validation.
 	NetworkTLSModeTerminate NetworkTLSMode = 2
-	// NetworkTLSModePassthrough is retained for wire compatibility; prefer unspecified.
+	// NetworkTLSModePassthrough is rejected by policy validation.
 	NetworkTLSModePassthrough NetworkTLSMode = 3
 )
 

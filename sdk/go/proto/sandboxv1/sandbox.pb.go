@@ -35,11 +35,11 @@ const (
 	NetworkTlsMode_NETWORK_TLS_MODE_UNSPECIFIED NetworkTlsMode = 0
 	// Disable TLS detection and relay the connection without inspection.
 	NetworkTlsMode_NETWORK_TLS_MODE_SKIP NetworkTlsMode = 1
-	// Deprecated compatibility spelling; use NETWORK_TLS_MODE_UNSPECIFIED.
+	// Rejected by policy validation; use NETWORK_TLS_MODE_UNSPECIFIED.
 	//
 	// Deprecated: Marked as deprecated in sandbox.proto.
 	NetworkTlsMode_NETWORK_TLS_MODE_TERMINATE NetworkTlsMode = 2
-	// Deprecated compatibility spelling; use NETWORK_TLS_MODE_UNSPECIFIED.
+	// Rejected by policy validation; use NETWORK_TLS_MODE_UNSPECIFIED.
 	//
 	// Deprecated: Marked as deprecated in sandbox.proto.
 	NetworkTlsMode_NETWORK_TLS_MODE_PASSTHROUGH NetworkTlsMode = 3

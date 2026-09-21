@@ -242,8 +242,11 @@ higher specificity rank deterministically overrides broader request-processing
 metadata. Equally specific overlapping endpoints must agree.
 
 Endpoint `tls`, `enforcement`, and `access` use protobuf enums and retain their
-named YAML spellings. `protocol` remains a string so the supported protocol set
-can evolve, but every ingress validates it before persistence or activation.
+named YAML spellings. `tls` admits only an omitted value, meaning auto-detect
+and terminate for inspection, or `skip`; every other value, including the
+removed `terminate` and `passthrough` spellings, is rejected. `protocol`
+remains a string so the supported protocol set can evolve, but every ingress
+validates it before persistence or activation.
 The supervisor also refuses unknown enum numbers and protocol values
 defensively; an unrecognized enforcement value never falls back to audit.
 

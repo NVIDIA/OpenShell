@@ -10019,14 +10019,12 @@ mod tests {
         }
     }
 
-    #[allow(deprecated)]
     fn l7_scope_policy() -> ProtoSandboxPolicy {
         let endpoint = NetworkEndpoint {
             host: "api.example.com".to_string(),
             port: 443,
             ports: vec![443, 8443],
             protocol: "rest".to_string(),
-            tls: openshell_core::proto::NetworkTlsMode::Terminate as i32,
             access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
             ..Default::default()
         };
@@ -10982,7 +10980,6 @@ mod tests {
         let mut policy = test_policy_with_rule("aws", host);
         let endpoint = &mut policy.network_policies.get_mut("aws").unwrap().endpoints[0];
         endpoint.protocol = "rest".to_string();
-        endpoint.tls = 2;
         endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
         endpoint.credential_signing = "sigv4".to_string();
         endpoint.signing_service = "s3".to_string();
@@ -13047,7 +13044,6 @@ mod tests {
             .endpoints[0];
         bound_endpoint.protocol = "rest".to_string();
         bound_endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
-        bound_endpoint.tls = 2;
         openshell_policy::ensure_sandbox_process_identity(&mut policy);
         state
             .store

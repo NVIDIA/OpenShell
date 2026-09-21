@@ -29,6 +29,18 @@ openshell sandbox create --from registry.example.com/agents/my-agent:1.0 -- my-a
 Gateway operators can replace the default with the driver configuration or the
 Helm `server.sandboxImage` value.
 
+### Network endpoint TLS handling
+
+OpenShell 0.1.0 closes the network endpoint `tls` field to two forms: omit it to auto-detect and terminate TLS for inspection, or set `skip` to stop inspecting that endpoint. The gateway, the sandbox supervisor, provider profile lint, and agent-authored policy proposals all reject any other value, including the former `terminate` and `passthrough` spellings.
+
+Remove the `tls` field from affected endpoints before upgrading. Removal preserves behavior, because `terminate` and `passthrough` already selected automatic termination.
+
+Do not substitute `tls: skip` for a removed `terminate`. `skip` stops TLS inspection, credential placeholder rewriting, dynamic token grant injection, and L7 rule enforcement for that endpoint, so it widens what the endpoint allows.
+
+A stored policy carrying a removed value fails validation on read, and affected sandboxes cannot start. Run `openshell policy list --global` to see which revision is invalid and why, then re-apply a corrected policy with `openshell policy set --global`.
+
+A policy baked into a workload image at `/etc/openshell/policy.yaml` is rejected the same way, because the supervisor requests it over the sandbox boundary when the gateway has no policy for the sandbox. Setting a policy with `openshell policy set --global` repairs that case too; rebuilding the image without the field restores the original behavior.
+
 ### Provider profiles are import-only
 
 OpenShell 0.1.0 stops compiling provider profiles into the gateway binary. A gateway's catalog contains exactly the profiles an operator imported, the default `provider_profile_sources` is `[{ type = "user" }]`, and the `builtin` source type is removed: a `gateway.toml` that still names it is rejected at startup with the import command. A gateway with nothing imported reaches ready and serves an empty catalog.

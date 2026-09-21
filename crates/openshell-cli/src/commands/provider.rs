@@ -2909,13 +2909,7 @@ binaries: [/usr/bin/curl]
         )
         .expect("valid profile fixture");
         let mut descriptions = Vec::new();
-        for (tls, allow_uninspected_credentials) in [
-            ("", false),
-            ("", true),
-            ("skip", true),
-            ("terminate", false),
-            ("passthrough", false),
-        ] {
+        for (tls, allow_uninspected_credentials) in [("", false), ("", true), ("skip", true)] {
             let mut variant = profile.clone();
             variant.endpoints[0].tls = tls.to_string();
             variant.endpoints[0].allow_uninspected_credentials = allow_uninspected_credentials;
@@ -2947,8 +2941,6 @@ binaries: [/usr/bin/curl]
                 .contains("TLS: skip (raw tunnel; no L7 inspection or credential rewrite)\n")
         );
         assert!(descriptions[2].contains("Allow uninspected credentials: true\n"));
-        assert!(descriptions[3].contains("TLS: terminate (automatic TLS detection)\n"));
-        assert!(descriptions[4].contains("TLS: passthrough (automatic TLS detection)\n"));
     }
 
     #[test]

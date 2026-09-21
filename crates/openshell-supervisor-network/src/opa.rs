@@ -9626,7 +9626,6 @@ network_policies:
         port: 8080
         protocol: rest
         enforcement: enforce
-        tls: terminate
         rules:
           - allow:
               method: GET
@@ -9669,7 +9668,6 @@ network_policies:
         port: 8080
         protocol: rest
         enforcement: enforce
-        tls: terminate
         rules:
           - allow:
               method: GET
@@ -9717,7 +9715,6 @@ network_policies:
         ports: [8080, 9090]
         protocol: rest
         enforcement: enforce
-        tls: terminate
         rules:
           - allow:
               method: GET
