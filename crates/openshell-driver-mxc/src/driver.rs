@@ -2721,6 +2721,8 @@ mod lifecycle_tests {
 
         let shell =
             std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+        let workload = tempfile::tempdir().expect("temporary workload directory");
+        let workload_dir = workload.path().to_string_lossy().into_owned();
         let mut policy = fs_policy(&[]);
         policy.network_policies.insert(
             "github".to_string(),
@@ -2735,10 +2737,19 @@ mod lifecycle_tests {
                     provider_credentialed: true,
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary { path: shell }],
+                binaries: vec![NetworkBinary {
+                    path: shell.clone(),
+                }],
             },
         );
-        let mut sandbox = with_policy(driver_sandbox("sb-provider-env"), policy);
+        let mut sandbox = with_policy(
+            driver_sandbox_with_command(
+                "sb-provider-env",
+                &workload_dir,
+                vec![shell, "/c".into(), "exit 0".into()],
+            ),
+            policy,
+        );
         sandbox
             .spec
             .as_mut()
