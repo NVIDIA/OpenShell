@@ -209,7 +209,8 @@ def test_interactive_exec_drains_output_after_request_eof(
         def requests():
             yield openshell_pb2.ExecSandboxInput(
                 start=openshell_pb2.ExecSandboxRequest(
-                    sandbox_id=sb.id,
+                    sandbox=sb.sandbox.name,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                     command=[
                         "/bin/sh",
                         "-c",
