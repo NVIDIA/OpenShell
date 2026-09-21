@@ -202,7 +202,10 @@ The gateway admits one owner before opening the supervisor relay. Both RPCs
 fingerprint the command, sandbox name, workspace selector, environment, initial
 stdin, and other start fields, excluding the request ID. Admission also binds the
 resolved sandbox UUID, so a replacement with the same name cannot receive the
-original launch. The RPCs use separate method namespaces.
+original launch. If the sandbox is replaced between authorization lookups for an
+unchanged name and workspace selector, the gateway returns
+`REQUEST_REPLAY_UNAVAILABLE` before admitting or launching the command.
+The RPCs use separate method namespaces.
 Later interactive stdin and resize messages are not part of the fingerprint and
 cannot be submitted through a duplicate stream.
 

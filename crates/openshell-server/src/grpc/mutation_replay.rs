@@ -92,6 +92,13 @@ pub(super) struct Scope {
     target_id: Option<String>,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct AuthorizationBarrier {
+    resolved: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
 #[tonic::async_trait]
 pub(super) trait Mutation: Message + Default + Send + Sync + 'static {
     type Output: Send + 'static;
@@ -100,6 +107,11 @@ pub(super) trait Mutation: Message + Default + Send + Sync + 'static {
     // Streaming producers, not returned stream handles, confirm completion.
     const DEFERRED: bool = false;
     fn request_id(&self) -> &str;
+    /// Name-addressed targets must keep their identity unless an interceptor
+    /// actually changes the selector, not merely another request field.
+    fn target_selector(&self) -> Option<(&str, &WorkspaceSelector)> {
+        None
+    }
     fn canonical_message(&self) -> Result<DynamicMessage, Status> {
         decode_request_message(&format!("{}Request", Self::METHOD), self)
     }
@@ -144,7 +156,19 @@ pub(super) async fn run<M: Mutation>(
         ));
     };
     let scope = original.authorize(state, &principal).await?;
+    #[cfg(test)]
+    if let Some(barrier) = request.extensions().get::<Arc<AuthorizationBarrier>>() {
+        barrier.resolved.notify_one();
+        barrier.resume.notified().await;
+    }
     let effective_scope = request.get_ref().authorize(state, &principal).await?;
+    if original.target_selector().is_some()
+        && original.target_selector() == request.get_ref().target_selector()
+        && (scope.workspace_id != effective_scope.workspace_id
+            || scope.target_id != effective_scope.target_id)
+    {
+        return Err(replay_unavailable());
+    }
     let (payload_hash, protection) = if M::PROTECTED {
         let key = fingerprint_key(state).await?;
         (

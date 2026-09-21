@@ -4,7 +4,8 @@
 use super::*;
 use crate::grpc::mutation_replay::tests::{reason, state_for};
 use crate::grpc::mutation_replay::{
-    Admission, Completion, OBJECT_TYPE, SUCCESS_TTL_MS, fingerprint, run,
+    Admission, AuthorizationBarrier, Completion, OBJECT_TYPE, OriginalMutation, SUCCESS_TTL_MS,
+    fingerprint, run,
 };
 use crate::grpc::test_support::authed_request;
 use crate::persistence::{ObjectType, WriteCondition, current_time_ms};
@@ -13,8 +14,82 @@ use openshell_core::proto::{
     GatewayMessage, Sandbox, SandboxPhase, SandboxStatus, gateway_message,
 };
 use openshell_core::{ObjectId, ObjectName};
+use prost::Message;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
+
+type ExecClient =
+    openshell_core::proto::open_shell_client::OpenShellClient<tonic::transport::Channel>;
+
+async fn wire_client(
+    state: Arc<ServerState>,
+    barrier: Option<Arc<AuthorizationBarrier>>,
+    original: Option<OriginalMutation>,
+) -> (ExecClient, tokio::task::JoinHandle<()>) {
+    use crate::grpc::OpenShellService;
+    use openshell_core::proto::open_shell_server::OpenShellServer;
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let principal = authed_request(())
+        .extensions()
+        .get::<Principal>()
+        .unwrap()
+        .clone();
+    let service = OpenShellServer::with_interceptor(
+        OpenShellService::new(state),
+        move |mut request: Request<()>| {
+            request.extensions_mut().insert(principal.clone());
+            if let Some(barrier) = &barrier {
+                request.extensions_mut().insert(barrier.clone());
+            }
+            if let Some(original) = &original {
+                request.extensions_mut().insert(original.clone());
+            }
+            Ok(request)
+        },
+    );
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let client = ExecClient::connect(format!("http://{address}"))
+        .await
+        .unwrap();
+    (client, server)
+}
+
+fn interactive_start(req: ExecSandboxRequest) -> ExecSandboxInput {
+    ExecSandboxInput {
+        payload: Some(exec_sandbox_input::Payload::Start(req)),
+    }
+}
+
+fn original_exec(req: ExecSandboxRequest, interactive: bool) -> OriginalMutation {
+    OriginalMutation(if interactive {
+        interactive_start(req).encode_to_vec()
+    } else {
+        req.encode_to_vec()
+    })
+}
+
+async fn exec_rpc(
+    client: &mut ExecClient,
+    req: ExecSandboxRequest,
+    interactive: bool,
+) -> Result<Response<tonic::Streaming<ExecSandboxEvent>>, Status> {
+    if interactive {
+        client
+            .exec_sandbox_interactive(tokio_stream::iter([interactive_start(req)]))
+            .await
+    } else {
+        client.exec_sandbox(req).await
+    }
+}
 
 async fn setup(url: &str, directory: &tempfile::TempDir) -> Arc<ServerState> {
     let mut state = state_for(Store::connect(url).await.unwrap()).await;
@@ -375,6 +450,125 @@ async fn exec_restart_preserves_pending_and_terminal_fences_and_reauthorizes() {
         run(&state, authed_request(req)).await.unwrap_err().code(),
         tonic::Code::NotFound
     );
+}
+
+#[tokio::test]
+async fn noninteractive_rejects_replacement_between_authorizations() {
+    replacement_between_authorizations(false).await;
+}
+
+#[tokio::test]
+async fn interactive_rejects_replacement_between_authorizations() {
+    replacement_between_authorizations(true).await;
+}
+
+async fn replacement_between_authorizations(interactive: bool) {
+    // A payload-only transformation must not be mistaken for redirection.
+    for change_command in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let state = setup("sqlite::memory:", &directory).await;
+        let mut req = request(&state).await;
+        let original = change_command.then(|| original_exec(req.clone(), interactive));
+        if change_command {
+            req.command.push("transformed-argument".into());
+        }
+        let id = sandbox_id(&state, &req).await;
+        let mut old_messages = register(&state, &id);
+        let barrier = Arc::new(AuthorizationBarrier::default());
+        let (mut client, server) =
+            wire_client(state.clone(), Some(barrier.clone()), original).await;
+        let call = tokio::spawn(async move { exec_rpc(&mut client, req, interactive).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            barrier.resolved.notified(),
+        )
+        .await
+        .unwrap();
+
+        let mut replacement: Sandbox = state.store.get_message(&id).await.unwrap().unwrap();
+        state
+            .store
+            .delete(Sandbox::object_type(), &id)
+            .await
+            .unwrap();
+        replacement.metadata.as_mut().unwrap().id = uuid::Uuid::new_v4().to_string();
+        state.store.put_message(&replacement).await.unwrap();
+        let mut replacement_messages = register(&state, replacement.object_id());
+        barrier.resume.notify_one();
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(reason(&status), "REQUEST_REPLAY_UNAVAILABLE");
+        assert!(old_messages.try_recv().is_err());
+        assert!(replacement_messages.try_recv().is_err());
+        assert!(
+            state
+                .store
+                .list_by_type_after(OBJECT_TYPE, None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn exec_transformations_preserve_unchanged_targets_and_explicit_redirection() {
+    use openshell_core::proto::Workspace;
+
+    for interactive in [false, true] {
+        for redirect in ["command-only", "sandbox", "workspace"] {
+            let directory = tempfile::tempdir().unwrap();
+            let state = setup("sqlite::memory:", &directory).await;
+            let mut req = request(&state).await;
+            let original = original_exec(req.clone(), interactive);
+            let original_id = sandbox_id(&state, &req).await;
+            let mut target: Sandbox = state
+                .store
+                .get_message(&original_id)
+                .await
+                .unwrap()
+                .unwrap();
+            req.command.push("transformed-argument".into());
+            if redirect != "command-only" {
+                target.metadata.as_mut().unwrap().id = uuid::Uuid::new_v4().to_string();
+                if redirect == "sandbox" {
+                    req.sandbox = "redirected".into();
+                    target.metadata.as_mut().unwrap().name = req.sandbox.clone();
+                } else {
+                    let workspace = Workspace {
+                        metadata: Some(ObjectMeta {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            name: "redirected".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    };
+                    state.store.put_message(&workspace).await.unwrap();
+                    target.metadata.as_mut().unwrap().workspace = "redirected".into();
+                    req.workspace_scope =
+                        Some(openshell_core::proto::workspace_selector("redirected"));
+                }
+                state.store.put_message(&target).await.unwrap();
+            }
+            let mut messages = register(&state, target.object_id());
+            let (mut client, server) = wire_client(state.clone(), None, Some(original)).await;
+            drop(exec_rpc(&mut client, req, interactive).await.unwrap());
+            receive_relay(&state, &mut messages).await;
+            let owner = completion(&state).await;
+            let admission: Admission = serde_json::from_slice(&owner.admission).unwrap();
+            assert_eq!(admission.target_id.as_deref(), Some(original_id.as_str()));
+            owner.ensure_target(target.object_id()).unwrap();
+            if redirect != "command-only" {
+                assert!(owner.ensure_target(&original_id).is_err());
+            }
+            server.abort();
+        }
+    }
 }
 
 #[tokio::test]

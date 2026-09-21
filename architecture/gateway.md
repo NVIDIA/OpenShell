@@ -101,8 +101,11 @@ Both exec RPCs share keyed admission but defer completion to the SSH producer.
 The initial interactive Start uses the exec request schema under a distinct RPC
 namespace; later stdin and resize frames are not replayable inputs. Admission
 resolves the public sandbox name and workspace, durably binds both original and
-effective sandbox UUIDs, and rejects same-name replacements. The owner checks
-the effective UUID again before relay opening, then hands its CAS-only finalizer to the owned producer,
+effective sandbox UUIDs, and rejects same-name replacements. When the original
+and effective selectors match, both authorization lookups must resolve the same
+workspace and sandbox identities before admission. A different effective target
+is allowed only when the selector changes. The owner checks the effective UUID
+again before relay opening, then hands its CAS-only finalizer to the owned producer,
 releasing the shared admission-worker permit after handoff. Only a confirmed
 remote exit records a terminal marker and starts 24-hour retention. Synthetic
 timeouts, disconnects without exit confirmation, and persistence failures leave

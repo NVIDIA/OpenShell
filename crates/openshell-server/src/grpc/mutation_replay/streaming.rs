@@ -9,7 +9,7 @@ mod tests;
 use std::sync::Arc;
 
 use openshell_core::proto::{
-    ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest, exec_sandbox_input,
+    ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest, WorkspaceSelector, exec_sandbox_input,
 };
 use openshell_core::rpc_error;
 use openshell_core::{ObjectId, ObjectWorkspace};
@@ -82,6 +82,12 @@ impl Mutation for ExecSandboxRequest {
         &self.request_id
     }
 
+    fn target_selector(&self) -> Option<(&str, &WorkspaceSelector)> {
+        self.workspace_scope
+            .as_ref()
+            .map(|workspace| (self.sandbox.as_str(), workspace))
+    }
+
     async fn authorize(&self, state: &ServerState, principal: &Principal) -> Result<Scope, Status> {
         authorize(state, principal, self).await
     }
@@ -111,6 +117,10 @@ impl Mutation for ExecSandboxInput {
 
     fn request_id(&self) -> &str {
         start(self).map_or("", |request| request.request_id.as_str())
+    }
+
+    fn target_selector(&self) -> Option<(&str, &WorkspaceSelector)> {
+        start(self).ok().and_then(Mutation::target_selector)
     }
 
     fn canonical_message(&self) -> Result<DynamicMessage, Status> {
