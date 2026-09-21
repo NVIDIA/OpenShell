@@ -291,6 +291,12 @@ configure the gateway to use them. The Ubuntu `deb` installer consumes
 for direct executable installation on every environment. Release Dev and
 Release Tag run Ubuntu conformance through the Debian package, while Fedora
 continues using direct executable installation until RPM coverage is available.
+The Debian qualification profile keeps candidate-image overrides outside the
+operator-owned gateway configuration: it writes a harness-owned file under
+`/var/lib/openshell-qualification` and selects it through the packaged systemd
+unit's `gateway.env` hook. Ordinary package installations continue to use the
+gateway's built-in runtime-image defaults unless the operator configures an
+override.
 
 ## Python Wheel Packaging
 

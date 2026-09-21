@@ -45,16 +45,25 @@
         - openshell-sandbox
         - openshell-supervisor
 
-    - name: Create OpenShell configuration directory
+    # The package normally starts from its built-in runtime-image defaults.
+    # Qualification instead pins the candidate images staged by tmachine, so
+    # keep that override separate from the operator-owned gateway.toml.
+    - name: Create OpenShell qualification configuration directory
+      become: true
       ansible.builtin.file:
-        path: /home/tmachine/.config/openshell
+        path: /var/lib/openshell-qualification
         state: directory
-        mode: "0700"
+        owner: root
+        group: root
+        mode: "0755"
 
-    - name: Configure candidate OpenShell runtime images
+    - name: Configure candidate OpenShell runtime images for qualification
+      become: true
       ansible.builtin.copy:
-        dest: /home/tmachine/.config/openshell/gateway.toml
-        mode: "0600"
+        dest: /var/lib/openshell-qualification/gateway.toml
+        owner: root
+        group: root
+        mode: "0644"
         content: |
           [openshell]
           version = 2
@@ -62,6 +71,19 @@
           [openshell.drivers.docker]
           sandbox_runtime_image = "docker.io/openshell/sandbox:tmachine"
           supervisor_image = "docker.io/openshell/supervisor:tmachine"
+
+    - name: Create OpenShell environment directory
+      ansible.builtin.file:
+        path: /home/tmachine/.config/openshell
+        state: directory
+        mode: "0700"
+
+    - name: Select qualification gateway configuration
+      ansible.builtin.copy:
+        dest: /home/tmachine/.config/openshell/gateway.env
+        mode: "0600"
+        content: |
+          OPENSHELL_GATEWAY_CONFIG=/var/lib/openshell-qualification/gateway.toml
 
     - name: Start tmachine user manager
       ansible.builtin.include_role:
