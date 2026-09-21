@@ -3270,7 +3270,7 @@ where
             &parse_buf,
             &mut forwarded_len,
             pos,
-            false,
+            true,
             generation_guard,
         )
         .await?;
@@ -3320,11 +3320,12 @@ where
     Ok(())
 }
 
-/// Forward complete, validated chunk framing in relay-sized batches.
+/// Forward complete, validated chunk framing.
 ///
-/// Tiny chunks no longer cause one upstream write per framing byte, while the
-/// final forced flush guarantees the complete body reaches upstream before the
-/// response relay starts.
+/// Size lines may be coalesced with their payload, but every completed chunk is
+/// forwarded immediately so streaming request and response bodies make
+/// progress without waiting for the terminal chunk. This writes by validated
+/// framing units rather than once per framing byte.
 async fn flush_validated_chunked_bytes<W>(
     writer: &mut W,
     parse_buf: &[u8],
@@ -4773,7 +4774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_chunked_buffers_tiny_chunks_without_an_aggregate_framing_limit() {
+    async fn relay_chunked_handles_tiny_chunks_without_an_aggregate_framing_limit() {
         let mut chunked_body = Vec::new();
         for _ in 0..10_000 {
             chunked_body.extend_from_slice(b"1\r\na\r\n");
@@ -4800,10 +4801,41 @@ mod tests {
             "connection buffering required {reads_after_body} underlying reads"
         );
         assert!(
-            writer.writes < 100,
-            "framing coalescing required {} upstream writes",
+            writer.writes <= 10_001,
+            "chunk forwarding should require at most one write per chunk, got {}",
             writer.writes
         );
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_forwards_complete_chunk_before_stream_ends() {
+        let (relay_reader, mut source_writer) = tokio::io::duplex(4096);
+        let (relay_writer, mut destination_reader) = tokio::io::duplex(4096);
+
+        let relay = tokio::spawn(async move {
+            let mut relay_reader = tokio::io::BufReader::with_capacity(4096, relay_reader);
+            let mut relay_writer = relay_writer;
+            relay_chunked(&mut relay_reader, &mut relay_writer, &[], None).await
+        });
+
+        let first_chunk = b"5\r\nhello\r\n";
+        source_writer.write_all(first_chunk).await.unwrap();
+
+        let mut forwarded = vec![0; first_chunk.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            destination_reader.read_exact(&mut forwarded),
+        )
+        .await
+        .expect("complete chunk must be forwarded while the stream remains open")
+        .unwrap();
+        assert_eq!(forwarded, first_chunk);
+
+        source_writer.write_all(b"0\r\n\r\n").await.unwrap();
+        relay
+            .await
+            .expect("relay task must complete")
+            .expect("terminal chunk must relay");
     }
 
     #[test]
