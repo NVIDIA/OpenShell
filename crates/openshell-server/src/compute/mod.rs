@@ -1150,12 +1150,24 @@ impl ComputeRuntime {
                 );
             }
             Err(error) => {
+                drop(global_guard);
+                let delete_result = self
+                    .delete_backend_after_failed_create(sandbox_id, sandbox_name)
+                    .await;
+                let cleanup_detail = match delete_result {
+                    Ok(_) => String::new(),
+                    Err(delete_error) => format!(
+                        "; best-effort backend cleanup also failed: {}",
+                        delete_error.message()
+                    ),
+                };
                 return Status::new(
                     original.code(),
                     format!(
-                        "{}; cleanup after successful create could not claim the sandbox record: {}",
+                        "{}; cleanup after successful create could not claim the sandbox record: {}{}",
                         original.message(),
-                        error.message()
+                        error.message(),
+                        cleanup_detail
                     ),
                 );
             }
@@ -1165,27 +1177,11 @@ impl ComputeRuntime {
         drop(global_guard);
 
         let delete_result = self
-            .driver
-            .call(
-                openshell_otel::rpc::DELETE_SANDBOX,
-                Some(sandbox_id),
-                |driver| {
-                    let sandbox_id = sandbox_id.to_string();
-                    let sandbox_name = sandbox_name.to_string();
-                    async move {
-                        driver
-                            .delete_sandbox(Request::new(DeleteSandboxRequest {
-                                sandbox_id,
-                                name: sandbox_name,
-                            }))
-                            .await
-                    }
-                },
-            )
+            .delete_backend_after_failed_create(sandbox_id, sandbox_name)
             .await;
         match delete_result {
-            Ok(response) => {
-                if response.into_inner().deleted {
+            Ok(deleted) => {
+                if deleted {
                     // The driver accepted an asynchronous deletion. Keep the
                     // durable Deleting record until the watch path confirms
                     // that the backend is absent, matching ordinary delete
@@ -1219,6 +1215,32 @@ impl ComputeRuntime {
                 )
             }
         }
+    }
+
+    async fn delete_backend_after_failed_create(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+    ) -> Result<bool, Status> {
+        self.driver
+            .call(
+                openshell_otel::rpc::DELETE_SANDBOX,
+                Some(sandbox_id),
+                |driver| {
+                    let sandbox_id = sandbox_id.to_string();
+                    let sandbox_name = sandbox_name.to_string();
+                    async move {
+                        driver
+                            .delete_sandbox(Request::new(DeleteSandboxRequest {
+                                sandbox_id,
+                                name: sandbox_name,
+                            }))
+                            .await
+                    }
+                },
+            )
+            .await
+            .map(|response| response.into_inner().deleted)
     }
 
     pub(crate) async fn stop_sandbox(
@@ -7164,6 +7186,67 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn create_compensation_deletes_backend_when_delete_transition_cannot_be_stored() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database_url = format!("sqlite://{}", directory.path().join("gateway.db").display());
+        let store = Arc::new(Store::connect(&database_url).await.expect("connect store"));
+        let pool = sqlx::SqlitePool::connect(&database_url)
+            .await
+            .expect("connect failure injector");
+        sqlx::query(
+            "CREATE TRIGGER reject_test_payload_updates \
+             BEFORE UPDATE OF payload ON objects \
+             BEGIN SELECT RAISE(ABORT, 'injected payload persistence failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("install persistence failure trigger");
+        pool.close().await;
+
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity("new-runtime-identity");
+        let mut runtime = test_runtime(driver.clone()).await;
+        runtime.store = store;
+        enable_runtime_identity_binding(&mut runtime);
+        let sandbox = sandbox_record(
+            "sb-create-transition-failure",
+            "create-transition-failure",
+            SandboxPhase::Provisioning,
+        );
+
+        let error = runtime
+            .create_sandbox(sandbox.clone(), None, false)
+            .await
+            .expect_err("binding and delete-transition persistence failures must fail create");
+
+        assert!(
+            error
+                .message()
+                .contains("persist compute runtime identity failed")
+        );
+        assert!(
+            error
+                .message()
+                .contains("could not claim the sandbox record")
+        );
+        assert_eq!(driver.delete_calls(), 1);
+        assert_eq!(
+            driver.delete_requests(),
+            vec![(
+                sandbox.object_id().to_string(),
+                sandbox.object_name().to_string()
+            )]
+        );
+        let retained = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .expect("failed durable transition must retain the original record");
+        assert_eq!(retained.phase(), SandboxPhase::Provisioning as i32);
     }
 
     #[tokio::test]
