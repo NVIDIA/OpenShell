@@ -18,11 +18,15 @@ Windows checks are not required for merging and do not run in merge queues.
 Main and manual runs also build release binaries, with `continue-on-error: true`
 so Windows failures do not fail the workflow.
 
-Three opt-in labels enable the long-running E2E suites:
+Four opt-in labels enable the long-running E2E suites:
 
 - `test:e2e` runs the Docker, rootless Podman, Kubernetes, and VM E2E suites
   with both managed and standalone compute drivers in `Branch E2E Checks`
 - `test:e2e-gpu` runs GPU E2E in `Branch E2E Checks`
+- `test:upgrade` runs tmachine Debian upgrade qualification in
+  `Branch E2E Checks`: the latest retained prerelease is installed first, then
+  the PR's Debian package is installed and both existing and new sandboxes are
+  verified
 - `test:e2e-kubernetes` runs Kubernetes E2E with the HA Helm overlay
   (`replicaCount: 2` and bundled PostgreSQL) and the credential-driver suite
   (Kubernetes Secrets plus Vault) in `Branch E2E Checks`
@@ -307,7 +311,7 @@ Flow:
 
 1. Open the PR. copy-pr-bot mirrors it to `pull-request/<N>` automatically.
 2. The mirror push runs `Branch Checks` automatically. `Required CI Gates` keeps the PR blocked until the mirror exists, matches the PR head SHA, and the required push-based workflow succeeds. The first `Branch E2E Checks` run only resolves metadata and skips expensive jobs unless an E2E label is already set.
-3. A maintainer applies `test:e2e`, `test:e2e-gpu`, and/or `test:e2e-kubernetes`. `E2E Label Help` posts a comment with a link to the existing gated workflow run.
+3. A maintainer applies `test:e2e`, `test:e2e-gpu`, `test:upgrade`, and/or `test:e2e-kubernetes`. `E2E Label Help` posts a comment with a link to the existing gated workflow run.
 4. The maintainer opens that link and clicks **Re-run all jobs**. This time `pr_metadata` sees the label and the build/E2E jobs run.
 5. When the run finishes, the matching `OpenShell / ...` gate status flips to green automatically.
 6. New commits push to the mirror automatically and re-trigger `Branch Checks` plus any labeled E2E jobs in `Branch E2E Checks`.
@@ -346,7 +350,7 @@ its own stable result status.
 Merge-group runs use the `merge_group` event. The event is distinct from `pull_request` and `push`, and GitHub will not report required checks for queued PRs unless the workflows include it. In this repository:
 
 - `Branch Checks` runs the standard non-E2E gates on the merge-group SHA.
-- `Branch E2E Checks` runs core E2E and GPU E2E for merge groups. Kubernetes HA E2E remains optional and label-driven on PRs.
+- `Branch E2E Checks` runs core E2E and GPU E2E for merge groups. Debian upgrade qualification and Kubernetes HA E2E remain optional and label-driven on PRs.
 - `Helm Lint` runs for merge groups without the PR diff optimization, because the merge-group branch is the final integration state.
 - `Trivy Changes` compares the merge-group configuration with its base and rejects new High or Critical findings.
 - `Required CI Gates` posts the same `OpenShell / ...` statuses to the merge-group SHA and does not require a `pull-request/<N>` mirror for merge-group events.
@@ -372,7 +376,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | File | Role |
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `push: pull-request/[0-9]+` for PR mirrors and `merge_group` for queued merges. |
-| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups run core and GPU E2E. |
+| `.github/workflows/branch-e2e.yml` | Standard, GPU, Debian upgrade, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, `test:upgrade`, and `test:e2e-kubernetes` labels; merge groups run core and GPU E2E. |
 | `.github/workflows/build-binaries.yml`, `build-vm-driver.yml` | Shared binary matrices used by branch and release workflows. The VM driver remains separate because its build consumes the runtime binaries. |
 | `.github/workflows/build-images.yml` | Builds and pushes multi-platform images, then uploads the same OCI images as workflow artifacts. |
 | `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |
