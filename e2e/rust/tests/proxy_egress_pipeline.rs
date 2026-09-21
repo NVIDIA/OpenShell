@@ -1501,6 +1501,68 @@ print("TRANSPARENT_PIPELINE_DENIED")
 
 #[tokio::test]
 #[serial(proxy_egress_pipeline)]
+async fn chunked_pipeline_is_authorized_separately_before_reaching_upstream() {
+    let server = PipelineProbeServer::start()
+        .await
+        .expect("start pipeline probe server");
+    let endpoint_options = r#"        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: POST
+              path: "/allowed""#;
+    let policy = write_policy(TEST_SERVER_HOST, server.port, endpoint_options)
+        .expect("write pipeline policy");
+    let policy_path = policy_path(&policy);
+    let script = format!(
+        r#"
+import socket
+
+target = "{host}:{port}"
+first = (
+    f"POST /allowed HTTP/1.1\r\n"
+    f"Host: {{target}}\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+    f"0\r\n\r\n"
+)
+second = (
+    f"DELETE /blocked HTTP/1.1\r\n"
+    f"Host: {{target}}\r\nContent-Length: 0\r\n\r\n"
+)
+with socket.create_connection(({host:?}, {port}), timeout=10) as sock:
+    sock.sendall((first + second).encode())
+    response = b""
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+responses = response.count(b"HTTP/1.1 ")
+first_status = response.split(b"\r\n", 1)[0]
+if responses != 2 or b" 200 " not in first_status or b"HTTP/1.1 403 Forbidden" not in response:
+    raise RuntimeError(f"unexpected chunked pipeline response: {{response!r}}")
+print("CHUNKED_PIPELINE_DENIED")
+"#,
+        host = TEST_SERVER_HOST,
+        port = server.port,
+    );
+
+    let guard = SandboxGuard::create(&["--policy", &policy_path, "--", "python3", "-c", &script])
+        .await
+        .expect("sandbox create");
+    assert!(
+        guard.create_output.contains("CHUNKED_PIPELINE_DENIED"),
+        "transparent HTTP stream did not evaluate the chunked pipeline separately:\n{}",
+        guard.create_output
+    );
+
+    let observed = String::from_utf8(server.observed_request()).expect("upstream HTTP request");
+    assert!(observed.starts_with("POST /allowed HTTP/1.1\r\n"));
+    assert!(observed.ends_with("0\r\n\r\n"));
+    assert!(!observed.contains("/blocked"));
+}
+
+#[tokio::test]
+#[serial(proxy_egress_pipeline)]
 async fn http_credentials_are_rewritten_in_transparent_headers_and_bodies() {
     let _provider_lock = PROVIDER_LOCK
         .lock()

@@ -3140,15 +3140,20 @@ where
             if let Some(end) = find_crlf(&parse_buf, pos) {
                 break end;
             }
-            let n = reader.read(&mut read_buf).await.into_diagnostic()?;
-            if n == 0 {
-                return Err(miette!("Chunked body ended before chunk-size line"));
-            }
-            if let Some(guard) = generation_guard {
-                guard.ensure_current()?;
-            }
-            writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
-            parse_buf.extend_from_slice(&read_buf[..n]);
+            let target_len = parse_buf
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| miette!("Chunked body size overflow"))?;
+            relay_chunked_until_len(
+                reader,
+                writer,
+                &mut read_buf,
+                &mut parse_buf,
+                target_len,
+                generation_guard,
+                "Chunked body ended before chunk-size line",
+            )
+            .await?;
         };
 
         let size_line = std::str::from_utf8(&parse_buf[pos..size_line_end])
@@ -3172,15 +3177,20 @@ where
                     if let Some(end) = find_crlf(&parse_buf, pos) {
                         break end;
                     }
-                    let n = reader.read(&mut read_buf).await.into_diagnostic()?;
-                    if n == 0 {
-                        return Err(miette!("Chunked body ended before trailer terminator"));
-                    }
-                    if let Some(guard) = generation_guard {
-                        guard.ensure_current()?;
-                    }
-                    writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
-                    parse_buf.extend_from_slice(&read_buf[..n]);
+                    let target_len = parse_buf
+                        .len()
+                        .checked_add(1)
+                        .ok_or_else(|| miette!("Chunked trailer size overflow"))?;
+                    relay_chunked_until_len(
+                        reader,
+                        writer,
+                        &mut read_buf,
+                        &mut parse_buf,
+                        target_len,
+                        generation_guard,
+                        "Chunked body ended before trailer terminator",
+                    )
+                    .await?;
                 };
 
                 let trailer_line = &parse_buf[pos..trailer_end];
@@ -3207,17 +3217,16 @@ where
             .checked_add(2)
             .ok_or_else(|| miette!("Chunk size overflow"))?;
 
-        while parse_buf.len() < chunk_with_crlf_end {
-            let n = reader.read(&mut read_buf).await.into_diagnostic()?;
-            if n == 0 {
-                return Err(miette!("Chunked body ended mid-chunk"));
-            }
-            if let Some(guard) = generation_guard {
-                guard.ensure_current()?;
-            }
-            writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
-            parse_buf.extend_from_slice(&read_buf[..n]);
-        }
+        relay_chunked_until_len(
+            reader,
+            writer,
+            &mut read_buf,
+            &mut parse_buf,
+            chunk_with_crlf_end,
+            generation_guard,
+            "Chunked body ended mid-chunk",
+        )
+        .await?;
         if &parse_buf[chunk_end..chunk_with_crlf_end] != b"\r\n" {
             return Err(miette!("Chunk missing terminating CRLF"));
         }
@@ -3231,6 +3240,43 @@ where
             pos = 0;
         }
     }
+}
+
+/// Read and forward only the bytes needed to reach `target_len`.
+///
+/// Limiting each socket read to the current chunked framing boundary prevents
+/// a pipelined request from being consumed and written upstream as part of the
+/// authorized request body.
+async fn relay_chunked_until_len<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    read_buf: &mut [u8; RELAY_BUF_SIZE],
+    parse_buf: &mut Vec<u8>,
+    target_len: usize,
+    generation_guard: Option<&PolicyGenerationGuard>,
+    eof_message: &'static str,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    while parse_buf.len() < target_len {
+        let remaining = target_len - parse_buf.len();
+        let to_read = remaining.min(read_buf.len());
+        let n = reader
+            .read(&mut read_buf[..to_read])
+            .await
+            .into_diagnostic()?;
+        if n == 0 {
+            return Err(miette!(eof_message));
+        }
+        if let Some(guard) = generation_guard {
+            guard.ensure_current()?;
+        }
+        writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
+        parse_buf.extend_from_slice(&read_buf[..n]);
+    }
+    Ok(())
 }
 
 fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
@@ -4557,6 +4603,67 @@ mod tests {
             BodyLength::Chunked => {}
             other => panic!("Expected Chunked, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_leaves_pipelined_request_for_next_policy_decision() {
+        let chunked_body = b"0\r\n\r\n";
+        let pipelined_request =
+            b"DELETE /blocked HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
+        let mut wire = chunked_body.to_vec();
+        wire.extend_from_slice(pipelined_request);
+
+        let (mut relay_reader, mut client_writer) = tokio::io::duplex(4096);
+        client_writer.write_all(&wire).await.unwrap();
+        let (mut relay_writer, mut upstream_reader) = tokio::io::duplex(4096);
+
+        relay_chunked(&mut relay_reader, &mut relay_writer, &[], None)
+            .await
+            .expect("chunked body should relay");
+
+        let mut remaining = vec![0; pipelined_request.len()];
+        relay_reader.read_exact(&mut remaining).await.unwrap();
+        assert_eq!(remaining, pipelined_request);
+
+        drop(relay_writer);
+        let mut forwarded = Vec::new();
+        upstream_reader.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(forwarded, chunked_body);
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_with_forwarded_prefix_and_trailers_preserves_pipeline_boundary() {
+        let already_forwarded = b"3\r\na";
+        let body_remainder = b"bc\r\n0\r\nX-Checksum: abc123\r\n\r\n";
+        let pipelined_request =
+            b"DELETE /blocked HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
+        let mut later_read = body_remainder.to_vec();
+        later_read.extend_from_slice(pipelined_request);
+
+        let (mut relay_reader, mut client_writer) = tokio::io::duplex(4096);
+        client_writer.write_all(&later_read).await.unwrap();
+        let (mut relay_writer, mut upstream_reader) = tokio::io::duplex(4096);
+        relay_writer.write_all(already_forwarded).await.unwrap();
+
+        relay_chunked(
+            &mut relay_reader,
+            &mut relay_writer,
+            already_forwarded,
+            None,
+        )
+        .await
+        .expect("chunked body with trailers should relay");
+
+        let mut remaining = vec![0; pipelined_request.len()];
+        relay_reader.read_exact(&mut remaining).await.unwrap();
+        assert_eq!(remaining, pipelined_request);
+
+        drop(relay_writer);
+        let mut forwarded = Vec::new();
+        upstream_reader.read_to_end(&mut forwarded).await.unwrap();
+        let mut expected = already_forwarded.to_vec();
+        expected.extend_from_slice(body_remainder);
+        assert_eq!(forwarded, expected);
     }
 
     #[test]
