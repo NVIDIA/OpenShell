@@ -5,7 +5,7 @@
 
 ["build:gateway"]
 description = "Build the standalone openshell-gateway binary"
-run = "cargo build -p openshell-gateway --bin openshell-gateway"
+run = "bash -c 'source tasks/scripts/build-env.sh && ensure_build_nofile_limit && cargo build -p openshell-gateway --bin openshell-gateway'"
 hide = true
 
 ["gateway"]
