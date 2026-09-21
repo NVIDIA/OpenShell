@@ -254,12 +254,12 @@ impl NetworkBroker {
         })?);
         let (pending_tx, pending_rx) = mpsc::channel(OPEN_QUEUE_CAPACITY);
         let (pending_dns_tx, pending_dns_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
-        let retained_socket_capacity = retained_socket_capacity()?;
-        let registry = Arc::new(Mutex::new(SocketRegistry::new(1, SOCKET_CAPACITY)?));
         let active_opens = Arc::new(AtomicUsize::new(0));
         let active_accepts = Arc::new(AtomicUsize::new(0));
         let dns_relay = start_dns_relay(dns_address, pending_dns_tx)?;
         let dns_address = dns_relay.address;
+        let retained_socket_capacity = retained_socket_capacity()?;
+        let registry = Arc::new(Mutex::new(SocketRegistry::new(1, SOCKET_CAPACITY)?));
         let queues = NotificationQueues {
             protected_control_port,
             accept_registrar: accept_monitor.registrar(),
@@ -669,11 +669,16 @@ fn retained_socket_capacity() -> io::Result<usize> {
         return Err(io::Error::last_os_error());
     }
     let soft_limit = usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX);
-    Ok(retained_socket_capacity_for_limit(soft_limit))
+    let open_descriptors = std::fs::read_dir("/proc/self/fd")?.count();
+    Ok(retained_socket_capacity_for_limit(
+        soft_limit,
+        open_descriptors,
+    ))
 }
 
-fn retained_socket_capacity_for_limit(soft_limit: usize) -> usize {
+fn retained_socket_capacity_for_limit(soft_limit: usize, open_descriptors: usize) -> usize {
     soft_limit
+        .saturating_sub(open_descriptors)
         .saturating_sub(SOCKET_FD_HEADROOM)
         .clamp(1, SOCKET_CAPACITY)
 }
@@ -1814,11 +1819,11 @@ mod tests {
 
     #[test]
     fn retained_socket_capacity_reserves_process_descriptor_headroom() {
-        assert_eq!(retained_socket_capacity_for_limit(1_024), 960);
-        assert_eq!(retained_socket_capacity_for_limit(128), 64);
-        assert_eq!(retained_socket_capacity_for_limit(64), 1);
+        assert_eq!(retained_socket_capacity_for_limit(1_024, 24), 936);
+        assert_eq!(retained_socket_capacity_for_limit(128, 32), 32);
+        assert_eq!(retained_socket_capacity_for_limit(64, 0), 1);
         assert_eq!(
-            retained_socket_capacity_for_limit(usize::MAX),
+            retained_socket_capacity_for_limit(usize::MAX, 0),
             SOCKET_CAPACITY
         );
     }
