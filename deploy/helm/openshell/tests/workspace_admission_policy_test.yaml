@@ -1,0 +1,119 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: workspace admission policy
+templates:
+  - templates/workspace-admission-policy.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: is not rendered in shared mode
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: is not rendered when disabled
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      admissionPolicy.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders a denying policy and binding in managed mode
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - hasDocuments:
+          count: 2
+      - isKind:
+          of: ValidatingAdmissionPolicy
+        documentIndex: 0
+      - equal:
+          path: spec.failurePolicy
+          value: Fail
+        documentIndex: 0
+      - isKind:
+          of: ValidatingAdmissionPolicyBinding
+        documentIndex: 1
+      - equal:
+          path: spec.validationActions
+          value: ["Deny"]
+        documentIndex: 1
+      - equal:
+          path: spec.policyName
+          value: openshell-workspace-scope-my-namespace
+        documentIndex: 1
+
+  - it: matches only the gateway ServiceAccount
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: spec.matchConditions[0].expression
+          value: request.userInfo.username == 'system:serviceaccount:my-namespace:openshell'
+
+  - it: allows gateway-owned managed namespaces by gateway ID
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      server.sandboxJwt.gatewayId: gw-1
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.variables[3].expression
+          pattern: "variables.labels\\['openshell.ai/gateway-id'\\] == 'gw-1'"
+      - equal:
+          path: spec.variables[4].expression
+          value: "false"
+
+  - it: allows the sandbox and credential namespaces
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      server.sandboxNamespace: sandboxes
+      server.credentialDrivers.kubernetesSecrets.enabled: true
+      server.credentialDrivers.kubernetesSecrets.namespace: provider-secrets
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[0].expression
+          pattern: "in \\['sandboxes', 'provider-secrets'\\]"
+
+  - it: renders operator equality selectors
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+      server.drivers.kubernetes.operatorNamespaceLabel: "team.example.com/openshell=enabled, tier=ai"
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: spec.variables[3].expression
+          value: "false"
+      - equal:
+          path: spec.variables[4].expression
+          value: "(('team.example.com/openshell' in variables.labels && variables.labels['team.example.com/openshell'] == 'enabled') && ('tier' in variables.labels && variables.labels['tier'] == 'ai'))"
+
+  - it: rejects set-based operator selectors
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+      server.drivers.kubernetes.operatorNamespaceLabel: "tier in (ai,ml)"
+    asserts:
+      - failedTemplate:
+          errorPattern: admissionPolicy supports only key=value terms
+
+  - it: rejects operator namespace files
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+      server.drivers.kubernetes.operatorNamespaceFile: /etc/openshell/namespaces.json
+    asserts:
+      - failedTemplate:
+          errorPattern: admissionPolicy cannot enforce
+
+  - it: rejects gateway IDs that are not DNS labels
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      server.sandboxJwt.gatewayId: "gw'1"
+    asserts:
+      - failedTemplate:
+          errorPattern: DNS-1123 label

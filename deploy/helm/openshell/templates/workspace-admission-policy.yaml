@@ -1,0 +1,100 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if include "openshell.admissionPolicyEnabled" . }}
+{{- $kubernetes := .Values.server.drivers.kubernetes }}
+{{- $workspaceMode := $kubernetes.workspaceMode }}
+{{- $gatewayId := .Values.server.sandboxJwt.gatewayId | default (include "openshell.fullname" .) }}
+{{- $allowedNamespaces := list (include "openshell.sandboxNamespace" .) }}
+{{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
+{{- $allowedNamespaces = append $allowedNamespaces (include "openshell.credentialKubernetesSecretsNamespace" .) }}
+{{- end }}
+{{- $managed := "false" }}
+{{- if eq $workspaceMode "managed" }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $gatewayId) }}
+{{- fail "admissionPolicy requires the gateway ID (server.sandboxJwt.gatewayId or the release fullname) to be a DNS-1123 label" }}
+{{- end }}
+{{- $managed = printf "('openshell.ai/managed-by' in variables.labels && variables.labels['openshell.ai/managed-by'] == 'openshell' && 'openshell.ai/gateway-id' in variables.labels && variables.labels['openshell.ai/gateway-id'] == '%s')" $gatewayId }}
+{{- end }}
+{{- $operator := "false" }}
+{{- if eq $workspaceMode "operator" }}
+{{- if $kubernetes.operatorNamespaceFile }}
+{{- fail "admissionPolicy cannot enforce server.drivers.kubernetes.operatorNamespaceFile; use operatorNamespaceLabel or set admissionPolicy.enabled=false" }}
+{{- end }}
+{{- $terms := list }}
+{{- range splitList "," $kubernetes.operatorNamespaceLabel }}
+{{- $term := trim . }}
+{{- if not (regexMatch "^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?=([A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?)?$" $term) }}
+{{- fail (printf "admissionPolicy supports only key=value terms in server.drivers.kubernetes.operatorNamespaceLabel, got %q; set admissionPolicy.enabled=false to use other selectors" $term) }}
+{{- end }}
+{{- $pair := splitn "=" 2 $term }}
+{{- $terms = append $terms (printf "('%s' in variables.labels && variables.labels['%s'] == '%s')" $pair._0 $pair._0 $pair._1) }}
+{{- end }}
+{{- $operator = printf "(%s)" (join " && " $terms) }}
+{{- end }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "openshell.fullname" . }}-workspace-scope-{{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["secrets", "pods", "services", "serviceaccounts", "namespaces"]
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["networkpolicies"]
+      - apiGroups: ["agents.x-k8s.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["sandboxes", "sandboxes/status"]
+  matchConditions:
+    - name: gateway-service-account
+      expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:{{ .Release.Namespace }}:{{ include "openshell.serviceAccountName" . }}'
+  variables:
+    - name: isNamespace
+      expression: "request.resource.group == '' && request.resource.resource == 'namespaces'"
+    - name: targetNamespace
+      expression: >-
+        variables.isNamespace
+        ? (request.operation == 'CREATE' ? object : oldObject)
+        : namespaceObject
+    - name: labels
+      expression: >-
+        has(variables.targetNamespace.metadata.labels)
+        ? variables.targetNamespace.metadata.labels
+        : {}
+    - name: managed
+      expression: {{ $managed | quote }}
+    - name: operator
+      expression: {{ $operator | quote }}
+  validations:
+    - expression: >-
+        variables.isNamespace
+        ? variables.managed
+        : (variables.targetNamespace.metadata.name in [{{ range $i, $ns := uniq $allowedNamespaces }}{{ if $i }}, {{ end }}'{{ $ns }}'{{ end }}]
+          || variables.managed || variables.operator)
+      messageExpression: >-
+        'the OpenShell gateway may not ' + request.operation + ' ' +
+        request.resource.resource + ' in namespace ' +
+        variables.targetNamespace.metadata.name
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "openshell.fullname" . }}-workspace-scope-{{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "openshell.fullname" . }}-workspace-scope-{{ .Release.Namespace }}
+  validationActions: ["Deny"]
+{{- end }}

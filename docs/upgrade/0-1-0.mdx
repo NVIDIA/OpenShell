@@ -61,6 +61,8 @@ If you run OpenShell for a team, start here.
 
 - **Install the workspace chart in operator-managed namespaces.** In operator workspace mode, the gateway receives Secret permissions only from the `openshell-workspace` chart. Install the matching chart release in every operator-managed namespace; without it, sandbox bootstrap fails ([PR #3616](https://github.com/NVIDIA/OpenShell/pull/3616)).
 
+- **Check admission policy requirements.** In managed and operator workspace modes, the chart installs a `ValidatingAdmissionPolicy` that limits gateway workspace requests to namespaces it owns or selects. This requires Kubernetes 1.30 or later. The chart fails to render with `operatorNamespaceFile` or a set-based `operatorNamespaceLabel` while the policy is enabled; set `admissionPolicy.enabled=false` to keep those configurations ([PR #3630](https://github.com/NVIDIA/OpenShell/pull/3630)).
+
 - **Implement extension protocol negotiation.** Custom compute drivers, credential drivers, gateway interceptors, and middleware must exchange `PeerMetadata`, use protocol `1.0`, and advertise their family base capability. Upgrade both peers together. See [Extension Protocol Negotiation](/extensibility/extension-negotiation) and [PR #3352](https://github.com/NVIDIA/OpenShell/pull/3352).
 
 - **Remove compute-driver callback-listener negotiation.** Regenerate custom compute-driver bindings and connect supervisors to the operator-configured primary gateway endpoint ([PR #3365](https://github.com/NVIDIA/OpenShell/pull/3365)).
