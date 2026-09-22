@@ -278,11 +278,11 @@ spec:
     {{- if .Values.upstreamProxy.caBundle.configMapName }}
     - name: upstream-proxy-ca
       configMap:
-        name: {{ .Values.upstreamProxy.caBundle.configMapName }}
+        name: {{ .Values.upstreamProxy.caBundle.configMapName | quote }}
         items:
           # The mounted filename stays fixed so the rendered proxy_ca_bundle
           # path does not depend on the operator's ConfigMap key.
-          - key: {{ .Values.upstreamProxy.caBundle.key | default "ca.crt" }}
+          - key: {{ .Values.upstreamProxy.caBundle.key | default "ca.crt" | quote }}
             path: ca.crt
     {{- end }}
     {{- if .Values.server.providerTokenGrants.spiffe.enabled }}

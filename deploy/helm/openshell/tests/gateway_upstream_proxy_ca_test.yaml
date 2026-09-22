@@ -78,6 +78,26 @@ tests:
                 - key: ca-bundle.crt
                   path: ca.crt
 
+  # Kubernetes requires both ConfigMap reference fields to be strings. Quote
+  # numeric-looking operator values in the rendered workload so YAML does not
+  # decode them as numbers before typed Kubernetes validation.
+  - it: preserves numeric-looking ConfigMap references as strings
+    template: templates/statefulset.yaml
+    set:
+      upstreamProxy.url: https://proxy.corp.example:3130
+      upstreamProxy.caBundle.configMapName: "123"
+      upstreamProxy.caBundle.key: "456"
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: upstream-proxy-ca
+            configMap:
+              name: "123"
+              items:
+                - key: "456"
+                  path: ca.crt
+
   - it: adds no volume when no corporate proxy CA is configured
     template: templates/statefulset.yaml
     set:
