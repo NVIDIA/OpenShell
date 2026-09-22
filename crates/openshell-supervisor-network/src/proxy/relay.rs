@@ -330,12 +330,15 @@ fn emit_stale_relay_close(request: &L7EvalContext, guard: &PolicyGenerationGuard
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        EgressIntent, EndpointDecision, ProcessIdentityEvidence, query_l7_route_snapshot,
-    };
+    #[cfg(target_os = "windows")]
+    use super::super::query_l7_route_snapshot;
+    use super::super::{EgressIntent, EndpointDecision, ProcessIdentityEvidence};
     use super::*;
+    #[cfg(target_os = "windows")]
     use crate::opa::NetworkInput;
+    #[cfg(target_os = "windows")]
     use std::path::PathBuf;
+    #[cfg(target_os = "windows")]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const POLICY_REGO: &str = include_str!("../../data/sandbox-policy.rego");
