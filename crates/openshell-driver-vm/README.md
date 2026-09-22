@@ -161,7 +161,7 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, console logs, image cache, and private `run/compute-driver.sock` UDS. Relative paths are resolved to absolute paths at driver startup. |
 | `driver_dir` | unset | Override the directory searched for `openshell-driver-vm`. |
 | `default_image` | OpenShell base image | Sandbox image used when a create request omits one. |
-| `bootstrap_image` | unset | VM runtime image used as the immutable bootstrap root disk. Defaults to the sandbox image when unset. |
+| `bootstrap_image` | unset | VM runtime image used as the immutable bootstrap root disk. Falls back only to the operator-configured `default_image`; the driver refuses to start when both are empty. |
 | `vcpus` | `2` | vCPUs per sandbox. |
 | `mem_mib` | `2048` | Memory per sandbox, in MiB. |
 | `overlay_disk_mib` | `4096` | Sparse writable overlay disk size per sandbox, in MiB. |
@@ -217,6 +217,9 @@ symlinks that remain inside the rootfs, but rejects absolute or escaping
 cross-layer symlink traversal before applying later files or whiteouts. The
 layer applier performs rootfs mutations relative to opened directory handles
 and creates destination files without following symlinks.
+The requested sandbox image is never selected as the bootstrap image. Operators
+must configure either `bootstrap_image` or `default_image`; when both are empty,
+the driver fails during startup.
 
 Each sandbox gets its own sparse writable
 `<state-dir>/sandboxes/<id>/overlay.ext4`. Guest init mounts overlayfs as `/`

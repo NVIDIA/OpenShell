@@ -434,6 +434,16 @@ impl VmDriverConfig {
         Ok(())
     }
 
+    pub fn validate_bootstrap_image_config(&self) -> Result<(), String> {
+        if self.bootstrap_image.trim().is_empty() && self.default_image.trim().is_empty() {
+            return Err(
+                "vm driver requires bootstrap_image or default_image; the sandbox image cannot be used as the VM bootstrap image"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate_rootfs_tar_config(&self) -> Result<(), String> {
         if self
             .rootfs_tar_staging_dir
@@ -691,6 +701,7 @@ impl VmDriver {
             .map_err(|err| err.message().to_string())?;
         config.validate_sandbox_identity()?;
         config.validate_runtime_security_config()?;
+        config.validate_bootstrap_image_config()?;
         config.validate_rootfs_tar_config()?;
         if config.grpc_endpoint.trim().is_empty() {
             return Err("openshell endpoint is required".to_string());
@@ -1317,7 +1328,7 @@ impl VmDriver {
                         "cannot restore rootfs-tar sandbox: persisted image identity not found: {err}"
                     ))
                 })?;
-            let bootstrap_image_ref = self.bootstrap_image_ref(&image_ref);
+            let bootstrap_image_ref = self.bootstrap_image_ref()?;
             let bootstrap_image_identity = self
                 .ensure_cached_bootstrap_rootfs_image(&sandbox.id, &bootstrap_image_ref)
                 .await?;
@@ -2704,7 +2715,7 @@ impl VmDriver {
         rootfs_tar_path: Option<&Path>,
     ) -> Result<RuntimeImagePlan, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let bootstrap_image_ref = self.bootstrap_image_ref(image_ref);
+        let bootstrap_image_ref = self.bootstrap_image_ref()?;
         let bootstrap_image_identity = self
             .ensure_cached_bootstrap_rootfs_image(sandbox_id, &bootstrap_image_ref)
             .await?;
@@ -2742,9 +2753,13 @@ impl VmDriver {
         }))
     }
 
-    fn bootstrap_image_ref(&self, sandbox_image_ref: &str) -> String {
+    fn bootstrap_image_ref(&self) -> Result<String, Status> {
         self.bootstrap_image_ref_default()
-            .unwrap_or_else(|| sandbox_image_ref.to_string())
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "vm driver requires bootstrap_image or default_image; the sandbox image cannot be used as the VM bootstrap image",
+                )
+            })
     }
 
     fn bootstrap_image_ref_default(&self) -> Option<String> {
@@ -9056,7 +9071,7 @@ mod tests {
         };
 
         assert_eq!(
-            driver.bootstrap_image_ref("ghcr.io/example/app:latest"),
+            driver.bootstrap_image_ref().unwrap(),
             "openshell/sandbox-bootstrap:latest"
         );
     }
@@ -9080,13 +9095,13 @@ mod tests {
         };
 
         assert_eq!(
-            driver.bootstrap_image_ref("ghcr.io/example/app:latest"),
+            driver.bootstrap_image_ref().unwrap(),
             "openshell/sandbox:default"
         );
     }
 
     #[test]
-    fn bootstrap_image_ref_falls_back_to_requested_image() {
+    fn bootstrap_image_ref_rejects_missing_trusted_image() {
         let (socket_root, socket_root_fd) = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig::default(),
@@ -9100,10 +9115,41 @@ mod tests {
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
-        assert_eq!(
-            driver.bootstrap_image_ref("ghcr.io/example/app:latest"),
-            "ghcr.io/example/app:latest"
-        );
+        let error = driver
+            .bootstrap_image_ref()
+            .expect_err("sandbox images must not become VM bootstrap images");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("sandbox image cannot be used"));
+    }
+
+    #[tokio::test]
+    async fn vm_driver_startup_rejects_missing_trusted_bootstrap_image() {
+        let Err(error) = VmDriver::new(VmDriverConfig::default()).await else {
+            panic!("driver startup must reject an empty bootstrap configuration");
+        };
+        assert!(error.contains("sandbox image cannot be used"));
+    }
+
+    #[test]
+    fn bootstrap_image_config_requires_a_trusted_image() {
+        let error = VmDriverConfig::default()
+            .validate_bootstrap_image_config()
+            .expect_err("an empty bootstrap configuration must fail closed");
+        assert!(error.contains("sandbox image cannot be used"));
+
+        VmDriverConfig {
+            default_image: "openshell/sandbox:default".to_string(),
+            ..Default::default()
+        }
+        .validate_bootstrap_image_config()
+        .expect("the operator-controlled default image is a valid fallback");
+
+        VmDriverConfig {
+            bootstrap_image: "openshell/sandbox-bootstrap:latest".to_string(),
+            ..Default::default()
+        }
+        .validate_bootstrap_image_config()
+        .expect("an explicit bootstrap image is valid");
     }
 
     #[test]
