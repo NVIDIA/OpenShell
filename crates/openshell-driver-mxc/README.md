@@ -124,7 +124,26 @@ PID from inheriting the previous process's attribution regardless of delivery
 delay. The process monitor retires the live PID at exit. Established identity,
 activity, and correlation-vector links remain available for five seconds so
 already in-flight ETW records can arrive, but retired PID evidence cannot resolve
-them. Records without matching generation evidence remain unattributed.
+them. Records without matching generation evidence remain unattributed --
+deliberately: misattributing an ETW record to the wrong `sandbox_id` would
+corrupt the audit trail, which is worse than a coverage gap. Unrelated,
+non-OpenShell AppContainer or UAC activity shares this same OS Sandboxing
+provider and cannot be told apart from OpenShell's own records without this
+generation evidence, so guessing (for example, by assuming a lone pending
+launch owns an unmatched record) is not a safe substitute for it.
+
+An unattributed record is dropped after five seconds, and the driver warns
+once immediately, then coalesces further drops to at most one aggregated
+warning every 30 seconds while they continue -- unattributed drops are
+expected, ordinary activity, not a rare condition, so warning once per record
+would let a burst of that activity flood operator logs.
+
+If the real-time ETW session itself never matches a single record from the
+Sandboxing provider despite observed sandbox activity -- for example a
+provider-identity mismatch, or the provider not firing at all on a given
+host/build -- the driver warns once per session and emits a `mxc-etw-zero-events`
+OCSF Detection Finding [2004] naming the gap, distinct from the per-record
+unattributed-drop warning above.
 
 Each sandbox receives a distinct proxy listener and a random per-sandbox credential through its proxy environment. Missing, incorrect, duplicate, or another sandbox's proxy credentials receive HTTP 407 before policy evaluation or forwarding. This authenticates requests to the OpenShell proxy; it does not restrict access to unrelated host-loopback services or authenticate individual processes inside a sandbox. Proxy credentials and command/environment payloads must not be logged.
 
