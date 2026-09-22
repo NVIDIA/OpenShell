@@ -28,7 +28,6 @@ use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::TraceContextExt as _;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use prost::Message;
-use prost_types::FileDescriptorSet;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
@@ -200,40 +199,6 @@ macro_rules! request_id_middleware {
 /// the largest payload and well within this cap under normal use.
 const MAX_GRPC_DECODE_SIZE: usize = 1_048_576;
 const MAX_INTERCEPTED_GRPC_BODY_SIZE: usize = MAX_GRPC_DECODE_SIZE + 5;
-const REFLECTED_PROTO_ROOTS: &[&str] = &["openshell.proto"];
-
-/// Restrict reflection to the public gateway APIs and their imported types.
-fn gateway_reflection_descriptor_set() -> Result<FileDescriptorSet, prost::DecodeError> {
-    let mut descriptor_set = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET)?;
-    let mut included: std::collections::BTreeSet<String> = REFLECTED_PROTO_ROOTS
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect();
-
-    loop {
-        let before = included.len();
-        for file in &descriptor_set.file {
-            if file
-                .name
-                .as_ref()
-                .is_some_and(|name| included.contains(name))
-            {
-                included.extend(file.dependency.iter().cloned());
-            }
-        }
-        if included.len() == before {
-            break;
-        }
-    }
-
-    descriptor_set.file.retain(|file| {
-        file.name
-            .as_ref()
-            .is_some_and(|name| included.contains(name))
-    });
-    Ok(descriptor_set)
-}
-
 /// Concurrent HTTP/2 streams allowed per connection. Sits above the
 /// per-replica pending relay budget so pooled peer connections are bounded by
 /// the relay caps rather than by the transport.
@@ -277,10 +242,7 @@ impl MultiplexService {
             self.state.gateway_interceptors.clone(),
             Some(self.state.clone()),
         );
-        let reflection = tonic_reflection::server::Builder::configure()
-            .register_file_descriptor_set(gateway_reflection_descriptor_set()?)
-            .with_service_name("openshell.v1.OpenShell")
-            .build_v1()?;
+        let reflection = self.state.reflection_service.clone();
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
@@ -774,7 +736,7 @@ impl GrpcRateLimiter {
         })
     }
 
-    fn allow(&self) -> bool {
+    pub(crate) fn allow(&self) -> bool {
         let now = Instant::now();
         let mut state = self
             .state
@@ -2644,11 +2606,8 @@ mod tests {
             server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
         };
 
-        let reflection = tonic_reflection::server::Builder::configure()
-            .register_file_descriptor_set(gateway_reflection_descriptor_set().unwrap())
-            .with_service_name("openshell.v1.OpenShell")
-            .build_v1()
-            .unwrap();
+        let reflection =
+            crate::reflection::build_gateway_reflection_service(&Config::new(None)).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let unrouted = tower::service_fn(|_request: Request<BoxBody>| async {
@@ -2665,10 +2624,7 @@ mod tests {
             true,
             false,
         );
-        let service = GatewayListenerContextService::new(
-            MultiplexedService::new(grpc, unrouted),
-            GatewayListenerScope::Primary,
-        );
+        let service = MultiplexedService::new(grpc, unrouted);
         let server = tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -2688,19 +2644,22 @@ mod tests {
             .await
             .unwrap();
         let mut client = ServerReflectionClient::new(channel);
-        let request = ServerReflectionRequest {
+        let list_request = ServerReflectionRequest {
             host: String::new(),
             message_request: Some(MessageRequest::ListServices(String::new())),
         };
-        let response = client
-            .server_reflection_info(tokio_stream::iter([request]))
+        let descriptor_request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::FileContainingSymbol(
+                "openshell.v1.OpenShell".to_string(),
+            )),
+        };
+        let mut responses = client
+            .server_reflection_info(tokio_stream::iter([list_request, descriptor_request]))
             .await
             .unwrap()
-            .into_inner()
-            .message()
-            .await
-            .unwrap()
-            .unwrap();
+            .into_inner();
+        let response = responses.message().await.unwrap().unwrap();
         let Some(MessageResponse::ListServicesResponse(response)) = response.message_response
         else {
             panic!("expected a reflection list-services response");
@@ -2713,12 +2672,78 @@ mod tests {
         names.sort();
 
         assert_eq!(names, vec!["openshell.v1.OpenShell"]);
+
+        let descriptor_response = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::FileDescriptorResponse(response)) =
+            descriptor_response.message_response
+        else {
+            panic!("expected a reflection file-descriptor response");
+        };
+        let descriptor = prost_types::FileDescriptorProto::decode(
+            response.file_descriptor_proto.first().unwrap().as_slice(),
+        )
+        .unwrap();
+        assert_eq!(descriptor.name.as_deref(), Some("openshell.proto"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reflection_rate_limit_charges_each_query_on_one_stream() {
+        use tonic::Code;
+        use tonic_reflection::pb::v1::{
+            ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
+            server_reflection_request::MessageRequest,
+        };
+
+        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let reflection = crate::reflection::build_gateway_reflection_service(&config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let unrouted = tower::service_fn(|_request: Request<BoxBody>| async {
+            Ok::<_, Infallible>(tonic::Status::unimplemented("test fallback").into_http())
+        });
+        let service = MultiplexedService::new(GrpcRouter::new(unrouted, reflection), unrouted);
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = service.clone();
+                tokio::spawn(async move {
+                    Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = ServerReflectionClient::new(channel);
+        let query = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        };
+        let mut responses = client
+            .server_reflection_info(tokio_stream::iter([query.clone(), query]))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(responses.message().await.unwrap().is_some());
+        let status = responses
+            .message()
+            .await
+            .expect_err("second query on the same stream must be rate limited");
+        assert_eq!(status.code(), Code::ResourceExhausted);
         server.abort();
     }
 
     #[test]
     fn reflection_descriptor_excludes_internal_service_protos() {
-        let descriptors = gateway_reflection_descriptor_set().unwrap();
+        let descriptors = crate::reflection::gateway_reflection_descriptor_set().unwrap();
         let names: std::collections::BTreeSet<_> = descriptors
             .file
             .iter()

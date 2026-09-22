@@ -160,6 +160,8 @@ Callback-only listeners reject reflection before authentication.
 Operators can configure a gateway-wide gRPC request rate limit. The limit is
 applied only to gRPC API traffic after protocol multiplexing; health, metrics,
 and local sandbox-service HTTP routes are not rate limited by this control.
+Reflection has an independent counter with the same configured count and
+window, charged once for every query carried by its bidirectional stream.
 
 Gateway interceptors run in one middleware layer on the `openshell.v1.OpenShell`
 gRPC service after authentication and before tonic dispatches to individual

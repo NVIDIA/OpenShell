@@ -33,6 +33,7 @@ pub(crate) mod policy_store;
 mod provider_profile_sources;
 mod provider_refresh;
 mod readiness;
+mod reflection;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
@@ -349,6 +350,9 @@ pub struct ServerState {
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
 
+    /// Immutable public reflection index and its per-query rate limiter.
+    pub(crate) reflection_service: reflection::GatewayReflectionServer,
+
     /// Per-sandbox bound on extension credential minting, which resolves the
     /// caller's effective policy on every request.
     pub(crate) extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter,
@@ -425,6 +429,8 @@ impl ServerState {
         let replica_id = compute::lease::replica_id();
         let peer_endpoint = derive_peer_endpoint(&config);
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
+        let reflection_service = reflection::build_gateway_reflection_service(&config)
+            .expect("compiled public gateway descriptors must be valid");
         let admin_role = config
             .oidc
             .as_ref()
@@ -456,6 +462,7 @@ impl ServerState {
             compute_driver_authenticator: None,
             peer_authenticator: None,
             grpc_rate_limiter,
+            reflection_service,
             gateway_interceptors: None,
             provider_profile_sources:
                 provider_profile_sources::ProviderProfileSources::with_default_sources(),
