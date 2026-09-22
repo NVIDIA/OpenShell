@@ -6,13 +6,16 @@
   hosts: all
   gather_facts: false
   vars:
-    upgrade_sandbox: tmachine-upgrade-existing
-    post_upgrade_sandbox: tmachine-upgrade-new
+    upgrade_sandbox: upgrade-existing
+    post_upgrade_sandbox: upgrade-new
     user_systemd_environment:
       HOME: /home/tmachine
       XDG_RUNTIME_DIR: /run/user/1000
       DBUS_SESSION_BUS_ADDRESS: unix:path=/run/user/1000/bus
   tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
     - name: Exercise prerelease baseline and RPM upgrade candidate
       block:
         - name: Read expected source package versions
