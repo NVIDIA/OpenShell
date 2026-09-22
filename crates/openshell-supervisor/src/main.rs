@@ -341,6 +341,7 @@ fn main() -> Result<()> {
         let push_layer = log_push_state.as_ref().map(|(layer, _)| layer.clone());
         let _log_push_handle = log_push_state.map(|(_, handle)| handle);
         let ocsf_enabled = Arc::new(AtomicBool::new(false));
+        let ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
 
         let (_file_guard, _jsonl_guard) = if let Some((file_writer, file_guard)) = file_logging {
             let jsonl_logging = tracing_appender::rolling::RollingFileAppender::builder()
@@ -352,7 +353,9 @@ fn main() -> Result<()> {
                 .ok()
                 .map(|roller| {
                     let (writer, guard) = tracing_appender::non_blocking(roller);
-                    let layer = OcsfJsonlLayer::new(writer).with_enabled_flag(ocsf_enabled.clone());
+                    let layer = OcsfJsonlLayer::new(writer)
+                        .with_enabled_flag(ocsf_enabled.clone())
+                        .with_target_version(ocsf_schema_version.clone());
                     (layer, guard)
                 });
             let (jsonl_layer, jsonl_guard) =
@@ -437,6 +440,7 @@ fn main() -> Result<()> {
                     args.ssh_socket_path,
                     args.health_socket_path,
                     ocsf_enabled,
+                    ocsf_schema_version,
                     upstream_proxy_args,
                     backend_descriptor,
                     auth_bundle,

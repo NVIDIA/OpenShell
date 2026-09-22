@@ -569,6 +569,7 @@ pub async fn run_sandbox(
     ssh_socket_path: Option<String>,
     health_socket_path: Option<std::path::PathBuf>,
     ocsf_enabled: Arc<AtomicBool>,
+    ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
     backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
@@ -1011,6 +1012,7 @@ pub async fn run_sandbox(
         let poll_endpoint = endpoint.to_string();
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_enabled.clone();
+        let poll_ocsf_schema_version = ocsf_schema_version.clone();
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
@@ -1031,6 +1033,7 @@ pub async fn run_sandbox(
             entrypoint_pid: poll_pid,
             interval_secs: poll_interval_secs,
             ocsf_enabled: poll_ocsf_enabled,
+            ocsf_schema_version: poll_ocsf_schema_version,
             provider_credentials: poll_provider_credentials,
             provider_readiness: provider_readiness.clone(),
             policy_local_ctx: poll_policy_local,
@@ -3513,6 +3516,7 @@ struct PolicyPollLoopContext {
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<AtomicBool>,
+    ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     provider_credentials: ProviderCredentialState,
     provider_readiness: ProviderReadinessTracker,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
@@ -4034,6 +4038,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     );
                     current_policy_generation = Some(generation.clone());
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -4072,6 +4077,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 }
                 (InitialPollDisposition::TrackOnly, _) => {
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -4680,6 +4686,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
         apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+        apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
 
         // Apply the agent-proposals feature toggle. On a false→true transition
         // we lazily install the skill so a sandbox that started with the flag
@@ -4734,6 +4741,38 @@ fn extract_bool_setting(
         .and_then(|sv| sv.value.as_ref())
         .and_then(|v| match v {
             setting_value::Value::BoolValue(b) => Some(*b),
+            _ => None,
+        })
+}
+
+fn apply_ocsf_schema_version_setting(
+    version: &std::sync::Mutex<String>,
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) {
+    let new_version = extract_string_setting(settings, "ocsf_schema_version").unwrap_or_default();
+    if let Ok(mut current) = version.lock()
+        && *current != new_version
+    {
+        info!(
+            ocsf_schema_version = %new_version,
+            "OCSF schema version target changed"
+        );
+        *current = new_version;
+    }
+}
+
+/// Extract a string value from an effective setting, if present.
+fn extract_string_setting(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    key: &str,
+) -> Option<String> {
+    use openshell_core::proto::setting_value;
+    settings
+        .get(key)
+        .and_then(|es| es.value.as_ref())
+        .and_then(|sv| sv.value.as_ref())
+        .and_then(|v| match v {
+            setting_value::Value::StringValue(value) => Some(value.clone()),
             _ => None,
         })
 }
@@ -5059,6 +5098,37 @@ mod tests {
         apply_ocsf_json_setting(&enabled, &settings);
 
         assert!(!enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn apply_ocsf_schema_version_setting_updates_from_initial_settings_snapshot() {
+        let version = std::sync::Mutex::new(String::new());
+        let mut settings = std::collections::HashMap::new();
+        settings.insert(
+            "ocsf_schema_version".to_string(),
+            openshell_core::proto::EffectiveSetting {
+                value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "1.3".into(),
+                    )),
+                }),
+                scope: openshell_core::proto::SettingScope::Sandbox.into(),
+            },
+        );
+
+        apply_ocsf_schema_version_setting(&version, &settings);
+
+        assert_eq!(*version.lock().unwrap(), "1.3");
+    }
+
+    #[test]
+    fn apply_ocsf_schema_version_setting_clears_when_setting_is_unset() {
+        let version = std::sync::Mutex::new("1.1".to_string());
+        let settings = std::collections::HashMap::new();
+
+        apply_ocsf_schema_version_setting(&version, &settings);
+
+        assert_eq!(*version.lock().unwrap(), "");
     }
 
     #[test]
@@ -6396,6 +6466,7 @@ network_policies:
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
             interval_secs: 0,
             ocsf_enabled: Arc::new(AtomicBool::new(false)),
+            ocsf_schema_version: Arc::new(std::sync::Mutex::new(String::new())),
             provider_credentials,
             provider_readiness,
             policy_local_ctx: None,
