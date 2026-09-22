@@ -15,6 +15,11 @@ navigation:
     path: get-started/quickstart.mdx
   - folder: get-started/tutorials
     skip-slug: true
+- section: "Upgrade"
+  slug: upgrade
+  contents:
+  - page: "0.1.0"
+    path: upgrade/0-1-0.mdx
 - folder: sandboxes
   title: "Manage OpenShell"
 - folder: providers
