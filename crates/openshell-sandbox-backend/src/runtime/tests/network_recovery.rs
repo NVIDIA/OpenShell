@@ -119,7 +119,7 @@ impl NetworkPeer {
                 assert!(self.attached.load(Ordering::Acquire));
                 *self.state.active.lock().unwrap() = Some(self.connection);
                 Response::Confirmed {
-                    evidence: Box::new(test_confirmation_evidence()),
+                    confirmation: Box::new(test_confirmation()),
                 }
             }
             Request::AcceptNetwork => {

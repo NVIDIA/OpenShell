@@ -38,6 +38,7 @@ mod sandbox_watch;
 mod service_routing;
 mod ssh_sessions;
 mod storage_proto;
+mod supervisor_owner;
 pub mod supervisor_session;
 mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
@@ -304,6 +305,20 @@ pub struct ServerState {
     /// distinguish expected transport closes from runtime failures.
     pub(crate) gateway_shutting_down: AtomicBool,
 
+    /// Stable identity for this gateway process.
+    pub replica_id: String,
+
+    /// Internal endpoint other gateway replicas can dial for peer RPCs.
+    pub peer_endpoint: Option<String>,
+
+    /// Reused peer connections, peer token, and owner lookups for relay
+    /// forwarding. Keeps per-relay cost off the connection and auth paths.
+    pub peer_routes: Arc<supervisor_session::PeerRouteCache>,
+
+    /// Idle HTTP/1 upstreams to sandbox services, so routed requests reuse a
+    /// relay instead of opening one per request.
+    pub service_upstreams: Arc<service_routing::ServiceUpstreamPool>,
+
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
@@ -327,6 +342,9 @@ pub struct ServerState {
     /// Optional selected-driver authenticator for the `IssueSandboxToken`
     /// bootstrap path.
     pub compute_driver_authenticator: Option<Arc<auth::compute_driver::ComputeDriverAuthenticator>>,
+
+    /// Optional K8s `ServiceAccount` authenticator for gateway peer RPCs.
+    pub peer_authenticator: Option<Arc<auth::peer::PeerServiceAccountAuthenticator>>,
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
@@ -404,6 +422,8 @@ impl ServerState {
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
         credentials: credentials::CredentialRuntime,
     ) -> Self {
+        let replica_id = compute::lease::replica_id();
+        let peer_endpoint = derive_peer_endpoint(&config);
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         let admin_role = config
             .oidc
@@ -423,6 +443,10 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
+            replica_id,
+            peer_endpoint,
+            peer_routes: Arc::new(supervisor_session::PeerRouteCache::default()),
+            service_upstreams: Arc::new(service_routing::ServiceUpstreamPool::default()),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
@@ -430,6 +454,7 @@ impl ServerState {
             sandbox_session_jwt_authority: None,
             sandbox_jwt_authenticator: None,
             compute_driver_authenticator: None,
+            peer_authenticator: None,
             grpc_rate_limiter,
             gateway_interceptors: None,
             provider_profile_sources:
@@ -437,6 +462,55 @@ impl ServerState {
             admin_role,
         }
     }
+}
+
+fn derive_peer_endpoint(config: &Config) -> Option<String> {
+    if let Ok(endpoint) = std::env::var("OPENSHELL_PEER_ENDPOINT")
+        && !endpoint.trim().is_empty()
+    {
+        return Some(endpoint.trim().to_string());
+    }
+
+    let pod_name = std::env::var("OPENSHELL_POD_NAME").ok()?;
+    let namespace = std::env::var("OPENSHELL_POD_NAMESPACE").ok()?;
+    let service = std::env::var("OPENSHELL_PEER_SERVICE_NAME").ok()?;
+    if pod_name.trim().is_empty() || namespace.trim().is_empty() || service.trim().is_empty() {
+        return None;
+    }
+
+    let scheme = if config.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    Some(format!(
+        "{scheme}://{pod}.{service}.{namespace}.svc.cluster.local:{port}",
+        pod = pod_name.trim(),
+        service = service.trim(),
+        namespace = namespace.trim(),
+        port = config.bind_address.port()
+    ))
+}
+
+/// Reject a plaintext peer endpoint on a gateway that serves TLS.
+///
+/// Peer relay traffic carries whole supervisor sessions between replicas. The
+/// chart renders a plaintext peer endpoint only when the gateway itself serves
+fn validate_peer_endpoint_scheme(config: &Config, peer_endpoint: &str) -> Result<()> {
+    if peer_endpoint.starts_with("https://") {
+        return Ok(());
+    }
+    if config.tls.is_some() {
+        return Err(Error::config(format!(
+            "gateway peer endpoint {peer_endpoint} is plaintext but this gateway serves TLS; \
+             set an https:// OPENSHELL_PEER_ENDPOINT so peer relay traffic is not downgraded"
+        )));
+    }
+    warn!(
+        peer_endpoint,
+        "gateway peer relay traffic is plaintext because this gateway does not serve TLS"
+    );
+    Ok(())
 }
 
 /// Run the `OpenShell` server.
@@ -700,6 +774,91 @@ pub(crate) async fn run_server(
         );
     }
 
+    let peer_routing_expected = state.peer_endpoint.is_some() && !state.store.is_single_replica();
+    if let Some(peer_endpoint) = state.peer_endpoint.as_deref()
+        && peer_routing_expected
+    {
+        validate_peer_endpoint_scheme(&state.config, peer_endpoint)?;
+    }
+    if state.peer_endpoint.is_none() && !state.store.is_single_replica() {
+        warn!(
+            "no gateway peer endpoint configured; this replica owns its supervisor sessions but \
+             peers cannot reach it. Single-gateway deployments are unaffected; set \
+             OPENSHELL_PEER_ENDPOINT on every replica when running more than one."
+        );
+    }
+
+    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+        let namespace = std::env::var("OPENSHELL_POD_NAMESPACE").ok();
+        let service_account = std::env::var("OPENSHELL_SERVICE_ACCOUNT_NAME").ok();
+        match (namespace, service_account) {
+            (Some(namespace), Some(service_account))
+                if !namespace.trim().is_empty() && !service_account.trim().is_empty() =>
+            {
+                let required_labels =
+                    auth::peer::required_pod_labels_from_env().map_err(Error::config)?;
+                match kube::Client::try_default().await {
+                    Ok(client) => {
+                        let audience = auth::peer::peer_token_audience_from_env();
+                        let resolver = Arc::new(auth::peer::LiveGatewayPeerResolver::new(
+                            client,
+                            namespace.trim(),
+                            audience.clone(),
+                            service_account.trim().to_string(),
+                            required_labels,
+                        ));
+                        let cache_ttl = auth::peer::peer_token_cache_ttl_from_env();
+                        let resolver = Arc::new(auth::peer::CachingGatewayPeerResolver::new(
+                            resolver, cache_ttl,
+                        ));
+                        let authenticator =
+                            auth::peer::PeerServiceAccountAuthenticator::new(resolver);
+                        state.peer_authenticator = Some(Arc::new(authenticator));
+                        info!(
+                            namespace = %namespace.trim(),
+                            service_account = %service_account.trim(),
+                            audience,
+                            token_cache_ttl_secs = cache_ttl.as_secs(),
+                            "gateway peer ServiceAccount TokenReview authentication enabled"
+                        );
+                    }
+                    Err(err) if peer_routing_expected => {
+                        return Err(Error::config(format!(
+                            "in-cluster K8s client construction failed ({err}); \
+                             gateway peer authentication is required because \
+                             OPENSHELL_PEER_ENDPOINT is configured"
+                        )));
+                    }
+                    Err(err) => warn!(
+                        error = %err,
+                        "in-cluster K8s client construction failed; \
+                         gateway peer ServiceAccount authentication is disabled"
+                    ),
+                }
+            }
+            _ if peer_routing_expected => {
+                return Err(Error::config(
+                    "OPENSHELL_POD_NAMESPACE or OPENSHELL_SERVICE_ACCOUNT_NAME missing; \
+                     both are required for gateway peer authentication because \
+                     OPENSHELL_PEER_ENDPOINT is configured"
+                        .to_string(),
+                ));
+            }
+            _ => {
+                debug!(
+                    "OPENSHELL_POD_NAMESPACE or OPENSHELL_SERVICE_ACCOUNT_NAME missing; \
+                     gateway peer ServiceAccount authentication disabled"
+                );
+            }
+        }
+    } else if peer_routing_expected {
+        return Err(Error::config(
+            "OPENSHELL_PEER_ENDPOINT is configured but the gateway is not running in a \
+             Kubernetes cluster, so gateway peer authentication is unavailable"
+                .to_string(),
+        ));
+    }
+
     let state = Arc::new(state);
 
     // Reconcile local-driver running intent before watchers spawn so their
@@ -839,6 +998,16 @@ pub(crate) async fn run_server(
     }
 
     startup_tx.send_replace(true);
+    // The poller exists to observe writes made by other replicas. Single-
+    // replica backends have none, so it would only add load.
+    if !store.is_single_replica() {
+        sandbox_watch::spawn_store_poller(
+            store.clone(),
+            state.sandbox_watch_bus.clone(),
+            sandbox_watch::DEFAULT_STORE_POLL_INTERVAL,
+            shutdown_rx.clone(),
+        );
+    }
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
@@ -1749,7 +1918,7 @@ mod tests {
         MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
         bind_gateway_listener, classify_initial_bytes, configured_compute_driver,
         extension_token_ttl, is_benign_tls_handshake_failure, mint_gateway_extension_credential,
-        serve_gateway_listener,
+        serve_gateway_listener, validate_peer_endpoint_scheme,
     };
     use openshell_core::{
         Config,
@@ -1768,6 +1937,40 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::tls_test_utils::generate_test_certs_with_ca;
+
+    fn tls_enabled_config() -> Config {
+        Config::new(Some(openshell_core::TlsConfig {
+            cert_path: "/tmp/cert.pem".into(),
+            key_path: "/tmp/key.pem".into(),
+            client_ca_path: None,
+            require_client_auth: false,
+            external_cert_path: None,
+            external_key_path: None,
+            external_server_names: Vec::new(),
+        }))
+    }
+
+    #[test]
+    fn plaintext_peer_endpoint_is_rejected_on_a_tls_gateway() {
+        let error = validate_peer_endpoint_scheme(&tls_enabled_config(), "http://10.0.0.1:8080")
+            .expect_err("plaintext peer endpoint must not be accepted alongside gateway TLS");
+        assert!(
+            error.to_string().contains("plaintext"),
+            "error should name the downgrade: {error}"
+        );
+    }
+
+    #[test]
+    fn https_peer_endpoint_is_accepted_on_a_tls_gateway() {
+        validate_peer_endpoint_scheme(&tls_enabled_config(), "https://10.0.0.1:8080").unwrap();
+    }
+
+    #[test]
+    fn plaintext_peer_endpoint_is_allowed_on_a_plaintext_gateway() {
+        let config = Config::new(None);
+        assert!(config.tls.is_none());
+        validate_peer_endpoint_scheme(&config, "http://10.0.0.1:8080").unwrap();
+    }
 
     static DETECTION_PROBE_ORDER: LazyLock<Mutex<Vec<&'static str>>> =
         LazyLock::new(|| Mutex::new(Vec::new()));

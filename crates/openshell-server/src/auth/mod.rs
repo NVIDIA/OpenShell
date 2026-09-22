@@ -18,6 +18,7 @@ mod http;
 pub mod identity;
 pub mod method_authz;
 pub mod oidc;
+pub mod peer;
 pub mod principal;
 pub mod sandbox_jwt;
 pub mod sandbox_methods;

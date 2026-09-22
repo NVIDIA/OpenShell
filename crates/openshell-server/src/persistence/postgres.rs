@@ -14,6 +14,7 @@ use crate::policy_store::{
 use openshell_core::SetResourceVersion;
 use openshell_core::proto::Sandbox;
 use prost::Message;
+use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, PgPool, Postgres, QueryBuilder, Row};
 
@@ -32,6 +33,23 @@ use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE}
 #[derive(Debug, Clone)]
 pub struct PostgresStore {
     pool: PgPool,
+}
+
+// Stable cluster-wide key for serializing sandbox/provider cross-object
+// mutations. The bytes spell "OPENSHLL" and stay within PostgreSQL's signed
+// 64-bit advisory-lock key space.
+const CROSS_OBJECT_ADVISORY_LOCK_KEY: i64 = 0x4f50_454e_5348_4c4c;
+
+// Bounds the wait for the cross-object lock. The holder only validates and
+// writes, so a wait this long means a stuck replica; failing beats blocking
+// every sandbox and provider mutation in the fleet indefinitely.
+const CROSS_OBJECT_ADVISORY_LOCK_TIMEOUT: &str = "10s";
+
+pub(super) struct PostgresAdvisoryLockGuard {
+    // `close_on_drop` is set before this guard is constructed. Closing the
+    // dedicated session releases the session-level advisory lock even when a
+    // request is cancelled or returns early.
+    _connection: PoolConnection<Postgres>,
 }
 
 impl PostgresStore {
@@ -94,6 +112,26 @@ impl PostgresStore {
     pub async fn ping(&self) -> PersistenceResult<()> {
         let mut conn = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
         conn.ping().await.map_err(|e| map_db_error(&e))
+    }
+
+    pub(super) async fn acquire_cross_object_lock(
+        &self,
+    ) -> PersistenceResult<PostgresAdvisoryLockGuard> {
+        let mut connection = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
+        connection.close_on_drop();
+        sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+            .bind(CROSS_OBJECT_ADVISORY_LOCK_TIMEOUT)
+            .execute(&mut *connection)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(CROSS_OBJECT_ADVISORY_LOCK_KEY)
+            .execute(&mut *connection)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(PostgresAdvisoryLockGuard {
+            _connection: connection,
+        })
     }
 
     /// Test support only: close the underlying connection pool.

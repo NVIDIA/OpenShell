@@ -453,7 +453,9 @@ async fn handle_create_sandbox_inner(
     let _sandbox_sync_guard = if spec.providers.is_empty() {
         None
     } else {
-        Some(state.compute.sandbox_sync_guard().await)
+        Some(state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire sandbox mutation lock")
+        })?)
     };
 
     // Validate provider names exist (fail fast).
@@ -1233,7 +1235,10 @@ pub(super) async fn handle_attach_sandbox_provider(
     if let Some(probe) = attach_wait_probe {
         probe.notify_one();
     }
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard =
+        state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire sandbox mutation lock")
+        })?;
     let provider_record = get_provider_record(state.store.as_ref(), &workspace, &request.provider)
         .await
         .map_err(|err| {
@@ -1403,7 +1408,10 @@ pub(super) async fn handle_detach_sandbox_provider(
         )));
     }
 
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _sandbox_sync_guard =
+        state.compute.sandbox_sync_guard().await.map_err(|err| {
+            super::persistence_error_to_status(err, "acquire sandbox mutation lock")
+        })?;
     let sandbox_name = sandbox.object_name().to_string();
     let sandbox_id = sandbox
         .metadata
@@ -1635,9 +1643,13 @@ async fn handle_start_sandbox_inner(
             state.sandbox_session_jwt_authority.as_deref(),
         )
         .await?;
+    let remote_authority =
+        crate::supervisor_session::remote_supervisor_owner(state, sandbox.object_id())
+            .await?
+            .is_some();
     state
         .supervisor_sessions
-        .project_endpoint_status(&mut sandbox);
+        .project_endpoint_status(&mut sandbox, remote_authority);
     info!(sandbox_name = %name, "StartSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
@@ -2013,11 +2025,15 @@ pub(super) async fn handle_exec_sandbox(
     // Open a relay channel through the supervisor session. Use a 15s
     // session-wait timeout, enough to cover a transient supervisor reconnect
     // while still failing quickly during normal operation.
-    let (channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
-        .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+    let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
+        state,
+        sandbox.object_id(),
+        relay_open::Target::Ssh(SshRelayTarget {}),
+        String::new(),
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
@@ -2142,16 +2158,15 @@ pub(super) async fn handle_forward_tcp(
     }
 
     let connection_guard = acquire_forward_connection_guard(state, &init, &sandbox).await?;
-    let (channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay_with_target(
-            sandbox.object_id(),
-            target,
-            init.service_id.clone(),
-            std::time::Duration::from_secs(15),
-        )
-        .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+    let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
+        state,
+        sandbox.object_id(),
+        target,
+        init.service_id.clone(),
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
     let sandbox_id = sandbox.object_id().to_string();
     let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
@@ -2465,11 +2480,15 @@ pub(super) async fn handle_exec_sandbox_interactive(
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
-    let (channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
-        .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+    let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
+        state,
+        sandbox.object_id(),
+        relay_open::Target::Ssh(SshRelayTarget {}),
+        String::new(),
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
@@ -3894,7 +3913,7 @@ mod tests {
 
         // Hold the global guard so the handler can resolve the original ID and
         // acquire its delete gate, but cannot yet revalidate or mutate it.
-        let global_guard = state.compute.sandbox_sync_guard().await;
+        let global_guard = state.compute.sandbox_sync_guard().await.unwrap();
         let delete_state = state.clone();
         let delete = tokio::spawn(async move {
             handle_delete_sandbox_inner(
@@ -5358,7 +5377,7 @@ mod tests {
             .await
             .unwrap();
 
-        let guard = state.compute.sandbox_sync_guard().await;
+        let guard = state.compute.sandbox_sync_guard().await.unwrap();
         let task_state = state.clone();
         let task = tokio::spawn(async move {
             handle_create_sandbox(

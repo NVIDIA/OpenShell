@@ -1228,7 +1228,9 @@ async fn apply_minted_credential(
     // prevents route status from committing against the old provider revision
     // after the rotation writes, without holding the guard across network I/O.
     let _sandbox_sync_guard = if let Some(compute) = compute {
-        Some(compute.sandbox_sync_guard().await)
+        Some(compute.sandbox_sync_guard().await.map_err(|error| {
+            Status::internal(format!("acquire provider mutation lock: {error}"))
+        })?)
     } else {
         None
     };

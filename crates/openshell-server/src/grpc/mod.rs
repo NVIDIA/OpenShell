@@ -50,7 +50,7 @@ use openshell_core::proto::{
     ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
     ListSandboxesRequest, ListSandboxesResponse, ListServicesRequest, ListServicesResponse,
     ListWorkspaceMembersRequest, ListWorkspaceMembersResponse, ListWorkspacesRequest,
-    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo,
+    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo, PeerRelayFrame,
     ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
@@ -857,6 +857,37 @@ impl OpenShell for OpenShellService {
         request: Request<ListWorkspaceMembersRequest>,
     ) -> Result<Response<ListWorkspaceMembersResponse>, Status> {
         workspace::handle_list_workspace_members(&self.state, request).await
+    }
+
+    type PeerRelayStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<PeerRelayFrame, Status>> + Send + 'static>>;
+
+    async fn peer_relay(
+        &self,
+        request: Request<tonic::Streaming<PeerRelayFrame>>,
+    ) -> Result<Response<Self::PeerRelayStream>, Status> {
+        crate::supervisor_session::handle_peer_relay(&self.state, request).await
+    }
+
+    async fn peer_report_provider_readiness(
+        &self,
+        request: Request<ReportProviderReadinessRequest>,
+    ) -> Result<Response<ReportProviderReadinessResponse>, Status> {
+        provider_readiness::handle_peer_report_provider_readiness(&self.state, request).await
+    }
+
+    async fn peer_report_endpoint_status(
+        &self,
+        request: Request<ReportEndpointStatusRequest>,
+    ) -> Result<Response<ReportEndpointStatusResponse>, Status> {
+        policy::handle_peer_report_endpoint_status(&self.state, request).await
+    }
+
+    async fn peer_get_sandbox_provider_status(
+        &self,
+        request: Request<GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<GetSandboxProviderStatusResponse>, Status> {
+        provider_readiness::handle_peer_get_sandbox_provider_status(&self.state, request).await
     }
 }
 
