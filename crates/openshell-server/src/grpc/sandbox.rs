@@ -3301,7 +3301,7 @@ async fn stream_interactive_exec_over_relay(
                     )),
                 }))
                 .await;
-            let _ = proxy_task.await;
+            finish_interactive_exec_proxy(proxy_task).await;
             return Ok(());
         }
     } else {
@@ -3311,12 +3311,12 @@ async fn stream_interactive_exec_over_relay(
     let exit_code = match exec_result {
         Ok(code) => code,
         Err(status) => {
-            let _ = proxy_task.await;
+            finish_interactive_exec_proxy(proxy_task).await;
             return Err(status);
         }
     };
 
-    let _ = proxy_task.await;
+    finish_interactive_exec_proxy(proxy_task).await;
 
     let _ = tx
         .send(Ok(ExecSandboxEvent {
