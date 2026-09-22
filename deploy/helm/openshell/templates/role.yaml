@@ -10,9 +10,9 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
-  # Metadata-only application admission still requires Kubernetes get permission.
+  # Metadata-only admission of caller-selected PVCs requires get permission.
   - apiGroups: [""]
-    resources: ["persistentvolumeclaims", "configmaps", "secrets"]
+    resources: ["persistentvolumeclaims"]
     verbs: ["get"]
   - apiGroups:
       - agents.x-k8s.io

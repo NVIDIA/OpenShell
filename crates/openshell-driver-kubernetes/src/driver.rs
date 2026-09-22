@@ -1306,28 +1306,6 @@ impl KubernetesComputeDriver {
                 }
             };
 
-            self.config
-                .resource_admission
-                .admit_shared(
-                    source
-                        .metadata
-                        .labels
-                        .as_ref()
-                        .into_iter()
-                        .flat_map(|labels| labels.iter()),
-                )
-                .map_err(|error| {
-                    admission_error(tonic::Status::new(
-                        error.code(),
-                        format!(
-                            "Secret '{}/{}': {}",
-                            self.config.namespace,
-                            secret_name,
-                            error.message()
-                        ),
-                    ))
-                })?;
-
             let existing = tokio::time::timeout(KUBE_API_TIMEOUT, target_api.get_opt(secret_name))
                 .await
                 .map_err(|_| {
@@ -11070,7 +11048,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_image_pull_secret_admits_source_before_copying() {
+    async fn managed_image_pull_secret_copies_operator_selected_source() {
         let source_path = "/api/v1/namespaces/openshell/secrets/regcred";
         let target_path = "/api/v1/namespaces/managed-team-a/secrets/regcred";
         let copied = serde_json::json!({
@@ -11101,7 +11079,7 @@ mod tests {
                         "metadata": {
                             "name": "regcred",
                             "namespace": "openshell",
-                            "labels": {"openshell.ai/sandbox-attachable": "true"}
+                            "labels": {}
                         },
                         "type": "kubernetes.io/dockerconfigjson",
                         "data": { ".dockerconfigjson": "e30=" }
@@ -11150,54 +11128,8 @@ mod tests {
         driver
             .ensure_image_pull_secrets("managed-team-a", "team-a")
             .await
-            .expect("approved source should be copied");
+            .expect("operator-selected source should be copied");
         assert!(steps.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn managed_image_pull_secret_rejects_unapproved_source_without_copying() {
-        let service = tower::service_fn(
-            move |request: http::Request<kube::client::Body>| async move {
-                assert_eq!(request.method(), http::Method::GET);
-                assert_eq!(
-                    request.uri().path(),
-                    "/api/v1/namespaces/openshell/secrets/regcred"
-                );
-                Ok::<_, std::convert::Infallible>(kube_test_response(
-                    http::StatusCode::OK,
-                    serde_json::json!({
-                        "apiVersion": "v1",
-                        "kind": "Secret",
-                        "metadata": {"name": "regcred", "namespace": "openshell"},
-                        "type": "kubernetes.io/dockerconfigjson",
-                        "data": { ".dockerconfigjson": "e30=" }
-                    }),
-                ))
-            },
-        );
-        let client = Client::new(service, "openshell");
-        let driver = KubernetesComputeDriver {
-            client: client.clone(),
-            watch_client: client,
-            sandbox_api_version: Arc::new(OnceCell::new()),
-            config: KubernetesComputeConfig {
-                namespace: "openshell".into(),
-                gateway_id: "gateway-a".into(),
-                image_pull_secrets: vec!["regcred".into()],
-                ..Default::default()
-            },
-            operator_allowlist: None,
-        };
-
-        let error = driver
-            .ensure_image_pull_secrets("managed-team-a", "team-a")
-            .await
-            .expect_err("unapproved source must not be copied");
-        assert!(matches!(error, KubernetesDriverError::Precondition(_)));
-        assert!(
-            error.to_string().contains("Secret 'openshell/regcred'"),
-            "unexpected error: {error}"
-        );
     }
 
     #[test]

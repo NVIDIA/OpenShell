@@ -574,26 +574,27 @@ metadata:
     openshell.ai/sandbox-attachable-workspace: "team-a"
 ```
 
-Kubernetes checks PVCs, RuntimeClasses, PriorityClasses, and credential/config
-references selected through the OpenShell-owned Pod template. Docker and Podman
-check engine volume labels. Read-only mounts still require approval. Namespaces
-and operator-selected defaults do not waive checks. Newly provisioned private
-storage and bootstrap material use driver ownership checks instead.
+Kubernetes checks caller-selected PVCs, RuntimeClasses, and PriorityClasses
+through the OpenShell-owned Pod template. Docker and Podman check engine volume
+labels. Read-only mounts still require approval. Namespaces do not grant
+approval. Newly provisioned private storage and bootstrap material use driver
+ownership checks instead.
 
-RuntimeClasses, PriorityClasses, and image-pull Secrets are shared operator
-infrastructure. They must match every fixed required label, but `${workspace}`
-entries do not apply to them. PVCs and Secret or ConfigMap data exposed to a
-sandbox must also match the resolved workspace label. Kubernetes API-server and
-admission-webhook mutations of the live Pod are trusted cluster-operator behavior
-and are not used as Workspace User authorization inputs.
+RuntimeClasses and PriorityClasses are shared operator infrastructure. They must
+match every fixed required label, but `${workspace}` entries do not apply to
+them. Kubernetes API-server and admission-webhook mutations of the live Pod are
+trusted cluster-operator behavior and are not used as Workspace User
+authorization inputs.
 
-With Kubernetes admission enabled, configured image-pull Secrets in the gateway
-namespace must carry the fixed approval labels. In managed mode OpenShell verifies
-that source, creates the workspace namespace, and copies the Secret with gateway
-ownership metadata. An existing target Secret is updated only when its ownership
-metadata matches the gateway and workspace. Operator mode still requires the
-approved Secret in each operator-managed namespace. Automatic service-account
-tokens and projected token volumes are prohibited.
+Image-pull Secrets are selected by gateway configuration, not by sandbox
+callers, and do not participate in resource admission. In managed mode OpenShell
+copies each explicitly configured Secret into the workspace namespace with
+gateway ownership metadata. An existing target Secret is updated only when its
+ownership metadata matches the gateway and workspace. In shared and operator
+modes, the configured Secret must already exist in the sandbox namespace. The
+typed Kubernetes driver config does not support caller-selected Secret or
+ConfigMap volumes or environment references. Automatic service-account tokens
+and projected token volumes are prohibited.
 
 GPU device attachments are temporarily exempt from label admission. Existing
 GPU validation still applies. Explicit GPU device settings inside driver JSON

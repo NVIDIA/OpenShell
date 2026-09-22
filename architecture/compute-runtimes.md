@@ -465,9 +465,9 @@ management. RBAC uses a namespace-scoped Role.
 Each new namespace receives a ServiceAccount and the configured gateway-only
 SSH ingress NetworkPolicy. Configured image-pull Secrets are copied from the
 driver's source namespace on every sandbox create so registry credential
-rotations propagate. Resource admission first validates the source as shared
-operator infrastructure, and copies carry gateway and workspace ownership
-labels; an unrelated existing target is never adopted. The namespace also copies
+rotations propagate. Their names are operator-selected gateway configuration,
+not caller attachments. Copies carry gateway and workspace ownership labels; an
+unrelated existing target is never adopted. The namespace also copies
 OpenShift SCC UID-range and supplemental-group annotations from the gateway
 namespace when present. The driver deletes the namespace during workspace
 deletion. The workspace remains durably `Terminating` until the Kubernetes API

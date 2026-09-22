@@ -110,9 +110,9 @@ fn inventory(spec: &Value, private_secret: &str) -> Result<BTreeSet<Reference>, 
     {
         return Err(deny());
     }
-    for secret in spec["imagePullSecrets"].as_array().into_iter().flatten() {
-        reference(&mut refs, "Secret", secret["name"].as_str(), Scope::Shared);
-    }
+    // Image-pull Secrets are selected by gateway configuration rather than by
+    // the sandbox caller. The kubelet resolves them; they are not workload data
+    // attachments and do not participate in caller resource admission.
     for volume in spec["volumes"].as_array().into_iter().flatten() {
         let object = volume.as_object().ok_or_else(deny)?;
         let sources: Vec<_> = object.keys().filter(|key| key.as_str() != "name").collect();
@@ -127,50 +127,27 @@ fn inventory(spec: &Value, private_secret: &str) -> Result<BTreeSet<Reference>, 
                 volume["persistentVolumeClaim"]["claimName"].as_str(),
                 Scope::Workspace,
             ),
-            "secret" => {
-                let name = volume["secret"]["secretName"].as_str();
-                if name != Some(private_secret) {
-                    reference(&mut refs, "Secret", name, Scope::Workspace);
-                }
-            }
-            "configMap" => reference(
-                &mut refs,
-                "ConfigMap",
-                volume["configMap"]["name"].as_str(),
-                Scope::Workspace,
-            ),
+            "secret" if volume["secret"]["secretName"].as_str() == Some(private_secret) => {}
+            // The typed Kubernetes driver config does not expose Secret or
+            // ConfigMap volumes. The closed-set fallback rejects them instead
+            // of expanding gateway RBAC for attachments callers cannot request.
             _ => return Err(deny()),
         }
     }
     for field in ["containers", "initContainers", "ephemeralContainers"] {
         for container in spec[field].as_array().into_iter().flatten() {
-            for env in container["envFrom"].as_array().into_iter().flatten() {
-                reference(
-                    &mut refs,
-                    "Secret",
-                    env["secretRef"]["name"].as_str(),
-                    Scope::Workspace,
-                );
-                reference(
-                    &mut refs,
-                    "ConfigMap",
-                    env["configMapRef"]["name"].as_str(),
-                    Scope::Workspace,
-                );
+            if container["envFrom"]
+                .as_array()
+                .is_some_and(|env| !env.is_empty())
+            {
+                return Err(deny());
             }
             for env in container["env"].as_array().into_iter().flatten() {
-                reference(
-                    &mut refs,
-                    "Secret",
-                    env["valueFrom"]["secretKeyRef"]["name"].as_str(),
-                    Scope::Workspace,
-                );
-                reference(
-                    &mut refs,
-                    "ConfigMap",
-                    env["valueFrom"]["configMapKeyRef"]["name"].as_str(),
-                    Scope::Workspace,
-                );
+                if !env["valueFrom"]["secretKeyRef"].is_null()
+                    || !env["valueFrom"]["configMapKeyRef"].is_null()
+                {
+                    return Err(deny());
+                }
             }
             for field in ["requests", "limits"] {
                 for (resource, _) in container["resources"][field]
@@ -207,8 +184,6 @@ pub async fn admit(
     for reference in inventory(spec, private_secret)? {
         let (group, version, plural, cluster) = match reference.kind {
             "PersistentVolumeClaim" => ("", "v1", "persistentvolumeclaims", false),
-            "Secret" => ("", "v1", "secrets", false),
-            "ConfigMap" => ("", "v1", "configmaps", false),
             "RuntimeClass" => ("node.k8s.io", "v1", "runtimeclasses", true),
             "PriorityClass" => ("scheduling.k8s.io", "v1", "priorityclasses", true),
             _ => unreachable!("closed resource inventory"),
@@ -479,13 +454,12 @@ mod tests {
     }
 
     #[test]
-    fn inventories_all_containers_and_reference_aliases() {
+    fn inventories_supported_external_resources() {
         let pod = serde_json::json!({"automountServiceAccountToken":false,"runtimeClassName":"r","priorityClassName":"p",
             "volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"gateway-db","readOnly":true}}],
-            "initContainers":[{"envFrom":[{"secretRef":{"name":"secret"}}]}],
-            "containers":[{"env":[{"valueFrom":{"configMapKeyRef":{"name":"config"}}}]}]});
+            "imagePullSecrets":[{"name":"regcred"}]});
         let refs = inventory(&pod, "private").unwrap();
-        assert_eq!(refs.len(), 5);
+        assert_eq!(refs.len(), 3);
         assert!(
             refs.iter()
                 .any(|r| r.name == "gateway-db" && r.scope == Scope::Workspace)
@@ -497,9 +471,13 @@ mod tests {
     }
     #[test]
     fn rejects_unsupported_volume_sources_but_allows_gpu() {
-        for kind in ["hostPath", "csi", "projected", "image"] {
+        for kind in ["hostPath", "csi", "projected", "image", "configMap"] {
             assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x",kind:{}}]}), "private").is_err());
         }
+        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x","secret":{"secretName":"external"}}]}), "private").is_err());
+        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x","secret":{"secretName":"private"}}]}), "private").is_ok());
+        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"containers":[{"envFrom":[{"secretRef":{"name":"external"}}]}]}), "private").is_err());
+        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"containers":[{"env":[{"valueFrom":{"configMapKeyRef":{"name":"external"}}}]}]}), "private").is_err());
         assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"containers":[{"resources":{"limits":{"nvidia.com/gpu":"1"}}}]}), "private").is_ok());
     }
     #[test]

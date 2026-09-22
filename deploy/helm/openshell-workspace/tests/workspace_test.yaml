@@ -20,6 +20,24 @@ tests:
       - equal:
           path: metadata.namespace
           value: app-a
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
+            verbs: ["get"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get"]
 
   - it: binds the shared gateway service account
     template: templates/rolebinding.yaml
