@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Template rendered by run-inference-test.ps1 into its per-run results directory.
+version: 1
+
+filesystem_policy:
+  include_workdir: false
+  read_only: []
+  read_write:
+    - "__OPENSHELL_DEMO_SHARE__"
+
+network_policies:
+  nvidia_inference:
+    name: nvidia-inference
+    endpoints:
+      - host: integrate.api.nvidia.com
+        port: 443
+        protocol: rest
+        # Chat completions use POST.
+        access: read-write
+        enforcement: enforce
+    binaries:
+      - path: '__CMD_EXE__'

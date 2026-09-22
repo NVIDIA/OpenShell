@@ -40,6 +40,97 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+mod token_probe {
+    #![allow(unsafe_code)]
+
+    use std::ffi::c_void;
+    use std::ptr;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn CloseHandle(handle: isize) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
+        fn GetTokenInformation(
+            token: isize,
+            class: i32,
+            info: *mut c_void,
+            len: u32,
+            return_len: *mut u32,
+        ) -> i32;
+        fn OpenSCManagerW(machine: *const u16, database: *const u16, access: u32) -> isize;
+        fn CloseServiceHandle(handle: isize) -> i32;
+    }
+
+    fn token_u32(token: isize, class: i32) -> Option<u32> {
+        let mut value = 0u32;
+        let mut returned = 0u32;
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                class,
+                (&raw mut value).cast(),
+                u32::try_from(size_of::<u32>()).expect("u32 size fits Win32 length"),
+                &raw mut returned,
+            )
+        };
+        (ok != 0).then_some(value)
+    }
+
+    fn has_appcontainer_sid(token: isize) -> bool {
+        let mut buf = [0u8; 256];
+        let mut returned = 0u32;
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                31, // TokenAppContainerSid
+                buf.as_mut_ptr().cast(),
+                u32::try_from(buf.len()).expect("token buffer length fits u32"),
+                &raw mut returned,
+            )
+        };
+        ok != 0 && !unsafe { ptr::read_unaligned(buf.as_ptr().cast::<*const c_void>()) }.is_null()
+    }
+
+    pub fn service_manager_create_access() -> (bool, u32) {
+        let manager = unsafe {
+            OpenSCManagerW(
+                ptr::null(),
+                ptr::null(),
+                0x0002, // SC_MANAGER_CREATE_SERVICE
+            )
+        };
+        if manager == 0 {
+            return (false, unsafe { GetLastError() });
+        }
+        unsafe { CloseServiceHandle(manager) };
+        (true, 0)
+    }
+
+    pub fn snapshot() -> serde_json::Value {
+        let mut token = 0isize;
+        let opened = unsafe { OpenProcessToken(GetCurrentProcess(), 0x0008, &raw mut token) };
+        assert_ne!(opened, 0, "OpenProcessToken failed");
+
+        let (can_create_service, create_service_error) = service_manager_create_access();
+        let snapshot = serde_json::json!({
+            "is_appcontainer": token_u32(token, 29), // TokenIsAppContainer
+            "has_appcontainer_sid": has_appcontainer_sid(token),
+            "can_create_service": can_create_service,
+            "create_service_error": create_service_error,
+        });
+        unsafe { CloseHandle(token) };
+        snapshot
+    }
+}
+
+const TOKEN_PROBE_MARKER: &str = "OPENSHELL_MXC_TOKEN_PROBE=";
+
 // ── Path resolution ──────────────────────────────────────────────────────────
 
 /// Resolve the path to `wxc-exec.exe`.
@@ -477,6 +568,17 @@ fn dryrun_accepts_split_policy_output() {
 // These skip on this box (processcontainer velocity keys not enabled;
 // isolation_session backend absent). They PASS where backends are live.
 
+/// Entrypoint used by `pc_oneshot_token_is_appcontainer_without_admin_access`.
+/// The parent test relaunches this integration-test binary inside MXC so the
+/// probe observes the workload token rather than the host test runner's token.
+#[test]
+fn child_token_probe_entry() {
+    if std::env::var("OPENSHELL_MXC_CHILD_TOKEN_PROBE").as_deref() != Ok("1") {
+        return;
+    }
+    println!("{TOKEN_PROBE_MARKER}{}", token_probe::snapshot());
+}
+
 /// Probe the processcontainer backend.
 ///
 /// Runs a trivial one-shot (`cmd /c exit 0`, user-owned temp grant). Returns
@@ -801,6 +903,101 @@ fn pc_oneshot_in_policy_write_succeeds() {
     );
 }
 
+/// Verify the default `ProcessContainer` token and an administrator-gated
+/// access attempt. `whoami /all` is not sufficient for this assertion: the
+/// package SID is exposed through `TokenAppContainerSid`, and `AppContainer`
+/// access is the intersection of the user/group and package/capability grants.
+#[test]
+#[ignore = "requires real wxc-exec"]
+fn pc_oneshot_token_is_appcontainer_without_admin_access() {
+    let Some(wxc) = wxc_path() else {
+        eprintln!("SKIP: wxc-exec not found");
+        return;
+    };
+    let (host_can_create_service, host_error) = token_probe::service_manager_create_access();
+    if !host_can_create_service {
+        eprintln!(
+            "SKIP: host test runner lacks SC_MANAGER_CREATE_SERVICE (Win32 error {host_error}); sandboxed denial would not prove isolation"
+        );
+        return;
+    }
+    if let Err(reason) = probe_processcontainer(&wxc) {
+        eprintln!("SKIP: processcontainer not live: {reason}");
+        return;
+    }
+
+    let (tempdir, temp_path) = temp_fixture();
+    let test_exe = std::env::current_exe().expect("resolve integration-test executable");
+    let test_exe_parent = test_exe
+        .parent()
+        .expect("integration-test executable has a parent")
+        .to_string_lossy()
+        .into_owned();
+    let command_line = format!(
+        "\"{}\" --exact child_token_probe_entry --nocapture",
+        test_exe.display()
+    );
+    let mut child_env = vec!["OPENSHELL_MXC_CHILD_TOKEN_PROBE=1".to_string()];
+    child_env.extend(
+        ["SYSTEMROOT", "WINDIR", "PATH", "COMSPEC", "LOCALAPPDATA"]
+            .into_iter()
+            .filter_map(|key| {
+                std::env::var(key)
+                    .ok()
+                    .map(|value| format!("{key}={value}"))
+            }),
+    );
+    let config = serde_json::json!({
+        "version": "0.8.0-alpha",
+        "containerId": "pc-token-identity",
+        "containment": "processcontainer",
+        "process": {
+            "commandLine": command_line,
+            "cwd": temp_path,
+            "env": child_env,
+            "timeout": 30_000,
+        },
+        "filesystem": {
+            "readwritePaths": [temp_path],
+            "readonlyPaths": [test_exe_parent],
+        },
+        "processContainer": {
+            "leastPrivilege": false,
+        },
+        "ui": {
+            "disable": false,
+            "clipboard": "none",
+            "injection": false,
+        },
+    });
+    let json = serde_json::to_string(&config).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+    let out = Command::new(&wxc)
+        .arg("--config-base64")
+        .arg(&b64)
+        .output()
+        .expect("wxc-exec token probe spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "token probe should exit successfully\nstdout={stdout}\nstderr={stderr}"
+    );
+    let snapshot: serde_json::Value = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(TOKEN_PROBE_MARKER))
+        .map_or_else(
+            || panic!("token probe marker missing\nstdout={stdout}\nstderr={stderr}"),
+            |value| serde_json::from_str(value).expect("parse token probe JSON"),
+        );
+
+    assert_eq!(snapshot["is_appcontainer"], 1);
+    assert_eq!(snapshot["has_appcontainer_sid"], true);
+    assert_eq!(snapshot["can_create_service"], false);
+    assert_eq!(snapshot["create_service_error"], 5); // ERROR_ACCESS_DENIED
+    drop(tempdir);
+}
+
 /// Run an HTTPS request through the real driver and `ProcessContainer`. The
 /// workload explicitly reads the injected bundle before curl uses it, proving
 /// that the driver's internal TLS share is reachable from the `AppContainer`.
@@ -1027,6 +1224,80 @@ fn pc_oneshot_out_of_policy_write_denied() {
         !denied_file.exists(),
         "out-of-policy file must be absent at {denied_file_str} (OS default-deny proof)\n\
          stdout={stdout}\nstderr={stderr}"
+    );
+}
+
+/// Reading an unrelated root-level path remains denied when only the workload
+/// fixture is granted. This guards the `OpenClaw` Node.js workaround against
+/// accidentally granting broad access beneath `C:\`.
+#[test]
+#[ignore = "requires real wxc-exec"]
+fn pc_oneshot_unrelated_root_path_read_denied() {
+    let Some(wxc) = wxc_path() else {
+        eprintln!("SKIP: wxc-exec not found");
+        return;
+    };
+
+    if let Err(reason) = probe_processcontainer(&wxc) {
+        eprintln!("SKIP: processcontainer not live: {reason}");
+        return;
+    }
+
+    let granted_dir = tempfile::tempdir().expect("granted tempdir");
+    let denied_root_dir = tempfile::Builder::new()
+        .prefix("openshell-pc-denied-")
+        .tempdir_in(r"C:\")
+        .expect("root-level denied tempdir");
+    let denied_file = denied_root_dir.path().join("sentinel.txt");
+    std::fs::write(&denied_file, "root-level secret").expect("write denied sentinel");
+    let denied_file_str = denied_file.to_string_lossy().into_owned();
+    let granted_str = granted_dir.path().to_string_lossy().into_owned();
+    let diagnostic = granted_dir.path().join("root-read.txt");
+    let diagnostic_str = diagnostic.to_string_lossy().into_owned();
+    let config = serde_json::json!({
+        "version": "0.6.0-alpha",
+        "containerId": "pc-root-read-denied",
+        "containment": "processcontainer",
+        "process": {
+            "commandLine": format!("cmd /d /c type \"{denied_file_str}\" 1>\"{diagnostic_str}\" 2>&1"),
+            "cwd": granted_str,
+            "timeout": 30_000,
+        },
+        "filesystem": {
+            "readwritePaths": [granted_str],
+        },
+        "processContainer": {
+            "leastPrivilege": false,
+        },
+        "ui": {
+            "disable": false,
+            "clipboard": "none",
+            "injection": false,
+        },
+    });
+
+    let json = serde_json::to_string(&config).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+    let out = Command::new(&wxc)
+        .arg("--config-base64")
+        .arg(&b64)
+        .output()
+        .expect("wxc-exec spawn");
+    let code = out.status.code().unwrap_or(-1);
+    let root_read = std::fs::read_to_string(&diagnostic)
+        .expect("sandboxed cmd must run and write its drive-root diagnostic");
+
+    assert_ne!(
+        code, 0,
+        "unrelated root-level read must remain denied; diagnostic={root_read}"
+    );
+    assert!(
+        root_read.to_ascii_lowercase().contains("access is denied"),
+        "failure must specifically be the root-level access denial; diagnostic={root_read}"
+    );
+    assert!(
+        !root_read.contains("root-level secret"),
+        "root-level file contents must not be readable; diagnostic={root_read}"
     );
 }
 

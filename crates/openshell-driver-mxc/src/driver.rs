@@ -21,6 +21,7 @@ use openshell_core::proto_struct::struct_to_json_value;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -30,12 +31,119 @@ use tokio::process::Child;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
+use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+use windows::Win32::NetworkManagement::IpHelper::{
+    GetExtendedTcpTable, MIB_TCP_STATE_LISTEN, MIB_TCPROW_LH, MIB_TCPTABLE,
+    TCP_TABLE_BASIC_LISTENER,
+};
+use windows::Win32::Networking::WinSock::AF_INET;
 
 const DRIVER_NAME: &str = "mxc";
 const DRIVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Sentinel image name — MXC has no OCI image; this string must be non-empty
 /// so the gateway's `default_image` cache is satisfied, but it is not pullable.
 const DEFAULT_IMAGE_SENTINEL: &str = "mxc:process-container";
+const TARGET_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
+const TARGET_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
+#[allow(unsafe_code)]
+fn tcp_listener_is_present(port: u16) -> std::io::Result<bool> {
+    let mut byte_count = 0_u32;
+    // SAFETY: The null-buffer call only asks Windows for the required size;
+    // `byte_count` points to initialized writable storage.
+    let status = unsafe {
+        GetExtendedTcpTable(
+            None,
+            &raw mut byte_count,
+            false,
+            u32::from(AF_INET.0),
+            TCP_TABLE_BASIC_LISTENER,
+            0,
+        )
+    };
+    if status != ERROR_INSUFFICIENT_BUFFER.0 && status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status.cast_signed()));
+    }
+    if (byte_count as usize) < size_of::<u32>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows returned an invalid TCP listener table size",
+        ));
+    }
+
+    let mut buffer;
+    loop {
+        let word_count = (byte_count as usize).div_ceil(size_of::<u32>());
+        buffer = vec![0_u32; word_count];
+        // SAFETY: `buffer` has the returned table's alignment and at least
+        // the requested byte count. Windows updates `byte_count` if the table
+        // grows concurrently.
+        let status = unsafe {
+            GetExtendedTcpTable(
+                Some(buffer.as_mut_ptr().cast()),
+                &raw mut byte_count,
+                false,
+                u32::from(AF_INET.0),
+                TCP_TABLE_BASIC_LISTENER,
+                0,
+            )
+        };
+        if status == ERROR_INSUFFICIENT_BUFFER.0 {
+            continue;
+        }
+        if status != 0 {
+            return Err(std::io::Error::from_raw_os_error(status.cast_signed()));
+        }
+        break;
+    }
+
+    let table = buffer.as_ptr().cast::<MIB_TCPTABLE>();
+    // SAFETY: A successful call writes a `MIB_TCPTABLE` header followed by
+    // `dwNumEntries` rows into the caller-provided buffer.
+    let entry_count = unsafe { (*table).dwNumEntries as usize };
+    let row_offset = std::mem::offset_of!(MIB_TCPTABLE, table);
+    let available_rows = (byte_count as usize)
+        .saturating_sub(row_offset)
+        .checked_div(size_of::<MIB_TCPROW_LH>())
+        .unwrap_or_default();
+    if entry_count > available_rows {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows returned a truncated TCP listener table",
+        ));
+    }
+    // SAFETY: The bounds check proves every row lies within `buffer`.
+    let rows = unsafe { std::slice::from_raw_parts((*table).table.as_ptr(), entry_count) };
+    Ok(rows.iter().any(|row| {
+        let port_bytes = row.dwLocalPort.to_ne_bytes();
+        let listener_port = u16::from_be_bytes([port_bytes[0], port_bytes[1]]);
+        // SAFETY: `dwState` and `State` are views of the same SDK union field,
+        // and Windows initialized every returned row.
+        let state = unsafe { row.Anonymous.dwState };
+        state == MIB_TCP_STATE_LISTEN.0.cast_unsigned() && listener_port == port
+    }))
+}
+
+async fn wait_for_target_listener(port: u16) -> std::io::Result<()> {
+    let start = tokio::time::Instant::now();
+    let deadline = start + TARGET_READY_TIMEOUT;
+    info!(port, timeout = ?TARGET_READY_TIMEOUT, "waiting for target listener in host TCP table");
+    loop {
+        if tcp_listener_is_present(port)? {
+            info!(port, elapsed = ?start.elapsed(), "target listener observed in host TCP table");
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep_until(std::cmp::min(now + TARGET_READY_POLL_INTERVAL, deadline)).await;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("timed out after {TARGET_READY_TIMEOUT:?} waiting for port {port}"),
+    ))
+}
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -585,6 +693,25 @@ fn stage_tls_ca_files(
     Ok(Some((staged_ca, staged_bundle)))
 }
 
+/// Resolve the CA paths to hand the sandboxed agent for TLS trust.
+///
+/// A curated `ProcessContainer` cannot read the host proxy's private temp
+/// folder, regardless of env tier -- stage only the public CA material
+/// beneath `share_dir`, whose `AppContainer` DACL is already granted by the
+/// policy, so HTTPS clients can authenticate the `OpenShell` inspection proxy
+/// without broadening filesystem access. Staging must happen whenever a
+/// host proxy CA exists at all, independent of `pc_minimal_env`.
+fn resolve_agent_proxy_ca_paths(
+    host_proxy_ca_paths: Option<&(PathBuf, PathBuf)>,
+    share_dir: &str,
+    sandbox_id: &str,
+) -> std::io::Result<Option<(PathBuf, PathBuf)>> {
+    if host_proxy_ca_paths.is_none() {
+        return Ok(None);
+    }
+    stage_tls_ca_files(host_proxy_ca_paths, share_dir, sandbox_id)
+}
+
 /// PROTOTYPE (2026-09-10): env-var-based governed egress, as an alternative
 /// to MXC's own `network.proxy`/`runtimeConfig.networkProxy` transparent
 /// redirect (both confirmed broken for this driver's use case -- see
@@ -742,25 +869,6 @@ fn quote_windows_argument(arg: &str) -> String {
     quoted.push('"');
     quoted
 }
-fn append_tls_readwrite_grant(
-    readwrite_paths: &mut Vec<String>,
-    ca_paths: Option<&(PathBuf, PathBuf)>,
-) {
-    let Some((ca_cert_path, _)) = ca_paths else {
-        return;
-    };
-    let Some(dir) = ca_cert_path.parent() else {
-        return;
-    };
-    let dir = dir.display().to_string();
-    if !readwrite_paths
-        .iter()
-        .any(|existing| existing.eq_ignore_ascii_case(&dir))
-    {
-        readwrite_paths.push(dir);
-    }
-}
-
 impl MxcComputeBackend {
     pub fn new(config: MxcComputeConfig) -> Self {
         let invoker = WxcExecInvoker::new(&config.wxc_exec_path, config.debug);
@@ -1500,31 +1608,23 @@ async fn run_lifecycle(
     let host_proxy_ca_paths = host_proxy
         .as_ref()
         .and_then(openshell_supervisor_network::host::HostProxyHandle::ca_file_paths);
-    // A curated ProcessContainer cannot read the host's private temp folder.
-    // Stage only the public CA material beneath the per-sandbox working directory,
-    // DACL is already granted by the policy, so HTTPS clients can authenticate
-    // the OpenShell inspection proxy without broadening filesystem access.
-    let agent_proxy_ca_paths = if config.pc_minimal_env && host_proxy_ca_paths.is_some() {
-        match stage_tls_ca_files(
-            host_proxy_ca_paths.as_ref(),
-            &sandbox_config.cwd,
-            &sandbox_id,
-        ) {
-            Ok(paths) => paths,
-            Err(error) => {
-                set_failed(
-                    &registry,
-                    &watch_tx,
-                    &sandbox,
-                    &sandbox_id,
-                    &format!("failed to stage MXC egress proxy CA files: {error}"),
-                )
-                .await;
-                return;
-            }
+    let agent_proxy_ca_paths = match resolve_agent_proxy_ca_paths(
+        host_proxy_ca_paths.as_ref(),
+        &sandbox_config.cwd,
+        &sandbox_id,
+    ) {
+        Ok(paths) => paths,
+        Err(error) => {
+            set_failed(
+                &registry,
+                &watch_tx,
+                &sandbox,
+                &sandbox_id,
+                &format!("failed to stage MXC egress proxy CA files: {error}"),
+            )
+            .await;
+            return;
         }
-    } else {
-        host_proxy_ca_paths.clone()
     };
     if let Some(addr) = proxy_addr {
         {
@@ -1542,10 +1642,7 @@ async fn run_lifecycle(
         ));
     }
 
-    let mut readwrite_paths = mapped.readwrite_paths;
-    if !config.pc_minimal_env {
-        append_tls_readwrite_grant(&mut readwrite_paths, host_proxy_ca_paths.as_ref());
-    }
+    let readwrite_paths = mapped.readwrite_paths;
     let readonly_paths = mapped.readonly_paths;
     let ui = mapped.ui;
     let filesystem = MxcFilesystem {
@@ -1581,8 +1678,8 @@ async fn run_lifecycle(
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
     append_provider_child_env(&mut env, provider_credentials.as_ref());
-    // Layer proxy configuration for every env tier. Curated ProcessContainers
-    // use the staged CA copies above; other tiers use the original paths.
+    // Layer proxy configuration for every env tier using the staged CA copies
+    // above. The host proxy's private temporary directory is never shared.
     append_tls_env_vars(&mut env, agent_proxy_ca_paths.as_ref());
     append_proxy_env_vars(&mut env, proxy_addr, proxy_auth.as_ref());
     env.sort(); // deterministic order for logging / debugging
@@ -1801,14 +1898,11 @@ async fn run_lifecycle(
     } else {
         (None, None)
     };
-    // Target-ready signal from the spawner (see control_channel.rs's
-    // try_route_target_ready) -- fired once the target is actually running
-    // and its configured port is accepting connections, distinct from the
-    // "launch" response below (which only confirms the command/env
-    // arrived). Awaited after "launch" succeeds and before publishing
-    // Ready=True, so Ready can't be reported while the target is still
-    // unreachable. Always Ok(()) when it fires (no version gate on this
-    // event -- see try_route_target_ready).
+    // Target-status signal from the spawner (see control_channel.rs's
+    // try_route_target_status): Ok once the host observes the target listener
+    // and the relay confirms the target has not exited, or Err with the
+    // target's real exit/stderr diagnostic. Distinct from the "launch"
+    // response below, which only confirms the command/env arrived.
     let (target_ready_slot, target_ready_rx) = if spawner_wrapping_active {
         let (tx, rx) = oneshot::channel::<Result<(), String>>();
         (Some(Arc::new(Mutex::new(Some(tx)))), Some(rx))
@@ -1830,7 +1924,9 @@ async fn run_lifecycle(
                             None => false,
                         };
                         let routed_target_ready = match &target_ready_slot {
-                            Some(slot) => ControlChannel::try_route_target_ready(slot, &line).await,
+                            Some(slot) => {
+                                ControlChannel::try_route_target_status(slot, &line).await
+                            }
                             None => false,
                         };
                         let routed = routed_ready
@@ -1861,7 +1957,7 @@ async fn run_lifecycle(
         });
     }
     // Drop this scope's Arc clones now that the stdout task holds its own:
-    // if the spawner exits before ever sending "ready"/"target_ready", the
+    // if the spawner exits before ever sending "ready"/target status, the
     // stdout task's clone is the only thing keeping the
     // Mutex<Option<Sender>> alive, so its loop ending (EOF) drops the last
     // reference -- which drops the still-`Some` Sender and makes
@@ -1888,14 +1984,14 @@ async fn run_lifecycle(
     // Publish a cancellable handle (exec_child, and for ProcessContainer
     // shutdown_tx/terminated_rx too) and release the startup gate now,
     // rather than holding it until the target-readiness wait below (up to
-    // ~430s worst case: 120s ready + 310s target_ready) completes or times
+    // ~430s worst case: 120s relay-ready + 300s listener + handshakes) completes or times
     // out. stop_sandbox/delete_sandbox block on lifecycle_gate before doing
     // anything else, so holding it this long meant a stop/delete arriving
     // while a target is slow to (or never does) come up had no way to
     // interrupt that wait -- it just queued up behind it. See also imp.rs's
-    // matching fix: openshell-supervisor-relay now races its own
-    // port-readiness wait against a "shutdown" request instead of only
-    // observing shutdown once that wait finishes.
+    // matching fix: openshell-supervisor-relay now races the host-readiness
+    // confirmation against a "shutdown" request instead of only observing
+    // shutdown once startup finishes.
     let shutdown_rx = {
         let mut reg = registry.lock().await;
         let Some(entry) = reg.get_mut(&sandbox_id) else {
@@ -2021,54 +2117,100 @@ async fn run_lifecycle(
         let launch_err = if let Some(e) = ready_err {
             Some(e)
         } else {
-            let launch_data = serde_json::json!({
-                "command": sandbox_config.command,
-                "env": env,
-            });
-            match channel
-                .request("launch", launch_data, std::time::Duration::from_mins(2))
-                .await
-            {
-                Ok(resp) if resp.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => {
-                    info!(sandbox = %sandbox_name, "control-channel launch acknowledged");
-                    // The "launch" response above only confirms the
-                    // command/env reached the spawner -- it still needs
-                    // to spawn the target and confirm its configured
-                    // port is accepting connections
-                    // (openshell-supervisor-relay's own
-                    // wait_for_port_ready, up to ~300s worst case across
-                    // its own retries). Await that distinct
-                    // "target_ready" event before treating launch as
-                    // successful, so a caller acting on Ready=True below
-                    // can never race a target that hasn't bound its port
-                    // yet.
-                    let target_ready_timeout = std::time::Duration::from_secs(310);
-                    match tokio::time::timeout(target_ready_timeout, target_ready_rx).await {
-                        Ok(Ok(Ok(()))) => {
-                            info!(sandbox = %sandbox_name, "control-channel target ready");
-                            None
+            let target_port = config.pc_relay_target_port;
+            match tcp_listener_is_present(target_port) {
+                Ok(true) => Some(format!(
+                    "target port {target_port} is already listening before launch"
+                )),
+                Err(error) => Some(format!(
+                    "failed to inspect target port {target_port} before launch: {error}"
+                )),
+                Ok(false) => {
+                    let launch_data = serde_json::json!({
+                        "command": sandbox_config.command,
+                        "env": env,
+                    });
+                    match channel
+                        .request("launch", launch_data, std::time::Duration::from_mins(2))
+                        .await
+                    {
+                        Ok(resp)
+                            if resp.get("ok").and_then(serde_json::Value::as_bool)
+                                == Some(true) =>
+                        {
+                            info!(sandbox = %sandbox_name, "control-channel launch acknowledged");
+                            // The AppContainer cannot safely probe its own
+                            // pre-listener loopback port or inspect the TCP
+                            // table. Observe the listener from the host while
+                            // racing the relay's early-exit diagnostic.
+                            let mut target_ready_rx = target_ready_rx;
+                            let listener_error = tokio::select! {
+                                result = wait_for_target_listener(target_port) => {
+                                    result.err().map(|error| error.to_string())
+                                }
+                                status = &mut target_ready_rx => {
+                                    Some(match status {
+                                        Ok(Err(target_err)) => target_err,
+                                        Ok(Ok(())) => "spawner reported target ready before host confirmation".to_string(),
+                                        Err(_) => "spawner exited before its target became ready".to_string(),
+                                    })
+                                }
+                            };
+                            if let Some(error) = listener_error {
+                                Some(error)
+                            } else {
+                                let confirm_timeout = std::time::Duration::from_secs(10);
+                                match channel
+                                    .request(
+                                        "target_ready",
+                                        serde_json::Value::Null,
+                                        confirm_timeout,
+                                    )
+                                    .await
+                                {
+                                    Ok(resp)
+                                        if resp.get("ok").and_then(serde_json::Value::as_bool)
+                                            == Some(true) =>
+                                    {
+                                        match tokio::time::timeout(
+                                            confirm_timeout,
+                                            &mut target_ready_rx,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(Ok(()))) => {
+                                                info!(sandbox = %sandbox_name, "control-channel target ready");
+                                                None
+                                            }
+                                            Ok(Ok(Err(target_err))) => Some(target_err),
+                                            Ok(Err(_)) => Some(
+                                                "spawner exited before confirming target readiness"
+                                                    .to_string(),
+                                            ),
+                                            Err(_) => Some(format!(
+                                                "timed out after {confirm_timeout:?} waiting for target readiness confirmation"
+                                            )),
+                                        }
+                                    }
+                                    Ok(resp) => Some(
+                                        resp.get("error")
+                                            .and_then(|value| value.as_str())
+                                            .unwrap_or("target readiness confirmation rejected")
+                                            .to_string(),
+                                    ),
+                                    Err(error) => Some(error.to_string()),
+                                }
+                            }
                         }
-                        // No version gate on this event, so this arm
-                        // never actually fires today -- see
-                        // try_route_target_ready -- but match it
-                        // explicitly rather than unreachable!(), in case
-                        // that ever changes.
-                        Ok(Ok(Err(target_err))) => Some(target_err),
-                        Ok(Err(_)) => {
-                            Some("spawner exited before its target became ready".to_string())
-                        }
-                        Err(_) => Some(format!(
-                            "timed out after {target_ready_timeout:?} waiting for target to become ready"
-                        )),
+                        Ok(resp) => Some(
+                            resp.get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("launch rejected")
+                                .to_string(),
+                        ),
+                        Err(e) => Some(e.to_string()),
                     }
                 }
-                Ok(resp) => Some(
-                    resp.get("error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("launch rejected")
-                        .to_string(),
-                ),
-                Err(e) => Some(e.to_string()),
             }
         };
         if let Some(err) = launch_err {
@@ -2397,7 +2539,21 @@ mod lifecycle_tests {
         NetworkMiddlewareConfig, NetworkPolicyRule, SandboxPolicy, StaticCredentialBinding,
         StaticCredentialEndpointBinding, UiClipboardAccess, UiPolicy,
     };
+    use openshell_policy::parse_sandbox_policy;
+    use std::path::Path;
     use std::time::Duration;
+
+    #[test]
+    fn target_ready_budget_remains_five_minutes() {
+        assert_eq!(TARGET_READY_TIMEOUT, Duration::from_mins(5));
+    }
+
+    #[tokio::test]
+    async fn host_tcp_table_observes_loopback_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(tcp_listener_is_present(port).unwrap());
+    }
 
     fn driver_sandbox(id: &str) -> DriverSandbox {
         let shell =
@@ -2539,6 +2695,80 @@ mod lifecycle_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         None
+    }
+
+    fn shipped_demo_config(name: &str) -> MxcComputeConfig {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join(name);
+        let source = std::fs::read_to_string(&path).expect("read shipped demo config");
+        let document: toml::Value = toml::from_str(&source).expect("parse shipped demo config");
+        document["openshell"]["drivers"]["mxc"]
+            .clone()
+            .try_into()
+            .expect("deserialize shipped MXC driver config")
+    }
+
+    fn shipped_demo_policy(name: &str, share: &str) -> SandboxPolicy {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join(name);
+        let rendered = std::fs::read_to_string(&path)
+            .expect("read shipped demo policy")
+            .replace("__OPENSHELL_DEMO_SHARE__", share)
+            .replace("__OLLAMA_HOST__", "127.0.0.1")
+            .replace("__OLLAMA_PORT__", "11434")
+            .replace("__CMD_EXE__", r"C:\Windows\System32\cmd.exe");
+        parse_sandbox_policy(&rendered).expect("parse rendered shipped demo policy")
+    }
+
+    #[tokio::test]
+    async fn shipped_inference_examples_create_process_container_sandboxes() {
+        for (index, (config_name, policy_name)) in [
+            ("mxc-ollama.toml", "ollama.yaml"),
+            ("mxc-inference.toml", "inference.yaml"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let share = tmp.path().to_string_lossy().replace('\\', "/");
+            let proof = format!("{share}/demo-created.txt");
+            let sandbox_name = format!("shipped-demo-{index}");
+            let cmd = vec![
+                r"C:\Windows\System32\cmd.exe".into(),
+                "/d".into(),
+                "/c".into(),
+                format!(r#"echo PASS>"{proof}""#),
+            ];
+            let config = shipped_demo_config(config_name);
+            assert_eq!(config.backend, MxcBackend::ProcessContainer);
+            assert!(config.egress_proxy);
+            let backend = MxcComputeBackend::new_mocked(config);
+            let policy = shipped_demo_policy(policy_name, &share);
+            let sandbox = with_policy(
+                driver_sandbox_with_command(&sandbox_name, &share, cmd),
+                policy,
+            );
+
+            backend
+                .create_sandbox(&sandbox)
+                .await
+                .unwrap_or_else(|error| panic!("{config_name} create failed: {error}"));
+            let completed = wait_for(&backend, &sandbox_name, |sandbox| {
+                ready_condition(sandbox)
+                    .is_some_and(|condition| condition.reason == "AgentCompleted")
+            })
+            .await;
+            assert!(
+                completed.is_some(),
+                "{config_name} did not reach Ready/AgentCompleted"
+            );
+            assert!(
+                tmp.path().join("demo-created.txt").is_file(),
+                "{config_name} did not run its in-policy workload"
+            );
+        }
     }
 
     #[test]
@@ -2710,6 +2940,8 @@ mod lifecycle_tests {
 
         let shell =
             std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+        let workload = tempfile::tempdir().expect("temporary workload directory");
+        let workload_dir = workload.path().to_string_lossy().into_owned();
         let mut policy = fs_policy(&[]);
         policy.network_policies.insert(
             "github".to_string(),
@@ -2724,10 +2956,19 @@ mod lifecycle_tests {
                     provider_credentialed: true,
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary { path: shell }],
+                binaries: vec![NetworkBinary {
+                    path: shell.clone(),
+                }],
             },
         );
-        let mut sandbox = with_policy(driver_sandbox("sb-provider-env"), policy);
+        let mut sandbox = with_policy(
+            driver_sandbox_with_command(
+                "sb-provider-env",
+                &workload_dir,
+                vec![shell, "/c".into(), "exit 0".into()],
+            ),
+            policy,
+        );
         sandbox
             .spec
             .as_mut()
@@ -2877,6 +3118,49 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn resolve_agent_proxy_ca_paths_stages_regardless_of_env_tier() {
+        // Regression test for the bug where CA staging was gated behind
+        // `config.pc_minimal_env`, so the default env tier (`pc_minimal_env
+        // == false`) left the agent pointed at the host proxy's private,
+        // AppContainer-unreadable temp directory instead of a staged copy.
+        // `resolve_agent_proxy_ca_paths` takes no env-tier argument at all,
+        // so this can't regress silently.
+        let source = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let ca = source.path().join("source-ca.pem");
+        let bundle = source.path().join("source-bundle.pem");
+        std::fs::write(&ca, b"ca").unwrap();
+        std::fs::write(&bundle, b"bundle").unwrap();
+        let host_proxy_ca_paths = (ca, bundle);
+
+        let resolved = resolve_agent_proxy_ca_paths(
+            Some(&host_proxy_ca_paths),
+            share.path().to_str().expect("UTF-8 test path"),
+            "sandbox-default-env-tier",
+        )
+        .unwrap()
+        .expect("resolved paths");
+
+        assert_eq!(
+            resolved.0.parent().unwrap(),
+            share
+                .path()
+                .join(".openshell-proxy")
+                .join("sandbox-default-env-tier")
+        );
+        assert_ne!(resolved.0, host_proxy_ca_paths.0);
+        assert_ne!(resolved.1, host_proxy_ca_paths.1);
+    }
+
+    #[test]
+    fn resolve_agent_proxy_ca_paths_is_none_without_a_host_proxy() {
+        assert_eq!(
+            resolve_agent_proxy_ca_paths(None, "unused-share", "sandbox-a").unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn proxy_env_replaces_inherited_values_and_clears_bypass_rules() {
         let mut env = vec![
             "PATH=C:\\Windows".to_owned(),
@@ -2965,19 +3249,6 @@ mod lifecycle_tests {
         assert!(env.contains(&format!("REQUESTS_CA_BUNDLE={bundle_path}")));
         assert!(env.contains(&format!("CURL_CA_BUNDLE={bundle_path}")));
         assert!(env.contains(&format!("GIT_SSL_CAINFO={bundle_path}")));
-    }
-
-    #[test]
-    fn tls_readwrite_grant_adds_ca_directory_once() {
-        let tls_dir = std::env::temp_dir().join("openshell-mxc-tls-test");
-        let ca_cert = tls_dir.join("openshell-ca.pem");
-        let bundle = tls_dir.join("ca-bundle.pem");
-        let existing = tls_dir.display().to_string().to_ascii_lowercase();
-        let mut readwrite = vec![existing.clone()];
-
-        append_tls_readwrite_grant(&mut readwrite, Some(&(ca_cert, bundle)));
-
-        assert_eq!(readwrite, vec![existing]);
     }
 
     #[test]
@@ -3174,18 +3445,22 @@ mod lifecycle_tests {
             );
             assert!(recorded["network"].get("proxy").is_none());
 
-            let proxy_addr = {
+            let (proxy_addr, host_proxy_ca_paths) = {
                 let registry = backend.registry.lock().await;
                 let entry = registry.get(sandbox_id).expect("registry entry");
-                assert!(
-                    entry.host_proxy.is_some(),
-                    "{sandbox_id}: governed egress must hold a live host proxy"
-                );
+                let host_proxy = entry.host_proxy.as_ref().unwrap_or_else(|| {
+                    panic!("{sandbox_id}: governed egress must hold a live host proxy")
+                });
                 assert_eq!(
                     entry.trimmed_policy.as_ref().unwrap().network_policies,
                     policy.network_policies
                 );
-                entry.proxy_addr.expect("proxy address")
+                (
+                    entry.proxy_addr.expect("proxy address"),
+                    host_proxy
+                        .ca_file_paths()
+                        .expect("governed egress proxy must expose public CA paths"),
+                )
             };
             tokio::time::timeout(
                 Duration::from_secs(2),
@@ -3196,6 +3471,46 @@ mod lifecycle_tests {
             .expect("proxy listener must accept connections");
 
             let child_env = recorded["process"]["env"].as_array().expect("child env");
+            let tls_env = child_env
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|entry| entry.split_once('='))
+                .filter(|(key, _)| TLS_ENV_KEYS.contains(key))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(
+                tls_env.len(),
+                TLS_ENV_KEYS.len(),
+                "{sandbox_id}: every TLS trust variable must be replaced"
+            );
+            let staged_ca_dir = PathBuf::from(&share)
+                .join(".openshell-proxy")
+                .join(sandbox_id);
+            for key in TLS_ENV_KEYS {
+                let path = PathBuf::from(
+                    tls_env
+                        .get(key)
+                        .unwrap_or_else(|| panic!("{sandbox_id}: missing {key}")),
+                );
+                assert_eq!(
+                    path.parent(),
+                    Some(staged_ca_dir.as_path()),
+                    "{sandbox_id}: {key} must use the staged CA directory"
+                );
+                assert!(path.is_file(), "{sandbox_id}: staged {key} path must exist");
+            }
+            let host_ca_dir = host_proxy_ca_paths
+                .0
+                .parent()
+                .expect("host CA path must have a parent");
+            assert!(
+                recorded["filesystem"]["readwritePaths"]
+                    .as_array()
+                    .expect("read-write paths")
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .all(|path| Path::new(path) != host_ca_dir),
+                "{sandbox_id}: the host proxy CA directory must not be writable"
+            );
             let proxy_env = child_env
                 .iter()
                 .filter_map(serde_json::Value::as_str)
