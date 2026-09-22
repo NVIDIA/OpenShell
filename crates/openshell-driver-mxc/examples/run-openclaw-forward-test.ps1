@@ -56,15 +56,10 @@ param(
   [Parameter(Mandatory = $true)]
   [string] $OpenClawInstallDir,
   # Must be a DIRECT CHILD of a drive root (e.g. C:\openshell-openclaw, not
-  # C:\work\openshell-openclaw). Node's CommonJS module resolver calls
-  # fs.realpathSync while resolving the entry script, which lstat()s every
-  # parent directory up the chain -- including ones OUTSIDE share_dir. The
-  # AppContainer only grants share_dir itself, so an intermediate parent like
-  # C:\work fails with EPERM (confirmed empirically: this exact test failed
-  # with "EPERM: operation not permitted, lstat 'C:\work'" until the share
-  # dir was moved to the drive root). The drive root itself (C:\) apparently
-  # doesn't need an explicit grant to lstat successfully, so a one-level path
-  # sidesteps the problem entirely.
+  # C:\work\openshell-openclaw). The staged Node invocation below uses
+  # --preserve-symlinks-main so Node does not realpath the main module before
+  # our capture script starts; keeping a one-level path also avoids exposing
+  # or depending on unrelated intermediate directories.
   [string] $ShareDir = "C:\openshell-openclaw",
   [int]    $TargetPort = 18889,
   [int]    $ForwardLocalPort = 28889,
@@ -217,6 +212,7 @@ $fwdProc     = $null
 $fwdLog      = Join-Path $resultDir "forward.log"
 $fwdErrLog   = Join-Path $resultDir "forward.err.log"
 $passed      = $false
+$failureMessage = ""
 $healthJson  = $null
 $selfProbeOutcome = "not-recorded"
 $selfProbeResponseBytes = 0
@@ -426,6 +422,7 @@ try {
     mxc = @{
       command = @(
         "$shareDirToml/node.exe",
+        "--preserve-symlinks-main",
         "$shareDirToml/openclaw-capture.mjs",
         "gateway", "run", "--dev", "--allow-unconfigured",
         "--auth", "token", "--bind", "loopback", "--port", "$TargetPort"
@@ -456,43 +453,23 @@ try {
     "--env", "NEMOCLAW_MXC_EGRESS_LOOPBACK_PORT=29999",
     "--no-tty", "--", "exit"
   )
+  # Windows PowerShell 5.1 wraps native stderr as ErrorRecord objects. Keep
+  # warnings in the captured diagnostic without letting them terminate the
+  # command before its real exit code and output are collected.
+  $createPrevEAP = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
   try { $createOut = & $cli @createArgs 2>&1; $createCode = $LASTEXITCODE }
   catch { $createOut = $_.Exception.Message; $createCode = 1 }
+  finally { $ErrorActionPreference = $createPrevEAP }
   $createBenign = Show-SandboxCreate $createOut $SandboxName
   if ($createCode -ne 0 -and -not $createBenign) {
     throw "sandbox create '$SandboxName' failed (exit $createCode): $($createOut | Out-String)"
   }
 
-  # 9. Wait for OpenClaw's gateway to report ready, by tailing the gateway's
-  #    own log for the line it prints on successful startup (forwarded from
-  #    the sandbox's stdout via "wxc-exec stdout:"). Generous timeout: Node
-  #    startup + AppContainer/UAC elevation + plugin warmup can take a while
-  #    on a cold run.
-  Step "Wait for OpenClaw gateway readiness"
-  $readyDeadline = (Get-Date).AddSeconds(90)
-  $openclawReady = $false
-  while ((Get-Date) -lt $readyDeadline) {
-    if (Test-Path $gwLog) {
-      # `.*` (not `\s+`) between "[gateway]" and "ready": OpenClaw wraps its
-      # log lines in ANSI color codes whenever it inherits enough of the host
-      # env to detect a color-capable terminal -- which happens with
-      # mxc-openclaw-localnet.toml (-UseLocalNetwork), since that config
-      # doesn't set pc_minimal_env and so inherits the full host env, unlike
-      # mxc-openclaw-gateway.toml's curated minimal set. A strict \s+ match
-      # missed this entirely and timed out waiting for a line that had
-      # already printed. Those codes render in this log as LITERAL backslash-
-      # escaped text (e.g. "...\x1b[36mready..."), not real ESC bytes -- so
-      # "m" from "36m" directly abuts "ready" with no word boundary, which is
-      # why a \bready\b tightening (tried once) also failed to match; a bare
-      # substring check is what actually works here. The resulting collision
-      # risk with "already" is theoretical -- no such line has been observed
-      # on this "[gateway]"-tagged forwarded-stdout path in practice.
-      if (Select-String -Path $gwLog -Pattern '\[gateway\].*ready' -Quiet -ErrorAction SilentlyContinue) { $openclawReady = $true; break }
-    }
-    Start-Sleep -Seconds 2
-  }
-  if (-not $openclawReady) { throw "OpenClaw did not report ready within 90s (see gateway.log in the results bundle)" }
-  Ok "OpenClaw gateway ready"
+  # `sandbox create` does not return success until the MXC driver receives the
+  # relay's target_ready event. Trust that lifecycle result directly instead
+  # of racing a second, text-based poll against gateway.log.
+  Ok "OpenClaw gateway ready (sandbox target_ready received)"
 
   # 10. openshell forward service: opens a fresh, on-demand relay for this
   #     one call and bridges TargetPort (inside the sandbox) to
@@ -610,26 +587,55 @@ try {
   }
 }
 catch {
-  Bad $_.Exception.Message
+  $failureMessage = $_.Exception.Message
+  Bad $failureMessage
 }
 finally {
   # Stop the forward before the sandbox so its relay tears down cleanly.
   if ($fwdProc -and -not $fwdProc.HasExited) {
     try { Stop-Process -Id $fwdProc.Id -Force -ErrorAction SilentlyContinue } catch {}
   }
+  if ($fwdProc) {
+    try {
+      if (-not $fwdProc.WaitForExit(5000)) {
+        throw "forward process did not exit within 5s"
+      }
+    } catch {
+      Info "forward teardown: $($_.Exception.Message)"
+      if ($passed) { $passed = $false; $failureMessage = $_.Exception.Message }
+    }
+  }
 
   # Tear down the sandbox while the gateway is still up (delete needs it).
   if ($cli -and $SandboxName) {
-    try { & $cli sandbox delete $SandboxName 2>&1 | Out-Null }
-    catch { Info "sandbox teardown '$SandboxName': $($_.Exception.Message) (continuing)" }
+    $deleteCode = 1
+    $deleteOut = @()
+    $deletePrevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { $deleteOut = & $cli sandbox delete $SandboxName 2>&1; $deleteCode = $LASTEXITCODE }
+    catch { $deleteOut = $_.Exception.Message }
+    finally { $ErrorActionPreference = $deletePrevEAP }
+    if ($deleteCode -ne 0) {
+      $cleanupFailure = "sandbox teardown '$SandboxName' failed (exit $deleteCode): $($deleteOut | Out-String)"
+      Info $cleanupFailure
+      if ($passed) { $passed = $false; $failureMessage = $cleanupFailure }
+    }
   }
 
   if ($KeepRunning -and $gw -and -not $gw.HasExited) {
     Info "leaving gateway pid $($gw.Id) running (-KeepRunning); stop with: Stop-Process -Id $($gw.Id) -Force"
   } elseif ($gw -and -not $gw.HasExited) {
     Step "Cleanup"; Stop-Process -Id $gw.Id -Force -ErrorAction SilentlyContinue
-    try { $gw.WaitForExit(5000) | Out-Null } catch {}
-    Info "stopped gateway pid $($gw.Id)"
+    try {
+      if (-not $gw.WaitForExit(5000)) {
+        throw "gateway process did not exit within 5s"
+      }
+      Info "stopped gateway pid $($gw.Id)"
+    } catch {
+      $cleanupFailure = "gateway teardown failed: $($_.Exception.Message)"
+      Info $cleanupFailure
+      if ($passed) { $passed = $false; $failureMessage = $cleanupFailure }
+    }
   }
 
   Step "Gateway log (tail)"
@@ -663,12 +669,17 @@ finally {
 
   Step "RESULT"
   $verdict = if ($passed) { "PASS" } else { "FAIL" }
+  if (-not $passed -and [string]::IsNullOrWhiteSpace($failureMessage)) {
+    $failureMessage = "one or more qualification assertions failed"
+  }
+  $failureSummary = ($failureMessage -replace '\s+', ' ').Trim()
   $summary = @"
 OpenShell MXC OpenClaw + dynamic forward test
 =====================================================================
 timestamp         : $stamp
 machine            : $env:COMPUTERNAME
 verdict            : $verdict
+failure            : $failureSummary
 sandbox            : $SandboxName
 backend            : $Backend
 config             : $tomlName
