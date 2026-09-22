@@ -1,407 +1,369 @@
 # Testing
 
-## Running Tests
+This document defines the desired testing model for OpenShell. It is a target
+state for migrating host-managed and `mise`-managed tests to reproducible Nix
+environments and `tmachine` wherever practical. It distinguishes the behavior
+required for a green change, release validation, specialized testing, and the
+current migration gaps.
 
-```bash
-mise run test          # Rust + Python unit tests
-mise run e2e           # End-to-end tests (starts a Docker-backed gateway)
-mise run ci            # Everything: lint, compile checks, and tests
-```
+Use [CI.md](CI.md) for current workflow mechanics. `flake.nix`,
+`tests/config.nix`, and `tests/suites` define the emerging test interface;
+`mise tasks` remains the inventory for paths that have not yet migrated.
 
-## Test Layout
+## Execution model
 
-```text
-crates/*/src/          # Inline #[cfg(test)] modules
-crates/*/tests/        # Rust integration tests
-python/openshell/      # Python unit tests (*_test.py suffix)
-e2e/python/            # Python E2E tests (test_*.py prefix)
-e2e/rust/              # Rust CLI E2E tests
-```
+OpenShell uses two primary test environments:
 
-## Rust Tests
+- Source-level checks run directly in Nix-provided environments. Nix pins the
+  compiler, tools, and native dependencies while preserving a short edit and
+  unit-test loop.
+- Integration and Linux installation tests run through `tmachine`. Nix builds
+  the candidate artifacts and test archives; `tmachine` creates a disposable
+  guest, applies scenario setup and installation playbooks, and runs a selected
+  testsuite.
 
-Unit tests live inline with `#[cfg(test)] mod tests` blocks. Integration tests
-go in `crates/*/tests/` and are named `*_integration.rs`.
+`flake.lock` pins the build and test inputs. `tests/artifacts.nix` defines the
+candidate artifacts, `tests/config.nix` defines machines and scenarios,
+`tests/ansible` owns guest setup and installation, and `tests/suites` owns test
+behavior.
 
-Use `#[tokio::test]` for anything async:
+A direct host or external workflow remains appropriate when `tmachine` cannot
+represent the required environment, such as native Windows or macOS behavior,
+GPU hardware, or an unsupported orchestration or virtualization topology. Such
+paths are exceptions rather than a second preferred test framework.
 
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
+`mise` tasks may remain as migration bridges, but new integration behavior
+should not depend exclusively on a `mise` task or add another host-managed
+harness when a Nix and `tmachine` path is possible.
 
-    #[tokio::test]
-    async fn store_round_trip() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
-        store.put("sandbox", "abc", "my-sandbox", b"payload").await.unwrap();
-        let record = store.get("sandbox", "abc").await.unwrap().unwrap();
-        assert_eq!(record.payload, b"payload");
-    }
-}
-```
+## Test dimensions
 
-Run Rust tests only:
+Keep these dimensions separate so CI can select useful combinations without
+creating an indiscriminate cross-product:
 
-```bash
-mise run test:rust     # cargo test --workspace
-```
-
-Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:check` to check them directly. If one is stale, refresh it with Cargo using its adjacent manifest, review the diff, and commit the update.
-
-### Native Windows validation
-
-Use `mise run --skip-tools pre-commit` with the existing Rust/MSVC toolchain.
-Windows now checks tracked Cargo lockfiles through PowerShell rather than
-skipping them. The deterministic gateway parity task uses Git for Windows Bash,
-with temporary Python launchers confined to a unique checkout-owned directory.
-
-`mise run --skip-tools sdk:ts:ci` selects the x64 Biome executable on Windows
-(including ARM64 hosts running it under emulation), resolves the protobuf
-plugin through its Windows `.cmd` launcher, and installs the matching locked
-ARM64 Rolldown binding when Node itself is ARM64. The helper preserves lockfile
-resolution; it must not upgrade unrelated test dependencies.
-
-`mise run --skip-tools go:ci` retains race detection except on Windows ARM64,
-where Go does not support it. Windows token-file tests explicitly skip POSIX
-mode-bit assertions; those skips do not establish Windows ACL protection.
-Use a checkout with LF text files when running Unix-shell fixture checks.
-
-## Python Unit Tests
-
-Python unit tests use the `*_test.py` suffix convention (not `test_*` prefix)
-and live alongside the source in `python/openshell/`. They use mock-based
-patterns with fake gRPC stubs:
-
-```python
-def test_exec_python_serializes_callable_payload() -> None:
-    stub = _FakeStub()
-    client = _client_with_fake_stub(stub)
-
-    def add(a: int, b: int) -> int:
-        return a + b
-
-    result = client.exec_python("sandbox-1", add, args=(2, 3))
-    assert result.exit_code == 0
-```
-
-Run Python unit tests only:
-
-```bash
-mise run test:python   # uv run pytest python/
-```
-
-## E2E Tests
-
-E2E tests run against a live gateway. By default, `mise run e2e` starts an
-ephemeral standalone gateway with the Docker compute driver, runs the suite,
-and cleans it up afterward. To run the suite against an existing plaintext
-gateway, set `OPENSHELL_GATEWAY_ENDPOINT`:
-
-```bash
-OPENSHELL_GATEWAY_ENDPOINT=http://127.0.0.1:18080 mise run e2e
-```
-
-Raw endpoint mode is HTTP-only. Use a named gateway config when a gateway
-requires mTLS.
-
-### Python E2E (`e2e/python/`)
-
-Tests use the `sandbox` fixture from `conftest.py` to create real sandboxes:
-
-```python
-def test_exec_returns_stdout(sandbox):
-    with sandbox(delete_on_exit=True) as sb:
-        result = sb.exec(["echo", "hello"])
-        assert result.exit_code == 0
-        assert "hello" in result.stdout
-```
-
-#### `Sandbox.exec_python`
-
-`exec_python` serializes a Python callable with `cloudpickle`, sends it to the
-sandbox, and returns the result. Because cloudpickle serializes module-level
-functions by reference (which fails inside the sandbox), use one of these
-patterns:
-
-**Closures from factory functions:**
-
-```python
-def _make_adder():
-    def add(a, b):
-        return a + b
-    return add
-
-def test_addition(sandbox):
-    with sandbox(delete_on_exit=True) as sb:
-        result = sb.exec_python(_make_adder(), args=(2, 3))
-        assert result.stdout.strip() == "5"
-```
-
-**Bound methods on local classes:**
-
-```python
-def test_multiply(sandbox):
-    class Calculator:
-        def multiply(self, a, b):
-            return a * b
-
-    with sandbox(delete_on_exit=True) as sb:
-        result = sb.exec_python(Calculator().multiply, args=(6, 7))
-        assert result.stdout.strip() == "42"
-```
-
-#### Shared Fixtures (`e2e/python/conftest.py`)
-
-| Fixture | Scope | Purpose |
+| Dimension | Meaning | Examples |
 |---|---|---|
-| `sandbox_client` | session | gRPC client connected to the active gateway |
-| `sandbox` | function | Factory returning a `Sandbox` context manager |
+| Platform | Host architecture and operating system used for source checks or to run `tmachine` | Linux x86_64, Linux ARM64, macOS ARM64 |
+| Environment | Guest operating system and execution mechanism under test | Fedora with Podman, Ubuntu with Docker, Kubernetes, VM driver |
+| Configuration | A product wiring choice independent of the environment | In-process driver, external driver, provider configuration |
+| Installation | How candidate artifacts enter the environment | Direct binaries and images, RPM, DEB, Helm, Snap |
+| Testsuite | The reusable assertions applied after installation | Conformance, a feature suite, or a driver suite |
 
-### Rust CLI E2E (`e2e/rust/`)
+For example, an external driver is a configuration axis rather than a new
+environment. The VM driver is an environment or product configuration, not an
+installation mechanism.
 
-Rust-based e2e tests that exercise the `openshell` CLI binary as a subprocess.
-They live in the `openshell-e2e` crate and use a shared harness for sandbox
-lifecycle management, output parsing, and cleanup.
+CI explicitly lists scenario and testsuite pairs so GitHub Actions can execute
+them in parallel. Those entries must reference scenarios declared in
+`tests/config.nix`; workflows must not duplicate the guest setup or installation
+logic.
 
-Suites:
+## Source-level validation
 
-- Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
-- CLI conformance (`openshell-conformance`) - the portable deployment smoke
-  scenario plus focused tests for its reusable command runner.
-- Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
-  `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
-  the selected deployment.
-- Docker suite (`--features e2e-docker`) - includes Docker-only coverage such as Dockerfile image builds, Docker preflight checks, and managed Docker gateway start.
-- Docker GPU suite (`--features e2e-docker-gpu`) - Docker suite plus GPU sandbox smoke coverage.
-- VM suite (`--features e2e-vm`) - runs e2e tests on a VM.
-- Kubernetes credential-driver suite (`--features e2e-kubernetes-credential-drivers`) - targeted Kubernetes Secrets and Vault provider credential storage coverage.
+Every change must run this minimum source gate:
 
-GPU device-selection tests compare OpenShell sandboxes against a plain Docker or
-Podman container that requests `--device nvidia.com/gpu=all`. The probe image
-defaults to the image used by the `gateway` stage in
-`deploy/docker/Dockerfile.images`; set `OPENSHELL_E2E_GPU_PROBE_IMAGE` to
-override it. Per-device checks run only for NVIDIA CDI device IDs reported by
-the runtime's discovered devices list, so WSL2 hosts that expose only
-`nvidia.com/gpu=all` skip the index-based cases. Exact CDI device selection is
-passed through `--driver-config-json` with the active Docker or Podman driver
-key.
+- Rust formatting and linting;
+- Rust unit tests;
+- compile-time and other static analysis needed to catch feature and platform
+  conditional-compilation failures;
+- dependency-policy checks; and
+- repository-level security checks using their existing configurations and
+  enforcement behavior.
 
-Run the Docker-backed Rust CLI e2e suite:
+Rust validation runs on multiple platforms for every change because conditional
+compilation is a material source of regressions. The initial required set is:
 
-```shell
-mise run e2e:docker
-```
+- Linux x86_64;
+- Linux ARM64; and
+- macOS ARM64.
 
-Run the minimal portable CLI conformance profile against the gateway selected
-in your OpenShell CLI configuration:
+Windows x64 and ARM64 compilation is desirable, but whether it joins the
+required source gate remains deferred until the other target matrices are
+established.
 
-```shell
-mise run e2e:cli-conformance
-```
+SDK checks are conditional:
 
-The gateway must already be installed, reachable, and selected before the task
-starts. The task does not provision a gateway or select a compute driver. Set
-`OPENSHELL_BIN` to test a prebuilt CLI; otherwise, the task builds the CLI from
-the current checkout.
+- a change local to one SDK runs that SDK's formatting, linting, generated-file
+  checks, build, and unit tests; and
+- a shared protobuf change runs every affected SDK's checks.
 
-The phase-1 scenario verifies the complete CLI-to-gateway-to-driver path without
-depending on how the gateway was installed or which driver is configured. It
-requires machine-readable gRPC status, creates a uniquely named detached
-sandbox with `--from base`, verifies the sandbox is `Ready` by finding its
-unique name in paginated JSON list output, executes `echo` with a run-specific
-marker, deletes the sandbox, and verifies that its name no longer appears.
-Driver suites enable the same profile
-instead of maintaining a separate smoke implementation. Sandbox lifecycle,
-label matrices, VM overlay, and TLS-key permission assertions remain regular
-E2E coverage.
+Packaging validation is also conditional. RPM, DEB, Helm, Snap, Homebrew, and
+other packaging checks run when their inputs change. Selection must account for
+transitive inputs such as shared binaries, schemas, versioning, installers, and
+release metadata. If CI cannot safely determine the affected set, it runs the
+broader set.
 
-Each invocation prints a ten-character run ID before creating resources.
-Conformance sandboxes use names such as `ct-<run-id>-01`. The runner tracks the
-exact name and uses it for cleanup; phase 1 does not add ownership labels.
+The desired implementation exposes these checks through Nix environments or
+flake outputs. Current `mise` tasks remain valid until equivalent Nix entry
+points exist.
 
-The runner deletes owned resources after both success and failure. If the test
-process is interrupted before cleanup, locate leftovers without touching
-unrelated gateway state:
+## Integration test classes
 
-```shell
-openshell sandbox list --output json
-openshell sandbox delete <sandbox-name>
-```
+Initial integration coverage has three classes.
 
-Gateway-backed Rust E2E tasks build the standalone conformance CLI, run its
-registered scenarios against the configured gateway, then run any lane-specific
-Rust tests that still apply. Run the Podman-backed Rust CLI e2e suite:
+### Conformance
 
-```shell
-mise run e2e:podman
-```
+Conformance tests cover driver-agnostic behavior that must work regardless of
+environment and OpenShell configuration. Existing driver-agnostic E2E behavior
+should migrate into this suite rather than remain copied across driver harnesses.
 
-Run the VM-backed Rust CLI e2e suite:
+The initial conformance suite is CLI-focused. API- and SDK-level conformance is
+outside the initial scope.
 
-```shell
-mise run e2e:vm
-```
+### Feature-specific
 
-Run the targeted Kubernetes credential-driver e2e suite. This deploys an
-OpenBao fixture for the Vault-compatible driver path and validates Kubernetes
-Secrets and Vault storage backends one at a time:
+Feature-specific tests require external functionality or an additional product
+configuration. Suites live under `tests/suites/features/<feature>` and are
+independently selectable in CI. Examples include provider-refresh and
+Keycloak-backed authentication.
 
-```shell
-mise run e2e:kubernetes:credential-drivers
-```
+The testsuite owns the lifecycle of its external dependencies. A feature suite
+should provision, configure, diagnose, and remove services such as Keycloak
+instead of turning each dependency into a permanent base environment.
 
-### Kubernetes E2E (`e2e/rust/e2e-kubernetes.sh`)
+### Driver-specific
 
-Kubernetes e2e tests deploy an OpenShell gateway into a real Kubernetes cluster
-via Helm and run the Rust e2e suite against it. On vanilla Kubernetes the harness
-reaches the gateway through `kubectl port-forward`; on OpenShift it instead uses a
-passthrough Route secured with mandatory mTLS (see the OpenShift note below).
+Driver-specific tests exercise behavior unique to a compute driver. Suites live
+under `tests/suites/drivers/<driver>`. The initial model uses one coarse suite
+per driver; finer capability-level selection is not required.
 
-Run with an ephemeral k3d cluster (macOS; created and torn down automatically):
+Common behavior belongs in conformance. A driver suite must not retain a
+driver-local copy of an assertion that is valid for every driver.
 
-```shell
-mise run e2e:kubernetes
-```
+## Merge integration matrix
 
-Target an existing cluster (kind, k3d, or OpenShift):
+A green merge runs a fixed integration matrix. Change-aware scenario selection
+may be added later as an optimization, but it is not part of the initial design.
 
-```shell
-OPENSHELL_E2E_KUBE_CONTEXT=my-context mise run e2e:kubernetes
-```
+Conformance runs against these five environment classes:
 
-Scope to a single test for local debugging:
+1. Fedora with rootful Podman.
+2. Fedora with rootless Podman.
+3. Ubuntu with Docker.
+4. A Kubernetes distribution.
+5. The VM driver.
 
-```shell
-OPENSHELL_E2E_KUBE_TEST=smoke mise run e2e:kubernetes
-```
+The exact Kubernetes distribution is deferred. k3s running inside a guest is a
+candidate, but the matrix should not encode that choice until it has been
+validated.
 
-**OpenShift**: when the target cluster exposes the `route.openshift.io` API
-group, the harness automatically applies SCC-compatible Helm overrides, grants
-the required SCCs (`privileged` to `openshell-sandbox`, and `anyuid` to the
-PostgreSQL fixture for DB scenarios), and drives the gateway through a
-passthrough Route with mandatory mTLS instead of port-forward. No extra flags are
-needed, but `oc` must be installed and authenticated against the target cluster
-with permission to modify SCC bindings (`oc adm policy add-scc-to-user`) — the
-harness exits early if `oc` is missing. The SCC grants and extracted client
-mTLS material are removed during cleanup, including on failure or interrupt.
+The five environments are the initial default rather than a permanent minimum.
+Maintainers may add or remove entries when the execution cost and defect-finding
+value justify the change.
 
-On a **remote** cluster, drop the `e2e-host-gateway` feature. Those tests rely
-on the sandbox-side `host.openshell.internal` alias reaching the machine running
-the tests, which is unreachable from pods on a remote cluster, so they fail.
-Left enabled, the `host_gateway_alias` suite fails because
-`host.openshell.internal` does not resolve inside the pod, so the gateway
-SSRF-denies the request (`DNS resolution failed` / `ssrf_denied`) — a networking
-property of remote pods, not a gateway or transport fault. Override
-`OPENSHELL_E2E_KUBERNETES_FEATURES` to exclude it:
+Each feature-specific suite runs against at least one representative compatible
+environment. Each driver-specific suite runs against at least one representative
+environment for that driver. A feature or driver suite need not run across the
+entire conformance matrix.
 
-```shell
-OPENSHELL_E2E_KUBE_CONTEXT=$(oc config current-context) \
-  OPENSHELL_E2E_KUBERNETES_FEATURES="e2e,e2e-kubernetes" \
-  mise run e2e:kubernetes
-```
+External-driver mode exists to test the gateway-to-driver interaction; external
+drivers are not currently release artifacts. One representative external-driver
+scenario is sufficient. Its environment is deferred.
 
-On an existing cluster the harness builds the CLI from your branch but pulls the
-**published** gateway/supervisor image (default tag `latest`). The CLI and the
-image can therefore be different versions. If tests fail because of this version
-difference — for example, sandbox tests fail with `Pod exists with phase: Failed`
-or connect-based tests stall because the deployed image predates a feature your
-branch CLI needs — set `IMAGE_TAG` to an image that matches your branch.
+Merge integration initially installs directly built binaries and images. Package
+installation may be added to merge testing later, but it is not required for the
+initial gate.
 
-The `latest` tag lags to the last semver release, so it is often older than
-`main`. Two better choices:
+## Specialized tests
 
-- `IMAGE_TAG=dev` — a floating tag that tracks the latest `main` build. Good for
-  an ad-hoc run when your branch is close to `main` HEAD. Because it floats, two
-  runs on different days can pull different images, so it is not reproducible.
-- **Pin the exact commit your branch is based on** — deterministic and immune to
-  a floating tag moving. Published tags are the full 40-char git SHA (semver tags
-  without a `v` prefix also exist but only for released versions):
+GPU and Windows tests remain label-selected, opt-in CI suites. They do not form
+part of the initial default integration matrix.
 
-```shell
-OPENSHELL_E2E_KUBE_CONTEXT=$(oc config current-context) \
-  OPENSHELL_E2E_KUBERNETES_FEATURES="e2e,e2e-kubernetes" \
-  IMAGE_TAG=$(git rev-parse "$(git merge-base HEAD upstream/main)") \
-  mise run e2e:kubernetes
-```
+Performance, scalability, soak, and generalized failure-recovery testing are
+outside the current testing plan. The document should not imply gates or service
+levels for those classes.
 
-To pin a specific released version, use its semver tag without a `v` prefix
-(`0.0.115`, not `v0.0.115`):
+## Release validation
+
+Release validation tests candidate artifacts before publication. It initially
+uses the same representative environment model rather than constructing the
+full cross-product of operating systems, architectures, drivers,
+configurations, installation mechanisms, and testsuites.
+
+`tmachine` installs and validates these candidate installation mechanisms:
+
+| Installation mechanism | Representative environment | Initial validation |
+|---|---|---|
+| RPM | Fedora | Install, start OpenShell, and run conformance |
+| DEB | Ubuntu | Install, start OpenShell, and run conformance |
+| Snap | Ubuntu | Install, start OpenShell, and run conformance |
+| Helm | Kubernetes | Install, start OpenShell, and run conformance |
+| Homebrew | Native macOS path | Reuse the existing path where available; deeper candidate validation is a follow-up |
+
+Conformance is sufficient as the initial post-install suite. Release validation
+runs for every candidate release; change-aware optimization is not initially
+required. Expanding the environment or installation matrix is opt-in and should
+target a specific risk rather than form a simple cross-product.
+
+Upgrade and backward-compatibility testing is a likely release follow-up, but it
+is not part of the initial release gate.
+
+## Running tests locally
+
+The local interface is migrating with the test implementation. This section
+separates commands that work now from the desired interface so contributors do
+not mistake a target-state command for an implemented one.
+
+### Available now
+
+Local Nix commands require flakes. `tmachine` additionally requires capacity for
+a four-vCPU, 4 GiB QEMU guest. It uses HVF on Apple Silicon macOS, KVM on
+native-architecture Linux when available, and a slower TCG fallback on Linux.
+Artifact image builds require Docker.
+
+Enter the pinned source-development environment:
 
 ```shell
-OPENSHELL_E2E_KUBE_CONTEXT=$(oc config current-context) \
-  OPENSHELL_E2E_KUBERNETES_FEATURES="e2e,e2e-kubernetes" \
-  IMAGE_TAG=0.0.115 \
-  mise run e2e:kubernetes
+nix develop
 ```
 
-A semver tag matches a released commit, which may be behind `main`; if your
-branch CLI needs a newer feature, pin the SHA of your branch's base instead.
-
-Confirm a tag exists before relying on it (set `TAG` to the tag you plan to use):
+From that shell, run the core Rust source checks individually:
 
 ```shell
-TAG=0.0.115
-skopeo inspect "docker://ghcr.io/nvidia/openshell/gateway:${TAG}"
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo nextest run --profile ci --workspace \
+  --features openshell-server/test-support
 ```
 
-`IMAGE_TAG` sets only the gateway/supervisor image; the CLI under test is always
-built from your branch. To validate against images from your exact commit
-instead, build and push them and point `OPENSHELL_REGISTRY`/`IMAGE_TAG` at them.
+These commands cover the main Rust workspace. CI also checks the separate E2E
+and example workspaces and exercises additional feature combinations as
+documented in [CI.md](CI.md).
 
-Available task variants:
+The default local integration cycle builds the current checkout and runs CLI
+conformance in the Ubuntu/Docker scenario:
 
-| Task | Purpose |
+```shell
+nix run .#build-artifacts
+nix run .#tmachine -- test ubuntu-docker-rootful conformance
+```
+
+`build-artifacts` produces the binaries, runtime images, Helm chart, and
+conformance archive expected by tmachine. For a focused rebuild, the flake also
+exposes:
+
+```shell
+nix run .#build-artifacts-binaries
+nix run .#build-artifacts-images
+nix run .#build-artifacts-test-archives
+nix run .#build-artifacts-helm
+```
+
+The tmachine invocation accepts any scenario and testsuite defined in
+`tests/config.nix`:
+
+```shell
+nix run .#tmachine -- test <scenario> <testsuite>
+```
+
+The currently implemented conformance pairs are:
+
+| Scenario | Testsuite |
 |---|---|
-| `e2e:kubernetes` | Default Rust e2e against Helm-deployed gateway |
-| `e2e:kubernetes:db` | All database backend scenarios (SQLite + external PostgreSQL) |
-| `e2e:kubernetes:sidecar` | Supervisor sidecar topology overlay |
-| `e2e:kubernetes:credential-drivers` | Kubernetes Secrets and Vault credential storage |
-| `e2e:kubernetes:workspace-managed` | Managed workspace mode (auto-created namespaces) |
-| `e2e:kubernetes:workspace-operator` | Operator workspace mode (pre-provisioned namespaces) |
-| `e2e:kubernetes:v1alpha1` | Agent Sandbox v1alpha1 compatibility |
-| `e2e:kubernetes:external-driver` | External Kubernetes driver sidecar |
+| `ubuntu-docker-rootful` | `conformance` |
+| `fedora-podman-rootful` | `conformance` |
+| `fedora-podman-rootless` | `conformance` |
 
-Kubernetes e2e environment variables:
+Nix and tmachine caches may reuse immutable setup and installation layers, while
+each test runs on a fresh writable overlay.
 
-| Variable | Purpose |
+Integration coverage that has not migrated to tmachine remains available through
+these legacy paths:
+
+| Current legacy path | Command |
 |---|---|
-| `OPENSHELL_E2E_KUBE_CONTEXT` | kubectl context for an existing cluster (skips k3d creation) |
-| `OPENSHELL_E2E_KUBE_TEST` | Scope to a single test (e.g. `smoke`) |
-| `OPENSHELL_E2E_KUBE_EXTRA_VALUES` | Colon-separated additional Helm values files |
-| `OPENSHELL_E2E_KUBERNETES_FEATURES` | Cargo feature flags (default: `e2e,e2e-host-gateway,e2e-kubernetes`) |
-| `IMAGE_TAG` | Gateway/supervisor image tag (default: `latest` for existing clusters) |
-| `OPENSHELL_REGISTRY` | Image registry prefix (default: `ghcr.io/nvidia/openshell`) |
+| Portable CLI conformance | `mise run e2e:cli-conformance` |
+| Docker | `mise run e2e:docker` |
+| Podman | `mise run e2e:podman` |
+| Kubernetes | `mise run e2e:kubernetes` |
+| VM | `mise run e2e:vm` |
+| Python SDK E2E | `mise run e2e:python` |
+| MCP conformance | `mise run e2e:mcp` |
+| Docker GPU | `mise run e2e:docker:gpu` |
+| External Docker driver | `mise run e2e:docker:external-driver` |
+| External Podman driver | `mise run e2e:podman:external-driver` |
+| External Kubernetes driver | `mise run e2e:kubernetes:external-driver` |
+| External VM driver | `mise run e2e:vm:external-driver` |
 
-Run a single test directly with cargo:
+These commands are migration bridges. `tasks/test.toml` defines them, and
+`mise tasks` lists specialized variants. Remove an entry when equivalent
+tmachine coverage replaces it.
+
+The repository also provides legacy aggregate commands for checks that have not
+migrated to Nix outputs:
 
 ```shell
-cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test sync
+mise run pre-commit
+mise run test
+mise run ci
 ```
 
-Run a single Docker-only test directly with cargo:
+These commands describe the current transition state; they are not the desired
+long-term integration-test interface.
 
-```shell
-cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test custom_image
-```
+### Desired interface
 
-The harness (`e2e/rust/src/harness/`) provides:
+The default local path remains build artifacts, then run one named tmachine
+scenario and testsuite. New feature and driver suites should use the same
+pattern rather than add new host-specific wrappers. Nix may expose convenience
+apps that compose the build and test steps, but artifact construction remains a
+Nix responsibility and scenario execution remains a tmachine responsibility.
 
-| Module | Purpose |
-|---|---|
-| `binary` | Builds and resolves the `openshell` binary from the workspace |
-| `container` | Container-engine selection and support containers for proxy tests |
-| `gateway` | Managed gateway restart controls for gateway-owned e2e runs |
-| `sandbox` | `SandboxGuard` RAII type — creates sandboxes and deletes them on drop |
-| `output` | ANSI stripping and field extraction from CLI output |
-| `port` | `wait_for_port()` and `find_free_port()` for TCP testing |
+Developers should be able to run one focused source check or one integration
+pair locally. CI runs the complete fixed matrix in parallel; contributors do
+not need to reproduce every CI pair before review.
 
-## Environment Variables
+## Test behavior and diagnostics
 
-| Variable | Purpose |
-|---|---|
-| `OPENSHELL_GATEWAY` | Override active gateway name for E2E tests |
-| `OPENSHELL_GATEWAY_ENDPOINT` | Run E2E tests against an existing plaintext HTTP gateway endpoint |
-| `OPENSHELL_E2E_DRIVER` | Driver name exported by the e2e gateway wrapper (`docker`, `podman`, or `vm`) |
-| `OPENSHELL_E2E_CREDENTIAL_DRIVERS` | Enables the Kubernetes credential-driver fixture path in `e2e/with-kube-gateway.sh` |
-| `OPENSHELL_E2E_KUBE_CONTEXT` | kubectl context for Kubernetes e2e (skips ephemeral k3d) |
-| `OPENSHELL_E2E_KUBE_TEST` | Scope Kubernetes e2e to a single test by name |
+Tests must be deterministic, bounded, isolated from unrelated developer or CI
+state, and safe to run concurrently. They use exact-revision candidate artifacts
+and immutable base inputs. Setup and cleanup belong to the scenario or
+testsuite, not to workflow-specific shell steps.
+
+Each environment and testsuite defines the logs needed to diagnose its failures.
+The current conformance suite prints command diagnostics and gateway journal
+logs on failure. A common structured reporting contract, standardized artifact
+retention, and guest snapshot behavior are deferred.
+
+Bug fixes should include regression coverage at the lowest effective layer. A
+test may move to tmachine and be removed from its legacy path in the same change
+when the new suite provides equivalent behavior coverage; parallel execution is
+not required solely for migration.
+
+## Migration plan
+
+Migrate coherent behavior rather than wrapping every existing command unchanged:
+
+1. Expose the required candidate artifacts or test archives through
+   `tests/artifacts.nix`.
+2. Move driver-agnostic behavior into `tests/suites/conformance`.
+3. Move external-dependency behavior into `tests/suites/features/<feature>`.
+4. Move driver-specific behavior into `tests/suites/drivers/<driver>`.
+5. Add scenario setup and installation through `tests/config.nix` and
+   `tests/ansible`.
+6. Add explicit scenario/testsuite pairs to the CI matrix for parallel
+   execution.
+7. Remove the legacy E2E path and `mise` entry point once the tmachine path has
+   equivalent coverage.
+8. Add candidate RPM, DEB, Snap, and Helm installation scenarios to release
+   validation and run conformance after installation.
+
+The current foundation includes Nix artifact builders, Ubuntu/Docker and
+Fedora/Podman tmachine scenarios, a CLI conformance suite, and a reusable CI
+workflow. The remaining legacy Rust, Python, MCP, driver, Kubernetes, GPU, and
+installation paths should migrate only where tmachine can faithfully represent
+their requirements.
+
+## Deferred decisions
+
+The initial model intentionally leaves these choices open:
+
+- the Kubernetes distribution used by the merge matrix;
+- the representative environment for external-driver compatibility;
+- when Windows compilation becomes a required source gate;
+- a standardized tmachine reporting and artifact-retention contract;
+- package-installation scenarios in ordinary merge CI;
+- candidate-artifact Homebrew validation beyond the existing native path;
+- release upgrade and backward-compatibility suites;
+- API- and SDK-level conformance; and
+- change-aware integration and release-matrix selection.
