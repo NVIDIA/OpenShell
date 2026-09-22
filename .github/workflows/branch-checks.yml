@@ -253,12 +253,24 @@ jobs:
           cargo build --locked -p openshell-supervisor --bin openshell-supervisor --no-default-features --features defaults-without-telemetry
           tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-supervisor
           cargo check --locked -p openshell-supervisor --all-targets --no-default-features --features system-ca-roots
-          if cargo tree --locked -p openshell-supervisor -i webpki-roots --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-roots; then
-            echo "ERROR: webpki-roots found in system CA roots build" >&2
+
+      - name: Verify system CA roots dependency boundary
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo tree --locked -p openshell-supervisor --prefix none --no-default-features --features system-ca-roots > /tmp/openshell-supervisor-dependencies.txt
+          if grep -Eq '^(webpki-roots|webpki-root-certs) v' /tmp/openshell-supervisor-dependencies.txt; then
+            echo "ERROR: bundled Mozilla roots found in system CA roots build" >&2
+            cat /tmp/openshell-supervisor-dependencies.txt >&2
             exit 1
           fi
-          if cargo tree --locked -p openshell-supervisor -i webpki-root-certs --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-root-certs; then
-            echo "ERROR: webpki-root-certs found in system CA roots build" >&2
+
+      - name: Verify standalone prover dependency boundary
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo tree --locked -p openshell-prover-cli --edges normal --prefix none > /tmp/openshell-prover-dependencies.txt
+          if grep -Eq '^(openshell-(cli|server|sdk|bootstrap|tui|providers|core|policy)) v' /tmp/openshell-prover-dependencies.txt; then
+            echo "ERROR: standalone prover includes an OpenShell control-plane dependency" >&2
+            cat /tmp/openshell-prover-dependencies.txt >&2
             exit 1
           fi
 
