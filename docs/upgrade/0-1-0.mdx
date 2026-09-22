@@ -13,22 +13,24 @@ Upgrading from OpenShell 0.0.x to 0.1.0? Start with the section that matches how
 This is a working outline for 0.1.0. Some changes are still in flight, so check the final release notes before upgrading production.
 </Warning>
 
+Each item links to the pull request that defines the change. Links marked open describe work that is not final yet.
+
 ## Operators
 
 If you run OpenShell for a team, start here.
 
-- **Coordinate the upgrade.** Stop all gateway replicas, back up the database, and upgrade gateways, compute and credential drivers, supervisors, middleware, CLI clients, and SDK clients from the same release. The protocol, field-name, and time-type changes do not support mixed 0.0.x and 0.1.0 peers.
+- **Coordinate the upgrade.** Stop all gateway replicas, back up the database, and upgrade gateways, compute and credential drivers, supervisors, middleware, CLI clients, and SDK clients from the same release. The protocol, field-name, and time-type changes do not support mixed 0.0.x and 0.1.0 peers ([PR #3113](https://github.com/NVIDIA/OpenShell/pull/3113), [PR #3272](https://github.com/NVIDIA/OpenShell/pull/3272), [PR #3352](https://github.com/NVIDIA/OpenShell/pull/3352)).
 
-- **Recreate every sandbox.** Remove 0.0.x sandboxes before the upgrade and recreate them afterward. The persisted sandbox boundary and runtime descriptors are not compatible with 0.1.0.
+- **Recreate every sandbox.** Remove 0.0.x sandboxes before the upgrade and recreate them afterward. The persisted sandbox boundary and runtime descriptors are not compatible with 0.1.0 ([PR #2942](https://github.com/NVIDIA/OpenShell/pull/2942), [PR #3366](https://github.com/NVIDIA/OpenShell/pull/3366)).
 
-- **Export provider profiles before upgrading.** The gateway no longer includes built-in profiles. Import the saved profiles after the upgrade at the same global or workspace scope. Replace profile aliases such as `claude` and `gh` with the canonical IDs `claude-code` and `github`.
+- **Export provider profiles before upgrading.** The gateway no longer includes built-in profiles. Import the saved profiles after the upgrade at the same global or workspace scope. Replace profile aliases such as `claude` and `gh` with the canonical IDs `claude-code` and `github` ([PR #2962](https://github.com/NVIDIA/OpenShell/pull/2962), [PR #3383](https://github.com/NVIDIA/OpenShell/pull/3383)).
 
   ```shell
   openshell provider profile export <id> -o yaml --global > <id>.yaml
   openshell profile import --from ./profiles --global
   ```
 
-- **Migrate `gateway.toml` to schema version 2.** Add the version, replace the plural compute-driver selector, move driver settings under `[openshell.drivers.<name>]`, and apply the renamed Docker, Podman, and VM fields. Validate the file before restarting. See [Gateway Configuration](/reference/gateway-config#migrate-to-schema-version-2) for the complete field mapping.
+- **Migrate `gateway.toml` to schema version 2.** Add the version, replace the plural compute-driver selector, move driver settings under `[openshell.drivers.<name>]`, and apply the renamed Docker, Podman, and VM fields. Validate the file before restarting. See [Gateway Configuration](/reference/gateway-config#migrate-to-schema-version-2) for the complete field mapping and [PR #2814](https://github.com/NVIDIA/OpenShell/pull/2814) for the implementation.
 
   ```toml
   [openshell]
@@ -45,31 +47,33 @@ If you run OpenShell for a team, start here.
   openshell-gateway config preflight --path /etc/openshell/gateway.toml
   ```
 
-- **Move Helm application settings to `gatewayConfig`.** Express gateway settings with the schema-v2 TOML hierarchy. Keep TLS keys, passwords, client secrets, RBAC, Services, image settings, and volumes in the chart-owned values and Secret interfaces.
+- **Move Helm application settings to `gatewayConfig`.** Express gateway settings with the schema-v2 TOML hierarchy. Keep TLS keys, passwords, client secrets, RBAC, Services, image settings, and volumes in the chart-owned values and Secret interfaces ([open PR #3384](https://github.com/NVIDIA/OpenShell/pull/3384)).
 
-- **Set an explicit workload image where needed.** The default becomes the generic `nvcr.io/nvidia/base/ubuntu:24.04` image. Bare Community image names and `OPENSHELL_COMMUNITY_REGISTRY` are removed, so specify a fully qualified agent-ready image when workloads need bundled tools, users, policy, or startup behavior.
+- **Review the default workload image.** The default becomes the minimal `nvcr.io/nvidia/base/ubuntu:24.04` image, which includes no agent CLI or image-baked policy. Bare Community image names and `OPENSHELL_COMMUNITY_REGISTRY` are removed, so specify a fully qualified agent-ready image when workloads need bundled tools or startup behavior. The runtime fallback policy denies network access and no longer grants `/app`; images without an OCI `USER` run as UID and GID `1000` ([PR #3386](https://github.com/NVIDIA/OpenShell/pull/3386)).
 
-- **Preserve credential encryption material.** New provider credentials use the active gateway credential driver, with encrypted database storage as the default. Preserve the generated key-encryption-key Secret, reconfigure refresh grants, and recreate credentials before switching credential drivers. Do not configure an empty `credential_drivers` list or run mixed gateway versions against the same refresh records.
+- **Preserve credential encryption material.** New provider credentials use the active gateway credential driver, with encrypted database storage as the default. Preserve the generated key-encryption-key Secret, reconfigure refresh grants, and recreate credentials before switching credential drivers. Do not configure an empty `credential_drivers` list or run mixed gateway versions against the same refresh records ([PR #2437](https://github.com/NVIDIA/OpenShell/pull/2437)).
 
-- **Update Kubernetes user-namespace configuration.** Remove `platform_config.host_users`. Use the typed sandbox template `user_namespaces` field or the Kubernetes driver default.
+- **Update Kubernetes user-namespace configuration.** Remove `platform_config.host_users`. Use the typed sandbox template `user_namespaces` field or the Kubernetes driver default ([PR #3248](https://github.com/NVIDIA/OpenShell/pull/3248)).
 
-- **Review Helm PKI and ingress settings.** PKI initialization now fails an install or upgrade after its timeout by default. Increase `pkiInitJob.timeoutSeconds` when needed, and set `server.tls.enableMtls=false` when enabling `grpcRoute.backendTLSPolicy`.
+- **Review Helm PKI and ingress settings.** PKI initialization now fails an install or upgrade after its timeout by default. Increase `pkiInitJob.timeoutSeconds` when needed, and set `server.tls.enableMtls=false` when enabling `grpcRoute.backendTLSPolicy` ([PR #2728](https://github.com/NVIDIA/OpenShell/pull/2728)).
 
-- **Remove orphaned Helm RBAC objects.** After verifying the new namespace-qualified `ClusterRole` and `ClusterRoleBinding`, delete the old fixed-name `openshell-gateway-node-reader` objects if no release still owns them.
+- **Remove orphaned Helm RBAC objects.** After verifying the new namespace-qualified `ClusterRole` and `ClusterRoleBinding`, delete the old fixed-name `openshell-gateway-node-reader` objects if no release still owns them ([PR #2939](https://github.com/NVIDIA/OpenShell/pull/2939)).
 
-- **Implement extension protocol negotiation.** Custom compute drivers, credential drivers, gateway interceptors, and middleware must exchange `PeerMetadata`, use protocol `1.0`, and advertise their family base capability. Upgrade both peers together. See [Extension Protocol Negotiation](/extensibility/extension-negotiation).
+- **Implement extension protocol negotiation.** Custom compute drivers, credential drivers, gateway interceptors, and middleware must exchange `PeerMetadata`, use protocol `1.0`, and advertise their family base capability. Upgrade both peers together. See [Extension Protocol Negotiation](/extensibility/extension-negotiation) and [PR #3352](https://github.com/NVIDIA/OpenShell/pull/3352).
 
-- **Remove compute-driver callback-listener negotiation.** Regenerate custom compute-driver bindings and connect supervisors to the operator-configured primary gateway endpoint.
+- **Remove compute-driver callback-listener negotiation.** Regenerate custom compute-driver bindings and connect supervisors to the operator-configured primary gateway endpoint ([PR #3365](https://github.com/NVIDIA/OpenShell/pull/3365)).
 
-- **Update supervisor middleware events.** Accept `MiddlewareDescribeRequest`, replace the WebSocket-specific terminal-event types with the shared middleware types, and handle the renamed and split end reasons.
+- **Update supervisor middleware events.** Accept `MiddlewareDescribeRequest`, replace the WebSocket-specific terminal-event types with the shared middleware types, and handle the renamed and split end reasons ([PR #3073](https://github.com/NVIDIA/OpenShell/pull/3073)).
 
-- **Regenerate extension bindings.** Update canonical request field names and protobuf `Timestamp` and `Duration` fields. Do not reuse generated 0.0.x bindings with 0.1.0 peers.
+- **Regenerate extension bindings.** Update canonical request field names and protobuf `Timestamp` and `Duration` fields. Do not reuse generated 0.0.x bindings with 0.1.0 peers ([PR #3113](https://github.com/NVIDIA/OpenShell/pull/3113), [PR #3272](https://github.com/NVIDIA/OpenShell/pull/3272)).
+
+- **Bind authenticated drivers to a runtime identity.** A custom compute driver that advertises `supports_sandbox_authentication` must return a non-empty `runtime_identity` from create, start, and authentication. It must also honor `expected_runtime_identity` during restart so the gateway can bind bootstrap credentials to the current compute resource ([PR #3531](https://github.com/NVIDIA/OpenShell/pull/3531)).
 
 ## End users
 
 If you use OpenShell through the CLI, policies, APIs, or SDKs, review these changes.
 
-- **Build local images before sandbox creation.** `openshell sandbox create --from` no longer builds a Dockerfile or directory. Build and tag with the gateway's container engine, then pass the image reference. Remote gateways need an image they can pull from a registry.
+- **Build local images before sandbox creation.** `openshell sandbox create --from` no longer builds a Dockerfile or directory. Build and tag with the gateway's container engine, then pass the image reference. Remote gateways need an image they can pull from a registry ([PR #3214](https://github.com/NVIDIA/OpenShell/pull/3214)).
 
   ```shell
   docker build -t registry.example.com/team/agent:0.1.0 .
@@ -77,40 +81,40 @@ If you use OpenShell through the CLI, policies, APIs, or SDKs, review these chan
   openshell sandbox create --from registry.example.com/team/agent:0.1.0
   ```
 
-- **Name providers explicitly.** A trailing sandbox command no longer infers or attaches a provider. Pass `--provider <name>`, and ask the operator to import the referenced profile when it is missing.
+- **Name providers explicitly.** A trailing sandbox command no longer infers or attaches a provider. Pass `--provider <name>`, and ask the operator to import the referenced profile when it is missing ([PR #3383](https://github.com/NVIDIA/OpenShell/pull/3383)).
 
-- **Replace managed inference routes.** The `openshell inference` commands, route APIs, and `inference.local` endpoint are removed. Attach a provider to each sandbox and call its native endpoint with its native model and request format. See [Migrate from Managed Inference Routes](/sandboxes/inference-routing#migrate-from-managed-inference-routes).
+- **Replace managed inference routes.** The `openshell inference` commands, route APIs, and `inference.local` endpoint are removed. Attach a provider to each sandbox and call its native endpoint with its native model and request format. See [Migrate from Managed Inference Routes](/sandboxes/inference-routing#migrate-from-managed-inference-routes) and [PR #3195](https://github.com/NVIDIA/OpenShell/pull/3195).
 
-- **Remove `NetworkBinary.harness`.** Write policy and profile binaries as scalar paths such as `- /usr/bin/curl`.
+- **Remove `NetworkBinary.harness`.** Write policy and profile binaries as scalar paths such as `- /usr/bin/curl` ([PR #3222](https://github.com/NVIDIA/OpenShell/pull/3222)).
 
-- **Fix unknown policy fields.** The authored policy schema rejects misspelled, obsolete, and other unknown fields instead of ignoring them.
+- **Fix unknown policy fields.** The authored policy schema rejects misspelled, obsolete, and other unknown fields instead of ignoring them ([PR #3334](https://github.com/NVIDIA/OpenShell/pull/3334)).
 
-- **Update endpoint modes.** Regenerate clients for the typed `tls`, `enforcement`, and `access` enums. Remove `tls: terminate` and `tls: passthrough`; omit `tls` for automatic inspection. Do not use `skip` as a replacement because it disables inspection.
+- **Update endpoint modes.** Regenerate clients for the typed `tls`, `enforcement`, and `access` enums. Remove `tls: terminate` and `tls: passthrough`; omit `tls` for automatic inspection. Do not use `skip` as a replacement because it disables inspection ([PR #3187](https://github.com/NVIDIA/OpenShell/pull/3187), [open PR #3414](https://github.com/NVIDIA/OpenShell/pull/3414)).
 
-- **Target L7 policy edits explicitly.** Policy update commands that append allow or deny rules must include `--rule-name` and every `--binary`, or `--any-binary`. Raw API calls must send the complete `L7RuleTarget`.
+- **Target L7 policy edits explicitly.** Policy update commands that append allow or deny rules must include `--rule-name` and every `--binary`, or `--any-binary`. Raw API calls must send the complete `L7RuleTarget` ([PR #3380](https://github.com/NVIDIA/OpenShell/pull/3380)).
 
-- **Send the negotiated MCP version.** MCP clients must include one `MCP-Protocol-Version` header on each post-initialization request, and the endpoint policy must allow that revision.
+- **Send the negotiated MCP version.** MCP clients must include one `MCP-Protocol-Version` header on each post-initialization request, and the endpoint policy must allow that revision ([PR #3241](https://github.com/NVIDIA/OpenShell/pull/3241)).
 
-- **Select workspaces explicitly.** Regenerate clients for `WorkspaceSelector`, and select the literal `default` workspace when appropriate. Omission no longer selects it. See [Manage Workspaces](/sandboxes/manage-workspaces).
+- **Select workspaces explicitly.** Regenerate clients for `WorkspaceSelector`, and select the literal `default` workspace when appropriate. Omission no longer selects it. See [Manage Workspaces](/sandboxes/manage-workspaces) and [PR #3245](https://github.com/NVIDIA/OpenShell/pull/3245).
 
-- **Use canonical resource names.** Public sandbox RPCs accept a sandbox name plus its workspace instead of an internal sandbox ID. Update renamed request and JSON fields such as `sandbox`, `provider`, and `name`.
+- **Use canonical resource names.** Public sandbox RPCs accept a sandbox name plus its workspace instead of an internal sandbox ID. Update renamed request and JSON fields such as `sandbox`, `provider`, and `name` ([PR #3272](https://github.com/NVIDIA/OpenShell/pull/3272)).
 
-- **Use protobuf time types.** Replace scalar millisecond, second, and string fields with `google.protobuf.Timestamp` and `google.protobuf.Duration`. Preserve the distinction between an absent field and a zero value. See [Protobuf Time Types](/reference/protobuf-time-types).
+- **Use protobuf time types.** Replace scalar millisecond, second, and string fields with `google.protobuf.Timestamp` and `google.protobuf.Duration`. Preserve the distinction between an absent field and a zero value. See [Protobuf Time Types](/reference/protobuf-time-types) and [PR #3113](https://github.com/NVIDIA/OpenShell/pull/3113).
 
-- **Replace offset pagination.** Send `page_size` and the opaque `page_token`, then continue while `next_page_token` is non-empty. Curated SDK list methods may return lazy, single-pass pagers; use `list_all` or `ListAll` only when the full collection is required.
+- **Replace offset pagination.** Send `page_size` and the opaque `page_token`, then continue while `next_page_token` is non-empty. Curated SDK list methods may return lazy, single-pass pagers; use `list_all` or `ListAll` only when the full collection is required ([PR #3249](https://github.com/NVIDIA/OpenShell/pull/3249), [PR #3256](https://github.com/NVIDIA/OpenShell/pull/3256), [open PR #3279](https://github.com/NVIDIA/OpenShell/pull/3279)).
 
-- **Handle typed deletion outcomes.** Replace `deleted`, `removed`, and `revoked` booleans with `DeletionOutcome`. Treat `ACCEPTED` as asynchronous, use the returned sandbox ID when waiting, and set `allow_missing` only when absence is acceptable. See [SDK Migration for Deletion](/reference/api-errors#sdk-migration-for-deletion).
+- **Handle typed deletion outcomes.** Replace `deleted`, `removed`, and `revoked` booleans with `DeletionOutcome`. Treat `ACCEPTED` as asynchronous, use the returned sandbox ID when waiting, and set `allow_missing` only when absence is acceptable. See [SDK Migration for Deletion](/reference/api-errors#sdk-migration-for-deletion) and [PR #3317](https://github.com/NVIDIA/OpenShell/pull/3317).
 
-- **Update SDK error handling.** Python clients raise `GatewayError`, which is a `grpc.RpcError` but not a `grpc.Call`. Rust error variants contain additional status fields. SDKs expose retry details but do not automatically retry mutations.
+- **Update SDK error handling.** Python clients raise `GatewayError`, which is a `grpc.RpcError` but not a `grpc.Call`. Rust error variants contain additional status fields. SDKs expose retry details but do not automatically retry mutations ([PR #3313](https://github.com/NVIDIA/OpenShell/pull/3313)).
 
-- **Use stable request IDs for retries.** When a mutation includes `request_id`, retry with the same identity, scope, method, and payload. Cancellation does not cancel admitted work. Reconcile the result after `REQUEST_OUTCOME_UNCERTAIN` instead of submitting a new ID.
+- **Use stable request IDs for retries.** When a mutation includes `request_id`, retry with the same identity, scope, method, and payload. Cancellation does not cancel admitted work. Reconcile the result after `REQUEST_OUTCOME_UNCERTAIN` instead of submitting a new ID ([PR #3321](https://github.com/NVIDIA/OpenShell/pull/3321), [PR #3323](https://github.com/NVIDIA/OpenShell/pull/3323)).
 
-- **Drain interactive exec after closing input.** Closing the request stream closes stdin but does not end output. Continue reading stdout, stderr, the exit event, and the final RPC status; use the SDK cancellation operation only when you intend to abort the RPC.
+- **Drain interactive exec after closing input.** Closing the request stream closes stdin but does not end output. Drain output concurrently and wait for both the exit event and final RPC status. Go clients use `CloseInteractiveInput` or `CancelInteractive`; TypeScript clients use `closeInput()` or `cancel()` ([PR #3359](https://github.com/NVIDIA/OpenShell/pull/3359)).
 
-- **Resume watch streams by cursor.** Treat stream warnings as recoverable gaps, persist the greatest processed opaque cursor, and send it when reconnecting. If the gateway returns `OUT_OF_RANGE`, discard the cursor and restart without resume.
+- **Resume watch streams by cursor.** Treat stream warnings as recoverable gaps, persist the greatest processed opaque cursor, and send it when reconnecting. If the gateway returns `OUT_OF_RANGE`, discard the cursor and restart without resume ([open PR #3209](https://github.com/NVIDIA/OpenShell/pull/3209)).
 
-- **Stop importing persistence messages.** The `StoredProviderProfile`, refresh-state, stored policy revision, and draft-chunk messages move to a private storage package and have no public API replacement.
+- **Stop importing persistence messages.** The `StoredProviderProfile`, refresh-state, stored policy revision, and draft-chunk messages move to a private storage package and have no public API replacement ([PR #3169](https://github.com/NVIDIA/OpenShell/pull/3169)).
 
-- **Replace scripted `gateway info` calls.** The command now returns live, admin-gated runtime state. Use `openshell gateway list -o json` for local registration metadata.
+- **Replace scripted `gateway info` calls.** The command now returns live, admin-gated runtime state. Use `openshell gateway list -o json` for local registration metadata ([PR #2202](https://github.com/NVIDIA/OpenShell/pull/2202)).
 
-- **Stop parsing the profile list table.** The human-readable columns change. Use JSON or YAML output in scripts; the structured profile schema is unchanged.
+- **Stop parsing the profile list table.** The human-readable columns change. Use JSON or YAML output in scripts; the structured profile schema is unchanged ([PR #3258](https://github.com/NVIDIA/OpenShell/pull/3258)).
