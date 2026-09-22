@@ -187,7 +187,7 @@ impl RelayProcess {
     async fn expect_ready(&mut self) {
         let v = self.next_json().await;
         assert_eq!(v["event"], "ready");
-        assert_eq!(v["protocol_version"], 2);
+        assert_eq!(v["protocol_version"], 4);
     }
 
     async fn launch(&mut self, id: u64, command: &[&str]) -> Value {
@@ -197,6 +197,11 @@ impl RelayProcess {
             "data": {"command": command, "env": []},
         }))
         .await;
+        self.next_json().await
+    }
+
+    async fn confirm_target_ready(&mut self, id: u64) -> Value {
+        self.send(json!({"id": id, "op": "target_ready"})).await;
         self.next_json().await
     }
 }
@@ -318,7 +323,8 @@ async fn launch_success_then_target_ready_ordering() {
         l.local_addr().unwrap().port()
     };
     let script = format!(
-        "$l=[System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback,{port}); \
+        "Start-Sleep -Milliseconds 800; \
+         $l=[System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback,{port}); \
          $l.Start(); Start-Sleep -Seconds 30"
     );
 
@@ -340,18 +346,69 @@ async fn launch_success_then_target_ready_ordering() {
     assert_eq!(ack["id"], 1);
     assert_eq!(ack["ok"], true, "launch ack: {ack}");
 
-    // The "launch" response only confirms the command/env arrived -- the
-    // unsolicited "target_ready" event (no correlation id) is the actual
-    // liveness confirmation once the port readiness poll succeeds, and it
-    // must not have been sent already (it can't have been: nothing before
-    // this point in the protocol lets the spawner know the port bound).
-    // Reading it as the very next line asserts the ordering directly.
+    // Production performs this observation in the host driver, where the TCP
+    // table is accessible. Stand in for that driver by waiting until the
+    // delayed target listener is visible, then explicitly confirm it.
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("delayed target did not bind");
+    let confirmation = relay.confirm_target_ready(2).await;
+    assert_eq!(confirmation, json!({"id": 2, "ok": true}));
+
+    // The correlated confirmation response precedes the relay's unsolicited
+    // event, which remains the driver's final race-safe startup signal.
     let target_ready = relay.next_json().await;
     assert_eq!(target_ready["event"], "target_ready");
     assert!(
         target_ready.get("id").is_none(),
         "target_ready must not carry a correlation id"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn early_child_crash_is_reported_promptly_with_its_stderr() {
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let mut relay = RelayProcess::spawn(port).await;
+    relay.expect_ready().await;
+
+    let ack = relay
+        .launch(
+            1,
+            &[
+                "cmd",
+                "/d",
+                "/c",
+                "echo early-child-crash-sentinel 1>&2 & exit /b 23",
+            ],
+        )
+        .await;
+    assert_eq!(ack["ok"], true, "launch ack: {ack}");
+
+    let failed = relay.next_json().await;
+    assert_eq!(failed["event"], "target_failed", "failure event: {failed}");
+    let error = failed["error"]
+        .as_str()
+        .expect("target_failed error string");
+    assert!(error.contains("23"), "exit status missing from: {error}");
+    assert!(
+        error.contains("early-child-crash-sentinel"),
+        "target stderr missing from: {error}"
+    );
+
+    tokio::time::timeout(TIMEOUT, relay.child.wait())
+        .await
+        .expect("relay must exit promptly after reporting an early target crash")
+        .expect("wait() failed");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -380,12 +437,14 @@ async fn shutdown_is_acked_and_the_process_exits() {
         )
         .await;
     assert_eq!(ack["ok"], true);
+    let confirmation = relay.confirm_target_ready(2).await;
+    assert_eq!(confirmation, json!({"id": 2, "ok": true}));
     let target_ready = relay.next_json().await;
     assert_eq!(target_ready["event"], "target_ready");
 
-    relay.send(json!({"id": 2, "op": "shutdown"})).await;
+    relay.send(json!({"id": 3, "op": "shutdown"})).await;
     let ack = relay.next_json().await;
-    assert_eq!(ack, json!({"id": 2, "ok": true}));
+    assert_eq!(ack, json!({"id": 3, "ok": true}));
 
     let status = tokio::time::timeout(TIMEOUT, relay.child.wait())
         .await
@@ -395,11 +454,10 @@ async fn shutdown_is_acked_and_the_process_exits() {
 }
 
 /// Reproduces the reported race: a "shutdown" request arriving while the
-/// target is still coming up (here, one that never binds the port at all)
-/// must stop this process promptly, not leave it waiting out the full
-/// port-readiness budget (~300s worst case, see `wait_for_port_ready`)
-/// before ever observing the shutdown that `run_control_channel` already
-/// acknowledged. Without racing that wait against shutdown, the final
+/// target is still coming up (here, one the host never confirms as ready)
+/// must stop this process promptly instead of leaving it waiting for host
+/// confirmation after `run_control_channel` already acknowledged shutdown.
+/// Without racing that wait against shutdown, the final
 /// `child.wait()` below would time out instead of completing within
 /// `SHUTDOWN_TIMEOUT`.
 ///
@@ -428,12 +486,11 @@ async fn shutdown_is_acked_and_the_process_exits() {
 /// process, observed externally, never exited. This test would have
 /// caught that.
 #[tokio::test(flavor = "multi_thread")]
-async fn shutdown_during_port_wait_stops_promptly() {
+async fn shutdown_while_waiting_for_host_readiness_stops_promptly() {
     // Generous: covers this host's observed CreateProcess stalls (up to
     // ~60s) plus real margin, not just the fast path.
     const SPAWN_TIMEOUT: Duration = Duration::from_mins(2);
-    // Well under the ~300s port-readiness budget this fix exists to avoid
-    // waiting out -- generous only relative to `TIMEOUT`, since a bare
+    // Generous only relative to `TIMEOUT`, since a bare
     // `std::process::exit` completes in well under a second.
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -444,20 +501,19 @@ async fn shutdown_during_port_wait_stops_promptly() {
 
     let mut relay = RelayProcess::spawn_capturing_stderr(port).await;
     relay.expect_ready().await;
-    // A real target that never binds `port` -- port-readiness polling never
-    // succeeds on its own. cmd.exe rather than powershell.exe: smaller,
-    // simpler, and this test's target just needs to run for a while and
-    // never bind `port`, not do anything powershell-specific.
+    // A real target the host never confirms as ready. Do not use `timeout.exe`
+    // here: it exits immediately
+    // when its stdin is not attached to a console, which is precisely how the
+    // relay launches targets.
     let ack = relay
-        .launch(1, &["cmd", "/c", "timeout /t 300 /nobreak >nul"])
+        .launch(1, &["cmd", "/d", "/c", "ping -n 301 127.0.0.1 >nul"])
         .await;
     assert_eq!(ack["ok"], true, "launch ack: {ack}");
 
-    // Confirms spawn_target() has returned and wait_for_port_ready has
-    // started -- only from this point on is the fix under test actually
-    // in play.
+    // Confirms spawn_target() has returned and the host-confirmation wait has
+    // started -- only from this point on is the fix under test in play.
     relay
-        .wait_for_stderr_line("waiting for target on", SPAWN_TIMEOUT)
+        .wait_for_stderr_line("waiting for host-confirmed target readiness", SPAWN_TIMEOUT)
         .await;
 
     relay.send(json!({"id": 2, "op": "shutdown"})).await;
@@ -468,7 +524,7 @@ async fn shutdown_during_port_wait_stops_promptly() {
         .await
         .expect(
             "relay did not exit promptly after shutdown during port-wait \
-             (see imp.rs's port-wait/shutdown race)",
+             (see imp.rs's host-readiness/shutdown race)",
         )
         .expect("wait() failed");
     assert!(status.success(), "expected a clean exit, got {status:?}");
