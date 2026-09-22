@@ -1164,10 +1164,10 @@ fn network_input_json(input: &NetworkInput) -> serde_json::Value {
 
 /// Return the stable representation used only for network-policy path matching.
 ///
-/// Windows paths are case-insensitive by default and accept either path separator.
-/// Normalizing both policy data and runtime input prevents equivalent spellings from
-/// being denied while leaving the original path intact for filesystem access and
-/// executable hashing. Other platforms retain exact path matching.
+/// Windows paths accept either path separator and are usually case-insensitive.
+/// Case folding is applied only when Windows confirms that the containing directory
+/// is case-insensitive. Case-sensitive, indeterminate, and verbatim paths retain
+/// their spelling so matching fails closed. Other platforms retain exact matching.
 pub(crate) fn network_binary_match_path(path: &Path) -> String {
     let path = path.to_string_lossy();
     #[cfg(target_os = "windows")]
@@ -1182,7 +1182,85 @@ pub(crate) fn network_binary_match_path(path: &Path) -> String {
 
 #[cfg(any(target_os = "windows", test))]
 fn windows_network_binary_match_path(path: &str) -> String {
-    path.replace('\\', "/").to_ascii_lowercase()
+    #[cfg(target_os = "windows")]
+    let case_sensitive = windows_path_case_sensitive(Path::new(path));
+    #[cfg(not(target_os = "windows"))]
+    let case_sensitive = Some(false);
+
+    windows_network_binary_match_path_with_case_sensitivity(path, case_sensitive)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_network_binary_match_path_with_case_sensitivity(
+    path: &str,
+    case_sensitive: Option<bool>,
+) -> String {
+    if is_windows_verbatim_path(path) {
+        return path.to_owned();
+    }
+
+    let normalized = path.replace('\\', "/");
+    if case_sensitive.unwrap_or(true) {
+        return normalized;
+    }
+    normalized.to_ascii_lowercase()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn is_windows_verbatim_path(path: &str) -> bool {
+    path.starts_with(r"\\?\") || path.starts_with("//?/")
+}
+
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+fn windows_path_case_sensitive(path: &Path) -> Option<bool> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_CASE_SENSITIVE_INFO, FileCaseSensitiveInfo, GetFileInformationByHandleEx,
+    };
+
+    if path.to_string_lossy().contains(['*', '?']) {
+        return None;
+    }
+    let directory = path.parent()?;
+    let directory = if directory.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        directory
+    };
+    let handle = open_windows_directory_for_attributes(directory)?;
+    let mut info = FILE_CASE_SENSITIVE_INFO::default();
+    let info_size = u32::try_from(size_of::<FILE_CASE_SENSITIVE_INFO>()).ok()?;
+    // SAFETY: `handle` stays alive for the call and `info` is the exact buffer
+    // type and size required by `FileCaseSensitiveInfo`.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(handle.as_raw_handle()),
+            FileCaseSensitiveInfo,
+            (&raw mut info).cast(),
+            info_size,
+        )
+    }
+    .ok()?;
+    Some(info.Flags & 1 != 0)
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_directory_for_attributes(path: &Path) -> Option<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES.0)
+        .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(path)
+        .ok()
 }
 
 /// Sets an already-built JSON value as Regorus input without encoding and reparsing JSON text.
@@ -2458,6 +2536,27 @@ mod tests {
         assert_ne!(
             normalized,
             windows_network_binary_match_path(r"C:\Windows\System32\powershell.exe")
+        );
+    }
+
+    #[test]
+    fn windows_binary_match_path_preserves_verbatim_paths() {
+        let verbatim = r"\\?\C:\Windows\System32\CURL.EXE";
+        assert_eq!(windows_network_binary_match_path(verbatim), verbatim);
+    }
+
+    #[test]
+    fn windows_binary_match_path_distinguishes_case_sensitive_directory_entries() {
+        assert_ne!(
+            windows_network_binary_match_path_with_case_sensitivity(
+                r"C:\case-sensitive\Trusted.exe",
+                Some(true),
+            ),
+            windows_network_binary_match_path_with_case_sensitivity(
+                r"C:\case-sensitive\trusted.exe",
+                Some(true),
+            ),
+            "case-distinct files must not share network permissions"
         );
     }
 

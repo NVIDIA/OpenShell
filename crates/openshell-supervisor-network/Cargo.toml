@@ -69,6 +69,9 @@ tokio-stream = { workspace = true, features = ["net"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
 [target.'cfg(unix)'.dev-dependencies]
 
 [lints]
