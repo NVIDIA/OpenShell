@@ -551,6 +551,47 @@ async fn managed_tls_secret_copied_to_namespace() {
     );
 }
 
+const GATEWAY_SERVICE_ACCOUNT: &str = "system:serviceaccount:openshell:openshell";
+
+async fn gateway_can(verb: &str, resource: &str, namespace: &str) -> bool {
+    let (_, out) = kubectl(&[
+        "auth",
+        "can-i",
+        verb,
+        resource,
+        "-n",
+        namespace,
+        "--as",
+        GATEWAY_SERVICE_ACCOUNT,
+    ])
+    .await;
+    match out.trim() {
+        "yes" => true,
+        "no" => false,
+        other => panic!("unexpected kubectl auth can-i output for {verb} {resource}: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn managed_gateway_cannot_read_or_modify_workspace_secrets() {
+    let ns = managed_namespace(&unique_workspace("mgdrbac"));
+
+    for verb in ["get", "patch"] {
+        assert!(
+            !gateway_can(verb, "secrets", &ns).await,
+            "gateway must not {verb} arbitrary Secrets in workspace namespace {ns}"
+        );
+        assert!(
+            !gateway_can(verb, "secrets/unrelated-secret", &ns).await,
+            "gateway must not {verb} an unrelated Secret in workspace namespace {ns}"
+        );
+    }
+    assert!(
+        gateway_can("get", "secrets", "openshell").await,
+        "gateway must still reach provider credential Secrets in its configured namespace"
+    );
+}
+
 #[tokio::test]
 async fn managed_rejects_namespace_owned_by_different_gateway() {
     let ws = unique_workspace("mgdown");

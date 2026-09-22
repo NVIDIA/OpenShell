@@ -137,6 +137,28 @@ also set `gateway.allowDriverConfig=true` on every workspace release. This
 grants the namespace-scoped PVC metadata read needed to admit caller-selected
 PVC mounts. Leave both values disabled when callers do not need driver config.
 
+### Store provider credentials in Kubernetes Secrets
+
+To store provider credentials as Kubernetes Secrets instead of in the gateway
+database, enable the Kubernetes Secrets credential driver with a dedicated
+namespace:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
+  --set server.credentialDrivers.kubernetesSecrets.enabled=true \
+  --set server.credentialDrivers.kubernetesSecrets.namespace=openshell-credentials \
+  --set server.credentialDrivers.kubernetesSecrets.createNamespace=true
+```
+
+The driver stores every credential in that namespace, in every workspace mode.
+The gateway receives Secret permissions through a Role in that namespace only. For
+the full set of options, refer to the
+[gateway configuration reference](/reference/gateway-config#credential-drivers).
+
 ## Wait for the gateway to be ready
 
 ```shell
@@ -288,6 +310,12 @@ The chart creates the following RBAC resources in the release namespace:
 | ServiceAccount | Namespace | `openshell-sandbox` (for sandbox pods) |
 | Role + RoleBinding | Namespace | `openshell-sandbox` |
 | ClusterRole + ClusterRoleBinding | Cluster | `openshell-node-reader` |
+
+When the Kubernetes Secrets credential driver is enabled, the chart also creates
+an `openshell-credential-secrets` Role and RoleBinding in the credential
+namespace. That Role grants `get`, `create`, `patch`, and `delete` on all Secrets
+in the credential namespace, and is the gateway's only permission grant for provider
+credential Secrets.
 
 The namespaced Role covers sandbox lifecycle and identity:
 

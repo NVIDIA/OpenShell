@@ -342,8 +342,11 @@ server:
       # Empty = Helm release namespace. A dedicated namespace is RECOMMENDED
       # to isolate OpenShell-managed Secrets from other workloads.
       namespace: ""
-      # -- Deprecated compatibility field. Credential storage no longer supports user-authored namespace references.
-      allowReferenceNamespace: false
+      # -- Create the credential namespace. Requires a namespace other than the
+      # release namespace. The Namespace is retained on uninstall so stored
+      # credentials survive; an existing Namespace not owned by this release is
+      # left untouched.
+      createNamespace: false
       rbac:
         # -- Create a Role/RoleBinding granting the gateway ServiceAccount read/write access to managed provider Secrets.
         create: true
