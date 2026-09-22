@@ -767,8 +767,10 @@ workload.
 
 If a Sandbox remains in the `suspending` bootstrap phase, verify that the
 gateway ServiceAccount can create and delete Secrets in the sandbox
-namespace. Recovery deletes the recorded generation's bootstrap Secrets by name
-before clearing the suspension annotations:
+namespace. In operator mode, those permissions come only from the
+`openshell-workspace` chart installed in the namespace. Recovery deletes the
+recorded generation's bootstrap Secrets by name before clearing the suspension
+annotations:
 
 ```bash
 for verb in create delete; do

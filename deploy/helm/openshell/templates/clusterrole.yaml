@@ -93,14 +93,18 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["create", "get"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get"]
+  {{- end }}
+  {{- if eq $workspaceMode "managed" }}
+  # Operator-mode namespaces receive Secret permissions from the openshell-workspace
+  # chart Role instead.
   - apiGroups: [""]
     resources: ["secrets"]
     # Bootstrap and image-pull Secrets are generation-scoped. Recovery deletes
     # them by exact name.
     verbs: ["create", "delete"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["networkpolicies"]
-    verbs: ["create", "get"]
   {{- end }}
   {{- if eq $workspaceMode "managed" }}
   # ServiceAccount creation in managed namespaces.

@@ -91,43 +91,14 @@ tests:
             resources: ["secrets"]
             verbs: ["get", "create", "patch", "delete"]
 
-  - it: omits credential Secret access in operator mode
-    set:
-      server.drivers.kubernetes.workspaceMode: operator
-      server.credentialDrivers.kubernetesSecrets.enabled: true
-    asserts:
-      - notContains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            verbs: ["get", "create", "patch", "delete"]
-
-  - it: names no Secrets in operator mode
+  - it: omits all Secret rules in operator mode
     set:
       server.drivers.kubernetes.workspaceMode: operator
       server.tls.clientTlsSecretName: custom-client-tls
+      server.credentialDrivers.kubernetesSecrets.enabled: true
     asserts:
       - notExists:
-          path: rules[*].resourceNames
-
-  - it: grants operator bootstrap secret lifecycle permissions when TLS and credential storage are disabled
-    set:
-      server.drivers.kubernetes.workspaceMode: operator
-      server.disableTls: true
-    asserts:
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            verbs: ["create", "delete"]
-      - notContains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            verbs: ["get", "create", "patch", "delete"]
+          path: rules[*].resources[?(@ == "secrets")]
 
   - it: names no Secrets in managed mode
     set:
@@ -150,12 +121,8 @@ tests:
     set:
       server.drivers.kubernetes.workspaceMode: shared
     asserts:
-      - notContains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-          any: true
+      - notExists:
+          path: rules[*].resources[?(@ == "secrets")]
 
   - it: grants managed sandbox-runtime companion permissions
     set:
@@ -196,9 +163,3 @@ tests:
             apiGroups: [""]
             resources: ["services"]
             verbs: ["create", "get"]
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            verbs: ["create", "delete"]
