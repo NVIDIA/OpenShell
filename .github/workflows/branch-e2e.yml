@@ -87,7 +87,7 @@ jobs:
 
   version:
     needs: [pr_metadata]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true'
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -199,7 +199,7 @@ jobs:
 
   build-vm-driver:
     needs: [pr_metadata, version, build-binaries]
-    if: needs.pr_metadata.outputs.run_core_e2e == 'true' || needs.pr_metadata.outputs.run_integration_upgrades == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/build-vm-driver.yml
@@ -225,10 +225,10 @@ jobs:
       packages: read
     uses: ./.github/workflows/prepare-integration-inputs.yml
 
-  build-deb-upgrade:
-    name: Build Debian package for upgrade qualification
+  build-deb:
+    name: Build Debian packages
     needs: [pr_metadata, version, build-binaries, build-vm-driver]
-    if: needs.pr_metadata.outputs.run_integration_upgrades == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true'
     permissions:
       actions: read
       contents: read
@@ -238,10 +238,10 @@ jobs:
       deb-version: ${{ needs.version.outputs.deb }}
       checkout-ref: ${{ github.sha }}
 
-  build-rpm-upgrade:
-    name: Build RPM packages for upgrade qualification
+  build-rpm:
+    name: Build RPM packages
     needs: [pr_metadata, version, build-binaries]
-    if: needs.pr_metadata.outputs.run_integration_upgrades == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true'
     permissions:
       actions: read
       contents: read
@@ -254,7 +254,7 @@ jobs:
 
   prepare-integration-upgrades:
     name: Prepare upgrade qualification inputs
-    needs: [pr_metadata, build-binaries, build-images, build-deb-upgrade, build-rpm-upgrade]
+    needs: [pr_metadata, build-binaries, build-images, build-deb, build-rpm]
     if: needs.pr_metadata.outputs.run_integration_upgrades == 'true'
     permissions:
       actions: read
