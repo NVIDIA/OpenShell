@@ -596,10 +596,10 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
     fi
   fi
   printf '[openshell.drivers.docker]\n'
-  printf 'allow_driver_config = true\n'
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     printf 'socket_path = %s\n' "$(toml_string "${DRIVER_SOCKET}")"
   else
+    printf 'allow_driver_config = true\n'
     printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
     printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
     printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
@@ -607,9 +607,9 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
     printf 'enable_bind_mounts = true\n'
     printf 'sandbox_runtime_image = %s\n' "$(toml_string "${SANDBOX_RUNTIME_IMAGE}")"
     printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
+    printf '\n[openshell.drivers.docker.resource_admission]\n'
+    printf 'enabled = false\n'
   fi
-  printf '\n[openshell.drivers.docker.resource_admission]\n'
-  printf 'enabled = false\n'
 } > "${GATEWAY_CONFIG}"
 
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
