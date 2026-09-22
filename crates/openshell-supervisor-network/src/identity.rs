@@ -11,6 +11,7 @@
 use crate::procfs;
 use miette::Result;
 use std::collections::HashMap;
+#[cfg(not(target_os = "windows"))]
 use std::fs::Metadata;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -18,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::debug;
 
+#[cfg(not(target_os = "windows"))]
 #[derive(Clone)]
 struct FileFingerprint {
     len: u64,
@@ -29,6 +31,7 @@ struct FileFingerprint {
     ino: u64,
 }
 
+#[cfg(not(target_os = "windows"))]
 impl FileFingerprint {
     fn from_metadata(metadata: &Metadata) -> Self {
         #[cfg(unix)]
@@ -53,7 +56,7 @@ impl FileFingerprint {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_os = "windows")))]
 fn system_time_parts(time: std::time::SystemTime) -> Option<(i64, i64)> {
     let duration = time.duration_since(std::time::UNIX_EPOCH).ok()?;
     Some((
@@ -62,6 +65,7 @@ fn system_time_parts(time: std::time::SystemTime) -> Option<(i64, i64)> {
     ))
 }
 
+#[cfg(not(target_os = "windows"))]
 impl PartialEq for FileFingerprint {
     fn eq(&self, other: &Self) -> bool {
         self.len == other.len
@@ -87,6 +91,7 @@ impl PartialEq for FileFingerprint {
 #[derive(Clone)]
 struct CachedBinary {
     hash: String,
+    #[cfg(not(target_os = "windows"))]
     fingerprint: FileFingerprint,
 }
 
@@ -138,8 +143,10 @@ impl BinaryIdentityCache {
         let start = std::time::Instant::now();
         let metadata = std::fs::metadata(access_path)
             .map_err(|error| miette::miette!("Failed to stat {}: {error}", cache_path.display()))?;
+        #[cfg(not(target_os = "windows"))]
         let fingerprint = FileFingerprint::from_metadata(&metadata);
 
+        #[cfg(not(target_os = "windows"))]
         let cached = self
             .hashes
             .lock()
@@ -147,6 +154,10 @@ impl BinaryIdentityCache {
             .get(cache_path)
             .cloned();
 
+        // Windows creation/modification timestamps and length can be restored
+        // after an in-place same-length rewrite. Rehash every Windows request
+        // so writable executables cannot reuse a spoofed cache fingerprint.
+        #[cfg(not(target_os = "windows"))]
         if let Some(cached_binary) = &cached
             && cached_binary.fingerprint == fingerprint
         {
@@ -186,6 +197,7 @@ impl BinaryIdentityCache {
             cache_path.to_path_buf(),
             CachedBinary {
                 hash: current_hash.clone(),
+                #[cfg(not(target_os = "windows"))]
                 fingerprint,
             },
         );
@@ -253,7 +265,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(hash1, hash2);
-        assert_eq!(hash_calls, 1);
+        assert_eq!(hash_calls, if cfg!(target_os = "windows") { 2 } else { 1 });
     }
 
     #[test]
@@ -327,6 +339,34 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(hash_calls, 2);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn same_length_rewrite_with_restored_mtime_is_rehashed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary.exe");
+        let original = b"trusted-content!";
+        let tampered = b"tampered-content";
+        assert_eq!(original.len(), tampered.len());
+        std::fs::write(&path, original).unwrap();
+
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let cache = BinaryIdentityCache::new();
+        cache.verify_or_cache(&path).unwrap();
+
+        std::fs::write(&path, tampered).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+
+        let error = cache
+            .verify_or_cache(&path)
+            .expect_err("Windows must rehash despite a restored metadata fingerprint");
+        assert!(error.to_string().contains("integrity violation"));
     }
 
     #[test]

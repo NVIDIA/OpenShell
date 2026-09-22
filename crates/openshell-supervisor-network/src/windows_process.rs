@@ -3,15 +3,15 @@
 
 //! Windows TCP socket-owner and process-image resolution.
 
-use std::mem::{size_of, size_of_val};
+use std::mem::{offset_of, size_of, size_of_val};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
 use miette::Result;
 use windows::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE};
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetExtendedTcpTable, MIB_TCP_STATE_ESTAB, MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID,
-    TCP_TABLE_OWNER_PID_ALL,
+    GetExtendedTcpTable, MIB_TCP_STATE_ESTAB, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
+    MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
 };
 use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 use windows::Win32::System::Threading::{
@@ -73,7 +73,12 @@ fn ipv4_owner_pids(
     proxy: std::net::SocketAddrV4,
 ) -> Result<Vec<u32>> {
     let (buffer, byte_len) = tcp_table(u32::from(AF_INET.0))?;
-    let rows = table_rows::<MIB_TCPROW_OWNER_PID>(&buffer, byte_len)?;
+    let rows = table_rows::<MIB_TCPROW_OWNER_PID>(
+        &buffer,
+        byte_len,
+        offset_of!(MIB_TCPTABLE_OWNER_PID, table),
+        size_of::<MIB_TCPROW_OWNER_PID>(),
+    )?;
     let established = u32::try_from(MIB_TCP_STATE_ESTAB.0).expect("TCP state constant fits u32");
     Ok(rows
         .into_iter()
@@ -95,21 +100,33 @@ fn ipv6_owner_pids(
     proxy: &std::net::SocketAddrV6,
 ) -> Result<Vec<u32>> {
     let (buffer, byte_len) = tcp_table(u32::from(AF_INET6.0))?;
-    let rows = table_rows::<MIB_TCP6ROW_OWNER_PID>(&buffer, byte_len)?;
+    let rows = table_rows::<MIB_TCP6ROW_OWNER_PID>(
+        &buffer,
+        byte_len,
+        offset_of!(MIB_TCP6TABLE_OWNER_PID, table),
+        size_of::<MIB_TCP6ROW_OWNER_PID>(),
+    )?;
     let established = u32::try_from(MIB_TCP_STATE_ESTAB.0).expect("TCP state constant fits u32");
     Ok(rows
         .into_iter()
-        .filter(|row| {
-            row.dwState == established
-                && Ipv6Addr::from(row.ucLocalAddr) == *workload.ip()
-                && row.dwLocalScopeId == workload.scope_id()
-                && tcp_port(row.dwLocalPort) == workload.port()
-                && Ipv6Addr::from(row.ucRemoteAddr) == *proxy.ip()
-                && row.dwRemoteScopeId == proxy.scope_id()
-                && tcp_port(row.dwRemotePort) == proxy.port()
-        })
+        .filter(|row| ipv6_row_matches(row, workload, proxy, established))
         .map(|row| row.dwOwningPid)
         .collect())
+}
+
+fn ipv6_row_matches(
+    row: &MIB_TCP6ROW_OWNER_PID,
+    workload: &std::net::SocketAddrV6,
+    proxy: &std::net::SocketAddrV6,
+    established: u32,
+) -> bool {
+    row.dwState == established
+        && Ipv6Addr::from(row.ucLocalAddr) == *workload.ip()
+        && u32::from_be(row.dwLocalScopeId) == workload.scope_id()
+        && tcp_port(row.dwLocalPort) == workload.port()
+        && Ipv6Addr::from(row.ucRemoteAddr) == *proxy.ip()
+        && u32::from_be(row.dwRemoteScopeId) == proxy.scope_id()
+        && tcp_port(row.dwRemotePort) == proxy.port()
 }
 
 fn tcp_port(raw: u32) -> u16 {
@@ -172,18 +189,34 @@ fn tcp_table(address_family: u32) -> Result<(Vec<u32>, usize)> {
     ))
 }
 
-fn table_rows<T: Copy>(buffer: &[u32], byte_len: usize) -> Result<Vec<T>> {
+fn table_rows<T: Copy>(
+    buffer: &[u32],
+    byte_len: usize,
+    first_row_offset: usize,
+    row_stride: usize,
+) -> Result<Vec<T>> {
     if byte_len < size_of::<u32>() {
         return Err(miette::miette!("Windows TCP table is missing its header"));
     }
+    if row_stride < size_of::<T>() {
+        return Err(miette::miette!(
+            "Windows TCP table row stride {row_stride} is smaller than row size {}",
+            size_of::<T>()
+        ));
+    }
     let count = buffer[0] as usize;
-    let required = size_of::<u32>()
-        .checked_add(
-            count
-                .checked_mul(size_of::<T>())
-                .ok_or_else(|| miette::miette!("Windows TCP row count overflow"))?,
-        )
-        .ok_or_else(|| miette::miette!("Windows TCP table size overflow"))?;
+    let required = if count == 0 {
+        size_of::<u32>()
+    } else {
+        first_row_offset
+            .checked_add(
+                (count - 1)
+                    .checked_mul(row_stride)
+                    .ok_or_else(|| miette::miette!("Windows TCP row count overflow"))?,
+            )
+            .and_then(|last_row| last_row.checked_add(size_of::<T>()))
+            .ok_or_else(|| miette::miette!("Windows TCP table size overflow"))?
+    };
     if required > byte_len || required > size_of_val(buffer) {
         return Err(miette::miette!(
             "Windows TCP table is truncated: {count} rows require {required} bytes, got {byte_len}"
@@ -191,14 +224,14 @@ fn table_rows<T: Copy>(buffer: &[u32], byte_len: usize) -> Result<Vec<T>> {
     }
 
     let mut rows = Vec::with_capacity(count);
-    // SAFETY: Bounds were checked above. `read_unaligned` avoids assuming the
-    // row begins at more than the four-byte alignment guaranteed by the API.
+    // SAFETY: Bounds were checked above. `read_unaligned` supports the padding
+    // permitted before the first row and between generated table rows.
     #[allow(unsafe_code)]
     unsafe {
-        let first = buffer.as_ptr().cast::<u8>().add(size_of::<u32>());
+        let first = buffer.as_ptr().cast::<u8>().add(first_row_offset);
         for index in 0..count {
             rows.push(std::ptr::read_unaligned(
-                first.add(index * size_of::<T>()).cast::<T>(),
+                first.add(index * row_stride).cast::<T>(),
             ));
         }
     }
@@ -282,5 +315,67 @@ mod tests {
         let (path, pid) = result.unwrap();
         assert_eq!(pid, child.id());
         assert_eq!(path, current_exe);
+    }
+
+    #[test]
+    fn parses_table_with_header_and_inter_row_padding() {
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct SyntheticRow {
+            value: u32,
+            pid: u32,
+        }
+
+        const FIRST_ROW_OFFSET: usize = 8;
+        const ROW_STRIDE: usize = 12;
+        let buffer = vec![
+            2,           // dwNumEntries
+            0xAAAA_AAAA, // header padding
+            11,
+            101,
+            0xBBBB_BBBB, // inter-row padding
+            22,
+            202,
+        ];
+        let rows = table_rows::<SyntheticRow>(
+            &buffer,
+            size_of_val(buffer.as_slice()),
+            FIRST_ROW_OFFSET,
+            ROW_STRIDE,
+        )
+        .expect("padded table should parse using its declared layout");
+
+        assert_eq!(
+            rows,
+            vec![
+                SyntheticRow {
+                    value: 11,
+                    pid: 101,
+                },
+                SyntheticRow {
+                    value: 22,
+                    pid: 202,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn matches_ipv6_scope_ids_from_network_byte_order() {
+        let workload = std::net::SocketAddrV6::new("fe80::1".parse().unwrap(), 51_234, 0, 17);
+        let proxy = std::net::SocketAddrV6::new("fe80::2".parse().unwrap(), 31_234, 0, 23);
+        let established = u32::try_from(MIB_TCP_STATE_ESTAB.0).unwrap();
+        let row = MIB_TCP6ROW_OWNER_PID {
+            ucLocalAddr: workload.ip().octets(),
+            dwLocalScopeId: workload.scope_id().to_be(),
+            dwLocalPort: u32::from(workload.port().to_be()),
+            ucRemoteAddr: proxy.ip().octets(),
+            dwRemoteScopeId: proxy.scope_id().to_be(),
+            dwRemotePort: u32::from(proxy.port().to_be()),
+            dwState: established,
+            dwOwningPid: 42,
+        };
+
+        assert!(ipv6_row_matches(&row, &workload, &proxy, established));
     }
 }
