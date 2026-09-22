@@ -29,6 +29,7 @@ tests:
   - it: limits namespaced admission reads to PVCs
     set:
       server.drivers.kubernetes.workspaceMode: managed
+      server.drivers.kubernetes.allowDriverConfig: true
     asserts:
       - contains:
           path: rules
@@ -47,6 +48,17 @@ tests:
           content:
             apiGroups: [""]
             resources: ["configmaps"]
+            verbs: ["get"]
+
+  - it: omits PVC admission reads when caller driver config is disabled
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
             verbs: ["get"]
 
   - it: preserves sandbox-runtime fence permissions when gateway isolation is disabled

@@ -20,7 +20,7 @@ tests:
       - equal:
           path: metadata.namespace
           value: app-a
-      - contains:
+      - notContains:
           path: rules
           content:
             apiGroups: [""]
@@ -37,6 +37,18 @@ tests:
           content:
             apiGroups: [""]
             resources: ["configmaps"]
+            verbs: ["get"]
+
+  - it: grants PVC admission reads only when caller driver config is enabled
+    template: templates/role.yaml
+    set:
+      gateway.allowDriverConfig: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
             verbs: ["get"]
 
   - it: binds the shared gateway service account

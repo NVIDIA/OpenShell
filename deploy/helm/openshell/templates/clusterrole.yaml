@@ -15,7 +15,7 @@ rules:
   - apiGroups: ["scheduling.k8s.io"]
     resources: ["priorityclasses"]
     verbs: ["get"]
-  {{- if ne $workspaceMode "shared" }}
+  {{- if and (ne $workspaceMode "shared") .Values.server.drivers.kubernetes.allowDriverConfig }}
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get"]

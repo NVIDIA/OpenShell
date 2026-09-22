@@ -10,10 +10,12 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
+  {{- if .Values.server.drivers.kubernetes.allowDriverConfig }}
   # Metadata-only admission of caller-selected PVCs requires get permission.
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get"]
+  {{- end }}
   - apiGroups:
       - agents.x-k8s.io
     resources:

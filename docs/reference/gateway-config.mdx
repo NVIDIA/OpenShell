@@ -651,9 +651,10 @@ calls until gateway and driver configuration agree again.
 Helm exposes `server.drivers.kubernetes.allowDriverConfig`,
 `resourceAdmission.enabled`, and `resourceAdmission.requiredLabels`. The label
 map defaults to `null`, which uses code defaults without merging those keys
-into a custom map. Admission reads need Kubernetes `get` permissions even
-though only metadata is requested. Never mark gateway database storage as
-attachable.
+into a custom map. The Helm chart grants PVC metadata reads only when
+`allowDriverConfig` is enabled. Split workspace releases must set the matching
+`gateway.allowDriverConfig=true` workspace-chart value. Never mark gateway
+database storage as attachable.
 
 Each example is a complete TOML file for one compute driver. The examples repeat `[openshell]` and `[openshell.gateway]` so they stay copyable, and the driver tables list the accepted driver-specific keys. Drivers receive only their own tables, and the gateway rejects unknown gateway and driver fields.
 

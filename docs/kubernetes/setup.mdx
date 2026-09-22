@@ -132,6 +132,11 @@ provisioned namespaces, use `workspaceMode=operator`, configure exactly one of
 `operatorNamespaceLabel` or `operatorNamespaceFile`, and install the workspace
 chart in every allowlisted namespace.
 
+If you enable `server.drivers.kubernetes.allowDriverConfig` on the gateway,
+also set `gateway.allowDriverConfig=true` on every workspace release. This
+grants the namespace-scoped PVC metadata read needed to admit caller-selected
+PVC mounts. Leave both values disabled when callers do not need driver config.
+
 ## Wait for the gateway to be ready
 
 ```shell
