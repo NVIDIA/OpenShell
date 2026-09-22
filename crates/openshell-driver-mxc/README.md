@@ -201,9 +201,10 @@ This example uses `process_container`. The `IsoSessionApp.dll` and
 
 ## Real-MXC test lane
 
-Three tasks drive real `wxc-exec.exe` hardware; all are **skip-safe** — any test
-or scenario that requires an absent binary or backend prints a SKIP reason and
-exits 0 rather than failing.
+Three tasks drive real `wxc-exec.exe` hardware. They print a SKIP reason and
+exit 0 when `wxc-exec` or the requested backend is unavailable. Once
+ProcessContainer is live, required capabilities are authoritative: rejection
+of `network.proxy` or another enforcement failure fails the task.
 
 | Task | What it runs | When to use |
 |---|---|---|
