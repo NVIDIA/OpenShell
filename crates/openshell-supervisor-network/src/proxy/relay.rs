@@ -114,9 +114,12 @@ pub(super) fn pin_policy_generation(
 /// Clone an L7 evaluator for a relay or the forward HTTP single-request path.
 pub(super) fn pin_l7_evaluator(
     opa_engine: &OpaEngine,
-    expected_generation: u64,
+    decision: &EgressDecision,
 ) -> Result<TunnelPolicyEngine> {
-    opa_engine.clone_engine_for_tunnel(expected_generation)
+    opa_engine.clone_engine_for_tunnel_with_match_paths(
+        decision.policy_generation,
+        decision.binary_match_paths.clone(),
+    )
 }
 
 pub(super) fn validate_route_generation(
@@ -157,7 +160,7 @@ pub(super) fn prepare_http_relay<'a>(
     }
 
     let policy = if let Some(route) = route.filter(|route| !route.configs.is_empty()) {
-        let evaluator = match pin_l7_evaluator(opa_engine, decision.policy_generation) {
+        let evaluator = match pin_l7_evaluator(opa_engine, decision) {
             Ok(evaluator) => evaluator,
             Err(error) => {
                 emit_l7_tunnel_close_after_policy_change(
@@ -357,6 +360,7 @@ mod tests {
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
+            binary_match_paths: Vec::new(),
         }
     }
 
@@ -423,6 +427,7 @@ network_policies:
                 binary_pid: None,
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                binary_match_paths: authorization.binary_match_paths.clone(),
             };
             let route = query_l7_route_snapshot(&decision, "example.com", 80)
                 .expect("REST endpoint should produce an inspected route");

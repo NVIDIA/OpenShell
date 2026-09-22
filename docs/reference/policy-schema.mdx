@@ -585,12 +585,11 @@ Identifies an executable that is permitted to use the associated endpoints.
 | `path` | string | Yes | Filesystem path to the executable. Supports glob patterns with `*` and `**`. For example, `/sandbox/.vscode-server/**` matches any executable under that directory tree. |
 
 On Windows, ordinary binary paths treat `/` and `\` as equivalent. ASCII case is
-folded only when Windows confirms that the containing directory is
-case-insensitive. Paths in case-sensitive directories, paths whose directory
-semantics cannot be determined, and paths containing glob metacharacters retain
-their case and therefore fail closed on case differences. Verbatim `\\?\` paths
-retain their exact spelling and separators; policy authors should use the same
-verbatim form reported by the runtime.
+folded only when Windows confirms that every parent directory of the
+runtime-observed executable uses case-insensitive lookup. If any component is
+case-sensitive or cannot be checked, matching remains case-exact and fails
+closed. Loading policy never opens a policy-authored path. UNC, device, and
+verbatim namespace paths retain their exact spelling and separators.
 
 ## Network Middleware
 

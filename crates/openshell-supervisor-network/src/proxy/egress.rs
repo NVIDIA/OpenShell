@@ -156,6 +156,8 @@ pub(super) struct EgressDecision {
     pub(super) ancestors: Vec<PathBuf>,
     /// Cmdline-derived absolute paths (for script detection).
     pub(super) cmdline_paths: Vec<PathBuf>,
+    /// Runtime-derived path representations carried into pinned L7 evaluation.
+    pub(super) binary_match_paths: Vec<crate::opa::NetworkBinaryPathEvidence>,
 }
 
 #[cfg(test)]
