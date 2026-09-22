@@ -200,7 +200,7 @@ const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
 const IMAGE_EXPORT_ROOTFS_ARCHIVE: &str = "source-rootfs.tar";
-const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v4";
+const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v5";
 const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v3";
 const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
@@ -712,7 +712,7 @@ impl VmDriver {
             )
         })?;
         let image_cache_root = image_cache_root_dir(&config.state_dir);
-        tokio::fs::create_dir_all(&image_cache_root)
+        create_private_dir_all(&image_cache_root)
             .await
             .map_err(|err| {
                 format!(
@@ -9438,6 +9438,214 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn apply_layer_dir_to_rootfs_does_not_write_through_escaping_symlink() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let layer = base.join("layer");
+        let outside = base.join("outside");
+
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::create_dir_all(layer.join("escape")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("sentinel"), "unchanged").unwrap();
+        std::os::unix::fs::symlink(&outside, rootfs.join("escape")).unwrap();
+        fs::write(layer.join("escape/payload"), "escaped").unwrap();
+
+        let error = apply_layer_dir_to_rootfs(&layer, &rootfs).err();
+
+        let sentinel = fs::read_to_string(outside.join("sentinel")).unwrap();
+        let payload_escaped = outside.join("payload").exists();
+        let _ = fs::remove_dir_all(base);
+
+        let error = error.expect("escaping symlink should reject the layer");
+        assert!(
+            error.contains("absolute symlink"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(sentinel, "unchanged");
+        assert!(
+            !payload_escaped,
+            "upper-layer payload escaped the rootfs through a lower-layer symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_layer_dir_to_rootfs_does_not_whiteout_through_escaping_symlink() {
+        let base = unique_temp_dir();
+        let outside_entry = base.join("outside-entry");
+        let outside_opaque = base.join("outside-opaque");
+        fs::create_dir_all(&outside_entry).unwrap();
+        fs::create_dir_all(&outside_opaque).unwrap();
+        fs::write(outside_entry.join("victim"), "entry").unwrap();
+        fs::write(outside_opaque.join("victim"), "opaque").unwrap();
+
+        let entry_rootfs = base.join("entry-rootfs");
+        let entry_layer = base.join("entry-layer");
+        fs::create_dir_all(&entry_rootfs).unwrap();
+        fs::create_dir_all(entry_layer.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&outside_entry, entry_rootfs.join("escape")).unwrap();
+        fs::write(entry_layer.join("escape/.wh.victim"), "").unwrap();
+        let entry_error = apply_layer_dir_to_rootfs(&entry_layer, &entry_rootfs).err();
+
+        let opaque_rootfs = base.join("opaque-rootfs");
+        let opaque_layer = base.join("opaque-layer");
+        fs::create_dir_all(&opaque_rootfs).unwrap();
+        fs::create_dir_all(opaque_layer.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&outside_opaque, opaque_rootfs.join("escape")).unwrap();
+        fs::write(opaque_layer.join("escape/.wh..wh..opq"), "").unwrap();
+        let opaque_error = apply_layer_dir_to_rootfs(&opaque_layer, &opaque_rootfs).err();
+
+        let entry_remained = outside_entry.join("victim").exists();
+        let opaque_remained = outside_opaque.join("victim").exists();
+        let _ = fs::remove_dir_all(base);
+
+        let entry_error =
+            entry_error.expect("escaping symlink should reject an individual whiteout layer");
+        let opaque_error =
+            opaque_error.expect("escaping symlink should reject an opaque whiteout layer");
+        assert!(
+            entry_error.contains("absolute symlink"),
+            "unexpected error: {entry_error}"
+        );
+        assert!(
+            opaque_error.contains("absolute symlink"),
+            "unexpected error: {opaque_error}"
+        );
+        assert!(entry_remained, "individual whiteout escaped the rootfs");
+        assert!(opaque_remained, "opaque whiteout escaped the rootfs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_layer_dir_to_rootfs_rejects_relative_symlink_escape() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let layer = base.join("layer");
+        let outside = base.join("outside");
+
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::create_dir_all(layer.join("escape")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink("../outside", rootfs.join("escape")).unwrap();
+        fs::write(layer.join("escape/payload"), "escaped").unwrap();
+
+        let error = apply_layer_dir_to_rootfs(&layer, &rootfs).err();
+        let payload_escaped = outside.join("payload").exists();
+        let _ = fs::remove_dir_all(base);
+
+        let error = error.expect("escaping symlink should reject the layer");
+        assert!(
+            error.contains("escapes rootfs"),
+            "unexpected error: {error}"
+        );
+        assert!(!payload_escaped, "relative symlink escaped the rootfs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_layer_dir_to_rootfs_rejects_directory_symlink_cycles() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let layer = base.join("layer");
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::create_dir_all(layer.join("a")).unwrap();
+        fs::write(layer.join("a/payload"), "payload").unwrap();
+        std::os::unix::fs::symlink("b", rootfs.join("a")).unwrap();
+        std::os::unix::fs::symlink("a", rootfs.join("b")).unwrap();
+
+        let error = apply_layer_dir_to_rootfs(&layer, &rootfs)
+            .expect_err("directory symlink cycle must reject the layer");
+
+        assert!(
+            error.contains("too many symlinks"),
+            "unexpected error: {error}"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracted_layers_do_not_write_through_escaping_symlink() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let lower = base.join("lower");
+        let upper = base.join("upper");
+        // GNU tar's legacy symlink field is limited to 100 bytes, while the
+        // macOS temporary directory path is already close to that limit.
+        let outside = Path::new("/tmp").join(format!(
+            "openshell-vm-layer-test-{}-{:x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("sentinel"), "unchanged").unwrap();
+
+        let mut lower_tar = tar::Builder::new(Vec::new());
+        append_test_tar_symlink(&mut lower_tar, "escape", &outside);
+        let lower_tar = lower_tar.into_inner().expect("finish lower tar");
+        extract_tar_reader_to_dir(std::io::Cursor::new(lower_tar), &lower).unwrap();
+
+        let upper_tar = tar_bytes_with_file("escape/payload", b"escaped");
+        extract_tar_reader_to_dir(std::io::Cursor::new(upper_tar), &upper).unwrap();
+
+        apply_layer_dir_to_rootfs(&lower, &rootfs).unwrap();
+        let error = apply_layer_dir_to_rootfs(&upper, &rootfs)
+            .expect_err("upper layer must not traverse the lower absolute symlink");
+
+        assert!(
+            error.contains("absolute symlink"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("sentinel")).unwrap(),
+            "unchanged"
+        );
+        assert!(!outside.join("payload").exists());
+
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracted_layer_implicit_parent_preserves_lower_directory_symlink() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let lower = base.join("lower");
+        let upper = base.join("upper");
+
+        let mut lower_tar = tar::Builder::new(Vec::new());
+        append_test_tar_file(&mut lower_tar, "usr/bin/bash", b"bash");
+        append_test_tar_symlink(&mut lower_tar, "bin", Path::new("usr/bin"));
+        let lower_tar = lower_tar.into_inner().expect("finish lower tar");
+        extract_tar_reader_to_dir(std::io::Cursor::new(lower_tar), &lower).unwrap();
+
+        // The tar contains no explicit `bin/` entry. Extraction necessarily
+        // materializes it as an implicit parent for `bin/tool`.
+        let upper_tar = tar_bytes_with_file("bin/tool", b"tool");
+        extract_tar_reader_to_dir(std::io::Cursor::new(upper_tar), &upper).unwrap();
+
+        apply_layer_dir_to_rootfs(&lower, &rootfs).unwrap();
+        apply_layer_dir_to_rootfs(&upper, &rootfs).unwrap();
+
+        assert!(
+            fs::symlink_metadata(rootfs.join("bin"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "implicit upper parent must not replace the lower /bin symlink"
+        );
+        assert_eq!(
+            fs::read_to_string(rootfs.join("usr/bin/tool")).unwrap(),
+            "tool"
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
     #[test]
     fn layer_compression_from_media_type_supports_common_formats() {
         assert_eq!(
@@ -9834,7 +10042,7 @@ mod tests {
     fn bootstrap_image_cache_identity_includes_rootfs_layout_version_and_guest_runtime() {
         let identity = bootstrap_image_cache_identity("sha256:bootstrap-image");
         assert!(identity.starts_with(&format!(
-            "sandbox-bootstrap-rootfs-ext4-v4:openshell-{}:guest-",
+            "sandbox-bootstrap-rootfs-ext4-v5:openshell-{}:guest-",
             openshell_core::VERSION
         )));
         assert!(identity.ends_with(":sha256:bootstrap-image"));
@@ -10228,6 +10436,11 @@ mod tests {
     /// Build an uncompressed tar holding a single file.
     fn tar_bytes_with_file(name: &str, contents: &[u8]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
+        append_test_tar_file(&mut builder, name, contents);
+        builder.into_inner().expect("finish tar")
+    }
+
+    fn append_test_tar_file(builder: &mut tar::Builder<Vec<u8>>, name: &str, contents: &[u8]) {
         let mut header = tar::Header::new_gnu();
         header.set_size(u64::try_from(contents.len()).expect("tar entry size fits u64"));
         header.set_mode(0o644);
@@ -10235,7 +10448,18 @@ mod tests {
         builder
             .append_data(&mut header, name, contents)
             .expect("append tar entry");
-        builder.into_inner().expect("finish tar")
+    }
+
+    fn append_test_tar_symlink(builder: &mut tar::Builder<Vec<u8>>, name: &str, target: &Path) {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_link_name(target).expect("set symlink target");
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, std::io::empty())
+            .expect("append symlink entry");
     }
 
     fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {

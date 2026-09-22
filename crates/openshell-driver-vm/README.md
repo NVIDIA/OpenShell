@@ -212,7 +212,11 @@ and reports the image-prep console tail. Set `OPENSHELL_VM_IMAGE_PULL_CONCURRENC
 tune registry layer download parallelism (default `4`, maximum `16`).
 Both caches are scoped by source image identity and OpenShell version, so an
 OpenShell upgrade builds a fresh guest rootfs instead of reusing one with an old
-embedded supervisor.
+embedded supervisor. Host-side bootstrap layer assembly preserves relative
+symlinks that remain inside the rootfs, but rejects absolute or escaping
+cross-layer symlink traversal before applying later files or whiteouts. The
+layer applier performs rootfs mutations relative to opened directory handles
+and creates destination files without following symlinks.
 
 Each sandbox gets its own sparse writable
 `<state-dir>/sandboxes/<id>/overlay.ext4`. Guest init mounts overlayfs as `/`
