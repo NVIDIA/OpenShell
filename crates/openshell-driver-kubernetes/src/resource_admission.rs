@@ -49,7 +49,7 @@ fn metadata_lookup_error(error: kube::Error, resource: &str) -> Status {
         kube::Error::Api(response) if response.code == 404 => {
             Status::failed_precondition(format!("{resource} does not exist"))
         }
-        kube::Error::Api(response) if response.code == 403 => Status::failed_precondition(format!(
+        kube::Error::Api(response) if response.code == 403 => Status::unavailable(format!(
             "gateway is forbidden from reading metadata for {resource} (Kubernetes 403); check gateway RBAC"
         )),
         kube::Error::Api(response) if response.code == 401 => Status::unavailable(format!(
@@ -372,7 +372,7 @@ mod tests {
             (
                 403,
                 "Forbidden",
-                tonic::Code::FailedPrecondition,
+                tonic::Code::Unavailable,
                 "check gateway RBAC",
             ),
             (

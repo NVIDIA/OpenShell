@@ -7408,6 +7408,104 @@ mod tests {
             .expect("stopped sandbox should use its stored private Secret reference");
     }
 
+    #[tokio::test]
+    async fn admission_reconcile_does_not_suspend_on_forbidden_metadata_lookup() {
+        let sandbox = serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {
+                "name": "sandbox-cr",
+                "namespace": "openshell",
+                "resourceVersion": "42",
+                "labels": {
+                    LABEL_SANDBOX_ID: "sandbox-id",
+                    LABEL_SANDBOX_WORKSPACE: "team-a"
+                },
+                "annotations": {
+                    crate::resource_admission::CONFIG_USED: "false",
+                    crate::resource_admission::IDENTITIES:
+                        "{\"PersistentVolumeClaim/openshell/team-data\":\"pvc-uid\"}"
+                }
+            },
+            "spec": {
+                "podTemplate": {
+                    "spec": {
+                        "automountServiceAccountToken": false,
+                        "volumes": [
+                            {
+                                "name": "data",
+                                "persistentVolumeClaim": {"claimName": "team-data"}
+                            },
+                            {
+                                "name": SANDBOX_BOOTSTRAP_VOLUME_NAME,
+                                "secret": {"secretName": "os-sandbox-sandbox-id-generation"}
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+        let steps = Arc::new(std::sync::Mutex::new(VecDeque::from([
+            (
+                http::Method::GET,
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes",
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "agents.x-k8s.io/v1beta1",
+                        "kind": "SandboxList",
+                        "items": [sandbox]
+                    }),
+                ),
+            ),
+            (
+                http::Method::GET,
+                "/api/v1/namespaces/openshell/persistentvolumeclaims/team-data",
+                kube_test_response(
+                    http::StatusCode::FORBIDDEN,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Status",
+                        "status": "Failure",
+                        "message": "fixture forbidden",
+                        "reason": "Forbidden",
+                        "code": 403
+                    }),
+                ),
+            ),
+        ])));
+        let service_steps = steps.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let steps = service_steps.clone();
+            async move {
+                let (method, path, response) = steps
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("403 admission retry must not issue a suspension patch");
+                assert_eq!(request.method(), method);
+                assert_eq!(request.uri().path(), path);
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        let client = Client::new(service, "openshell");
+        let driver = KubernetesComputeDriver {
+            client: client.clone(),
+            watch_client: client,
+            sandbox_api_version: Arc::new(OnceCell::new()),
+            config: KubernetesComputeConfig::default(),
+            operator_allowlist: None,
+        };
+        driver
+            .sandbox_api_version
+            .set(SANDBOX_VERSION_V1BETA1)
+            .expect("set test Sandbox API version");
+
+        driver.reconcile_sandbox_runtime_resources().await;
+
+        assert!(steps.lock().unwrap().is_empty());
+    }
+
     use openshell_core::progress::{
         PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
         PROGRESS_COMPLETE_STEP_KEY,
