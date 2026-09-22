@@ -396,13 +396,14 @@ async fn handle_create_sandbox_inner(
 
     // Drivers without live policy updates need an atomic boundary between
     // create-time policy resolution and mutations that affect existing sandboxes.
-    // Capable drivers retain the existing concurrent-create behavior and do not
-    // need the MXC-specific serialization around their potentially slow RPCs.
-    let _sandbox_sync_guard = if state.compute.supports_live_policy_updates() {
-        None
-    } else {
-        Some(state.compute.sandbox_sync_guard().await)
-    };
+    // Provider-backed creates also serialize with profile mutation so the initial
+    // policy snapshot cannot miss a concurrent profile update before persistence.
+    let _sandbox_sync_guard =
+        if !state.compute.supports_live_policy_updates() || !spec.providers.is_empty() {
+            Some(state.compute.sandbox_sync_guard().await)
+        } else {
+            None
+        };
 
     // Validate provider names exist (fail fast).
     for name in &spec.providers {
@@ -5058,6 +5059,55 @@ mod tests {
         assert!(
             response.sandbox.unwrap().spec.unwrap().providers.is_empty(),
             "the concurrency test must exercise a provider-free create"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_with_providers_waits_for_sandbox_sync_guard() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+
+        let guard = state.compute.sandbox_sync_guard().await;
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            handle_create_sandbox(
+                &task_state,
+                authed_request(CreateSandboxRequest {
+                    name: "provider-backed-create".to_string(),
+                    spec: Some(SandboxSpec {
+                        providers: vec!["work-github".to_string()],
+                        ..Default::default()
+                    }),
+                    labels: HashMap::new(),
+                    annotations: HashMap::new(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    await_main_process_attachment: false,
+                    workload_template_name: String::new(),
+                }),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !task.is_finished(),
+            "sandbox create with initial providers should wait for sandbox sync guard"
+        );
+        drop(guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("create should finish after guard release")
+            .expect("join create task")
+            .expect("create should succeed")
+            .into_inner();
+        assert_eq!(
+            response.sandbox.unwrap().spec.unwrap().providers,
+            vec!["work-github".to_string()]
         );
     }
 
