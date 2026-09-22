@@ -132,7 +132,7 @@ function Get-Sha256([string] $Path) {
 function Get-DirectorySha256([string] $Path) {
     $root = (Resolve-Path -LiteralPath $Path).Path.TrimEnd('\') + '\'
     $entries = @(
-        Get-ChildItem -LiteralPath $Path -File -Recurse | ForEach-Object {
+        Get-ChildItem -LiteralPath $Path -File -Recurse -Force | ForEach-Object {
             [pscustomobject]@{
                 RelativePath = $_.FullName.Substring($root.Length).Replace('\', '/')
                 Sha256 = Get-Sha256 $_.FullName
@@ -254,6 +254,16 @@ Invoke-LoggedProcess "gb300-arm64-host" "mxc-host-probe.log" $PowerShellExe @(
 $probe = Get-Content -LiteralPath $probeReport -Raw | ConvertFrom-Json
 if ($probe.verdicts.processcontainer -ne "live" -or $probe.verdicts.dryRun -ne "ok") {
     throw "MXC preflight must report processcontainer=live and dryRun=ok. See $probeReport"
+}
+
+$openClawSnapshotDir = Join-Path $EvidenceDir "openclaw-package"
+New-Item -ItemType Directory -Path $openClawSnapshotDir | Out-Null
+Get-ChildItem -LiteralPath $OpenClawInstallDir -Force | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $openClawSnapshotDir -Recurse -Force
+}
+$OpenClawInstallDir = (Resolve-Path -LiteralPath $openClawSnapshotDir).Path
+if (-not (Test-Path -LiteralPath (Join-Path $OpenClawInstallDir "openclaw.mjs") -PathType Leaf)) {
+    throw "The staged OpenClaw package must directly contain openclaw.mjs: $OpenClawInstallDir"
 }
 
 $packageJsonPath = Join-Path $OpenClawInstallDir "package.json"
@@ -380,12 +390,20 @@ $mxcBundlePath = Join-Path $EvidenceDir "mxc-policy-e2e.zip"
 Copy-Item -LiteralPath $mxcBundle.FullName -Destination $mxcBundlePath
 
 $openClawRunner = Join-Path $packageDir "run-openclaw-forward-test.ps1"
+$openClawPreRunSha256 = Get-DirectorySha256 $OpenClawInstallDir
+if ($openClawPreRunSha256 -ne $openClawPackageSha256) {
+    throw "The staged OpenClaw package changed before execution: expected $openClawPackageSha256, found $openClawPreRunSha256"
+}
 Invoke-LoggedProcess "openclaw-arm64-forward" "openclaw-forward.log" $PowerShellExe @(
     "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $openClawRunner,
     "-Backend", "process_container", "-WxcExecPath", $WxcExecPath,
     "-NodeExePath", $NodeExePath, "-OpenClawInstallDir", $OpenClawInstallDir,
     "-ShareDir", $openClawShareDir
 )
+$openClawPostRunSha256 = Get-DirectorySha256 $OpenClawInstallDir
+if ($openClawPostRunSha256 -ne $openClawPackageSha256) {
+    throw "The staged OpenClaw package changed during execution: expected $openClawPackageSha256, found $openClawPostRunSha256"
+}
 $openClawBundle = Get-ChildItem -LiteralPath $packageDir -Filter "results-openclaw-forward-*.zip" -File |
     Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
 if (-not $openClawBundle) {

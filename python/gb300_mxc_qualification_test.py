@@ -159,6 +159,26 @@ def test_runner_hash_binds_a_versioned_openclaw_package() -> None:
     assert "package.json must declare a non-empty version" in source
     assert "openclaw_package_sha256" in source
     assert "openclaw_package_json_sha256" in source
+    assert "Get-ChildItem -LiteralPath $OpenClawInstallDir -Force" in source
+    assert "Copy-Item -LiteralPath $_.FullName" in source
+    assert "$openClawPreRunSha256 = Get-DirectorySha256 $OpenClawInstallDir" in source
+    assert "$openClawPostRunSha256 = Get-DirectorySha256 $OpenClawInstallDir" in source
+
+
+def test_gb300_gate_invokes_only_required_real_mxc_tests() -> None:
+    source = (REPO_ROOT / "tasks" / "scripts" / "windows-msvc.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    gb300_function = source.split("function Invoke-MxcGb300Tests", 1)[1].split(
+        "function Get-Sha256", 1
+    )[0]
+
+    assert "$test -- --ignored --exact --test-threads=1 --nocapture" in gb300_function
+    assert (
+        "--target $RustTarget -- --ignored --test-threads=1 --nocapture"
+        not in gb300_function
+    )
 
 
 def test_repository_contract_is_valid() -> None:

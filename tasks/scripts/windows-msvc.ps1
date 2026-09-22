@@ -610,25 +610,28 @@ function Invoke-MxcGb300Tests([string] $RustTarget) {
         "pc_oneshot_out_of_policy_write_denied"
     )
     $logName = "test-$RustTarget-mxc-gb300.log"
-    Invoke-VsCargo `
-        -RustTarget $RustTarget `
-        -CargoArgs "cargo test -p openshell-driver-mxc --test wxc_exec_real --target $RustTarget -- --ignored --test-threads=1 --nocapture" `
-        -LogName $logName
-
     $logPath = Join-Path $LogDir $logName
-    $allowedSkipPattern = '^test (dryrun_current_schema_rejects_isolation_session_ui|iso_lifecycle_round_trip) \.\.\. SKIP:'
-    $unexpectedSkips = @(Select-String -Path $logPath -SimpleMatch "SKIP:" | Where-Object {
-        $_.Line -notmatch $allowedSkipPattern
-    })
-    if ($unexpectedSkips.Count -gt 0) {
-        throw "A required GB300 MXC test skipped: $($unexpectedSkips.Line -join '; '). See $logPath"
-    }
+    $combinedLog = @()
     foreach ($test in $tests) {
+        $testLogName = "test-$RustTarget-mxc-gb300-$test.log"
+        Invoke-VsCargo `
+            -RustTarget $RustTarget `
+            -CargoArgs "cargo test -p openshell-driver-mxc --test wxc_exec_real --target $RustTarget $test -- --ignored --exact --test-threads=1 --nocapture" `
+            -LogName $testLogName
+
+        $testLogPath = Join-Path $LogDir $testLogName
+        $testLog = @(Get-Content -LiteralPath $testLogPath)
+        $combinedLog += "===== $test ====="
+        $combinedLog += $testLog
+        if ($testLog -match 'SKIP:') {
+            throw "Required GB300 MXC test $test skipped. See $testLogPath"
+        }
         $escapedTest = [Regex]::Escape($test)
-        if (-not (Select-String -Path $logPath -Pattern "^test $escapedTest \.\.\. ok$" -Quiet)) {
-            throw "Required GB300 MXC test $test did not report a passing assertion. See $logPath"
+        if (-not ($testLog -match "^test $escapedTest \.\.\. ok$")) {
+            throw "Required GB300 MXC test $test did not report a passing assertion. See $testLogPath"
         }
     }
+    $combinedLog | Out-File -LiteralPath $logPath -Encoding utf8
 }
 
 function Get-Sha256([string] $Path) {
