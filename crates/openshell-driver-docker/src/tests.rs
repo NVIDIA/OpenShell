@@ -3469,3 +3469,18 @@ async fn different_start_generation_is_rejected() {
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert!(error.message().contains("generation-one"));
 }
+
+#[test]
+fn admission_provisioning_failure_distinguishes_denials_from_lookup_failures() {
+    let denied = DockerProvisioningFailure::from_admission_status(Status::failed_precondition(
+        "volume is not admitted",
+    ));
+    assert_eq!(denied.reason, "ResourceAdmissionDenied");
+    assert_eq!(denied.message, "volume is not admitted");
+
+    let lookup = DockerProvisioningFailure::from_admission_status(Status::internal(
+        "inspect docker volume failed",
+    ));
+    assert_eq!(lookup.reason, "ResourceAdmissionLookupFailed");
+    assert_eq!(lookup.message, "inspect docker volume failed");
+}

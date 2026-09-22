@@ -43,8 +43,12 @@ tests:
     set:
       server.drivers.kubernetes.allowDriverConfig: true
       server.drivers.kubernetes.resourceAdmission.requiredLabels:
+        platform.example.com/sandbox-attachable: "approved"
         platform.example.com/team: '${workspace}'
     asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '"platform.example.com/sandbox-attachable" = "approved"'
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '"platform.example.com/team" = "\$\{workspace\}"'

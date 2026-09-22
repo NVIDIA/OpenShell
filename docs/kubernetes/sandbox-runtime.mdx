@@ -87,14 +87,17 @@ cluster CNI enforces both ingress and egress policies for these namespaces.
 
 ## Bootstrap a Sandbox
 
-Resource admission checks the requested external references before provisioning
-and the actual workload Pod before releasing its scheduling gate. PVCs and
-other supported external references require operator approval labels, including
-same-namespace and read-only mounts. Unexpected references, changed resource
-UIDs, and unsupported volume sources fail closed. GPU device attachments are
-temporarily exempt. The driver rechecks persisted references on restart and
-every 30 seconds during reconciliation; confirmed revocation suspends compute,
-while transient lookup failures block new launches and recovery.
+Resource admission checks external references selected through the OpenShell-owned
+Pod template before provisioning and again before releasing the workload's
+scheduling gate. Kubernetes API-server and admission-webhook mutations of the
+live Pod are trusted cluster-operator behavior and are not used as Workspace User
+authorization inputs. PVCs and other supported external references require
+operator approval labels, including same-namespace and read-only mounts.
+Unexpected references, changed resource UIDs, and unsupported volume sources fail
+closed. GPU device attachments are temporarily exempt. The driver rechecks
+persisted references on restart and every 30 seconds during reconciliation;
+confirmed revocation suspends compute, while transient lookup failures block new
+launches and recovery.
 
 See [External Resource Admission](../reference/gateway-config#external-resource-admission)
 for label configuration and upgrade requirements. Admission cannot repair data

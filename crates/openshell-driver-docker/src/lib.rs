@@ -1649,10 +1649,7 @@ impl DockerComputeDriver {
                 let _ = remove_docker_channel_volume_by_id(&self.docker, &sandbox.id, &self.config)
                     .await;
                 cleanup_docker_boundary_state(sandbox, &self.config);
-                return Err(DockerProvisioningFailure::from_status(
-                    "ResourceAdmissionDenied",
-                    status,
-                ));
+                return Err(DockerProvisioningFailure::from_admission_status(status));
             }
         };
         create_body
@@ -3448,6 +3445,15 @@ impl DockerProvisioningFailure {
 
     fn from_status(reason: &'static str, status: Status) -> Self {
         Self::new(reason, status.message())
+    }
+
+    fn from_admission_status(status: Status) -> Self {
+        let reason = if status.code() == tonic::Code::FailedPrecondition {
+            "ResourceAdmissionDenied"
+        } else {
+            "ResourceAdmissionLookupFailed"
+        };
+        Self::from_status(reason, status)
     }
 }
 
