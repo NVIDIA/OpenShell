@@ -10,6 +10,14 @@ position: 4
 
 The gateway's configured compute driver determines how OpenShell creates each sandbox. The CLI workflow stays the same across drivers: you create, connect to, inspect, stop, start, and delete sandboxes through the gateway API.
 
+Caller driver config is disabled by default across drivers. Enabling it does
+not authorize external attachments: referenced resources must carry matching
+operator-controlled approval labels. GPU device attachments are temporarily
+exempt. Host bind mounts, supplemental image mounts, and MXC host filesystem
+grants lack a trusted label resolver and are unavailable with admission enabled.
+See [External Resource Admission](gateway-config#external-resource-admission)
+for configuration, migration, and the explicit unsafe opt-out.
+
 Most compute drivers run the OpenShell supervisor inside the sandbox workload.
 The supervisor launches the agent process, applies policy, routes egress through
 the proxy, injects configured credentials, and maintains the gateway session.
@@ -199,7 +207,8 @@ For GPU-backed Docker sandboxes, configure Docker CDI before starting the gatewa
 
 Docker driver config accepts user-supplied `volume` and `tmpfs` mounts. It also
 accepts `bind` mounts when `[openshell.drivers.docker]` sets
-`enable_bind_mounts = true` in `gateway.toml`. See Docker's [storage documentation](https://docs.docker.com/engine/storage/) for more information.
+`enable_bind_mounts = true` and explicitly disables resource admission in
+`gateway.toml`. All examples require `allow_driver_config = true`. See Docker's [storage documentation](https://docs.docker.com/engine/storage/) for more information.
 Docker local-driver named volumes created with bind options also expose
 gateway-host paths, so OpenShell treats them like bind mounts and requires
 `enable_bind_mounts = true`.
@@ -207,7 +216,8 @@ gateway-host paths, so OpenShell treats them like bind mounts and requires
 Use a `volume` mount for existing Docker named volumes:
 
 ```shell
-docker volume create openshell-work
+docker volume create --label openshell.ai/sandbox-attachable=true \
+  --label openshell.ai/workspace=default openshell-work
 
 openshell sandbox create \
   --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
@@ -221,11 +231,16 @@ workspace isolation and filesystem policy. Use them only when you understand and
 accept that loss of isolation.
 </Warning>
 
-Use a `bind` mount only after enabling it in the Docker driver table:
+Raw paths cannot satisfy label admission. The following unsafe opt-out permits
+bind mounts and removes label protection for all Docker attachments:
 
 ```toml
 [openshell.drivers.docker]
+allow_driver_config = true
 enable_bind_mounts = true
+
+[openshell.drivers.docker.resource_admission]
+enabled = false
 ```
 
 ```shell
@@ -281,9 +296,11 @@ your Podman machine uses a non-standard host-loopback address, or set
 
 ### Podman Driver Config Mounts
 
-Podman driver config accepts user-supplied `volume`, `tmpfs`, and `image`
-mounts. It also accepts `bind` mounts when `[openshell.drivers.podman]` sets
-`enable_bind_mounts = true` in `gateway.toml`. Podman local-driver named
+Podman driver config accepts user-supplied `volume` and `tmpfs` mounts.
+All examples require `allow_driver_config = true`. Supplemental `image` mounts
+require disabling resource admission. It also accepts `bind` mounts when
+`[openshell.drivers.podman]` sets `enable_bind_mounts = true` and explicitly
+disables resource admission in `gateway.toml`. Podman local-driver named
 volumes created with bind options also expose gateway-host paths, so
 OpenShell treats them like bind mounts and requires `enable_bind_mounts = true`.
 Host bind mounts expose gateway host paths to sandbox requests, so they are
@@ -292,7 +309,8 @@ disabled by default.
 Use a `volume` mount for existing Podman named volumes:
 
 ```shell
-podman volume create openshell-work
+podman volume create --label openshell.ai/sandbox-attachable=true \
+  --label openshell.ai/workspace=default openshell-work
 
 openshell sandbox create \
   --driver-config-json '{"podman":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
@@ -306,11 +324,16 @@ workspace isolation and filesystem policy. Use them only when you understand and
 accept that loss of isolation.
 </Warning>
 
-Use a `bind` mount only after enabling it in the Podman driver table:
+Raw paths cannot satisfy label admission. The following unsafe opt-out permits
+bind mounts and removes label protection for all Podman attachments:
 
 ```toml
 [openshell.drivers.podman]
+allow_driver_config = true
 enable_bind_mounts = true
+
+[openshell.drivers.podman.resource_admission]
+enabled = false
 ```
 
 ```shell

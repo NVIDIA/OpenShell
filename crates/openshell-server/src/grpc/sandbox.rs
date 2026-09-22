@@ -948,6 +948,10 @@ pub(super) async fn handle_create_sandbox_template(
         deletion_time: None,
     });
     validate_sandbox_workload_template(&resolved)?;
+    let spec = sandbox_spec_from_user_workload_template(&resolved)?;
+    state
+        .compute
+        .validate_caller_driver_config(spec.template.as_ref())?;
 
     let labels_map = resolved.object_labels();
     let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {

@@ -246,6 +246,12 @@ enum GuestImagePayloadSource {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VmDriverConfig {
+    /// Permit caller-supplied driver JSON. Does not waive resource admission.
+    #[serde(default)]
+    pub allow_driver_config: bool,
+    /// Operator-owned external attachment approval policy.
+    #[serde(default)]
+    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     pub grpc_endpoint: String,
     pub state_dir: PathBuf,
     pub launcher_bin: Option<PathBuf>,
@@ -363,6 +369,9 @@ impl Default for VmDriverConfig {
     fn default() -> Self {
         Self {
             grpc_endpoint: String::new(),
+            allow_driver_config: false,
+            resource_admission:
+                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
             state_dir: PathBuf::from("target/openshell-vm-driver"),
             launcher_bin: None,
             default_image: String::new(),
@@ -671,6 +680,7 @@ impl VmDriver {
         mut config: VmDriverConfig,
         lifecycle_extensions: LifecycleExtensionRegistry,
     ) -> Result<Self, String> {
+        config.resource_admission.validate()?;
         lifecycle_extensions
             .validate()
             .map_err(|err| err.message().to_string())?;
@@ -1010,6 +1020,11 @@ impl VmDriver {
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
+            resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
+                allow_driver_config: self.config.allow_driver_config,
+                resource_admission: self.config.resource_admission.clone(),
+            }
+            .acknowledgement(),
             driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
@@ -1047,6 +1062,10 @@ impl VmDriver {
     // gRPC API surface; boxing here would diverge from every other handler.
     #[allow(clippy::result_large_err)]
     pub fn validate_sandbox(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        openshell_core::resource_admission::check_sandbox_driver_config(
+            self.config.allow_driver_config,
+            sandbox,
+        )?;
         validate_vm_sandbox(sandbox, self.config.gpu_enabled)?;
         let has_rootfs_tar =
             VmSandboxDriverConfig::from_sandbox(sandbox).is_ok_and(|c| c.rootfs_tar_path.is_some());
@@ -1062,6 +1081,7 @@ impl VmDriver {
     // gRPC API surface; boxing here would diverge from every other handler.
     #[allow(clippy::result_large_err)]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<CreateSandboxResponse, Status> {
+        self.validate_sandbox(sandbox)?;
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %sandbox.name,
@@ -1832,6 +1852,12 @@ impl VmDriver {
                 record.process.is_some() || record.provisioning_task.is_some(),
             )
         };
+        let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+            .await
+            .map_err(|error| {
+                Status::failed_precondition(format!("read VM admission provenance: {error}"))
+            })?;
+        self.validate_sandbox(&sandbox)?;
         if already_running {
             let active_generation =
                 tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE))
@@ -1870,11 +1896,6 @@ impl VmDriver {
         )
         .await
         .map_err(|error| Status::internal(format!("persist VM start generation: {error}")))?;
-        let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
-            .await
-            .map_err(|err| {
-                Status::internal(format!("read sandbox start metadata failed: {err}"))
-            })?;
         let authentication = serde_json::from_slice::<
             openshell_core::jwt::SandboxLaunchAuthentication,
         >(&launch_authentication)
@@ -2177,6 +2198,10 @@ impl VmDriver {
         clear_stop_marker: bool,
         reconciliation_span: &tracing::Span,
     ) -> bool {
+        if let Err(error) = self.validate_sandbox(&sandbox) {
+            warn!(sandbox_id = %sandbox.id, reason = %error.message(), "VM recovery denied by admission");
+            return false;
+        }
         let has_rootfs_tar = VmSandboxDriverConfig::from_sandbox(&sandbox)
             .is_ok_and(|c| c.rootfs_tar_path.is_some());
 
@@ -8581,11 +8606,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         driver.config.state_dir = temp.path().to_path_buf();
+        let (old_authentication, old_session) = test_launch_authentication("old");
         let sandbox = Sandbox {
             id: "sandbox-stopped".to_string(),
             name: "stopped".to_string(),
             spec: Some(SandboxSpec {
-                launch_authentication: test_launch_authentication("old").0,
+                launch_authentication: old_authentication,
                 ..Default::default()
             }),
             ..Default::default()
@@ -8609,7 +8635,7 @@ mod tests {
             },
         );
 
-        let (fresh_authentication, fresh_session) = test_launch_authentication("fresh");
+        let (fresh_authentication, _) = test_launch_authentication("fresh");
         let err = driver
             .start_sandbox(
                 &sandbox.id,
@@ -8620,7 +8646,7 @@ mod tests {
             .await
             .expect_err("start without an image should fail");
 
-        assert_eq!(err.code(), Code::Internal);
+        assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(
             tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
                 .await
@@ -8650,10 +8676,7 @@ mod tests {
                     .launch_authentication,
             )
             .expect("persisted launch authentication");
-        assert_eq!(
-            persisted_authentication.supervisor.session_id,
-            fresh_session
-        );
+        assert_eq!(persisted_authentication.supervisor.session_id, old_session);
     }
 
     fn test_launch_authentication(label: &str) -> (Vec<u8>, openshell_core::SandboxSessionId) {

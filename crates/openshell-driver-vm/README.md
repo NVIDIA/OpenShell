@@ -8,6 +8,13 @@ The driver embeds libkrun, libkrunfw, the guest OCI unpacker, the portable guest
 
 ## How it fits together
 
+Caller driver config is disabled by default, including upload workflows
+encoded in driver JSON. GPU devices and their trusted VFIO plumbing are
+temporarily exempt from approval labels; existing GPU selection validation
+still applies. Private rootfs staging does not authorize arbitrary host paths.
+The gateway passes its common policy to its managed VM subprocess.
+See [resource admission configuration](../../docs/reference/gateway-config.mdx#external-resource-admission).
+
 ```mermaid
 flowchart LR
     subgraph host["Host"]

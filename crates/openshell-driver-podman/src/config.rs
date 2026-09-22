@@ -27,6 +27,10 @@ pub const fn podman_image_pull_policy(policy: ImagePullPolicy) -> &'static str {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PodmanComputeConfig {
+    /// Permit caller-supplied driver JSON. Does not waive resource admission.
+    pub allow_driver_config: bool,
+    /// Operator-owned external attachment approval policy.
+    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     /// Podman API Unix socket. When unset, use the socket selected by
     /// gateway auto-detection.
     pub socket_path: Option<PathBuf>,
@@ -224,6 +228,9 @@ pub fn parse_id_map_entry(
 impl PodmanComputeConfig {
     /// Validate and normalize startup configuration without connecting to Podman.
     pub fn validate_configuration(&mut self) -> Result<(), crate::client::PodmanApiError> {
+        self.resource_admission
+            .validate()
+            .map_err(crate::client::PodmanApiError::InvalidInput)?;
         self.validate_tls_config()?;
         self.validate_runtime_limits()?;
         self.validate_host_gateway_ip()?;
@@ -462,6 +469,9 @@ impl Default for PodmanComputeConfig {
     fn default() -> Self {
         Self {
             socket_path: None,
+            allow_driver_config: false,
+            resource_admission:
+                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
             default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),

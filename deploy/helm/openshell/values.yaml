@@ -261,6 +261,13 @@ server:
   # Kubernetes compute driver settings.
   drivers:
     kubernetes:
+      # -- Allow caller driver JSON; external resources still require approval.
+      allowDriverConfig: false
+      resourceAdmission:
+        # -- Require operator approval labels on external sandbox attachments (GPU attachments exempt).
+        enabled: true
+        # -- Replacement label map; null uses built-in attachable/workspace labels. Empty map is invalid when enabled.
+        requiredLabels: null
       # -- How workspaces map to Kubernetes namespaces.
       # "shared" (default): all sandboxes in a single namespace.
       # "managed": auto-creates per-workspace namespaces.

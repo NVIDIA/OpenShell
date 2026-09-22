@@ -455,6 +455,7 @@ impl AcquiredRemoteDriverEndpoint {
 #[derive(Debug, Clone)]
 struct RemoteComputeDriver {
     client: RemoteComputeDriverClient,
+    admission_acknowledgement: Arc<StdMutex<Option<String>>>,
 }
 
 type RemoteComputeDriverClient = ComputeDriverClient<
@@ -465,11 +466,35 @@ impl RemoteComputeDriver {
     fn new(channel: Channel) -> Self {
         Self {
             client: ComputeDriverClient::with_interceptor(channel, TraceContextInterceptor),
+            admission_acknowledgement: Arc::new(StdMutex::new(None)),
         }
     }
 
     fn client(&self) -> RemoteComputeDriverClient {
         self.client.clone()
+    }
+
+    async fn verify_admission_policy(&self) -> Result<(), Status> {
+        let expected = self
+            .admission_acknowledgement
+            .lock()
+            .map_err(|_| Status::internal("admission handshake lock poisoned"))?
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("driver admission handshake required"))?;
+        let current = self
+            .client()
+            .get_capabilities(GetCapabilitiesRequest {
+                gateway: Some(gateway_metadata(ExtensionFamily::Compute)),
+            })
+            .await?
+            .into_inner()
+            .resource_admission_policy;
+        if current != expected {
+            return Err(Status::failed_precondition(
+                "remote driver admission policy changed; restart gateway after configuring matching policy",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -483,7 +508,12 @@ impl ComputeDriver for RemoteComputeDriver {
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::GetCapabilitiesResponse>, Status>
     {
         let mut client = self.client();
-        client.get_capabilities(request).await
+        let response = client.get_capabilities(request).await?;
+        self.admission_acknowledgement
+            .lock()
+            .map_err(|_| Status::internal("admission handshake lock poisoned"))?
+            .get_or_insert_with(|| response.get_ref().resource_admission_policy.clone());
+        Ok(response)
     }
 
     async fn authenticate_sandbox(
@@ -505,6 +535,7 @@ impl ComputeDriver for RemoteComputeDriver {
         Status,
     > {
         let mut client = self.client();
+        self.verify_admission_policy().await?;
         client.validate_sandbox_create(request).await
     }
 
@@ -532,6 +563,7 @@ impl ComputeDriver for RemoteComputeDriver {
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::CreateSandboxResponse>, Status>
     {
         let mut client = self.client();
+        self.verify_admission_policy().await?;
         client.create_sandbox(request).await
     }
 
@@ -550,6 +582,7 @@ impl ComputeDriver for RemoteComputeDriver {
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::StartSandboxResponse>, Status>
     {
         let mut client = self.client();
+        self.verify_admission_policy().await?;
         client.start_sandbox(request).await
     }
 
@@ -591,6 +624,8 @@ impl ComputeDriver for RemoteComputeDriver {
 
 #[derive(Clone)]
 pub struct ComputeRuntime {
+    admission: openshell_core::resource_admission::DriverAdmissionConfig,
+    admission_acknowledgement: String,
     driver: TracedDriver,
     driver_info: ComputeDriverInfoSnapshot,
     telemetry_compute_driver: TelemetryComputeDriver,
@@ -688,6 +723,8 @@ impl ComputeRuntime {
         rootfs_tar_staging.sweep_orphans();
         Ok(Self {
             driver: TracedDriver::new(driver, driver_name),
+            admission: openshell_core::resource_admission::DriverAdmissionConfig::default(),
+            admission_acknowledgement: capabilities.resource_admission_policy,
             driver_info,
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process,
@@ -790,6 +827,33 @@ impl ComputeRuntime {
         &self.driver_info.name
     }
 
+    pub(crate) fn with_admission_policy(
+        mut self,
+        policy: openshell_core::resource_admission::DriverAdmissionConfig,
+    ) -> Result<Self, String> {
+        policy.verify_acknowledgement(&self.admission_acknowledgement)?;
+        if !policy.resource_admission.enabled {
+            warn!(driver = %self.driver_info.name, "External resource label admission is DISABLED");
+        }
+        self.admission = policy;
+        Ok(self)
+    }
+
+    pub(crate) fn validate_caller_driver_config(
+        &self,
+        template: Option<&SandboxTemplate>,
+    ) -> Result<(), Status> {
+        let selected = template
+            .map(|template| select_driver_config(&template.driver_config, &self.driver_info.name))
+            .transpose()
+            .map_err(|error| *error)?
+            .flatten();
+        openshell_core::resource_admission::check_driver_config(
+            self.admission.allow_driver_config,
+            selected.as_ref(),
+        )
+    }
+
     #[must_use]
     pub fn supports_sandbox_authentication(&self) -> bool {
         self.driver_info.supports_sandbox_authentication
@@ -874,6 +938,12 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        self.validate_caller_driver_config(
+            sandbox
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.as_ref()),
+        )?;
         let mut driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
         // Peek, never consume: create runs the same path immediately after and
@@ -947,6 +1017,12 @@ impl ComputeRuntime {
         lifecycle_guard: SandboxLifecycleGuard,
         global_guard: SandboxSyncGuard,
     ) -> Result<Sandbox, Status> {
+        self.validate_caller_driver_config(
+            sandbox
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.as_ref()),
+        )?;
         let sandbox_id = sandbox.object_id().to_string();
         let mut sandbox = sandbox;
 
@@ -1445,6 +1521,13 @@ impl ComputeRuntime {
             ));
         }
 
+        self.validate_caller_driver_config(
+            current
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.as_ref()),
+        )?;
+
         let mut attempts = 0;
         let (previous, starting, launch_authentication) = loop {
             let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
@@ -1474,7 +1557,6 @@ impl ComputeRuntime {
                     "sandbox must be Stopped, Completed, or a failed main-process Error to start (current phase: {phase:?})"
                 )));
             }
-
             if phase == SandboxPhase::Completed || is_failed_main_process_result(&current) {
                 self.cleanup_stopped_sandbox_sessions(&current)
                     .await
@@ -1621,6 +1703,12 @@ impl ComputeRuntime {
         lifecycle_guard: SandboxLifecycleGuard,
         launch_authentication: Vec<u8>,
     ) -> Result<Sandbox, Status> {
+        self.validate_caller_driver_config(
+            starting
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.as_ref()),
+        )?;
         let generation_id = sandbox_runtime_generation(&starting)
             .map_err(Status::failed_precondition)?
             .into_string();
@@ -2896,6 +2984,19 @@ impl ComputeRuntime {
                 continue;
             }
 
+            if let Err(error) = self.validate_caller_driver_config(
+                sandbox
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.template.as_ref()),
+            ) {
+                self.mark_sandbox_error(&sandbox, "ResourceAdmissionDenied", error.message())
+                    .await;
+                authentication_failed(sandbox.object_id());
+                failed += 1;
+                continue;
+            }
+
             let sandbox_name = sandbox.object_name().to_string();
             let generation_id = match sandbox_runtime_generation(&sandbox) {
                 Ok(generation) => generation.into_string(),
@@ -3160,6 +3261,20 @@ impl ComputeRuntime {
                     }
                 }
                 SandboxPhase::Starting => {
+                    if let Err(error) = self.validate_caller_driver_config(
+                        sandbox
+                            .spec
+                            .as_ref()
+                            .and_then(|spec| spec.template.as_ref()),
+                    ) {
+                        self.mark_sandbox_error(
+                            &sandbox,
+                            "ResourceAdmissionDenied",
+                            error.message(),
+                        )
+                        .await;
+                        continue;
+                    }
                     let sandbox_id = sandbox.object_id().to_string();
                     let sandbox_name = sandbox.object_name().to_string();
                     let driver_sandbox_id = sandbox_id.clone();
@@ -5883,6 +5998,9 @@ impl ComputeDriver for NoopTestDriver {
         Ok(tonic::Response::new(
             openshell_core::proto::compute::v1::GetCapabilitiesResponse {
                 driver_name: "noop-test-driver".to_string(),
+                resource_admission_policy:
+                    openshell_core::resource_admission::DriverAdmissionConfig::default()
+                        .acknowledgement(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
@@ -6058,6 +6176,11 @@ pub fn new_test_runtime_with_driver(
     let supports_sandbox_authentication = driver.sandbox_authentication.is_some();
     ComputeRuntime {
         driver: TracedDriver::new(driver, "test".to_string()),
+        admission: openshell_core::resource_admission::DriverAdmissionConfig {
+            allow_driver_config: true,
+            ..Default::default()
+        },
+        admission_acknowledgement: String::new(),
         driver_info: ComputeDriverInfoSnapshot {
             name: driver_name.to_string(),
             driver_name: driver_name.to_string(),
@@ -6474,6 +6597,9 @@ mod tests {
         ) -> Result<tonic::Response<GetCapabilitiesResponse>, Status> {
             Ok(tonic::Response::new(GetCapabilitiesResponse {
                 driver_name: "test-driver".to_string(),
+                resource_admission_policy:
+                    openshell_core::resource_admission::DriverAdmissionConfig::default()
+                        .acknowledgement(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
@@ -6858,6 +6984,9 @@ mod tests {
         ) -> Result<tonic::Response<GetCapabilitiesResponse>, Status> {
             Ok(tonic::Response::new(GetCapabilitiesResponse {
                 driver_name: "controlled-test-driver".to_string(),
+                resource_admission_policy:
+                    openshell_core::resource_admission::DriverAdmissionConfig::default()
+                        .acknowledgement(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
@@ -7094,6 +7223,11 @@ mod tests {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
             driver: TracedDriver::new(driver, "test-driver".to_string()),
+            admission: openshell_core::resource_admission::DriverAdmissionConfig {
+                allow_driver_config: true,
+                ..Default::default()
+            },
+            admission_acknowledgement: String::new(),
             driver_info: ComputeDriverInfoSnapshot {
                 name: driver_name.to_string(),
                 driver_name: driver_name.to_string(),
@@ -13275,7 +13409,7 @@ mod tests {
         let traceparents = driver.traceparents();
         assert_eq!(
             traceparents.len(),
-            8,
+            10,
             "the client interceptor should cover every RPC"
         );
         assert!(
@@ -13346,7 +13480,7 @@ mod tests {
             .await
             .unwrap();
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
-        let runtime = ComputeRuntime::new_remote_driver(
+        let mut runtime = ComputeRuntime::new_remote_driver(
             endpoint,
             store,
             SandboxIndex::new(),
@@ -13356,6 +13490,7 @@ mod tests {
         )
         .await
         .unwrap();
+        runtime.admission.allow_driver_config = true;
         let mut sandbox = sandbox_record("sb-uds", "uds-sandbox", SandboxPhase::Provisioning);
         sandbox.spec = Some(SandboxSpec {
             log_level: "debug".to_string(),
@@ -13387,8 +13522,10 @@ mod tests {
         runtime.validate_sandbox_create(&sandbox).await.unwrap();
         runtime.create_sandbox(sandbox, None, false).await.unwrap();
         let calls = driver.calls();
-        assert_eq!(calls.len(), 3, "unexpected calls: {calls:?}");
-        let validated = match &calls[1] {
+        assert_eq!(calls.len(), 5, "unexpected calls: {calls:?}");
+        assert!(matches!(calls[1], FakeComputeDriverCall::GetCapabilities));
+        assert!(matches!(calls[3], FakeComputeDriverCall::GetCapabilities));
+        let validated = match &calls[2] {
             FakeComputeDriverCall::ValidateSandboxCreate {
                 sandbox: Some(sandbox),
             } => sandbox,
@@ -13411,7 +13548,7 @@ mod tests {
             Some(42)
         );
         assert!(matches!(
-            &calls[2],
+            &calls[4],
             FakeComputeDriverCall::CreateSandbox { sandbox: Some(sandbox) }
                 if sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref())
                     .is_some_and(|policy| policy.version == 42)
@@ -13432,7 +13569,7 @@ mod tests {
         runtime.start_persisted_sandboxes().await.unwrap();
         assert!(matches!(
             driver.calls().as_slice(),
-            [FakeComputeDriverCall::StartSandbox { sandbox_id, sandbox_name }]
+            [FakeComputeDriverCall::GetCapabilities, FakeComputeDriverCall::StartSandbox { sandbox_id, sandbox_name }]
                 if sandbox_id == "sb-uds" && sandbox_name == "uds-sandbox"
         ));
         driver.clear_calls();
@@ -13456,6 +13593,54 @@ mod tests {
             }
             other => panic!("expected DeleteSandbox call, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn remote_compute_driver_rejects_policy_changes_before_forwarding() {
+        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("admission.sock");
+        let driver = FakeComputeDriver::new();
+        let _server = driver.serve_uds(&socket_path).unwrap();
+        let endpoint = connect_remote_compute_driver("external-test", &socket_path)
+            .await
+            .unwrap();
+        let remote = RemoteComputeDriver::new(endpoint.channel);
+        remote
+            .get_capabilities(Request::new(GetCapabilitiesRequest {
+                gateway: Some(gateway_metadata(ExtensionFamily::Compute)),
+            }))
+            .await
+            .unwrap();
+        driver.set_admission_acknowledgement(String::new());
+        driver.clear_calls();
+        let sandbox = DriverSandbox::default();
+        let status = remote
+            .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
+                sandbox: Some(sandbox.clone()),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert!(
+            remote
+                .create_sandbox(Request::new(CreateSandboxRequest {
+                    sandbox: Some(sandbox)
+                }))
+                .await
+                .is_err()
+        );
+        assert!(
+            remote
+                .start_sandbox(Request::new(StartSandboxRequest::default()))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            driver.calls(),
+            vec![FakeComputeDriverCall::GetCapabilities; 3]
+        );
     }
 
     #[tokio::test]

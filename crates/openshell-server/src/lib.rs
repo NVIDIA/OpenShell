@@ -1663,6 +1663,8 @@ async fn build_compute_runtime(
         false,
     )?;
     let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
+    let admission =
+        compute::driver_config::admission_config_from_context(driver_startup, driver.name())?;
     info!(driver = %driver.name(), "Using compute driver");
     if config
         .gateway_jwt
@@ -1744,6 +1746,9 @@ async fn build_compute_runtime(
         }
     };
 
+    let runtime = runtime
+        .with_admission_policy(admission)
+        .map_err(Error::config)?;
     Ok(runtime.with_telemetry_compute_driver(telemetry_compute_driver))
 }
 

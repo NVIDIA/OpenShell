@@ -301,8 +301,15 @@ openshell sandbox template create gpu-kata \
 openshell sandbox create --name my-sandbox --template gpu-kata --provider my-github -- claude
 ```
 
-Direct `sandbox create --driver-config-json` remains valid for one-off
-creates. Put driver config on a template only when it should be reused.
+Driver config is disabled by default. These template and one-off
+`sandbox create --driver-config-json` examples require the administrator to set
+`allow_driver_config = true` for the selected driver. This does not waive
+resource admission: external attachments need administrator-controlled approval
+labels on the actual resources, not sandbox labels. GPU device attachments
+are temporarily exempt from labels; the public `--gpu` flag needs no driver
+config opt-in. Consult the published gateway configuration reference before
+changing admission settings; do not recommend disabling admission to bypass a
+denial. Put driver config on a template only when it should be reused.
 
 ### Manage sandbox workload templates
 

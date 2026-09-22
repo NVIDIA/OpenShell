@@ -85,6 +85,23 @@ pub struct PodmanSandboxDriverConfig {
 }
 
 impl PodmanSandboxDriverConfig {
+    pub(crate) fn admit_mount_types(
+        &self,
+        policy: &openshell_core::resource_admission::ResourceAdmissionConfig,
+    ) -> Result<(), ComputeDriverError> {
+        for mount in &self.mounts {
+            if matches!(
+                mount,
+                PodmanDriverMountConfig::Bind { .. } | PodmanDriverMountConfig::Image { .. }
+            ) {
+                policy
+                    .reject_unlabelable("host bind or image mount")
+                    .map_err(|error| ComputeDriverError::Precondition(error.message().into()))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn from_sandbox(sandbox: &DriverSandbox) -> Result<Self, ComputeDriverError> {
         let Some(template) = sandbox
             .spec
@@ -653,6 +670,13 @@ fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
         }
     }
     // Managed labels (highest priority -- always overwrite).
+    labels.insert(
+        openshell_core::resource_admission::CONFIG_USED_LABEL.into(),
+        template
+            .and_then(|t| t.driver_config.as_ref())
+            .is_some_and(|config| !config.fields.is_empty())
+            .to_string(),
+    );
     labels.insert(LABEL_SANDBOX_ID.into(), sandbox.id.clone());
     labels.insert(LABEL_SANDBOX_NAME.into(), sandbox.name.clone());
     labels.insert(LABEL_SANDBOX_NAMESPACE.into(), sandbox.namespace.clone());
@@ -1083,7 +1107,13 @@ fn build_base_spec(
     let vol = volume_name(&sandbox.id);
 
     let env = build_env(sandbox, config, requested_image, oci_user)?;
-    let labels = build_labels(sandbox);
+    let mut labels = build_labels(sandbox);
+    labels.insert(
+        "openshell.ai/runtime-binary-source".into(),
+        supervisor_bin_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    );
     let resource_limits = build_resource_limits(sandbox, config);
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
@@ -1409,6 +1439,20 @@ pub struct IsolationSpecInput<'a> {
 pub struct IsolationSpecs {
     pub workload: ContainerSpec,
     pub supervisor: ContainerSpec,
+}
+
+impl IsolationSpecs {
+    pub(crate) fn record_resource_identities(
+        &mut self,
+        identities: &BTreeMap<String, Value>,
+    ) -> Result<(), ComputeDriverError> {
+        self.workload.labels.insert(
+            openshell_core::resource_admission::IDENTITIES_LABEL.into(),
+            serde_json::to_string(identities)
+                .map_err(|error| ComputeDriverError::Message(error.to_string()))?,
+        );
+        Ok(())
+    }
 }
 
 pub fn build_isolation_specs(

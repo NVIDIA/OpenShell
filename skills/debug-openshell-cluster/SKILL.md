@@ -92,6 +92,22 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 
+For resource-admission failures, distinguish disabled caller driver config from
+missing resource approval. Helm defaults `server.drivers.kubernetes.allowDriverConfig`
+to false and `resourceAdmission.enabled` to true. Existing PVCs, Secrets,
+ConfigMaps, RuntimeClasses, and PriorityClasses need matching administrator-owned
+labels; namespace membership and read-only access do not grant approval. Inspect
+metadata only when diagnosing credentials. GPU devices do not need labels.
+RuntimeClasses, PriorityClasses, and image-pull Secrets match fixed approval
+labels but do not use the workspace placeholder. In managed mode, inspect the
+approved source image-pull Secret in the gateway namespace and the gateway-owned
+copy in the workspace namespace. Legacy workloads without admission provenance need recreation. Do not
+automatically label control-plane resources or disable enforcement as a repair.
+
+For out-of-tree compute drivers, also check that their versioned admission-policy
+acknowledgement matches the gateway's policy. Configure standalone driver policy
+through its administrator-owned `--admission-config-json` option.
+
 For out-of-tree compute drivers, confirm the selected driver name and socket agree across CLI flags or `gateway.toml`, and that the operator-owned driver is running before the gateway starts:
 
 ```bash

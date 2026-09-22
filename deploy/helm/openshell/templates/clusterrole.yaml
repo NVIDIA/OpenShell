@@ -9,6 +9,17 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    verbs: ["get"]
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    verbs: ["get"]
+  {{- if ne $workspaceMode "shared" }}
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims", "configmaps", "secrets"]
+    verbs: ["get"]
+  {{- end }}
   # Validate projected ServiceAccount tokens during sandbox bootstrap and
   # internal gateway peer authentication.
   - apiGroups:

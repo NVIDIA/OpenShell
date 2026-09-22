@@ -228,6 +228,17 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 /// This prevents gRPC handlers from blocking indefinitely when the k8s
 /// API server is unreachable or slow.
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
+fn admission_error(error: tonic::Status) -> KubernetesDriverError {
+    match error.code() {
+        tonic::Code::InvalidArgument => {
+            KubernetesDriverError::InvalidArgument(error.message().into())
+        }
+        tonic::Code::FailedPrecondition => {
+            KubernetesDriverError::Precondition(error.message().into())
+        }
+        _ => KubernetesDriverError::Message(error.message().into()),
+    }
+}
 const SANDBOX_RUNTIME_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 /// Bound how long a crash-interrupted, fail-closed bootstrap may remain stranded.
 const SANDBOX_RUNTIME_BOOTSTRAP_GRACE: Duration = Duration::from_mins(5);
@@ -674,6 +685,10 @@ impl KubernetesComputeDriver {
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self, KubernetesDriverError> {
         config
+            .resource_admission
+            .validate()
+            .map_err(KubernetesDriverError::Precondition)?;
+        config
             .validate_workspace_mode()
             .map_err(KubernetesDriverError::Precondition)?;
         config
@@ -747,6 +762,11 @@ impl KubernetesComputeDriver {
 
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
         Ok(GetCapabilitiesResponse {
+            resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
+                allow_driver_config: self.config.allow_driver_config,
+                resource_admission: self.config.resource_admission.clone(),
+            }
+            .acknowledgement(),
             driver_name: "kubernetes".to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
@@ -1215,6 +1235,7 @@ impl KubernetesComputeDriver {
     async fn ensure_image_pull_secrets(
         &self,
         namespace: &str,
+        workspace: &str,
     ) -> Result<(), KubernetesDriverError> {
         let source_api: Api<Secret> = Api::namespaced(self.client.clone(), &self.config.namespace);
         let target_api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
@@ -1239,7 +1260,45 @@ impl KubernetesComputeDriver {
                 }
             };
 
-            let copy = image_pull_secret_copy(secret_name, namespace, source);
+            self.config
+                .resource_admission
+                .admit_shared(
+                    source
+                        .metadata
+                        .labels
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|labels| labels.iter()),
+                )
+                .map_err(admission_error)?;
+
+            let existing = tokio::time::timeout(KUBE_API_TIMEOUT, target_api.get_opt(secret_name))
+                .await
+                .map_err(|_| {
+                    KubernetesDriverError::Message(format!(
+                        "timeout checking image-pull Secret {secret_name} in {namespace}"
+                    ))
+                })?
+                .map_err(KubernetesDriverError::from_kube)?;
+            if existing.as_ref().is_some_and(|existing| {
+                !image_pull_secret_owned_by_gateway(
+                    existing.metadata.labels.as_ref(),
+                    &self.config.gateway_id,
+                    workspace,
+                )
+            }) {
+                return Err(KubernetesDriverError::Precondition(format!(
+                    "image-pull Secret {secret_name} in {namespace} is not owned by this gateway"
+                )));
+            }
+
+            let copy = image_pull_secret_copy(
+                secret_name,
+                namespace,
+                workspace,
+                &self.config.gateway_id,
+                source,
+            );
             match tokio::time::timeout(
                 KUBE_API_TIMEOUT,
                 target_api.patch(
@@ -1508,6 +1567,14 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
+        openshell_core::resource_admission::check_sandbox_driver_config(
+            self.config.allow_driver_config,
+            sandbox,
+        )?;
+        self.config
+            .resource_admission
+            .validate()
+            .map_err(tonic::Status::failed_precondition)?;
         let _ = Self::validate_driver_config_for_sandbox(sandbox)
             .map_err(tonic::Status::invalid_argument)?;
         match self.config.workspace_mode {
@@ -1531,6 +1598,88 @@ impl KubernetesComputeDriver {
         {
             return Err(tonic::Status::failed_precondition(
                 "GPU sandbox requested, but the active gateway has no allocatable GPUs. Please refer to documentation and use `openshell doctor` commands to inspect GPU support and gateway configuration.",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn admit_requested_resources(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<crate::resource_admission::Identities, tonic::Status> {
+        openshell_core::resource_admission::check_sandbox_driver_config(
+            self.config.allow_driver_config,
+            sandbox,
+        )?;
+        self.validate_workspace_namespace(&sandbox.workspace)
+            .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
+        let namespace = self
+            .config
+            .namespace_for_workspace(&sandbox.workspace, self.operator_allowlist.as_ref())
+            .map_err(tonic::Status::failed_precondition)?;
+        let params = SandboxPodParams {
+            default_image: &self.config.default_image,
+            image_pull_secrets: &self.config.image_pull_secrets,
+            default_runtime_class_name: &self.config.default_runtime_class_name,
+            service_account_name: &self.config.service_account_name,
+            ..Default::default()
+        };
+        let rendered = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
+            .map_err(tonic::Status::invalid_argument)?;
+        crate::resource_admission::admit(
+            &self.client,
+            &self.config.resource_admission,
+            &sandbox.workspace,
+            &namespace,
+            &rendered["spec"]["podTemplate"]["spec"],
+            params.sandbox_secret_name,
+        )
+        .await
+    }
+
+    async fn admit_stored_resources(&self, object: &DynamicObject) -> Result<(), tonic::Status> {
+        if self.config.allow_driver_config && !self.config.resource_admission.enabled {
+            return Ok(());
+        }
+        let expected = crate::resource_admission::check_record(
+            object.metadata.annotations.as_ref(),
+            self.config.allow_driver_config,
+        )?;
+        if !self.config.resource_admission.enabled {
+            return Ok(());
+        }
+        let workspace = object
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_SANDBOX_WORKSPACE))
+            .ok_or_else(|| {
+                tonic::Status::failed_precondition("sandbox lacks workspace identity")
+            })?;
+        let namespace = object
+            .metadata
+            .namespace
+            .as_deref()
+            .ok_or_else(|| tonic::Status::failed_precondition("sandbox lacks namespace"))?;
+        let sandbox_id =
+            sandbox_id_from_object(object).map_err(tonic::Status::failed_precondition)?;
+        let generation = sandbox_runtime_generation(object).ok_or_else(|| {
+            tonic::Status::failed_precondition("sandbox lacks runtime generation")
+        })?;
+        let names = SandboxRuntimeNames::for_generation(&sandbox_id, generation);
+        let spec = object.data["spec"]["podTemplate"]["spec"].clone();
+        let actual = crate::resource_admission::admit(
+            &self.client,
+            &self.config.resource_admission,
+            workspace,
+            namespace,
+            &spec,
+            &names.sandbox_secret,
+        )
+        .await?;
+        if actual != expected {
+            return Err(tonic::Status::failed_precondition(
+                "sandbox external resource identity or attachment inventory changed",
             ));
         }
         Ok(())
@@ -1673,6 +1822,11 @@ impl KubernetesComputeDriver {
         &self,
         sandbox: &Sandbox,
     ) -> Result<String, KubernetesDriverError> {
+        openshell_core::resource_admission::check_sandbox_driver_config(
+            self.config.allow_driver_config,
+            sandbox,
+        )
+        .map_err(admission_error)?;
         let gpu_requirements = sandbox
             .spec
             .as_ref()
@@ -1693,7 +1847,8 @@ impl KubernetesComputeDriver {
             WorkspaceMode::Shared => self.config.namespace.clone(),
             WorkspaceMode::Managed => {
                 let namespace = self.ensure_namespace(workspace).await?;
-                self.ensure_image_pull_secrets(&namespace).await?;
+                self.ensure_image_pull_secrets(&namespace, workspace)
+                    .await?;
                 namespace
             }
             WorkspaceMode::Operator => {
@@ -1711,6 +1866,10 @@ impl KubernetesComputeDriver {
         if self.config.is_multi_namespace() {
             self.ensure_tls_secret(&target_namespace).await?;
         }
+        let resource_identities = self
+            .admit_requested_resources(sandbox)
+            .await
+            .map_err(admission_error)?;
 
         info!(
             sandbox_id = %sandbox.id,
@@ -1772,6 +1931,21 @@ impl KubernetesComputeDriver {
         }
         let mut obj = DynamicObject::new(&kube_name, &agent_sandbox_api.resource);
         let mut annotations = sandbox_annotations(sandbox);
+        annotations.insert(
+            crate::resource_admission::IDENTITIES.into(),
+            serde_json::to_string(&resource_identities)
+                .map_err(|error| KubernetesDriverError::Message(error.to_string()))?,
+        );
+        annotations.insert(
+            crate::resource_admission::CONFIG_USED.into(),
+            sandbox
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.as_ref())
+                .and_then(|template| template.driver_config.as_ref())
+                .is_some_and(|config| !config.fields.is_empty())
+                .to_string(),
+        );
         add_trace_context_annotation(&mut annotations);
         annotations.insert(
             ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING.to_string(),
@@ -2284,6 +2458,14 @@ impl KubernetesComputeDriver {
         let workload_pod = self
             .wait_for_bootstrap_workload_pod(&pods, cr_name, cr_uid)
             .await?;
+        let admission_object = sandbox_api
+            .api
+            .get(cr_name)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?;
+        self.admit_stored_resources(&admission_object)
+            .await
+            .map_err(admission_error)?;
         Self::validate_capability_free_workload_pod(
             &workload_pod,
             cr_uid,
@@ -2549,6 +2731,14 @@ impl KubernetesComputeDriver {
         let workload_pod = self
             .wait_for_bootstrap_workload_pod(&pods, cr_name, cr_uid)
             .await?;
+        let admission_object = sandbox_api
+            .api
+            .get(cr_name)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?;
+        self.admit_stored_resources(&admission_object)
+            .await
+            .map_err(admission_error)?;
         Self::validate_capability_free_workload_pod(
             &workload_pod,
             cr_uid,
@@ -2865,6 +3055,9 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::from_kube)?
             .items;
         let mut object = select_expected_sandbox_runtime(objects, &expected_runtime_identity)?;
+        self.admit_stored_resources(&object)
+            .await
+            .map_err(admission_error)?;
         if sandbox_runtime_bootstrap_in_progress(&object) {
             let phase = sandbox_runtime_bootstrap_phase(&object);
             if phase != Some(SandboxRuntimeBootstrapPhase::Suspending)
@@ -2917,6 +3110,9 @@ impl KubernetesComputeDriver {
                 .map_err(KubernetesDriverError::from_kube)?
                 .items;
             object = select_expected_sandbox_runtime(refreshed, &expected_runtime_identity)?;
+            self.admit_stored_resources(&object)
+                .await
+                .map_err(admission_error)?;
         }
         let namespace = object
             .metadata
@@ -3497,6 +3693,14 @@ impl KubernetesComputeDriver {
             let Ok(sandbox_id) = sandbox_id_from_object(&object) else {
                 continue;
             };
+            if let Err(error) = self.admit_stored_resources(&object).await {
+                warn!(%sandbox_id, reason = %error.message(), "Sandbox resource admission revalidation failed");
+                if error.code() == tonic::Code::FailedPrecondition {
+                    self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
+                        .await;
+                }
+                continue;
+            }
             let namespace = object
                 .metadata
                 .namespace
@@ -4603,21 +4807,47 @@ fn managed_ssh_network_policy(namespace: &str, config: &KubernetesComputeConfig)
     }
 }
 
-fn image_pull_secret_copy(secret_name: &str, namespace: &str, source: Secret) -> Secret {
+fn image_pull_secret_copy(
+    secret_name: &str,
+    namespace: &str,
+    workspace: &str,
+    gateway_id: &str,
+    source: Secret,
+) -> Secret {
+    let mut labels = source.metadata.labels.unwrap_or_default();
+    labels.insert(
+        LABEL_MANAGED_BY.to_string(),
+        LABEL_MANAGED_BY_VALUE.to_string(),
+    );
+    labels.insert(LABEL_GATEWAY_ID.to_string(), gateway_id.to_string());
+    labels.insert(LABEL_SANDBOX_WORKSPACE.to_string(), workspace.to_string());
     Secret {
         metadata: ObjectMeta {
             name: Some(secret_name.to_string()),
             namespace: Some(namespace.to_string()),
-            labels: Some(BTreeMap::from([(
-                LABEL_MANAGED_BY.to_string(),
-                LABEL_MANAGED_BY_VALUE.to_string(),
-            )])),
+            labels: Some(labels),
             ..Default::default()
         },
         data: source.data,
         type_: source.type_,
         ..Default::default()
     }
+}
+
+fn image_pull_secret_owned_by_gateway(
+    labels: Option<&BTreeMap<String, String>>,
+    gateway_id: &str,
+    workspace: &str,
+) -> bool {
+    labels.is_some_and(|labels| {
+        labels.get(LABEL_MANAGED_BY).map(String::as_str) == Some(LABEL_MANAGED_BY_VALUE)
+            && labels
+                .get(LABEL_GATEWAY_ID)
+                .is_none_or(|value| value == gateway_id)
+            && labels
+                .get(LABEL_SANDBOX_WORKSPACE)
+                .is_none_or(|value| value == workspace)
+    })
 }
 
 fn sandbox_annotations(sandbox: &Sandbox) -> BTreeMap<String, String> {
@@ -7056,6 +7286,64 @@ fn spawn_namespace_file_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn admission_defaults_reject_driver_config_before_kubernetes_io_in_every_mode() {
+        for workspace_mode in [
+            WorkspaceMode::Shared,
+            WorkspaceMode::Managed,
+            WorkspaceMode::Operator,
+        ] {
+            let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+                workspace_mode,
+                ..Default::default()
+            });
+            let sandbox = Sandbox {
+                workspace: "team-a".into(),
+                name: "attacker".into(),
+                spec: Some(SandboxSpec {
+                    template: Some(SandboxTemplate {
+                        driver_config: Some(json_struct(
+                            serde_json::json!({"volumes":[{"name":"data","persistent_volume_claim":{"claim_name":"openshell-data-openshell-0"}}]}),
+                        )),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let error = driver.validate_sandbox_create(&sandbox).await.unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(error.message().contains("allow_driver_config"));
+            assert!(
+                matches!(driver.create_sandbox_inner(&sandbox).await, Err(KubernetesDriverError::Precondition(message)) if message.contains("allow_driver_config"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_allows_private_default_workload_without_external_lookups() {
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+        let sandbox = Sandbox {
+            workspace: "team-a".into(),
+            name: "private".into(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    image: "test".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            driver
+                .admit_requested_resources(&sandbox)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
     use openshell_core::progress::{
         PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
         PROGRESS_COMPLETE_STEP_KEY,
@@ -10361,7 +10649,7 @@ mod tests {
     }
 
     #[test]
-    fn image_pull_secret_copy_keeps_only_portable_secret_fields() {
+    fn image_pull_secret_copy_keeps_portable_fields_and_records_ownership() {
         let source: Secret = serde_json::from_value(serde_json::json!({
             "apiVersion": "v1",
             "kind": "Secret",
@@ -10379,7 +10667,7 @@ mod tests {
         }))
         .unwrap();
 
-        let copy = image_pull_secret_copy("regcred", "workspace", source);
+        let copy = image_pull_secret_copy("regcred", "workspace", "team-a", "gateway-a", source);
         assert_eq!(copy.metadata.name.as_deref(), Some("regcred"));
         assert_eq!(copy.metadata.namespace.as_deref(), Some("workspace"));
         assert_eq!(
@@ -10401,10 +10689,206 @@ mod tests {
                 .map(String::as_str),
             Some(LABEL_MANAGED_BY_VALUE)
         );
+        assert_eq!(
+            copy.metadata
+                .labels
+                .as_ref()
+                .unwrap()
+                .get(LABEL_GATEWAY_ID)
+                .map(String::as_str),
+            Some("gateway-a")
+        );
+        assert_eq!(
+            copy.metadata
+                .labels
+                .as_ref()
+                .unwrap()
+                .get(LABEL_SANDBOX_WORKSPACE)
+                .map(String::as_str),
+            Some("team-a")
+        );
+        assert_eq!(
+            copy.metadata
+                .labels
+                .as_ref()
+                .unwrap()
+                .get("source-only")
+                .map(String::as_str),
+            Some("true")
+        );
         assert!(copy.metadata.uid.is_none());
         assert!(copy.metadata.resource_version.is_none());
         assert!(copy.metadata.annotations.is_none());
         assert!(copy.metadata.finalizers.is_none());
+    }
+
+    #[test]
+    fn image_pull_secret_collision_requires_gateway_ownership() {
+        let legacy = BTreeMap::from([(
+            LABEL_MANAGED_BY.to_string(),
+            LABEL_MANAGED_BY_VALUE.to_string(),
+        )]);
+        assert!(image_pull_secret_owned_by_gateway(
+            Some(&legacy),
+            "gateway-a",
+            "team-a"
+        ));
+
+        let owned = BTreeMap::from([
+            (
+                LABEL_MANAGED_BY.to_string(),
+                LABEL_MANAGED_BY_VALUE.to_string(),
+            ),
+            (LABEL_GATEWAY_ID.to_string(), "gateway-a".to_string()),
+            (LABEL_SANDBOX_WORKSPACE.to_string(), "team-a".to_string()),
+        ]);
+        assert!(image_pull_secret_owned_by_gateway(
+            Some(&owned),
+            "gateway-a",
+            "team-a"
+        ));
+        assert!(!image_pull_secret_owned_by_gateway(
+            Some(&owned),
+            "gateway-b",
+            "team-a"
+        ));
+        assert!(!image_pull_secret_owned_by_gateway(
+            Some(&owned),
+            "gateway-a",
+            "team-b"
+        ));
+        assert!(!image_pull_secret_owned_by_gateway(
+            Some(&BTreeMap::new()),
+            "gateway-a",
+            "team-a"
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_image_pull_secret_admits_source_before_copying() {
+        let source_path = "/api/v1/namespaces/openshell/secrets/regcred";
+        let target_path = "/api/v1/namespaces/managed-team-a/secrets/regcred";
+        let copied = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": "regcred",
+                "namespace": "managed-team-a",
+                "labels": {
+                    "openshell.ai/sandbox-attachable": "true",
+                    LABEL_MANAGED_BY: LABEL_MANAGED_BY_VALUE,
+                    LABEL_GATEWAY_ID: "gateway-a",
+                    LABEL_SANDBOX_WORKSPACE: "team-a"
+                }
+            },
+            "type": "kubernetes.io/dockerconfigjson",
+            "data": { ".dockerconfigjson": "e30=" }
+        });
+        let steps = Arc::new(std::sync::Mutex::new(VecDeque::from([
+            (
+                http::Method::GET,
+                source_path,
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": {
+                            "name": "regcred",
+                            "namespace": "openshell",
+                            "labels": {"openshell.ai/sandbox-attachable": "true"}
+                        },
+                        "type": "kubernetes.io/dockerconfigjson",
+                        "data": { ".dockerconfigjson": "e30=" }
+                    }),
+                ),
+            ),
+            (
+                http::Method::GET,
+                target_path,
+                kube_test_not_found("secrets", "regcred"),
+            ),
+            (
+                http::Method::PATCH,
+                target_path,
+                kube_test_response(http::StatusCode::OK, copied),
+            ),
+        ])));
+        let service_steps = steps.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let steps = service_steps.clone();
+            async move {
+                let (method, path, response) = steps
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("unexpected Kubernetes API request");
+                assert_eq!(request.method(), method);
+                assert_eq!(request.uri().path(), path);
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        let client = Client::new(service, "openshell");
+        let driver = KubernetesComputeDriver {
+            client: client.clone(),
+            watch_client: client,
+            sandbox_api_version: Arc::new(OnceCell::new()),
+            config: KubernetesComputeConfig {
+                namespace: "openshell".into(),
+                gateway_id: "gateway-a".into(),
+                image_pull_secrets: vec!["regcred".into()],
+                ..Default::default()
+            },
+            operator_allowlist: None,
+        };
+
+        driver
+            .ensure_image_pull_secrets("managed-team-a", "team-a")
+            .await
+            .expect("approved source should be copied");
+        assert!(steps.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_image_pull_secret_rejects_unapproved_source_without_copying() {
+        let service = tower::service_fn(
+            move |request: http::Request<kube::client::Body>| async move {
+                assert_eq!(request.method(), http::Method::GET);
+                assert_eq!(
+                    request.uri().path(),
+                    "/api/v1/namespaces/openshell/secrets/regcred"
+                );
+                Ok::<_, std::convert::Infallible>(kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": {"name": "regcred", "namespace": "openshell"},
+                        "type": "kubernetes.io/dockerconfigjson",
+                        "data": { ".dockerconfigjson": "e30=" }
+                    }),
+                ))
+            },
+        );
+        let client = Client::new(service, "openshell");
+        let driver = KubernetesComputeDriver {
+            client: client.clone(),
+            watch_client: client,
+            sandbox_api_version: Arc::new(OnceCell::new()),
+            config: KubernetesComputeConfig {
+                namespace: "openshell".into(),
+                gateway_id: "gateway-a".into(),
+                image_pull_secrets: vec!["regcred".into()],
+                ..Default::default()
+            },
+            operator_allowlist: None,
+        };
+
+        let error = driver
+            .ensure_image_pull_secrets("managed-team-a", "team-a")
+            .await
+            .expect_err("unapproved source must not be copied");
+        assert!(matches!(error, KubernetesDriverError::Precondition(_)));
     }
 
     #[test]

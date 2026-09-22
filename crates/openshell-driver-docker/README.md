@@ -15,6 +15,12 @@ metadata, and flushes spans during graceful shutdown.
 
 ## Runtime Model
 
+Caller driver config is disabled by default. Existing volumes require
+administrator-controlled approval labels; raw bind mounts have no supported
+label resolver and are denied under enforcement. GPU devices are temporarily
+exempt. Inspect labels again before launch, restart, and during reconciliation.
+See [resource admission configuration](../../docs/reference/gateway-config.mdx#external-resource-admission).
+
 The driver creates two containers for each sandbox:
 
 - `openshell-sandbox` is PID 1 in the workload container. It owns the workload
@@ -98,7 +104,8 @@ The gateway forwards the `docker` block from `--driver-config-json`. Supported
 mount types are:
 
 - `bind`: an absolute daemon-host path, allowed only when
-  `[openshell.drivers.docker].enable_bind_mounts = true`.
+  `[openshell.drivers.docker].enable_bind_mounts = true` and label admission
+  is explicitly disabled.
 - `volume`: an existing named volume. The driver never creates or removes a
   user-supplied volume. Bind-backed local volumes require
   `enable_bind_mounts = true`.

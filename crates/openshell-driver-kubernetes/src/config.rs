@@ -153,6 +153,10 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
+    /// Permit caller-supplied driver JSON. Does not waive resource admission.
+    pub allow_driver_config: bool,
+    /// Operator-owned external attachment approval policy.
+    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     /// How workspaces map to Kubernetes namespaces. `"shared"` (default)
     /// renders all sandboxes into `namespace`; `"managed"` creates per-workspace
     /// namespaces on demand; `"operator"` uses pre-provisioned namespaces.
@@ -294,6 +298,9 @@ impl Default for KubernetesComputeConfig {
     fn default() -> Self {
         Self {
             workspace_mode: WorkspaceMode::default(),
+            allow_driver_config: false,
+            resource_admission:
+                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
             gateway_id: DEFAULT_GATEWAY_ID.to_string(),
             namespace: DEFAULT_K8S_NAMESPACE.to_string(),
             operator_namespace_label: None,

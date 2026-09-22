@@ -114,6 +114,30 @@ pub struct DriverStartupContext<'a> {
     pub endpoint_overrides: &'a BTreeMap<String, PathBuf>,
 }
 
+/// Decode common controls without interpreting backend-specific driver fields.
+pub fn admission_config_from_context(
+    context: DriverStartupContext<'_>,
+    name: &str,
+) -> Result<openshell_core::resource_admission::DriverAdmissionConfig> {
+    let mut table = toml::map::Map::new();
+    if let Some(config) = context
+        .file
+        .and_then(|file| file.openshell.drivers.get(name))
+    {
+        for field in ["allow_driver_config", "resource_admission"] {
+            if let Some(value) = config.get(field) {
+                table.insert(field.into(), value.clone());
+            }
+        }
+    }
+    let policy: openshell_core::resource_admission::DriverAdmissionConfig =
+        toml::Value::Table(table).try_into().map_err(|error| {
+            Error::config(format!("invalid driver admission configuration: {error}"))
+        })?;
+    policy.validate().map_err(Error::config)?;
+    Ok(policy)
+}
+
 pub fn remote_driver_config_from_context(
     context: DriverStartupContext<'_>,
     name: &str,
@@ -233,6 +257,37 @@ mod tests {
             gateway_tls_enabled: false,
             endpoint_overrides,
         }
+    }
+
+    #[test]
+    fn common_admission_defaults_and_replacement_apply_to_every_driver() {
+        for name in ["kubernetes", "docker", "podman", "vm", "mxc", "external"] {
+            let defaults = admission_config_from_context(test_context(None), name).unwrap();
+            assert!(!defaults.allow_driver_config);
+            assert!(defaults.resource_admission.enabled);
+            assert_eq!(defaults.resource_admission.required_labels.len(), 2);
+            let file: config_file::ConfigFile = toml::from_str(&format!(
+                "[openshell.drivers.{name}]\nallow_driver_config = true\n[openshell.drivers.{name}.resource_admission.required_labels]\n\"example.com/approved\" = \"yes\"\n"
+            )).unwrap();
+            let custom = admission_config_from_context(test_context(Some(&file)), name).unwrap();
+            assert!(custom.allow_driver_config);
+            assert_eq!(
+                custom.resource_admission.required_labels,
+                BTreeMap::from([("example.com/approved".into(), "yes".into())])
+            );
+        }
+    }
+
+    #[test]
+    fn common_admission_rejects_empty_map_and_preserves_explicit_opt_out() {
+        let file: config_file::ConfigFile =
+            toml::from_str("[openshell.drivers.docker.resource_admission.required_labels]\n")
+                .unwrap();
+        assert!(admission_config_from_context(test_context(Some(&file)), "docker").is_err());
+        let file: config_file::ConfigFile = toml::from_str("[openshell.drivers.docker.resource_admission]\nenabled = false\nrequired_labels = {}\n").unwrap();
+        let policy = admission_config_from_context(test_context(Some(&file)), "docker").unwrap();
+        assert!(!policy.resource_admission.enabled);
+        assert!(!policy.allow_driver_config);
     }
 
     #[test]

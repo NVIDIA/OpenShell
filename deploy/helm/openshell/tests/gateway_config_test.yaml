@@ -13,6 +13,45 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: defaults to label admission with caller driver config disabled
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^allow_driver_config\s*=\s*false$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.resource_admission\]\s*enabled\s*=\s*true'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.drivers\.kubernetes\.resource_admission\.required_labels\]'
+
+  - it: preserves explicit admission opt-out without enabling driver config
+    template: templates/gateway-config.yaml
+    set:
+      server.drivers.kubernetes.resourceAdmission.enabled: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^allow_driver_config\s*=\s*false$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.resource_admission\]\s*enabled\s*=\s*false'
+
+  - it: renders replacement labels and literal workspace substitution
+    template: templates/gateway-config.yaml
+    set:
+      server.drivers.kubernetes.allowDriverConfig: true
+      server.drivers.kubernetes.resourceAdmission.requiredLabels:
+        platform.example.com/team: '${workspace}'
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '"platform.example.com/team" = "\$\{workspace\}"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'openshell.ai/sandbox-attachable'
+
   - it: identifies the gateway by chart fullname by default
     template: templates/gateway-config.yaml
     asserts:

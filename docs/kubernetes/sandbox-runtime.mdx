@@ -87,6 +87,19 @@ cluster CNI enforces both ingress and egress policies for these namespaces.
 
 ## Bootstrap a Sandbox
 
+Resource admission checks the requested external references before provisioning
+and the actual workload Pod before releasing its scheduling gate. PVCs and
+other supported external references require operator approval labels, including
+same-namespace and read-only mounts. Unexpected references, changed resource
+UIDs, and unsupported volume sources fail closed. GPU device attachments are
+temporarily exempt. The driver rechecks persisted references on restart and
+every 30 seconds during reconciliation; confirmed revocation suspends compute,
+while transient lookup failures block new launches and recovery.
+
+See [External Resource Admission](../reference/gateway-config#external-resource-admission)
+for label configuration and upgrade requirements. Admission cannot repair data
+or credentials compromised before upgrade.
+
 The driver creates each sandbox generation in a fail-closed order:
 
 1. Create and validate the workload egress fence.

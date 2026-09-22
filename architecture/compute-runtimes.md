@@ -16,6 +16,22 @@ the common protocol owns process, identity, TCP, DNS, and forwarding semantics.
 
 ## Driver Contract
 
+External resource admission is an operator-owned boundary shared by drivers.
+The gateway gates caller driver JSON independently from attachment approval.
+Drivers resolve the complete effective attachment inventory against authoritative
+resource labels before launch and on reuse. Missing labels or an unsupported
+resolver deny access; GPU attachments are an explicit temporary exception.
+Fresh sandbox-private resources instead require verified provisioning ownership.
+Workload metadata must not grant approval or override admission evidence.
+
+The shared evaluator lives in `openshell-core`; native resolution remains in
+each driver. External drivers acknowledge the effective versioned policy through
+capabilities, and policy mismatch prevents activation or new launch operations.
+Trusted deployment configuration can explicitly disable label admission, but
+that opt-out does not waive other ownership and isolation checks. This boundary
+assumes operators control approval metadata and runtime resource replacement;
+it does not provide atomic mount authorization or instantaneous revocation.
+
 Each runtime receives a sandbox spec and canonical policy from the gateway and
 is responsible for:
 
@@ -449,11 +465,14 @@ management. RBAC uses a namespace-scoped Role.
 Each new namespace receives a ServiceAccount and the configured gateway-only
 SSH ingress NetworkPolicy. Configured image-pull Secrets are copied from the
 driver's source namespace on every sandbox create so registry credential
-rotations propagate. The namespace also copies OpenShift SCC UID-range and
-supplemental-group annotations from the gateway namespace when present. The
-driver deletes the namespace during workspace deletion. The workspace remains
-durably `Terminating` until the Kubernetes API accepts namespace cleanup, so a
-transient failure can be retried. Namespace deletion uses the fetched UID as a
+rotations propagate. Resource admission first validates the source as shared
+operator infrastructure, and copies carry gateway and workspace ownership
+labels; an unrelated existing target is never adopted. The namespace also copies
+OpenShift SCC UID-range and supplemental-group annotations from the gateway
+namespace when present. The driver deletes the namespace during workspace
+deletion. The workspace remains durably `Terminating` until the Kubernetes API
+accepts namespace cleanup, so a transient failure can be retried. Namespace
+deletion uses the fetched UID as a
 precondition to avoid deleting a replacement namespace. Requires a non-empty
 `gateway_id` (validated as a
 DNS-1123 label at startup) so the namespace prefix fits within the K8s 63-character
