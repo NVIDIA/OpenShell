@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Compatibility rewriting for protobuf records written before time fields used WKTs.
+//! Compatibility rewriting for protobuf records written by earlier releases.
 
 use prost::Message;
 use prost_reflect::{DescriptorPool, Kind, MessageDescriptor};
@@ -24,6 +24,14 @@ enum Conversion {
     DurationSeconds { new_tag: u32 },
     DurationString { new_tag: u32 },
     TimestampMap { new_tag: u32 },
+    StringEnum { tag: u32, kind: LegacyEnum },
+}
+
+#[derive(Clone, Copy)]
+enum LegacyEnum {
+    TlsMode,
+    EnforcementMode,
+    AccessPreset,
 }
 
 pub(super) fn migrate(object_type: &str, payload: &[u8]) -> PersistenceResult<Vec<u8>> {
@@ -78,7 +86,6 @@ fn rewrite_message(descriptor: &MessageDescriptor, input: &[u8]) -> PersistenceR
             )?;
         } else if wire_type == 2
             && let Some(field) = descriptor.get_field(field_number)
-            && !field.is_map()
             && let Kind::Message(child) = field.kind()
         {
             let rewritten = rewrite_message(&child, &input[payload_start..payload_end])?;
@@ -163,8 +170,90 @@ fn rewrite_legacy_field(
                 write_embedded(output, new_tag, &rewritten);
             }
         }
+        Conversion::StringEnum { tag, kind } => {
+            rewrite_string_enum(output, tag, kind, wire_type, payload)?;
+        }
     }
     Ok(())
+}
+
+fn rewrite_string_enum(
+    output: &mut Vec<u8>,
+    tag: u32,
+    kind: LegacyEnum,
+    wire_type: u8,
+    payload: &[u8],
+) -> PersistenceResult<()> {
+    let value = match wire_type {
+        // Current records already encode these fields as enum varints. Rewrite
+        // them canonically so the migration remains idempotent.
+        0 => {
+            let (value, consumed) = read_varint(payload)?;
+            if consumed != payload.len() {
+                return Err(PersistenceError::Decode(
+                    "invalid network endpoint enum value".into(),
+                ));
+            }
+            value
+        }
+        // v0.1.0-pre.4 and earlier encoded the same field numbers as strings.
+        2 => {
+            let value = std::str::from_utf8(payload).map_err(|error| {
+                PersistenceError::Decode(format!(
+                    "legacy network endpoint mode is not UTF-8: {error}"
+                ))
+            })?;
+            legacy_enum_value(kind, value).ok_or_else(|| {
+                PersistenceError::Decode(format!(
+                    "unsupported legacy network endpoint {} value '{value}'",
+                    legacy_enum_name(kind)
+                ))
+            })?
+        }
+        _ => {
+            return Err(PersistenceError::Decode(format!(
+                "network endpoint {} field has wire type {wire_type}, expected varint or string",
+                legacy_enum_name(kind)
+            )));
+        }
+    };
+
+    write_key(output, tag, 0);
+    write_varint(output, value);
+    Ok(())
+}
+
+fn legacy_enum_value(kind: LegacyEnum, value: &str) -> Option<u64> {
+    match kind {
+        LegacyEnum::TlsMode => match value {
+            "" => Some(0),
+            "skip" => Some(1),
+            "terminate" => Some(2),
+            "passthrough" => Some(3),
+            _ => None,
+        },
+        LegacyEnum::EnforcementMode => match value {
+            "" => Some(0),
+            "enforce" => Some(1),
+            "audit" => Some(2),
+            _ => None,
+        },
+        LegacyEnum::AccessPreset => match value {
+            "" => Some(0),
+            "read-only" => Some(1),
+            "read-write" => Some(2),
+            "full" => Some(3),
+            _ => None,
+        },
+    }
+}
+
+fn legacy_enum_name(kind: LegacyEnum) -> &'static str {
+    match kind {
+        LegacyEnum::TlsMode => "tls",
+        LegacyEnum::EnforcementMode => "enforcement",
+        LegacyEnum::AccessPreset => "access",
+    }
 }
 
 fn parse_legacy_duration(value: &str) -> PersistenceResult<std::time::Duration> {
@@ -219,9 +308,10 @@ fn rewrite_timestamp_map_entry(input: &[u8]) -> PersistenceResult<Option<Vec<u8>
 
 fn conversion(message: &str, field: u32) -> Option<Conversion> {
     use Conversion::{
-        DurationSeconds as D, DurationString as DS, Timestamp as T, TimestampMap as M,
-        TimestampString as TS,
+        DurationSeconds as D, DurationString as DS, StringEnum as E, Timestamp as T,
+        TimestampMap as M, TimestampString as TS,
     };
+    use LegacyEnum::{AccessPreset as Access, EnforcementMode as Enforcement, TlsMode as Tls};
     match (message, field) {
         ("openshell.datamodel.v1.ObjectMeta", 3) => Some(T { new_tag: 103 }),
         ("openshell.datamodel.v1.ObjectMeta", 8) => Some(T { new_tag: 108 }),
@@ -242,6 +332,15 @@ fn conversion(message: &str, field: u32) -> Option<Conversion> {
             Some(D { new_tag: 116 })
         }
         ("openshell.sandbox.v1.MiddlewareBinding", 4) => Some(DS { new_tag: 104 }),
+        ("openshell.sandbox.v1.NetworkEndpoint", 4) => Some(E { tag: 4, kind: Tls }),
+        ("openshell.sandbox.v1.NetworkEndpoint", 5) => Some(E {
+            tag: 5,
+            kind: Enforcement,
+        }),
+        ("openshell.sandbox.v1.NetworkEndpoint", 6) => Some(E {
+            tag: 6,
+            kind: Access,
+        }),
         _ => None,
     }
 }
@@ -324,7 +423,7 @@ fn require_wire_type(actual: u8, expected: u8) -> PersistenceResult<()> {
         Ok(())
     } else {
         Err(PersistenceError::Decode(format!(
-            "legacy time field has wire type {actual}, expected {expected}"
+            "legacy field has wire type {actual}, expected {expected}"
         )))
     }
 }
@@ -336,7 +435,8 @@ mod tests {
         StoredProviderCredentialRefreshState, StoredProviderCredentialRefreshStateV2,
     };
     use openshell_core::proto::{
-        EndpointStatus, Provider, SandboxCondition, SandboxWorkloadTemplate, SshSession,
+        EndpointStatus, NetworkAccessPreset, NetworkEnforcementMode, NetworkTlsMode, Provider,
+        Sandbox, SandboxCondition, SandboxWorkloadTemplate, SshSession,
     };
     use std::collections::HashMap;
 
@@ -410,6 +510,94 @@ mod tests {
     struct LegacySandboxWorkloadTemplate {
         #[prost(message, optional, tag = "1")]
         metadata: Option<LegacyObjectMeta>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacySandbox {
+        #[prost(message, optional, tag = "2")]
+        spec: Option<LegacySandboxSpec>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacySandboxSpec {
+        #[prost(message, optional, tag = "7")]
+        policy: Option<LegacySandboxPolicy>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacySandboxPolicy {
+        #[prost(map = "string, message", tag = "5")]
+        network_policies: HashMap<String, LegacyNetworkPolicyRule>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyNetworkPolicyRule {
+        #[prost(message, repeated, tag = "2")]
+        endpoints: Vec<LegacyNetworkEndpoint>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyNetworkEndpoint {
+        #[prost(string, tag = "1")]
+        host: String,
+        #[prost(string, tag = "4")]
+        tls: String,
+        #[prost(string, tag = "5")]
+        enforcement: String,
+        #[prost(string, tag = "6")]
+        access: String,
+    }
+
+    fn legacy_sandbox_with_endpoint(endpoint: LegacyNetworkEndpoint) -> LegacySandbox {
+        LegacySandbox {
+            spec: Some(LegacySandboxSpec {
+                policy: Some(LegacySandboxPolicy {
+                    network_policies: HashMap::from([(
+                        "api".into(),
+                        LegacyNetworkPolicyRule {
+                            endpoints: vec![endpoint],
+                        },
+                    )]),
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn migrates_pre4_network_endpoint_strings_to_enums() {
+        let legacy = legacy_sandbox_with_endpoint(LegacyNetworkEndpoint {
+            host: "api.example.com".into(),
+            tls: "terminate".into(),
+            enforcement: "enforce".into(),
+            access: "read-write".into(),
+        });
+
+        let migrated = migrate("sandbox", &legacy.encode_to_vec()).unwrap();
+        let sandbox = Sandbox::decode(migrated.as_slice()).unwrap();
+        let endpoint = &sandbox.spec.unwrap().policy.unwrap().network_policies["api"].endpoints[0];
+
+        assert_eq!(endpoint.tls, NetworkTlsMode::Terminate as i32);
+        assert_eq!(endpoint.enforcement, NetworkEnforcementMode::Enforce as i32);
+        assert_eq!(endpoint.access, NetworkAccessPreset::ReadWrite as i32);
+        assert_eq!(migrate("sandbox", &migrated).unwrap(), migrated);
+    }
+
+    #[test]
+    fn rejects_unknown_pre4_network_endpoint_strings() {
+        let legacy = legacy_sandbox_with_endpoint(LegacyNetworkEndpoint {
+            host: "api.example.com".into(),
+            tls: String::new(),
+            enforcement: "observe".into(),
+            access: String::new(),
+        });
+
+        let error = migrate("sandbox", &legacy.encode_to_vec()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported legacy network endpoint enforcement value 'observe'")
+        );
     }
 
     #[test]
