@@ -761,25 +761,6 @@ fn quote_windows_argument(arg: &str) -> String {
     quoted.push('"');
     quoted
 }
-fn append_tls_readwrite_grant(
-    readwrite_paths: &mut Vec<String>,
-    ca_paths: Option<&(PathBuf, PathBuf)>,
-) {
-    let Some((ca_cert_path, _)) = ca_paths else {
-        return;
-    };
-    let Some(dir) = ca_cert_path.parent() else {
-        return;
-    };
-    let dir = dir.display().to_string();
-    if !readwrite_paths
-        .iter()
-        .any(|existing| existing.eq_ignore_ascii_case(&dir))
-    {
-        readwrite_paths.push(dir);
-    }
-}
-
 impl MxcComputeBackend {
     pub fn new(config: MxcComputeConfig) -> Self {
         let invoker = WxcExecInvoker::new(&config.wxc_exec_path, config.debug);
@@ -1553,10 +1534,7 @@ async fn run_lifecycle(
         ));
     }
 
-    let mut readwrite_paths = mapped.readwrite_paths;
-    if !config.pc_minimal_env {
-        append_tls_readwrite_grant(&mut readwrite_paths, host_proxy_ca_paths.as_ref());
-    }
+    let readwrite_paths = mapped.readwrite_paths;
     let readonly_paths = mapped.readonly_paths;
     let ui = mapped.ui;
     let filesystem = MxcFilesystem {
@@ -1592,8 +1570,8 @@ async fn run_lifecycle(
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
     append_provider_child_env(&mut env, provider_credentials.as_ref());
-    // Layer proxy configuration for every env tier. Curated ProcessContainers
-    // use the staged CA copies above; other tiers use the original paths.
+    // Layer proxy configuration for every env tier using the staged CA copies
+    // above. The host proxy's private temporary directory is never shared.
     append_tls_env_vars(&mut env, agent_proxy_ca_paths.as_ref());
     append_proxy_env_vars(&mut env, proxy_addr, proxy_auth.as_ref());
     env.sort(); // deterministic order for logging / debugging
@@ -2721,6 +2699,8 @@ mod lifecycle_tests {
 
         let shell =
             std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+        let workload = tempfile::tempdir().expect("temporary workload directory");
+        let workload_dir = workload.path().to_string_lossy().into_owned();
         let mut policy = fs_policy(&[]);
         policy.network_policies.insert(
             "github".to_string(),
@@ -2735,10 +2715,19 @@ mod lifecycle_tests {
                     provider_credentialed: true,
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary { path: shell }],
+                binaries: vec![NetworkBinary {
+                    path: shell.clone(),
+                }],
             },
         );
-        let mut sandbox = with_policy(driver_sandbox("sb-provider-env"), policy);
+        let mut sandbox = with_policy(
+            driver_sandbox_with_command(
+                "sb-provider-env",
+                &workload_dir,
+                vec![shell, "/c".into(), "exit 0".into()],
+            ),
+            policy,
+        );
         sandbox
             .spec
             .as_mut()
@@ -3022,19 +3011,6 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn tls_readwrite_grant_adds_ca_directory_once() {
-        let tls_dir = std::env::temp_dir().join("openshell-mxc-tls-test");
-        let ca_cert = tls_dir.join("openshell-ca.pem");
-        let bundle = tls_dir.join("ca-bundle.pem");
-        let existing = tls_dir.display().to_string().to_ascii_lowercase();
-        let mut readwrite = vec![existing.clone()];
-
-        append_tls_readwrite_grant(&mut readwrite, Some(&(ca_cert, bundle)));
-
-        assert_eq!(readwrite, vec![existing]);
-    }
-
-    #[test]
     fn windows_command_line_preserves_argument_boundaries() {
         assert_eq!(
             encode_windows_command_line(&[
@@ -3228,18 +3204,22 @@ mod lifecycle_tests {
             );
             assert!(recorded["network"].get("proxy").is_none());
 
-            let proxy_addr = {
+            let (proxy_addr, host_proxy_ca_paths) = {
                 let registry = backend.registry.lock().await;
                 let entry = registry.get(sandbox_id).expect("registry entry");
-                assert!(
-                    entry.host_proxy.is_some(),
-                    "{sandbox_id}: governed egress must hold a live host proxy"
-                );
+                let host_proxy = entry.host_proxy.as_ref().unwrap_or_else(|| {
+                    panic!("{sandbox_id}: governed egress must hold a live host proxy")
+                });
                 assert_eq!(
                     entry.trimmed_policy.as_ref().unwrap().network_policies,
                     policy.network_policies
                 );
-                entry.proxy_addr.expect("proxy address")
+                (
+                    entry.proxy_addr.expect("proxy address"),
+                    host_proxy
+                        .ca_file_paths()
+                        .expect("governed egress proxy must expose public CA paths"),
+                )
             };
             tokio::time::timeout(
                 Duration::from_secs(2),
@@ -3250,6 +3230,46 @@ mod lifecycle_tests {
             .expect("proxy listener must accept connections");
 
             let child_env = recorded["process"]["env"].as_array().expect("child env");
+            let tls_env = child_env
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|entry| entry.split_once('='))
+                .filter(|(key, _)| TLS_ENV_KEYS.contains(key))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(
+                tls_env.len(),
+                TLS_ENV_KEYS.len(),
+                "{sandbox_id}: every TLS trust variable must be replaced"
+            );
+            let staged_ca_dir = PathBuf::from(&share)
+                .join(".openshell-proxy")
+                .join(sandbox_id);
+            for key in TLS_ENV_KEYS {
+                let path = PathBuf::from(
+                    tls_env
+                        .get(key)
+                        .unwrap_or_else(|| panic!("{sandbox_id}: missing {key}")),
+                );
+                assert_eq!(
+                    path.parent(),
+                    Some(staged_ca_dir.as_path()),
+                    "{sandbox_id}: {key} must use the staged CA directory"
+                );
+                assert!(path.is_file(), "{sandbox_id}: staged {key} path must exist");
+            }
+            let host_ca_dir = host_proxy_ca_paths
+                .0
+                .parent()
+                .expect("host CA path must have a parent");
+            assert!(
+                recorded["filesystem"]["readwritePaths"]
+                    .as_array()
+                    .expect("read-write paths")
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .all(|path| Path::new(path) != host_ca_dir),
+                "{sandbox_id}: the host proxy CA directory must not be writable"
+            );
             let proxy_env = child_env
                 .iter()
                 .filter_map(serde_json::Value::as_str)
