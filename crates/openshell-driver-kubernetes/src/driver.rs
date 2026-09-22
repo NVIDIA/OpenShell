@@ -13,7 +13,6 @@ use crate::isolation::{
 };
 use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH,
-    SANDBOX_SECRET_COMPONENT, SUPERVISOR_SECRET_COMPONENT,
     SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames, boundary_service,
     generate_proxy_ca_material, sandbox_bootstrap_secret,
     sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
@@ -3032,8 +3031,12 @@ impl KubernetesComputeDriver {
                 pod_is_gone,
             );
             if stop_is_complete {
-                self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace)
-                    .await?;
+                self.delete_sandbox_runtime_supervisor(
+                    sandbox_id,
+                    &namespace,
+                    sandbox_runtime_generation(&object).as_slice(),
+                )
+                .await?;
                 patch_dynamic_object_with_resource_version_retry(
                     &agent_sandbox_api.api,
                     &kube_name,
@@ -3216,7 +3219,9 @@ impl KubernetesComputeDriver {
         let names = SandboxRuntimeNames::for_generation(sandbox_id, generation.as_str());
         self.create_sandbox_runtime_fence(&namespace, &names)
             .await?;
-        self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace)
+        let mut stale_generations = sandbox_runtime_generation(&object).as_slice().to_vec();
+        stale_generations.push(generation.as_str());
+        self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace, &stale_generations)
             .await?;
         let main_process_spec =
             required_sandbox_annotation(&object, ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC)?;
@@ -3499,40 +3504,28 @@ impl KubernetesComputeDriver {
         &self,
         sandbox_id: &str,
         namespace: &str,
+        generations: &[&str],
     ) -> Result<(), KubernetesDriverError> {
         self.delete_sandbox_runtime_supervisor_pod(sandbox_id, namespace)
             .await?;
-        self.delete_sandbox_runtime_generation_secrets(sandbox_id, namespace)
+        self.delete_sandbox_runtime_generation_secrets(sandbox_id, namespace, generations)
             .await
     }
 
+    /// Delete the bootstrap Secrets of the given runtime generations by exact
+    /// name. Garbage collection through their owner Pods removes older
+    /// generations.
     async fn delete_sandbox_runtime_generation_secrets(
         &self,
         sandbox_id: &str,
         namespace: &str,
+        generations: &[&str],
     ) -> Result<(), KubernetesDriverError> {
         let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
-        for component in [SANDBOX_SECRET_COMPONENT, SUPERVISOR_SECRET_COMPONENT] {
-            let selector =
-                format!("openshell.ai/sandbox-id={sandbox_id},openshell.ai/component={component}");
-            let items = secrets
-                .list(&ListParams::default().labels(&selector))
-                .await
-                .map_err(KubernetesDriverError::from_kube)?;
-            for secret in items {
-                let Some(name) = secret.metadata.name else {
-                    continue;
-                };
-                match secrets
-                    .delete(
-                        &name,
-                        &DeleteParams::default().preconditions(Preconditions {
-                            uid: secret.metadata.uid,
-                            resource_version: None,
-                        }),
-                    )
-                    .await
-                {
+        for generation in generations {
+            let names = SandboxRuntimeNames::for_generation(sandbox_id, generation);
+            for name in [&names.sandbox_secret, &names.supervisor_secret] {
+                match secrets.delete(name, &DeleteParams::default()).await {
                     Ok(_) | Err(KubeError::Api(kube::core::ErrorResponse { code: 404, .. })) => {}
                     Err(error) => return Err(KubernetesDriverError::from_kube(error)),
                 }
@@ -3884,7 +3877,12 @@ impl KubernetesComputeDriver {
                 }
             }
             match self
-                .reconcile_sandbox_runtime_supervisor(&sandbox_id, namespace, desired_running)
+                .reconcile_sandbox_runtime_supervisor(
+                    &sandbox_id,
+                    namespace,
+                    desired_running,
+                    sandbox_runtime_generation(&object).as_slice(),
+                )
                 .await
             {
                 Ok(()) => {}
@@ -3938,7 +3936,11 @@ impl KubernetesComputeDriver {
             }
         }
         if let Err(error) = self
-            .delete_sandbox_runtime_supervisor(sandbox_id, namespace)
+            .delete_sandbox_runtime_supervisor(
+                sandbox_id,
+                namespace,
+                sandbox_runtime_generation(object).as_slice(),
+            )
             .await
         {
             warn!(sandbox_id, %error, "could not finish sandbox-runtime suspension cleanup");
@@ -4208,10 +4210,11 @@ impl KubernetesComputeDriver {
         sandbox_id: &str,
         namespace: &str,
         desired_running: bool,
+        generations: &[&str],
     ) -> Result<(), KubernetesDriverError> {
         if !desired_running {
             return self
-                .delete_sandbox_runtime_supervisor(sandbox_id, namespace)
+                .delete_sandbox_runtime_supervisor(sandbox_id, namespace, generations)
                 .await;
         }
         let names = SandboxRuntimeNames::new(sandbox_id);
@@ -8440,6 +8443,7 @@ mod tests {
                 "resourceVersion": "42",
                 "annotations": {
                     SANDBOX_POD_NAME_ANNOTATION: "workload-pod",
+                    ANNOTATION_SANDBOX_RUNTIME_GENERATION: "gen-7",
                     ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE:
                         SandboxRuntimeBootstrapPhase::Suspending.as_str()
                 }
@@ -8453,12 +8457,6 @@ mod tests {
             kube_test_response(
                 http::StatusCode::OK,
                 serde_json::json!({"kind": "Status", "status": "Success", "code": 200}),
-            )
-        };
-        let no_secrets = || {
-            kube_test_response(
-                http::StatusCode::OK,
-                serde_json::json!({"apiVersion": "v1", "kind": "SecretList", "items": []}),
             )
         };
         let steps = Arc::new(std::sync::Mutex::new(VecDeque::from([
@@ -8504,14 +8502,14 @@ mod tests {
                 kube_test_not_found("pods", "os-supervisor-sandbox-1"),
             ),
             (
-                http::Method::GET,
-                "/api/v1/namespaces/openshell/secrets",
-                no_secrets(),
+                http::Method::DELETE,
+                "/api/v1/namespaces/openshell/secrets/os-sandbox-sandbox-1-gen7",
+                success(),
             ),
             (
-                http::Method::GET,
-                "/api/v1/namespaces/openshell/secrets",
-                no_secrets(),
+                http::Method::DELETE,
+                "/api/v1/namespaces/openshell/secrets/os-supervisor-sandbox-1-gen7",
+                kube_test_not_found("secrets", "os-supervisor-sandbox-1-gen7"),
             ),
             (
                 http::Method::GET,

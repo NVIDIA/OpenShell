@@ -126,7 +126,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
+            verbs: ["create", "delete"]
       - notContains:
           path: rules
           content:
@@ -154,7 +154,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
+            verbs: ["create", "delete"]
 
   - it: restricts managed copies to image-pull secrets when TLS is disabled
     set:
@@ -175,7 +175,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
+            verbs: ["create", "delete"]
 
   - it: omits secrets rule entirely in shared mode
     set:
@@ -209,7 +209,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
+            verbs: ["create", "delete"]
 
   - it: grants operator sandbox-runtime companion permissions
     set:
@@ -232,4 +232,4 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
+            verbs: ["create", "delete"]
