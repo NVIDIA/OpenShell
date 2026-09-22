@@ -1186,7 +1186,8 @@ func (*IssueSandboxTokenRequest) Descriptor() ([]byte, []int) {
 // gateway RPC.
 type IssueSandboxTokenResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Gateway-minted JWT bound to the calling sandbox's UUID.
+	// Gateway-minted session JWT bound to the calling sandbox's UUID, active
+	// runtime generation, authorization epoch, and durable token lineage.
 	Token string `protobuf:"bytes,1,opt,name=token,proto3" json:"token,omitempty"`
 	// Absolute expiry of the issued token. Absence means the token is non-expiring.
 	ExpirationTime *timestamppb.Timestamp `protobuf:"bytes,102,opt,name=expiration_time,json=expirationTime,proto3" json:"expiration_time,omitempty"`

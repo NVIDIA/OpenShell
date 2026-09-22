@@ -368,7 +368,7 @@ impl ComputeDriver for FakeComputeDriver {
                 .calls
                 .push(FakeComputeDriverCall::CreateSandbox { sandbox });
         });
-        Ok(Response::new(CreateSandboxResponse {}))
+        Ok(Response::new(CreateSandboxResponse::default()))
     }
 
     async fn stop_sandbox(
@@ -398,7 +398,7 @@ impl ComputeDriver for FakeComputeDriver {
                 sandbox_name: request.name,
             });
         });
-        Ok(Response::new(StartSandboxResponse {}))
+        Ok(Response::new(StartSandboxResponse::default()))
     }
 
     async fn delete_sandbox(

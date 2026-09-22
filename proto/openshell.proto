@@ -827,7 +827,8 @@ message IssueSandboxTokenRequest {}
 message IssueSandboxTokenResponse {
   reserved 2;
   reserved "expires_at_ms";
-  // Gateway-minted JWT bound to the calling sandbox's UUID.
+  // Gateway-minted session JWT bound to the calling sandbox's UUID, active
+  // runtime generation, authorization epoch, and durable token lineage.
   string token = 1 [(openshell.options.v1.secret) = true];
   // Absolute expiry of the issued token. Absence means the token is non-expiring.
   google.protobuf.Timestamp expiration_time = 102;

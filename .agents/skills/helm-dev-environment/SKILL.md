@@ -359,7 +359,11 @@ OpenShell mounts the SPIFFE CSI Workload API socket at
 grants. Supervisor-to-gateway authentication remains on the Kubernetes
 ServiceAccount bootstrap and gateway-minted sandbox JWT path; the selected
 Kubernetes compute driver validates the projected token before the gateway
-mints its JWT.
+returns the current generation-bound session JWT. The driver also returns the
+runtime identity recorded during provisioning. Restart preserves its namespace
+and Sandbox CR UID, rejects ambiguous label matches, and rotates only the
+supervisor Pod UID; bootstrap fails when the live identity does not match the
+durable sandbox record.
 
 ### Vault Credential Driver
 

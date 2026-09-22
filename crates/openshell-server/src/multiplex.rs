@@ -866,9 +866,13 @@ where
 /// 2. `ComputeDriverAuthenticator` (path-scoped to `IssueSandboxToken`)
 ///    — delegates a driver-native credential and receives a sandbox identity
 ///    so the handler can mint a gateway JWT. No-op on every other path.
-/// 3. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
-///    via a distinctive `kid` so non-matching Bearer tokens fall through.
-/// 4. `OidcAuthenticator` — validates user Bearer tokens against the
+/// 3. `SandboxSessionJwtAuthenticator` — validates generation-bound gateway
+///    JWTs against the durable sandbox identity. When configured, legacy
+///    unbound sandbox JWTs are deliberately not admitted.
+/// 4. `SandboxJwtAuthenticator` — legacy fallback used only when session JWT
+///    authentication is unavailable. Recognized via a distinctive `kid` so
+///    non-matching Bearer tokens fall through.
+/// 5. `OidcAuthenticator` — validates user Bearer tokens against the
 ///    configured OIDC issuer. Returns `Unauthenticated` for missing
 ///    Bearer headers so non-OIDC clients can't sneak through.
 ///
@@ -889,6 +893,7 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
     if let Some(driver) = state.compute_driver_authenticator.clone() {
         authenticators.push(driver);
     }
+    let session_authentication_enabled = state.sandbox_session_jwt_authority.is_some();
     if let Some(authority) = state.sandbox_session_jwt_authority.clone() {
         authenticators.push(Arc::new(
             crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator::new(
@@ -897,7 +902,7 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
             ),
         ));
     }
-    if let Some(jwt) = state.sandbox_jwt_authenticator.clone() {
+    if !session_authentication_enabled && let Some(jwt) = state.sandbox_jwt_authenticator.clone() {
         authenticators.push(jwt);
     }
     if let Some(cache) = state.oidc_cache.clone() {

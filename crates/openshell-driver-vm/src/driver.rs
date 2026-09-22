@@ -1155,7 +1155,7 @@ impl VmDriver {
             task.abort();
         }
 
-        Ok(CreateSandboxResponse {})
+        Ok(CreateSandboxResponse::default())
     }
 
     async fn provision_sandbox(
@@ -4368,7 +4368,7 @@ impl ComputeDriver for VmDriver {
             request.launch_authentication,
         )
         .await?;
-        Ok(Response::new(StartSandboxResponse {}))
+        Ok(Response::new(StartSandboxResponse::default()))
     }
 
     async fn delete_sandbox(

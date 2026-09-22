@@ -450,13 +450,17 @@ async fn handle_create_sandbox_inner(
             .authorize(&token, &workspace, &subject)?;
     }
 
-    let _sandbox_sync_guard = if spec.providers.is_empty() {
-        None
+    let id = uuid::Uuid::new_v4().to_string();
+    let name = if request.name.is_empty() {
+        generate_routable_name()
     } else {
-        Some(state.compute.sandbox_sync_guard().await.map_err(|err| {
-            super::persistence_error_to_status(err, "acquire sandbox mutation lock")
-        })?)
+        request.name.clone()
     };
+    let (sandbox_lifecycle_guard, sandbox_sync_guard) = state
+        .compute
+        .sandbox_create_guards(&id)
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
 
     // Validate provider names exist (fail fast).
     for name in &spec.providers {
@@ -515,13 +519,6 @@ async fn handle_create_sandbox_inner(
         spec.policy.as_ref(),
     )
     .await?;
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let name = if request.name.is_empty() {
-        generate_routable_name()
-    } else {
-        request.name.clone()
-    };
 
     let now_ms = current_time_ms();
 
@@ -620,15 +617,15 @@ async fn handle_create_sandbox_inner(
         })
         .transpose()?;
 
-    let sandbox = state
-        .compute
-        .create_sandbox_authenticated(
-            sandbox,
-            sandbox_token,
-            launch_authentication,
-            await_main_process_attachment,
-        )
-        .await?;
+    let sandbox = Box::pin(state.compute.create_sandbox_authenticated_with_guards(
+        sandbox,
+        sandbox_token,
+        launch_authentication,
+        await_main_process_attachment,
+        sandbox_lifecycle_guard,
+        sandbox_sync_guard,
+    ))
+    .await?;
 
     let mut service_urls = HashMap::with_capacity(request.service_exposures.len());
     for exposure in &request.service_exposures {
@@ -3361,8 +3358,10 @@ async fn run_exec_with_russh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compute::NoopTestDriver;
     use crate::grpc::test_support::{
-        authed_request, test_server_state, test_server_state_with_driver,
+        authed_request, test_server_state, test_server_state_with_compute_driver,
+        test_server_state_with_driver,
     };
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{GpuResourceRequirements, SandboxServiceExposure, ServiceEndpoint};
@@ -4476,6 +4475,52 @@ mod tests {
         assert!(err.message().contains("TOKEN"));
         assert!(err.message().contains("provider-a"));
         assert!(err.message().contains("provider-b"));
+    }
+
+    #[tokio::test]
+    async fn provider_create_failure_releases_global_guard_before_compensation() {
+        let state = test_server_state_with_compute_driver(
+            "test",
+            Arc::new(NoopTestDriver::authenticating_sandbox_with_runtime(
+                "unused", "",
+            )),
+        )
+        .await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle_create_sandbox(
+                &state,
+                authed_request(CreateSandboxRequest {
+                    name: "provider-fail".to_string(),
+                    spec: Some(SandboxSpec {
+                        providers: vec!["work-github".to_string()],
+                        ..Default::default()
+                    }),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    ..Default::default()
+                }),
+            ),
+        )
+        .await
+        .expect("create compensation must not deadlock")
+        .expect_err("empty runtime identity must fail create");
+
+        assert_eq!(result.code(), tonic::Code::Internal, "{}", result.message());
+        let retained = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "provider-fail")
+            .await
+            .unwrap()
+            .expect("accepted asynchronous cleanup must retain the sandbox record");
+        assert_eq!(retained.phase(), SandboxPhase::Deleting as i32);
     }
 
     #[tokio::test]

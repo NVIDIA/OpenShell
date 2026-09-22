@@ -3092,7 +3092,7 @@ impl ComputeDriver for DockerComputeDriver {
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.create_sandbox_inner(&sandbox).await?;
-        span_status.finish(Ok(Response::new(CreateSandboxResponse {})))
+        span_status.finish(Ok(Response::new(CreateSandboxResponse::default())))
     }
 
     #[tracing::instrument(
@@ -3152,7 +3152,7 @@ impl ComputeDriver for DockerComputeDriver {
         }
         self.publish_container_snapshot(&request.sandbox_id, &request.name)
             .await?;
-        Ok(Response::new(StartSandboxResponse {}))
+        Ok(Response::new(StartSandboxResponse::default()))
     }
 
     #[tracing::instrument(

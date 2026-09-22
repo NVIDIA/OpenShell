@@ -649,6 +649,15 @@ the selected Kubernetes compute driver rejects projected tokens from other
 service accounts. For an external driver, inspect its logs and confirm it
 advertises `supports_sandbox_authentication`; the gateway delegates the opaque
 credential over the driver socket and never interprets Kubernetes settings.
+Drivers that advertise sandbox authentication must return the same non-empty
+runtime identity from sandbox creation and credential authentication. A
+gateway log reporting a compute runtime identity mismatch indicates stale or
+re-created runtime resources; compare the live resource UID with the sandbox
+that the gateway provisioned. Restart also rejects multiple Sandbox resources
+with the same sandbox label and requires the persisted namespace and CR UID to
+remain unchanged. A generation-bound session-token rejection usually means the
+supervisor is presenting credentials from a runtime that was replaced; inspect
+the persisted generation before retrying bootstrap.
 
 ```bash
 helm -n openshell get values openshell | grep -A3 sandboxServiceAccount

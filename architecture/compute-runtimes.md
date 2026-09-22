@@ -226,11 +226,13 @@ conservative operator-managed behavior.
 Drivers that can verify a platform-native sandbox credential advertise
 `GetCapabilities.supports_sandbox_authentication`. On the path-scoped
 `IssueSandboxToken` exchange, the gateway forwards the opaque bearer credential
-to that selected driver through `AuthenticateSandbox`. The driver returns only
-the authenticated sandbox ID. The gateway then verifies that its durable
-sandbox record exists and mints the gateway JWT. The driver socket is therefore
-a sandbox-identity trust boundary, but it does not grant user or administrator
-authority.
+to that selected driver through `AuthenticateSandbox`. The driver returns the
+authenticated sandbox ID and opaque runtime identity. The gateway verifies
+that both match its durable sandbox record and returns a generation-bound
+session JWT whose lineage is checked on every subsequent sandbox RPC. Legacy
+unbound sandbox JWTs are not admitted when session authentication is enabled.
+The driver socket is therefore a sandbox-identity trust boundary, but it does
+not grant user or administrator authority.
 
 ## Deletion Lifecycle
 
@@ -506,19 +508,29 @@ The Kubernetes driver's `AuthenticateSandbox` implementation applies its named
   until the first watcher update.
 
 It validates the projected token with Kubernetes `TokenReview`, checks the live
-pod UID, and verifies the pod's controlling Sandbox CR UID and sandbox ID before
-returning the identity to the gateway. These checks rely on an ownership
-invariant. In shared and managed modes, the Kubernetes driver and its trusted
-Agent Sandbox controller exclusively administer the sandbox namespace, Sandbox
-CRs, sandbox pods, and configured sandbox ServiceAccount. Other principals must
-not create or mutate those resources or use that ServiceAccount. In operator
-mode, the platform operator retains
-namespace lifecycle ownership, but must preserve the same exclusive control of
-Sandbox CRs and the pods and ServiceAccount used for sandbox token bootstrap.
-An allowlisted namespace is therefore a trust grant, not a tenant isolation
-boundary. Kubernetes owner references alone do not prove which controller
-created a pod, so admitting principals that can fabricate that resource chain
-would allow them to claim an existing sandbox identity.
+pod UID, and verifies the pod's controlling Sandbox CR UID and sandbox ID. The
+driver returns both the sandbox ID and an opaque runtime identity derived from
+the namespace, immutable Sandbox CR UID, and authenticated supervisor Pod UID.
+Advertising sandbox authentication includes the runtime-binding contract. The
+gateway requires non-empty runtime identities from successful create, start,
+and authentication responses. It records the runtime identity when provisioning
+succeeds and requires an exact match before issuing a sandbox JWT. If binding
+validation or storage fails after a lifecycle call succeeds, the gateway
+compensates that call before returning the error. This correlates credential
+authentication with the durable runtime record rather than authorizing from the
+sandbox ID alone.
+
+`StartSandbox` carries the previously recorded opaque identity. Kubernetes
+requires exactly one label-selected Sandbox CR and verifies that its namespace
+and immutable UID match that identity before replacing the supervisor Pod. The
+new Pod UID becomes the updated binding only after the continuity check passes.
+
+Shared and managed modes still reserve the sandbox namespace, Sandbox CRs,
+sandbox pods, and configured sandbox ServiceAccount for the Kubernetes driver
+and trusted Agent Sandbox controller. In operator mode, the platform operator
+retains namespace lifecycle ownership and must preserve the same control of
+those resources. An allowlisted namespace is a trust grant, not a tenant
+isolation boundary.
 
 ### Credential Driver Integration
 

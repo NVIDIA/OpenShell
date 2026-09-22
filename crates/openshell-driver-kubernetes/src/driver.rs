@@ -777,7 +777,10 @@ impl KubernetesComputeDriver {
     }
 
     /// Authenticate the projected `ServiceAccount` token used by a sandbox pod.
-    pub async fn authenticate_sandbox(&self, credential: &str) -> Result<String, tonic::Status> {
+    pub async fn authenticate_sandbox(
+        &self,
+        credential: &str,
+    ) -> Result<(String, String), tonic::Status> {
         let reviews: Api<TokenReview> = Api::all(self.client.clone());
         let review = TokenReview {
             metadata: ObjectMeta::default(),
@@ -831,7 +834,15 @@ impl KubernetesComputeDriver {
         })?.ok_or_else(|| tonic::Status::permission_denied("sandbox owner not found"))?;
         validate_sandbox_owner_identity(&owner, &sandbox_id, &sandbox)?;
         require_proxy_control_authentication(via_proxy_control)?;
-        Ok(sandbox_id)
+        let resource_uid = sandbox
+            .metadata
+            .uid
+            .as_deref()
+            .ok_or_else(|| tonic::Status::permission_denied("sandbox owner has no UID"))?;
+        Ok((
+            sandbox_id,
+            kubernetes_runtime_identity(&identity.namespace, resource_uid, &identity.pod_uid),
+        ))
     }
 
     #[allow(clippy::result_large_err)]
@@ -1651,14 +1662,17 @@ impl KubernetesComputeDriver {
             sandbox.name = %sandbox.name,
         )
     )]
-    pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
+    pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<String, KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let result = self.create_sandbox_inner(sandbox).await;
         span_status.finish(result)
     }
 
     #[allow(clippy::similar_names)]
-    async fn create_sandbox_inner(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
+    async fn create_sandbox_inner(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<String, KubernetesDriverError> {
         let gpu_requirements = sandbox
             .spec
             .as_ref()
@@ -1840,7 +1854,7 @@ impl KubernetesComputeDriver {
                 )));
             }
         };
-        if let Err(error) = self
+        let runtime_identity = match self
             .create_sandbox_runtime_companions(
                 sandbox,
                 &target_namespace,
@@ -1856,14 +1870,17 @@ impl KubernetesComputeDriver {
             )
             .await
         {
-            warn!(sandbox_id = %sandbox.id, %error, "sandbox-runtime provisioning failed; rolling back Sandbox CR");
-            let _ = agent_sandbox_api
-                .api
-                .delete(&kube_name, &DeleteParams::default())
-                .await;
-            return Err(error);
-        }
-        Ok(())
+            Ok(runtime_identity) => runtime_identity,
+            Err(error) => {
+                warn!(sandbox_id = %sandbox.id, %error, "sandbox-runtime provisioning failed; rolling back Sandbox CR");
+                let _ = agent_sandbox_api
+                    .api
+                    .delete(&kube_name, &DeleteParams::default())
+                    .await;
+                return Err(error);
+            }
+        };
+        Ok(runtime_identity)
     }
 
     async fn create_sandbox_runtime_fence(
@@ -2150,7 +2167,7 @@ impl KubernetesComputeDriver {
         agent_gid: u32,
         main_process_spec: &str,
         log_level: &str,
-    ) -> Result<(), KubernetesDriverError> {
+    ) -> Result<String, KubernetesDriverError> {
         let cr_uid = sandbox_cr.metadata.uid.as_deref().ok_or_else(|| {
             KubernetesDriverError::Message("created Sandbox CR has no UID".to_string())
         })?;
@@ -2419,7 +2436,7 @@ impl KubernetesComputeDriver {
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),
                 name: names.supervisor_pod.clone(),
-                uid: supervisor_uid,
+                uid: supervisor_uid.clone(),
                 controller: Some(false),
                 block_owner_deletion: Some(false),
             },
@@ -2465,7 +2482,11 @@ impl KubernetesComputeDriver {
         // boundary PID 1 is running at this point; the agent process cannot
         // start until control attaches and confirms enforcement. Reconcile
         // removes the marker after the supervisor Pod becomes Ready.
-        Ok(())
+        Ok(kubernetes_runtime_identity(
+            namespace,
+            cr_uid,
+            &supervisor_uid,
+        ))
     }
 
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
@@ -2804,12 +2825,14 @@ impl KubernetesComputeDriver {
         sandbox_id: &str,
         generation_id: &str,
         launch_authentication: &[u8],
-    ) -> Result<(), KubernetesDriverError> {
+        expected_runtime_identity: &str,
+    ) -> Result<String, KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let result = Box::pin(self.start_sandbox_runtime_generation(
             sandbox_id,
             generation_id,
             launch_authentication,
+            expected_runtime_identity,
         ))
         .await;
         span_status.finish(result)
@@ -2821,24 +2844,27 @@ impl KubernetesComputeDriver {
         sandbox_id: &str,
         encoded_generation: &str,
         encoded_authentication: &[u8],
-    ) -> Result<(), KubernetesDriverError> {
+        encoded_expected_runtime_identity: &str,
+    ) -> Result<String, KubernetesDriverError> {
         let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
             encoded_generation.to_string(),
         )
         .map_err(|error| KubernetesDriverError::InvalidArgument(error.to_string()))?;
         let launch_authentication = decode_launch_authentication(encoded_authentication)?;
+        let expected_runtime_identity =
+            parse_kubernetes_runtime_identity(encoded_expected_runtime_identity)?;
         let lookup_api = self
             .supported_sandbox_api_for_lookup(self.client.clone())
             .await
             .map_err(KubernetesDriverError::Message)?;
         let selector = self.sandbox_lookup_selector(sandbox_id);
-        let mut objects = lookup_api
+        let objects = lookup_api
             .api
             .list(&ListParams::default().labels(&selector))
             .await
             .map_err(KubernetesDriverError::from_kube)?
             .items;
-        let mut object = objects.pop().ok_or(KubernetesDriverError::NotFound)?;
+        let mut object = select_expected_sandbox_runtime(objects, &expected_runtime_identity)?;
         if sandbox_runtime_bootstrap_in_progress(&object) {
             let phase = sandbox_runtime_bootstrap_phase(&object);
             if phase != Some(SandboxRuntimeBootstrapPhase::Suspending)
@@ -2864,7 +2890,18 @@ impl KubernetesComputeDriver {
                 {
                     self.complete_sandbox_runtime_bootstrap(&lookup_api, &object)
                         .await;
-                    return Ok(());
+                    let cr_uid = object.metadata.uid.as_deref().ok_or_else(|| {
+                        KubernetesDriverError::Message("sandbox resource has no UID".to_string())
+                    })?;
+                    let supervisor_uid = required_sandbox_annotation(
+                        &object,
+                        ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID,
+                    )?;
+                    return Ok(kubernetes_runtime_identity(
+                        namespace,
+                        cr_uid,
+                        &supervisor_uid,
+                    ));
                 }
             }
 
@@ -2873,13 +2910,13 @@ impl KubernetesComputeDriver {
             // after gateway replacement because launch credentials stay in
             // memory and are supplied again by the caller.
             self.stop_sandbox_inner(sandbox_id).await?;
-            let mut refreshed = lookup_api
+            let refreshed = lookup_api
                 .api
                 .list(&ListParams::default().labels(&selector))
                 .await
                 .map_err(KubernetesDriverError::from_kube)?
                 .items;
-            object = refreshed.pop().ok_or(KubernetesDriverError::NotFound)?;
+            object = select_expected_sandbox_runtime(refreshed, &expected_runtime_identity)?;
         }
         let namespace = object
             .metadata
@@ -2913,6 +2950,7 @@ impl KubernetesComputeDriver {
                     sandbox_id,
                     encoded_generation,
                     encoded_authentication,
+                    encoded_expected_runtime_identity,
                 ))
                 .await;
             }
@@ -3057,7 +3095,11 @@ impl KubernetesComputeDriver {
             }
             return Err(error);
         }
-        Ok(())
+        Ok(kubernetes_runtime_identity(
+            &namespace,
+            cr_uid,
+            &supervisor_uid,
+        ))
     }
 
     async fn prepare_sandbox_stop(
@@ -4587,6 +4629,76 @@ fn sandbox_annotations(sandbox: &Sandbox) -> BTreeMap<String, String> {
         sandbox.workspace.clone(),
     );
     annotations
+}
+
+fn kubernetes_runtime_identity(namespace: &str, resource_uid: &str, pod_uid: &str) -> String {
+    format!("kubernetes://{namespace}/{resource_uid}/{pod_uid}")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct KubernetesRuntimeIdentity {
+    namespace: String,
+    resource_uid: String,
+}
+
+fn parse_kubernetes_runtime_identity(
+    encoded: &str,
+) -> Result<KubernetesRuntimeIdentity, KubernetesDriverError> {
+    let value = encoded.strip_prefix("kubernetes://").ok_or_else(|| {
+        KubernetesDriverError::Precondition(
+            "persisted runtime identity is missing or is not a Kubernetes identity".to_string(),
+        )
+    })?;
+    let mut components = value.split('/');
+    let namespace = components.next().unwrap_or_default();
+    let resource_uid = components.next().unwrap_or_default();
+    let pod_uid = components.next().unwrap_or_default();
+    if namespace.is_empty()
+        || resource_uid.is_empty()
+        || pod_uid.is_empty()
+        || components.next().is_some()
+    {
+        return Err(KubernetesDriverError::Precondition(
+            "persisted Kubernetes runtime identity is invalid".to_string(),
+        ));
+    }
+    Ok(KubernetesRuntimeIdentity {
+        namespace: namespace.to_string(),
+        resource_uid: resource_uid.to_string(),
+    })
+}
+
+fn select_expected_sandbox_runtime(
+    objects: Vec<DynamicObject>,
+    expected: &KubernetesRuntimeIdentity,
+) -> Result<DynamicObject, KubernetesDriverError> {
+    let [object]: [DynamicObject; 1] = objects.try_into().map_err(|objects: Vec<_>| {
+        if objects.is_empty() {
+            KubernetesDriverError::NotFound
+        } else {
+            KubernetesDriverError::Precondition(
+                "multiple Kubernetes Sandbox resources match the persisted sandbox identity"
+                    .to_string(),
+            )
+        }
+    })?;
+    let namespace = object.metadata.namespace.as_deref().ok_or_else(|| {
+        KubernetesDriverError::Precondition(
+            "matched Kubernetes Sandbox resource has no namespace".to_string(),
+        )
+    })?;
+    let resource_uid = object.metadata.uid.as_deref().ok_or_else(|| {
+        KubernetesDriverError::Precondition(
+            "matched Kubernetes Sandbox resource has no UID".to_string(),
+        )
+    })?;
+    if namespace != expected.namespace || resource_uid != expected.resource_uid {
+        return Err(KubernetesDriverError::Precondition(
+            "matched Kubernetes Sandbox resource does not match the persisted runtime identity"
+                .to_string(),
+        ));
+    }
+    Ok(object)
 }
 
 fn sandbox_id_from_object(obj: &DynamicObject) -> Result<String, String> {
@@ -7045,6 +7157,7 @@ mod tests {
                 "sandbox-1",
                 "invalid-generation",
                 b"secret-launch-authentication",
+                "kubernetes://namespace/resource/pod",
             )
             .with_subscriber(subscriber)
             .await
@@ -7380,11 +7493,74 @@ mod tests {
         ));
         let mut sandbox = DynamicObject::new("sandbox-a", &resource);
         sandbox.metadata.uid = Some(uid.to_string());
+        sandbox.metadata.namespace = Some("sandbox-namespace".to_string());
         sandbox.metadata.labels = Some(BTreeMap::from([(
             LABEL_SANDBOX_ID.to_string(),
             sandbox_id.to_string(),
         )]));
         sandbox
+    }
+
+    #[test]
+    fn restart_runtime_selection_preserves_namespace_and_resource_uid() {
+        let expected = parse_kubernetes_runtime_identity(
+            "kubernetes://sandbox-namespace/resource-uid/old-supervisor-uid",
+        )
+        .expect("persisted identity");
+        let sandbox = sandbox_object_for_test("resource-uid", "sandbox-id-a");
+        let selected = select_expected_sandbox_runtime(vec![sandbox], &expected)
+            .expect("matching runtime must be selected");
+        assert_eq!(selected.metadata.uid.as_deref(), Some("resource-uid"));
+
+        let wrong_namespace = KubernetesRuntimeIdentity {
+            namespace: "other-namespace".to_string(),
+            resource_uid: "resource-uid".to_string(),
+        };
+        assert!(matches!(
+            select_expected_sandbox_runtime(
+                vec![sandbox_object_for_test("resource-uid", "sandbox-id-a")],
+                &wrong_namespace,
+            ),
+            Err(KubernetesDriverError::Precondition(_))
+        ));
+
+        let wrong_uid = KubernetesRuntimeIdentity {
+            namespace: "sandbox-namespace".to_string(),
+            resource_uid: "replacement-resource-uid".to_string(),
+        };
+        assert!(matches!(
+            select_expected_sandbox_runtime(
+                vec![sandbox_object_for_test("resource-uid", "sandbox-id-a")],
+                &wrong_uid,
+            ),
+            Err(KubernetesDriverError::Precondition(_))
+        ));
+    }
+
+    #[test]
+    fn restart_runtime_selection_rejects_ambiguous_and_invalid_bindings() {
+        let expected = parse_kubernetes_runtime_identity(
+            "kubernetes://sandbox-namespace/resource-uid/old-supervisor-uid",
+        )
+        .expect("persisted identity");
+        assert!(matches!(
+            select_expected_sandbox_runtime(
+                vec![
+                    sandbox_object_for_test("resource-uid", "sandbox-id-a"),
+                    sandbox_object_for_test("resource-uid", "sandbox-id-a"),
+                ],
+                &expected,
+            ),
+            Err(KubernetesDriverError::Precondition(_))
+        ));
+        assert!(matches!(
+            parse_kubernetes_runtime_identity(""),
+            Err(KubernetesDriverError::Precondition(_))
+        ));
+        assert!(matches!(
+            parse_kubernetes_runtime_identity("kubernetes://namespace/resource-only"),
+            Err(KubernetesDriverError::Precondition(_))
+        ));
     }
 
     #[test]
