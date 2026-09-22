@@ -1015,17 +1015,26 @@ pub(crate) async fn run_server(
     shutdown_signal().await;
     info!("Shutdown signal received; stopping gateway");
     state.gateway_shutting_down.store(true, Ordering::Release);
+    state.supervisor_sessions.close_admission();
     let _ = shutdown_tx.send(true);
 
     if let Err(err) = listener_task.await {
         warn!(error = %err, "Gateway listener task failed during shutdown");
     }
 
-    state
-        .compute
-        .cleanup_on_shutdown()
-        .await
+    let compute_cleanup = state.compute.cleanup_on_shutdown().await;
+    // A stopped supervisor may still have a detached task deleting its owner
+    // record. Drain it even when compute cleanup failed before exiting Tokio.
+    let session_cleanup = state
+        .supervisor_sessions
+        .shutdown(Duration::from_secs(10))
+        .await;
+    if let Err(err) = &session_cleanup {
+        warn!(error = %err, "Gateway supervisor session cleanup incomplete");
+    }
+    compute_cleanup
         .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
+    session_cleanup.map_err(Error::execution)?;
 
     Ok(())
 }

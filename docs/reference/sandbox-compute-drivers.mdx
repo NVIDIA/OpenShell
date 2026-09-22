@@ -25,12 +25,18 @@ Delete remains independent and removes compute plus driver-owned persistent
 state. While a sandbox is stopped, gateway access paths and exposed services
 remain unavailable.
 
-Restarting the gateway preserves this intent. The gateway does not stop Docker
-or Podman containers during shutdown. At startup it sends idempotent start
+Restarting the gateway preserves this intent. During graceful shutdown, the
+gateway stops running-intent Docker, Podman, and MicroVM sandboxes through their
+drivers without recording an explicit user stop. At startup it sends idempotent start
 requests for Docker, Podman, and MicroVM sandboxes that were intended to run;
 already-running resources are unchanged, retained stopped compute is restarted,
 and explicitly stopped sandboxes remain stopped. Kubernetes workloads continue
 running independently of the gateway process.
+
+Before exiting, the gateway waits up to ten seconds for supervisor-session
+ownership cleanup so replacement supervisors can reconnect after restart.
+If tracked cleanup exceeds this deadline, the gateway reports a shutdown
+error. Persistence errors during ownership release are logged separately.
 
 The gateway forwards one exact, persisted main-process specification to every
 driver. Drivers serialize that specification in

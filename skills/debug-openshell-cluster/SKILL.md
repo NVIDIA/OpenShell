@@ -273,6 +273,12 @@ not follow this local gateway lifecycle. Internal and external drivers follow
 the same rule: `GetCapabilities.gateway_manages_lifecycle` must be true for the
 gateway to run shutdown and startup sweeps.
 
+The gateway also drains supervisor-session ownership cleanup before exiting.
+If shutdown reports `Gateway supervisor session cleanup incomplete`, inspect
+the associated persistence errors: a stopped supervisor's owner record may
+remain until its lease expires and temporarily block reconnection. Successful
+compute stop alone does not confirm that session cleanup finished.
+
 ### Step 5: Check Podman-Backed Gateways
 
 ```bash

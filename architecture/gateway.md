@@ -950,6 +950,15 @@ The same relay pattern backs interactive SSH, command execution, file sync, and
 local service forwarding. The gateway tracks live sessions in memory and
 persists session records so tokens can expire or be revoked.
 
+Graceful gateway shutdown closes supervisor-session admission before stopping
+local compute. It then signals the remaining control sessions to exit and waits
+up to ten seconds for their cleanup, including conditional deletion of persisted
+ownership. Pending connection setup and sessions already removed from the live
+registry remain tracked until cleanup finishes. This lets a replacement
+supervisor claim ownership immediately after restart without deleting a newer
+replica's claim. An incomplete drain is reported as a shutdown error. Closing
+these control sessions does not stop Kubernetes-owned workloads.
+
 Relay liveness has two backstops so a reset supervisor session cannot leave a
 request parked forever. The gateway runs server-side HTTP/2 keepalive on
 supervisor connections, and each exec relay's SSH client uses SSH keepalive: an

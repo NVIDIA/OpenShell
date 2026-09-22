@@ -3,11 +3,11 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock, mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -20,8 +20,8 @@ use openshell_core::proto::{
     PeerRelayFrame, PeerRelayInit, ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen,
     ReportEndpointStatusRequest, ReportEndpointStatusResponse, ReportMainProcessExitRequest,
     ReportMainProcessExitResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
-    Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget, SupervisorMessage, gateway_message,
-    open_shell_client, peer_relay_frame, relay_open, supervisor_message,
+    Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget, SupervisorHello, SupervisorMessage,
+    gateway_message, open_shell_client, peer_relay_frame, relay_open, supervisor_message,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
@@ -324,6 +324,11 @@ pub struct SupervisorSessionRegistry {
     sessions: Mutex<HashMap<String, LiveSession>>,
     /// `channel_id` -> oneshot sender for the reverse CONNECT stream.
     pending_relays: Mutex<HashMap<String, PendingRelay>>,
+    /// Read guards cover owner publication through final cleanup, even after
+    /// a session has left `sessions`. Shutdown waits for the write guard.
+    session_lifetimes: Arc<RwLock<()>>,
+    admission_closed: AtomicBool,
+    shutdown: watch::Sender<bool>,
 }
 
 struct PendingRelay {
@@ -353,6 +358,36 @@ impl std::fmt::Debug for SupervisorSessionRegistry {
 impl SupervisorSessionRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn track_session(&self) -> Result<OwnedRwLockReadGuard<()>, Status> {
+        // Acquire tracking BEFORE checking admission. A concurrent shutdown
+        // either sees this reader and waits for it, or prevents its admission.
+        let lifetime = Arc::clone(&self.session_lifetimes)
+            .try_read_owned()
+            .map_err(|_| Status::unavailable("gateway is shutting down"))?;
+        if self.admission_closed.load(Ordering::Acquire) {
+            return Err(Status::unavailable("gateway is shutting down"));
+        }
+        Ok(lifetime)
+    }
+
+    /// Prevent existing HTTP connections from creating new owner records.
+    pub(crate) fn close_admission(&self) {
+        self.admission_closed.store(true, Ordering::Release);
+    }
+
+    /// Close control sessions and wait for tracked ownership cleanup. Call
+    /// after compute shutdown so supervisors can finish normal stop reporting.
+    pub(crate) async fn shutdown(&self, timeout: Duration) -> Result<(), String> {
+        self.close_admission();
+        self.shutdown.send_replace(true);
+        tokio::time::timeout(timeout, self.session_lifetimes.write())
+            .await
+            .map(|_| ())
+            .map_err(|_| {
+                format!("supervisor session ownership cleanup did not complete within {timeout:?}")
+            })
     }
 
     /// Register a live supervisor session for the given sandbox.
@@ -1761,6 +1796,34 @@ pub async fn handle_connect_supervisor(
     // supervisors remain usable but cannot assert provider installation.
     let provider_readiness = ProviderReadinessEvidence::from_hello(&hello)?;
 
+    let session_lifetime = state.supervisor_sessions.track_session()?;
+    let state = Arc::clone(state);
+    // Keep setup alive if the RPC caller disconnects after publication. The
+    // tracking guard moves into the session task or outlives early cleanup.
+    tokio::spawn(establish_supervisor_session(
+        state,
+        inbound,
+        hello,
+        provider_readiness,
+        session_lifetime,
+    ))
+    .await
+    .map_err(|error| Status::internal(format!("supervisor session setup failed: {error}")))?
+}
+
+async fn establish_supervisor_session(
+    state: Arc<ServerState>,
+    mut inbound: tonic::Streaming<SupervisorMessage>,
+    hello: SupervisorHello,
+    provider_readiness: ProviderReadinessEvidence,
+    session_lifetime: OwnedRwLockReadGuard<()>,
+) -> Result<
+    Response<
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<GatewayMessage, Status>> + Send + 'static>>,
+    >,
+    Status,
+> {
+    let sandbox_id = hello.sandbox_id.clone();
     let session_id = Uuid::new_v4().to_string();
     let owner_peer_endpoint = state.peer_endpoint.as_deref().map_or_else(
         || local_owner_endpoint(&state.replica_id),
@@ -1808,7 +1871,7 @@ pub async fn handle_connect_supervisor(
     // results before acknowledging the session so it cannot inherit evidence
     // reported by the superseded stream.
     if let Err(error) = crate::grpc::policy::reset_endpoint_status_for_supervisor_session(
-        state,
+        &state,
         &sandbox_id,
         &session_id,
     )
@@ -1905,9 +1968,10 @@ pub async fn handle_connect_supervisor(
     }
 
     // Step 4: Spawn the session loop that reads inbound messages.
-    let state_clone = Arc::clone(state);
+    let state_clone = Arc::clone(&state);
     let sandbox_id_clone = sandbox_id.clone();
     tokio::spawn(async move {
+        let _session_lifetime = session_lifetime;
         let mut owner_guard = owner_guard;
         run_session_loop(
             &state_clone,
@@ -2030,6 +2094,7 @@ async fn run_session_loop(
     mut shutdown_rx: oneshot::Receiver<()>,
     owner_guard: &mut OwnerGuard,
 ) {
+    let mut gateway_shutdown = state.supervisor_sessions.shutdown.subscribe();
     let heartbeat_interval = Duration::from_secs(u64::from(HEARTBEAT_INTERVAL_SECS));
     let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
     // Skip the first immediate tick.
@@ -2037,6 +2102,10 @@ async fn run_session_loop(
 
     loop {
         tokio::select! {
+            () = async { let _ = gateway_shutdown.wait_for(|shutdown| *shutdown).await; } => {
+                info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: gateway shutting down");
+                break;
+            }
             _ = &mut shutdown_rx => {
                 info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: superseded by reconnect, shutting down");
                 break;
@@ -2212,6 +2281,153 @@ mod tests {
     /// `register` signature without the receiver noise.
     fn make_shutdown() -> oneshot::Sender<()> {
         oneshot::channel::<()>().0
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_owner_release_after_session_leaves_registry() {
+        let registry = Arc::new(SupervisorSessionRegistry::new());
+        let owner_index = Arc::new(SupervisorOwnerIndex::new(test_store().await, OWNER_TTL));
+        let lifetime = registry.track_session().unwrap();
+        let owner = owner_index
+            .publish(
+                "sb-1",
+                "old-session",
+                "old-instance",
+                1,
+                "old-replica",
+                "local://old",
+            )
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        registry.register("sb-1".into(), "old-session".into(), tx, make_shutdown());
+
+        let (removed_tx, removed_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let cleanup_registry = Arc::clone(&registry);
+        let cleanup_index = owner_index.clone();
+        let cleanup = tokio::spawn(async move {
+            let _lifetime = lifetime;
+            cleanup_registry.remove_if_current("sb-1", "old-session");
+            removed_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            cleanup_index.release_if_current(&owner).await.unwrap();
+        });
+        removed_rx.await.unwrap();
+        assert!(registry.sessions.lock().unwrap().is_empty());
+
+        let shutdown = registry.shutdown(Duration::from_secs(5));
+        tokio::pin!(shutdown);
+        assert!(futures_util::poll!(&mut shutdown).is_pending());
+        assert!(matches!(
+            owner_index
+                .publish(
+                    "sb-1",
+                    "new-session",
+                    "new-instance",
+                    1,
+                    "new-replica",
+                    "local://new"
+                )
+                .await,
+            Err(OwnerError::AlreadyOwned)
+        ));
+
+        release_tx.send(()).unwrap();
+        shutdown.await.unwrap();
+        cleanup.await.unwrap();
+        assert!(owner_index.read("sb-1").await.unwrap().is_none());
+        owner_index
+            .publish(
+                "sb-1",
+                "new-session",
+                "new-instance",
+                1,
+                "new-replica",
+                "local://new",
+            )
+            .await
+            .expect("restart can immediately claim ownership after shutdown");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_admitted_setup_and_rejects_new_connections() {
+        let registry = SupervisorSessionRegistry::new();
+        // An RPC has been admitted but has not yet registered a live session.
+        let lifetime = registry.track_session().unwrap();
+        registry.close_admission();
+        assert_eq!(
+            registry.track_session().unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+        // Closing admission alone must leave stop reporting available.
+        assert!(!*registry.shutdown.borrow());
+
+        let shutdown = registry.shutdown(Duration::from_secs(5));
+        tokio::pin!(shutdown);
+        assert!(futures_util::poll!(&mut shutdown).is_pending());
+        // An admitted setup that starts its session loop after cancellation
+        // must still observe the shutdown signal immediately.
+        let mut late_subscriber = registry.shutdown.subscribe();
+        assert!(*late_subscriber.wait_for(|closing| *closing).await.unwrap());
+        drop(lifetime);
+        shutdown.await.unwrap();
+        assert_eq!(
+            registry.track_session().unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleanup_does_not_delete_replacement_owner() {
+        let registry = Arc::new(SupervisorSessionRegistry::new());
+        let owner_index = SupervisorOwnerIndex::new(test_store().await, OWNER_TTL);
+        let lifetime = registry.track_session().unwrap();
+        let old = owner_index
+            .publish("sb-1", "old", "instance", 1, "replica-a", "local://a")
+            .await
+            .unwrap();
+        let replacement = owner_index
+            .publish("sb-1", "new", "instance", 2, "replica-b", "local://b")
+            .await
+            .unwrap();
+        let shutdown = registry.shutdown(Duration::from_secs(5));
+        tokio::pin!(shutdown);
+        assert!(futures_util::poll!(&mut shutdown).is_pending());
+        owner_index.release_if_current(&old).await.unwrap();
+        drop(lifetime);
+        shutdown.await.unwrap();
+        let persisted = owner_index.read("sb-1").await.unwrap().unwrap();
+        assert_eq!(persisted.session_id, replacement.session_id);
+        assert_eq!(persisted.owner_replica_id, replacement.owner_replica_id);
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_bounded_failure_when_cleanup_stalls() {
+        let registry = SupervisorSessionRegistry::new();
+        let lifetime = registry.track_session().unwrap();
+        let error = registry
+            .shutdown(Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(error.contains("ownership cleanup did not complete"));
+        assert!(*registry.shutdown.borrow());
+        assert_eq!(
+            registry.track_session().unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+        drop(lifetime);
+        registry.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_sessions_completes_and_closes_admission() {
+        let registry = SupervisorSessionRegistry::new();
+        registry.shutdown(Duration::from_secs(1)).await.unwrap();
+        assert_eq!(
+            registry.track_session().unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
     }
 
     #[test]
