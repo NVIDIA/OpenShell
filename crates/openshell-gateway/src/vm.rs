@@ -173,6 +173,11 @@ impl VmComputeConfig {
                 "grpc_endpoint is required when using the vm compute driver",
             ));
         }
+        if self.bootstrap_image.trim().is_empty() && self.default_image.trim().is_empty() {
+            return Err(Error::config(
+                "bootstrap_image or default_image is required when using the vm compute driver; sandbox images cannot be used as VM bootstrap images",
+            ));
+        }
         validate_vm_sandbox_identity(self)?;
         if self
             .rootfs_tar_staging_dir
@@ -795,6 +800,34 @@ mod tests {
             VmComputeConfig::default().default_image,
             openshell_core::image::DEFAULT_SANDBOX_BASE_IMAGE
         );
+    }
+
+    #[test]
+    fn vm_gateway_requires_a_trusted_bootstrap_image_source() {
+        let config = VmComputeConfig {
+            grpc_endpoint: "http://127.0.0.1:50051".to_string(),
+            default_image: String::new(),
+            bootstrap_image: String::new(),
+            ..Default::default()
+        };
+        let error = config
+            .validate_configuration()
+            .expect_err("the gateway must reject an empty bootstrap configuration");
+        assert!(error.to_string().contains("sandbox images cannot be used"));
+
+        VmComputeConfig {
+            default_image: "openshell/sandbox:default".to_string(),
+            ..config.clone()
+        }
+        .validate_configuration()
+        .expect("the operator-controlled default image is a valid fallback");
+
+        VmComputeConfig {
+            bootstrap_image: "openshell/sandbox-bootstrap:latest".to_string(),
+            ..config
+        }
+        .validate_configuration()
+        .expect("an explicit bootstrap image is valid");
     }
 
     #[test]

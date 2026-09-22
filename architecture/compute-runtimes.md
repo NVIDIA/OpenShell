@@ -364,7 +364,8 @@ handles with no-follow file creation, so later copies, permission changes, and
 whiteouts cannot be redirected by replacing a validated pathname component.
 The bootstrap rootfs comes only from the operator-configured `bootstrap_image`
 or `default_image`; a sandbox-requested image never becomes the VM bootstrap
-image, and the driver fails startup when neither trusted source is configured.
+image. The gateway rejects configurations without either trusted source, and
+the standalone driver independently fails startup for the same condition.
 
 Runtime-specific implementation notes belong in the driver crate README:
 
