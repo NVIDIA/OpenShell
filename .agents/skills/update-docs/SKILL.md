@@ -63,7 +63,7 @@ For each relevant commit, determine which doc page(s) it affects. Use this mappi
 | `python/` (SDK changes) | `docs/reference/` or `docs/get-started/quickstart.mdx` |
 | `proto/` (API changes) | `docs/reference/` |
 | `deploy/` (Dockerfile, Helm) | `docs/sandboxes/manage-gateways.mdx`, `docs/about/architecture.mdx` |
-| Community sandbox definitions | `docs/sandboxes/community-sandboxes.mdx` |
+| Sandbox image behavior | `docs/sandboxes/manage-sandboxes.mdx` |
 
 If a commit does not map to any existing page but introduces a user-visible concept, flag it as needing a new page.
 

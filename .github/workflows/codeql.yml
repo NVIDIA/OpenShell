@@ -7,13 +7,23 @@ on:
   schedule:
     - cron: "29 5 * * *"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      candidate_ref:
+        description: Optional pre-release tag to scan instead of the triggering revision
+        default: ""
+        type: string
+      fail-on-findings:
+        description: Fail on HIGH/CRITICAL security findings (score at least 7.0)
+        default: false
+        type: boolean
 
 permissions:
   contents: read
   security-events: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: codeql-${{ github.workflow }}-${{ inputs.candidate_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -38,7 +48,9 @@ jobs:
             build-mode: none
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
         with:
+          ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
           persist-credentials: false
 
       - name: Set up Go
@@ -69,9 +81,11 @@ jobs:
           upload: never
 
       - name: Summarize findings
+        id: findings
         if: always()
         env:
           LANGUAGE: ${{ matrix.language }}
+          FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings || false }}
         shell: bash
         run: |
           set -euo pipefail
@@ -83,11 +97,23 @@ jobs:
             echo
             if [ "${#sarif_files[@]}" -eq 0 ]; then
               echo "No SARIF report was produced."
+              exit 1
             else
-              finding_count=$(jq -s '[.[].runs[]?.results[]?] | length' "${sarif_files[@]}")
+              finding_count=$(jq -s '[.[].runs[].results[]] | length' "${sarif_files[@]}")
+              high_count=$(jq -s '
+                [ .[].runs[] | . as $run | .results[]
+                  | select(all(.suppressions[]?; .status != "accepted"))
+                  | .ruleId as $id
+                  | ($run.tool.driver, $run.tool.extensions[]?) | .rules[]?
+                  | select(.id == $id)
+                  | select((.properties["security-severity"] // "0" | tonumber) >= 7)
+                ] | length
+              ' "${sarif_files[@]}")
+              echo "high_count=$high_count" >> "$GITHUB_OUTPUT"
               echo "Findings: $finding_count"
+              echo "HIGH/CRITICAL: $high_count"
               echo
-              echo "Findings are informational and do not fail CI."
+              echo "Fail on HIGH/CRITICAL: $FAIL_ON_FINDINGS"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -96,6 +122,8 @@ jobs:
         uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           sarif_file: codeql-results
+          ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
+          sha: ${{ inputs.candidate_ref && steps.checkout.outputs.commit || '' }}
           category: /language:${{ matrix.language }}
 
       - name: Upload SARIF
@@ -107,8 +135,22 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      - name: Enforce HIGH/CRITICAL threshold
+        if: ${{ !cancelled() && steps.findings.outcome == 'success' }}
+        env:
+          HIGH_COUNT: ${{ steps.findings.outputs.high_count }}
+          FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings || false }}
+        run: |
+          if [ "$HIGH_COUNT" -gt 0 ]; then
+            if [ "$FAIL_ON_FINDINGS" = "true" ]; then
+              echo "::error::CodeQL reported $HIGH_COUNT HIGH/CRITICAL findings."
+              exit 1
+            fi
+            echo "::warning::CodeQL reported $HIGH_COUNT HIGH/CRITICAL findings; enforcement is disabled."
+          fi
+
   result:
-    name: OpenShell / CodeQL (informational)
+    name: ${{ inputs.fail-on-findings && 'OpenShell / CodeQL' || 'OpenShell / CodeQL (informational)' }}
     if: always()
     needs: analyze
     runs-on: ubuntu-latest
@@ -120,7 +162,7 @@ jobs:
         shell: bash
         run: |
           if [ "$ANALYZE_RESULT" != "success" ]; then
-            echo "::error::One or more CodeQL analyzers did not complete successfully."
+            echo "::error::CodeQL execution or the configured finding threshold failed."
             exit 1
           fi
-          echo "All CodeQL analyzers completed; findings remain informational."
+          echo "All CodeQL analyzers completed and the configured finding threshold passed."

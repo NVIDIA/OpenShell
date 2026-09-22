@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Resolve tmachine UID
+  ansible.builtin.command:
+    argv:
+      - id
+      - -u
+      - tmachine
+  changed_when: false
+  register: tmachine_container_runtime_tmachine_uid
+
+- name: Check Docker socket
+  become: true
+  ansible.builtin.stat:
+    path: /var/run/docker.sock
+  register: tmachine_container_runtime_docker_socket
+
+- name: Check rootful Podman socket
+  become: true
+  ansible.builtin.stat:
+    path: /run/podman/podman.sock
+  register: tmachine_container_runtime_rootful_podman_socket
+
+- name: Check rootless Podman socket
+  become: true
+  ansible.builtin.stat:
+    path: "/run/user/{{ tmachine_container_runtime_tmachine_uid.stdout }}/podman/podman.sock"
+  register: tmachine_container_runtime_rootless_podman_socket
+
+- name: Require exactly one container runtime socket
+  ansible.builtin.assert:
+    that:
+      - >-
+        (tmachine_container_runtime_docker_socket.stat.exists | int)
+        + (tmachine_container_runtime_rootful_podman_socket.stat.exists | int)
+        + (tmachine_container_runtime_rootless_podman_socket.stat.exists | int) == 1
+    fail_msg: Expected exactly one Docker or Podman socket
+
+- name: Select tmachine container runtime
+  ansible.builtin.set_fact:
+    tmachine_container_runtime_name: >-
+      {{ 'docker' if tmachine_container_runtime_docker_socket.stat.exists else 'podman' }}
+    tmachine_container_runtime_is_rootless: >-
+      {{ tmachine_container_runtime_rootless_podman_socket.stat.exists }}
+    tmachine_container_runtime_socket: >-
+      {{ '/var/run/docker.sock' if tmachine_container_runtime_docker_socket.stat.exists
+         else '/run/podman/podman.sock' if tmachine_container_runtime_rootful_podman_socket.stat.exists
+         else '/run/user/' ~ tmachine_container_runtime_tmachine_uid.stdout ~ '/podman/podman.sock' }}

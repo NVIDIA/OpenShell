@@ -12,8 +12,7 @@ use openshell_core::proto::compute::v1::{
     AuthenticateSandboxRequest, AuthenticateSandboxResponse, CreateSandboxRequest,
     CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse, DeleteWorkspaceRequest,
     DeleteWorkspaceResponse, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
-    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
@@ -37,9 +36,17 @@ impl ComputeDriverService {
 impl ComputeDriver for ComputeDriverService {
     async fn get_capabilities(
         &self,
-        _request: Request<GetCapabilitiesRequest>,
+        request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
-        Ok(Response::new(self.backend.capabilities()))
+        let capabilities = self.backend.capabilities();
+        openshell_core::extension_protocol::validate_gateway_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::Compute,
+            "mxc",
+            capabilities.extension.as_ref(),
+            request.into_inner().gateway,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(capabilities))
     }
 
     async fn authenticate_sandbox(
@@ -49,17 +56,6 @@ impl ComputeDriver for ComputeDriverService {
         Err(Status::unimplemented(
             "mxc does not authenticate sandbox credentials",
         ))
-    }
-
-    async fn get_gateway_listener_requirements(
-        &self,
-        _request: Request<GetGatewayListenerRequirementsRequest>,
-    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
-        // MXC is an in-process, single-host driver: it needs no extra gateway
-        // listeners (no relay/surrogate/remote endpoint), so it reports none.
-        Ok(Response::new(GetGatewayListenerRequirementsResponse {
-            requirements: Vec::new(),
-        }))
     }
 
     async fn validate_sandbox_create(
@@ -79,14 +75,14 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
         let req = request.into_inner();
-        if req.sandbox_name.is_empty() {
-            return Err(Status::invalid_argument("sandbox_name is required"));
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
         }
         let sandbox = self
             .backend
-            .get_sandbox(&req.sandbox_name)
+            .get_sandbox(&req.name)
             .await
-            .ok_or_else(|| Status::not_found(format!("sandbox {} not found", req.sandbox_name)))?;
+            .ok_or_else(|| Status::not_found(format!("sandbox {} not found", req.name)))?;
         if !req.sandbox_id.is_empty() && req.sandbox_id != sandbox.id {
             return Err(Status::failed_precondition(
                 "sandbox_id did not match the fetched sandbox",
@@ -114,7 +110,7 @@ impl ComputeDriver for ComputeDriverService {
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.backend.create_sandbox(&sandbox).await?;
-        Ok(Response::new(CreateSandboxResponse {}))
+        Ok(Response::new(CreateSandboxResponse::default()))
     }
 
     async fn stop_sandbox(
@@ -151,12 +147,12 @@ impl ComputeDriver for ComputeDriverService {
         if req.sandbox_id.is_empty() {
             return Err(Status::invalid_argument("sandbox_id is required"));
         }
-        if req.sandbox_name.is_empty() {
-            return Err(Status::invalid_argument("sandbox_name is required"));
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
         }
         let deleted = self
             .backend
-            .delete_sandbox(&req.sandbox_id, &req.sandbox_name)
+            .delete_sandbox(&req.sandbox_id, &req.name)
             .await?;
         Ok(Response::new(DeleteSandboxResponse { deleted }))
     }
@@ -205,6 +201,20 @@ mod tests {
 
         assert_eq!(error.code(), tonic::Code::Unimplemented);
         assert!(error.message().contains("does not support restarting"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_authentication_is_not_supported() {
+        let service =
+            ComputeDriverService::new(MxcComputeBackend::new(MxcComputeConfig::default()));
+
+        let error = service
+            .authenticate_sandbox(Request::new(AuthenticateSandboxRequest::default()))
+            .await
+            .expect_err("MXC must not advertise sandbox credential authentication");
+
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        assert!(error.message().contains("does not authenticate"));
     }
 
     #[tokio::test]

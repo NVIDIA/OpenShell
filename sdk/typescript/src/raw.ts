@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 export * from './gen/datamodel_pb.js';
+export * from './gen/google/rpc/error_details_pb.js';
 // Advanced surface: the full generated protobuf types (messages, enums, and the
 // OpenShell service descriptor) for callers using the raw escape hatch on
 // OpenShellClient / SandboxClient (`.raw` and `.transport`). These are the

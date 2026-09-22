@@ -1,0 +1,170 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Explicit compatibility exceptions for the schema-v2 parity campaign. These
+# entries document behavior that is not expected to match schema v1 byte for
+# byte. They do not waive the requirement that the replacement behavior work.
+ledger_version = 1
+issue = 2792
+baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+candidate_start_commit = "8c868e430e9cd3284d7e274628419ab484ebcee0"
+
+[[intentional_changes]]
+id = "schema-version-cutover"
+category = "schema_cutover"
+origin_main_contract = "Gateway configuration uses schema version 1; omitted versions were accepted in some paths."
+schema_v2_contract = "Every loaded gateway configuration must declare [openshell] version = 2; missing, v1, and future versions fail."
+migration = "Set version = 2 and apply every field relocation, rename, and type migration in this ledger before restart."
+rationale = "An explicit version boundary prevents a partially migrated security-sensitive configuration from being interpreted with mixed ownership rules."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["schema-version-and-strict-layout", "rpm-schema-upgrade", "homebrew-debian-and-snap-upgrades"]
+
+[[intentional_changes]]
+id = "singular-compute-driver-selector"
+category = "cardinality"
+origin_main_contract = "Configuration spells the selector compute_drivers as a list even though runtime selection rejects more than one configured driver."
+schema_v2_contract = "Configuration uses one optional scalar compute_driver; omission retains built-in auto-detection."
+migration = "Replace compute_drivers = [\"name\"] with compute_driver = \"name\"."
+rationale = "The schema now represents the existing one-driver runtime invariant instead of implying unsupported multi-driver operation."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["schema-version-and-strict-layout", "external-compute-driver-socket"]
+
+[[intentional_changes]]
+id = "driver-table-exclusive-ownership"
+category = "ownership"
+origin_main_contract = "Selected driver tables inherit an allowlisted set of values from [openshell.gateway]."
+schema_v2_contract = "Driver-specific values are read only from [openshell.drivers.<name>]; gateway scope contains only gateway-owned values."
+migration = "Move every driver option to the selected driver table instead of relying on gateway inheritance."
+rationale = "Only one compute driver is active, so inheritance adds ambiguity and can map one gateway key to different backend meanings."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["schema-version-and-strict-layout", "docker-image-and-callback-configuration", "podman-image-and-callback-configuration", "kubernetes-core-placement-and-images", "vm-launch-and-resource-configuration"]
+
+[[intentional_changes]]
+id = "kubernetes-fields-relocated"
+category = "relocation"
+origin_main_contract = "Kubernetes namespace, image, client TLS Secret, ServiceAccount, host gateway, user namespace, and token TTL values may be inherited from gateway scope."
+schema_v2_contract = "Those values exist exclusively under [openshell.drivers.kubernetes]."
+migration = "Move namespace, default_image, supervisor_image, client_tls_secret_name, service_account_name, host_gateway_ip, enable_user_namespaces, and sa_token_ttl_secs into the Kubernetes driver table."
+rationale = "Kubernetes-only deployment controls are not gateway-wide concerns."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["kubernetes-core-placement-and-images"]
+
+[[intentional_changes]]
+id = "docker-sandbox-label-rename"
+category = "rename"
+origin_main_contract = "Docker identifies OpenShell containers with sandbox_namespace."
+schema_v2_contract = "Docker uses sandbox_label."
+migration = "Rename [openshell.drivers.docker].sandbox_namespace to sandbox_label."
+rationale = "The value is a Docker container label, not a Kubernetes-style namespace."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["docker-image-and-callback-configuration"]
+
+[[intentional_changes]]
+id = "podman-ssh-socket-rename"
+category = "rename"
+origin_main_contract = "Podman uses sandbox_ssh_socket_path in gateway TOML."
+schema_v2_contract = "Podman uses ssh_socket_path in gateway TOML."
+migration = "Rename [openshell.drivers.podman].sandbox_ssh_socket_path to ssh_socket_path."
+rationale = "The canonical name now matches the Docker and Kubernetes driver tables."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["podman-runtime-security-and-health"]
+
+[[intentional_changes]]
+id = "vm-grpc-endpoint-rename"
+category = "rename"
+origin_main_contract = "The VM gateway TOML callback override is grpc_endpoint, while the spawned standalone driver uses the internal field openshell_endpoint and flag --openshell-endpoint; OPENSHELL_GRPC_ENDPOINT is the environment override."
+schema_v2_contract = "The VM gateway TOML callback override remains grpc_endpoint, and the spawned standalone driver now uses the same internal field name plus --grpc-endpoint; OPENSHELL_GRPC_ENDPOINT is unchanged."
+migration = "No gateway TOML key changes. Operators invoking openshell-driver-vm directly must replace --openshell-endpoint with --grpc-endpoint."
+rationale = "All compute drivers use the same name for the gateway gRPC callback endpoint."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["vm-launch-and-resource-configuration", "external-compute-driver-socket"]
+
+[[intentional_changes]]
+id = "canonical-image-pull-policy"
+category = "type_normalization"
+origin_main_contract = "Drivers accept different pull-policy types and spellings, including Podman missing and Kubernetes-style capitalization."
+schema_v2_contract = "Gateway TOML uses always, if_not_present, never, and Podman-only newer through the shared typed policy."
+migration = "Translate legacy or runtime-native spellings to canonical lowercase values."
+rationale = "A shared validated type rejects typos before contacting a container runtime while preserving Podman's additional newer behavior."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["docker-image-and-callback-configuration", "podman-image-and-callback-configuration", "kubernetes-core-placement-and-images", "local-launch-script-producers"]
+
+[[intentional_changes]]
+id = "gateway-jwt-zero-sentinel-removed"
+category = "sentinel_removal"
+origin_main_contract = "gateway_jwt.ttl_secs = 0 means that sandbox tokens do not expire."
+schema_v2_contract = "Omitting gateway_jwt.ttl_secs means non-expiring sandbox tokens; an explicit zero is invalid."
+migration = "Remove ttl_secs when non-expiring local tokens are intended, or set a positive duration."
+rationale = "Omission distinguishes a deliberate absence of expiry from an invalid duration."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["gateway-minted-sandbox-jwt"]
+
+[[intentional_changes]]
+id = "sandbox-pid-zero-sentinel-removed"
+category = "sentinel_removal"
+origin_main_contract = "Docker and Podman sandbox_pids_limit use zero as a backend-default sentinel."
+schema_v2_contract = "Omitting sandbox_pids_limit uses the OpenShell default of 2048; configured values must be positive."
+migration = "Remove a zero sandbox_pids_limit or replace it with a positive explicit limit."
+rationale = "A typed optional non-zero limit removes ambiguous zero handling and gives both local container drivers one default."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["docker-security-and-provider-configuration", "podman-runtime-security-and-health"]
+
+[[intentional_changes]]
+id = "podman-pid-limit-restored"
+category = "bug_fix"
+origin_main_contract = "Podman accepts a positive sandbox_pids_limit, but serializes it with Docker's PidsLimit shape; libpod ignores that field and applies its default limit of 2048."
+schema_v2_contract = "Podman serializes a positive sandbox_pids_limit as OCI resource_limits.pids.limit, and the configured value is applied to the container."
+migration = "No configuration migration is required; existing positive values begin taking effect after upgrading."
+rationale = "Schema-v2 live validation exposed that the frozen baseline accepted this security control without enforcing it at runtime. Preserving that defect would make configuration parity unsafe."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["podman-runtime-security-and-health"]
+
+[[intentional_changes]]
+id = "podman-health-zero-sentinel-removed"
+category = "sentinel_removal"
+origin_main_contract = "Podman health_check_interval_secs = 0 disables health checks."
+schema_v2_contract = "Omitting health_check_interval_secs disables gateway-managed Podman health checks; configured values must be positive."
+migration = "Remove a zero health_check_interval_secs or set a positive interval."
+rationale = "Optional non-zero duration expresses enabled and disabled states without a sentinel."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["podman-runtime-security-and-health"]
+
+[[intentional_changes]]
+id = "guest-tls-centralized"
+category = "ownership"
+origin_main_contract = "Local driver tables may override guest_tls_ca, guest_tls_cert, and guest_tls_key inherited from gateway scope."
+schema_v2_contract = "One complete guest TLS bundle is gateway-owned and injected into the selected Docker, Podman, or VM driver; driver-local fields are rejected."
+migration = "Keep guest_tls_ca, guest_tls_cert, and guest_tls_key under [openshell.gateway] only."
+rationale = "A single active local driver needs one callback client identity, and centralized validation prevents partial or conflicting bundles."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["guest-callback-tls-ownership"]
+
+[[intentional_changes]]
+id = "middleware-payload-name-normalized"
+category = "rename_with_alias"
+origin_main_contract = "Supervisor middleware uses max_body_bytes while gateway interceptors use max_response_bytes."
+schema_v2_contract = "Supervisor middleware uses max_payload_bytes and continues accepting max_body_bytes as a compatibility alias."
+migration = "Prefer max_payload_bytes in new configuration; existing max_body_bytes remains accepted."
+rationale = "Payload describes middleware data more accurately without forcing an immediate compatibility break."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["supervisor-middleware-registration"]
+
+[[intentional_changes]]
+id = "vm-sandbox-identity-selection"
+category = "default_behavior"
+origin_main_contract = "New VM sandboxes default to UID and GID 10001 when no explicit identity is configured."
+schema_v2_contract = "New VM root filesystems use the image sandbox account when present and otherwise UID/GID 1000; persisted overlays retain recorded or recoverable identity and ambiguous state fails closed."
+migration = "Set sandbox_uid and sandbox_gid for a fixed identity, or retain the generated owner marker with persistent VM state."
+rationale = "Image-derived identity preserves filesystem ownership, while explicit state evidence avoids silently reassigning legacy overlays."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["vm-launch-and-resource-configuration", "vm-guest-security-and-spiffe"]
+
+[[intentional_changes]]
+id = "package-default-only-auto-migration"
+category = "migration_policy"
+origin_main_contract = "Package-managed and operator-edited schema-v1 configuration may exist at upgrade time."
+schema_v2_contract = "RPM and Homebrew automatically replace only recognized byte-identical package defaults; Debian and Snap preserve every legacy file and fail closed through read-only package preflight with explicit manual-migration guidance because their historical generated defaults have no safe provenance marker."
+migration = "Automatically migrate recognized defaults, preserve every edited file, and require manual schema-v2 conversion when a package cannot prove that a legacy file is an untouched default."
+rationale = "An upgrade must not overwrite operator intent merely because the old schema no longer parses."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["rpm-schema-upgrade", "homebrew-debian-and-snap-upgrades"]

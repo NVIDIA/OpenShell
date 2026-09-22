@@ -32,3 +32,13 @@ misconfigurations:
       - "**/deployment.yaml"
     statement: >-
       Images come from ghcr.io/nvidia/openshell, this project's own registry.
+
+  # The Kubernetes compute driver creates its runtime infrastructure and the
+  # per-sandbox outer egress fence in the configured sandbox namespace.
+  - id: KSV-0056
+    paths:
+      - "**/role.yaml"
+    statement: >-
+      The namespace-scoped gateway role can create Services and NetworkPolicy
+      resources so the compute driver can connect each sandbox runtime to its
+      supervisor while denying direct workload egress.

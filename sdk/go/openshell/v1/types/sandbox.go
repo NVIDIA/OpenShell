@@ -18,6 +18,9 @@ type Sandbox struct {
 	CreatedFromWorkloadTemplate *SandboxWorkloadTemplateProvenance
 	Spec                        SandboxSpec
 	Status                      SandboxStatus
+	// ServiceURLs is populated by create operations and keyed by service name.
+	// The empty key identifies the unnamed service.
+	ServiceURLs map[string]string
 }
 
 // SandboxSpec holds the desired state of a sandbox.
@@ -109,7 +112,6 @@ type SandboxWorkloadTemplateProvenance struct {
 
 // SandboxStatus holds the observed state of a sandbox.
 type SandboxStatus struct {
-	SandboxName          string
 	AgentPod             string
 	AgentFd              string
 	SandboxFd            string
@@ -117,7 +119,74 @@ type SandboxStatus struct {
 	Conditions           []SandboxCondition
 	CurrentPolicyVersion uint32
 	ExitCode             *int32
+	// EndpointStatuses describes configured external tool endpoints and their
+	// last accepted network results, independently of sandbox readiness.
+	EndpointStatuses       []EndpointStatus
+	ConfigurationAdmission *SandboxConfigurationAdmission
 }
+
+// ConfigurationAdmissionState describes validation of an effective configuration.
+type ConfigurationAdmissionState string
+
+// Configuration admission states reported by the gateway.
+const (
+	ConfigurationAdmissionUnknown  ConfigurationAdmissionState = "unknown"
+	ConfigurationAdmissionPending  ConfigurationAdmissionState = "pending"
+	ConfigurationAdmissionAccepted ConfigurationAdmissionState = "accepted"
+	ConfigurationAdmissionRejected ConfigurationAdmissionState = "rejected"
+)
+
+// SandboxConfigurationAdmission identifies a validated or rejected configuration.
+// Supervisor instance fencing remains available through the raw protobuf API.
+type SandboxConfigurationAdmission struct {
+	State               ConfigurationAdmissionState
+	PolicyVersion       uint32
+	PolicyHash          string
+	ConfigRevision      uint64
+	ProviderEnvRevision uint64
+	Error               string
+}
+
+// EndpointStatus holds a configured tool endpoint and its last accepted network result.
+// Observations aggregate configured callers across the listed ports; the result
+// does not establish present availability or successful tool execution.
+type EndpointStatus struct {
+	// EndpointID selects this endpoint without parsing its address or display text.
+	EndpointID string
+	Host       string
+	Ports      []uint32
+	Path       string
+	LastResult EndpointResult
+	// LastReportedAt is the RFC 3339 UTC rendering of the time when the gateway accepted the
+	// observation, not the request time. Retained evidence can be accepted after
+	// a reset. NoObservedExchange has no report timestamp.
+	LastReportedAt string
+}
+
+// EndpointResult classifies the last accepted network result for a tool endpoint.
+type EndpointResult string
+
+// EndpointResult values describe passive observations of actual traffic.
+const (
+	// EndpointUnspecified means the result was absent or was not recognized.
+	EndpointUnspecified EndpointResult = "Unspecified"
+	// EndpointNoObservedExchange means the active configuration and supervisor
+	// session have no applicable observation.
+	EndpointNoObservedExchange EndpointResult = "NoObservedExchange"
+	// EndpointHTTPResponseReceived means an HTTP status below 400 was received.
+	// The response body can still contain a tool error.
+	EndpointHTTPResponseReceived EndpointResult = "HttpResponseReceived"
+	// EndpointPolicyDenied means OpenShell policy denied the request locally.
+	EndpointPolicyDenied EndpointResult = "PolicyDenied"
+	// EndpointCredentialUnavailable means a required managed credential was unavailable.
+	EndpointCredentialUnavailable EndpointResult = "CredentialUnavailable"
+	// EndpointTLSFailed means TLS setup for the upstream connection failed.
+	EndpointTLSFailed EndpointResult = "TlsFailed"
+	// EndpointTransportFailed means the transport failed before an HTTP response arrived.
+	EndpointTransportFailed EndpointResult = "TransportFailed"
+	// EndpointUpstreamRejected means the server returned an HTTP status of 400 or higher.
+	EndpointUpstreamRejected EndpointResult = "UpstreamRejected"
+)
 
 // SandboxCondition describes an observed condition of a sandbox.
 type SandboxCondition struct {

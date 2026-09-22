@@ -15,9 +15,9 @@
 //! Two families:
 //!
 //! **(a) Dry-run contract tests** — exercise `--dry-run` only; pass/fail on
-//!   schema acceptance. Some `wxc-exec` builds select the DACL fallback during
-//!   dry-run and validate filesystem grants, so these tests use owned temporary
-//!   directories with concrete Windows paths.
+//!   schema acceptance. These pass on this box even though no enforcement
+//!   backend is live (dry-run validates the JSON schema without spinning up the
+//!   `AppContainer` or isolation session).
 //!
 //! **(b) Enforcement tests** — probe-gated; print a human-readable SKIP reason
 //!   and return early when the backend is not live. The probe distinguishes
@@ -31,8 +31,15 @@
 #![cfg(target_os = "windows")]
 
 use base64::Engine as _;
+use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxSpec, DriverSandboxTemplate};
+use openshell_core::proto::{
+    FilesystemPolicy, NetworkAccessPreset, NetworkBinary, NetworkEndpoint, NetworkEnforcementMode,
+    NetworkPolicyRule, NetworkTlsMode, SandboxPolicy,
+};
+use openshell_driver_mxc::{MxcComputeBackend, MxcComputeConfig};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 // ── Path resolution ──────────────────────────────────────────────────────────
 
@@ -57,6 +64,17 @@ fn wxc_path() -> Option<PathBuf> {
         return Some(default);
     }
     None
+}
+
+/// Create a real, user-owned Windows directory for MXC filesystem grants.
+///
+/// MXC config values are literal paths: it does not expand `%TEMP%`. A unique
+/// directory also keeps AppContainer+DACL fallback mutations scoped to test
+/// data the current user owns.
+fn temp_fixture() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("create MXC temp fixture");
+    let path = dir.path().to_string_lossy().into_owned();
+    (dir, path)
 }
 
 // ── Dry-run helper ────────────────────────────────────────────────────────────
@@ -94,19 +112,18 @@ fn dryrun_accepts_minimal_processcontainer_config() {
         return;
     };
 
-    let tmpdir = tempfile::tempdir().expect("tempdir");
-    let tmpdir_str = tmpdir.path().to_string_lossy().into_owned();
+    let (_tempdir, temp_path) = temp_fixture();
     let config = serde_json::json!({
         "version": "0.6.0-alpha",
         "containerId": "test-minimal",
         "containment": "processcontainer",
         "process": {
             "commandLine": "cmd /c exit 0",
-            "cwd": tmpdir_str,
+            "cwd": temp_path,
             "timeout": 0,
         },
         "filesystem": {
-            "readwritePaths": [tmpdir_str],
+            "readwritePaths": [temp_path],
         },
     });
 
@@ -126,24 +143,21 @@ fn dryrun_accepts_network_block_without_proxy() {
         return;
     };
 
-    let tmpdir = tempfile::tempdir().expect("tempdir");
-    let tmpdir_str = tmpdir.path().to_string_lossy().into_owned();
+    let (_tempdir, temp_path) = temp_fixture();
     let config = serde_json::json!({
         "version": "0.6.0-alpha",
         "containerId": "test-net-block",
         "containment": "processcontainer",
         "process": {
             "commandLine": "cmd /c exit 0",
-            "cwd": tmpdir_str,
+            "cwd": temp_path,
             "timeout": 0,
         },
         "filesystem": {
-            "readwritePaths": [tmpdir_str],
+            "readwritePaths": [temp_path],
         },
         "network": {
             "defaultPolicy": "block",
-            "allowedHosts": [],
-            "blockedHosts": [],
         },
     });
 
@@ -165,24 +179,21 @@ fn dryrun_accepts_localhost_proxy_shape() {
         return;
     };
 
-    let tmpdir = tempfile::tempdir().expect("tempdir");
-    let tmpdir_str = tmpdir.path().to_string_lossy().into_owned();
+    let (_tempdir, temp_path) = temp_fixture();
     let config = serde_json::json!({
         "version": "0.6.0-alpha",
         "containerId": "test-proxy-localhost",
         "containment": "processcontainer",
         "process": {
             "commandLine": "cmd /c exit 0",
-            "cwd": tmpdir_str,
+            "cwd": temp_path,
             "timeout": 0,
         },
         "filesystem": {
-            "readwritePaths": [tmpdir_str],
+            "readwritePaths": [temp_path],
         },
         "network": {
             "defaultPolicy": "block",
-            "allowedHosts": [],
-            "blockedHosts": [],
             "proxy": { "localhost": 18080 },
         },
     });
@@ -205,22 +216,21 @@ fn dryrun_rejects_host_port_proxy_shape() {
         return;
     };
 
+    let (_tempdir, temp_path) = temp_fixture();
     let config = serde_json::json!({
         "version": "0.6.0-alpha",
         "containerId": "test-proxy-hostport",
         "containment": "processcontainer",
         "process": {
             "commandLine": "cmd /c exit 0",
-            "cwd": "%TEMP%",
+            "cwd": temp_path,
             "timeout": 0,
         },
         "filesystem": {
-            "readwritePaths": ["%TEMP%"],
+            "readwritePaths": [temp_path],
         },
         "network": {
             "defaultPolicy": "block",
-            "allowedHosts": [],
-            "blockedHosts": [],
             // MXC 0.6.0-alpha rejects {"host","port"} — verified empirically.
             "proxy": { "host": "127.0.0.1", "port": 18080 },
         },
@@ -243,17 +253,18 @@ fn dryrun_rejects_unknown_containment() {
         return;
     };
 
+    let (_tempdir, temp_path) = temp_fixture();
     let config = serde_json::json!({
         "version": "0.6.0-alpha",
         "containerId": "test-bad-containment",
         "containment": "nonsense",
         "process": {
             "commandLine": "cmd /c exit 0",
-            "cwd": "%TEMP%",
+            "cwd": temp_path,
             "timeout": 0,
         },
         "filesystem": {
-            "readwritePaths": ["%TEMP%"],
+            "readwritePaths": [temp_path],
         },
     });
 
@@ -261,10 +272,9 @@ fn dryrun_rejects_unknown_containment() {
     assert_ne!(code, 0, "unknown containment 'nonsense' should be rejected");
 }
 
-/// The most important dry-run test: parse the quickstart example policy with
-/// `openshell_policy`, run `split_policy` (`proxy_redirect` 127.0.0.1:18080,
-/// containment "processcontainer"), take the resulting `mxc_config`, inject a
-/// real process block with a valid cwd, and verify that `--dry-run` exits 0.
+/// The most important dry-run test: build a typed Windows policy, run
+/// `split_policy` (`proxy_redirect` 127.0.0.1:18080, containment
+/// "processcontainer"), and verify the resulting config with `--dry-run`.
 ///
 /// This proves that the mapper's emitted JSON is accepted by the real binary —
 /// the central contract of the policy-mapper integration.
@@ -276,33 +286,28 @@ fn dryrun_accepts_split_policy_output() {
         return;
     };
 
-    // Find the quickstart policy relative to CARGO_MANIFEST_DIR.
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let policy_path = manifest_dir.join("../../examples/sandbox-policy-quickstart/policy.yaml");
-
-    if !policy_path.exists() {
-        eprintln!(
-            "SKIP: quickstart policy not found at {}",
-            policy_path.display()
-        );
-        return;
-    }
-
-    let yaml = std::fs::read_to_string(&policy_path).expect("read policy YAML");
-    let policy = openshell_policy::parse_sandbox_policy(&yaml).expect("parse quickstart policy");
+    let (_tempdir, temp_path) = temp_fixture();
+    let policy = SandboxPolicy {
+        filesystem: Some(FilesystemPolicy {
+            include_workdir: false,
+            read_only: Vec::new(),
+            read_write: vec![temp_path.clone()],
+        }),
+        ..Default::default()
+    };
 
     let opts = openshell_driver_mxc::MxcMappingOptions {
         containment: "processcontainer".to_string(),
+        command: "cmd /c exit 0".to_string(),
+        container_id: "split-policy-dryrun".to_string(),
+        cwd: Some(temp_path),
         proxy_redirect: Some("127.0.0.1:18080".parse().unwrap()),
         ..Default::default()
     };
 
     let result = openshell_driver_mxc::split_policy(&policy, &opts)
         .expect("split_policy must return Some when proxy_redirect is set");
-    // The quickstart policy has network_policies with error-level losses on
-    // isolation_session, but on processcontainer there should be zero error
-    // losses from the split itself. Warn if there are any error losses so the
-    // test is informative even when it proceeds.
+    // There should be no error losses on the processcontainer split path.
     let error_losses: Vec<_> = result
         .loss
         .iter()
@@ -316,29 +321,7 @@ fn dryrun_accepts_split_policy_output() {
         );
     }
 
-    // Take the mapper's MXC config and inject the required process block.
-    // The split config does not include a process block (that comes from the
-    // gateway TOML at runtime); wxc-exec --dry-run requires one.
-    //
-    // The quickstart policy uses sandbox-internal Unix paths. Replace only the
-    // environment-dependent filesystem paths with an owned Windows directory:
-    // this test verifies the mapper's MXC JSON shape, while mapper unit tests
-    // cover the exact filesystem translation.
-    let tmpdir = tempfile::tempdir().expect("tempdir");
-    let tmpdir_str = tmpdir.path().to_string_lossy().into_owned();
-    let mut mxc_config = result.mxc_config.clone();
-    mxc_config["filesystem"] = serde_json::json!({
-        "readwritePaths": [tmpdir_str],
-        "readonlyPaths": [],
-        "deniedPaths": [],
-    });
-    mxc_config["process"] = serde_json::json!({
-        "commandLine": "cmd /c exit 0",
-        "cwd": tmpdir_str,
-        "timeout": 0,
-    });
-    // containerId is also required for processcontainer.
-    mxc_config["containerId"] = serde_json::json!("split-policy-dryrun");
+    let mxc_config = result.mxc_config;
 
     let (code, stdout, stderr) = dry_run(&wxc, &mxc_config);
     assert_eq!(
@@ -358,8 +341,8 @@ fn dryrun_accepts_split_policy_output() {
 
 /// Probe the processcontainer backend.
 ///
-/// Runs a trivial one-shot (`cmd /c exit 0`, owned temporary-directory grant).
-/// Returns `Ok(())` when the backend is live, or `Err(reason)` when it is not (the
+/// Runs a trivial one-shot (`cmd /c exit 0`, user-owned temp grant). Returns
+/// `Ok(())` when the backend is live, or `Err(reason)` when it is not (the
 /// caller prints SKIP + reason and returns from the test).
 fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
     // Abort early if the mock env var is set — a stale OPENSHELL_MXC_MOCK_WXC
@@ -371,19 +354,23 @@ fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
         );
     }
 
-    let tmpdir = tempfile::tempdir().map_err(|error| format!("tempdir failed: {error}"))?;
-    let tmpdir_str = tmpdir.path().to_string_lossy().into_owned();
+    let (_tempdir, temp_path) = temp_fixture();
     let config = serde_json::json!({
         "version": "0.6.0-alpha",
         "containerId": "probe-pc",
         "containment": "processcontainer",
         "process": {
             "commandLine": "cmd /c exit 0",
-            "cwd": tmpdir_str,
-            "timeout": 10,
+            "cwd": temp_path,
+            "timeout": 30_000,
         },
         "filesystem": {
-            "readwritePaths": [tmpdir_str],
+            "readwritePaths": [temp_path],
+        },
+        "ui": {
+            "disable": false,
+            "clipboard": "none",
+            "injection": false,
         },
     });
 
@@ -430,6 +417,58 @@ fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Probe the released binary's live `network.proxy` support separately from
+/// ordinary `ProcessContainer` support. Some builds accept the proxy JSON during
+/// `--dry-run` but return `ERROR_INVALID_PARAMETER` from the live launcher.
+fn probe_processcontainer_proxy(wxc: &PathBuf) -> Result<(), String> {
+    let (_tempdir, temp_path) = temp_fixture();
+    let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|error| format!("failed to reserve proxy probe port: {error}"))?;
+    let proxy_port = proxy_listener
+        .local_addr()
+        .map_err(|error| format!("failed to read proxy probe port: {error}"))?
+        .port();
+    let config = serde_json::json!({
+        "version": "0.6.0-alpha",
+        "containerId": "probe-pc-proxy",
+        "containment": "processcontainer",
+        "process": {
+            "commandLine": "C:\\Windows\\System32\\cmd.exe /c exit 0",
+            "cwd": temp_path,
+            "timeout": 30_000,
+        },
+        "filesystem": {
+            "readwritePaths": [temp_path],
+        },
+        "processContainer": {
+            "leastPrivilege": false,
+        },
+        "network": {
+            "defaultPolicy": "block",
+            "proxy": { "localhost": proxy_port },
+        },
+    });
+
+    let json = serde_json::to_string(&config).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+    let output = Command::new(wxc)
+        .arg("--config-base64")
+        .arg(&b64)
+        .output()
+        .map_err(|error| format!("wxc-exec proxy probe failed to spawn: {error}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "live network.proxy probe returned exit {}: stdout={} stderr={}",
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ))
 }
 
 /// Probe the `isolation_session` backend.
@@ -586,13 +625,18 @@ fn pc_oneshot_in_policy_write_succeeds() {
         "process": {
             "commandLine": format!("cmd /c echo hello > \"{target_str}\""),
             "cwd": tmpdir_str,
-            "timeout": 30,
+            "timeout": 30_000,
         },
         "filesystem": {
             "readwritePaths": [tmpdir_str],
         },
         "processContainer": {
             "leastPrivilege": false,
+        },
+        "ui": {
+            "disable": false,
+            "clipboard": "none",
+            "injection": false,
         },
     });
 
@@ -616,6 +660,155 @@ fn pc_oneshot_in_policy_write_succeeds() {
     assert!(
         target.exists(),
         "in-policy write: file should exist at {target_str}\nstdout={stdout}\nstderr={stderr}"
+    );
+}
+
+/// Run an HTTPS request through the real driver and `ProcessContainer`. The
+/// workload explicitly reads the injected bundle before curl uses it, proving
+/// that the driver's internal TLS share is reachable from the `AppContainer`.
+#[tokio::test]
+#[ignore = "requires real wxc-exec and outbound HTTPS"]
+async fn pc_https_egress_reads_injected_ca_bundle() {
+    let Some(wxc) = wxc_path() else {
+        eprintln!("SKIP: wxc-exec not found");
+        return;
+    };
+
+    if let Err(reason) = probe_processcontainer(&wxc) {
+        eprintln!("SKIP: processcontainer not live: {reason}");
+        return;
+    }
+    if let Err(reason) = probe_processcontainer_proxy(&wxc) {
+        eprintln!("SKIP: processcontainer network.proxy not live: {reason}");
+        return;
+    }
+
+    let system_root = std::env::var("SYSTEMROOT").expect("SYSTEMROOT must be set on Windows");
+    let cmd = PathBuf::from(&system_root).join("System32").join("cmd.exe");
+    let curl = PathBuf::from(system_root).join("System32").join("curl.exe");
+    if !curl.exists() {
+        eprintln!("SKIP: Windows curl.exe not found at {}", curl.display());
+        return;
+    }
+
+    let output_dir = tempfile::tempdir().expect("HTTPS output directory");
+    let output_path = output_dir.path().join("example.html");
+    let certificate_path = output_dir.path().join("peer-certificate.txt");
+    let output_dir_string = output_dir.path().to_string_lossy().into_owned();
+    let output_path_string = output_path.to_string_lossy().into_owned();
+    let certificate_path_string = certificate_path.to_string_lossy().into_owned();
+    let cmd_string = cmd.to_string_lossy().into_owned();
+    let script = format!(
+        "type \"%CURL_CA_BUNDLE%\" 1>NUL && \
+         \"{}\" --fail --silent --show-error --cacert \"%CURL_CA_BUNDLE%\" \
+         https://example.com/ --output \"{output_path_string}\" \
+         --write-out \"%{{certs}}\" 1>\"{certificate_path_string}\"",
+        curl.display()
+    );
+    let command = vec![
+        cmd_string.clone(),
+        "/d".to_string(),
+        "/c".to_string(),
+        script,
+    ];
+    let serde_json::Value::Object(driver_config) = serde_json::json!({
+        "command": command,
+        "cwd": output_dir_string,
+    }) else {
+        unreachable!();
+    };
+
+    let policy = SandboxPolicy {
+        version: 1,
+        filesystem: Some(FilesystemPolicy {
+            include_workdir: false,
+            read_only: Vec::new(),
+            read_write: vec![output_dir_string],
+        }),
+        network_policies: std::collections::HashMap::from([(
+            "https_example".to_string(),
+            NetworkPolicyRule {
+                name: "https-example".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.com".to_string(),
+                    ports: vec![443],
+                    protocol: "rest".to_string(),
+                    tls: NetworkTlsMode::Unspecified as i32,
+                    enforcement: NetworkEnforcementMode::Enforce as i32,
+                    access: NetworkAccessPreset::ReadOnly as i32,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary { path: cmd_string }],
+            },
+        )]),
+        ..Default::default()
+    };
+    let sandbox = DriverSandbox {
+        id: "pc-https-ca".to_string(),
+        name: "pc-https-ca".to_string(),
+        spec: Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(
+                    openshell_core::proto_struct::json_object_to_struct(driver_config)
+                        .expect("driver config"),
+                ),
+                ..Default::default()
+            }),
+            policy: Some(policy),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let config = MxcComputeConfig {
+        wxc_exec_path: wxc.to_string_lossy().into_owned(),
+        egress_proxy: true,
+        egress_proxy_addr: "127.0.0.1:18080".to_string(),
+        ..Default::default()
+    };
+    let backend = MxcComputeBackend::new(config);
+    backend
+        .create_sandbox(&sandbox)
+        .await
+        .expect("real HTTPS sandbox create accepted");
+
+    let mut terminal_condition = None;
+    for _ in 0..600 {
+        if let Some(observed) = backend.get_sandbox("pc-https-ca").await
+            && let Some(condition) = observed
+                .status
+                .and_then(|status| status.conditions.into_iter().find(|c| c.r#type == "Ready"))
+            && matches!(
+                condition.reason.as_str(),
+                "AgentCompleted" | "ExecFailed" | "ProvisionFailed"
+            )
+        {
+            terminal_condition = Some(condition);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let condition = terminal_condition.expect("HTTPS sandbox should reach a terminal condition");
+    assert_eq!(
+        condition.reason, "AgentCompleted",
+        "HTTPS workload failed: {}",
+        condition.message
+    );
+    assert!(output_path.exists(), "curl should write the HTTPS response");
+    assert!(
+        std::fs::metadata(&output_path)
+            .expect("HTTPS response metadata")
+            .len()
+            > 0,
+        "HTTPS response should not be empty"
+    );
+    let peer_certificate =
+        std::fs::read_to_string(certificate_path).expect("curl peer certificate output");
+    assert!(
+        peer_certificate.contains("OpenShell Sandbox CA"),
+        "HTTPS response must use a certificate issued by the host proxy CA"
     );
 }
 
@@ -648,7 +841,7 @@ fn pc_oneshot_out_of_policy_write_denied() {
         "process": {
             "commandLine": format!("cmd /c echo denied > \"{denied_file_str}\""),
             "cwd": granted_str,
-            "timeout": 30,
+            "timeout": 30_000,
         },
         "filesystem": {
             // Only the granted_dir is in policy — denied_dir is NOT granted.
@@ -656,6 +849,11 @@ fn pc_oneshot_out_of_policy_write_denied() {
         },
         "processContainer": {
             "leastPrivilege": false,
+        },
+        "ui": {
+            "disable": false,
+            "clipboard": "none",
+            "injection": false,
         },
     });
 

@@ -5,7 +5,7 @@
 
 use openshell_e2e::harness::sandbox::SandboxGuard;
 
-fn localhost_bypass_script() -> &'static str {
+fn localhost_transparent_script() -> &'static str {
     r#"
 import json
 import os
@@ -13,11 +13,8 @@ import threading
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-expected_no_proxy = '127.0.0.1,localhost,::1'
-assert os.environ['HTTP_PROXY'].startswith('http://')
-assert os.environ['HTTPS_PROXY'].startswith('http://')
-assert os.environ['NO_PROXY'] == expected_no_proxy
-assert os.environ['no_proxy'] == expected_no_proxy
+for name in ('HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy'):
+    assert name not in os.environ, f'unexpected proxy environment variable: {name}'
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -36,7 +33,7 @@ thread.start()
 try:
     with urllib.request.urlopen(f'http://127.0.0.1:{server.server_port}', timeout=10) as response:
         print(json.dumps({
-            'no_proxy': os.environ['NO_PROXY'],
+            'proxy_env_absent': True,
             'payload': json.loads(response.read().decode()),
         }), flush=True)
 finally:
@@ -47,16 +44,16 @@ finally:
 }
 
 #[tokio::test]
-async fn sandbox_bypasses_proxy_for_localhost_http() {
-    let guard = SandboxGuard::create(&["--", "python3", "-c", localhost_bypass_script()])
+async fn sandbox_reaches_localhost_without_proxy_environment() {
+    let guard = SandboxGuard::create(&["--", "python3", "-c", localhost_transparent_script()])
         .await
-        .expect("sandbox create with localhost proxy bypass check");
+        .expect("sandbox create with transparent localhost check");
 
     assert!(
-        guard.create_output.contains(
-            r#"{"no_proxy": "127.0.0.1,localhost,::1", "payload": {"message": "hello"}}"#
-        ),
-        "expected localhost HTTP request to bypass proxy and succeed:\n{}",
+        guard
+            .create_output
+            .contains(r#"{"proxy_env_absent": true, "payload": {"message": "hello"}}"#),
+        "expected localhost HTTP request to stay local and succeed:\n{}",
         guard.create_output
     );
 }

@@ -3,7 +3,7 @@
 
 //! Builder for Process Activity [1007] events.
 
-use crate::builders::SandboxContext;
+use crate::builders::EventContext;
 use crate::enums::{ActionId, ActivityId, DispositionId, LaunchTypeId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{OcsfEvent, ProcessActivityEvent};
@@ -11,7 +11,7 @@ use crate::objects::{Actor, Process};
 
 /// Builder for Process Activity [1007] events.
 pub struct ProcessActivityBuilder<'a> {
-    ctx: &'a SandboxContext,
+    ctx: &'a EventContext,
     activity: ActivityId,
     severity: SeverityId,
     status: Option<StatusId>,
@@ -26,7 +26,7 @@ pub struct ProcessActivityBuilder<'a> {
 
 impl<'a> ProcessActivityBuilder<'a> {
     #[must_use]
-    pub fn new(ctx: &'a SandboxContext) -> Self {
+    pub fn new(ctx: &'a EventContext) -> Self {
         Self {
             ctx,
             activity: ActivityId::Unknown,

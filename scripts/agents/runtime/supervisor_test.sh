@@ -49,6 +49,8 @@ run_supervisor() {
         OPENSHELL_AGENT_POLL_INTERVAL_SECONDS="${OPENSHELL_AGENT_POLL_INTERVAL_SECONDS:-1}" \
         OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES=2 \
         OPENSHELL_AGENT_HEARTBEAT_SECONDS="${OPENSHELL_AGENT_HEARTBEAT_SECONDS:-0}" \
+        OPENSHELL_AGENT_STATE_DIR="${OPENSHELL_AGENT_TEST_STATE_DIR:-$payload_dir/state}" \
+        OPENSHELL_AGENT_STATE_HISTORY_LIMIT="${OPENSHELL_AGENT_STATE_HISTORY_LIMIT:-100}" \
         OPENSHELL_AGENT_TEST_STATE="${OPENSHELL_AGENT_TEST_STATE:-}" \
         bash "$payload_dir/runtime/supervisor.sh" > "$output_file" 2>&1
     local status=$?
@@ -216,6 +218,44 @@ printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done
     printf 'ok - watch prints active cycle heartbeat\n'
 }
 
+test_persists_agent_notes_and_terminal_state() {
+    local tmp
+    tmp="$(mktemp -d)"
+    make_payload "$tmp/payload" 'printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\",\"notes\":\"The current head is ready. No further action is needed.\"}"'
+
+    run_supervisor "$tmp/payload" once "$tmp/output"
+    assert_contains "$tmp/payload/state/status.json" '"supervisor_state":"terminal"'
+    assert_contains "$tmp/payload/state/status.json" '"notes":"The current head is ready. No further action is needed."'
+    assert_contains "$tmp/payload/state/status.json" '"harness_exit_code":0'
+    [[ "$(wc -l < "$tmp/payload/state/history.jsonl")" -eq 2 ]] || fail "expected running and terminal history records"
+    printf 'ok - persists agent notes and terminal state\n'
+}
+
+test_bounds_state_history() {
+    local tmp
+    tmp="$(mktemp -d)"
+    make_payload "$tmp/payload" '
+state_file="${OPENSHELL_AGENT_TEST_STATE:?}"
+count=0
+if [[ -f "$state_file" ]]; then count="$(cat "$state_file")"; fi
+count=$((count + 1))
+printf "%s\n" "$count" > "$state_file"
+if [[ "$count" -lt 2 ]]; then
+    printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"waiting\",\"reason\":\"checks_pending\",\"next_poll_seconds\":1,\"notes\":\"Checks are still running. Gator will inspect them next cycle.\"}"
+else
+    printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\",\"notes\":\"The work is complete.\"}"
+fi
+'
+
+    OPENSHELL_AGENT_TEST_STATE="$tmp/count" \
+        OPENSHELL_AGENT_STATE_HISTORY_LIMIT=2 \
+        run_supervisor "$tmp/payload" watch "$tmp/output"
+    [[ "$(wc -l < "$tmp/payload/state/history.jsonl")" -eq 2 ]] || fail "expected bounded history"
+    assert_contains "$tmp/payload/state/history.jsonl" '"cycle":2'
+    assert_contains "$tmp/payload/state/status.json" '"notes":"The work is complete."'
+    printf 'ok - bounds state history\n'
+}
+
 test_once_requires_sentinel
 test_watch_retries_missing_sentinel_until_complete
 test_watch_retries_invalid_status_until_complete
@@ -224,3 +264,5 @@ test_watch_retries_failed_alias_until_complete
 test_watch_terminal_failure_exits
 test_watch_transient_failure_honors_next_poll_seconds
 test_watch_prints_active_cycle_heartbeat
+test_persists_agent_notes_and_terminal_state
+test_bounds_state_history

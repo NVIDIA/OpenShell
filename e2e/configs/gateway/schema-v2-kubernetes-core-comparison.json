@@ -1,0 +1,9 @@
+{
+  "accepted": true,
+  "baseline_commit": "74960ebfaeec4673885089ed995fad902459749f",
+  "baseline_success": true,
+  "candidate_commit": "0f08b5822e4da98c9ced3d4b0f2bf4f30dae28fd",
+  "candidate_success": true,
+  "classification": "pass",
+  "parity": true
+}

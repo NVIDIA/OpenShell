@@ -362,7 +362,6 @@ start_agent_sandbox() {
     (
         "$OPENSHELL_BIN" sandbox create \
             --name "$DEMO_SANDBOX_NAME" \
-            --from base \
             --provider "$DEMO_CODEX_PROVIDER_NAME" \
             --provider "$DEMO_GITHUB_PROVIDER_NAME" \
             --policy "$POLICY_FILE" \

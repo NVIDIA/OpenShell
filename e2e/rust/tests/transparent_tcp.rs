@@ -9,6 +9,8 @@ use std::process::{Command, Stdio};
 
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::container::{SupportContainer, is_e2e_driver};
+use openshell_e2e::harness::host_process::HostPythonFixture;
+use openshell_e2e::harness::port::find_free_port;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
@@ -78,13 +80,13 @@ impl MuslDnsProbe {
     }
 }
 
-fn write_policy() -> Result<NamedTempFile, String> {
+fn write_policy(host: &str, fixture_port: u16, tcp_dns_port: u16) -> Result<NamedTempFile, String> {
     write_policy_for_identity(
-        FIXTURE_ALIAS,
+        host,
         "sandbox",
         "sandbox",
         &[],
-        &[FIXTURE_PORT, TCP_DNS_PORT],
+        &[fixture_port, tcp_dns_port],
     )
 }
 
@@ -253,9 +255,8 @@ async fn local_container_native_tcp_uses_policy_dns_and_fails_closed() {
         return;
     }
 
-    let fixture = SupportContainer::start_python_with_capabilities(
-        FIXTURE_ALIAS,
-        &format!(
+    let fixture_script = |fixture_port: u16, tcp_dns_port: u16, transparent_port: u16| {
+        format!(
             r#"import socket, threading
 def listen(port):
   s = socket.socket()
@@ -271,21 +272,63 @@ def serve(s):
     c.sendall(b'native-tcp-ok:' + data)
     c.close()
 
-transparent_listener = listen({TRANSPARENT_LISTENER_PORT})
-tcp_dns_listener = listen({TCP_DNS_PORT})
-fixture_listener = listen({FIXTURE_PORT})
+transparent_listener = listen({transparent_port})
+tcp_dns_listener = listen({tcp_dns_port})
+fixture_listener = listen({fixture_port})
 threading.Thread(target=serve, args=(transparent_listener,), daemon=True).start()
 threading.Thread(target=serve, args=(tcp_dns_listener,), daemon=True).start()
 serve(fixture_listener)
 "#
-        ),
-        FIXTURE_PORT,
-        &["NET_BIND_SERVICE"],
-    )
-    .await
-    .expect("start TCP fixture");
-    let real_ip = fixture.ip().expect("fixture IP");
-    let policy = write_policy().expect("write policy");
+        )
+    };
+    enum Fixture {
+        Host(HostPythonFixture),
+        Network(SupportContainer),
+    }
+    let (fixture, policy_host, real_ip, fixture_port, tcp_dns_port, transparent_port) =
+        if is_e2e_driver("docker") {
+            let fixture_host_port = find_free_port();
+            let tcp_dns_host_port = find_free_port();
+            let transparent_host_port = find_free_port();
+            let fixture = HostPythonFixture::start(
+                &fixture_script(fixture_host_port, tcp_dns_host_port, transparent_host_port),
+                fixture_host_port,
+            )
+            .await
+            .expect("start host TCP fixture");
+            (
+                Fixture::Host(fixture),
+                "host.openshell.internal".to_string(),
+                "127.0.0.1".to_string(),
+                fixture_host_port,
+                tcp_dns_host_port,
+                transparent_host_port,
+            )
+        } else {
+            let fixture = SupportContainer::start_python_with_capabilities(
+                FIXTURE_ALIAS,
+                &fixture_script(FIXTURE_PORT, TCP_DNS_PORT, TRANSPARENT_LISTENER_PORT),
+                FIXTURE_PORT,
+                &["NET_BIND_SERVICE"],
+            )
+            .await
+            .expect("start shared-network TCP fixture");
+            let real_ip = fixture.ip().expect("fixture IP");
+            (
+                Fixture::Network(fixture),
+                FIXTURE_ALIAS.to_string(),
+                real_ip,
+                FIXTURE_PORT,
+                TCP_DNS_PORT,
+                TRANSPARENT_LISTENER_PORT,
+            )
+        };
+    // Keep the fixture alive through the sandbox assertions.
+    match &fixture {
+        Fixture::Host(value) => assert_eq!(value.port, fixture_port),
+        Fixture::Network(value) => assert!(!value.alias.is_empty()),
+    }
+    let policy = write_policy(&policy_host, fixture_port, tcp_dns_port).expect("write policy");
     let policy_path = policy.path().to_string_lossy().into_owned();
     let mut sandbox = SandboxGuard::create_keep_with_args(
         &["--policy", &policy_path],
@@ -327,12 +370,12 @@ assert denied({real_ip:?}, {port})
 assert denied({real_ip:?}, {transparent_port})
 print('transparent-tcp-e2e-ok')
 "#,
-        host = FIXTURE_ALIAS,
-        port = FIXTURE_PORT,
-        tcp_dns_port = TCP_DNS_PORT,
-        wrong_port = FIXTURE_PORT + 1,
+        host = policy_host,
+        port = fixture_port,
+        tcp_dns_port = tcp_dns_port,
+        wrong_port = fixture_port + 1,
         real_ip = real_ip,
-        transparent_port = TRANSPARENT_LISTENER_PORT,
+        transparent_port = transparent_port,
     );
     let output = match sandbox.exec(&["python3", "-c", &script]).await {
         Ok(output) => output,
@@ -355,16 +398,19 @@ print('transparent-tcp-e2e-ok')
     assert!(output.contains("transparent-tcp-e2e-ok"), "{output}");
 
     let logs = wait_for_sandbox_logs(&sandbox.name, |logs| {
-        logs.contains(&format!("-> {FIXTURE_ALIAS}:{FIXTURE_PORT}"))
-            && logs.contains("transparent_tcp_port_mismatch")
+        logs.contains(&format!("-> {policy_host}:{fixture_port}"))
+            && logs.contains("Denied staged transparent connection")
     })
     .await
     .expect("wait for sandbox logs");
     assert!(
-        logs.contains(&format!("-> {FIXTURE_ALIAS}:{FIXTURE_PORT}")),
+        logs.contains(&format!("-> {policy_host}:{fixture_port}")),
         "{logs}"
     );
-    assert!(logs.contains("transparent_tcp_port_mismatch"), "{logs}");
+    assert!(
+        logs.contains("Denied staged transparent connection"),
+        "{logs}"
+    );
 
     sandbox.cleanup().await;
 }

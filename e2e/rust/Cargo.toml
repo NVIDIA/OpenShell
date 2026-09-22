@@ -29,24 +29,24 @@ e2e-docker = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-gpu = ["e2e"]
 e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
 e2e-kubernetes = ["e2e"]
+e2e-kubernetes-ha = ["e2e-kubernetes"]
 e2e-kubernetes-credential-drivers = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-managed = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-operator = ["e2e-kubernetes"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
 e2e-oidc-pkce = []
-e2e-provider-refresh-keycloak = []
 e2e-vm = ["e2e", "e2e-host-gateway"]
+
+[[test]]
+name = "policy_activation"
+path = "tests/policy_activation.rs"
+required-features = ["e2e-docker"]
 
 [[test]]
 name = "oidc_pkce"
 path = "tests/oidc_pkce.rs"
 required-features = ["e2e-oidc-pkce"]
-
-[[test]]
-name = "provider_refresh_keycloak"
-path = "tests/provider_refresh_keycloak.rs"
-required-features = ["e2e-provider-refresh-keycloak"]
 
 [[test]]
 name = "vm_overlay"
@@ -109,6 +109,11 @@ path = "tests/provider_refresh_handles.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
+name = "provider_readiness"
+path = "tests/provider_readiness.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "vm_gateway_start"
 path = "tests/vm_gateway_start.rs"
 required-features = ["e2e-vm"]
@@ -124,9 +129,9 @@ path = "tests/provider_token_exchange.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
-name = "readyz_health"
-path = "tests/readyz_health.rs"
-required-features = ["e2e-kubernetes"]
+name = "kubernetes_ha_rebalancing"
+path = "tests/kubernetes_ha_rebalancing.rs"
+required-features = ["e2e-kubernetes-ha"]
 
 [[test]]
 name = "kubernetes_corporate_proxy"
@@ -243,3 +248,7 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+[[test]]
+name = "live_internet_traffic_perf"
+path = "tests/live_internet_traffic_perf.rs"
+required-features = ["e2e-host-gateway"]

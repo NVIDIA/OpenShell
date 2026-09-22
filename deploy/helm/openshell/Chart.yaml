@@ -8,6 +8,6 @@ description: runtime environment for autonomous agents
 type: application
 # version and appVersion are patched to the release semver by CI before helm package.
 # appVersion doubles as the default image tag (image.tag defaults to appVersion when
-# empty), so a released chart automatically pulls the matching gateway and supervisor images.
+# empty), so a released chart automatically pulls matching gateway, sandbox, and supervisor images.
 version: 0.0.0
 appVersion: "0.0.0"

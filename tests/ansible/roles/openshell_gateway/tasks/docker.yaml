@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Copy OpenShell runtime images
+  become: true
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "/var/lib/openshell/{{ item.name }}.tar"
+    owner: "{{ openshell_gateway_user }}"
+    group: "{{ openshell_gateway_user }}"
+    mode: "0600"
+  loop:
+    - name: sandbox
+      src: "{{ openshell_sandbox_image }}"
+    - name: supervisor
+      src: "{{ openshell_supervisor_image }}"
+
+- name: Load OpenShell runtime images
+  become: true
+  ansible.builtin.command:
+    argv:
+      - docker
+      - load
+      - --input
+      - "/var/lib/openshell/{{ item }}.tar"
+  loop:
+    - sandbox
+    - supervisor

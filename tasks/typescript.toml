@@ -9,6 +9,7 @@
 description = "Install TypeScript SDK dependencies"
 dir = "sdk/typescript"
 run = "npm ci"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File ../../tasks/scripts/typescript-install.ps1"
 hide = true
 
 ["sdk:ts:proto"]
@@ -16,6 +17,7 @@ description = "Generate TypeScript protobuf stubs for the SDK"
 depends = ["sdk:ts:install"]
 dir = "sdk/typescript"
 run = "npm run gen"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File ../../tasks/scripts/typescript-proto.ps1"
 
 # Lints the repo-level proto module (buf.yaml at the root) against STANDARD.
 # buf ships only in the SDK's devDependencies today, so this depends on the
@@ -25,6 +27,7 @@ run = "npm run gen"
 description = "Lint proto/ with buf (repo-level buf.yaml)"
 depends = ["sdk:ts:install"]
 run = "./sdk/typescript/node_modules/.bin/buf lint"
+run_windows = "sdk\\typescript\\node_modules\\.bin\\buf.cmd lint"
 
 ["sdk:ts:typecheck"]
 description = "Type-check the TypeScript SDK"
@@ -55,6 +58,11 @@ description = "Run TypeScript SDK unit tests (Vitest, in-memory transport)"
 depends = ["sdk:ts:proto"]
 dir = "sdk/typescript"
 run = "npm test"
+
+["e2e:sdk:ts:exec"]
+description = "Test public TypeScript interactive exec against a Docker-backed gateway"
+depends = ["sdk:ts:build"]
+run = "e2e/with-docker-gateway.sh node --test sdk/typescript/e2e/interactive-exec.mjs"
 
 ["sdk:ts:ci"]
 description = "TypeScript SDK checks (proto lint, Biome lint, codegen, typecheck, test, build)"

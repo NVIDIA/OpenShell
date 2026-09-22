@@ -25,7 +25,7 @@ pub struct TokenGrantRequest<'a> {
     pub client_assertion_type: &'a str,
     pub audience: &'a str,
     pub scopes: &'a [String],
-    pub cache_ttl_seconds: i64,
+    pub cache_ttl: Option<std::time::Duration>,
     pub grant_type: i32,
     pub requested_token_type: &'a str,
 }
@@ -54,7 +54,7 @@ impl TokenGrantResolver for SpiffeTokenGrantResolver {
                     client_assertion_type: request.client_assertion_type,
                     audience: request.audience,
                     scopes: request.scopes,
-                    cache_ttl_override: request.cache_ttl_seconds,
+                    cache_ttl_override: request.cache_ttl,
                     grant_type: request.grant_type,
                     requested_token_type: request.requested_token_type,
                 },
@@ -95,7 +95,7 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
             .token_grant_resolver
             .as_ref()
             .ok_or_else(|| miette!("token grant resolver unavailable"))?;
-        let request = token_grant_request(&provider_key, token_grant);
+        let request = token_grant_request(&provider_key, token_grant)?;
 
         match resolver.obtain(request).await {
             Ok(access_token) => {
@@ -172,18 +172,24 @@ fn ocsf_message_field(value: &str) -> String {
 fn token_grant_request<'a>(
     provider_key: &'a str,
     token_grant: &'a ProviderCredentialTokenGrant,
-) -> TokenGrantRequest<'a> {
-    TokenGrantRequest {
+) -> Result<TokenGrantRequest<'a>> {
+    let cache_ttl = token_grant
+        .cache_ttl
+        .as_ref()
+        .map(openshell_core::time::duration_to_std)
+        .transpose()
+        .map_err(|error| miette!("invalid token grant cache_ttl: {error}"))?;
+    Ok(TokenGrantRequest {
         provider_key,
         token_endpoint: &token_grant.token_endpoint,
         jwt_svid_audience: &token_grant.jwt_svid_audience,
         client_assertion_type: &token_grant.client_assertion_type,
         audience: &token_grant.audience,
         scopes: &token_grant.scopes,
-        cache_ttl_seconds: token_grant.cache_ttl_seconds,
+        cache_ttl,
         grant_type: token_grant.grant_type,
         requested_token_type: &token_grant.requested_token_type,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -376,7 +382,7 @@ pub mod test_support {
         client_assertion_type: String,
         audience: String,
         scopes: Vec<String>,
-        cache_ttl_seconds: i64,
+        cache_ttl: Option<std::time::Duration>,
         grant_type: i32,
         requested_token_type: String,
     }
@@ -473,7 +479,7 @@ pub mod test_support {
             );
             assert_eq!(request.audience, "api://example");
             assert_eq!(request.scopes, ["read"]);
-            assert_eq!(request.cache_ttl_seconds, 300);
+            assert_eq!(request.cache_ttl, Some(std::time::Duration::from_mins(5)));
             assert_eq!(
                 request.grant_type,
                 ProviderCredentialTokenGrantType::ClientCredentials as i32
@@ -498,7 +504,7 @@ pub mod test_support {
             );
             assert_eq!(request.audience, "api://example");
             assert_eq!(request.scopes, ["read"]);
-            assert_eq!(request.cache_ttl_seconds, 300);
+            assert_eq!(request.cache_ttl, Some(std::time::Duration::from_mins(5)));
             assert_eq!(
                 request.grant_type,
                 ProviderCredentialTokenGrantType::TokenExchange as i32
@@ -518,7 +524,10 @@ pub mod test_support {
             client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
                 .to_string(),
             scopes: vec!["read".to_string()],
-            cache_ttl_seconds: 300,
+            cache_ttl: Some(prost_types::Duration {
+                seconds: 300,
+                nanos: 0,
+            }),
             audience_overrides: Vec::new(),
             grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
             subject_token: None,
@@ -553,7 +562,7 @@ pub mod test_support {
                 client_assertion_type: request.client_assertion_type.to_string(),
                 audience: request.audience.to_string(),
                 scopes: request.scopes.to_vec(),
-                cache_ttl_seconds: request.cache_ttl_seconds,
+                cache_ttl: request.cache_ttl,
                 grant_type: request.grant_type,
                 requested_token_type: request.requested_token_type.to_string(),
             };

@@ -12,7 +12,7 @@ repository.workspace = true
 
 [dependencies]
 openshell-bootstrap = { path = "../openshell-bootstrap" }
-openshell-core = { path = "../openshell-core", default-features = false, features = ["oauth"] }
+openshell-core = { path = "../openshell-core", default-features = false, features = ["jwt", "oauth"] }
 openshell-driver-db-credstore = { path = "../openshell-driver-db-credstore" }
 openshell-driver-kubernetes-secrets = { path = "../openshell-driver-kubernetes-secrets" }
 openshell-driver-vault = { path = "../openshell-driver-vault" }
@@ -33,8 +33,9 @@ k8s-openapi = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
-socket2 = { workspace = true }
+socket2 = { workspace = true, features = ["all"] }
 nix = { workspace = true }
+libc = "0.2"
 
 # gRPC
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
@@ -64,10 +65,12 @@ clap = { workspace = true }
 miette = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 
 # OpenTelemetry (OTLP trace export, opt-in via [openshell.gateway.otlp])
 opentelemetry = { workspace = true }
@@ -118,9 +121,17 @@ default = ["telemetry"]
 ## that contains no telemetry endpoint, HTTP client, or emission code.
 telemetry = ["openshell-core/telemetry"]
 bundled-z3 = ["openshell-prover/bundled-z3"]
+prebuilt-z3 = ["openshell-prover/prebuilt-z3"]
 test-support = []
 
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
+
 [dev-dependencies]
+# Tests import the example profiles from providers/ the way an operator
+# would; the feature is test-only and never reaches a release binary.
+openshell-providers = { path = "../openshell-providers", features = ["example-profiles"] }
 base64 = { workspace = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "aws-lc-rs"] }
 rcgen = { workspace = true }

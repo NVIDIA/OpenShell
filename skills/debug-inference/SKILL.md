@@ -1,6 +1,6 @@
 ---
 name: debug-inference
-description: Debug inference clients that use an attached provider and its native endpoint, including hosted APIs and host-local Ollama, vLLM, SGLang, TRT-LLM, LM Studio, or NIM. Use for provider attachment, endpoint policy, credential substitution, topology, and migration from the removed inference.local endpoint. Trigger keywords - debug inference, inference.local, local inference, ollama, lm studio, vllm, sglang, trtllm, NIM, inference failing, model server unreachable, credential_endpoint_mismatch, host.openshell.internal.
+description: Debug inference clients that use an attached provider and its native endpoint, including hosted APIs and host-local Ollama, vLLM, SGLang, TRT-LLM, LM Studio, or NIM. Use for provider attachment, endpoint policy, credential substitution, topology, and migration from the removed managed inference endpoint. Trigger keywords - debug inference, managed inference endpoint, local inference, ollama, lm studio, vllm, sglang, trtllm, NIM, inference failing, model server unreachable, credential_endpoint_mismatch, host.openshell.internal.
 ---
 
 # Debug Inference
@@ -34,7 +34,7 @@ container; bind it to an address reachable from the gateway runtime.
 
 ```bash
 openshell provider get <provider>
-openshell provider profile export <profile-id> -o yaml
+openshell profile export <profile-id> -o yaml
 ```
 
 Check that the profile:
@@ -49,8 +49,8 @@ endpoint-bearing profile. A base URL stored only in provider configuration does
 not authorize a new endpoint.
 
 ```bash
-openshell provider profile lint -f ./provider-profile.yaml
-openshell provider profile import -f ./provider-profile.yaml
+openshell profile lint -f ./provider-profile.yaml
+openshell profile import -f ./provider-profile.yaml
 openshell provider create --name <provider> --type <profile-id>
 ```
 
@@ -62,28 +62,30 @@ binding error.
 
 ```bash
 openshell sandbox provider list <sandbox>
-openshell sandbox provider attach <sandbox> <provider>
+openshell sandbox provider attach <sandbox> <provider> --wait --timeout 30
 ```
 
-Launch a new process after attaching a provider so it inherits newly available
-credential placeholders:
+Save the change's `receipt_id` and use `openshell sandbox provider status <sandbox> <provider> --receipt <receipt-id> --wait --timeout 30` to check when it takes effect. Success confirms that the sandbox applied the credentials, policy, and environment for new processes. If the result is pending, failed, withheld, or superseded, inspect its reason before launching the client.
+
+Launch the client after the attachment wait succeeds so it receives the updated environment:
 
 ```bash
-openshell sandbox exec <sandbox> -- env
+openshell sandbox exec <sandbox> -- <client-command>
 ```
 
-Do not print or copy credential values into diagnostic output. Detaching a
-provider revokes its policy and credential access:
+After updating an ordinary static provider, wait for that change and launch a new client. An existing process keeps its revision-scoped reference; readiness does not make the old reference resolve the replacement value. Diagnose managed-refresh credentials according to their own lifecycle.
+
+Keep credentials and issued references out of diagnostic output. Acknowledged detach revokes future credential resolution and removes the reference from future process environments. Requests already forwarded may still finish:
 
 ```bash
-openshell sandbox provider detach <sandbox> <provider>
+openshell sandbox provider detach <sandbox> <provider> --wait --timeout 30
 ```
 
 ### 4. Verify Native Client Configuration
 
 The application must use the real upstream contract:
 
-- Native provider base URL, not `https://inference.local`.
+- Native provider base URL, not the retired managed virtual endpoint.
 - Real model ID, not a placeholder that OpenShell used to rewrite.
 - Native OpenAI, Anthropic, Vertex, or other provider request shape.
 - Application-owned timeout and retry settings.
@@ -97,7 +99,8 @@ inference request using the provider's documented API shape.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `Could not resolve host: inference.local` | Client still uses the removed managed endpoint | Configure the provider's native base URL and attach an endpoint-bearing provider profile |
+| `credential_placeholder_in_request_body` | A body reference is invalid/revoked, or classification metadata is unavailable | Check the controlled denial reason; remove the reference from conversation history or restore provider access. Do not enable body credential rewriting or bypass flags to send tool output. Unknown literals and valid issued placeholders pass unchanged, including the model provider’s own placeholder. Header resolution does not enable body rewriting. |
+| A retired managed endpoint fails DNS resolution | Client still uses the removed managed endpoint | Configure the provider's native base URL and attach an endpoint-bearing provider profile |
 | Direct request is denied | Missing attachment, endpoint policy, HTTP rule, or binary authorization | Inspect the attached provider profile and sandbox effective policy |
 | `credential_endpoint_mismatch` | Credential profile does not authorize the request recipient | Correct the host/port/path or import a narrowly scoped profile for the intended endpoint |
 | `request_authority_mismatch` | HTTP authority differs from the CONNECT destination | Use the same host and effective port in both authorities |

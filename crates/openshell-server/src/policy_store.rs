@@ -4,12 +4,24 @@
 use crate::persistence::{
     DraftChunkRecord, PersistenceError, PersistenceResult, PolicyRecord, SetResourceVersion, Store,
 };
-use openshell_core::proto::{
-    DraftChunkPayload, NetworkPolicyRule, PolicyRevisionPayload, Sandbox,
-    SandboxPolicy as ProtoSandboxPolicy,
-};
+use crate::storage_proto::{DraftChunkPayload, PolicyRevisionPayload};
+use openshell_core::proto::{NetworkPolicyRule, Sandbox, SandboxPolicy as ProtoSandboxPolicy};
 use prost::Message;
 use std::collections::HashMap;
+
+#[derive(Clone, PartialEq, Message)]
+struct RawPolicyRevisionPayload {
+    #[prost(bytes = "vec", optional, tag = "1")]
+    policy: Option<Vec<u8>>,
+    #[prost(string, tag = "2")]
+    hash: String,
+    #[prost(string, tag = "3")]
+    load_error: String,
+    #[prost(int64, tag = "4")]
+    loaded_at_ms: i64,
+    #[prost(map = "string, string", tag = "5")]
+    provenance: HashMap<String, String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct AtomicPolicyRevisionWrite {
@@ -22,6 +34,8 @@ pub struct AtomicPolicyRevisionWrite {
     pub provenance: HashMap<String, String>,
     pub expected_resource_version: u64,
     pub annotations: HashMap<String, String>,
+    /// Populate the create-time baseline, or replace it while startup admission
+    /// is blocked and no workload has consumed the static restrictions.
     pub backfill_policy: Option<ProtoSandboxPolicy>,
 }
 
@@ -43,6 +57,26 @@ pub fn policy_record_for_atomic_write(
     }
 }
 
+/// Only a new sandbox with durable evidence of no prior activation can replace
+/// static restrictions. Legacy records are conservative: absence is not false.
+pub fn permits_initial_static_policy_repair(sandbox: &Sandbox) -> bool {
+    sandbox.status.as_ref().is_some_and(|status| {
+        status.configuration_activated == Some(false)
+            && status
+                .configuration_admission
+                .as_ref()
+                .is_some_and(|admission| {
+                    matches!(
+                        openshell_core::proto::ConfigurationAdmissionState::try_from(
+                            admission.state
+                        ),
+                        Ok(openshell_core::proto::ConfigurationAdmissionState::Pending
+                            | openshell_core::proto::ConfigurationAdmissionState::Rejected)
+                    )
+                })
+    })
+}
+
 pub fn project_policy_revision_onto_sandbox(
     write: &AtomicPolicyRevisionWrite,
     payload: &[u8],
@@ -56,11 +90,13 @@ pub fn project_policy_revision_onto_sandbox(
         });
     }
 
-    let mut sandbox = Sandbox::decode(payload)
+    let payload = crate::persistence::migrate_legacy_time_fields("sandbox", payload)?;
+    let mut sandbox = Sandbox::decode(payload.as_slice())
         .map_err(|e| PersistenceError::Decode(format!("decode sandbox payload failed: {e}")))?;
     sandbox.set_resource_version(current_resource_version);
 
     let mut changed = false;
+    let startup_blocked = permits_initial_static_policy_repair(&sandbox);
     if let Some(backfill_policy) = write.backfill_policy.as_ref() {
         let spec = sandbox
             .spec
@@ -72,6 +108,10 @@ pub fn project_policy_revision_onto_sandbox(
                 changed = true;
             }
             Some(current) if current == backfill_policy => {}
+            Some(_) if startup_blocked => {
+                spec.policy = Some(backfill_policy.clone());
+                changed = true;
+            }
             Some(_) => {
                 return Err(PersistenceError::Conflict {
                     current_resource_version: Some(current_resource_version),
@@ -127,11 +167,19 @@ pub trait PolicyStoreExt {
         version: i64,
     ) -> PersistenceResult<Option<PolicyRecord>>;
 
+    #[allow(dead_code)]
     async fn list_policies(
         &self,
         sandbox_id: &str,
         limit: u32,
         offset: u32,
+    ) -> PersistenceResult<Vec<PolicyRecord>>;
+
+    async fn list_policies_before(
+        &self,
+        sandbox_id: &str,
+        limit: u32,
+        before_version: Option<i64>,
     ) -> PersistenceResult<Vec<PolicyRecord>>;
 
     async fn update_policy_status(
@@ -284,6 +332,26 @@ impl PolicyStoreExt for Store {
         }
     }
 
+    async fn list_policies_before(
+        &self,
+        sandbox_id: &str,
+        limit: u32,
+        before_version: Option<i64>,
+    ) -> PersistenceResult<Vec<PolicyRecord>> {
+        match self {
+            Self::Postgres(store) => {
+                store
+                    .list_policies_before(sandbox_id, limit, before_version)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .list_policies_before(sandbox_id, limit, before_version)
+                    .await
+            }
+        }
+    }
+
     async fn update_policy_status(
         &self,
         sandbox_id: &str,
@@ -422,10 +490,10 @@ impl PolicyStoreExt for Store {
 }
 
 pub fn policy_payload_from_record(record: &PolicyRecord) -> PersistenceResult<Vec<u8>> {
-    let policy = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+    ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
         .map_err(|e| PersistenceError::Decode(format!("decode policy payload failed: {e}")))?;
-    Ok(PolicyRevisionPayload {
-        policy: Some(policy),
+    Ok(RawPolicyRevisionPayload {
+        policy: Some(record.policy_payload.clone()),
         hash: record.policy_hash.clone(),
         load_error: record.load_error.clone().unwrap_or_default(),
         loaded_at_ms: record.loaded_at_ms.unwrap_or(0),
@@ -442,16 +510,21 @@ pub fn policy_record_from_parts(
     payload: &[u8],
     created_at_ms: i64,
 ) -> PersistenceResult<PolicyRecord> {
+    let raw_wrapper = RawPolicyRevisionPayload::decode(payload)
+        .map_err(|e| PersistenceError::Decode(format!("decode raw policy wrapper failed: {e}")))?;
     let wrapper = PolicyRevisionPayload::decode(payload)
         .map_err(|e| PersistenceError::Decode(format!("decode policy wrapper failed: {e}")))?;
-    let policy = wrapper
+    wrapper
+        .policy
+        .ok_or_else(|| PersistenceError::Decode("policy wrapper missing policy".to_string()))?;
+    let policy_payload = raw_wrapper
         .policy
         .ok_or_else(|| PersistenceError::Decode("policy wrapper missing policy".to_string()))?;
     Ok(PolicyRecord {
         id,
         sandbox_id,
         version,
-        policy_payload: policy.encode_to_vec(),
+        policy_payload,
         policy_hash: wrapper.hash,
         status,
         load_error: if wrapper.load_error.is_empty() {
@@ -550,4 +623,68 @@ pub fn draft_chunk_record_from_parts(
         current_effective_policy: wrapper.current_effective_policy,
         candidate_effective_policy: wrapper.candidate_effective_policy,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openshell_core::proto::{
+        ConfigurationAdmissionState as Admission, SandboxConfigurationAdmission, SandboxSpec,
+        SandboxStatus,
+    };
+
+    #[test]
+    fn static_projection_requires_durable_evidence_of_no_previous_activation() {
+        let baseline = openshell_policy::restrictive_default_policy();
+        let mut replacement = baseline.clone();
+        replacement
+            .filesystem
+            .as_mut()
+            .unwrap()
+            .read_write
+            .push("/new-static-path".to_string());
+        let write = AtomicPolicyRevisionWrite {
+            id: "revision".to_string(),
+            sandbox_id: "sandbox".to_string(),
+            workspace: "default".to_string(),
+            version: 2,
+            policy_payload: replacement.encode_to_vec(),
+            policy_hash: String::new(),
+            provenance: HashMap::new(),
+            expected_resource_version: 0,
+            annotations: HashMap::new(),
+            backfill_policy: Some(replacement.clone()),
+        };
+        for activated in [None, Some(false), Some(true)] {
+            for state in [Admission::Pending, Admission::Rejected, Admission::Accepted] {
+                let sandbox = Sandbox {
+                    spec: Some(SandboxSpec {
+                        policy: Some(baseline.clone()),
+                        ..Default::default()
+                    }),
+                    status: Some(SandboxStatus {
+                        configuration_activated: activated,
+                        configuration_admission: Some(SandboxConfigurationAdmission {
+                            state: state.into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let result =
+                    project_policy_revision_onto_sandbox(&write, &sandbox.encode_to_vec(), 1);
+                if activated == Some(false) && state != Admission::Accepted {
+                    let (projected, changed) = result.unwrap();
+                    assert!(changed);
+                    assert_eq!(projected.spec.unwrap().policy, Some(replacement.clone()));
+                } else {
+                    assert!(
+                        matches!(result, Err(PersistenceError::Conflict { .. })),
+                        "{activated:?} {state:?}"
+                    );
+                }
+            }
+        }
+    }
 }

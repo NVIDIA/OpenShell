@@ -22,8 +22,8 @@ func ServiceEndpointFromProto(resp *pb.ServiceEndpointResponse) *types.ServiceEn
 
 	if ep := resp.GetEndpoint(); ep != nil {
 		result.SandboxID = ep.GetSandboxId()
-		result.SandboxName = ep.GetSandboxName()
-		result.ServiceName = ep.GetServiceName()
+		result.Sandbox = ep.GetSandbox()
+		result.Name = ep.GetName()
 		result.TargetPort = ep.GetTargetPort()
 		result.Domain = ep.GetDomain()
 
@@ -48,11 +48,11 @@ func ServiceEndpointToProto(se *types.ServiceEndpoint) *pb.ServiceEndpointRespon
 				Id:        se.ID,
 				Workspace: se.Workspace,
 			},
-			SandboxId:   se.SandboxID,
-			SandboxName: se.SandboxName,
-			ServiceName: se.ServiceName,
-			TargetPort:  se.TargetPort,
-			Domain:      se.Domain,
+			SandboxId:  se.SandboxID,
+			Sandbox:    se.Sandbox,
+			Name:       se.Name,
+			TargetPort: se.TargetPort,
+			Domain:     se.Domain,
 		},
 		Url: se.URL,
 	}

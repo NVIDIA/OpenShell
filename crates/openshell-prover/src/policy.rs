@@ -7,16 +7,12 @@
 //! types) because the prover needs fields like `access`, `protocol`, and
 //! individual L7 rules that the proto representation strips.
 
+use openshell_policy_schema::{
+    AccessPreset, L7Allow as AuthoredAllow, NetworkEndpoint as AuthoredEndpoint, ParseLimits,
+    PolicyDocument,
+};
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
-
-use miette::{IntoDiagnostic, Result, WrapErr};
-use serde::Deserialize;
-use serde::de::IgnoredAny;
-
-// ---------------------------------------------------------------------------
-// Policy intent
-// ---------------------------------------------------------------------------
 
 /// The inferred access intent for an endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,105 +25,21 @@ pub enum PolicyIntent {
 }
 
 impl std::fmt::Display for PolicyIntent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::L4Only => write!(f, "l4_only"),
-            Self::ReadOnly => write!(f, "read_only"),
-            Self::ReadWrite => write!(f, "read_write"),
-            Self::Full => write!(f, "full"),
-            Self::Custom => write!(f, "custom"),
-        }
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::L4Only => "l4_only",
+            Self::ReadOnly => "read_only",
+            Self::ReadWrite => "read_write",
+            Self::Full => "full",
+            Self::Custom => "custom",
+        })
     }
 }
 
 /// HTTP methods considered to be write operations.
 pub const WRITE_METHODS: &[&str] = &["POST", "PUT", "PATCH", "DELETE"];
 
-/// All standard HTTP methods.
 const ALL_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
-
-// ---------------------------------------------------------------------------
-// Serde types — mirrors the YAML schema
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct PolicyFile {
-    #[allow(dead_code)]
-    version: Option<u32>,
-    #[serde(default)]
-    filesystem_policy: Option<FilesystemDef>,
-    #[serde(default)]
-    network_policies: Option<BTreeMap<String, NetworkPolicyRuleDef>>,
-    // Ignored fields the prover does not need.
-    #[serde(default)]
-    #[allow(dead_code)]
-    landlock: Option<IgnoredAny>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    process: Option<IgnoredAny>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FilesystemDef {
-    #[serde(default)]
-    include_workdir: bool,
-    #[serde(default)]
-    read_only: Vec<String>,
-    #[serde(default)]
-    read_write: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NetworkPolicyRuleDef {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    endpoints: Vec<EndpointDef>,
-    #[serde(default)]
-    binaries: Vec<BinaryDef>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EndpointDef {
-    #[serde(default)]
-    host: String,
-    #[serde(default)]
-    port: u16,
-    #[serde(default)]
-    ports: Vec<u16>,
-    #[serde(default)]
-    protocol: String,
-    #[serde(default)]
-    tls: String,
-    #[serde(default)]
-    enforcement: String,
-    #[serde(default)]
-    access: String,
-    #[serde(default)]
-    rules: Vec<L7RuleDef>,
-    #[serde(default)]
-    allowed_ips: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct L7RuleDef {
-    allow: L7AllowDef,
-}
-
-#[derive(Debug, Deserialize)]
-struct L7AllowDef {
-    #[serde(default)]
-    method: String,
-    #[serde(default)]
-    path: String,
-    #[serde(default)]
-    command: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BinaryDef {
-    path: String,
-}
 
 // ---------------------------------------------------------------------------
 // Public model types
@@ -158,19 +70,19 @@ pub struct Endpoint {
 impl Endpoint {
     /// Whether this endpoint has L7 (protocol-level) enforcement.
     pub fn is_l7_enforced(&self) -> bool {
-        !self.protocol.is_empty()
+        !self.protocol.is_empty() && !self.protocol.eq_ignore_ascii_case("tcp")
     }
 
     /// The inferred access intent.
     pub fn intent(&self) -> PolicyIntent {
-        if self.protocol.is_empty() {
+        if !self.is_l7_enforced() {
             return PolicyIntent::L4Only;
         }
-        match self.access.as_str() {
-            "read-only" => PolicyIntent::ReadOnly,
-            "read-write" => PolicyIntent::ReadWrite,
-            "full" => PolicyIntent::Full,
-            _ => {
+        match AccessPreset::parse(&self.access) {
+            Some(AccessPreset::ReadOnly) => PolicyIntent::ReadOnly,
+            Some(AccessPreset::ReadWrite) => PolicyIntent::ReadWrite,
+            Some(AccessPreset::Full) => PolicyIntent::Full,
+            None => {
                 if self.rules.is_empty() {
                     return PolicyIntent::Custom;
                 }
@@ -204,33 +116,32 @@ impl Endpoint {
 
     /// The set of HTTP methods this endpoint allows. Empty means all (L4-only).
     pub fn allowed_methods(&self) -> HashSet<String> {
-        if self.protocol.is_empty() {
+        if !self.is_l7_enforced() {
             return HashSet::new(); // L4-only: all traffic passes
         }
-        match self.access.as_str() {
-            "read-only" => ["GET", "HEAD", "OPTIONS"]
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
-            "read-write" => ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"]
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
-            "full" => ALL_METHODS.iter().map(|s| (*s).to_owned()).collect(),
-            _ => {
-                if !self.rules.is_empty() {
-                    let mut methods = HashSet::new();
-                    for r in &self.rules {
-                        let m = r.method.to_uppercase();
-                        if m == "*" {
-                            return ALL_METHODS.iter().map(|s| (*s).to_owned()).collect();
-                        }
-                        methods.insert(m);
-                    }
-                    return methods;
-                }
-                HashSet::new()
+        if let Some(preset) = AccessPreset::parse(&self.access) {
+            let methods = preset.methods(&self.protocol);
+            if methods.contains(&"*") {
+                ALL_METHODS
+                    .iter()
+                    .map(|method| (*method).to_owned())
+                    .collect()
+            } else {
+                methods.iter().map(|method| (*method).to_owned()).collect()
             }
+        } else {
+            if !self.rules.is_empty() {
+                let mut methods = HashSet::new();
+                for r in &self.rules {
+                    let m = r.method.to_uppercase();
+                    if m == "*" {
+                        return ALL_METHODS.iter().map(|s| (*s).to_owned()).collect();
+                    }
+                    methods.insert(m);
+                }
+                return methods;
+            }
+            HashSet::new()
         }
     }
 }
@@ -344,80 +255,78 @@ impl PolicyModel {
 // Parsing
 // ---------------------------------------------------------------------------
 
-/// Parse an `OpenShell` policy YAML file into a [`PolicyModel`].
-pub fn parse_policy(path: &Path) -> Result<PolicyModel> {
-    let contents = std::fs::read_to_string(path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("reading policy file {}", path.display()))?;
-    parse_policy_str(&contents)
+/// Parse an `OpenShell` policy YAML file into a `PolicyModel`.
+pub fn parse_policy(path: &Path) -> miette::Result<PolicyModel> {
+    let document = openshell_policy_schema::parse_policy_file(path, ParseLimits::default())?;
+    Ok(project_policy(document))
 }
 
-/// Parse a policy YAML string into a [`PolicyModel`].
-pub fn parse_policy_str(yaml: &str) -> Result<PolicyModel> {
-    let raw: PolicyFile = serde_yml::from_str(yaml)
-        .into_diagnostic()
-        .wrap_err("parsing policy YAML")?;
+/// Parse a policy YAML string into a `PolicyModel`.
+pub fn parse_policy_str(yaml: &str) -> miette::Result<PolicyModel> {
+    let document = openshell_policy_schema::parse_policy(yaml)?;
+    Ok(project_policy(document))
+}
 
-    let fs = match raw.filesystem_policy {
-        Some(fs_def) => FilesystemPolicy {
-            include_workdir: fs_def.include_workdir,
-            read_only: fs_def.read_only,
-            read_write: fs_def.read_write,
-        },
-        None => FilesystemPolicy::default(),
+fn project_policy(document: PolicyDocument) -> PolicyModel {
+    let filesystem = document.effective_filesystem_policy();
+    let filesystem_policy = FilesystemPolicy {
+        include_workdir: filesystem.include_workdir,
+        read_only: filesystem.read_only,
+        read_write: filesystem.read_write,
     };
 
-    let mut network_policies = BTreeMap::new();
-    if let Some(np) = raw.network_policies {
-        for (key, rule_raw) in np {
-            let endpoints = rule_raw
-                .endpoints
-                .into_iter()
-                .map(|ep_raw| {
-                    let rules = ep_raw
-                        .rules
-                        .into_iter()
-                        .map(|r| L7Rule {
-                            method: r.allow.method,
-                            path: r.allow.path,
-                            command: r.allow.command,
-                        })
-                        .collect();
-                    Endpoint {
-                        host: ep_raw.host,
-                        port: ep_raw.port,
-                        ports: ep_raw.ports,
-                        protocol: ep_raw.protocol,
-                        tls: ep_raw.tls,
-                        enforcement: ep_raw.enforcement,
-                        access: ep_raw.access,
-                        rules,
-                        allowed_ips: ep_raw.allowed_ips,
-                    }
-                })
-                .collect();
-
-            let binaries = rule_raw
+    let network_policies = document
+        .network_policies
+        .into_iter()
+        .map(|(key, rule)| {
+            let name = rule.effective_name(&key).to_owned();
+            let endpoints = rule.endpoints.into_iter().map(project_endpoint).collect();
+            let binaries = rule
                 .binaries
                 .into_iter()
-                .map(|b| Binary { path: b.path })
+                .map(|binary| Binary { path: binary.path })
                 .collect();
-
-            let name = rule_raw.name.unwrap_or_else(|| key.clone());
-            network_policies.insert(
+            (
                 key,
                 NetworkPolicyRule {
                     name,
                     endpoints,
                     binaries,
                 },
-            );
-        }
-    }
+            )
+        })
+        .collect();
 
-    Ok(PolicyModel {
-        version: raw.version.unwrap_or(1),
-        filesystem_policy: fs,
+    PolicyModel {
+        version: document.version,
+        filesystem_policy,
         network_policies,
-    })
+    }
+}
+
+fn project_endpoint(endpoint: AuthoredEndpoint) -> Endpoint {
+    let rules = endpoint
+        .rules
+        .into_iter()
+        .map(|rule| project_allow(rule.allow))
+        .collect();
+    Endpoint {
+        host: endpoint.host,
+        port: endpoint.port,
+        ports: endpoint.ports,
+        protocol: endpoint.protocol,
+        tls: endpoint.tls,
+        enforcement: endpoint.enforcement,
+        access: endpoint.access,
+        rules,
+        allowed_ips: endpoint.allowed_ips,
+    }
+}
+
+fn project_allow(allow: AuthoredAllow) -> L7Rule {
+    L7Rule {
+        method: allow.method,
+        path: allow.path,
+        command: allow.command,
+    }
 }

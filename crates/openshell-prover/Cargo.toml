@@ -12,15 +12,22 @@ repository.workspace = true
 
 [features]
 bundled-z3 = ["z3/bundled"]
+prebuilt-z3 = ["z3/gh-release"]
 
 [dependencies]
 z3 = { workspace = true }
+openshell-policy-schema = { path = "../openshell-policy-schema" }
 serde = { workspace = true }
 serde_yml = { workspace = true }
 miette = { workspace = true }
 owo-colors = { workspace = true }
 include_dir = { workspace = true }
 glob = { workspace = true }
+
+[dev-dependencies]
+openshell-core = { path = "../openshell-core" }
+regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob"] }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

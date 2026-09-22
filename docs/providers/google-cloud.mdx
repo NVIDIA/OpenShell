@@ -16,6 +16,14 @@ never holds a real GCP credential.
 
 ## Quick Start
 
+Import the `google-cloud` profile first; a gateway serves only the profiles you
+imported:
+
+```shell
+curl -LsSfO https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/google-cloud.yaml
+openshell provider profile import -f google-cloud.yaml --global
+```
+
 If you already have `gcloud` configured with Application Default Credentials,
 create a provider with automatic credential refresh in one command:
 

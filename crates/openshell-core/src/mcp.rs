@@ -1,40 +1,25 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenShell-owned MCP protocol revisions and immutable batch-shape metadata.
+//! `OpenShell`-owned MCP protocol revisions and immutable batch-shape metadata.
 
 use std::collections::BTreeSet;
-use std::fmt;
-use std::str::FromStr;
 
 use crate::proto::{McpOptions, ProviderProfile};
 
-/// Fixed `OpenShell` batch-member bound for the MCP `2025-03-26` wire profile.
-///
-/// The bound is distinct from the separately enforced request-body byte limit.
-pub const MAX_MCP_LEGACY_BATCH_MESSAGES: usize = 64;
+pub use openshell_policy_schema::{
+    DEFAULT_MCP_PROTOCOL_VERSION, MAX_MCP_LEGACY_BATCH_MESSAGES, McpProtocolVersion,
+    McpWireProfile, ParseMcpProtocolVersionError,
+};
 
-/// Stable MCP protocol revisions accepted by `OpenShell` policy configuration.
+/// Return whether a policy protocol name denotes MCP.
 ///
-/// Variant order is the canonical semantic order used when normalizing policy
-/// allowlists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[non_exhaustive]
-pub enum McpProtocolVersion {
-    /// MCP protocol revision `2025-03-26`.
-    V2025_03_26,
-    /// MCP protocol revision `2025-06-18`.
-    V2025_06_18,
-    /// MCP protocol revision `2025-11-25`.
-    V2025_11_25,
+/// Protocol names are case-insensitive throughout policy validation and
+/// execution, so every MCP-specific projection must use the same predicate.
+#[must_use]
+pub fn is_mcp_protocol(protocol: &str) -> bool {
+    protocol.trim().eq_ignore_ascii_case("mcp")
 }
-
-/// Pinned MCP protocol revision used when policy authoring omits a revision.
-///
-/// This value is assigned directly rather than derived from
-/// [`McpProtocolVersion::ALL`] or its order. Adding support for a newer
-/// revision therefore cannot silently change versionless policies.
-pub const DEFAULT_MCP_PROTOCOL_VERSION: McpProtocolVersion = McpProtocolVersion::V2025_11_25;
 
 /// Normalize only the MCP option fields in a provider profile.
 ///
@@ -46,7 +31,7 @@ pub const DEFAULT_MCP_PROTOCOL_VERSION: McpProtocolVersion = McpProtocolVersion:
 /// original evidence. MCP-shaped data on non-MCP endpoints is also untouched.
 pub fn normalize_provider_profile_mcp_fields(profile: &mut ProviderProfile) {
     for endpoint in &mut profile.endpoints {
-        if !endpoint.protocol.eq_ignore_ascii_case("mcp") {
+        if !is_mcp_protocol(&endpoint.protocol) {
             continue;
         }
 
@@ -82,116 +67,6 @@ pub fn normalize_provider_profile_mcp_fields(profile: &mut ProviderProfile) {
             .into_iter()
             .map(|version| version.as_str().to_string())
             .collect();
-    }
-}
-
-impl McpProtocolVersion {
-    /// Every supported MCP protocol revision in canonical semantic order.
-    pub const ALL: &'static [Self] = &[Self::V2025_03_26, Self::V2025_06_18, Self::V2025_11_25];
-
-    /// Return the exact protocol identifier used on the MCP wire.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::V2025_03_26 => "2025-03-26",
-            Self::V2025_06_18 => "2025-06-18",
-            Self::V2025_11_25 => "2025-11-25",
-        }
-    }
-
-    /// Return the fixed batch-shape metadata for this protocol revision.
-    #[must_use]
-    pub const fn wire_profile(self) -> McpWireProfile {
-        match self {
-            Self::V2025_03_26 => McpWireProfile {
-                version: self,
-                allows_json_rpc_batches: true,
-                max_batch_messages: Some(MAX_MCP_LEGACY_BATCH_MESSAGES),
-            },
-            Self::V2025_06_18 | Self::V2025_11_25 => McpWireProfile {
-                version: self,
-                allows_json_rpc_batches: false,
-                max_batch_messages: None,
-            },
-        }
-    }
-}
-
-impl fmt::Display for McpProtocolVersion {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl FromStr for McpProtocolVersion {
-    type Err = ParseMcpProtocolVersionError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "2025-03-26" => Ok(Self::V2025_03_26),
-            "2025-06-18" => Ok(Self::V2025_06_18),
-            "2025-11-25" => Ok(Self::V2025_11_25),
-            _ => Err(ParseMcpProtocolVersionError {
-                value: value.to_string(),
-            }),
-        }
-    }
-}
-
-/// Error returned when a string is not an exact supported MCP revision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseMcpProtocolVersionError {
-    value: String,
-}
-
-impl ParseMcpProtocolVersionError {
-    /// Return the exact input that failed MCP revision parsing.
-    #[must_use]
-    pub fn value(&self) -> &str {
-        &self.value
-    }
-}
-
-impl fmt::Display for ParseMcpProtocolVersionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "unsupported MCP protocol version '{}'",
-            self.value
-        )
-    }
-}
-
-impl std::error::Error for ParseMcpProtocolVersionError {}
-
-/// Immutable batch-shape metadata for one exact MCP protocol revision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct McpWireProfile {
-    version: McpProtocolVersion,
-    allows_json_rpc_batches: bool,
-    max_batch_messages: Option<usize>,
-}
-
-impl McpWireProfile {
-    /// Return the protocol revision governed by this profile.
-    #[must_use]
-    pub const fn version(self) -> McpProtocolVersion {
-        self.version
-    }
-
-    /// Return whether the revision permits a top-level JSON-RPC batch array.
-    #[must_use]
-    pub const fn allows_json_rpc_batches(self) -> bool {
-        self.allows_json_rpc_batches
-    }
-
-    /// Return the maximum batch members when batching is permitted.
-    ///
-    /// `None` means the profile forbids batches; it never represents an
-    /// unbounded batch.
-    #[must_use]
-    pub const fn max_batch_messages(self) -> Option<usize> {
-        self.max_batch_messages
     }
 }
 
@@ -385,13 +260,10 @@ mod tests {
             "draft",
             "latest",
         ] {
-            let error = unsupported.parse::<McpProtocolVersion>();
-            assert_eq!(
-                error,
-                Err(ParseMcpProtocolVersionError {
-                    value: unsupported.to_string(),
-                })
-            );
+            let error = unsupported
+                .parse::<McpProtocolVersion>()
+                .expect_err("unsupported MCP revision must be rejected");
+            assert_eq!(error.value(), unsupported);
         }
     }
 

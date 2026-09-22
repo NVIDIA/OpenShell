@@ -64,7 +64,7 @@ def sandbox_client(cluster_name: str | None) -> Iterator[SandboxClient]:
 def ensure_sandbox_persistence_ready(sandbox_client: SandboxClient) -> None:
     for _ in range(60):
         try:
-            sandbox_client.list_ids(workspace="default", limit=1)
+            sandbox_client.list_ids(workspace="default", page_size=1)
             return
         except grpc.RpcError as exc:
             details = exc.details() or ""
@@ -93,8 +93,7 @@ def sandbox(cluster_name: str | None) -> Callable[..., Sandbox]:
             cluster=cluster_name,
             spec=spec,
             delete_on_exit=delete_on_exit,
-            # The sandbox image is large (Python, Node.js, coding agents) so the
-            # first pod in the cluster may need extra time for the image pull.
+            # Allow time to pull an explicitly supplied workload fixture.
             ready_timeout_seconds=300.0,
         )
 

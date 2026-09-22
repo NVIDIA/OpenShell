@@ -18,7 +18,9 @@ pub mod driver_mounts;
 pub mod driver_utils;
 pub mod dynamic_string_allowlist;
 pub mod endpoint_path;
+pub mod endpoint_status;
 pub mod error;
+pub mod extension_protocol;
 #[cfg(unix)]
 pub mod external_driver_socket;
 pub mod forward;
@@ -37,12 +39,16 @@ pub mod net;
 pub mod oauth;
 pub mod paths;
 pub mod policy;
+pub mod policy_identity;
 pub mod progress;
 pub mod proposals;
 pub mod proto;
 pub mod proto_struct;
 pub mod provider_credentials;
+pub mod rpc_error;
 pub mod sandbox_env;
+pub mod sandbox_generation;
+pub mod sandbox_session;
 pub mod secrets;
 pub mod settings;
 pub mod shell;
@@ -52,16 +58,18 @@ pub mod time;
 pub mod transport_errors;
 
 pub use config::{
-    Config, GatewayAuthConfig, GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy,
-    GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig,
-    GatewayJwtConfig, GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig,
-    PolicyValidationFailureMode, TlsConfig,
+    AppArmorProfile, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,
+    GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
+    GatewayInterceptorPhaseConfig, GatewayJwtConfig, GatewayProviderProfileSourceConfig,
+    ImagePullPolicy, MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode, TlsConfig,
+    UpstreamProxyConfig,
 };
 pub use dynamic_string_allowlist::DynamicStringAllowlist;
 pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{
     GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
 };
+pub use sandbox_session::{SandboxSessionId, SandboxSessionIdError};
 
 /// Build version string derived from git metadata.
 ///

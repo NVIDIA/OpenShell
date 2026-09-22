@@ -3,7 +3,7 @@
 
 //! Builder for Detection Finding [2004] events.
 
-use crate::builders::SandboxContext;
+use crate::builders::EventContext;
 use crate::enums::{ActionId, ActivityId, ConfidenceId, DispositionId, RiskLevelId, SeverityId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{DetectionFindingEvent, OcsfEvent};
@@ -11,7 +11,7 @@ use crate::objects::{Attack, Evidence, FindingInfo, Remediation};
 
 /// Builder for Detection Finding [2004] events.
 pub struct DetectionFindingBuilder<'a> {
-    ctx: &'a SandboxContext,
+    ctx: &'a EventContext,
     activity: ActivityId,
     severity: SeverityId,
     action: Option<ActionId>,
@@ -30,7 +30,7 @@ pub struct DetectionFindingBuilder<'a> {
 
 impl<'a> DetectionFindingBuilder<'a> {
     #[must_use]
-    pub fn new(ctx: &'a SandboxContext) -> Self {
+    pub fn new(ctx: &'a EventContext) -> Self {
         Self {
             ctx,
             activity: ActivityId::Open,

@@ -1,0 +1,99 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Run OpenShell conformance tests
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Create OpenShell conformance test directory
+      become: true
+      ansible.builtin.file:
+        path: /var/lib/openshell-conformance/tests
+        state: directory
+        owner: tmachine
+        group: tmachine
+        mode: "0700"
+
+    - name: Extract OpenShell conformance test bundle
+      become: true
+      ansible.builtin.unarchive:
+        src: "{{ openshell_conformance_test_bundle }}"
+        dest: /var/lib/openshell-conformance/tests
+        owner: tmachine
+        group: tmachine
+
+    # Report a malformed outer bundle directly instead of failing later with
+    # an opaque cargo-nextest missing-archive error.
+    - name: Check OpenShell conformance nextest archive
+      ansible.builtin.stat:
+        path: /var/lib/openshell-conformance/tests/tests.tar.zst
+      register: conformance_archive
+
+    - name: Require OpenShell conformance nextest archive
+      ansible.builtin.assert:
+        that:
+          - conformance_archive.stat.isreg | default(false)
+        fail_msg: OpenShell conformance test bundle did not contain tests.tar.zst
+
+    - name: Resolve installed OpenShell CLI
+      ansible.builtin.command:
+        argv:
+          - /bin/sh
+          - -c
+          - command -v openshell
+      register: openshell_cli
+      changed_when: false
+
+    - name: Run OpenShell conformance archive
+      ansible.builtin.command:
+        argv:
+          - cargo-nextest
+          - nextest
+          - run
+          - --archive-file
+          - /var/lib/openshell-conformance/tests/tests.tar.zst
+          - --workspace-remap
+          - /var/lib/openshell-conformance/tests
+          - --no-capture
+      environment:
+        OPENSHELL_BIN: "{{ openshell_cli.stdout }}"
+      register: conformance_result
+      changed_when: false
+      failed_when: false
+
+    # Preserve both streams for failures without adding passing-test output to
+    # every tmachine run.
+    - name: Show OpenShell conformance diagnostics
+      ansible.builtin.debug:
+        var: conformance_result
+      when: conformance_result.rc != 0
+
+    - name: Read OpenShell gateway logs
+      become: true
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - --unit
+          - openshell-gateway.service
+          - --no-pager
+          - --lines
+          - "500"
+      register: openshell_gateway_logs
+      changed_when: false
+      failed_when: false
+      when: conformance_result.rc != 0
+
+    - name: Show OpenShell gateway logs
+      ansible.builtin.debug:
+        var: openshell_gateway_logs.stdout_lines
+      when: conformance_result.rc != 0
+
+    - name: Require OpenShell conformance success
+      ansible.builtin.assert:
+        that:
+          - conformance_result.rc == 0
+        fail_msg: OpenShell conformance test failed

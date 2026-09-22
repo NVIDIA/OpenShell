@@ -12,6 +12,19 @@ on:
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      candidate_ref:
+        description: Optional pre-release tag to scan instead of the triggering revision
+        default: ""
+        type: string
+      fail-on-findings:
+        description: Fail on Zizmor HIGH findings; Actionlint remains informational
+        default: false
+        type: boolean
+    secrets:
+      CACHIX_AUTH_TOKEN:
+        required: false
 
 permissions:
   contents: read
@@ -21,7 +34,7 @@ defaults:
     shell: nix develop --command bash -euo pipefail {0}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: workflow-security-${{ github.workflow }}-${{ inputs.candidate_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -33,7 +46,9 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
         with:
+          ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
           persist-credentials: false
 
       - name: Set up Nix
@@ -95,6 +110,8 @@ jobs:
         uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           sarif_file: reports/actionlint.sarif
+          ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
+          sha: ${{ inputs.candidate_ref && steps.checkout.outputs.commit || '' }}
           category: actionlint
 
       - name: Upload Actionlint report
@@ -109,14 +126,16 @@ jobs:
           retention-days: 14
 
   zizmor:
-    name: Zizmor High report (informational)
+    name: ${{ inputs.fail-on-findings && 'Zizmor High report' || 'Zizmor High report (informational)' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       security-events: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
         with:
+          ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
           persist-credentials: false
 
       - name: Set up Nix
@@ -125,6 +144,9 @@ jobs:
           cachix-auth-token: ${{ github.event_name != 'pull_request' && secrets.CACHIX_AUTH_TOKEN || '' }}
 
       - name: Run Zizmor
+        id: findings
+        env:
+          FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings || false }}
         run: |
           set -euo pipefail
           mkdir -p reports
@@ -145,7 +167,10 @@ jobs:
             --format=sarif \
             . > reports/zizmor-high.sarif
 
-          finding_count=$(jq 'length' reports/zizmor-high.json)
+          finding_count=$(jq '
+            [.[] | select(.ignored != true and .determinations.severity == "High")] | length
+          ' reports/zizmor-high.json)
+          echo "high_count=$finding_count" >> "$GITHUB_OUTPUT"
           {
             echo "### Zizmor high-severity report"
             echo
@@ -158,12 +183,12 @@ jobs:
                 'group_by(.ident) | .[] | "- `\(.[0].ident)`: \(length)"' \
                 reports/zizmor-high.json
               echo
-              echo "These findings are informational and do not fail CI."
+              echo "Fail on HIGH findings: $FAIL_ON_FINDINGS"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$finding_count" -gt 0 ]; then
-            echo "::warning::Zizmor reported $finding_count high-severity findings; this check is informational."
+            echo "::warning::Zizmor reported $finding_count high-severity findings."
           fi
 
       - name: Upload Zizmor SARIF to Code Scanning
@@ -171,6 +196,8 @@ jobs:
         uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           sarif_file: reports/zizmor-high.sarif
+          ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
+          sha: ${{ inputs.candidate_ref && steps.checkout.outputs.commit || '' }}
           category: zizmor-high
 
       - name: Upload Zizmor reports
@@ -183,3 +210,17 @@ jobs:
             reports/zizmor-high.sarif
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: Enforce HIGH/CRITICAL threshold
+        if: ${{ !cancelled() && steps.findings.outcome == 'success' }}
+        env:
+          HIGH_COUNT: ${{ steps.findings.outputs.high_count }}
+          FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings || false }}
+        run: |
+          if [ "$HIGH_COUNT" -gt 0 ]; then
+            if [ "$FAIL_ON_FINDINGS" = "true" ]; then
+              echo "::error::Zizmor reported $HIGH_COUNT HIGH findings."
+              exit 1
+            fi
+            echo "::warning::Zizmor reported $HIGH_COUNT HIGH findings; enforcement is disabled."
+          fi

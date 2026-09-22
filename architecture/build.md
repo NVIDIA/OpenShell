@@ -13,33 +13,25 @@ OpenShell builds these main artifacts:
 | Gateway binary | `crates/openshell-gateway` |
 | CLI binaries and system packages | `crates/openshell-cli` plus release packaging |
 | E2E conformance CLI | `crates/openshell-conformance-cli` |
+| Standalone policy prover | `crates/openshell-prover-cli` |
 | Python SDK wheel | `python/openshell` |
 | TypeScript SDK package | `sdk/typescript` |
 | Gateway container image | `deploy/docker/Dockerfile.gateway` |
-| Supervisor container image | `deploy/docker/Dockerfile.supervisor` |
+| Sandbox runtime binary and container image | `crates/openshell-sandbox` and `deploy/docker/Dockerfile.sandbox` |
+| Supervisor binary and container image | `crates/openshell-supervisor` and `deploy/docker/Dockerfile.supervisor` |
 | Helm chart | `deploy/helm/openshell` |
 | VM driver/runtime assets | `crates/openshell-driver-vm` |
 | Published docs site | `docs/` rendered by Fern config in `fern/` |
 
-Sandbox community images are built outside this repository.
+Workload images are standard OCI images supplied by operators or users.
 
 ## Build Features
-
-Rust builds require Rust 1.94 or newer. TLS and certificate generation use
-AWS-LC, including the CLI and standalone examples. Native and cross-build
-environments must provide the C toolchain required by aws-lc-sys; the Nix
-development shells provide static AWS-LC libraries.
-
-SQLx uses AWS-LC with native certificate roots. The server enables
-`sqlx-core/rustls-native-certs` directly because SQLx's facade does not expose
-that root selection independently of the crypto provider. Credential storage
-continues to use the same AES-256-GCM envelope format across backend changes.
 
 Anonymous telemetry emission is gated behind a default-on `telemetry` Cargo
 feature. It is defined in `openshell-core` (where the emission code, HTTP
 client, and endpoint live) and forwarded by the binary crates that emit or
-collect telemetry: `openshell-gateway`, `openshell-sandbox`
-(supervisor), and `openshell-driver-vm`. Every crate depends on
+collect telemetry: `openshell-gateway`, `openshell-sandbox`,
+`openshell-supervisor`, and `openshell-driver-vm`. Every crate depends on
 `openshell-core` with `default-features = false`, so the binary crate's feature
 is the single switch that enables `openshell-core/telemetry` for its build
 graph. In-process drivers (`docker`, `kubernetes`, `podman`) inherit the
@@ -57,8 +49,7 @@ Cargo cannot subtract a single default feature, so each of the three binary
 crates also defines a `defaults-without-telemetry` alias listing every default
 except `telemetry`. Telemetry-free builds use
 `--no-default-features --features defaults-without-telemetry` and stay correct
-as the default set grows, instead of dropping unrelated defaults the way a bare
-`--no-default-features` does on `openshell-sandbox`. The alias is a keep-list,
+as the default set grows. The alias is a keep-list,
 not a switch: enabling it on top of the defaults would otherwise yield a
 telemetry-on binary that reads as telemetry-free, so each crate root carries a
 `compile_error!` for the `telemetry` + `defaults-without-telemetry` combination.
@@ -73,7 +64,7 @@ roots through `webpki-roots` plus locally-installed CAs from the system bundle.
 Building without `bundled-ca-roots` switches to the platform trust store via
 `rustls-native-certs` and excludes bundled Mozilla root crates such as
 `webpki-roots` and `webpki-root-certs` from the dependency graph. The
-`system-ca-roots` feature alias on `openshell-sandbox` includes all other
+`system-ca-roots` feature alias on `openshell-supervisor` includes all other
 defaults (currently `telemetry`) except `bundled-ca-roots`, so Linux
 distribution builds (e.g. RPM) can use
 `--no-default-features --features system-ca-roots` without manually re-adding
@@ -84,6 +75,14 @@ The workspace uses `z3` versions whose `z3-sys` dependency keeps downloader
 HTTP/TLS support behind explicit build features, so default system-Z3 builds do
 not reintroduce bundled Mozilla roots. Release builds that need bundled Z3
 continue to opt in with `bundled-z3`.
+
+Release workflows build the standalone `openshell-prover` executable for Linux
+musl x86_64 and aarch64 and macOS Apple Silicon. The standard Debian, RPM, and
+Homebrew installations include it. Releases also publish one standalone archive
+per target plus a dedicated SHA-256 manifest. Before publication, target-native
+jobs extract each archive, reject host Z3 or Nix store linkage, and run a real
+local containment check. The standalone artifact therefore requires neither an
+OpenShell installation nor a separately installed Z3 runtime.
 
 ## Linux Runtime Environments
 
@@ -96,38 +95,24 @@ The gateway bundles z3 into the release binary so Linux packages, standalone
 tarballs, and gateway images do not depend on distro-specific z3 shared-library
 SONAMEs.
 
-The supervisor is the one binary whose libc is selectable, because it is the one
-binary executed inside a userland OpenShell does not control. `SUPERVISOR_LIBC`
-chooses between `musl` (default) and `glibc-static`. Both produce a fully static
-binary; the choice does not change the runtime layout or the supervisor image base.
-Static linkage is a hard requirement rather than a preference, so both variants
-are verified by `tasks/scripts/verify-static-binary.sh`, which fails the build on
-any `PT_INTERP` or `DT_NEEDED` entry.
-
-The two variants differ only in build-time constraints:
-
-| | `musl` (default) | `glibc-static` |
-|---|---|---|
-| Cross-compiles | yes, via `cargo zigbuild` | no — must build natively per architecture |
-| Host requirement | zig + cargo-zigbuild | glibc static libraries (`glibc-static` on Fedora/RHEL, `libc6-dev` on Debian/Ubuntu) |
-| libc license | MIT | LGPL-2.1-or-later, statically linked |
-
-`cargo zigbuild` cannot produce the `glibc-static` variant: `zig cc` accepts
-`-static` for `*-linux-gnu` targets and emits a dynamically linked binary
-anyway. The staging script therefore refuses to cross-compile that variant
-instead of silently degrading linkage.
-
-Selecting `glibc-static` statically links LGPL glibc into a redistributed
-binary, which carries relinking obligations that musl (MIT) does not. Treat the
-default as the shipping configuration unless that has been reviewed.
+The workload-side `openshell-sandbox` binary is statically linked with musl so
+drivers can stage it into an arbitrary agent image without depending on that
+image's libc. The separate `openshell-supervisor` binary is dynamically linked
+with GNU libc and uses the same glibc 2.28 compatibility floor as the gateway.
 
 ## Container Builds
 
+Docker E2E tool-dependent workloads use a dedicated Noble-based fixture,
+separate from the product's minimal default image. The fixture supplies the
+test identity and tools, with Python aligned to the host test runner for
+serialized callable compatibility. Default-image coverage retains the product
+image. Other compute-driver test lanes retain their existing workload fixtures.
+
 The Docker image pipeline is a two-step flow: build the Rust binary natively
 for the target architecture, then assemble the container image from the
-prebuilt binary. The gateway image is built from `deploy/docker/Dockerfile.gateway`
-and the supervisor image from `deploy/docker/Dockerfile.supervisor`. Neither
-Dockerfile compiles Rust — both copy a staged binary out of
+prebuilt binary. The gateway, sandbox, and supervisor images use distinct
+Dockerfiles under `deploy/docker/`. None of the Dockerfiles compile Rust; they
+copy staged binaries out of
 `deploy/docker/.build/prebuilt-binaries/<arch>/` into the final image.
 
 Local binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Because
@@ -144,11 +129,8 @@ package-managed VM support does not raise the package runtime requirement.
 Gateway staging and release workflows set up the Zig C/C++ wrapper before
 bundled Z3 builds and verify the maximum referenced `GLIBC_*` symbol version
 before publishing or copying artifacts.
-Supervisor binaries are static in every configuration. The default `musl`
-variant uses `cargo zigbuild` when available, including native CPU
-architectures, so C dependencies are compiled for the musl target instead of the
-host GNU libc target. The `glibc-static` variant uses plain `cargo build` with
-`+crt-static` and requires a native per-architecture build. Local Docker image tasks infer the
+Supervisor staging uses the GNU build path and verifies the glibc 2.28 floor.
+Sandbox staging uses the static musl build path. Local Docker image tasks infer the
 target architecture from `DOCKER_PLATFORM` when set. Otherwise, they require
 valid container engine host metadata and fail when the engine query is
 unavailable or reports an unsupported architecture, avoiding host-kernel
@@ -156,28 +138,6 @@ fallbacks that can target the wrong architecture. CI instead compiles binaries
 in platform-specific Nix development shells through reusable workflows and the
 shared `build-rust-binary` action. The image build downloads each binary artifact
 into the staging directory before running Buildx.
-
-The Nix flake exposes one development shell with target-specific toolchains.
-The shared `mkToolchain` function in `nix/toolchain/default.nix` assembles native
-libraries and Cargo environment settings. Linux and Darwin modules select the
-compiler and sysroot and generate the compiler wrapper for their platform.
-The `nix/toolchain/glibc-2.28/` directory contains the pinned glibc build,
-GCC environment, and sysroot assembly used by GNU Linux targets.
-The glibc build reuses a pinned historical Nixpkgs recipe with current build
-tools; its headers, shared libraries, and static archives are assembled into
-the sysroot from separate outputs.
-Each toolchain supplies its compiler driver, assembler, archiver, native
-libraries, and Cargo environment through derivation passthru. The shell omits
-an implicit host C compiler; Cargo builds select the appropriate tools with
-`--target`. GNU targets use a glibc 2.28 sysroot and static GCC runtimes, while
-musl targets produce static executables.
-
-On macOS, the shell also provides a native Darwin toolchain with static Z3
-and AWS-LC. Its Clang driver uses the pinned, unprocessed Apple SDK so system
-library stubs, including libiconv and libc++, retain their Apple install names.
-System libraries and frameworks remain dynamically linked. The deployment
-target matches the Nix host platform's minimum macOS version. The Rust toolchain
-does not propagate Nix's replacement system libraries into the link environment.
 
 Gateway and supervisor binaries staged into branch E2E, Release Dev, and Release
 Tag images are compiled through `cargo auditable` (pinned in `mise.toml`), which
@@ -189,15 +149,17 @@ is a different artifact from the source SBOM produced by `syft dir:.` in
 `tasks/sbom.toml`, which describes the checkout, and from the image SBOM
 attestation below, which describes a published image.
 
-The shared binary build action uses the default Nix shell and compiles release
-artifacts with `cargo auditable build --target <triple>`. Verification and upload
-read binaries from `target/<triple>/release/`.
+The shared binary build action compiles release artifacts with `cargo auditable`.
+The standalone prover uses this same action, while its package workflow adds
+target-native extracted-archive linkage and containment smoke checks before
+producing its checksum manifest.
 Branch E2E, Release Dev, and Release Tag image jobs stage those same artifacts
 instead of rebuilding binaries in Docker. Each binary build scans its output with
 Syft and requires at least one decoded Cargo package before uploading the
-artifact. The action checks each binary's `--version` output and leaves its
-linkage as produced by the Nix toolchain, without post-link rewriting or
-platform-specific linkage checks. The CI image gains the pinned `cargo-auditable`
+artifact. Darwin builds replace Nix's `libiconv` load command with the macOS
+system install name, ad-hoc sign the modified binary, and fail if `otool -L`
+reports any remaining `/nix/store` dependency. Runtime and Syft verification
+run after that normalization. The CI image gains the pinned `cargo-auditable`
 tool through `mise install --locked` but ships no auditable OpenShell binary of
 its own.
 
@@ -219,6 +181,10 @@ Runtime layout:
   gateway binaries must not reference `GLIBC_*` symbols newer than
   `GLIBC_2.28`; release workflows verify this before publishing artifacts. The
   gateway bundles z3, so the image does not need a distro-provided z3 runtime.
+  The base is pinned to a multi-architecture digest; distro security updates
+  require refreshing that digest and rebuilding the gateway image.
+  Updating the container's glibc package does not raise the binary's glibc
+  compatibility floor.
 - **VM driver**: host GNU-linked binary installed at
   `/usr/libexec/openshell/openshell-driver-vm` in Linux packages and published
   as a release artifact. Linux GNU VM driver binaries must not reference
@@ -229,15 +195,19 @@ Runtime layout:
   cache action runs. An explicitly configured VM runtime bundle is required to
   contain every non-empty embedding input; the driver build fails before
   packaging when an input is absent or empty.
-- **Supervisor**: Alpine base with `nftables`, static binary at
-  `/openshell-sandbox` (musl by default; see `SUPERVISOR_LIBC` above). Static
-  linkage keeps the binary usable when the image is mounted/extracted into
-  sandbox environments (Docker extraction, Podman image volumes, Kubernetes
-  init-container copy-self), whose libc and glibc version are not known at build
-  time, while `nftables` supports Kubernetes supervisor sidecar egress
-  enforcement. The VM driver bundles its own supervisor build
-  (`tasks/scripts/vm/build-supervisor-bundle.sh`) and does not read
-  `SUPERVISOR_LIBC`.
+- **Sandbox**: Alpine-based `openshell/sandbox` image containing the static
+  musl `/openshell-sandbox` binary and its static VM guest-init helper.
+  Drivers stage this binary into the workload trust domain.
+- **Supervisor**: digest-pinned `gcr.io/distroless/base-nossl-debian13` base
+  with the dynamically linked GNU `/openshell-supervisor` binary. The base
+  supplies glibc and CA roots without a shell, package manager, OpenSSL or zlib.
+  GNU supervisor builds must not reference `GLIBC_*` symbols newer than
+  `GLIBC_2.28`. Image defaults remain UID 0 and working directory `/`; compute
+  drivers set the runtime identity and writable mounts. Docker stages private
+  files with the same numeric identity as the supervisor so archive uploads
+  preserve access regardless of the base image's default user. Health probes execute
+  the supervisor binary directly. Base updates require refreshing the
+  multi-architecture digest and rebuilding the image.
 
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.
@@ -278,6 +248,8 @@ The Nix test guest harness under `nix/test-guest` boots native-architecture clou
 through QEMU for package, release, and E2E validation. A prepared cache entry is
 captured after the exact ordered Ansible configuration list and before
 test-specific packages, copied binaries, forwarded ports, or commands.
+On macOS, the test guest and tmachine paths use the same pinned QEMU and OVMF
+package set so the hypervisor and firmware remain compatible.
 
 Prepared disks are flattened, sanitized QCOW2 images. The local cache keeps them
 read-only and each test receives a fresh writable overlay and cloud-init
@@ -289,12 +261,69 @@ pulls and explicit publication. OCI pulls require a trusted manifest digest
 and retain that provenance with the local entry; mutable tags are used only
 for explicit publication.
 
-CLI conformance runs after target provisioning. Action-free scenarios operate
-only through the configured OpenShell CLI. A versioned conformance plan may add
-an ordered sequence of target-supplied host-side actions, such as a gateway
-restart, while the scenario remains responsible for black-box sandbox
-continuity checks. The plan exposes opaque executable paths and timeouts rather
-than driver or package-manager configuration; target setup owns those details.
+CLI conformance runs after target provisioning and operates only through the
+configured OpenShell CLI. The smoke scenario verifies the black-box sandbox
+lifecycle by creating, inspecting, executing in, and deleting a sandbox.
+Feature suites use the same disposable guest but may provision isolated
+dependencies after installation. The Keycloak provider-refresh suite starts a
+guest-local Keycloak realm and verifies a successful OAuth refresh followed by
+revocation and the gateway's reauthorization-required recovery state.
+
+Tmachine environments define the guest machine and runtime setup, while named
+installers define how OpenShell is installed. This keeps the runtime mode
+independent from binary or package installation and lets multiple installers
+reuse the same prepared setup disk. The `none` installer skips OpenShell
+installation and boots the prepared environment directly.
+
+### Interactive tmachine shell
+
+The test command is `tmachine test <environment> <installer> <testsuite>`. The
+`shell` testsuite prepares the selected environment and installer, then opens an
+interactive SSH session in the disposable guest for manual debugging.
+
+Start an Ubuntu Docker guest without installing OpenShell:
+
+```shell
+nix run .#tmachine -- test ubuntu-docker-rootful none shell
+```
+
+Replace `none` with `deb` to install the locally staged Debian package before
+opening the shell:
+
+```shell
+nix run .#tmachine -- test ubuntu-docker-rootful deb shell
+```
+
+Exit the SSH session to shut down and discard the disposable guest.
+
+The `tests/tmachine` setup and install caches include a digest of the
+entire directory containing `ANSIBLE_CONFIG`, including local roles, task
+includes, templates, inventory, and requirements. The digest uses sorted
+relative paths, file contents, and executable permissions; source symlinks
+are unsupported. Both keys also retain the ordered playbook paths and contents,
+their base disk contents, and whether Galaxy is enabled; install keys
+include named artifact inputs. The top-level `.roles` directory is excluded:
+Galaxy release pins in `requirements.yaml` are treated as immutable, including
+any transitive dependency pins. Cache misses with Galaxy enabled reinstall
+the required roles and their dependencies before running playbooks.
+
+The `tests/artifacts.nix` helpers build the CLI, conformance CLI, and sandbox
+with musl, and the gateway and supervisor with GNU. Image assembly stages
+the gateway, sandbox, and supervisor as separate binaries for their respective
+Dockerfiles. The helpers stage binaries under `artifacts/binaries` so local and
+CI builds expose the same inputs to tmachine and image assembly. The Ubuntu
+Docker and Fedora Podman environments import both local runtime images and
+configure the gateway to use them. The Ubuntu `deb` installer consumes
+`artifacts/packages/openshell.deb`; the `binaries` installer remains available
+for direct executable installation on every environment. Release Dev and
+Release Tag run Ubuntu conformance through the Debian package, while Fedora
+continues using direct executable installation until RPM coverage is available.
+The Debian qualification profile keeps candidate-image overrides outside the
+operator-owned gateway configuration: it writes a harness-owned file under
+`/var/lib/openshell-qualification` and selects it through the packaged systemd
+unit's `gateway.env` hook. Ordinary package installations continue to use the
+gateway's built-in runtime-image defaults unless the operator configures an
+override.
 
 ## Python Wheel Packaging
 
@@ -366,8 +395,9 @@ Triggers differ by workflow: `.github/workflows/workflow-security.yml` runs on
 `merge_group` only, because it needs a base and head commit to compare;
 `.github/workflows/codeql.yml` runs nightly on the default branch (`main`) via
 `schedule`, with `workflow_dispatch` kept for manual diagnostics; and
-`.github/workflows/codex-security.yml` runs on pushed `v*.*.*-pre.*` tags, and is
-also callable through `workflow_call` and `workflow_dispatch`. CodeQL does
+`.github/workflows/codex-security.yml` is called by the aggregate release scan
+for pre-release tags and is also callable through `workflow_call` and
+`workflow_dispatch`. CodeQL does
 not run on `pull_request`, `merge_group`, or pushes to `main`, so it reports
 repository-level Code Scanning state on the default branch instead of per-PR
 results, and its four-language matrix stays off the per-change critical path.
@@ -474,43 +504,37 @@ job republishes the analysis job's outcome as the
 required statuses, so they do not gate merges.
 
 Codex Security findings are informational during the observation phase, and the
-workflow only reports on candidates that already exist. Creating pre-release
-tags and gating stable promotion on qualification results are part of
-[RFC 0014](../rfc/0014-release-stability/release-qualification.md) and are not
-implemented yet.
+workflow only reports on candidates that already exist. Gating stable promotion
+on qualification results remains proposed in
+[RFC 0014](../rfc/0014-release-stability/release-qualification.md).
 
-## Artifact Scanning
+The tagged release workflow calls the aggregate Security Scan after publishing
+the candidate's commit-addressed gateway, sandbox, and supervisor images. CodeQL,
+Trivy, Cargo Deny, and Actionlint/Zizmor run for every release tag; Codex Security
+also runs for pre-release tags. The release job depends on the aggregate result,
+which fails on scanner errors, Cargo Deny advisories, and unexcepted High or
+Critical findings.
 
-Two entry points share `tasks/scripts/trivy-scan.sh`: a standalone analysis
-workflow and a pull-request change gate. Nix supplies Trivy, Helm and `yq`.
+`release-auto-tag.yml` runs at 14:00 Europe/Zurich on weekdays (including daylight
+saving time changes) and supports manual dispatch. Maintainers start weekday
+pre-release publishing by tagging the initial `vX.Y.Z-pre.1` release candidate.
+The workflow increments the highest release series' pre-release number on `main`
+only when that seed exists, its stable tag does not exist, and new commits are
+available. It never chooses a minor or patch version or creates the initial seed.
+After pushing the tag, it explicitly dispatches `release-tag.yml` to build the
+candidate.
 
-The standalone workflow scans deployment configuration and supplied OCI
-references independently of release publication. Detailed JSON reports feed the
-differential gate; the summary and published SARIF consolidate configuration
-findings across profiles while preserving resource identity and affected profiles.
-Images and packaged charts retain separate identities based on their full
-references. Publication batches respect GitHub's limit of 20 SARIF runs.
-
-The PR/merge-group gate scans base and candidate with the same scanner and rejects
-new `HIGH` or `CRITICAL` configuration findings. Its stable
-`OpenShell / Trivy Changes` status succeeds when nothing relevant changed.
-Image CVEs need the standalone scan. The reporting and gate invariants are:
-
-- A structurally invalid Trivy report is an error, not an empty finding set.
-- Scanner failures prevent publication of incomplete analyses; findings alone
-  do not prevent publishing complete reports.
-- Findings compare per profile against the same baseline profile, by semantic
-  identity and count rather than line number; a profile absent from the baseline
-  falls back to that identity's maximum across all profiles.
-- The candidate's ignore file is validated, but the baseline's policy applies to
-  both scans, so an exemption takes effect only after merge.
-
-See [CI.md](../CI.md#artifact-scanning) for profiles, report paths, severity
-settings, exceptions, and the contributor and maintainer workflows.
+See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 
 ## Docs Site
 
-Published docs live in `docs/`, and Fern site configuration lives in `fern/`. See [fern/README.md](../fern/README.md) for the source layout, local development commands, version model, and publishing workflows.
+Published docs live in `docs/`. Navigation lives in `docs/index.yml`. Fern site
+configuration, components, theme assets, and publish settings live in `fern/`.
+
+Use `mise run docs` for strict validation and `mise run docs:serve` for local
+preview. PR previews are produced by `.github/workflows/branch-docs.yml` when
+Fern credentials are available. Production docs publish from the release tag
+workflow.
 
 ## Validation Expectations
 

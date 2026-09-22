@@ -56,6 +56,12 @@ LINE_REWRITES = {
             "from . import datamodel_pb2 as datamodel__pb2",
         ),
     ],
+    "python/openshell/_proto/sandbox_pb2.py": [
+        (
+            r"^import datamodel_pb2 as datamodel__pb2$",
+            "from . import datamodel_pb2 as datamodel__pb2",
+        ),
+    ],
     "python/openshell/_proto/sandbox_pb2_grpc.py": [
         (
             r"^import sandbox_pb2 as sandbox__pb2$",

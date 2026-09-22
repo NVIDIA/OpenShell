@@ -59,7 +59,7 @@ docker run -d \
   -v openshell-state:/var/openshell \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v ~/openshell/supervisor/openshell-sandbox:~/openshell/supervisor/openshell-sandbox:ro \
-  -e OPENSHELL_DRIVERS=docker \
+  -e OPENSHELL_COMPUTE_DRIVER=docker \
   -e OPENSHELL_GRPC_ENDPOINT=http://host.openshell.internal:8080 \
   -e OPENSHELL_DOCKER_SUPERVISOR_BIN=~/openshell/supervisor/openshell-sandbox \
   -e OPENSHELL_DB_URL=sqlite:/var/openshell/openshell.db \
@@ -128,7 +128,7 @@ docker run -d \
   -v "$HOME/.local/state/openshell:/home/openshell/.local/state/openshell" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v ~/openshell/supervisor/openshell-sandbox:~/openshell/supervisor/openshell-sandbox:ro \
-  -e OPENSHELL_DRIVERS=docker \
+  -e OPENSHELL_COMPUTE_DRIVER=docker \
   -e OPENSHELL_GRPC_ENDPOINT=https://127.0.0.1:8080 \
   -e OPENSHELL_DOCKER_SUPERVISOR_BIN=~/openshell/supervisor/openshell-sandbox \
   -e OPENSHELL_DB_URL=sqlite:/home/openshell/.local/state/openshell/openshell.db \
@@ -188,7 +188,7 @@ podman run -d \
   -p 127.0.0.1:8080:8080 \
   -v openshell-state:/var/openshell \
   -v "$XDG_RUNTIME_DIR/podman/podman.sock:/var/run/podman.sock" \
-  -e OPENSHELL_DRIVERS=podman \
+  -e OPENSHELL_COMPUTE_DRIVER=podman \
   -e OPENSHELL_PODMAN_SOCKET=/var/run/podman.sock \
   -e OPENSHELL_DB_URL=sqlite:/var/openshell/openshell.db \
   -e OPENSHELL_DISABLE_TLS=true \

@@ -17,7 +17,7 @@ import (
 
 func TestFakeProfile_List_ReturnsUnimplemented(t *testing.T) {
 	c := newFakeProfileClient(func() bool { return false })
-	_, err := c.List(context.Background(), "default")
+	_, err := c.ListAll(context.Background(), "default")
 	require.Error(t, err)
 	assert.True(t, types.IsUnimplemented(err))
 }
@@ -59,7 +59,7 @@ func TestFakeProfile_Delete_ReturnsUnimplemented(t *testing.T) {
 
 func TestFakeProfile_List_ClosedReturnsUnavailable(t *testing.T) {
 	c := newFakeProfileClient(func() bool { return true })
-	_, err := c.List(context.Background(), "default")
+	_, err := c.ListAll(context.Background(), "default")
 	require.Error(t, err)
 	assert.True(t, types.IsUnavailable(err))
 }

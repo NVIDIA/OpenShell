@@ -15,7 +15,12 @@ pub type CliExecution<'a> =
     Pin<Box<dyn Future<Output = Result<Output, CliExecutionError>> + Send + 'a>>;
 
 pub trait CliExecutor: Send + Sync {
-    fn execute(&self, args: Vec<String>, command_timeout: Duration) -> CliExecution<'_>;
+    fn execute(
+        &self,
+        args: Vec<String>,
+        environment: Vec<(String, String)>,
+        command_timeout: Duration,
+    ) -> CliExecution<'_>;
 }
 
 pub enum CliExecutionError {
@@ -34,11 +39,17 @@ impl ProcessCli {
 }
 
 impl CliExecutor for ProcessCli {
-    fn execute(&self, args: Vec<String>, command_timeout: Duration) -> CliExecution<'_> {
+    fn execute(
+        &self,
+        args: Vec<String>,
+        environment: Vec<(String, String)>,
+        command_timeout: Duration,
+    ) -> CliExecution<'_> {
         Box::pin(async move {
             let mut process = tokio::process::Command::new(&self.binary);
             process
                 .args(&args)
+                .envs(environment)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);

@@ -17,7 +17,7 @@ A sandbox is the OpenShell data plane: a safe, private execution environment whe
 Create a sandbox with a single command. For example, to create a sandbox with Claude, run:
 
 ```shell
-openshell sandbox create -- claude
+openshell sandbox create --from registry.example.com/your-org/claude-agent:latest -- claude
 ```
 
 The trailing command is the sandbox's canonical main process. OpenShell starts
@@ -46,6 +46,17 @@ captures the command result, and deletes the sandbox after the command exits:
 openshell sandbox create --no-keep -- sh -c 'echo done; exit 0'
 ```
 
+Combine `--detach` and `--no-keep` for a background workload whose lifecycle
+belongs entirely to the gateway:
+
+```shell
+openshell sandbox create --detach --no-keep -- ./worker
+```
+
+The create command returns after the workload is ready. The gateway keeps the
+canonical process running without a host-side attachment and deletes the
+sandbox after that process exits.
+
 `--upload` cannot yet be combined with a trailing main command because uploads
 finish after the canonical process starts. Create a scratch sandbox, upload the
 files, then launch the workload with `sandbox exec`, or build the files into the
@@ -69,7 +80,7 @@ openshell gateway select local
 Set per-sandbox CPU and memory amounts with `--cpu` and `--memory`:
 
 ```shell
-openshell sandbox create --cpu 2 --memory 4Gi -- claude
+openshell sandbox create --from registry.example.com/your-org/claude-agent:latest --cpu 2 --memory 4Gi -- claude
 ```
 
 CPU values use Kubernetes-style quantities such as `500m`, `1`, or `2.5`.
@@ -104,13 +115,13 @@ the same behavior.
 To request GPU resources, add `--gpu`:
 
 ```shell
-openshell sandbox create --gpu -- claude
+openshell sandbox create --gpu --from registry.example.com/your-org/gpu-agent:latest -- claude
 ```
 
 Request a specific number of GPUs by passing a count to `--gpu`:
 
 ```shell
-openshell sandbox create --gpu 2 -- claude
+openshell sandbox create --gpu 2 --from registry.example.com/your-org/gpu-agent:latest -- claude
 ```
 
 When you omit the count, OpenShell treats the request as `--gpu 1`.
@@ -142,22 +153,22 @@ openshell sandbox create \
   -- claude
 ```
 
-### Custom Containers
+### Sandbox Images
 
-Use `--from` to create a sandbox from the base image, another pre-built sandbox name, a rootfs tar archive, or a container image:
+Without `--from`, the gateway uses its configured default workload image. The
+built-in default is `nvcr.io/nvidia/base/ubuntu:24.04`.
+
+Use `--from` with an explicit OCI image reference or a rootfs tar archive:
 
 ```shell
-openshell sandbox create --from base
-openshell sandbox create --from ollama
-openshell sandbox create --from ./rootfs.tar
+openshell sandbox create --from nvcr.io/nvidia/base/ubuntu:24.04
 openshell sandbox create --from my-registry.example.com/my-image:latest
+openshell sandbox create --from ./rootfs.tar
 ```
 
-Bare names such as `base` and `ollama` resolve to images under `ghcr.io/nvidia/openshell-community/sandboxes`. Set `OPENSHELL_COMMUNITY_REGISTRY` when you need to use an internal mirror.
-
-`--from` does not build local Dockerfiles or directories. Build and tag the
-image with the container engine used by your local gateway, then pass the
-resulting image reference:
+`--from` does not expand catalog aliases and does not build local Dockerfiles or
+directories. Build and tag the image with the container engine used by your
+local gateway, then pass the resulting image reference:
 
 ```shell
 # Docker gateway
@@ -174,8 +185,8 @@ from and use that registry image reference.
 
 <Warning>
 **Pre-0.1.0 breaking change:** `openshell sandbox create --from ./Dockerfile`
-and directory sources no longer build images. Build and tag the image before
-you create the sandbox.
+and directory sources no longer build images. Bare catalog names are no longer
+expanded. Build or select an image and pass its explicit reference.
 </Warning>
 
 #### Rootfs Tar Archives
@@ -262,17 +273,31 @@ Use `--all-workspaces` with `sandbox template list` when you need an admin view 
 openshell sandbox template list --all-workspaces
 ```
 
-## Base Sandbox Container
+For JSON or YAML, template list output contains `templates` and
+`next_page_token` fields. Pass the returned token to `--page-token` to
+continue.
 
-The `base` sandbox container is the default runtime image for standard OpenShell sandboxes unless the gateway overrides its default sandbox image. It is published as `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` and maintained in the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) repository.
+## Default Workload Image
 
-The base container includes common development tooling, supported agent CLIs, and the default sandbox policy. Use it when you want a general-purpose agent environment without a workflow-specific image:
+OpenShell defaults to `nvcr.io/nvidia/base/ubuntu:24.04` unless the gateway
+operator configures another image. The image provides a minimal Ubuntu Noble
+userspace. It does not include agent CLIs or an image-baked OpenShell policy.
+OpenShell applies its built-in restrictive policy when no explicit policy is
+provided.
+
+Create a sandbox with the default image:
 
 ```shell
-openshell sandbox create --from base
+openshell sandbox create
 ```
 
-For default policy coverage by agent, refer to [Default Policy](/reference/default-policy). For the supported agent list, refer to [Supported Agents](/about/supported-agents).
+Override it with any image visible to the active compute driver:
+
+```shell
+openshell sandbox create --from registry.example.com/agents/my-agent:1.0
+```
+
+Refer to [Default Policy](/reference/default-policy), [Supported Agents](/about/supported-agents), and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container).
 
 ## Connect to a Sandbox
 
@@ -303,6 +328,12 @@ OpenShell-managed SSH include file instead of cluttering your main
 `~/.ssh/config` with generated host blocks.
 
 ## Execute a Command in a Sandbox
+
+For raw `ExecSandboxInteractive` clients, ending the request stream closes stdin
+and terminal resize input. Continue reading the response to drain stdout/stderr
+and receive the exit event and final gRPC status. Input EOF does not immediately
+close the SSH output channel and is distinct from cancelling the RPC. With a PTY,
+input closure is not equivalent to sending a terminal Ctrl-D keystroke.
 
 Run a one-shot command inside a running sandbox without opening an interactive shell:
 
@@ -356,7 +387,7 @@ Inject environment variables into the sandbox at creation time:
 openshell sandbox create --env API_KEY=sk-test --env DEBUG=1 -- my-agent
 ```
 
-Variables set with `--env` are available to all processes in the sandbox, including interactive shells and exec commands.
+Variables set with `--env` are available to all processes in the sandbox, including the initial command, interactive shells, and exec commands.
 
 When an `--env` key looks like a credential — a known provider variable, or a name whose underscore-separated segments include a credential word such as `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `SECRET_KEY` (for example `DB_TOKEN` or `MY_ACCESS_KEY`) — `sandbox create` prints a non-blocking warning. Matching is on whole segments, so unrelated names like `TOKENIZERS_PARALLELISM` or `PASSWORDLESS_LOGIN` do not warn. The agent inside the sandbox can read plain environment values directly, so to hide a secret from the agent, attach it through a [profile-backed provider](/providers/profiles) with `--provider` instead. Suppress the warning with `--no-credential-warnings`. Detection uses the key name only; values are never inspected or printed.
 
@@ -375,7 +406,7 @@ Environment variable names starting with `OPENSHELL_` are reserved. Keys must ma
 Attach labels when you create a sandbox to track ownership, environment, or workflow grouping:
 
 ```shell
-openshell sandbox create --label env=dev --label team=platform -- claude
+openshell sandbox create --from registry.example.com/your-org/claude-agent:latest --label env=dev --label team=platform -- claude
 ```
 
 List only the sandboxes that match a label selector:
@@ -396,9 +427,13 @@ with SandboxClient.from_active_cluster() as client:
     sandbox = client.create(workspace="default", name="deep-research-1", labels={"env": "dev", "team": "platform"})
     assert sandbox.labels["team"] == "platform"
 
-    matches = client.list(workspace="default", label_selector="env=dev,team=platform")
+    matches = client.list_all(workspace="default", label_selector="env=dev,team=platform")
     assert sandbox.id in {s.id for s in matches}
 ```
+
+Python SDK `list` methods return a lazy `Pager` whose iteration yields one
+`Page` per gateway request. Use `list_all` only when you want to exhaust the
+collection; pass `page_token` to resume from a token saved from an earlier page.
 
 Create reusable sandbox templates through the Python SDK when several runs
 should share the same workload shape:
@@ -412,10 +447,10 @@ with SandboxClient.from_active_cluster() as client:
     templates.create(
         workspace="default",
         name="python",
-        image="ghcr.io/nvidia/openshell-community/sandboxes/python:latest",
+        image="registry.example.com/agents/python:latest",
     )
 
-    sandbox = client.create_from_template(workspace="default", template_name="python")
+    sandbox = client.create_from_template(workspace="default", workload_template="python")
 ```
 
 For non-interactive automation, pass a renewable client-credentials provider.
@@ -427,12 +462,75 @@ from openshell import ClientCredentialsAuth, SandboxClient
 
 auth = ClientCredentialsAuth(client_secret=lambda: load_secret())
 with SandboxClient.from_active_cluster(client_credentials=auth) as client:
-    sandboxes = client.list(workspace="default")
+    sandboxes = client.list_all(workspace="default")
 ```
 
 ## Expose Long Running Services
 
 Service forwarding makes a long-running process inside a sandbox reachable through a gateway-managed URL. Use it for development servers, notebooks, dashboards, or other services that keep listening after the sandbox starts. Run the service on loopback inside the sandbox, expose its port, then open the URL printed by OpenShell.
+
+Expose the unnamed service as part of sandbox creation when the sandbox's main
+process starts the server:
+
+```shell
+openshell sandbox create \
+  --name my-sandbox \
+  --expose 8080 \
+  --detach \
+  -- python -m http.server 8080 --bind 127.0.0.1
+```
+
+The CLI includes the unnamed endpoint in the sandbox create request and prints
+its URL after the sandbox reaches `Ready`. `--expose` keeps the sandbox after
+the create command returns and cannot be combined with `--no-keep`. Use
+`openshell service expose` to add or update an endpoint later.
+
+SDK create methods accept named or unnamed service exposures. An empty service
+name selects the unnamed endpoint. The returned sandbox includes a service URL
+map keyed by those names; use the empty key for the unnamed endpoint:
+
+```python
+from openshell import SandboxClient, ServiceExposure
+
+with SandboxClient.from_active_cluster() as client:
+    sandbox = client.create(
+        workspace="default",
+        name="app-server",
+        service_exposures=[ServiceExposure(target_port=4500)],
+    )
+    print(sandbox.service_urls[""])
+```
+
+```ts
+const sandbox = await client.sandbox.create({
+  name: 'app-server',
+  image: 'base',
+  serviceExposures: [{ targetPort: 4500 }],
+})
+console.log(sandbox.serviceUrls[''])
+```
+
+```go
+sandbox, err := client.Sandboxes().Create(
+    ctx, "default", "app-server", spec, nil,
+    v1.CreateOptions{ServiceExposures: []v1.ServiceExposure{
+        {TargetPort: 4500},
+    }},
+)
+fmt.Println(sandbox.ServiceURLs[""])
+```
+
+```rust
+let sandbox = client.create_sandbox(openshell_sdk::SandboxSpec {
+    name: Some("app-server".into()),
+    service_exposures: vec![openshell_sdk::ServiceExposure {
+        service: String::new(),
+        target_port: 4500,
+    }],
+    ..Default::default()
+}).await?;
+println!("{}", sandbox.service_urls[""]);
+```
 
 Expose a service that listens on loopback inside the sandbox:
 
@@ -465,9 +563,10 @@ openshell service list --output json
 openshell service list my-sandbox --output yaml
 ```
 
-Each record contains `workspace`, `sandbox`, `service`, `target_port`, and
-`url`. The unnamed service uses an empty `service` string. An empty result is
-an empty collection.
+Structured list output contains `services` and `next_page_token` fields. Each
+record contains `workspace`, `sandbox`, `service`, `target_port`, and `url`.
+The unnamed service uses an empty `service` string. Pass the returned token to
+`--page-token` to continue. An empty result has an empty `services` collection.
 
 Show or delete one endpoint:
 
@@ -508,6 +607,9 @@ openshell sandbox list -o json
 openshell sandbox list -o yaml
 ```
 
+Structured list output contains `sandboxes` and `next_page_token` fields.
+Pass the returned token to `--page-token` to continue.
+
 Get detailed information about a specific sandbox. The output lists **Policy source** (`sandbox` or `global`), **Revision** (the active policy’s row version for that source), and the formatted active policy YAML:
 
 ```shell
@@ -520,11 +622,48 @@ For automation, use `--output json` or `--output yaml` to get machine-readable s
 openshell sandbox get my-sandbox --output json
 ```
 
-Print only that policy YAML for scripting (same effective policy, no metadata):
+Print only the policy YAML for scripting (same effective policy, no metadata):
 
 ```shell
 openshell sandbox get my-sandbox --policy-only
 ```
+
+### Diagnose Failed Calls to Tool Servers
+
+A sandbox can be `Ready` while an agent's call to an external tool server fails with `fetch failed`. Run `openshell sandbox get my-sandbox` and look under `Tool server connections` for the server's address, `Last result`, and `Reported at`. This information is available for configured endpoints that use MCP over HTTP. It helps you find where the call failed without changing sandbox readiness.
+
+JSON and YAML output include an `endpoint_statuses` list with `last_reported_at`. The protobuf API exposes the corresponding timestamp as `Sandbox.status.endpoint_statuses[].last_reported_time`; SDKs render it using their native or curated time representation. Select the endpoint by its address to read the result directly. Treat `endpoint_id` as opaque.
+
+For example, use `jq` to select the tool server at `tools.example.com`, path `/mcp`, and port `443`:
+
+```shell
+openshell sandbox get my-sandbox --output json | jq -e \
+  --arg host tools.example.com --arg path /mcp --argjson ports '[443]' '
+  .endpoint_statuses[]
+  | select(.host == $host and .path == $path and .ports == $ports)
+  '
+```
+
+Read `last_result` to choose the next check:
+
+- `NoObservedExchange`: no result has been reported for the current configuration and supervisor session. Try the operation and inspect its logs if no result appears.
+- `HttpResponseReceived`: the server returned a final HTTP status below 400, including a protocol upgrade. Informational responses alone do not establish success. Check the client's response for protocol or tool errors; an HTTP 200 response can still contain an error.
+- `PolicyDenied`: OpenShell denied the request, including MCP protocol-version or request-body policy checks. Check the sandbox policy and denial logs.
+- `CredentialUnavailable`: required credentials were unavailable. Check the endpoint's attached provider.
+- `TlsFailed`: TLS setup or the handshake failed. Check certificates and TLS configuration.
+- `TransportFailed`: the network exchange failed. Check name resolution, connectivity, and the server process.
+- `UpstreamRejected`: the server returned an HTTP status of 400 or higher. Check the server's response and logs.
+- `Unspecified`: the result is unrecognized or absent. Do not infer success from it.
+
+For example, a stopped server can produce `TransportFailed` while the sandbox stays `Ready`. After the server recovers, an HTTP response below 400 updates the result to `HttpResponseReceived`.
+
+Results come from actual traffic and do not expire. A result can remain unchanged after the server stops until another observed exchange or configuration/session reset. Reports combine recent observations and can drop them when full, so this list is not a request history. The address remains available when a result resets to `NoObservedExchange`. To verify current tool availability, run the actual operation.
+
+`last_reported_at` is the RFC 3339 rendering of the protobuf `last_reported_time` when the gateway accepted the result. It is empty until a result is reported. New accepted observations advance it, including repeated results; identical report retries do not. If a configuration reset supersedes a report whose acknowledgement was lost, the gateway can accept still-valid pending evidence again and advance this timestamp without another exchange.
+
+Addresses use lowercase hosts, canonical paths, and sorted distinct effective ports. Equivalent addresses share one record that combines observations from all callers and ports; it does not establish that every caller or port works. A failure before the HTTP path is known, such as a TLS failure during CONNECT, updates status only when the host and port identify one distinct endpoint. If several configured paths share that host and port, inspect the logs for the failure.
+
+### Inspect Logs and Activity
 
 Stream sandbox logs to monitor agent activity and diagnose policy decisions:
 
@@ -548,6 +687,8 @@ openshell term
 Use the terminal to spot blocked connections marked `action=deny` and provider-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy or update the attached provider profile. Refer to [Policies](/sandboxes/policies) for the workflow.
 
 The dashboard has three panels stacked vertically: Gateways, Providers (or Global Settings), and Sandboxes. Navigate within a panel with `Up`/`Down` or `j`/`k`. At a list boundary the cursor overflows into the adjacent panel, skipping empty panels. Use `Tab`/`Shift+Tab` to cycle panels directly. Press `h`/`l` or `Left`/`Right` in the middle panel to switch between the Providers and Global Settings tabs.
+
+The sandbox table’s NOTES column shows `Invalid config` when policy or provider configuration blocks provisioning. Open the sandbox detail view for the full rejection reason, or run `openshell sandbox get <name> -o json`. The note clears after the configuration is repaired; active port forwards remain listed.
 
 ## Port Forwarding
 
@@ -574,10 +715,11 @@ openshell forward list --output json
 openshell forward list --output yaml
 ```
 
-Structured output includes `sandbox`, `bind_address`, `port`, `pid`, and
-`alive`. The `alive` boolean reports whether the tracked PID still matches the
-expected OpenShell SSH forward; it does not probe the forwarded socket. When no
-forwards are tracked, structured output returns an empty collection.
+Structured output includes `workspace`, `sandbox`, `bind_address`, `port`,
+`pid`, and `alive`. The `alive` boolean reports whether the tracked PID still
+matches the expected workspace-scoped OpenShell SSH forward and immutable
+sandbox identity; it does not probe the forwarded socket. When no forwards are
+tracked, structured output returns an empty collection.
 
 The default table colorizes the `STATUS` column only when both standard output and standard error are capable ANSI terminals; piping or redirecting either stream, or running under `TERM=dumb`, gives a plain-text table. Other styled output—including `-v` log lines, progress spinners, prompts, and error messages—is decided per stream, so redirecting one stream leaves the other styled. Prefer `--output json` for automation rather than matching on the table. Set `NO_COLOR` to any non-empty value or pass `--color never` to suppress ANSI formatting, and `--color always` to force it when piping into a pager. `--color` applies to every `openshell` command.
 
@@ -585,7 +727,7 @@ The default table colorizes the `STATUS` column only when both standard output a
 You can also forward a port at creation time with `--forward`:
 
 ```shell
-openshell sandbox create --forward 8000 -- claude
+openshell sandbox create --from registry.example.com/your-org/claude-agent:latest --forward 8000 -- claude
 ```
 
 </Tip>
@@ -637,7 +779,7 @@ You can also upload files at creation time with the `--upload` flag on
 several paths in a single command:
 
 ```shell
-openshell sandbox create --upload ./src:/workspace/src --upload ./config:/workspace/config -- claude
+openshell sandbox create --from registry.example.com/your-org/claude-agent:latest --upload ./src:/workspace/src --upload ./config:/workspace/config -- claude
 ```
 
 </Note>
@@ -676,6 +818,12 @@ longer need its retained state.
 
 Deleting a sandbox stops all processes, releases resources, and purges injected credentials.
 
+The command can return while cleanup is pending. `deletion accepted` means the
+gateway started deletion; inspect the sandbox until it disappears if your next
+step requires completion. An already-absent sandbox is a successful no-op, but
+missing workspaces and authorization failures remain errors. SDK callers can
+inspect [typed deletion outcomes](/reference/api-errors#deletion-outcomes).
+
 ```shell
 openshell sandbox delete my-sandbox
 ```
@@ -693,6 +841,39 @@ after it attempts every requested deletion if any entry failed.
 ## Sandbox Lifecycle
 
 Every sandbox moves through a defined set of phases:
+
+Before workload activation, OpenShell validates the effective policy and matching
+provider configuration. A rejection keeps the workload unstarted and exposes a
+`ConfigurationInvalid` condition in `Provisioning`. Use `openshell sandbox get`
+to inspect the diagnostic, then [repair the policy or provider configuration](/sandboxes/policies#validation-failures).
+Management operations remain available while startup is blocked. After repair,
+the supervisor completes startup without recreating the sandbox. Starting a
+stopped sandbox repeats configuration admission before launching its workload.
+
+The gateway enforces a 300-second provisioning repair window, independently of
+the CLI wait timeout. An effective policy, settings, provider, profile, or
+attachment change resets the window from its stored change time. The first
+failed configuration load for that change grants another full window. Repeated
+failures and reconnects do not extend it; reaching `Ready` clears it.
+
+When the window expires, the sandbox enters `Error` with reason
+`ProvisioningTimedOut`. The gateway stops its workload and supervisor compute,
+retaining the sandbox record, diagnostic, and restartable storage. Cleanup can
+remain pending if the backend is unavailable; the gateway retries it. Inspect
+`provisioning` in JSON output for the deadline, timeout, and cleanup timestamps.
+TUI NOTES distinguishes pending cleanup from reclaimed compute.
+
+Repair the configuration, wait for cleanup to complete, then explicitly restart:
+
+```shell
+openshell sandbox get my-sandbox --output json
+openshell sandbox start my-sandbox
+```
+
+Editing configuration after expiry does not restart compute. A retry gets a new
+300-second window, while static-policy restrictions from any previous activation
+remain in force. Timed-out records are retained even for ephemeral creates; use
+`sandbox delete` when you no longer need the diagnostic or stored state.
 
 | Phase        | Description                                                                                                                                                    |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -730,4 +911,4 @@ For Docker, Podman, MicroVM, and Kubernetes behavior, refer to [Sandbox Compute 
 - To select a workspace or understand access roles, refer to [Manage Workspaces and Access](/sandboxes/manage-workspaces).
 - To supply API keys or tokens, refer to [Manage Providers](/sandboxes/manage-providers).
 - To control what the agent can access, refer to [Policies](/sandboxes/policies).
-- To use the default runtime image, refer to [Base Sandbox Container](#base-sandbox-container).
+- To use the default runtime image, refer to [Default Workload Image](#default-workload-image).

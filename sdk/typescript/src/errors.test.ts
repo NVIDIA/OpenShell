@@ -7,8 +7,40 @@
 import { Code, ConnectError } from '@connectrpc/connect';
 import { describe, expect, it } from 'vitest';
 import { errorCode, fromConnect, SdkError, type SdkErrorCode } from './errors.js';
+import { BadRequestSchema, ErrorInfoSchema, RetryInfoSchema } from './gen/google/rpc/error_details_pb.js';
 
 describe('fromConnect', () => {
+  it('decodes standard details and preserves unknown and malformed wire details', () => {
+    const raw = new ConnectError('try later', Code.Unavailable, { 'request-id': 'correlation' }, [
+      { desc: BadRequestSchema, value: { fieldViolations: [{ field: 'name', description: 'invalid' }] } },
+      {
+        desc: ErrorInfoSchema,
+        value: { reason: 'GATEWAY_NOT_READY', domain: 'openshell.nvidia.com', metadata: { scope: 'test' } },
+      },
+      { desc: RetryInfoSchema, value: { retryDelay: { seconds: 1n, nanos: 250000000 } } },
+    ]);
+    raw.details.push({ type: 'google.rpc.BadRequest', value: new Uint8Array([255]) });
+    raw.details.push({ type: 'future.ErrorDetail', value: new Uint8Array([8, 1]) });
+    const error = fromConnect(raw);
+    expect(error.fieldViolations).toEqual([{ field: 'name', description: 'invalid' }]);
+    expect(error.errorInfo).toEqual({
+      reason: 'GATEWAY_NOT_READY',
+      domain: 'openshell.nvidia.com',
+      metadata: { scope: 'test' },
+    });
+    expect(error.retryDelayMs).toBe(1250);
+    expect(error.cause).toBe(raw);
+    expect(raw.details).toHaveLength(5);
+    expect(raw.metadata.get('request-id')).toBe('correlation');
+  });
+
+  it('does not fabricate retry guidance from the status code', () => {
+    expect(fromConnect(new ConnectError('temporary', Code.Unavailable)).retryDelayMs).toBeUndefined();
+    const raw = new ConnectError('invalid delay', Code.Unavailable, undefined, [
+      { desc: RetryInfoSchema, value: { retryDelay: { seconds: -1n } } },
+    ]);
+    expect(fromConnect(raw).retryDelayMs).toBeUndefined();
+  });
   const cases: Array<[Code, SdkErrorCode]> = [
     [Code.NotFound, 'not_found'],
     [Code.AlreadyExists, 'already_exists'],

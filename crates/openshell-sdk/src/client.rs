@@ -11,12 +11,14 @@
 use crate::auth::{BearerSlot, EdgeAuthInterceptor, bearer_metadata};
 use crate::config::{AuthConfig, ClientConfig};
 use crate::error::{Result, SdkError};
+use crate::pagination::{Page, Pager};
 use crate::raw::AuthedGrpcClient;
 use crate::refresh::{RefreshedToken, TokenSource};
 use crate::transport;
 use crate::types::{
-    ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxSpec,
-    SandboxTemplateCreateSpec, SandboxTemplateListOptions, SandboxWorkloadTemplate, WorkspaceRef,
+    DeleteOptions, DeletionResult, ExecOptions, ExecResult, Health, ListOptions, SandboxPhase,
+    SandboxRef, SandboxSpec, SandboxTemplateCreateSpec, SandboxTemplateListOptions,
+    SandboxWorkloadTemplate, WorkspaceRef,
 };
 use futures::StreamExt;
 use openshell_core::proto;
@@ -142,7 +144,7 @@ impl OpenShellClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_response(response.sandbox)
+        sandbox_from_create_response(response)
     }
 
     /// Create a new sandbox from a workspace-scoped workload template name.
@@ -157,7 +159,7 @@ impl OpenShellClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_response(response.sandbox)
+        sandbox_from_create_response(response)
     }
 
     /// Create a reusable sandbox template in the default workspace.
@@ -168,8 +170,9 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::CreateSandboxTemplateRequest {
+                    request_id: String::new(),
                     template: Some(template.clone()),
-                    workspace: String::new(),
+                    workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.create_sandbox_template(request).await }
             })
@@ -183,7 +186,7 @@ impl OpenShellClient {
             .unary(|mut grpc| {
                 let request = proto::GetSandboxTemplateRequest {
                     name: name.to_string(),
-                    workspace: String::new(),
+                    workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.get_sandbox_template(request).await }
             })
@@ -191,38 +194,107 @@ impl OpenShellClient {
         sandbox_template_from_response(response.template)
     }
 
-    /// List reusable sandbox templates in the default workspace or across all workspaces.
-    pub async fn list_sandbox_templates(
+    /// List reusable sandbox templates in the default workspace.
+    pub fn list_sandbox_templates(
+        &self,
+        opts: SandboxTemplateListOptions,
+    ) -> Pager<SandboxWorkloadTemplate> {
+        let client = self.clone();
+        let initial_page_token = opts.page_token.clone();
+        Pager::new(initial_page_token, move |page_token| {
+            let client = client.clone();
+            let opts = opts.clone();
+            async move {
+                let response = client
+                    .unary(|mut grpc| {
+                        let page_token = page_token.clone();
+                        let request = proto::ListSandboxTemplatesRequest {
+                            page_size: opts.page_size,
+                            page_token,
+                            label_selector: opts.label_selector.clone(),
+                            workspace_scope: Some(proto::workspace_selector("default")),
+                        };
+                        async move { grpc.list_sandbox_templates(request).await }
+                    })
+                    .await?;
+                Ok(Page {
+                    items: response.templates,
+                    next_page_token: response.next_page_token,
+                })
+            }
+        })
+    }
+
+    /// List and collect every reusable sandbox template.
+    pub async fn list_all_sandbox_templates(
         &self,
         opts: SandboxTemplateListOptions,
     ) -> Result<Vec<SandboxWorkloadTemplate>> {
-        let response = self
-            .unary(|mut grpc| {
-                let request = proto::ListSandboxTemplatesRequest {
-                    limit: opts.limit,
-                    offset: opts.offset,
-                    workspace: String::new(),
-                    all_workspaces: opts.all_workspaces,
-                    label_selector: opts.label_selector.clone(),
-                };
-                async move { grpc.list_sandbox_templates(request).await }
-            })
-            .await?;
-        Ok(response.templates)
+        self.list_sandbox_templates(opts).collect_all().await
+    }
+
+    /// List reusable sandbox templates across all workspaces.
+    pub fn list_sandbox_templates_all_workspaces(
+        &self,
+        opts: SandboxTemplateListOptions,
+    ) -> Pager<SandboxWorkloadTemplate> {
+        let client = self.clone();
+        let initial_page_token = opts.page_token.clone();
+        Pager::new(initial_page_token, move |page_token| {
+            let client = client.clone();
+            let opts = opts.clone();
+            async move {
+                let response = client
+                    .unary(|mut grpc| {
+                        let page_token = page_token.clone();
+                        let request = proto::ListSandboxTemplatesRequest {
+                            page_size: opts.page_size,
+                            page_token,
+                            label_selector: opts.label_selector.clone(),
+                            workspace_scope: Some(proto::all_workspaces_selector()),
+                        };
+                        async move { grpc.list_sandbox_templates(request).await }
+                    })
+                    .await?;
+                Ok(Page {
+                    items: response.templates,
+                    next_page_token: response.next_page_token,
+                })
+            }
+        })
+    }
+
+    /// List and collect every reusable sandbox template across all workspaces.
+    pub async fn list_all_sandbox_templates_all_workspaces(
+        &self,
+        opts: SandboxTemplateListOptions,
+    ) -> Result<Vec<SandboxWorkloadTemplate>> {
+        self.list_sandbox_templates_all_workspaces(opts)
+            .collect_all()
+            .await
     }
 
     /// Delete a reusable sandbox template by name from the default workspace.
-    pub async fn delete_sandbox_template(&self, name: &str) -> Result<bool> {
+    pub async fn delete_sandbox_template(
+        &self,
+        name: &str,
+        opts: DeleteOptions,
+    ) -> Result<DeletionResult> {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxTemplateRequest {
+                    request_id: String::new(),
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
-                    workspace: String::new(),
+                    workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.delete_sandbox_template(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: None,
+        })
     }
 
     /// Fetch a sandbox by name.
@@ -231,7 +303,7 @@ impl OpenShellClient {
             .unary(|mut grpc| {
                 let request = proto::GetSandboxRequest {
                     name: name.to_string(),
-                    workspace: String::new(),
+                    workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.get_sandbox(request).await }
             })
@@ -240,43 +312,62 @@ impl OpenShellClient {
     }
 
     /// List sandboxes.
-    pub async fn list_sandboxes(&self, opts: ListOptions) -> Result<Vec<SandboxRef>> {
-        let response = self
-            .unary(|mut grpc| {
-                let request = proto::ListSandboxesRequest {
-                    limit: opts.limit,
-                    offset: opts.offset,
-                    label_selector: opts.label_selector.clone().unwrap_or_default(),
-                    workspace: String::new(),
-                    all_workspaces: false,
-                };
-                async move { grpc.list_sandboxes(request).await }
-            })
-            .await?;
-        Ok(response
-            .sandboxes
-            .into_iter()
-            .map(SandboxRef::from_proto)
-            .collect())
+    pub fn list_sandboxes(&self, opts: ListOptions) -> Pager<SandboxRef> {
+        let client = self.clone();
+        let initial_page_token = opts.page_token.clone();
+        Pager::new(initial_page_token, move |page_token| {
+            let client = client.clone();
+            let opts = opts.clone();
+            async move {
+                let response = client
+                    .unary(|mut grpc| {
+                        let page_token = page_token.clone();
+                        let request = proto::ListSandboxesRequest {
+                            page_size: opts.page_size,
+                            page_token,
+                            label_selector: opts.label_selector.clone().unwrap_or_default(),
+                            workspace_scope: Some(proto::workspace_selector("default")),
+                        };
+                        async move { grpc.list_sandboxes(request).await }
+                    })
+                    .await?;
+                Ok(Page {
+                    items: response
+                        .sandboxes
+                        .into_iter()
+                        .map(SandboxRef::from_proto)
+                        .collect(),
+                    next_page_token: response.next_page_token,
+                })
+            }
+        })
+    }
+
+    /// List and collect every sandbox in the default workspace.
+    pub async fn list_all_sandboxes(&self, opts: ListOptions) -> Result<Vec<SandboxRef>> {
+        self.list_sandboxes(opts).collect_all().await
     }
 
     /// Delete a sandbox by name.
     ///
-    /// Returns `true` when the gateway acknowledges the deletion, `false`
-    /// when it was already absent. The sandbox may still be in
-    /// [`SandboxPhase::Deleting`] when this returns — pair with
-    /// [`OpenShellClient::wait_deleted`] when you need a terminal guarantee.
-    pub async fn delete_sandbox(&self, name: &str) -> Result<bool> {
+    /// An accepted outcome is not completion. The result identifies the original
+    /// sandbox; a same-name replacement is not part of this operation.
+    pub async fn delete_sandbox(&self, name: &str, opts: DeleteOptions) -> Result<DeletionResult> {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
+                    request_id: String::new(),
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
-                    workspace: String::new(),
+                    workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.delete_sandbox(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: (!response.sandbox_id.is_empty()).then_some(response.sandbox_id),
+        })
     }
 
     /// Stop a sandbox by name.
@@ -284,8 +375,9 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::StopSandboxRequest {
+                    request_id: String::new(),
                     name: name.to_string(),
-                    workspace: String::new(),
+                    workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.stop_sandbox(request).await }
             })
@@ -298,8 +390,9 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::StartSandboxRequest {
+                    request_id: String::new(),
                     name: name.to_string(),
-                    workspace: String::new(),
+                    workspace_scope: Some(proto::workspace_selector("default")),
                 };
                 async move { grpc.start_sandbox(request).await }
             })
@@ -329,16 +422,26 @@ impl OpenShellClient {
         .await
     }
 
-    /// Poll until the sandbox is gone (gRPC `NotFound`) or the `timeout`
-    /// elapses.
-    pub async fn wait_deleted(&self, name: &str, timeout: Duration) -> Result<()> {
+    /// Poll until the sandbox is gone (gRPC `NotFound`) or the timeout elapses.
+    ///
+    /// Pass the deletion result's `sandbox_id` as `expected_sandbox_id` to also
+    /// complete when the name resolves to a different sandbox. With `None`,
+    /// waits for the name to be absent, including any same-name replacement.
+    pub async fn wait_deleted(
+        &self,
+        name: &str,
+        timeout: Duration,
+        expected_sandbox_id: Option<&str>,
+    ) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut delay = Duration::from_millis(250);
         loop {
             match self.get_sandbox(name).await {
                 Err(SdkError::NotFound { .. }) => return Ok(()),
                 Err(other) => return Err(other),
-                Ok(snapshot) if snapshot.phase == SandboxPhase::Deleting => {}
+                Ok(snapshot) if expected_sandbox_id.is_some_and(|id| snapshot.id != id) => {
+                    return Ok(());
+                }
                 Ok(_) => {}
             }
             if Instant::now() >= deadline {
@@ -363,27 +466,43 @@ impl OpenShellClient {
     }
 
     /// List sandboxes across all workspaces.
-    pub async fn list_sandboxes_all_workspaces(
+    pub fn list_sandboxes_all_workspaces(&self, opts: ListOptions) -> Pager<SandboxRef> {
+        let client = self.clone();
+        let initial_page_token = opts.page_token.clone();
+        Pager::new(initial_page_token, move |page_token| {
+            let client = client.clone();
+            let opts = opts.clone();
+            async move {
+                let response = client
+                    .unary(|mut grpc| {
+                        let page_token = page_token.clone();
+                        let request = proto::ListSandboxesRequest {
+                            page_size: opts.page_size,
+                            page_token,
+                            label_selector: opts.label_selector.clone().unwrap_or_default(),
+                            workspace_scope: Some(proto::all_workspaces_selector()),
+                        };
+                        async move { grpc.list_sandboxes(request).await }
+                    })
+                    .await?;
+                Ok(Page {
+                    items: response
+                        .sandboxes
+                        .into_iter()
+                        .map(SandboxRef::from_proto)
+                        .collect(),
+                    next_page_token: response.next_page_token,
+                })
+            }
+        })
+    }
+
+    /// List and collect every sandbox across all workspaces.
+    pub async fn list_all_sandboxes_all_workspaces(
         &self,
         opts: ListOptions,
     ) -> Result<Vec<SandboxRef>> {
-        let response = self
-            .unary(|mut grpc| {
-                let request = proto::ListSandboxesRequest {
-                    limit: opts.limit,
-                    offset: opts.offset,
-                    label_selector: opts.label_selector.clone().unwrap_or_default(),
-                    workspace: String::new(),
-                    all_workspaces: true,
-                };
-                async move { grpc.list_sandboxes(request).await }
-            })
-            .await?;
-        Ok(response
-            .sandboxes
-            .into_iter()
-            .map(SandboxRef::from_proto)
-            .collect())
+        self.list_sandboxes_all_workspaces(opts).collect_all().await
     }
 
     /// Create a new workspace.
@@ -395,6 +514,7 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::CreateWorkspaceRequest {
+                    request_id: String::new(),
                     name: name.to_string(),
                     labels: labels.clone(),
                 };
@@ -424,35 +544,61 @@ impl OpenShellClient {
     }
 
     /// List workspaces.
-    pub async fn list_workspaces(&self, opts: ListOptions) -> Result<Vec<WorkspaceRef>> {
-        let response = self
-            .unary(|mut grpc| {
-                let request = proto::ListWorkspacesRequest {
-                    limit: opts.limit,
-                    offset: opts.offset,
-                    label_selector: opts.label_selector.clone().unwrap_or_default(),
-                };
-                async move { grpc.list_workspaces(request).await }
-            })
-            .await?;
-        Ok(response
-            .workspaces
-            .into_iter()
-            .map(WorkspaceRef::from_proto)
-            .collect())
+    pub fn list_workspaces(&self, opts: ListOptions) -> Pager<WorkspaceRef> {
+        let client = self.clone();
+        let initial_page_token = opts.page_token.clone();
+        Pager::new(initial_page_token, move |page_token| {
+            let client = client.clone();
+            let opts = opts.clone();
+            async move {
+                let response = client
+                    .unary(|mut grpc| {
+                        let page_token = page_token.clone();
+                        let request = proto::ListWorkspacesRequest {
+                            page_size: opts.page_size,
+                            page_token,
+                            label_selector: opts.label_selector.clone().unwrap_or_default(),
+                        };
+                        async move { grpc.list_workspaces(request).await }
+                    })
+                    .await?;
+                Ok(Page {
+                    items: response
+                        .workspaces
+                        .into_iter()
+                        .map(WorkspaceRef::from_proto)
+                        .collect(),
+                    next_page_token: response.next_page_token,
+                })
+            }
+        })
+    }
+
+    /// List and collect every workspace.
+    pub async fn list_all_workspaces(&self, opts: ListOptions) -> Result<Vec<WorkspaceRef>> {
+        self.list_workspaces(opts).collect_all().await
     }
 
     /// Delete a workspace by name.
-    pub async fn delete_workspace(&self, name: &str) -> Result<bool> {
+    pub async fn delete_workspace(
+        &self,
+        name: &str,
+        opts: DeleteOptions,
+    ) -> Result<DeletionResult> {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::DeleteWorkspaceRequest {
+                    request_id: String::new(),
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
                 };
                 async move { grpc.delete_workspace(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: None,
+        })
     }
 
     /// Run a command inside a sandbox and buffer stdout/stderr to the end.
@@ -460,15 +606,17 @@ impl OpenShellClient {
     /// For streaming output, drop down to [`OpenShellClient::raw_grpc`] and
     /// call `exec_sandbox` directly.
     pub async fn exec(&self, name: &str, cmd: &[String], opts: ExecOptions) -> Result<ExecResult> {
-        let sandbox = self.get_sandbox(name).await?;
         let request = proto::ExecSandboxRequest {
-            sandbox_id: sandbox.id,
+            sandbox: name.to_string(),
+            workspace_scope: Some(proto::workspace_selector("default")),
             command: cmd.to_vec(),
             workdir: opts.workdir.unwrap_or_default(),
             environment: opts.environment,
-            timeout_seconds: opts
+            execution_timeout: opts
                 .timeout
-                .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX)),
+                .map(openshell_core::time::duration_from_std)
+                .transpose()
+                .map_err(|error| SdkError::invalid_config(error.to_string()))?,
             stdin: opts.stdin.unwrap_or_default(),
             tty: false,
             cols: 0,
@@ -618,7 +766,7 @@ impl WorkspaceScopedClient {
     /// Create a new sandbox in this workspace.
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
         let mut request = create_sandbox_request(spec);
-        request.workspace = self.workspace.clone();
+        request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
         let response = self
             .client
             .unary(|mut grpc| {
@@ -626,7 +774,7 @@ impl WorkspaceScopedClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_response(response.sandbox)
+        sandbox_from_create_response(response)
     }
 
     /// Create a new sandbox from a template in this workspace.
@@ -635,7 +783,7 @@ impl WorkspaceScopedClient {
         spec: SandboxTemplateCreateSpec,
     ) -> Result<SandboxRef> {
         let mut request = create_sandbox_from_template_request(spec);
-        request.workspace = self.workspace.clone();
+        request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
         let response = self
             .client
             .unary(|mut grpc| {
@@ -643,7 +791,7 @@ impl WorkspaceScopedClient {
                 async move { grpc.create_sandbox(request).await }
             })
             .await?;
-        sandbox_from_response(response.sandbox)
+        sandbox_from_create_response(response)
     }
 
     /// Create a reusable sandbox template in this workspace.
@@ -655,8 +803,9 @@ impl WorkspaceScopedClient {
             .client
             .unary(|mut grpc| {
                 let request = proto::CreateSandboxTemplateRequest {
+                    request_id: String::new(),
                     template: Some(template.clone()),
-                    workspace: self.workspace.clone(),
+                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.create_sandbox_template(request).await }
             })
@@ -671,7 +820,7 @@ impl WorkspaceScopedClient {
             .unary(|mut grpc| {
                 let request = proto::GetSandboxTemplateRequest {
                     name: name.to_string(),
-                    workspace: self.workspace.clone(),
+                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.get_sandbox_template(request).await }
             })
@@ -679,44 +828,69 @@ impl WorkspaceScopedClient {
         sandbox_template_from_response(response.template)
     }
 
-    /// List reusable sandbox templates in this workspace, or across all workspaces.
-    pub async fn list_sandbox_templates(
+    /// List reusable sandbox templates in this workspace.
+    pub fn list_sandbox_templates(
+        &self,
+        opts: SandboxTemplateListOptions,
+    ) -> Pager<SandboxWorkloadTemplate> {
+        let client = self.client.clone();
+        let workspace = self.workspace.clone();
+        let initial_page_token = opts.page_token.clone();
+        Pager::new(initial_page_token, move |page_token| {
+            let client = client.clone();
+            let workspace = workspace.clone();
+            let opts = opts.clone();
+            async move {
+                let response = client
+                    .unary(|mut grpc| {
+                        let page_token = page_token.clone();
+                        let request = proto::ListSandboxTemplatesRequest {
+                            page_size: opts.page_size,
+                            page_token,
+                            label_selector: opts.label_selector.clone(),
+                            workspace_scope: Some(proto::workspace_selector(&workspace)),
+                        };
+                        async move { grpc.list_sandbox_templates(request).await }
+                    })
+                    .await?;
+                Ok(Page {
+                    items: response.templates,
+                    next_page_token: response.next_page_token,
+                })
+            }
+        })
+    }
+
+    /// List and collect every reusable sandbox template in this scope.
+    pub async fn list_all_sandbox_templates(
         &self,
         opts: SandboxTemplateListOptions,
     ) -> Result<Vec<SandboxWorkloadTemplate>> {
-        let response = self
-            .client
-            .unary(|mut grpc| {
-                let request = proto::ListSandboxTemplatesRequest {
-                    limit: opts.limit,
-                    offset: opts.offset,
-                    workspace: if opts.all_workspaces {
-                        String::new()
-                    } else {
-                        self.workspace.clone()
-                    },
-                    all_workspaces: opts.all_workspaces,
-                    label_selector: opts.label_selector.clone(),
-                };
-                async move { grpc.list_sandbox_templates(request).await }
-            })
-            .await?;
-        Ok(response.templates)
+        self.list_sandbox_templates(opts).collect_all().await
     }
 
     /// Delete a reusable sandbox template by name in this workspace.
-    pub async fn delete_sandbox_template(&self, name: &str) -> Result<bool> {
+    pub async fn delete_sandbox_template(
+        &self,
+        name: &str,
+        opts: DeleteOptions,
+    ) -> Result<DeletionResult> {
         let response = self
             .client
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxTemplateRequest {
+                    request_id: String::new(),
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
-                    workspace: self.workspace.clone(),
+                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.delete_sandbox_template(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: None,
+        })
     }
 
     /// Fetch a sandbox by name in this workspace.
@@ -726,7 +900,7 @@ impl WorkspaceScopedClient {
             .unary(|mut grpc| {
                 let request = proto::GetSandboxRequest {
                     name: name.to_string(),
-                    workspace: self.workspace.clone(),
+                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.get_sandbox(request).await }
             })
@@ -735,40 +909,62 @@ impl WorkspaceScopedClient {
     }
 
     /// List sandboxes in this workspace.
-    pub async fn list_sandboxes(&self, opts: ListOptions) -> Result<Vec<SandboxRef>> {
-        let response = self
-            .client
-            .unary(|mut grpc| {
-                let request = proto::ListSandboxesRequest {
-                    limit: opts.limit,
-                    offset: opts.offset,
-                    label_selector: opts.label_selector.clone().unwrap_or_default(),
-                    workspace: self.workspace.clone(),
-                    all_workspaces: false,
-                };
-                async move { grpc.list_sandboxes(request).await }
-            })
-            .await?;
-        Ok(response
-            .sandboxes
-            .into_iter()
-            .map(SandboxRef::from_proto)
-            .collect())
+    pub fn list_sandboxes(&self, opts: ListOptions) -> Pager<SandboxRef> {
+        let client = self.client.clone();
+        let workspace = self.workspace.clone();
+        let initial_page_token = opts.page_token.clone();
+        Pager::new(initial_page_token, move |page_token| {
+            let client = client.clone();
+            let workspace = workspace.clone();
+            let opts = opts.clone();
+            async move {
+                let response = client
+                    .unary(|mut grpc| {
+                        let page_token = page_token.clone();
+                        let request = proto::ListSandboxesRequest {
+                            page_size: opts.page_size,
+                            page_token,
+                            label_selector: opts.label_selector.clone().unwrap_or_default(),
+                            workspace_scope: Some(proto::workspace_selector(&workspace)),
+                        };
+                        async move { grpc.list_sandboxes(request).await }
+                    })
+                    .await?;
+                Ok(Page {
+                    items: response
+                        .sandboxes
+                        .into_iter()
+                        .map(SandboxRef::from_proto)
+                        .collect(),
+                    next_page_token: response.next_page_token,
+                })
+            }
+        })
+    }
+
+    /// List and collect every sandbox in this workspace.
+    pub async fn list_all_sandboxes(&self, opts: ListOptions) -> Result<Vec<SandboxRef>> {
+        self.list_sandboxes(opts).collect_all().await
     }
 
     /// Delete a sandbox by name in this workspace.
-    pub async fn delete_sandbox(&self, name: &str) -> Result<bool> {
+    pub async fn delete_sandbox(&self, name: &str, opts: DeleteOptions) -> Result<DeletionResult> {
         let response = self
             .client
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
+                    request_id: String::new(),
+                    allow_missing: opts.allow_missing,
                     name: name.to_string(),
-                    workspace: self.workspace.clone(),
+                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.delete_sandbox(request).await }
             })
             .await?;
-        Ok(response.deleted)
+        Ok(DeletionResult {
+            outcome: response.outcome.into(),
+            sandbox_id: (!response.sandbox_id.is_empty()).then_some(response.sandbox_id),
+        })
     }
 
     /// Stop a sandbox by name in this workspace.
@@ -777,8 +973,9 @@ impl WorkspaceScopedClient {
             .client
             .unary(|mut grpc| {
                 let request = proto::StopSandboxRequest {
+                    request_id: String::new(),
                     name: name.to_string(),
-                    workspace: self.workspace.clone(),
+                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.stop_sandbox(request).await }
             })
@@ -792,8 +989,9 @@ impl WorkspaceScopedClient {
             .client
             .unary(|mut grpc| {
                 let request = proto::StartSandboxRequest {
+                    request_id: String::new(),
                     name: name.to_string(),
-                    workspace: self.workspace.clone(),
+                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };
                 async move { grpc.start_sandbox(request).await }
             })
@@ -835,13 +1033,25 @@ impl WorkspaceScopedClient {
     }
 
     /// Poll until the sandbox is gone (`NotFound`) or the timeout elapses.
-    pub async fn wait_deleted(&self, name: &str, timeout: Duration) -> Result<()> {
+    ///
+    /// Pass the deletion result's `sandbox_id` as `expected_sandbox_id` to also
+    /// complete when the name resolves to a different sandbox. With `None`,
+    /// waits for the name to be absent, including any same-name replacement.
+    pub async fn wait_deleted(
+        &self,
+        name: &str,
+        timeout: Duration,
+        expected_sandbox_id: Option<&str>,
+    ) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut delay = Duration::from_millis(250);
         loop {
             match self.get_sandbox(name).await {
                 Err(SdkError::NotFound { .. }) => return Ok(()),
                 Err(other) => return Err(other),
+                Ok(snapshot) if expected_sandbox_id.is_some_and(|id| snapshot.id != id) => {
+                    return Ok(());
+                }
                 Ok(_) => {}
             }
             if Instant::now() >= deadline {
@@ -856,15 +1066,17 @@ impl WorkspaceScopedClient {
 
     /// Run a command inside a sandbox and buffer stdout/stderr.
     pub async fn exec(&self, name: &str, cmd: &[String], opts: ExecOptions) -> Result<ExecResult> {
-        let sandbox = self.get_sandbox(name).await?;
         let request = proto::ExecSandboxRequest {
-            sandbox_id: sandbox.id,
+            sandbox: name.to_string(),
+            workspace_scope: Some(proto::workspace_selector(&self.workspace)),
             command: cmd.to_vec(),
             workdir: opts.workdir.unwrap_or_default(),
             environment: opts.environment,
-            timeout_seconds: opts
+            execution_timeout: opts
                 .timeout
-                .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX)),
+                .map(openshell_core::time::duration_from_std)
+                .transpose()
+                .map_err(|error| SdkError::invalid_config(error.to_string()))?,
             stdin: opts.stdin.unwrap_or_default(),
             tty: false,
             cols: 0,
@@ -966,6 +1178,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         gpu,
         command,
         tty,
+        service_exposures,
     } = spec;
     let template = image.map(|image| proto::SandboxTemplate {
         image,
@@ -975,6 +1188,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         gpu: Some(proto::GpuResourceRequirements { count: None }),
     });
     proto::CreateSandboxRequest {
+        request_id: String::new(),
         spec: Some(proto::SandboxSpec {
             environment,
             template,
@@ -987,9 +1201,16 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         name: name.unwrap_or_default(),
         labels,
         annotations: HashMap::new(),
-        workspace: String::new(),
+        workspace_scope: Some(proto::workspace_selector("default")),
         await_main_process_attachment: false,
-        workload_template_name: String::new(),
+        workload_template: String::new(),
+        service_exposures: service_exposures
+            .into_iter()
+            .map(|exposure| proto::SandboxServiceExposure {
+                service: exposure.service,
+                target_port: u32::from(exposure.target_port),
+            })
+            .collect(),
     }
 }
 
@@ -1004,8 +1225,10 @@ fn create_sandbox_from_template_request(
         command,
         tty,
         policy,
+        service_exposures,
     } = spec;
     proto::CreateSandboxRequest {
+        request_id: String::new(),
         spec: Some(proto::SandboxSpec {
             providers,
             command,
@@ -1016,9 +1239,16 @@ fn create_sandbox_from_template_request(
         name: name.unwrap_or_default(),
         labels,
         annotations: HashMap::new(),
-        workspace: String::new(),
-        workload_template_name: template_name,
+        workspace_scope: Some(proto::workspace_selector("default")),
+        workload_template: template_name,
         await_main_process_attachment: false,
+        service_exposures: service_exposures
+            .into_iter()
+            .map(|exposure| proto::SandboxServiceExposure {
+                service: exposure.service,
+                target_port: u32::from(exposure.target_port),
+            })
+            .collect(),
     }
 }
 
@@ -1026,6 +1256,12 @@ fn sandbox_from_response(sandbox: Option<proto::Sandbox>) -> Result<SandboxRef> 
     sandbox
         .map(SandboxRef::from_proto)
         .ok_or_else(|| SdkError::invalid_config("sandbox missing from gateway response"))
+}
+
+fn sandbox_from_create_response(response: proto::SandboxResponse) -> Result<SandboxRef> {
+    let mut sandbox = sandbox_from_response(response.sandbox)?;
+    sandbox.service_urls = response.service_urls;
+    Ok(sandbox)
 }
 
 fn sandbox_template_from_response(
@@ -1036,17 +1272,7 @@ fn sandbox_template_from_response(
 }
 
 fn map_status(status: tonic::Status) -> SdkError {
-    let message = status.message().to_string();
-    match status.code() {
-        tonic::Code::NotFound => SdkError::NotFound { message },
-        tonic::Code::AlreadyExists => SdkError::AlreadyExists { message },
-        tonic::Code::InvalidArgument => SdkError::invalid_config(message),
-        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => SdkError::auth(message),
-        _ => SdkError::Rpc {
-            code: status.code() as i32,
-            message,
-        },
-    }
+    SdkError::from_status(status)
 }
 
 #[cfg(test)]

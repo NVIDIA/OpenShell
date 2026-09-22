@@ -20,12 +20,12 @@ func WorkspaceFromProto(w *dm.Workspace) *types.Workspace {
 	if m := w.GetMetadata(); m != nil {
 		result.ID = m.GetId()
 		result.Name = m.GetName()
-		result.CreatedAt = TimeFromMillis(m.GetCreatedAtMs())
+		result.CreatedAt = TimeFromProto(m.GetCreatedTime())
 		result.Labels = CopyStringMap(m.GetLabels())
 		result.Annotations = CopyStringMap(m.GetAnnotations())
 		result.ResourceVersion = m.GetResourceVersion()
 		result.Workspace = m.GetWorkspace()
-		result.DeletionTimestamp = TimeFromMillisPtr(m.GetDeletionTimestampMs())
+		result.DeletionTimestamp = TimePtrFromProto(m.GetDeletionTime())
 	}
 
 	if status := w.GetStatus(); status != nil {
@@ -63,7 +63,7 @@ func WorkspaceMemberFromProto(m *pb.WorkspaceMember) *types.WorkspaceMember {
 	if meta := m.GetMetadata(); meta != nil {
 		result.ID = meta.GetId()
 		result.Name = meta.GetName()
-		result.CreatedAt = TimeFromMillis(meta.GetCreatedAtMs())
+		result.CreatedAt = TimeFromProto(meta.GetCreatedTime())
 		result.Labels = CopyStringMap(meta.GetLabels())
 		result.Annotations = CopyStringMap(meta.GetAnnotations())
 		result.ResourceVersion = meta.GetResourceVersion()

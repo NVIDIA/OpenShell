@@ -7,6 +7,16 @@ on:
   schedule:
     - cron: "23 7 * * *"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      candidate_ref:
+        description: Optional pre-release tag to scan instead of the triggering revision
+        default: ""
+        type: string
+      advisories-only:
+        description: Run only the dependency advisory check
+        default: false
+        type: boolean
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,7 +27,7 @@ permissions:
   packages: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: cargo-deny-${{ github.workflow }}-${{ inputs.candidate_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -31,9 +41,16 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
 
       - name: Install tools
         run: mise install --locked
 
       - name: Check dependencies
+        if: ${{ !inputs.advisories-only }}
         run: mise run rust:deny
+
+      - name: Check dependency advisories
+        if: inputs.advisories-only
+        run: cargo deny check advisories

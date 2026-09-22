@@ -37,9 +37,7 @@ func (t *tcpClient) Forward(ctx context.Context, workspace, sandboxName string, 
 			Message: fmt.Sprintf("port must be in range 1-65535, got %d", port),
 		}
 	}
-
-	sb, err := t.sandboxes.Get(ctx, workspace, sandboxName)
-	if err != nil {
+	if _, err := t.sandboxes.Get(ctx, workspace, sandboxName); err != nil {
 		return nil, err
 	}
 
@@ -56,7 +54,8 @@ func (t *tcpClient) Forward(ctx context.Context, workspace, sandboxName string, 
 	initFrame := &pb.TcpForwardFrame{
 		Payload: &pb.TcpForwardFrame_Init{
 			Init: &pb.TcpForwardInit{
-				SandboxId: sb.ID,
+				Sandbox:   sandboxName,
+				Workspace: workspace,
 				ServiceId: cfg.serviceID,
 				Target: &pb.TcpForwardInit_Tcp{
 					Tcp: &pb.TcpRelayTarget{

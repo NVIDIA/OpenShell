@@ -14,9 +14,7 @@ use openshell_e2e::harness::container::ContainerHttpServer;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
-const TEST_SERVER_ALIAS: &str = "rest-l7.openshell.test";
-
-async fn start_test_server() -> Result<ContainerHttpServer, String> {
+async fn start_test_server(alias: &str) -> Result<ContainerHttpServer, String> {
     let script = r#"from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class Handler(BaseHTTPRequestHandler):
@@ -34,7 +32,7 @@ class Handler(BaseHTTPRequestHandler):
 HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
 "#;
 
-    ContainerHttpServer::start_python(TEST_SERVER_ALIAS, script).await
+    ContainerHttpServer::start_python(alias, script).await
 }
 
 fn write_policy_with_l7_rules(host: &str, port: u16) -> Result<NamedTempFile, String> {
@@ -98,7 +96,9 @@ network_policies:
 /// GET /allowed should succeed — the L7 policy explicitly allows it.
 #[tokio::test]
 async fn forward_proxy_allows_l7_permitted_request() {
-    let server = start_test_server().await.expect("start test server");
+    let server = start_test_server("rest-l7-allow.openshell.test")
+        .await
+        .expect("start test server");
     let policy =
         write_policy_with_l7_rules(&server.host, server.port).expect("write custom policy");
     let policy_path = policy
@@ -148,7 +148,9 @@ print(json.dumps(last))
 /// POST /allowed should be denied — the L7 policy only allows GET.
 #[tokio::test]
 async fn forward_proxy_denies_l7_blocked_request() {
-    let server = start_test_server().await.expect("start test server");
+    let server = start_test_server("rest-l7-deny.openshell.test")
+        .await
+        .expect("start test server");
     let policy =
         write_policy_with_l7_rules(&server.host, server.port).expect("write custom policy");
     let policy_path = policy

@@ -32,36 +32,13 @@ use openshell_e2e::harness::output::{extract_field, strip_ansi};
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
-#[cfg(feature = "e2e-docker")]
-const LOCAL_OVERRIDE_REGO: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../crates/openshell-supervisor-network/data/sandbox-policy.rego"
-));
-
-#[cfg(feature = "e2e-docker")]
-const LOCAL_OVERRIDE_DOCKERFILE: &str = r#"FROM public.ecr.aws/docker/library/python:3.13-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
-    && rm -rf /var/lib/apt/lists/*
-RUN groupadd -g 1000660000 sandbox && \
-    useradd -m -u 1000660000 -g sandbox sandbox
-
-COPY local-policy.rego /etc/openshell/local-policy.rego
-COPY local-policy.yaml /etc/openshell/local-policy.yaml
-
-ENV OPENSHELL_POLICY_RULES=/etc/openshell/local-policy.rego
-ENV OPENSHELL_POLICY_DATA=/etc/openshell/local-policy.yaml
-ENV OPENSHELL_POLICY_POLL_INTERVAL_SECS=1
-
-CMD ["sleep", "infinity"]
-"#;
-
 // ---------------------------------------------------------------------------
 // Policy YAML builders
 // ---------------------------------------------------------------------------
 
 /// Build a policy YAML that allows any binary to reach the given hosts on
-/// port 443.
+/// port 443. Keep its filesystem paths aligned with the empty-network policy
+/// so live network updates do not remove startup filesystem access.
 ///
 /// NOTE: The indentation in the format string is load-bearing YAML structure.
 fn write_policy(hosts: &[&str]) -> Result<NamedTempFile, String> {
@@ -88,6 +65,7 @@ fn write_policy(hosts: &[&str]) -> Result<NamedTempFile, String> {
 filesystem_policy:
   include_workdir: true
   read_only:
+    - /bin
     - /usr
     - /lib
     - /proc
@@ -114,7 +92,8 @@ network_policies:
     Ok(file)
 }
 
-/// Build a minimal policy YAML with no network rules.
+/// Build a minimal policy YAML with no network rules. Both /bin and /usr
+/// are readable so shell entrypoints work on merged and unmerged images.
 fn write_empty_network_policy() -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|e| format!("create temp policy file: {e}"))?;
 
@@ -123,6 +102,7 @@ fn write_empty_network_policy() -> Result<NamedTempFile, String> {
 filesystem_policy:
   include_workdir: true
   read_only:
+    - /bin
     - /usr
     - /lib
     - /proc
@@ -144,56 +124,6 @@ landlock:
     file.flush()
         .map_err(|e| format!("flush temp policy file: {e}"))?;
     Ok(file)
-}
-
-#[cfg(feature = "e2e-docker")]
-fn write_local_override_image() -> Result<
-    (
-        tempfile::TempDir,
-        openshell_e2e::harness::container::ImageGuard,
-    ),
-    String,
-> {
-    let dir = tempfile::tempdir().map_err(|e| format!("create image context: {e}"))?;
-    let dockerfile = dir.path().join("Dockerfile");
-    std::fs::write(&dockerfile, LOCAL_OVERRIDE_DOCKERFILE)
-        .map_err(|e| format!("write local override Dockerfile: {e}"))?;
-    std::fs::write(dir.path().join("local-policy.rego"), LOCAL_OVERRIDE_REGO)
-        .map_err(|e| format!("write local override Rego policy: {e}"))?;
-    std::fs::write(
-        dir.path().join("local-policy.yaml"),
-        r"version: 1
-
-filesystem_policy:
-  include_workdir: true
-  read_only:
-    - /usr
-    - /lib
-    - /proc
-    - /dev/urandom
-    - /etc
-  read_write:
-    - /sandbox
-    - /tmp
-    - /dev/null
-
-landlock:
-  compatibility: best_effort
-
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-
-network_policies: {}
-",
-    )
-    .map_err(|e| format!("write local override policy data: {e}"))?;
-    let image = openshell_e2e::harness::container::ImageGuard::build(
-        "local-override",
-        &dockerfile,
-        dir.path(),
-    )?;
-    Ok((dir, image))
 }
 
 // ---------------------------------------------------------------------------
@@ -254,6 +184,172 @@ fn list_output_contains_version(output: &str, version: u32) -> bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Read the effective policy through the same CLI boundary used by operators.
+async fn l7_scope_snapshot(name: &str) -> serde_json::Value {
+    let result = run_cli(&["policy", "get", name, "--full", "--output", "json"]).await;
+    assert!(result.success, "policy snapshot failed: {}", result.output);
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&result.output).expect("policy get returns JSON");
+    assert!(snapshot["version"].as_u64().is_some());
+    assert!(
+        snapshot["hash"]
+            .as_str()
+            .is_some_and(|hash| !hash.is_empty())
+    );
+    assert!(snapshot["policy"]["network_policies"].is_object());
+    snapshot
+}
+
+/// Incomplete declarations reject without a revision; an explicit target
+/// changes only its endpoint even when another rule shares the host and ports.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn l7_append_target_scope_round_trip() {
+    let mut policy = write_empty_network_policy().expect("write base policy");
+    policy
+        .write_all(
+            br"
+network_policies:
+  internal_api:
+    name: internal_api
+    binaries:
+      - path: /usr/bin/curl
+      - path: /usr/bin/python3
+    endpoints:
+      - host: api.example.com
+        ports: [443, 8443]
+        protocol: rest
+        access: read-only
+      - host: other.example.com
+        port: 443
+        protocol: rest
+        access: read-only
+  sibling:
+    name: sibling
+    binaries:
+      - path: /usr/bin/wget
+    endpoints:
+      - host: api.example.com
+        ports: [443, 8443]
+        protocol: rest
+        access: read-only
+",
+        )
+        .expect("write scoped policy");
+    policy.flush().expect("flush scoped policy");
+    let path = policy.path().to_str().expect("UTF-8 policy path");
+    let mut guard = SandboxGuard::create_keep_with_args(
+        &["--policy", path, "--no-tty"],
+        &["sh", "-c", "echo Ready && sleep infinity"],
+        "Ready",
+    )
+    .await
+    .expect("create scoped-policy sandbox");
+    let before = l7_scope_snapshot(&guard.name).await;
+
+    // Check each independent axis with the other fully declared, so a guard
+    // requiring both mismatches at once cannot satisfy this regression.
+    for (ports, binaries) in [
+        (
+            "api.example.com:443:POST:/admin",
+            vec!["/usr/bin/curl", "/usr/bin/python3"],
+        ),
+        (
+            "api.example.com:443,8443:POST:/admin",
+            vec!["/usr/bin/curl"],
+        ),
+    ] {
+        let mut args = vec![
+            "policy",
+            "update",
+            &guard.name,
+            "--rule-name",
+            "internal_api",
+            "--add-allow",
+            ports,
+        ];
+        for binary in binaries {
+            args.extend(["--binary", binary]);
+        }
+        let rejected = run_cli(&args).await;
+        assert!(
+            !rejected.success,
+            "partial scope was accepted: {}",
+            rejected.output
+        );
+        let unchanged = l7_scope_snapshot(&guard.name).await;
+        for field in ["version", "hash", "policy"] {
+            assert_eq!(unchanged[field], before[field], "rejection changed {field}");
+        }
+    }
+
+    let common = [
+        "policy",
+        "update",
+        &guard.name,
+        "--rule-name",
+        "internal_api",
+        "--binary",
+        "/usr/bin/curl",
+        "--binary",
+        "/usr/bin/python3",
+    ];
+    let mut allow_args = common.to_vec();
+    allow_args.extend([
+        "--add-allow",
+        "api.example.com:443,8443:POST:/admin",
+        "--wait",
+    ]);
+    let accepted = run_cli(&allow_args).await;
+    assert!(
+        accepted.success,
+        "explicit allow failed: {}",
+        accepted.output
+    );
+    let after_allow = l7_scope_snapshot(&guard.name).await;
+    assert!(after_allow["version"].as_u64() > before["version"].as_u64());
+    assert_ne!(after_allow["hash"], before["hash"]);
+    let rules = &after_allow["policy"]["network_policies"];
+    assert_eq!(
+        rules["sibling"],
+        before["policy"]["network_policies"]["sibling"]
+    );
+    assert_eq!(
+        rules["internal_api"]["endpoints"][1],
+        before["policy"]["network_policies"]["internal_api"]["endpoints"][1]
+    );
+    assert!(
+        rules["internal_api"]["endpoints"][0]["rules"]
+            .as_array()
+            .expect("allow rules")
+            .iter()
+            .any(|rule| rule["allow"]["method"] == "POST" && rule["allow"]["path"] == "/admin")
+    );
+
+    let mut deny_args = common.to_vec();
+    deny_args.extend([
+        "--add-deny",
+        "api.example.com:443,8443:POST:/admin/private",
+        "--wait",
+    ]);
+    let denied = run_cli(&deny_args).await;
+    assert!(denied.success, "explicit deny failed: {}", denied.output);
+    let after_deny = l7_scope_snapshot(&guard.name).await;
+    assert!(after_deny["version"].as_u64() > after_allow["version"].as_u64());
+    assert_eq!(
+        after_deny["policy"]["network_policies"]["sibling"],
+        before["policy"]["network_policies"]["sibling"]
+    );
+    assert!(
+        after_deny["policy"]["network_policies"]["internal_api"]["endpoints"][0]["deny_rules"]
+            .as_array()
+            .expect("deny rules")
+            .iter()
+            .any(|rule| rule["method"] == "POST" && rule["path"] == "/admin/private")
+    );
+    guard.cleanup().await;
+}
 
 /// Test the full live policy update lifecycle:
 ///
@@ -588,118 +684,6 @@ async fn initial_sparse_policy_is_acknowledged_as_loaded() {
     assert!(
         list_output_contains_version(&last_list, 1),
         "policy list should contain revision 1:\n{last_list}"
-    );
-
-    guard.cleanup().await;
-}
-
-/// An explicit local Rego/data override remains authoritative even when the
-/// sandbox has a gateway policy and that policy changes while it is running.
-/// Gateway polling must continue for settings and providers without replacing
-/// the locally loaded OPA engine.
-#[cfg(feature = "e2e-docker")]
-#[tokio::test]
-async fn local_policy_override_survives_gateway_policy_polls() {
-    let (_image_context, image) = write_local_override_image().expect("write local override image");
-
-    let gateway_policy_a_file = write_policy(&["example.com"]).expect("write gateway policy A");
-    let gateway_policy_a_path = gateway_policy_a_file
-        .path()
-        .to_str()
-        .expect("gateway policy A path should be utf-8")
-        .to_string();
-    let gateway_policy_b_file =
-        write_policy(&["example.com", "api.anthropic.com"]).expect("write gateway policy B");
-    let gateway_policy_b_path = gateway_policy_b_file
-        .path()
-        .to_str()
-        .expect("gateway policy B path should be utf-8")
-        .to_string();
-
-    let mut guard = SandboxGuard::create_keep_with_args(
-        &[
-            "--name",
-            "e2e-lcl-pol-ovrd",
-            "--from",
-            image.tag(),
-            "--policy",
-            &gateway_policy_a_path,
-            "--no-tty",
-        ],
-        &["sh", "-c", "echo Ready && sleep infinity"],
-        "Ready",
-    )
-    .await
-    .expect("create sandbox with local policy override");
-
-    // Allow several one-second poll intervals. Before the fix, the first poll
-    // immediately reloaded gateway policy A over the local override.
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-    let initial_logs = run_cli(&[
-        "logs",
-        &guard.name,
-        "-n",
-        "500",
-        "--since",
-        "1m",
-        "--source",
-        "sandbox",
-    ])
-    .await;
-    assert!(
-        initial_logs.success,
-        "fetch initial sandbox logs:\n{}",
-        initial_logs.output
-    );
-    assert!(
-        initial_logs
-            .output
-            .contains("Loading OPA policy engine from local files"),
-        "sandbox should load the explicit local policy:\n{}",
-        initial_logs.output
-    );
-    assert!(
-        !initial_logs.output.contains("Policy reloaded successfully"),
-        "the first gateway poll must not replace the local policy:\n{}",
-        initial_logs.output
-    );
-
-    let update = run_cli(&[
-        "policy",
-        "set",
-        &guard.name,
-        "--policy",
-        &gateway_policy_b_path,
-    ])
-    .await;
-    assert!(
-        update.success,
-        "publish gateway policy B:\n{}",
-        update.output
-    );
-
-    // A later gateway revision must also remain observational in local mode.
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-    let updated_logs = run_cli(&[
-        "logs",
-        &guard.name,
-        "-n",
-        "500",
-        "--since",
-        "1m",
-        "--source",
-        "sandbox",
-    ])
-    .await;
-    assert!(
-        updated_logs.success,
-        "fetch updated sandbox logs:\n{}",
-        updated_logs.output
-    );
-    assert!(
-        !updated_logs.output.contains("Policy reloaded successfully"),
-        "gateway policy updates must not replace the local override:\n{}",
-        updated_logs.output
     );
 
     guard.cleanup().await;

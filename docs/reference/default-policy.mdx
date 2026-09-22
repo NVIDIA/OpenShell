@@ -7,23 +7,28 @@ description: "Breakdown of the built-in default policy applied when you create a
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Security, Policy"
 position: 2
 ---
-The default policy is the policy applied when you create an OpenShell sandbox without `--policy`. It is baked into the community base image ([`ghcr.io/nvidia/openshell-community/sandboxes/base`](https://github.com/NVIDIA/OpenShell-Community)) and defined in the community repo's `dev-sandbox-policy.yaml`.
 
-## Agent Compatibility
+When you create a sandbox without `--policy`, OpenShell applies a restrictive built-in fallback. The policy comes from the OpenShell runtime and does not depend on the selected workload image.
 
-The following table shows the coverage of the default policy for common agents.
+## Filesystem Access
 
-| Agent | Coverage | Action Required |
-|---|---|---|
-| Claude Code | Full | None. Works out of the box. |
-| OpenCode | Partial | Add `opencode.ai` endpoint and OpenCode binary paths. |
-| Codex | None | Provide a complete custom policy with OpenAI endpoints and Codex binary paths. |
+The fallback includes the sandbox working directory and grants read-only access to standard runtime paths:
 
-<Info>
-If you run a non-Claude agent without a custom policy, the agent's API calls are denied by the proxy. You must provide a policy that declares the agent's endpoints and binaries.
+- `/usr`
+- `/lib`
+- `/proc`
+- `/dev/urandom`
+- `/etc`
+- `/var/log`
 
-</Info>
+It grants read-write access to `/tmp` and `/dev/null`. Landlock enforcement uses `best_effort` compatibility so OpenShell can use the strongest ABI available on the host while retaining its mandatory baseline protections.
 
-## Default Policy Blocks
+## Network Access
 
-The default policy blocks are defined in the community base image. Refer to the [OpenShell Community repository](https://github.com/NVIDIA/OpenShell-Community) for the full `dev-sandbox-policy.yaml` source.
+The fallback defines no network policies or provider-derived endpoints, so outbound network access is denied. Attach a provider or apply a custom policy that names the required endpoints and executable paths before running a networked agent.
+
+## Process Identity
+
+The fallback leaves process identity selection to the compute driver. Docker and Podman honor a non-root OCI `USER`; when an image declares no user, they use numeric UID and GID `1000`. Kubernetes and MicroVM drivers apply their configured non-root identities.
+
+Use `openshell policy get <sandbox> --full` to inspect the effective policy. Refer to [Customize Sandbox Policies](/sandboxes/policies) to replace the fallback.

@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Register OpenShell gateway for test client
+  ansible.builtin.command:
+    argv:
+      - openshell
+      - gateway
+      - add
+      - "{{ openshell_client_gateway_endpoint | default('http://127.0.0.1:17670') }}"
+      - --local
+      - --name
+      - "{{ openshell_client_gateway_name | default('tmachine') }}"

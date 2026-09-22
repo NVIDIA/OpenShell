@@ -21,7 +21,7 @@ For how the CLI resolves gateways and stores credentials, refer to [Gateway Auth
 
 ## Sandbox Supervisor Identity
 
-Kubernetes sandbox supervisors authenticate back to the gateway as sandbox workloads. By default, the Kubernetes compute driver validates each projected ServiceAccount token and returns the authenticated sandbox ID to the gateway. The gateway verifies the sandbox still exists and mints its own sandbox JWT.
+Kubernetes sandbox supervisors authenticate back to the gateway as sandbox workloads. By default, the Kubernetes compute driver validates each projected ServiceAccount token and returns the authenticated sandbox ID plus a stable runtime identity to the gateway. The gateway requires that identity to match the namespace, immutable Sandbox resource UID, and supervisor Pod UID recorded during provisioning before it mints its own sandbox JWT.
 
 Dynamic provider token grants can use SPIFFE without changing supervisor-to-gateway authentication. Set `server.providerTokenGrants.spiffe.enabled=true` to mount the SPIFFE CSI Workload API socket into gateway and sandbox pods while keeping the projected ServiceAccount token bootstrap and gateway-minted sandbox JWT path.
 
@@ -52,12 +52,20 @@ The `audience` value must match the client ID configured in your identity provid
 | Value | Default | Purpose |
 |---|---|---|
 | `server.oidc.issuer` | `""` | OIDC issuer URL. Empty disables OIDC. |
+| `server.oidc.dangerouslyAllowInsecureHttp` | `false` | Development-only acknowledgement for numeric-loopback HTTP. It does not allow cluster-service or remote HTTP issuers. |
+| `server.oidc.jwksAllowedOrigins` | `[]` | Additional trusted HTTPS origins allowed to serve JWKS. |
+| `server.oidc.caConfigMapName` | `""` | ConfigMap containing the private issuer CA in `ca.crt`. |
 | `server.oidc.audience` | `openshell-cli` | Expected `aud` claim in the JWT. |
 | `server.oidc.jwksTtl` | `3600` | JWKS key cache TTL in seconds. Must be greater than zero. |
 | `server.oidc.rolesClaim` | `""` | Dot-separated path to the roles array in JWT claims. |
 | `server.oidc.adminRole` | `""` | Role name that grants admin access. |
 | `server.oidc.userRole` | `""` | Role name that grants standard user access. |
 | `server.oidc.scopesClaim` | `""` | Dot-separated path to the scopes array in JWT claims. |
+
+The issuer must use HTTPS. The gateway rejects discovery and JWKS redirects,
+limits response sizes, requires a JSON media type, and rejects a `jwks_uri` on
+a different origin unless that origin appears in `jwksAllowedOrigins`. Use
+`server.oidc.caConfigMapName` for issuers signed by a private CA.
 
 ### Auth-only mode vs. RBAC mode
 

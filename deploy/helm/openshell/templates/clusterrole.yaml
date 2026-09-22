@@ -5,12 +5,12 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "openshell.fullname" . }}-node-reader
+  name: {{ include "openshell.fullname" . }}-node-reader-{{ .Release.Namespace }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
-  # Validate projected sandbox ServiceAccount tokens during the
-  # IssueSandboxToken bootstrap exchange.
+  # Validate projected ServiceAccount tokens during sandbox bootstrap and
+  # internal gateway peer authentication.
   - apiGroups:
       - authentication.k8s.io
     resources:
@@ -71,7 +71,12 @@ rules:
     resources:
       - pods
     verbs:
+      - create
+      - delete
       - get
+      - list
+      - patch
+      - watch
   {{- end }}
   {{- $copiedSecretNames := list }}
   {{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) }}
@@ -83,6 +88,19 @@ rules:
   {{- $copiedSecretNames = append $copiedSecretNames .name }}
   {{- end }}
   {{- end }}
+  {{- end }}
+  {{- if ne $workspaceMode "shared" }}
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    # Bootstrap Secrets are generation-scoped. Recovery lists them by label and
+    # deletes stale generations with UID preconditions before retrying creation.
+    verbs: ["create", "list", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get"]
   {{- end }}
   {{- $copiedSecretNames = uniq $copiedSecretNames }}
   {{- if $copiedSecretNames }}

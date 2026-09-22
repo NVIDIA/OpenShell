@@ -38,8 +38,13 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
 | `crates/openshell-conformance-cli/` | Conformance CLI | Distributable `list` and `run` entrypoint for gateway conformance |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
-| `crates/openshell-sandbox/` | Sandbox runtime | Container supervision, policy-enforced egress routing |
+| `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
+| `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
+| `crates/openshell-binary-identity/` | Binary identity | Shared trusted procfs executable identity resolution for isolation backends |
+| `crates/openshell-isolation-interface/` | Isolation backend interface | RFC 0012 `IsolationBackend` trait and types; the supervisor-facing runtime contract |
+| `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | `OpenShellRuntimeBackend` and the authenticated OpenShell Sandbox Protocol shared with `openshell-sandbox` |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, and process constraints |
+| `crates/openshell-policy-schema/` | Authored policy schema | Dependency-light YAML/JSON representation, bounded parsing, and pure authored-language semantics |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
 | `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
@@ -60,6 +65,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
 | `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
 | `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
+| `crates/openshell-prover-cli/` | Policy prover CLI | Standalone local policy boundary checks |
 | `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
 | `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
 | `crates/openshell-supervisor-middleware-builtins/` | Built-in middleware | First-party in-process middleware implementations |
@@ -76,6 +82,12 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `.agents/skills/` | Contributor agent skills | Repository-aware workflows for developing OpenShell |
 | `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer, doc writer) |
 | `architecture/` | Architecture docs | Design decisions and component documentation |
+
+## Public API Conventions
+
+Follow [proto/README.md](proto/README.md) for public protobuf API design. It is
+the canonical source for entity-reference naming, workspace selectors, field
+design, and schema evolution.
 
 ## Vouch System
 
@@ -173,7 +185,7 @@ ocsf_emit!(event);
 
 ### Key points
 
-- `crate::ocsf_ctx()` returns the process-wide `SandboxContext`. It is always available (falls back to defaults in tests).
+- `crate::ocsf_ctx()` returns the process-wide `EventContext`. It is always available (falls back to defaults in tests).
 - `ocsf_emit!()` is non-blocking and cannot panic. It stores the event in a thread-local and emits via `tracing::info!()`.
 - The shorthand layer and JSONL layer extract the event from the thread-local. The shorthand format is derived automatically from the builder fields.
 - For security findings, **dual-emit**: one domain event (e.g., `SshActivityBuilder`) AND one `DetectionFindingBuilder` for the same incident.

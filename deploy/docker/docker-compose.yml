@@ -79,13 +79,8 @@ services:
     user: "0"
 
     ports:
-      # gRPC / control-plane API  (used by the openshell CLI and sandbox callbacks)
-      # The Docker driver injects host.openshell.internal:<gateway-port> into sandbox
-      # containers as the callback endpoint.  The gateway's internal port is 8080, so
-      # host port 8080 must be published at the same number so that
-      # host.openshell.internal:8080 routes to the gateway container.
-      # gateway.toml binds to 127.0.0.1 — the Docker driver adds the bridge listener
-      # automatically so sandbox containers can reach the gateway without 0.0.0.0.
+      # gRPC / control-plane API. The Docker supervisor uses host networking
+      # and reaches this primary loopback endpoint through the published port.
       - "127.0.0.1:${OPENSHELL_PORT:-8080}:8080"
       # Health endpoint  (GET /healthz, GET /readyz)
       - "127.0.0.1:${OPENSHELL_HEALTH_PORT:-8081}:8081"

@@ -7,6 +7,7 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
 	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
@@ -21,12 +22,14 @@ import (
 
 type mockProviderServer struct {
 	pb.UnimplementedOpenShellServer
-	providers map[string]*dm.Provider
-	createErr error
-	getErr    error
-	listErr   error
-	updateErr error
-	deleteErr error
+	providers  map[string]*dm.Provider
+	lastList   *pb.ListProvidersRequest
+	lastUpdate *pb.UpdateProviderRequest
+	createErr  error
+	getErr     error
+	listErr    error
+	updateErr  error
+	deleteErr  error
 }
 
 func newMockProviderServer() *mockProviderServer {
@@ -57,7 +60,8 @@ func (s *mockProviderServer) GetProvider(_ context.Context, req *pb.GetProviderR
 	return &pb.ProviderResponse{Provider: p}, nil
 }
 
-func (s *mockProviderServer) ListProviders(_ context.Context, _ *pb.ListProvidersRequest) (*pb.ListProvidersResponse, error) {
+func (s *mockProviderServer) ListProviders(_ context.Context, req *pb.ListProvidersRequest) (*pb.ListProvidersResponse, error) {
+	s.lastList = req
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
@@ -69,6 +73,7 @@ func (s *mockProviderServer) ListProviders(_ context.Context, _ *pb.ListProvider
 }
 
 func (s *mockProviderServer) UpdateProvider(_ context.Context, req *pb.UpdateProviderRequest) (*pb.ProviderResponse, error) {
+	s.lastUpdate = req
 	if s.updateErr != nil {
 		return nil, s.updateErr
 	}
@@ -188,7 +193,7 @@ func TestProviderList(t *testing.T) {
 	client, cleanup := setupProviderTest(t, mock)
 	defer cleanup()
 
-	result, err := client.List(context.Background(), "default")
+	result, err := client.ListAll(context.Background(), "default")
 
 	require.NoError(t, err)
 	assert.Len(t, result, 2)
@@ -199,10 +204,28 @@ func TestProviderList_Empty(t *testing.T) {
 	client, cleanup := setupProviderTest(t, mock)
 	defer cleanup()
 
-	result, err := client.List(context.Background(), "default")
+	result, err := client.ListAll(context.Background(), "default")
 
 	require.NoError(t, err)
+	assert.NotNil(t, result)
 	assert.Empty(t, result)
+}
+
+func TestProviderListAll_SelectsAllWorkspaces(t *testing.T) {
+	mock := newMockProviderServer()
+	client, cleanup := setupProviderTest(t, mock)
+	defer cleanup()
+
+	providers, err := client.ListAll(context.Background(), "", ListOptions{
+		PageSize:      10,
+		AllWorkspaces: true,
+	})
+
+	require.NoError(t, err)
+	assert.Empty(t, providers)
+	require.NotNil(t, mock.lastList)
+	assert.Equal(t, int32(10), mock.lastList.GetPageSize())
+	assert.NotNil(t, mock.lastList.GetWorkspaceScope().GetAllWorkspaces())
 }
 
 func TestProviderUpdate(t *testing.T) {
@@ -229,6 +252,27 @@ func TestProviderUpdate(t *testing.T) {
 	assert.Equal(t, "updatable", result.Name)
 }
 
+func TestProviderUpdate_ClearsZeroCredentialExpiry(t *testing.T) {
+	mock := newMockProviderServer()
+	mock.providers["updatable"] = &dm.Provider{Metadata: &dm.ObjectMeta{Name: "updatable"}}
+	client, cleanup := setupProviderTest(t, mock)
+	defer cleanup()
+
+	_, err := client.Update(context.Background(), "default", &Provider{
+		Name: "updatable",
+		Spec: ProviderSpec{CredentialExpiresAt: map[string]time.Time{
+			"clear_me": {},
+			"keep_me":  time.Unix(1_700_000_000, 0),
+		}},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, mock.lastUpdate)
+	assert.Equal(t, []string{"clear_me"}, mock.lastUpdate.GetClearCredentialExpirationKeys())
+	assert.Contains(t, mock.lastUpdate.GetCredentialExpirationTimes(), "keep_me")
+	assert.NotContains(t, mock.lastUpdate.GetCredentialExpirationTimes(), "clear_me")
+}
+
 func TestProviderUpdate_NotFound(t *testing.T) {
 	mock := newMockProviderServer()
 	client, cleanup := setupProviderTest(t, mock)
@@ -248,7 +292,7 @@ func TestProviderDelete(t *testing.T) {
 	client, cleanup := setupProviderTest(t, mock)
 	defer cleanup()
 
-	err := client.Delete(context.Background(), "default", "deleteme")
+	_, err := client.Delete(context.Background(), "default", "deleteme")
 
 	require.NoError(t, err)
 	assert.Empty(t, mock.providers["deleteme"])
@@ -260,7 +304,7 @@ func TestProviderDelete_NotFound(t *testing.T) {
 	client, cleanup := setupProviderTest(t, mock)
 	defer cleanup()
 
-	err := client.Delete(context.Background(), "default", "nonexistent")
+	_, err := client.Delete(context.Background(), "default", "nonexistent")
 
 	require.Error(t, err)
 	assert.True(t, IsNotFound(err))

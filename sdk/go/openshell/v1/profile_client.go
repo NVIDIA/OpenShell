@@ -19,37 +19,41 @@ func newProfileClient(conn grpc.ClientConnInterface) *profileClient {
 	return &profileClient{client: pb.NewOpenShellClient(conn)}
 }
 
-func (p *profileClient) List(ctx context.Context, workspace string, opts ...ListOptions) ([]*ProviderProfile, error) {
-	req := &pb.ListProviderProfilesRequest{
-		Workspace: workspace,
-	}
-	if len(opts) > 0 {
-		if opts[0].Limit < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
-		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
-		}
-		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
-	}
-
-	resp, err := p.client.ListProviderProfiles(ctx, req)
+func (p *profileClient) List(workspace string, opts ...ListOptions) (*Pager[*ProviderProfile], error) {
+	pageSize, err := listPageSize(opts)
 	if err != nil {
-		return nil, converter.FromGRPCError(err)
+		return nil, err
 	}
+	var pageToken string
+	if len(opts) > 0 {
+		pageToken = opts[0].PageToken
+	}
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*ProviderProfile], error) {
+		req := &pb.ListProviderProfilesRequest{WorkspaceScope: profileWorkspaceScope(workspace), PageSize: pageSize, PageToken: pageToken}
+		resp, err := p.client.ListProviderProfiles(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		profiles := make([]*ProviderProfile, 0, len(resp.GetProfiles()))
+		for _, profile := range resp.GetProfiles() {
+			profiles = append(profiles, converter.ProviderProfileFromProto(profile))
+		}
+		return &Page[*ProviderProfile]{Items: profiles, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
 
-	profiles := make([]*ProviderProfile, 0, len(resp.GetProfiles()))
-	for _, pp := range resp.GetProfiles() {
-		profiles = append(profiles, converter.ProviderProfileFromProto(pp))
+func (p *profileClient) ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*ProviderProfile, error) {
+	pager, err := p.List(workspace, opts...)
+	if err != nil {
+		return nil, err
 	}
-	return profiles, nil
+	return pager.All(ctx)
 }
 
 func (p *profileClient) Get(ctx context.Context, workspace, id string) (*ProviderProfile, error) {
 	resp, err := p.client.GetProviderProfile(ctx, &pb.GetProviderProfileRequest{
-		Id:        id,
-		Workspace: workspace,
+		Id:             id,
+		WorkspaceScope: profileWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -64,8 +68,8 @@ func (p *profileClient) Import(ctx context.Context, workspace string, items []Pr
 	}
 
 	resp, err := p.client.ImportProviderProfiles(ctx, &pb.ImportProviderProfilesRequest{
-		Profiles:  pbItems,
-		Workspace: workspace,
+		Profiles:       pbItems,
+		WorkspaceScope: profileWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -95,7 +99,7 @@ func (p *profileClient) Update(ctx context.Context, workspace, id string, expect
 		Id:                      id,
 		Profile:                 converter.ProfileImportItemToProto(&item),
 		ExpectedResourceVersion: expectedResourceVersion,
-		Workspace:               workspace,
+		WorkspaceScope:          profileWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -122,8 +126,8 @@ func (p *profileClient) Lint(ctx context.Context, workspace string, items []Prof
 	}
 
 	resp, err := p.client.LintProviderProfiles(ctx, &pb.LintProviderProfilesRequest{
-		Profiles:  pbItems,
-		Workspace: workspace,
+		Profiles:       pbItems,
+		WorkspaceScope: profileWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -142,13 +146,14 @@ func (p *profileClient) Lint(ctx context.Context, workspace string, items []Prof
 	return result, nil
 }
 
-func (p *profileClient) Delete(ctx context.Context, workspace, id string) (bool, error) {
+func (p *profileClient) Delete(ctx context.Context, workspace, id string, opts ...DeleteOptions) (*DeletionResult, error) {
 	resp, err := p.client.DeleteProviderProfile(ctx, &pb.DeleteProviderProfileRequest{
-		Id:        id,
-		Workspace: workspace,
+		AllowMissing:   allowMissing(opts),
+		Id:             id,
+		WorkspaceScope: profileWorkspaceScope(workspace),
 	})
 	if err != nil {
-		return false, converter.FromGRPCError(err)
+		return nil, converter.FromGRPCError(err)
 	}
-	return resp.GetDeleted(), nil
+	return &DeletionResult{Outcome: DeletionOutcome(resp.GetOutcome())}, nil
 }

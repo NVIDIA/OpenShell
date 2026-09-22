@@ -97,7 +97,7 @@ async fn run_cli_with_env(args: &[&str], env: &[(&str, &str)]) -> Result<String,
 
 async fn delete_provider_resources() {
     let _ = run_cli(&["provider", "delete", PROVIDER_NAME]).await;
-    let _ = run_cli(&["provider", "profile", "delete", PROFILE_ID]).await;
+    let _ = run_cli(&["profile", "delete", PROFILE_ID]).await;
 }
 
 fn write_profile(resource_port: u16, token_port: u16) -> Result<NamedTempFile, String> {
@@ -106,7 +106,7 @@ fn write_profile(resource_port: u16, token_port: u16) -> Result<NamedTempFile, S
         .tempfile()
         .map_err(|error| format!("create profile: {error}"))?;
     let profile = format!(
-        r#"id: {PROFILE_ID}
+        r"id: {PROFILE_ID}
 display_name: Stable refresh handle E2E
 category: other
 credentials:
@@ -139,8 +139,8 @@ endpoints:
       - 172.0.0.0/8
       - 192.168.0.0/16
 binaries:
-  - /usr/bin/curl
-"#
+  - /usr/local/bin/python3
+"
     );
     file.write_all(profile.as_bytes())
         .map_err(|error| format!("write profile: {error}"))?;
@@ -155,7 +155,7 @@ fn write_policy(resource_port: u16) -> Result<NamedTempFile, String> {
         .tempfile()
         .map_err(|error| format!("create policy: {error}"))?;
     let policy = format!(
-        r#"version: 1
+        r"version: 1
 filesystem_policy:
   include_workdir: true
   read_only: [/usr, /lib, /proc, /etc, /dev/urandom]
@@ -181,8 +181,8 @@ network_policies:
           - 172.0.0.0/8
           - 192.168.0.0/16
     binaries:
-      - path: /usr/bin/curl
-"#
+      - path: /usr/local/bin/python3
+"
     );
     file.write_all(policy.as_bytes())
         .map_err(|error| format!("write policy: {error}"))?;
@@ -193,7 +193,7 @@ network_policies:
 
 async fn configure_refresh(profile: &NamedTempFile) -> Result<(), String> {
     let profile_path = profile.path().to_string_lossy().into_owned();
-    run_cli(&["provider", "profile", "import", "--file", &profile_path]).await?;
+    run_cli(&["profile", "import", "--file", &profile_path]).await?;
     run_cli_with_env(
         &[
             "provider",
@@ -311,9 +311,7 @@ echo {READY_MARKER}
 while true; do
   if [ -f /sandbox/probe-trigger ]; then
     rm -f /sandbox/probe-trigger
-    if curl --fail --silent --output /dev/null \
-      --header "Authorization: Bearer $REFRESH_E2E_ACCESS_TOKEN" \
-      {resource_url}; then
+    if python3 -c 'import os, urllib.request; request = urllib.request.Request("{resource_url}", headers=dict(Authorization="Bearer " + os.environ["REFRESH_E2E_ACCESS_TOKEN"])); urllib.request.urlopen(request, timeout=5).read()'; then
       echo ok > /sandbox/probe-result
     else
       echo failed > /sandbox/probe-result
@@ -343,7 +341,7 @@ done"#
         wait_for_probe_failure(&sandbox).await?;
 
         let fresh_probe = format!(
-            "curl --fail --silent --output /dev/null --header \"Authorization: Bearer $REFRESH_E2E_ACCESS_TOKEN\" {resource_url}"
+            r#"python3 -c 'import os, urllib.request; request = urllib.request.Request("{resource_url}", headers=dict(Authorization="Bearer " + os.environ["REFRESH_E2E_ACCESS_TOKEN"])); urllib.request.urlopen(request, timeout=5).read()'"#
         );
         sandbox.exec(&["sh", "-c", &fresh_probe]).await?;
         Ok(())

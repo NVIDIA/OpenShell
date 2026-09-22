@@ -117,7 +117,7 @@
 - Proto message field `filesystem` maps to YAML key `filesystem_policy` (different names!)
 - IMPORTANT: Sandbox always runs in Proxy mode. NetworkMode::Block exists as enum variant but is NEVER set.
 - Both file mode and gRPC mode set NetworkMode::Proxy unconditionally (see load_policy() in lib.rs and TryFrom in policy.rs)
-- Reason: proxy always needed so inference.local is addressable + all egress evaluated by OPA
+- Reason: proxy always needed so all egress is evaluated by OPA
 - OPA two-action model: Allow, Deny (NetworkAction in opa.rs). InspectForInference was REMOVED.
 - Rego network_action rule: "allow" or "deny" only (no "inspect_for_inference")
 - Behavioral trigger: endpoint `protocol` field -> L7 inspection; absent -> L4 raw copy_bidirectional
@@ -152,9 +152,9 @@
 - Route sources: `--inference-routes` YAML file (standalone) > cluster bundle via gRPC; empty routes gracefully disable
 - Cluster bundle refreshed every ROUTE_REFRESH_INTERVAL_SECS (30s)
 - Patterns: POST /v1/chat/completions, /v1/completions, /v1/responses, /v1/messages; GET /v1/models, /v1/models/*
-- inference.local CONNECT intercepted BEFORE OPA evaluation in proxy
+- Managed inference CONNECT traffic was intercepted before OPA evaluation in the proxy
 - InferenceProviderProfile in openshell-core/src/inference.rs: centralized provider metadata
-- proxy.rs: ONLY CONNECT to inference.local is handled; non-CONNECT requests get 403 for ALL hosts
+- proxy.rs: only managed inference CONNECT traffic was handled; non-CONNECT requests received 403 for all hosts
 - Buffer: INITIAL_INFERENCE_BUF=64KiB, MAX_INFERENCE_BUF=10MiB; grows by doubling
 - Dev sandbox: `mise run sandbox -e VAR_NAME` forwards host env vars; NVIDIA_API_KEY always passed
 

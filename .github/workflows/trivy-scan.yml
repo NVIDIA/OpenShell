@@ -9,6 +9,10 @@ name: Trivy Scan
 on:
   workflow_call:
     inputs:
+      candidate_ref:
+        description: Optional pre-release tag to scan instead of the triggering revision
+        default: ""
+        type: string
       images:
         description: Newline-separated image references to scan
         type: string
@@ -77,7 +81,7 @@ env:
 
 jobs:
   scan:
-    name: OpenShell / Trivy (informational)
+    name: ${{ inputs.fail-on-findings && 'OpenShell / Trivy' || 'OpenShell / Trivy (informational)' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
@@ -89,6 +93,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
           persist-credentials: false
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -203,7 +208,9 @@ jobs:
         batch: ${{ fromJSON(needs.scan.outputs.sarif-batches) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
         with:
+          ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
           persist-credentials: false
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -217,3 +224,5 @@ jobs:
       - uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           sarif_file: reports/trivy/code-scanning/uploads/${{ matrix.batch }}
+          ref: ${{ inputs.candidate_ref && format('refs/tags/{0}', inputs.candidate_ref) || '' }}
+          sha: ${{ inputs.candidate_ref && steps.checkout.outputs.commit || '' }}

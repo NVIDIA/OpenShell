@@ -18,7 +18,24 @@ SCRIPT = Path(__file__).resolve().parent / "codex_security_range.py"
 
 
 def _git(repo: Path, *args: str) -> str:
-    return subprocess.check_output(["git", *args], cwd=repo).decode("utf-8").strip()
+    # Temporary fixture repositories must not inherit developer-wide signing
+    # requirements: these tests intentionally create disposable commits and
+    # lightweight tags without prompting for a private key.
+    return (
+        subprocess.check_output(
+            [
+                "git",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "tag.gpgsign=false",
+                *args,
+            ],
+            cwd=repo,
+        )
+        .decode("utf-8")
+        .strip()
+    )
 
 
 def _commit(repo: Path, name: str) -> None:

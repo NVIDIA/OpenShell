@@ -25,13 +25,12 @@ func (c *configClient) GetSandbox(ctx context.Context, workspace, sandboxName st
 	if sandboxName == "" {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "sandbox name must not be empty"}
 	}
-	sb, err := c.sandboxes.Get(ctx, workspace, sandboxName)
-	if err != nil {
+	if _, err := c.sandboxes.Get(ctx, workspace, sandboxName); err != nil {
 		return nil, err
 	}
-
 	resp, err := c.client.GetSandboxConfig(ctx, &sbv1.GetSandboxConfigRequest{
-		SandboxId: sb.ID,
+		Name:           sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -58,7 +57,9 @@ func (c *configClient) Update(ctx context.Context, workspace string, update *Con
 	if convErr != nil {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: convErr.Error()}
 	}
-	req.Workspace = workspace
+	if !req.GetGlobal() {
+		req.WorkspaceScope = namedWorkspaceScope(workspace)
+	}
 	resp, err := c.client.UpdateConfig(ctx, req)
 	if err != nil {
 		return nil, converter.FromGRPCError(err)

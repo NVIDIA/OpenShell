@@ -57,7 +57,7 @@ func (s *mockSandboxTemplateServer) CreateSandboxTemplate(_ context.Context, req
 	if template.Metadata == nil {
 		template.Metadata = &dm.ObjectMeta{}
 	}
-	template.Metadata.Workspace = req.GetWorkspace()
+	template.Metadata.Workspace = req.GetWorkspaceScope().GetWorkspace()
 	template.Metadata.ResourceVersion = 1
 	s.templates[template.Metadata.GetName()] = template
 	return &pb.SandboxTemplateResponse{Template: proto.Clone(template).(*pb.SandboxWorkloadTemplate)}, nil
@@ -99,7 +99,7 @@ func (s *mockSandboxTemplateServer) DeleteSandboxTemplate(_ context.Context, req
 		return nil, s.deleteErr
 	}
 	delete(s.templates, req.GetName())
-	return &pb.DeleteSandboxTemplateResponse{Deleted: true}, nil
+	return &pb.DeleteSandboxTemplateResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED}, nil
 }
 
 func setupSandboxTemplateTest(t *testing.T, mock *mockSandboxTemplateServer) (*sandboxTemplateClient, func()) {
@@ -164,7 +164,7 @@ func TestSandboxTemplateCreate(t *testing.T) {
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
 	require.NotNil(t, mock.createRequest)
-	assert.Equal(t, "default", mock.createRequest.Workspace)
+	assert.Equal(t, "default", mock.createRequest.GetWorkspaceScope().GetWorkspace())
 	assert.Equal(t, "gpu-kata", mock.createRequest.Template.Metadata.Name)
 	assert.Equal(t, "2", mock.createRequest.Template.Spec.Workload.Resources.Cpu)
 	assert.Equal(t, "8Gi", mock.createRequest.Template.Spec.Workload.Resources.Memory)
@@ -220,11 +220,9 @@ func TestSandboxTemplateGetListDelete(t *testing.T) {
 	assert.Equal(t, "gpu-kata", got.Name)
 	assert.Equal(t, "img:v1", got.Spec.Workload.Image)
 
-	list, err := client.List(context.Background(), "default", ListOptions{
-		Limit:         10,
-		Offset:        2,
+	list, err := client.ListAll(context.Background(), "default", ListOptions{
+		PageSize:      10,
 		LabelSelector: "team=runtime",
-		AllWorkspaces: true,
 	})
 	require.NoError(t, err)
 	require.Len(t, list, 1)
@@ -232,21 +230,20 @@ func TestSandboxTemplateGetListDelete(t *testing.T) {
 
 	deleted, err := client.Delete(context.Background(), "default", "gpu-kata")
 	require.NoError(t, err)
-	assert.True(t, deleted)
+	assert.Equal(t, DeletionCompleted, deleted.Outcome)
 
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
 	require.NotNil(t, mock.getRequest)
-	assert.Equal(t, "default", mock.getRequest.Workspace)
+	assert.Equal(t, "default", mock.getRequest.GetWorkspaceScope().GetWorkspace())
 	assert.Equal(t, "gpu-kata", mock.getRequest.Name)
 	require.NotNil(t, mock.listRequest)
-	assert.Empty(t, mock.listRequest.Workspace)
-	assert.Equal(t, uint32(10), mock.listRequest.Limit)
-	assert.Equal(t, uint32(2), mock.listRequest.Offset)
+	assert.Equal(t, "default", mock.listRequest.GetWorkspaceScope().GetWorkspace())
+	assert.Equal(t, int32(10), mock.listRequest.PageSize)
+	assert.Empty(t, mock.listRequest.PageToken)
 	assert.Equal(t, "team=runtime", mock.listRequest.LabelSelector)
-	assert.True(t, mock.listRequest.AllWorkspaces)
 	require.NotNil(t, mock.deleteRequest)
-	assert.Equal(t, "default", mock.deleteRequest.Workspace)
+	assert.Equal(t, "default", mock.deleteRequest.GetWorkspaceScope().GetWorkspace())
 	assert.Equal(t, "gpu-kata", mock.deleteRequest.Name)
 }
 
@@ -255,11 +252,19 @@ func TestSandboxTemplateList_RejectsNegativePagination(t *testing.T) {
 	client, cleanup := setupSandboxTemplateTest(t, mock)
 	defer cleanup()
 
-	_, err := client.List(context.Background(), "default", ListOptions{Limit: -1})
+	_, err := client.ListAll(context.Background(), "default", ListOptions{PageSize: -1})
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
+}
 
-	_, err = client.List(context.Background(), "default", ListOptions{Offset: -1})
-	require.Error(t, err)
-	assert.True(t, IsInvalidArgument(err))
+func TestSandboxTemplateList_EmptyReturnsNonNilSlice(t *testing.T) {
+	mock := newMockSandboxTemplateServer()
+	client, cleanup := setupSandboxTemplateTest(t, mock)
+	defer cleanup()
+
+	templates, err := client.ListAll(context.Background(), "default")
+
+	require.NoError(t, err)
+	assert.NotNil(t, templates)
+	assert.Empty(t, templates)
 }

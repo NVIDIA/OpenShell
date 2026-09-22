@@ -52,13 +52,15 @@ type ProfileCredential struct {
 
 // ProfileCredentialRefresh declares how a profile credential is refreshed.
 type ProfileCredentialRefresh struct {
-	Strategy             RefreshStrategy
-	TokenURL             string
-	Scopes               []string
-	RefreshBeforeSeconds int64
-	MaxLifetimeSeconds   int64
-	Material             []ProfileCredentialRefreshMaterial
-	AdditionalOutputs    []ProfileCredentialRefreshOutput
+	Strategy RefreshStrategy
+	TokenURL string
+	Scopes   []string
+	// RefreshBefore retains the exact protobuf duration, including presence and nanoseconds.
+	RefreshBefore *ProfileDuration
+	// MaxLifetime retains the exact protobuf duration, including presence and nanoseconds.
+	MaxLifetime       *ProfileDuration
+	Material          []ProfileCredentialRefreshMaterial
+	AdditionalOutputs []ProfileCredentialRefreshOutput
 }
 
 // ProfileCredentialRefreshMaterial declares one input required by a refresh strategy.
@@ -86,16 +88,25 @@ const (
 
 // CredentialTokenGrant configures dynamic credential acquisition via OAuth2 grant.
 type CredentialTokenGrant struct {
-	TokenEndpoint       string
-	Audience            string
-	JWTSVIDAudience     string
-	Scopes              []string
-	CacheTTLSeconds     int64
+	TokenEndpoint   string
+	Audience        string
+	JWTSVIDAudience string
+	Scopes          []string
+	// CacheTTL retains the exact protobuf duration, including presence and nanoseconds.
+	CacheTTL            *ProfileDuration
 	AudienceOverrides   []TokenGrantAudienceOverride
 	ClientAssertionType string
 	GrantType           CredentialTokenGrantType
 	SubjectToken        *TokenGrantSubjectToken
 	RequestedTokenType  string
+}
+
+// ProfileDuration represents a protobuf duration without importing generated
+// protobuf packages into the curated SDK types. A nil pointer means absent; a
+// non-nil zero value means an explicitly present zero duration.
+type ProfileDuration struct {
+	Seconds int64
+	Nanos   int32
 }
 
 // TokenGrantSubjectToken configures the subject token for token exchange grants.

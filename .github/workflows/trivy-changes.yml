@@ -34,6 +34,7 @@ jobs:
       pull-requests: read
     outputs:
       should_run: ${{ steps.default.outputs.should_run || steps.changed.outputs.any_modified }}
+      base_sha: ${{ steps.comparison.outputs.base_sha }}
     steps:
       - id: default
         if: github.event_name != 'pull_request'
@@ -42,12 +43,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request'
         with:
+          ref: ${{ github.sha }}
+          # Include both parents of the exact PR merge commit, even on reruns.
+          fetch-depth: 2
           persist-credentials: false
+
+      - name: Resolve PR baseline
+        id: comparison
+        if: github.event_name == 'pull_request'
+        run: |
+          git rev-parse --verify HEAD^2 >/dev/null
+          base_sha=$(git rev-parse --verify HEAD^1)
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "Trivy comparison: $base_sha -> $(git rev-parse HEAD)"
 
       - id: changed
         if: github.event_name == 'pull_request'
         uses: tj-actions/changed-files@aa08304bd477b800d468db44fe10f6c61f7f7b11 # v42.1.0
         with:
+          base_sha: ${{ steps.comparison.outputs.base_sha }}
+          sha: ${{ github.sha }}
+          output_renamed_files_as_deleted_and_added: true
           # `any_modified` covers deletions, which `any_changed` omits, and a
           # failed diff has to fail the job: both otherwise report no relevant
           # change, and removing the scanner or a value fixture would skip the
@@ -73,7 +89,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      BASE_REF: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || inputs.base_sha }}
+      BASE_REF: ${{ needs.changes.outputs.base_sha || github.event.merge_group.base_sha || inputs.base_sha }}
       HEAD_REF: ${{ inputs.head_sha || github.sha }}
     defaults:
       run:

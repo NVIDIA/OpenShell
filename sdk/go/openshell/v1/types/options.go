@@ -8,13 +8,18 @@ import "time"
 // CreateOptions configures resource creation.
 type CreateOptions struct {
 	Annotations map[string]string
+	// ServiceExposures are loopback HTTP services registered with the sandbox.
+	ServiceExposures []ServiceExposure
 }
 
 // ListOptions configures resource listing with pagination and filtering.
 type ListOptions struct {
-	Limit         int
-	Offset        int
+	// PageSize is the maximum number of resources requested per RPC.
+	PageSize int
+	// PageToken resumes after a page returned by the same list query.
+	PageToken     string
 	LabelSelector string
+	// AllWorkspaces selects a platform-admin view across workspace boundaries.
 	AllWorkspaces bool
 }
 

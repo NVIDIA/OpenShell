@@ -23,13 +23,16 @@ pub use openshell_core::proto::open_shell_client::OpenShellClient as GrpcClient;
 pub use openshell_core::proto::{
     CreateSandboxRequest, CreateSandboxTemplateRequest, CreateWorkspaceRequest,
     DeleteSandboxRequest, DeleteSandboxTemplateRequest, DeleteWorkspaceRequest, ExecSandboxRequest,
-    GetSandboxRequest, GetSandboxTemplateRequest, GetWorkspaceRequest, HealthRequest,
-    ListProvidersRequest, ListSandboxTemplatesRequest, ListSandboxesRequest, ListWorkspacesRequest,
-    Sandbox, SandboxPhase as ProtoSandboxPhase, SandboxResources, SandboxServiceLevel,
-    SandboxSpec as ProtoSandboxSpec, SandboxStartup, SandboxTemplate, SandboxTemplateResponse,
-    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
-    SandboxWorkloadTemplateSpec, ServiceStatus as ProtoServiceStatus, StartSandboxRequest,
-    StopSandboxRequest, Workspace,
+    GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse, GetSandboxRequest,
+    GetSandboxTemplateRequest, GetWorkspaceRequest, HealthRequest, ListProvidersRequest,
+    ListSandboxTemplatesRequest, ListSandboxesRequest, ListWorkspacesRequest,
+    ProviderDesiredIdentity, ProviderMutationKind, ProviderMutationReceipt,
+    ProviderReadinessObservation, ProviderReadinessReason, ProviderReadinessState,
+    ProviderReadinessStatus, Sandbox, SandboxPhase as ProtoSandboxPhase, SandboxResources,
+    SandboxServiceLevel, SandboxSpec as ProtoSandboxSpec, SandboxStartup, SandboxTemplate,
+    SandboxTemplateResponse, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+    SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec,
+    ServiceStatus as ProtoServiceStatus, StartSandboxRequest, StopSandboxRequest, Workspace,
 };
 
 /// Type alias for the gRPC client wrapped in the SDK's auth interceptor.

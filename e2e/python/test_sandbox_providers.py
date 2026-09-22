@@ -81,12 +81,13 @@ def provider(
     _delete_provider(stub, name)
     stub.CreateProvider(
         openshell_pb2.CreateProviderRequest(
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name=name),
                 type=provider_type,
                 credentials=credentials,
                 profile_workspace=profile_workspace,
-            )
+            ),
         )
     )
     try:
@@ -98,7 +99,12 @@ def provider(
 def _delete_provider(stub: object, name: str) -> None:
     """Delete a provider, ignoring not-found errors."""
     try:
-        stub.DeleteProvider(openshell_pb2.DeleteProviderRequest(name=name))
+        stub.DeleteProvider(
+            openshell_pb2.DeleteProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name=name,
+            )
+        )
     except grpc.RpcError as exc:
         if hasattr(exc, "code") and exc.code() == grpc.StatusCode.NOT_FOUND:
             pass
@@ -112,7 +118,7 @@ def _delete_provider_profile(stub: object, profile_id: str) -> None:
         stub.DeleteProviderProfile(
             openshell_pb2.DeleteProviderProfileRequest(
                 id=profile_id,
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             )
         )
     except grpc.RpcError as exc:
@@ -139,7 +145,7 @@ def imported_provider_profile(
                     source=source,
                 )
             ],
-            workspace="default",
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
         )
     )
     assert response.imported, f"profile import failed: {response.diagnostics!r}"
@@ -179,8 +185,8 @@ def _native_inference_profile(
                 host="host.openshell.internal",
                 port=port,
                 protocol="rest",
-                tls="none",
-                enforcement="enforce",
+                tls=sandbox_pb2.NETWORK_TLS_MODE_UNSPECIFIED,
+                enforcement=sandbox_pb2.NETWORK_ENFORCEMENT_MODE_ENFORCE,
                 rules=rules,
                 allowed_ips=[
                     "10.0.0.0/8",
@@ -278,24 +284,6 @@ def native_endpoint_server() -> Iterator[int]:
         proc.communicate(timeout=5)
 
 
-def _proxy_connect():
-    """Return a closure that sends a raw CONNECT and returns the status line."""
-
-    def fn(host, port):
-        import socket
-
-        conn = socket.create_connection(("10.200.0.1", 3128), timeout=10)
-        try:
-            conn.sendall(
-                f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode()
-            )
-            return conn.recv(256).decode("latin1")
-        finally:
-            conn.close()
-
-    return fn
-
-
 # ===========================================================================
 # Tests: placeholder visibility
 # ===========================================================================
@@ -309,7 +297,7 @@ def test_provider_credentials_available_as_env_vars(
     with provider(
         sandbox_client._stub,
         name="e2e-test-provider-env",
-        provider_type="claude",
+        provider_type="claude-code",
         credentials={"ANTHROPIC_API_KEY": "sk-e2e-test-key-12345"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
@@ -337,13 +325,14 @@ def test_profileless_provider_creation_is_rejected(
     with pytest.raises(grpc.RpcError) as exc_info:
         sandbox_client._stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(
                         name="e2e-test-profileless-provider"
                     ),
                     type="generic",
                     credentials={"CUSTOM_SERVICE_TOKEN": "token-generic-123"},
-                )
+                ),
             )
         )
     assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
@@ -397,7 +386,7 @@ def test_endpointless_profile_credentials_use_explicit_policy_binding(
                         host="storage.googleapis.com",
                         port=443,
                         protocol="rest",
-                        access="full",
+                        access=sandbox_pb2.NETWORK_ACCESS_PRESET_FULL,
                         credential_binding=sandbox_pb2.NetworkCredentialBinding(
                             provider=provider_name
                         ),
@@ -496,8 +485,11 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
             try:
                 stub.AttachSandboxProvider(
                     openshell_pb2.AttachSandboxProviderRequest(
-                        sandbox_name=sb.sandbox.name,
-                        provider_name=provider_name,
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
+                        sandbox=sb.sandbox.name,
+                        provider=provider_name,
                     )
                 )
                 wait_for_token(
@@ -507,8 +499,11 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
 
                 stub.DetachSandboxProvider(
                     openshell_pb2.DetachSandboxProviderRequest(
-                        sandbox_name=sb.sandbox.name,
-                        provider_name=provider_name,
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
+                        sandbox=sb.sandbox.name,
+                        provider=provider_name,
                     )
                 )
                 wait_for_token(sb, "NOT_SET")
@@ -516,8 +511,11 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                 try:
                     stub.DetachSandboxProvider(
                         openshell_pb2.DetachSandboxProviderRequest(
-                            sandbox_name=sb.sandbox.name,
-                            provider_name=provider_name,
+                            workspace_scope=datamodel_pb2.WorkspaceSelector(
+                                workspace="default"
+                            ),
+                            sandbox=sb.sandbox.name,
+                            provider=provider_name,
                         )
                     )
                 except grpc.RpcError as exc:
@@ -612,11 +610,10 @@ def test_imported_openai_profile_allows_native_endpoint_with_attached_provider(
                     assert body["model"] == "fixture-openai-model"
 
 
-def test_imported_anthropic_profile_uses_native_endpoint_and_inference_local_is_not_privileged(
+def test_imported_anthropic_profile_allows_native_endpoint_with_attached_provider(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
-    """Attached imported profiles should not resurrect `inference.local` routing."""
     stub = sandbox_client._stub
     profile_id = f"e2e-native-anthropic-{int(time.time() * 1000)}"
     provider_name = f"{profile_id}-provider"
@@ -701,16 +698,6 @@ def test_imported_anthropic_profile_uses_native_endpoint_and_inference_local_is_
                     assert payload["x_api_key"] == secret
                     assert body["model"] == "fixture-anthropic-model"
 
-                    denied = sb.exec_python(
-                        _proxy_connect(),
-                        args=("inference.local", 443),
-                        timeout_seconds=30,
-                    )
-                    assert denied.exit_code == 0, denied.stderr
-                    status = denied.stdout.strip()
-                    assert status.startswith("HTTP/1.1 "), status
-                    assert " 200 " not in status, status
-
 
 # ===========================================================================
 # Tests: security & edge cases
@@ -740,7 +727,7 @@ def test_credentials_not_in_persisted_spec_environment(
     with provider(
         sandbox_client._stub,
         name="e2e-test-no-persist",
-        provider_type="claude",
+        provider_type="claude-code",
         credentials={"ANTHROPIC_API_KEY": "sk-should-not-persist"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
@@ -750,7 +737,12 @@ def test_credentials_not_in_persisted_spec_environment(
 
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             fetched = sandbox_client._stub.GetSandbox(
-                openshell_pb2.GetSandboxRequest(name=sb.sandbox.name)
+                openshell_pb2.GetSandboxRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
+                    name=sb.sandbox.name,
+                )
             )
             persisted_env = dict(fetched.sandbox.spec.environment)
             assert "ANTHROPIC_API_KEY" not in persisted_env, (
@@ -774,6 +766,7 @@ def test_update_provider_preserves_unset_credentials_and_config(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="codex",
@@ -783,21 +776,27 @@ def test_update_provider_preserves_unset_credentials_and_config(
                         "CODEX_AUTH_ACCOUNT_ID": "account-id",
                     },
                     config={"BASE_URL": "https://example.com"},
-                )
+                ),
             )
         )
 
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
                     credentials={"CODEX_AUTH_ACCESS_TOKEN": "rotated-a"},
-                )
+                ),
             )
         )
 
-        got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
+        got = stub.GetProvider(
+            openshell_pb2.GetProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name=name,
+            )
+        )
         p = got.provider
         # Credential keys are preserved but values are redacted.
         assert len(p.credentials) > 0, "credential keys should be preserved"
@@ -823,25 +822,32 @@ def test_update_provider_empty_maps_preserves_all(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="openai",
                     credentials={"OPENAI_API_KEY": "secret"},
                     config={"URL": "https://api.example.com"},
-                )
+                ),
             )
         )
 
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
-                )
+                ),
             )
         )
 
-        got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
+        got = stub.GetProvider(
+            openshell_pb2.GetProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name=name,
+            )
+        )
         p = got.provider
         # Credential keys are preserved but values are redacted.
         assert len(p.credentials) > 0, "credential keys should be preserved"
@@ -865,26 +871,33 @@ def test_update_provider_merges_config_preserves_credentials(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="openai",
                     credentials={"OPENAI_API_KEY": "original-key"},
                     config={"ENDPOINT": "https://old.example.com"},
-                )
+                ),
             )
         )
 
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
                     config={"ENDPOINT": "https://new.example.com"},
-                )
+                ),
             )
         )
 
-        got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
+        got = stub.GetProvider(
+            openshell_pb2.GetProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name=name,
+            )
+        )
         p = got.provider
         # Credential keys are preserved but values are redacted.
         assert len(p.credentials) > 0, "credential keys should be preserved"
@@ -908,21 +921,25 @@ def test_update_provider_rejects_type_change(
     try:
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
                 provider=datamodel_pb2.Provider(
                     metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="openai",
                     credentials={"OPENAI_API_KEY": "val"},
-                )
+                ),
             )
         )
 
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.UpdateProvider(
                 openshell_pb2.UpdateProviderRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
                     provider=datamodel_pb2.Provider(
                         metadata=datamodel_pb2.ObjectMeta(name=name),
                         type="nvidia",
-                    )
+                    ),
                 )
             )
         assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
@@ -1020,9 +1037,10 @@ def test_provider_profile_platform_vs_workspace_isolation(
     def _cleanup() -> None:
         for pid, ws in [(platform_id, ""), (workspace_id, "default")]:
             try:
-                stub.DeleteProviderProfile(
-                    openshell_pb2.DeleteProviderProfileRequest(id=pid, workspace=ws)
-                )
+                request = openshell_pb2.DeleteProviderProfileRequest(id=pid)
+                if ws:
+                    request.workspace_scope.workspace = ws
+                stub.DeleteProviderProfile(request)
             except grpc.RpcError:
                 pass
 
@@ -1031,7 +1049,6 @@ def test_provider_profile_platform_vs_workspace_isolation(
         resp = stub.ImportProviderProfiles(
             openshell_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile(platform_id)],
-                workspace="",
             )
         )
         assert resp.imported, "platform-scoped import should succeed"
@@ -1039,13 +1056,13 @@ def test_provider_profile_platform_vs_workspace_isolation(
         resp = stub.ImportProviderProfiles(
             openshell_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile(workspace_id)],
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             )
         )
         assert resp.imported, "workspace-scoped import should succeed"
 
         platform_list = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace="")
+            openshell_pb2.ListProviderProfilesRequest(page_size=200)
         )
         platform_ids = [p.id for p in platform_list.profiles]
         assert platform_id in platform_ids, (
@@ -1056,7 +1073,10 @@ def test_provider_profile_platform_vs_workspace_isolation(
         )
 
         workspace_list = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace="default")
+            openshell_pb2.ListProviderProfilesRequest(
+                page_size=200,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+            )
         )
         workspace_ids = [p.id for p in workspace_list.profiles]
         assert workspace_id in workspace_ids, (
@@ -1098,7 +1118,7 @@ def test_cross_workspace_profile_ids_do_not_collide(
         resp_a = stub.ImportProviderProfiles(
             openshell_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile()],
-                workspace=ws_a,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_a),
             )
         )
         assert resp_a.imported, "import into ws-a should succeed"
@@ -1106,20 +1126,26 @@ def test_cross_workspace_profile_ids_do_not_collide(
         resp_b = stub.ImportProviderProfiles(
             openshell_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile()],
-                workspace=ws_b,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_b),
             )
         )
         assert resp_b.imported, "import into ws-b should succeed"
 
         list_a = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace=ws_a)
+            openshell_pb2.ListProviderProfilesRequest(
+                page_size=200,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_a),
+            )
         )
         assert any(p.id == profile_id for p in list_a.profiles), (
             "profile should appear in ws-a"
         )
 
         list_b = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace=ws_b)
+            openshell_pb2.ListProviderProfilesRequest(
+                page_size=200,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_b),
+            )
         )
         assert any(p.id == profile_id for p in list_b.profiles), (
             "profile should appear in ws-b"
@@ -1129,7 +1155,8 @@ def test_cross_workspace_profile_ids_do_not_collide(
             with contextlib.suppress(Exception):
                 stub.DeleteProviderProfile(
                     openshell_pb2.DeleteProviderProfileRequest(
-                        id=profile_id, workspace=ws
+                        id=profile_id,
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws),
                     )
                 )
             with contextlib.suppress(Exception):

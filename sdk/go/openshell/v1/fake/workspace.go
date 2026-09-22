@@ -90,31 +90,43 @@ func (c *fakeWorkspaceClient) Get(_ context.Context, name string) (*types.Worksp
 	return c.workspaceStore.Get("", name)
 }
 
-// List returns all workspaces. ListOptions are accepted for interface compatibility but filtering is not implemented.
-func (c *fakeWorkspaceClient) List(_ context.Context, _ ...v1.ListOptions) ([]*types.Workspace, error) {
+// List returns a lazy pager over workspaces.
+func (c *fakeWorkspaceClient) List(opts ...v1.ListOptions) (*v1.Pager[*types.Workspace], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-	return c.workspaceStore.ListAll(), nil
+	var options v1.ListOptions
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	return newSlicePager(c.workspaceStore.ListAll(), options.PageSize, options.PageToken)
+}
+
+func (c *fakeWorkspaceClient) ListAll(ctx context.Context, opts ...v1.ListOptions) ([]*types.Workspace, error) {
+	pager, err := c.List(opts...)
+	if err != nil {
+		return nil, err
+	}
+	return pager.All(ctx)
 }
 
 // Delete removes a workspace. Unlike the sandbox fake (which treats delete as
 // idempotent), workspace delete returns NotFound for non-existent workspaces to
 // match the gateway's workspace deletion behavior.
-func (c *fakeWorkspaceClient) Delete(_ context.Context, name string) error {
+func (c *fakeWorkspaceClient) Delete(_ context.Context, name string, opts ...v1.DeleteOptions) (*types.DeletionResult, error) {
 	if c.closedFunc() {
-		return &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
 	if name == "" {
-		return &types.StatusError{Code: types.ErrorInvalidArgument, Message: "workspace name must not be empty"}
+		return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "workspace name must not be empty"}
 	}
 
 	_, existed := c.workspaceStore.DeleteAndGet("", name)
 	if !existed {
-		return &types.StatusError{Code: types.ErrorNotFound, Message: name + " not found"}
+		return deletionResult(false, "", opts)
 	}
 	c.memberStore.DeleteWorkspace(name)
-	return nil
+	return deletionResult(true, "", opts)
 }
 
 func (c *fakeWorkspaceClient) AddMember(_ context.Context, workspace, principalSubject string, role types.WorkspaceRole) (*types.WorkspaceMember, error) {
@@ -142,31 +154,43 @@ func (c *fakeWorkspaceClient) AddMember(_ context.Context, workspace, principalS
 	return c.memberStore.Create(workspace, member)
 }
 
-func (c *fakeWorkspaceClient) RemoveMember(_ context.Context, workspace, principalSubject string) error {
-	if c.closedFunc() {
-		return &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
-	}
-	if workspace == "" {
-		return &types.StatusError{Code: types.ErrorInvalidArgument, Message: "workspace name must not be empty"}
-	}
-	if principalSubject == "" {
-		return &types.StatusError{Code: types.ErrorInvalidArgument, Message: "principal subject must not be empty"}
-	}
-
-	_, existed := c.memberStore.DeleteAndGet(workspace, principalSubject)
-	if !existed {
-		return &types.StatusError{Code: types.ErrorNotFound, Message: principalSubject + " not found"}
-	}
-	return nil
-}
-
-// ListMembers returns all members for the workspace. ListOptions are accepted for interface compatibility but filtering is not implemented.
-func (c *fakeWorkspaceClient) ListMembers(_ context.Context, workspace string, _ ...v1.ListOptions) ([]*types.WorkspaceMember, error) {
+func (c *fakeWorkspaceClient) RemoveMember(_ context.Context, workspace, principalSubject string, opts ...v1.DeleteOptions) (*types.DeletionResult, error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
 	if workspace == "" {
 		return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "workspace name must not be empty"}
 	}
-	return c.memberStore.List(workspace), nil
+	if principalSubject == "" {
+		return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "principal subject must not be empty"}
+	}
+
+	_, existed := c.memberStore.DeleteAndGet(workspace, principalSubject)
+	if !existed {
+		return deletionResult(false, "", opts)
+	}
+	return deletionResult(true, "", opts)
+}
+
+// ListMembers returns all members for the workspace. ListOptions are accepted for interface compatibility but filtering is not implemented.
+func (c *fakeWorkspaceClient) ListMembers(workspace string, opts ...v1.ListOptions) (*v1.Pager[*types.WorkspaceMember], error) {
+	if c.closedFunc() {
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
+	if workspace == "" {
+		return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "workspace name must not be empty"}
+	}
+	var options v1.ListOptions
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	return newSlicePager(c.memberStore.List(workspace), options.PageSize, options.PageToken)
+}
+
+func (c *fakeWorkspaceClient) ListAllMembers(ctx context.Context, workspace string, opts ...v1.ListOptions) ([]*types.WorkspaceMember, error) {
+	pager, err := c.ListMembers(workspace, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return pager.All(ctx)
 }

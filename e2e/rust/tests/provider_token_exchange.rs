@@ -554,7 +554,7 @@ fn write_profile(profile_type: &str, token_port: u16, target_port: u16) -> Named
         .tempfile()
         .expect("create provider profile temp file");
     let profile = format!(
-        r#"id: {profile_type}
+        r"id: {profile_type}
 display_name: Podman token exchange e2e
 description: Podman e2e provider profile for two-stage token exchange
 category: other
@@ -592,9 +592,8 @@ endpoints:
       - 172.0.0.0/8
       - 192.168.0.0/16
 binaries:
-  - /usr/bin/curl
-  - /usr/local/bin/curl
-"#
+  - /usr/local/bin/python3
+"
     );
     file.write_all(profile.as_bytes())
         .expect("write provider profile");
@@ -604,10 +603,10 @@ binaries:
 
 fn sandbox_script(token_port: u16) -> String {
     let _ = token_port;
-    r#"set -eu
+    r"set -eu
 echo token-server-ready
 while true; do sleep 60; done
-"#
+"
     .to_string()
 }
 
@@ -773,8 +772,11 @@ async fn container_loopback_port_ready(container_name: &str, token_port: u16) ->
         .unwrap_or(false)
 }
 
-async fn sandbox_exec_curl(sandbox_name: &str, target_port: u16) -> Result<String, String> {
+async fn sandbox_exec_http(sandbox_name: &str, target_port: u16) -> Result<String, String> {
     let url = format!("http://host.openshell.internal:{target_port}/resource");
+    let script = format!(
+        "import urllib.request; print(urllib.request.urlopen({url:?}, timeout=5).read().decode())"
+    );
     let mut last_output = String::new();
     for _ in 0..20 {
         let output = openshell_cmd()
@@ -785,11 +787,9 @@ async fn sandbox_exec_curl(sandbox_name: &str, target_port: u16) -> Result<Strin
                 sandbox_name,
                 "--no-tty",
                 "--",
-                "curl",
-                "-fsS",
-                "--max-time",
-                "5",
-                &url,
+                "python3",
+                "-c",
+                &script,
             ])
             .output()
             .await
@@ -807,7 +807,7 @@ async fn sandbox_exec_curl(sandbox_name: &str, target_port: u16) -> Result<Strin
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     Err(format!(
-        "curl to protected target did not succeed at {url}; last attempt:\n{last_output}"
+        "HTTP request to protected target did not succeed at {url}; last attempt:\n{last_output}"
     ))
 }
 
@@ -836,14 +836,14 @@ async fn podman_provider_token_exchange_injects_bearer_header() {
     let _target = start_protected_target(target_port).await;
 
     run_cli_ignore_error(&["provider", "delete", &provider_name, "--yes"]).await;
-    run_cli_ignore_error(&["provider", "profile", "delete", &profile_type, "--yes"]).await;
+    run_cli_ignore_error(&["profile", "delete", &profile_type, "--yes"]).await;
 
     let profile = write_profile(&profile_type, token_port, target_port);
     let profile_path = profile
         .path()
         .to_str()
         .expect("profile path should be UTF-8");
-    run_cli(&["provider", "profile", "import", "-f", profile_path])
+    run_cli(&["profile", "import", "-f", profile_path])
         .await
         .expect("import provider profile");
     run_cli(&[
@@ -874,21 +874,21 @@ async fn podman_provider_token_exchange_injects_bearer_header() {
     start_container_token_endpoint(&sandbox.name, token_port)
         .await
         .expect("start container token endpoint");
-    let curl_output = match sandbox_exec_curl(&sandbox.name, target_port).await {
+    let request_output = match sandbox_exec_http(&sandbox.name, target_port).await {
         Ok(output) => output,
         Err(err) => {
             let debug = provider_token_debug(&sandbox.name, token_port, target_port).await;
-            panic!("curl protected target from kept sandbox: {err}\n{debug}");
+            panic!("request protected target from kept sandbox: {err}\n{debug}");
         }
     };
 
     run_cli_ignore_error(&["provider", "delete", &provider_name, "--yes"]).await;
-    run_cli_ignore_error(&["provider", "profile", "delete", &profile_type, "--yes"]).await;
+    run_cli_ignore_error(&["profile", "delete", &profile_type, "--yes"]).await;
     sandbox.cleanup().await;
 
     assert!(
-        curl_output.contains("token-exchange-ok"),
+        request_output.contains("token-exchange-ok"),
         "protected target should receive the final exchanged bearer token:\n{}",
-        curl_output
+        request_output
     );
 }

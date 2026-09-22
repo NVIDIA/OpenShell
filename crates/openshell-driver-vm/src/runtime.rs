@@ -5,12 +5,12 @@
 
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
-use std::process::{Child as StdChild, Command as StdCommand, Stdio};
+use std::process::{Command as StdCommand, Stdio};
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::{embedded_runtime, ffi, nft_ruleset, procguard, rootfs};
+use crate::{embedded_runtime, ffi, procguard, rootfs};
 
 pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
 const KRUN_INIT_PID1_ENV: &str = "KRUN_INIT_PID1=1";
@@ -19,31 +19,18 @@ const KRUN_INIT_PID1_ENV: &str = "KRUN_INIT_PID1=1";
 /// Used by the SIGTERM/SIGINT handler to forward signals to the VM.
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 
-/// PID of the helper process (gvproxy for libkrun; zero for QEMU).
-/// Zero when not running. Used by the SIGTERM/SIGINT handler and
-/// procguard cleanup callback to ensure the helper doesn't outlive the
-/// launcher (especially on macOS where `PR_SET_PDEATHSIG` is absent).
-static GVPROXY_PID: AtomicI32 = AtomicI32::new(0);
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmBackend {
     Libkrun,
     Qemu,
 }
 
-// virtio-net feature bits (see Linux `include/uapi/linux/virtio_net.h`).
-const NET_FEATURE_CSUM: u32 = 1 << 0;
-const NET_FEATURE_GUEST_CSUM: u32 = 1 << 1;
-const NET_FEATURE_GUEST_TSO4: u32 = 1 << 7;
-const NET_FEATURE_GUEST_UFO: u32 = 1 << 10;
-const NET_FEATURE_HOST_TSO4: u32 = 1 << 11;
-const NET_FEATURE_HOST_UFO: u32 = 1 << 14;
-const COMPAT_NET_FEATURES: u32 = NET_FEATURE_CSUM
-    | NET_FEATURE_GUEST_CSUM
-    | NET_FEATURE_GUEST_TSO4
-    | NET_FEATURE_GUEST_UFO
-    | NET_FEATURE_HOST_TSO4
-    | NET_FEATURE_HOST_UFO;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VsockPortMap {
+    pub guest_port: u32,
+    pub host_socket: PathBuf,
+    pub host_initiated: bool,
+}
 
 pub struct VmLaunchConfig {
     pub root_disk: PathBuf,
@@ -60,12 +47,8 @@ pub struct VmLaunchConfig {
     pub console_output: PathBuf,
     pub backend: VmBackend,
     pub gpu_bdf: Option<String>,
-    pub tap_device: Option<String>,
-    pub guest_ip: Option<String>,
-    pub host_ip: Option<String>,
     pub vsock_cid: Option<u32>,
-    pub guest_mac: Option<String>,
-    pub gateway_port: Option<u16>,
+    pub vsock_port_map: Option<VsockPortMap>,
 }
 
 pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
@@ -80,25 +63,9 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .gpu_bdf
         .as_deref()
         .ok_or("gpu_bdf is required for QEMU backend")?;
-    let tap_device = config
-        .tap_device
-        .as_deref()
-        .ok_or("tap_device is required for QEMU backend")?;
-    let guest_mac = config
-        .guest_mac
-        .as_deref()
-        .ok_or("guest_mac is required for QEMU backend")?;
     let vsock_cid = config
         .vsock_cid
         .ok_or("vsock_cid is required for QEMU backend")?;
-    let _guest_ip = config
-        .guest_ip
-        .as_deref()
-        .ok_or("guest_ip is required for QEMU backend")?;
-    let host_ip = config
-        .host_ip
-        .as_deref()
-        .ok_or("host_ip is required for QEMU backend")?;
 
     if !config.root_disk.is_file() {
         return Err(format!(
@@ -125,12 +92,8 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     check_kvm_access()?;
 
-    let guest_env = qemu_guest_env_vars(config, host_dns_server());
+    let guest_env = qemu_guest_env_vars(config);
     write_guest_env_file(&config.overlay_disk, &guest_env)?;
-
-    let gw_port = config.gateway_port.unwrap_or(0);
-    setup_tap_networking(tap_device, host_ip, gw_port)?;
-    let mut tap_guard = TapGuard::new(tap_device.to_string(), host_ip.to_string(), gw_port);
 
     let vmlinux = if let Some(kernel_image) = &config.kernel_image {
         kernel_image.clone()
@@ -155,21 +118,12 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .arg(format!("{}M", config.mem_mib))
         .arg("-nographic")
         .arg("-no-reboot")
+        .args(qemu_network_args())
         .arg("-kernel")
         .arg(&vmlinux)
         .arg("-append")
         .arg(&kernel_cmdline)
         .args(qemu_disk_args(config))
-        .arg("-netdev")
-        .arg(format!(
-            "tap,id=net0,ifname={tap_device},script=no,downscript=no"
-        ))
-        .arg("-device")
-        .arg("pcie-root-port,id=net_root,slot=3")
-        .arg("-device")
-        .arg(format!(
-            "virtio-net-pci-non-transitional,netdev=net0,mac={guest_mac},bus=net_root"
-        ))
         .arg("-device")
         .arg("pcie-root-port,id=vsock_root,slot=1")
         .arg("-device")
@@ -211,14 +165,16 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .map_err(|e| format!("failed to wait for QEMU: {e}"))?;
 
     CHILD_PID.store(0, Ordering::Relaxed);
-    teardown_tap_networking(tap_device, host_ip, gw_port);
-    tap_guard.disarm();
 
     if status.success() {
         Ok(())
     } else {
         Err(format!("QEMU exited with status {status}"))
     }
+}
+
+fn qemu_network_args() -> [&'static str; 2] {
+    ["-nic", "none"]
 }
 
 fn qemu_disk_args(config: &VmLaunchConfig) -> Vec<String> {
@@ -271,20 +227,8 @@ fn write_guest_env_file(overlay_disk: &Path, env_vars: &[String]) -> Result<(), 
     )
 }
 
-fn qemu_guest_env_vars(config: &VmLaunchConfig, dns_server: Option<String>) -> Vec<String> {
+fn qemu_guest_env_vars(config: &VmLaunchConfig) -> Vec<String> {
     let mut env_vars = config.env.clone();
-
-    if let Some(ip) = &config.guest_ip
-        && let Some(host_ip) = &config.host_ip
-    {
-        env_vars.push(format!("VM_NET_IP={ip}"));
-        env_vars.push(format!("VM_NET_GW={host_ip}"));
-    }
-
-    if let Some(dns) = dns_server {
-        env_vars.push(format!("VM_NET_DNS={dns}"));
-    }
-
     if config.gpu_bdf.is_some() {
         env_vars.push("GPU_ENABLED=true".to_string());
     }
@@ -312,12 +256,6 @@ fn build_kernel_cmdline(config: &VmLaunchConfig) -> String {
         format!("init={}", config.exec_path),
     ];
 
-    if let Some(ip) = &config.guest_ip
-        && let Some(host_ip) = &config.host_ip
-    {
-        parts.push(format!("ip={ip}::{host_ip}:255.255.255.252:sandbox::off"));
-    }
-
     if config.gpu_bdf.is_some() {
         parts.push("firmware_class.path=/lib/firmware".to_string());
     }
@@ -325,326 +263,16 @@ fn build_kernel_cmdline(config: &VmLaunchConfig) -> String {
     parts.join(" ")
 }
 
-fn host_dns_server() -> Option<String> {
-    // Prefer systemd-resolved upstream config (skips the 127.0.0.53
-    // stub listener which is unreachable from inside QEMU/TAP guests).
-    for path in &["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
-        let Ok(resolv) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        for line in resolv.lines() {
-            let line = line.trim();
-            if let Some(server) = line.strip_prefix("nameserver") {
-                let server = server.trim();
-                if server == "127.0.0.53" || server.starts_with("127.") {
-                    continue;
-                }
-                if !server.is_empty() {
-                    return Some(server.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Remove leftover `vmtap-*` interfaces from previous driver runs.
-///
-/// Called once at driver startup for interfaces that were not torn down
-/// (e.g. the launcher was `SIGKILL`-ed before teardown), so stale
-/// interfaces cannot cause subnet routing conflicts with newly allocated TAPs.
-pub fn cleanup_stale_tap_interfaces() {
-    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if !name.starts_with("vmtap-") {
-            continue;
-        }
-        // Read the IP address so we can clean up iptables rules too.
-        // Port 0 tells teardown we don't know the original gateway port;
-        // the blanket legacy rule is still cleaned up best-effort.
-        let ip = read_tap_host_ip(name);
-        if let Some(ref host_ip) = ip {
-            teardown_tap_networking(name, host_ip, 0);
-        } else {
-            let _ = run_cmd("ip", &["link", "set", name, "down"]);
-            let _ = run_cmd("ip", &["tuntap", "del", "dev", name, "mode", "tap"]);
-        }
-        tracing::warn!(interface = %name, "removed stale TAP interface from previous run");
-    }
-}
-
-/// Read the first IPv4 address assigned to a network interface.
-fn read_tap_host_ip(device: &str) -> Option<String> {
-    let output = StdCommand::new("ip")
-        .args(["-4", "-o", "addr", "show", "dev", device])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Format: "28: vmtap-xxx    inet 10.0.128.1/30 ..."
-    for token in stdout.split_whitespace() {
-        if let Some((ip, _prefix)) = token.split_once('/')
-            && ip.parse::<std::net::Ipv4Addr>().is_ok()
-        {
-            return Some(ip.to_string());
-        }
-    }
-    None
-}
-
-fn setup_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) -> Result<(), String> {
-    run_cmd("ip", &["tuntap", "add", "dev", tap_device, "mode", "tap"])?;
-    run_cmd(
-        "ip",
-        &["addr", "add", &format!("{host_ip}/30"), "dev", tap_device],
-    )?;
-    run_cmd("ip", &["link", "set", tap_device, "up"])?;
-
-    // Deprioritize routes through down interfaces so a stale vmtap-*
-    // that somehow survives cleanup cannot shadow the active one.
-    let _ = std::fs::write(
-        format!("/proc/sys/net/ipv4/conf/{tap_device}/ignore_routes_with_linkdown"),
-        "1",
-    );
-
-    enable_ip_forwarding()?;
-
-    let subnet = tap_subnet_from_host_ip(host_ip);
-    let table_name = nft_ruleset::teardown_table_name(tap_device);
-
-    // Delete any stale nftables table from a previous driver run.
-    let _ = run_cmd("nft", &["delete", "table", "ip", &table_name]);
-
-    // Clean up legacy iptables rules from older driver versions.
-    let _ = run_cmd(
-        "iptables",
-        &[
-            "-t",
-            "nat",
-            "-D",
-            "POSTROUTING",
-            "-s",
-            &subnet,
-            "-j",
-            "MASQUERADE",
-        ],
-    );
-    let _ = run_cmd(
-        "iptables",
-        &["-D", "FORWARD", "-i", tap_device, "-j", "ACCEPT"],
-    );
-    let _ = run_cmd(
-        "iptables",
-        &[
-            "-D",
-            "FORWARD",
-            "-o",
-            tap_device,
-            "-m",
-            "state",
-            "--state",
-            "RELATED,ESTABLISHED",
-            "-j",
-            "ACCEPT",
-        ],
-    );
-    let port_str = gateway_port.to_string();
-    let _ = run_cmd(
-        "iptables",
-        &[
-            "-D", "INPUT", "-i", tap_device, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
-        ],
-    );
-    let _ = run_cmd(
-        "iptables",
-        &["-D", "INPUT", "-i", tap_device, "-j", "ACCEPT"],
-    );
-
-    // Load nftables ruleset atomically.
-    let ruleset = nft_ruleset::generate_tap_ruleset(tap_device, &subnet, gateway_port);
-    run_nft_stdin(&ruleset)?;
-
-    Ok(())
-}
-
-fn teardown_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) {
-    // Delete the entire nftables table — single atomic operation.
-    let table_name = nft_ruleset::teardown_table_name(tap_device);
-    let _ = run_cmd("nft", &["delete", "table", "ip", &table_name]);
-
-    // Clean up legacy iptables rules from older driver versions.
-    let subnet = tap_subnet_from_host_ip(host_ip);
-    let _ = run_cmd(
-        "iptables",
-        &[
-            "-D",
-            "FORWARD",
-            "-o",
-            tap_device,
-            "-m",
-            "state",
-            "--state",
-            "RELATED,ESTABLISHED",
-            "-j",
-            "ACCEPT",
-        ],
-    );
-    let _ = run_cmd(
-        "iptables",
-        &["-D", "FORWARD", "-i", tap_device, "-j", "ACCEPT"],
-    );
-    if gateway_port > 0 {
-        let port_str = gateway_port.to_string();
-        let _ = run_cmd(
-            "iptables",
-            &[
-                "-D", "INPUT", "-i", tap_device, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
-            ],
-        );
-    }
-    let _ = run_cmd(
-        "iptables",
-        &["-D", "INPUT", "-i", tap_device, "-j", "ACCEPT"],
-    );
-    let _ = run_cmd(
-        "iptables",
-        &[
-            "-t",
-            "nat",
-            "-D",
-            "POSTROUTING",
-            "-s",
-            &subnet,
-            "-j",
-            "MASQUERADE",
-        ],
-    );
-
-    let _ = run_cmd("ip", &["link", "set", tap_device, "down"]);
-    let _ = run_cmd("ip", &["tuntap", "del", "dev", tap_device, "mode", "tap"]);
-}
-
-fn tap_subnet_from_host_ip(host_ip: &str) -> String {
-    host_ip.parse::<std::net::Ipv4Addr>().map_or_else(
-        |_| format!("{host_ip}/30"),
-        |ip| {
-            let base = u32::from(ip) & !3;
-            let base_ip = std::net::Ipv4Addr::from(base);
-            format!("{base_ip}/30")
-        },
-    )
-}
-
-fn enable_ip_forwarding() -> Result<(), String> {
-    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")
-        .map_err(|e| format!("enable ip_forward: {e}"))
-}
-
-fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), String> {
-    let output = StdCommand::new(cmd)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("failed to run {cmd}: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("{cmd} {} failed: {stderr}", args.join(" ")))
-    }
-}
-
-fn run_nft_stdin(ruleset: &str) -> Result<(), String> {
-    use std::io::Write;
-
-    let mut child = StdCommand::new("nft")
-        .args(["-f", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to run nft: {e}"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(ruleset.as_bytes())
-            .map_err(|e| format!("failed to write nft ruleset: {e}"))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("failed to wait for nft: {e}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("nft -f - failed: {stderr}"))
-    }
-}
-
-/// RAII guard that tears down TAP networking on drop.
-struct TapGuard {
-    tap_device: String,
-    host_ip: String,
-    gateway_port: u16,
-    disarmed: bool,
-}
-
-impl TapGuard {
-    fn new(tap_device: String, host_ip: String, gateway_port: u16) -> Self {
-        Self {
-            tap_device,
-            host_ip,
-            gateway_port,
-            disarmed: false,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.disarmed = true;
-    }
-}
-
-impl Drop for TapGuard {
-    fn drop(&mut self) {
-        if !self.disarmed {
-            teardown_tap_networking(&self.tap_device, &self.host_ip, self.gateway_port);
-        }
-    }
-}
-
 /// Shared procguard cleanup callback for both libkrun and QEMU paths.
 /// Only async-signal-safe calls: atomic loads and `kill(2)`.
 fn procguard_kill_children() {
-    let helper_pid = GVPROXY_PID.load(Ordering::Relaxed);
     let child_pid = CHILD_PID.load(Ordering::Relaxed);
-    if helper_pid > 0 {
-        unsafe {
-            libc::kill(helper_pid, libc::SIGTERM);
-        }
-    }
     if child_pid > 0 {
         unsafe {
             libc::kill(child_pid, libc::SIGTERM);
         }
     }
     std::thread::sleep(Duration::from_millis(200));
-    if helper_pid > 0 {
-        unsafe {
-            libc::kill(helper_pid, libc::SIGKILL);
-        }
-    }
     if child_pid > 0 {
         unsafe {
             libc::kill(child_pid, libc::SIGKILL);
@@ -677,13 +305,9 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
         return Err(format!("image disk not found: {}", image_disk.display()));
     }
 
-    // Arm procguard first, BEFORE we spawn gvproxy or fork libkrun, so
-    // that the launcher can't be orphaned during setup. The cleanup
-    // callback reads the GVPROXY_PID atomic (initially 0 — no-op) and
-    // the CHILD_PID atomic (the libkrun fork), so it stays correct as
-    // those slots get populated later in this function. Only ONE arm
-    // per process: racing two watchers for the same NOTE_EXIT event
-    // would cause whichever wins to skip the cleanup.
+    // Arm procguard before forking libkrun so the VM worker cannot outlive
+    // the launcher. No network helper is started: the only host/guest data
+    // path is the protected vsock mapping below.
     if let Err(err) = procguard::die_with_parent_cleanup(procguard_kill_children) {
         return Err(format!("procguard arm failed: {err}"));
     }
@@ -705,132 +329,12 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
     )?;
     vm.set_workdir(&config.workdir)?;
 
-    // Run gvproxy strictly as the guest's virtual NIC / DHCP / router.
-    //
-    // After the supervisor-initiated relay migration (#867), the driver
-    // no longer forwards any host-side ports into the guest — all ingress
-    // traffic for SSH and exec rides the outbound `ConnectSupervisor`
-    // gRPC stream the guest opens to the gateway. What gvproxy still
-    // provides here is the TCP/IP *plane* the guest kernel needs:
-    //
-    //   * a virtio-net backend attached to libkrun via a Unix
-    //     SOCK_STREAM (Linux) or SOCK_DGRAM (macOS vfkit), which
-    //     surfaces as `eth0` inside the guest;
-    //   * the DHCP server + default router the guest's udhcpc client
-    //     talks to on boot (IPs 192.168.127.1 / .2, defaults for
-    //     gvisor-tap-vsock);
-    //   * the host-facing gateway identity the guest uses for callbacks:
-    //     gvproxy installs a default NAT entry rewriting `192.168.127.254`
-    //     (the subnet's HostIP) to the host's `127.0.0.1`, and serves
-    //     `host.containers.internal` / `host.docker.internal` /
-    //     `host.openshell.internal` in its embedded DNS pointing at that
-    //     same HostIP. The guest init script seeds /etc/hosts with the
-    //     same mapping so the supervisor reaches the host gateway even
-    //     when gvproxy's DNS isn't in resolv.conf. The gateway IP
-    //     (192.168.127.1) is NOT a host-loopback proxy — it only listens
-    //     on its own service ports (DNS:53, DHCP, HTTP API:80).
-    //
-    // That network plane is also what the sandbox supervisor's
-    // per-sandbox netns (veth pair + nftables, see
-    // `openshell-sandbox/src/sandbox/linux/netns.rs`) branches off of;
-    // libkrun's built-in TSI socket impersonation would not satisfy
-    // those kernel-level primitives.
-    //
-    // The `-listen` API socket and `-ssh-port` forwarder are both
-    // deliberately omitted: nothing in the driver enqueues port
-    // forwards on the API any more, and the host-side SSH listener is
-    // dead plumbing.
-    let gvproxy_guard = {
-        let gvproxy_binary = runtime_dir.join("gvproxy");
-        if !gvproxy_binary.is_file() {
-            return Err(format!(
-                "missing runtime file: {}",
-                gvproxy_binary.display()
-            ));
-        }
-
-        let sock_base = gvproxy_socket_base(&config.overlay_disk)?;
-        let net_sock = sock_base.with_extension("v");
-        let _ = std::fs::remove_file(&net_sock);
-        let _ = std::fs::remove_file(sock_base.with_extension("v-krun.sock"));
-
-        let run_dir = config.overlay_disk.parent().unwrap_or(&config.overlay_disk);
-        let gvproxy_log = run_dir.join("gvproxy.log");
-        let gvproxy_log_file = std::fs::File::create(&gvproxy_log)
-            .map_err(|e| format!("create gvproxy log {}: {e}", gvproxy_log.display()))?;
-
-        #[cfg(target_os = "linux")]
-        let (gvproxy_net_flag, gvproxy_net_url) =
-            ("-listen-qemu", format!("unix://{}", net_sock.display()));
-        #[cfg(target_os = "macos")]
-        let (gvproxy_net_flag, gvproxy_net_url) = (
-            "-listen-vfkit",
-            format!("unixgram://{}", net_sock.display()),
-        );
-
-        // `-ssh-port -1` tells gvproxy to skip its default SSH forward
-        // (127.0.0.1:2222 → guest:22). We don't use it — all gateway
-        // ingress rides the supervisor-initiated relay — and leaving
-        // the default on would bind a host-side TCP listener per
-        // sandbox, racing concurrent sandboxes for port 2222 and
-        // surfacing a misleading "sshd is reachable" endpoint. See
-        // https://github.com/containers/gvisor-tap-vsock `cmd/gvproxy/main.go`
-        // (`getForwardsMap` returns an empty map when `sshPort == -1`).
-        let mut gvproxy_cmd = StdCommand::new(&gvproxy_binary);
-        gvproxy_cmd
-            .arg(gvproxy_net_flag)
-            .arg(&gvproxy_net_url)
-            .arg("-ssh-port")
-            .arg("-1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(gvproxy_log_file);
-
-        // On Linux the kernel will SIGKILL gvproxy the moment this
-        // launcher dies (or is SIGKILLed). `pre_exec` runs in the child
-        // between fork and execve, so the PR_SET_PDEATHSIG flag is
-        // inherited across execve and applies to gvproxy proper. On
-        // macOS/BSDs there is no equivalent; we fall back to killing
-        // gvproxy explicitly from the launcher's procguard cleanup
-        // callback (see `run_vm` above) and SIGTERM handler
-        // (see `install_signal_forwarding` below).
-        #[cfg(target_os = "linux")]
-        {
-            use nix::sys::signal::Signal;
-            use std::os::unix::process::CommandExt as _;
-            unsafe {
-                gvproxy_cmd.pre_exec(|| {
-                    nix::sys::prctl::set_pdeathsig(Signal::SIGKILL)
-                        .map_err(|err| std::io::Error::other(format!("pdeathsig: {err}")))
-                });
-            }
-        }
-
-        let child = gvproxy_cmd
-            .spawn()
-            .map_err(|e| format!("failed to start gvproxy {}: {e}", gvproxy_binary.display()))?;
-        // The procguard cleanup reads GVPROXY_PID atomically. Storing it
-        // here makes the callback able to SIGTERM gvproxy if the driver
-        // dies from this moment onward.
-        GVPROXY_PID.store(child.id().cast_signed(), Ordering::Relaxed);
-
-        wait_for_path(&net_sock, Duration::from_secs(5), "gvproxy data socket")?;
-
-        vm.disable_implicit_vsock()?;
-        vm.add_vsock(0)?;
-
-        let mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
-
-        #[cfg(target_os = "linux")]
-        vm.add_net_unixstream(&net_sock, &mac, COMPAT_NET_FEATURES)?;
-        #[cfg(target_os = "macos")]
-        {
-            const NET_FLAG_VFKIT: u32 = 1 << 0;
-            vm.add_net_unixgram(&net_sock, &mac, COMPAT_NET_FEATURES, NET_FLAG_VFKIT)?;
-        }
-
-        Some(GvproxyGuard::new(child))
-    };
+    vm.disable_implicit_vsock()?;
+    vm.add_vsock(0)?;
+    if let Some(port_map) = &config.vsock_port_map {
+        let _ = std::fs::remove_file(&port_map.host_socket);
+        vm.add_vsock_port(port_map)?;
+    }
 
     vm.set_console_output(&config.console_output)?;
 
@@ -846,8 +350,7 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
             // fires). Arm procguard so this fork is SIGKILLed if the
             // parent launcher dies abruptly. On Linux this uses
             // `PR_SET_PDEATHSIG`; on macOS this spawns a kqueue
-            // NOTE_EXIT watcher thread. Either way it closes the same
-            // leak gvproxy does above.
+            // NOTE_EXIT watcher thread.
             //
             // We also SIGKILL ourselves if arming fails — there's no
             // safe way to continue if we can't guarantee cleanup.
@@ -864,9 +367,6 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
 
             let status = wait_for_child(pid)?;
             CHILD_PID.store(0, Ordering::Relaxed);
-            cleanup_gvproxy(gvproxy_guard);
-            GVPROXY_PID.store(0, Ordering::Relaxed);
-
             if libc::WIFEXITED(status) {
                 match libc::WEXITSTATUS(status) {
                     0 => Ok(()),
@@ -1118,50 +618,18 @@ impl VmContext {
         )
     }
 
-    #[cfg(target_os = "macos")]
-    fn add_net_unixgram(
-        &self,
-        socket_path: &Path,
-        mac: &[u8; 6],
-        features: u32,
-        flags: u32,
-    ) -> Result<(), String> {
-        let sock_c = path_to_cstring(socket_path)?;
+    fn add_vsock_port(&self, port_map: &VsockPortMap) -> Result<(), String> {
+        let socket_c = path_to_cstring(&port_map.host_socket)?;
         check(
             unsafe {
-                (self.krun.krun_add_net_unixgram)(
+                (self.krun.krun_add_vsock_port2)(
                     self.ctx_id,
-                    sock_c.as_ptr(),
-                    -1,
-                    mac.as_ptr(),
-                    features,
-                    flags,
+                    port_map.guest_port,
+                    socket_c.as_ptr(),
+                    port_map.host_initiated,
                 )
             },
-            "krun_add_net_unixgram",
-        )
-    }
-
-    #[allow(dead_code)] // Used on Linux when gvproxy runs in qemu/unixstream mode.
-    fn add_net_unixstream(
-        &self,
-        socket_path: &Path,
-        mac: &[u8; 6],
-        features: u32,
-    ) -> Result<(), String> {
-        let sock_c = path_to_cstring(socket_path)?;
-        check(
-            unsafe {
-                (self.krun.krun_add_net_unixstream)(
-                    self.ctx_id,
-                    sock_c.as_ptr(),
-                    -1,
-                    mac.as_ptr(),
-                    features,
-                    0,
-                )
-            },
-            "krun_add_net_unixstream",
+            "krun_add_vsock_port2",
         )
     }
 
@@ -1210,109 +678,6 @@ impl Drop for VmContext {
     }
 }
 
-struct GvproxyGuard {
-    child: Option<StdChild>,
-}
-
-impl GvproxyGuard {
-    fn new(child: StdChild) -> Self {
-        Self { child: Some(child) }
-    }
-
-    fn disarm(&mut self) -> Option<StdChild> {
-        self.child.take()
-    }
-}
-
-impl Drop for GvproxyGuard {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-fn wait_for_path(path: &Path, timeout: Duration, label: &str) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
-    let mut interval = Duration::from_millis(5);
-    while !path.exists() {
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "{label} did not appear within {:.1}s: {}",
-                timeout.as_secs_f64(),
-                path.display()
-            ));
-        }
-        std::thread::sleep(interval);
-        interval = (interval * 2).min(Duration::from_millis(200));
-    }
-    Ok(())
-}
-
-fn hash_path_id(path: &Path) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in path.to_string_lossy().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    format!("{:012x}", hash & 0x0000_ffff_ffff_ffff)
-}
-
-fn secure_socket_base(subdir: &str) -> Result<PathBuf, String> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
-        || {
-            let fallback = PathBuf::from("/tmp");
-            if fallback.is_dir() {
-                fallback
-            } else {
-                std::env::temp_dir()
-            }
-        },
-        PathBuf::from,
-    );
-    let dir = base.join(subdir);
-
-    if dir.exists() {
-        let meta = dir
-            .symlink_metadata()
-            .map_err(|e| format!("lstat {}: {e}", dir.display()))?;
-        if meta.file_type().is_symlink() {
-            return Err(format!(
-                "socket directory {} is a symlink; refusing to use it",
-                dir.display()
-            ));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            let uid = unsafe { libc::getuid() };
-            if meta.uid() != uid {
-                return Err(format!(
-                    "socket directory {} is owned by uid {} but we are uid {}",
-                    dir.display(),
-                    meta.uid(),
-                    uid
-                ));
-            }
-        }
-    } else {
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("create socket dir {}: {e}", dir.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        }
-    }
-
-    Ok(dir)
-}
-
-fn gvproxy_socket_base(overlay_disk: &Path) -> Result<PathBuf, String> {
-    Ok(secure_socket_base("osd-gv")?.join(hash_path_id(overlay_disk)))
-}
-
 fn install_signal_forwarding(pid: i32) {
     unsafe {
         libc::signal(
@@ -1327,12 +692,7 @@ fn install_signal_forwarding(pid: i32) {
     CHILD_PID.store(pid, Ordering::Relaxed);
 }
 
-/// Async-signal-safe handler that forwards SIGTERM to every process we
-/// own: the libkrun VM worker and the gvproxy helper. We cannot rely on
-/// Rust destructors (`GvproxyGuard::drop`, `ManagedDriverProcess::drop`)
-/// running on signal-driven exit, so we explicitly deliver the signal
-/// here. The `wait_for_child` loop reaps libkrun and `cleanup_gvproxy`
-/// reaps gvproxy before `run_vm` returns.
+/// Async-signal-safe handler that forwards SIGTERM to the VM worker.
 ///
 /// Only async-signal-safe libc calls are used — `kill(2)` is listed in
 /// POSIX.1-2017 as async-signal-safe, atomic loads are lock-free on the
@@ -1342,13 +702,6 @@ extern "C" fn forward_signal(_sig: libc::c_int) {
     if vm_pid > 0 {
         unsafe {
             libc::kill(vm_pid, libc::SIGTERM);
-        }
-    }
-    let gv_pid = GVPROXY_PID.load(Ordering::Relaxed);
-    if gv_pid > 0 {
-        // gvproxy handles SIGTERM cleanly; no need for SIGKILL.
-        unsafe {
-            libc::kill(gv_pid, libc::SIGTERM);
         }
     }
 }
@@ -1363,15 +716,6 @@ fn wait_for_child(pid: i32) -> Result<libc::c_int, String> {
         ));
     }
     Ok(status)
-}
-
-fn cleanup_gvproxy(mut guard: Option<GvproxyGuard>) {
-    if let Some(mut guard) = guard.take()
-        && let Some(mut child) = guard.disarm()
-    {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 }
 
 fn check(ret: i32, func: &'static str) -> Result<(), String> {
@@ -1431,23 +775,17 @@ mod tests {
             console_output: PathBuf::from("/console.log"),
             backend: VmBackend::Qemu,
             gpu_bdf: Some("0000:01:00.0".to_string()),
-            tap_device: Some("vmtap-test".to_string()),
-            guest_ip: Some("10.0.128.2".to_string()),
-            host_ip: Some("10.0.128.1".to_string()),
             vsock_cid: Some(4),
-            guest_mac: Some("02:00:00:00:00:01".to_string()),
-            gateway_port: Some(8080),
+            vsock_port_map: None,
         }
     }
 
     #[test]
-    fn qemu_guest_env_vars_include_driver_runtime_metadata() {
-        let env = qemu_guest_env_vars(&qemu_config(), Some("1.1.1.1".to_string()));
+    fn qemu_guest_env_vars_omit_network_metadata() {
+        let env = qemu_guest_env_vars(&qemu_config());
 
         assert!(env.contains(&"OPENSHELL_ENDPOINT=http://10.0.128.1:8080".to_string()));
-        assert!(env.contains(&"VM_NET_IP=10.0.128.2".to_string()));
-        assert!(env.contains(&"VM_NET_GW=10.0.128.1".to_string()));
-        assert!(env.contains(&"VM_NET_DNS=1.1.1.1".to_string()));
+        assert!(!env.iter().any(|value| value.starts_with("VM_NET_")));
         assert!(env.contains(&"GPU_ENABLED=true".to_string()));
     }
 
@@ -1490,13 +828,13 @@ mod tests {
     }
 
     #[test]
-    fn kernel_cmdline_keeps_guest_init_metadata_out_of_proc_cmdline() {
+    fn kernel_cmdline_has_no_guest_network_configuration() {
         let cmdline = build_kernel_cmdline(&qemu_config());
 
         assert!(cmdline.contains("root=/dev/vda"));
         assert!(cmdline.contains("rootfstype=ext4"));
         assert!(cmdline.contains(" ro"));
-        assert!(cmdline.contains("ip=10.0.128.2::10.0.128.1:255.255.255.252:sandbox::off"));
+        assert!(!cmdline.contains("ip="));
         assert!(cmdline.contains("firmware_class.path=/lib/firmware"));
         assert!(!cmdline.contains("VM_NET_IP="));
         assert!(!cmdline.contains("VM_NET_GW="));
@@ -1525,6 +863,11 @@ mod tests {
     }
 
     #[test]
+    fn qemu_explicitly_disables_implicit_network_devices() {
+        assert_eq!(qemu_network_args(), ["-nic", "none"]);
+    }
+
+    #[test]
     fn qemu_disk_args_attach_prepared_image_readonly_when_present() {
         let mut config = qemu_config();
         config.image_disk = Some(PathBuf::from("/image-rootfs.ext4"));
@@ -1535,30 +878,5 @@ mod tests {
             &"file=/image-rootfs.ext4,if=none,format=raw,id=image,readonly=on".to_string()
         ));
         assert!(args.contains(&"virtio-blk-pci,drive=image".to_string()));
-    }
-
-    #[test]
-    fn gvproxy_socket_base_is_per_sandbox_overlay_path() {
-        let first =
-            gvproxy_socket_base(Path::new("/tmp/openshell-vm/sandboxes/first/overlay.ext4"))
-                .expect("first socket base");
-        let second =
-            gvproxy_socket_base(Path::new("/tmp/openshell-vm/sandboxes/second/overlay.ext4"))
-                .expect("second socket base");
-
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn tap_subnet_from_host_ip_calculates_slash30_base() {
-        assert_eq!(tap_subnet_from_host_ip("10.0.128.1"), "10.0.128.0/30");
-        assert_eq!(tap_subnet_from_host_ip("10.0.128.2"), "10.0.128.0/30");
-        assert_eq!(tap_subnet_from_host_ip("10.0.128.5"), "10.0.128.4/30");
-    }
-
-    #[test]
-    fn tap_subnet_from_host_ip_handles_invalid_ip() {
-        let result = tap_subnet_from_host_ip("not-an-ip");
-        assert_eq!(result, "not-an-ip/30");
     }
 }

@@ -171,36 +171,6 @@ binary_allowed(policy, exec) if {
 	glob.match(b.path, ["/"], p)
 }
 
-user_declared_binary_allowed(_, _) if {
-	not binary_identity_required
-}
-
-user_declared_binary_allowed(policy, exec) if {
-	some b
-	b := policy.binaries[_]
-	not object.get(b, "advisor_proposed", false)
-	not contains(b.path, "*")
-	b.path == exec.path
-}
-
-user_declared_binary_allowed(policy, exec) if {
-	some b
-	b := policy.binaries[_]
-	not object.get(b, "advisor_proposed", false)
-	not contains(b.path, "*")
-	ancestor := exec.ancestors[_]
-	b.path == ancestor
-}
-
-user_declared_binary_allowed(policy, exec) if {
-	some b in policy.binaries
-	not object.get(b, "advisor_proposed", false)
-	contains(b.path, "*")
-	all_paths := array.concat([exec.path], exec.ancestors)
-	some p in all_paths
-	glob.match(b.path, ["/"], p)
-}
-
 # --- Network action (allow / deny) ---
 #
 # These rules are mutually exclusive by construction:
@@ -900,8 +870,8 @@ _matching_endpoint_configs := [cfg |
 # Full matched endpoint records are kept separate from the legacy
 # endpoint-config list, which intentionally contains only connection/L7
 # metadata. The policy name and array index identify the endpoint within this
-# policy generation while the complete endpoint preserves explicit protocol
-# markers needed by later policy-DNS correlation.
+# policy generation while the complete endpoint preserves protocol markers
+# needed by later policy-DNS correlation.
 
 _policy_endpoint_records(policy_name, policy) := [record |
 	some endpoint_index, ep in policy.endpoints
@@ -922,12 +892,15 @@ _matching_endpoint_records := [record |
 
 # Endpoints eligible for policy DNS are a policy-data snapshot, not an
 # authorization decision. In particular, they do not depend on input.exec or
-# grant access to any process. Only endpoints that explicitly opt into raw TCP
-# and provide a resolvable host plus concrete ports are materialized.
+# grant access to any process. Every supported endpoint protocol is carried by
+# TCP, and an omitted protocol is the default L4 TCP form. Endpoints with a
+# resolvable host plus concrete ports are therefore materialized regardless of
+# whether later stream handling is L4, HTTP, WebSocket, or another L7 adapter.
 policy_dns_eligible_endpoint_records := [record |
 	some policy_name, policy in data.network_policies
 	some endpoint_index, ep in policy.endpoints
-	lower(object.get(ep, "protocol", "")) == "tcp"
+	protocol := lower(object.get(ep, "protocol", "tcp"))
+	protocol in {"tcp", "rest", "websocket", "graphql", "sql", "json-rpc", "mcp"}
 	object.get(ep, "host", "") != ""
 	ports := object.get(ep, "ports", [])
 	count(ports) > 0
@@ -982,7 +955,7 @@ _policy_has_exact_declared_endpoint(policy) if {
 exact_declared_endpoint_host if {
 	some pname
 	policy := data.network_policies[pname]
-	user_declared_binary_allowed(policy, input.exec)
+	binary_allowed(policy, input.exec)
 	_policy_has_exact_declared_endpoint(policy)
 }
 

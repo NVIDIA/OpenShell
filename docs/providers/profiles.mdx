@@ -20,7 +20,7 @@ Provider profiles keep those pieces together:
 
 | Need | Profile-backed behavior |
 |---|---|
-| Repeatable provider setup | Built-in and custom provider profiles define reusable provider types. |
+| Repeatable provider setup | Imported provider profiles define reusable provider types. |
 | Provider-aware policy | Attached providers contribute `_provider_*` network policy entries to the effective sandbox policy. |
 | Custom provider definitions | You can export, edit, lint, import, list, and delete custom profiles. |
 | Runtime provider lifecycle | You can list, attach, and detach providers on existing sandboxes. |
@@ -31,16 +31,16 @@ Provider profiles keep those pieces together:
 
 Provider profiles include these user-facing features:
 
-- Built-in provider profiles loaded by the gateway by default.
-- Gateway configuration can compose built-in, user-managed, and interceptor-vended profile sources. Selecting only an interceptor makes its catalog authoritative by omission.
-- A user-managed profile shadows a built-in profile with the same ID in its applicable workspace or platform scope. The built-in remains the fallback outside that scope. Source-managed interceptor collisions still fail closed.
-- `openshell provider list-profiles` with table, YAML, and JSON output.
-- `openshell provider profile export`, `import`, `update`, `lint`, and `delete` for custom profiles.
-- Provider instances created from built-in or imported profile IDs with `openshell provider create --type <id>`.
+- An import-only catalog: the gateway serves the profiles you imported and nothing else. A gateway with none imported serves an empty catalog.
+- Gateway configuration can compose user-managed and interceptor-vended profile sources. Selecting only an interceptor makes its catalog authoritative by omission.
+- Platform-scoped and workspace-scoped profiles. A workspace profile takes precedence over a platform profile with the same ID inside that workspace, and the platform profile applies outside it. An interceptor-vended profile cannot share an ID with an imported one; that collision fails closed.
+- `openshell profile list` and `openshell profile describe` with table, YAML, and JSON output.
+- `openshell profile export`, `import`, `update`, `lint`, and `delete` for custom profiles.
+- Provider instances created from imported profile IDs with `openshell provider create --type <id>`.
 - Provider instances whose submitted credentials can be stored by a configured gateway credential driver.
-- Profile-backed credential discovery for explicit `openshell provider create --from-existing` and `openshell provider update --from-existing` flows. The built-in `google-vertex-ai` profile also supplements discovery with Vertex config env vars such as `VERTEX_AI_PROJECT_ID` and `VERTEX_AI_REGION`.
+- Profile-backed credential discovery for explicit `openshell provider create --from-existing` and `openshell provider update --from-existing` flows. The `google-vertex-ai` profile also supplements discovery with Vertex config env vars such as `VERTEX_AI_PROJECT_ID` and `VERTEX_AI_REGION`.
 - Just-in-time effective policy composition from sandbox policy plus attached provider profiles.
-- Runtime sandbox provider lifecycle commands under `openshell sandbox provider list|attach|detach`.
+- Runtime sandbox provider commands under `openshell sandbox provider list|attach|detach|status`, with an option to wait until the sandbox applies a change.
 - Credential refresh configuration with `openshell provider refresh status|configure|rotate|delete`.
 - Credential expiry metadata with `openshell provider update --credential-expires-at`; values accept Unix epoch milliseconds or ISO/RFC3339 timestamps.
 - Dynamic token grants that use the sandbox's SPIFFE JWT-SVID as an OAuth2 client assertion and inject short-lived tokens into supported headers for matching profile endpoints.
@@ -55,11 +55,13 @@ supply that boundary by default. For an endpointless profile, a sandbox policy
 endpoint can name the attached provider instance explicitly. The proxy checks
 the resulting association before it substitutes the real value.
 
-The built-in `openai` and `anthropic` profiles bind credentials to their public
+The example `openai` and `anthropic` profiles bind credentials to their public
 vendor endpoints. To use a proxy or compatible API at another host, import a
-custom profile that declares that host and attach a provider created from that
-profile. OpenShell never broadens a built-in profile's credential boundary from
-a base URL environment variable alone.
+separate profile that declares that host and attach a provider created from that
+profile. OpenShell never broadens a profile's credential boundary from a base URL
+environment variable alone: if a provider's `*_BASE_URL` points outside the hosts
+its profile declares, the profile is treated as endpointless and its credential
+binds only through explicit sandbox policy.
 
 A request can use a static credential only when all of these checks pass:
 
@@ -214,57 +216,79 @@ inference provider and call its native endpoint.
 
 A provider profile defines a provider type. It contains metadata, credential declarations, endpoint policy, binary policy, an informational provider category, and optional credential refresh metadata.
 
+Use `openshell profile` to discover, inspect, and manage reusable profile definitions. Use `openshell provider` to manage provider instances and their credential values. Provider profiles are the supported profile type.
+
+Existing command names remain supported. `openshell provider list-profiles` is equivalent to `openshell profile list --type provider`, and `openshell provider profile export/import/update/lint/delete` invokes the same handlers as the corresponding `openshell profile` commands. The nested commands retain their existing arguments, output options, and workspace/global flags. New examples use the top-level form.
+
 List available profiles:
 
 ```shell
-openshell provider list-profiles
+openshell profile list
+openshell profile list --type provider -o json
 ```
 
-By default the gateway lists built-in profiles plus custom profiles imported
-through the profile APIs. When a configured gateway interceptor vends an
-authoritative provider profile catalog, that catalog becomes the visible source
-of truth: list, export, provider creation, policy composition, and sandbox
-provider environment resolution use the interceptor-vended profiles instead of
-built-in or user-imported profiles.
+The default table shows `NAME`, `TYPE`, `CATEGORY`, `SOURCE`, and `SCOPE`. `NAME` is the profile ID used by the other profile commands and by `provider create --type`. The optional `--type provider` filter selects provider profiles. Use `-o json` or `-o yaml` for structured output.
 
-Built-in provider profiles currently include:
-
-| Profile ID | Category | Credential environment variables |
-|---|---|---|
-| `anthropic` | `inference` | `ANTHROPIC_API_KEY` |
-| `claude-code` | `agent` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` |
-| `codex` | `agent` | `CODEX_AUTH_ACCESS_TOKEN`, `CODEX_AUTH_REFRESH_TOKEN`, `CODEX_AUTH_ACCOUNT_ID`, `CODEX_AUTH_ID_TOKEN` |
-| `copilot` | `agent` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` |
-| `cursor` | `agent` | None |
-| `deepinfra` | `inference` | `DEEPINFRA_API_KEY` |
-| `github` | `source_control` | `GITHUB_TOKEN`, `GH_TOKEN` |
-| `google-vertex-ai` | `inference` | `GOOGLE_SERVICE_ACCOUNT_KEY`, `GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN`, `VERTEX_AI_SERVICE_ACCOUNT_TOKEN`, `GOOGLE_VERTEX_AI_TOKEN`, `VERTEX_AI_TOKEN` |
-| `nvidia` | `inference` | `NVIDIA_API_KEY` |
-| `openai` | `inference` | `OPENAI_API_KEY` |
-| `pypi` | `data` | None |
-
-Export a built-in profile as YAML:
+Inspect one profile before creating a provider:
 
 ```shell
-openshell provider profile export github -o yaml > github-profile.yaml
+openshell profile describe github
+openshell profile describe github -o yaml
 ```
+
+The description shows metadata, credential names and authentication settings, endpoints with their protocols and policy rule counts, allowed binaries, source, and scope. Endpoint details include TLS handling, permission for uninspected credential traffic, and MCP method and tool-name settings. A `tls: skip` endpoint is shown as a raw tunnel without L7 inspection or credential rewrite, even when it declares an L7 protocol and rules. Use JSON or YAML output to inspect the complete rule definitions. The description reads the reusable definition without reading credential values from provider instances. A missing profile ID returns an error.
+
+List and describe use the selected workspace's effective catalog. Pass the inherited `--workspace` flag to select another workspace, or `--global` to target platform scope. Platform operations require Platform Admin access.
+
+```shell
+openshell profile list --workspace team-ml
+openshell profile describe github --workspace team-ml
+openshell profile list --global
+openshell profile describe github --global
+```
+
+A gateway serves exactly the profiles you imported. OpenShell ships no profiles inside the gateway binary, so a new gateway lists an empty catalog until you import one. When a configured gateway interceptor vends an authoritative provider profile catalog, that catalog becomes the visible source of truth: list, describe, export, provider creation, policy composition, and sandbox provider environment resolution use the interceptor-vended profiles.
+
+### Import the Example Profiles
+
+The OpenShell repository ships example profiles for GitHub, PyPI, and the major
+inference and agent providers in
+[`providers/`](https://github.com/NVIDIA/OpenShell/tree/main/providers). They are
+reviewable starting points, not platform defaults.
+
+Read a file's header before importing it. Each one names the client binaries it
+expects, the reference image layout those paths assume, the credential scope,
+the endpoint access it grants, and a smoke test. Several name layout-specific
+paths, such as `/sandbox/.venv` or `/usr/lib/node_modules/@openai`. Imported
+unchanged into a different image the
+profile matches nothing: the catalog still lists it, but the credential is never
+injected and the traffic is denied. Copy the file, edit `binaries` and
+`endpoints` for your image and workload, and import your copy.
 
 Lint a profile before importing it:
 
 ```shell
-openshell provider profile lint -f github-profile.yaml
+openshell profile lint -f providers/github.yaml
 ```
 
-Import one profile file:
+Import one profile file at platform scope:
 
 ```shell
-openshell provider profile import -f github-profile.yaml
+openshell profile import -f providers/github.yaml --global
 ```
 
 Import all non-recursive `*.yaml`, `*.yml`, and `*.json` files from a directory:
 
 ```shell
-openshell provider profile import --from ./provider-profiles
+openshell profile import --from ./providers --global
+```
+
+Omit `--global` to import into the current workspace instead.
+
+Export a profile as YAML, to edit or to keep before an upgrade:
+
+```shell
+openshell profile export github -o yaml --global > github-profile.yaml
 ```
 
 Import is create-only. It fails if a custom profile with the same ID already exists.
@@ -272,17 +296,25 @@ Import is create-only. It fails if a custom profile with the same ID already exi
 Update an existing custom profile by exporting the current custom profile, editing the file, and submitting the edited file back:
 
 ```shell
-openshell provider profile export github-profile -o yaml > github-profile.yaml
-openshell provider profile update github-profile -f github-profile.yaml
+openshell profile export github-profile -o yaml > github-profile.yaml
+openshell profile update github-profile -f github-profile.yaml
 ```
 
 Exported custom profiles include `resource_version`. OpenShell requires that version during update so stale files cannot silently overwrite newer profile definitions. The target ID in the command must match the profile ID in the file. Update accepts one file at a time. If an update would make dynamic token grants ambiguous for an attached sandbox, OpenShell rejects it before changing the profile.
 
-Custom profile IDs must use lowercase kebab-case with `a-z`, `0-9`, and `-`. Built-in profile IDs and legacy provider aliases are reserved. Built-in and interceptor-managed profiles are read-only through the profile APIs. OpenShell also rejects deleting a custom profile while a sandbox-attached provider uses it.
+Delete custom profiles by ID:
+
+```shell
+openshell profile delete custom-api custom-alt
+```
+
+Export accepts `-o yaml` or `-o json` and defaults to YAML. Lint also accepts `--from <directory>` and asks the gateway to validate the supplied definitions without storing them. Export, import, update, lint, and delete use the selected workspace unless you pass `--global`.
+
+Profile IDs must use lowercase kebab-case with `a-z`, `0-9`, and `-`. No IDs are reserved: `github`, `openai`, and every other example profile imports at its own ID, and the imported profile is the only definition for it. Interceptor-managed profiles are read-only through the profile APIs. OpenShell rejects deleting a profile while a sandbox-attached provider uses it.
 
 ### Category Enum
 
-The `category` field controls how `openshell provider list-profiles` groups profiles. Use one of these canonical YAML values:
+The `category` field supplies the `CATEGORY` column in `openshell profile list`. Use one of these canonical YAML values:
 
 | Value | Use for |
 |---|---|
@@ -335,8 +367,8 @@ credentials:
       strategy: oauth2_client_credentials
       token_url: https://login.example.com/oauth2/token
       scopes: [api.read, api.write]
-      refresh_before_seconds: 300
-      max_lifetime_seconds: 3600
+      refresh_before: "300s"
+      max_lifetime: "3600s"
       material:
         - name: client_id
           description: OAuth client ID
@@ -358,7 +390,7 @@ credentials:
       jwt_svid_audience: https://login.example.com/realms/custom
       client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-spiffe
       scopes: [api.read, api.write]
-      cache_ttl_seconds: 300
+      cache_ttl: "300s"
       requested_token_type: urn:ietf:params:oauth:token-type:access_token
       subject_token:
         source: provider_credential
@@ -420,11 +452,17 @@ binaries:
   - /usr/local/bin/custom-cli
 ```
 
+Duration fields use protobuf duration strings and preserve fractional seconds.
+An absent `refresh_before` uses the gateway default, while `"0s"` refreshes at
+expiry. An absent `max_lifetime` uses the strategy default; an explicit zero
+maximum lifetime is invalid. Existing `*_seconds` fields remain accepted on
+import for compatibility.
+
 ### Profile Sections
 
 `id`, `display_name`, and `description` identify the profile. `id` is the value passed to `openshell provider create --type`.
 
-`category` groups profiles in `openshell provider list-profiles`. Use one of the values in the category enum.
+`category` supplies the `CATEGORY` column in `openshell profile list`. Use one of the values in the category enum.
 
 `credentials` declares the credential names, environment variables, auth metadata, optional refresh metadata, and optional dynamic token grant metadata for the provider type. The `auth_style` field accepts `basic`, `bearer`, `header`, `query`, or `path`. When `auth_style` is `path`, set `path_template` to a URL path containing the `{credential}` placeholder exactly once (for example, `/v1/{credential}/resources`). Static credentials are exposed as placeholder environment variables and resolved in outbound HTTP requests only at their binding endpoints. Every static credential environment key receives the full profile endpoint set when the profile defines endpoints. An endpointless profile requires explicit sandbox policy bindings for each attached provider instance. Dynamic token grants are resolved by the sandbox proxy on demand for matching profile endpoints and support `bearer` or `header` placement. Credential environment variable names must not use the reserved `v<digits>_` prefix, such as `v10_GITHUB_TOKEN`, because OpenShell uses that namespace for revision-scoped placeholders.
 
@@ -436,7 +474,9 @@ environment value under the actual environment variable key.
 
 `endpoints` contains the same endpoint object shape as sandbox network policy. A profile can use access presets, protocol-specific allow rules, deny rules, WebSocket credential rewriting, request body credential rewriting, GraphQL fields, and SSRF IP allowlists. Because profile credentials are not mapped to individual endpoints, OpenShell conservatively treats every endpoint in a profile that declares credentials as credentialed. Such endpoints require L7 inspection and cannot use `tls: skip` unless the profile explicitly sets `allow_uninspected_credentials: true`.
 
-`binaries` contains the executable paths allowed to reach the profile endpoints when the profile contributes policy to a sandbox.
+Profile validation rejects unknown `tls`, `enforcement`, and `access` values before the profile can contribute policy to a sandbox.
+
+`binaries` contains the executable paths allowed to reach the profile endpoints when the profile contributes policy to a sandbox. Write each binary as a scalar path. OpenShell also accepts the transitional object form `- path: /usr/bin/example` and exports it as a scalar. The removed `harness` property is rejected; delete it from profiles created before 0.1.0.
 
 `inference_capable` is informational metadata that marks profiles intended for
 model and inference APIs. It does not grant access, select a model, configure a
@@ -541,7 +581,7 @@ Token grant fields:
 | `jwt_svid_audience` | No | Audience used when requesting the JWT-SVID. When omitted, OpenShell derives an issuer-style audience from Keycloak token endpoint paths or falls back to the full token endpoint URL. |
 | `client_assertion_type` | No | OAuth2 `client_assertion_type` form value. Defaults to RFC 7523 `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. Set `urn:ietf:params:oauth:client-assertion-type:jwt-spiffe` when the token issuer expects the SPIFFE assertion type. |
 | `scopes` | No | OAuth2 scopes sent as a space-separated `scope` parameter. |
-| `cache_ttl_seconds` | No | Token cache TTL override. When omitted or `0`, OpenShell uses the token response `expires_in` with a 30-second safety margin and one-hour cap, or five minutes minus the margin if the response does not include an expiry. |
+| `cache_ttl` | No | Protobuf-duration cache override, such as `300s` or `0.500s`. Omission uses the token response expiry; `0s` disables caching. The legacy `cache_ttl_seconds` input remains accepted. |
 | `requested_token_type` | No | RFC 8693 `requested_token_type` sent during token exchange. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
 | `subject_token` | Required for `token_exchange` | Subject-token source used for the gateway-brokered intermediate exchange. Phase one supports `source: provider_credential`, where `credential` names another credential declared in the same profile. That referenced credential is broker-only and cannot declare workload injection metadata such as env vars, static placement, refresh, or token grant metadata. |
 | `subject_token.subject_token_type` | No | RFC 8693 `subject_token_type` for the stored subject token. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
@@ -553,9 +593,9 @@ The gateway only brokers an intermediate token for a sandbox principal, and only
 
 ## Provider Instances
 
-A provider instance stores concrete credentials and config for a profile type. Built-in profile IDs and imported custom profile IDs are accepted by `--type`.
+A provider instance stores concrete credentials and config for a profile type. `--type` accepts the ID of any imported profile, matched exactly. Creating a provider for a profile the gateway does not serve fails and names the import command.
 
-Create a GitHub provider from the built-in `github` profile:
+Create a GitHub provider from an imported `github` profile:
 
 ```shell
 openshell provider create \
@@ -575,11 +615,11 @@ openshell provider create \
 
 `--from-existing` uses the provider profile's `discovery` section. If no
 profile exists for the requested type, the command fails instead of falling
-back to the retired provider registry. The built-in `openai` profile discovers
-`OPENAI_API_KEY`; the built-in `anthropic` profile discovers
+back to the retired provider registry. The example `openai` profile discovers
+`OPENAI_API_KEY`; the example `anthropic` profile discovers
 `ANTHROPIC_API_KEY`.
 
-Create a provider from an imported custom profile:
+Create a provider from another imported profile:
 
 ```shell
 openshell provider create \
@@ -757,7 +797,7 @@ This example assumes you imported a custom profile with `id: google-drive`.
 `--secret-material-key` takes the name of a `--material` key, not the secret value. For example, use `--material client_secret="$MS_CLIENT_SECRET"` with `--secret-material-key client_secret`. Prefer `--secret-material-env` so the value does not appear in shell history. The gateway combines caller markings with authoritative profile metadata and strategy-defined secret fields, then stores those values through the active credential driver. Only the `--credential-key` value, such as `MS_GRAPH_ACCESS_TOKEN`, becomes injectable. If an OAuth response rotates a refresh token, OpenShell stores the replacement through the credential driver automatically.
 </Note>
 
-Use `--credential-expires-at` when the current provider credential already has a known expiry timestamp. For refresh-managed keys, the value can be Unix epoch milliseconds or an ISO/RFC3339 timestamp such as `2026-01-01T00:00:00Z` or `2026-01-01T01:00:00+01:00`. OpenShell stores that value as epoch milliseconds in both refresh state and provider credential metadata. Later gateway-managed refreshes replace it with the minted token expiry.
+Use `--credential-expires-at` when the current provider credential already has a known expiry timestamp. For refresh-managed keys, the value can be Unix epoch milliseconds or an ISO/RFC3339 timestamp such as `2026-01-01T00:00:00Z` or `2026-01-01T01:00:00+01:00`. OpenShell stores that value as epoch milliseconds in both refresh state and provider credential metadata. An explicit Unix epoch value remains distinct from an omitted expiry and is already expired. Later gateway-managed refreshes replace it with the minted token expiry.
 
 Force a refresh immediately:
 
@@ -804,7 +844,7 @@ openshell provider refresh delete my-graph \
   --credential-key MS_GRAPH_ACCESS_TOKEN
 ```
 
-Deleting refresh state clears the provider credential expiry only when that expiry came from the deleted refresh state. If you later set a different expiry manually with `openshell provider update --credential-expires-at`, OpenShell preserves the manual value.
+Deleting refresh state clears the provider credential expiry only when that expiry came from the deleted refresh state, including an explicit Unix epoch expiry. If you later set a different expiry manually with `openshell provider update --credential-expires-at`, OpenShell preserves the manual value.
 
 ### Refresh Logs
 
@@ -857,7 +897,7 @@ includes credential values, opaque credential handles, or config values.
 
 OpenShell stores the base policy and provider attachments separately. When a sandbox asks for its effective policy, the gateway composes the current base policy with provider policy layers just in time.
 
-For example, the built-in GitHub profile contains these endpoints and binaries:
+For example, the GitHub example profile contains these endpoints and binaries:
 
 ```yaml wordWrap showLineNumbers={false}
 id: github
@@ -962,29 +1002,66 @@ Composition follows these rules:
 
 ## Attach and Detach Providers
 
-Attach an existing provider to a running sandbox:
+Attach an existing provider and wait until the sandbox can use it:
 
 ```shell
-openshell sandbox provider attach provider-demo work-github
+openshell sandbox provider attach provider-demo work-github --wait --timeout 30
 ```
 
-Detach a provider:
+Detach a provider and wait until the sandbox stops resolving its credentials:
 
 ```shell
-openshell sandbox provider detach provider-demo work-github
+openshell sandbox provider detach provider-demo work-github --wait --timeout 30
 ```
 
 Attach and detach are idempotent. Attach validates that the provider exists before mutating the sandbox, and provider deletion fails while the provider is attached to any sandbox.
 
+### Inspect Provider Readiness
+
+Without `--wait`, attach, detach, and update confirm that the gateway saved the change. Add `--wait` when the next step depends on that change taking effect. The command succeeds after the sandbox applies the matching credentials and policy, and updates the environment used by new processes.
+
+Each result includes a change record called a `receipt` in the API. Its ID lets you check the same change later, including after a timeout:
+
+```shell
+openshell sandbox provider status provider-demo work-github --output json
+openshell sandbox provider status provider-demo work-github --receipt RECEIPT_ID --wait --timeout 30
+```
+
+Replace `RECEIPT_ID` with the `receipt_id` returned by attach, detach, or update. The ID always refers to the original change. If a later change replaces it, the status is `superseded` and the wait ends without reporting success.
+
+If attach, detach, or update reports `CONFIG_OPERATION_STORAGE_UNCERTAIN`, the change may already be saved even though the gateway could not record its readiness receipt. Do not blindly retry the mutation: inspect the provider and sandbox state and reconcile the saved change first. A receipt may be unavailable, so an error does not establish that the mutation was rolled back or that the sandbox is ready.
+
+Readiness states have these meanings:
+
+- `persisted`: the gateway saved the change; the command has not checked the sandbox yet.
+- `pending`: the sandbox has not confirmed all parts of the change.
+- `ready`: the sandbox applied the requested provider credentials, policy, and environment for new processes.
+- `revoked`: the detached provider's credentials no longer resolve, and new processes do not receive its credential references.
+- `withheld`: a credential or supervisor configuration prevents the sandbox from applying the change.
+- `failed`: the sandbox could not install the credentials, policy, or process environment.
+- `superseded`: a later change replaced the original request.
+
+The default wait is 30 seconds and the maximum is 3600 seconds. The timeout starts after the gateway saves the change and includes time spent requesting status. If time runs out, the command exits with an error and reports `wait_outcome: timed_out` with the last known state. The change remains saved and may finish applying later. Check its ID again to learn the result.
+
+An unavailable supervisor, an expired report, a failed installation, or a missing process-environment acknowledgment cannot produce `ready` or `revoked`. After a reconnect or restart, the current authenticated supervisor must report its installed state again.
+
+JSON and YAML output include change IDs, requested and installed revisions, timestamps, reason categories, and a result for each sandbox. Revision strings identify configurations; compare them for equality rather than numerical order. Status output excludes credential values, credential references, authorization headers, and raw installation errors.
+
+The `persisted_time`, `observed_time`, and `evaluated_time` fields use RFC 3339 timestamp strings. An absent `observed_time` means the current supervisor session has not supplied accepted evidence. API operation timestamps use protobuf `Timestamp`, and report intervals and observation lifetimes use protobuf `Duration`, following the [protobuf time representation](/reference/protobuf-time-types).
+
+The API's `operation` field records the common operation's historical outcome; its `operation_id` equals the receipt ID. Use the provider `state` and the wait result for current readiness. A disconnected supervisor can make the live state pending even after the operation previously applied, and a newer change can supersede the live result. Historical completion does not override those checks.
+
 ### Runtime Limitations
 
-Provider attach and detach update the persisted sandbox provider list. Running sandboxes poll for provider environment revisions and effective policy changes.
+Running sandboxes periodically check for provider and policy changes. Use `--wait` or `sandbox provider status` to confirm when a saved change has taken effect.
 
 The policy effect applies to future effective policy reads after the sandbox observes the update. The credential environment effect applies only to new process launches after the update is observed, such as later SSH, exec, or SFTP sessions.
 
-Already-running processes keep the placeholder environment they started with. OpenShell does not mutate a live process environment after provider attach, detach, or credential update. The proxy resolves existing placeholders against current credentials and bindings, so rotation, expiry, endpoint changes, and detach take effect without restarting the process. If a long-running process needs a newly attached provider credential placeholder, restart that process or launch a new process after the sandbox has observed the provider update.
+Already-running processes keep the placeholder environment they started with. For ordinary static credentials, an existing reference retains its selected revision after a value update; readiness does not retarget that reference to the replacement value. After an update wait succeeds, launch a new process to receive the updated credential reference. Gateway-managed refresh follows its own reference lifecycle. Expiry, endpoint authorization, and acknowledged detach continue to apply when the proxy resolves retained references.
 
-Detaching a provider removes its provider policy layer from future effective policy reads, revokes resolution for its existing placeholders, and removes its credential placeholders from future process environments. It does not remove the placeholder strings from already-running process environments.
+For a static provider, the sequence is attach, wait, then launch client A; update, wait, then launch client B. B's first request uses the newly installed credential. Readiness does not establish that A has stopped using its retained revision or that an old upstream key can be retired.
+
+An acknowledged detachment removes its provider policy layer from the active effective policy, revokes future resolution for its existing placeholders, and removes its credential placeholders from future process environments. It does not remove strings from already-running process environments or undo requests already forwarded upstream.
 
 OpenShell rejects provider updates and refresh configuration when they would make two providers attached to the same sandbox expose the same active credential environment key. It also rejects attached provider sets with ambiguous dynamic token grants at equal host/path specificity. Use provider-specific credential names and make one dynamic grant selector more specific when one sandbox needs multiple providers with overlapping upstream concepts.
 

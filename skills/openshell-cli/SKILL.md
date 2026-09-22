@@ -1,6 +1,6 @@
 ---
 name: openshell-cli
-description: Guide agents through using the OpenShell CLI (openshell) for sandbox management, gateway registration, provider configuration and refresh, policy iteration, settings, service exposure, BYOC workflows, and attached-provider inference. Covers basic through advanced multi-step workflows. Trigger keywords - openshell, sandbox create, sandbox exec, sandbox connect, logs, provider create, provider profile, provider refresh, policy set, policy get, settings, service expose, forward, port forward, BYOC, bring your own container, inference, use openshell, run openshell, CLI usage, manage sandbox, manage provider, gateway add, gateway select.
+description: Guide agents through using the OpenShell CLI (openshell) for sandbox management, gateway registration, provider configuration and refresh, profile management, policy iteration, settings, service exposure, BYOC workflows, and attached-provider inference. Covers basic through advanced multi-step workflows. Trigger keywords - openshell, sandbox create, sandbox exec, sandbox connect, logs, provider create, profile list, profile describe, provider refresh, policy set, policy get, settings, service expose, forward, port forward, BYOC, bring your own container, inference, use openshell, run openshell, CLI usage, manage sandbox, manage provider, gateway add, gateway select.
 ---
 
 # OpenShell CLI
@@ -37,6 +37,7 @@ Use `openshell --help` and nested `--help` output as the authority for the insta
 - [Manage gateways](https://docs.nvidia.com/openshell/latest/sandboxes/manage-gateways.md)
 - [Manage sandboxes](https://docs.nvidia.com/openshell/latest/sandboxes/manage-sandboxes.md)
 - [Manage providers](https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers.md)
+- [Profiles](https://docs.nvidia.com/openshell/latest/providers/profiles.md)
 - [Sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
 - [Inference routing](https://docs.nvidia.com/openshell/latest/sandboxes/inference-routing.md)
 
@@ -84,15 +85,20 @@ An explicit trailing command is foreground even when stdin or stdout is not a
 terminal. The CLI streams its stdout and stderr and returns its exact exit
 status. Exit code 0 leaves a retained sandbox in `Completed`; nonzero leaves it
 in `Error` with `MainProcessFailed`. Use `--no-keep` to delete either result
-after output drains, or `--detach` for a long-running service.
+after output drains, or `--detach` for a long-running service. Combine
+`--detach --no-keep` when the gateway should run the service without a host
+attachment and delete its sandbox after the service exits.
 
 When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
 
-**Shortcut for known tools**: When the trailing command is a recognized tool, the CLI auto-creates the required provider from local credentials:
+Provider attachment is explicit. Name each provider with `--provider`; the
+trailing command does not select or attach one. If the named provider does not
+exist but a profile with that ID is available, the CLI can create it from local
+credentials:
 
 ```bash
-openshell sandbox create -- claude        # Auto-creates claude provider
-openshell sandbox create -- codex         # Auto-creates codex provider
+openshell sandbox create --from registry.example.com/your-org/claude-agent:latest --provider claude-code -- claude
+openshell sandbox create --from registry.example.com/your-org/codex-agent:latest --provider codex -- codex
 ```
 
 The agent will be prompted interactively if credentials are missing.
@@ -109,11 +115,11 @@ openshell sandbox delete <name>
 
 ## Workflow 2: Provider Management
 
-Providers supply credentials and provider-specific configuration to sandboxes. Provider types come from built-in and custom profiles; do not rely on a hard-coded type list. Discover the profiles available on the selected gateway:
+Providers supply credentials and provider-specific configuration to sandboxes. Provider profiles are import-only: a gateway serves exactly what an operator imported, and a new gateway serves an empty catalog. Never rely on a hard-coded type list or on a legacy alias such as `gh` or `claude` — `--type` matches a profile ID exactly. Discover the profiles available on the selected gateway:
 
-```bash
-openshell provider list-profiles
-openshell provider list-profiles --output json
+```shell
+openshell profile list
+openshell profile list --type provider --output json
 ```
 
 ### Create a provider from local credentials
@@ -136,7 +142,7 @@ Bare `KEY` reads the value from the environment variable of that name and avoids
 Other credential sources are `--from-gcloud-adc` for compatible profiles and `--runtime-credentials` when the gateway or sandbox resolves the required credentials at runtime.
 
 Static provider credentials resolve only for hosts, ports, and paths declared by
-the provider profile. Use `provider profile export` to inspect that boundary
+the provider profile. Use `profile export` to inspect that boundary
 when a placeholder is present but requests receive
 `credential_endpoint_mismatch`. A profileless static provider fails closed
 because the gateway cannot construct a binding.
@@ -154,13 +160,22 @@ enforced.
 
 ### Inspect and manage provider profiles
 
-```bash
-openshell provider profile export github --output yaml
-openshell provider profile lint --file ./my-profile.yaml
-openshell provider profile import --file ./my-profile.yaml
+```shell
+openshell profile describe github
+openshell profile export github --output yaml
+openshell profile lint --file ./my-profile.yaml
+openshell profile import --file ./my-profile.yaml
 ```
 
+Use `profile describe` to inspect a definition's credential metadata, endpoints, TLS handling, MCP access settings, rule counts, binaries, source, and scope before creating a provider. Check for `tls: skip` and the uninspected-credential opt-in before relying on displayed L7 rules. List and describe accept table, JSON, and YAML output; use structured output for complete rule definitions, `--workspace` for a workspace catalog, or `--global` for platform scope. Use `profile export` when preparing an editable definition, `profile update <id> --file <file>` to replace an existing custom profile with its current resource version, and `profile delete <id>...` to remove custom profiles. Provider instances remain under `provider`.
+
+Existing scripts can continue using `provider list-profiles` and `provider profile export/import/update/lint/delete`. These commands share the top-level handlers and preserve their arguments, output options, and workspace/global flags. Prefer `profile` when writing new commands.
+
 ### List, inspect, update, delete
+
+Use `openshell sandbox provider status --help` and the attach, detach, and update help to find the installed version's wait options. Add `--wait` when the next step depends on a provider change taking effect. Without it, a successful command only confirms that the gateway saved the change. Save the returned `receipt_id` to check that same change later, and inspect the result for every selected sandbox. Credential refresh status confirms that OpenShell obtained credentials; provider status confirms that the sandbox applied them, activated the policy, and updated the environment for new processes. If the status is `superseded`, explain that a later change replaced the request and inspect that change separately.
+
+If attach, detach, or update reports `CONFIG_OPERATION_STORAGE_UNCERTAIN`, explain that the change may already be saved and its readiness receipt may be unavailable. Do not blindly retry the mutation. Inspect the provider and sandbox state and reconcile the saved change before deciding on another mutation; the error proves neither rollback nor readiness.
 
 ```bash
 openshell provider list
@@ -243,6 +258,7 @@ openshell sandbox create \
 ```
 
 Key flags:
+
 - `--provider`: Attach configured credential providers for API keys, tokens, and other secrets (repeatable)
 - `--policy`: Custom policy YAML (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var)
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
@@ -263,7 +279,9 @@ Key flags:
 `--detach` adds no attachment grace period. When the canonical process exits,
 its terminal phase is reported immediately. A foreground create declares one
 expected main-process SSH attachment; cleanup finalizes after that connection
-closes naturally.
+closes naturally. With `--detach --no-keep`, the gateway owns the detached
+process lifecycle and deletes the ephemeral sandbox after terminal reporting
+finishes.
 
 Do not combine `--upload` with a trailing main command. Uploads currently finish
 after the canonical process starts; create a scratch sandbox and use
@@ -274,7 +292,7 @@ image, environment, sizing, or driver-specific configuration:
 
 ```bash
 openshell sandbox template create gpu-kata \
-  --image ghcr.io/nvidia/openshell-community/sandboxes/python:latest \
+  --image registry.example.com/agents/python:latest \
   --cpu 2 \
   --memory 4Gi \
   --gpu 1 \
@@ -290,7 +308,7 @@ creates. Put driver config on a template only when it should be reused.
 
 ```bash
 openshell sandbox template create gpu-kata \
-  --image ghcr.io/nvidia/openshell-community/sandboxes/python:latest \
+  --image registry.example.com/agents/python:latest \
   --cpu 2 \
   --memory 4Gi \
   --gpu 1 \
@@ -374,8 +392,9 @@ provider instead of passing API keys, tokens, or other secrets to `sandbox exec`
 ```bash
 openshell sandbox provider list my-sandbox
 openshell sandbox provider list my-sandbox --output json
-openshell sandbox provider attach my-sandbox my-github
-openshell sandbox provider detach my-sandbox my-github
+openshell sandbox provider attach my-sandbox my-github --wait --timeout 30
+openshell sandbox provider status my-sandbox my-github --output json
+openshell sandbox provider detach my-sandbox my-github --wait --timeout 30
 ```
 
 Structured attachment output contains provider names, types, and sorted
@@ -406,6 +425,11 @@ openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 openshell sandbox delete --all
 ```
 
+`deletion accepted` means cleanup is still pending. Inspect the sandbox until
+it disappears before assuming completion. An already-absent sandbox succeeds;
+missing workspaces and authorization failures remain errors. Do not blindly
+retry by name if another process might have recreated that name.
+
 ### Stop and start sandboxes
 
 Use stop to halt compute while retaining the sandbox and its persistent
@@ -430,7 +454,21 @@ the operation that removes retained state.
 
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
-**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
+**Key concept**: Policies have static fields (immutable after activation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
+
+If startup reports `ConfigurationInvalid`, inspect `openshell sandbox get` and
+repair the complete policy or provider set through the gateway. The workload
+has not started on its first activation, so static fields can also be replaced
+during this initial repair. A previously activated sandbox retains static-field
+restrictions while restart admission is pending or rejected.
+Before the gateway's 300-second repair window expires, successful validation
+completes startup in place. Effective stored configuration changes and their
+first failed load reset that window; repeated failures do not. After
+`ProvisioningTimedOut`, inspect the retained record and cleanup status, repair
+configuration, and explicitly run `sandbox start` once cleanup completes. A CLI
+wait timeout is separate from this gateway deadline. Follow the
+published [policy repair guidance](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
+and confirm current replacement/detach syntax with installed CLI help.
 
 An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
 `protocol: tcp` requests policy DNS and transparent TCP and currently requires
@@ -463,7 +501,7 @@ Create sandbox with initial policy
 ### Step 1: Create sandbox with initial policy
 
 ```bash
-openshell sandbox create --name dev --policy ./initial-policy.yaml -- claude
+openshell sandbox create --name dev --from registry.example.com/your-org/claude-agent:latest --policy ./initial-policy.yaml -- claude
 ```
 
 Sandboxes stay alive by default for iteration. Add `--no-keep` only when the sandbox should be deleted automatically after the initial session.
@@ -477,6 +515,7 @@ openshell logs dev --tail --source sandbox
 ```
 
 Look for log lines with `action: deny` -- these indicate blocked network requests. The logs include:
+
 - **Destination host and port** (what was blocked)
 - **Binary path** (which process attempted the connection)
 - **Deny reason** (why it was blocked)
@@ -492,17 +531,22 @@ The `--full` flag includes the effective policy, including provider-composed ent
 ### Step 4: Modify the policy
 
 Edit `current-policy.yaml` to allow the blocked actions. **For policy content authoring, delegate to the `generate-sandbox-policy` skill.** That skill handles:
+
 - Network endpoint rule structure
 - L4 vs REST, WebSocket, JSON-RPC, MCP, and SQL L7 policy decisions
 - Access presets (`read-only`, `read-write`, `full`)
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
 - Binary matching patterns
-- Ordered `network_middlewares`, host selection, HTTP and WebSocket bindings, and `fail_open` or `fail_closed` behavior
+- Ordered `network_middlewares`, host selection, HTTP request/response and WebSocket bindings, and `fail_open` or `fail_closed` behavior
 
 `network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
-Middleware can inspect parsed HTTP request bodies and complete client-to-upstream WebSocket text messages over both `ws://` and `wss://` when the implementation advertises the matching binding. The built-in `openshell/regex` advertises both bindings and applies its fixed patterns to UTF-8 text. A host-matched HTTP-only attachment can inspect the upgrade GET but does not join the WebSocket chain; look for `binding_not_selected` coverage. Binary messages pass under both `on_error` modes and active stages emit `unsupported_message_type` coverage; upstream-to-client messages remain uninspected. A broken fail-open WebSocket stage is disabled for the rest of that connection; inspect sandbox OCSF logs for `openshell.middleware.websocket_stage_disabled`.
+Middleware can inspect HTTP requests, HTTP responses, or client WebSocket text
+messages when the implementation advertises the matching binding. The built-in
+`openshell/regex` supports request bodies and client WebSocket text messages.
+Use the `generate-sandbox-policy` skill to choose attachments and failure policy,
+and `debug-openshell-cluster` to investigate middleware failures.
 
 ### Step 5: Push the updated policy
 
@@ -521,6 +565,7 @@ endpoint, or an explicit binding to an endpointless AWS profile. Fix the
 conflicting endpoint selectors or credential source and submit again.
 
 The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls every second). Exit codes:
+
 - **0**: Policy loaded successfully
 - **1**: Policy load failed
 - **124**: Timeout (default 60 seconds)
@@ -542,7 +587,7 @@ Return to Step 2. Continue monitoring logs and refining the policy until all req
 View all revisions to understand how the policy evolved:
 
 ```bash
-openshell policy list dev --limit 50
+openshell policy list dev --page-size 50
 openshell policy list dev --output json
 ```
 
@@ -589,15 +634,14 @@ docker build -t my-app:latest .
 openshell sandbox create --from my-app:latest --name my-app
 ```
 
-The `--from` flag accepts an existing full image reference such as `myregistry.com/img:tag`, or a community sandbox name such as `ollama`. Build local Dockerfiles first with the same container engine as the local gateway, then pass the image tag.
+The `--from` flag accepts an explicit OCI image reference such as `myregistry.com/img:tag`. It does not expand catalog aliases. Build local Dockerfiles first with the same container engine as the local gateway, then pass the image tag.
 
-Use `docker build -t my-app:latest` for Docker gateways. For Podman gateways, use `podman build -t localhost/my-app:latest` and pass `localhost/my-app:latest` to `--from`. For remote gateways, push the image to a registry reachable by the gateway. Bare community names resolve under `ghcr.io/nvidia/openshell-community/sandboxes` unless `OPENSHELL_COMMUNITY_REGISTRY` overrides the prefix.
+Use `docker build -t my-app:latest` for Docker gateways. For Podman gateways, use `podman build -t localhost/my-app:latest` and pass `localhost/my-app:latest` to `--from`. For remote gateways, push the image to a registry reachable by the gateway.
 
 For Docker and Podman gateways, custom images should declare a non-root OCI
-`USER`. Each explicit `process.run_as_user` or `process.run_as_group` policy
+`USER`. Images without one run as numeric UID and GID `1000`. Each explicit `process.run_as_user` or `process.run_as_group` policy
 field wins independently; omitted fields fall back to the image declaration.
-An image with no `USER` fails before readiness unless policy supplies both
-fields. Explicit numeric fields may use any UID/GID from `1` through
+Explicit numeric fields may use any UID/GID from `1` through
 `4294967294`; `0` is root and `4294967295` is the invalid identity sentinel.
 Warn users that low IDs can inherit permissions from matching accounts, image
 files, mounted volumes, or devices.
@@ -630,9 +674,9 @@ validated process state:
 openshell forward list --output json
 ```
 
-Each record includes `sandbox`, `bind_address`, `port`, `pid`, and `alive`.
-The `alive` boolean validates the tracked process identity; it does not probe
-the forwarded socket.
+Each record includes `workspace`, `sandbox`, `bind_address`, `port`, `pid`, and
+`alive`. The `alive` boolean validates the workspace-scoped sandbox and tracked
+process identity; it does not probe the forwarded socket.
 
 Create and forward in one command:
 
@@ -673,7 +717,7 @@ When denied actions appear:
 
 1. Prefer incremental updates for additive network changes:
    `openshell policy update work-session --add-endpoint api.github.com:443:read-only:rest:enforce --binary /usr/bin/gh --wait`
-   `openshell policy update work-session --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
+   `openshell policy update work-session --rule-name allow_api_github_com_443 --binary /usr/bin/gh --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
 
    A rule authorizes every binary it lists to reach every endpoint it lists, so
    an update that adds a binary or an endpoint to an existing rule must declare
@@ -684,10 +728,7 @@ When denied actions appear:
    `--rule-name`; it stays on its own rule instead of folding into the broader
    one.
 
-   `--add-allow` and `--add-deny` select an endpoint by host and port alone. If
-   that host and port appears in more than one rule, or twice in one rule under
-   different paths, the update is rejected as ambiguous. Fall back to full YAML
-   replacement for those endpoints.
+   `--add-allow` and `--add-deny` require `--rule-name` and the complete binary scope through repeated `--binary` or explicit `--any-binary`. Declare every port on the endpoint in the operation, for example `api.example.com:443,8443:POST:/admin`. Use `--endpoint-path` to disambiguate endpoints within the selected rule; an explicitly empty path selects an endpoint without a path selector. The gateway rejects missing or mismatched scope before persistence. Inspect the current policy and confirm the intended affected scope; do not automatically fill declarations from current policy just to make a rejection pass.
 2. Use full YAML replacement for broad changes or non-network fields, including
    any change that would otherwise require restating a large existing scope:
    `openshell policy get work-session --full > policy.yaml`
@@ -710,14 +751,14 @@ endpoint, create the provider, and attach it only to sandboxes that need it:
 ```bash
 openshell provider profile import -f ./inference-provider.yaml
 openshell provider create --name model-provider --type <profile-id> --credential <KEY>
-openshell sandbox provider attach work-session model-provider
+openshell sandbox provider attach work-session model-provider --wait --timeout 30
 openshell sandbox exec work-session -- <client-command>
 ```
 
 The application owns the native base URL, model, request shape, and timeout.
-Launch a new process after attaching a provider so it inherits the provider
-credential placeholder. Use the `debug-inference` skill for endpoint, policy,
-credential-binding, or migration failures.
+Launch a new process after attachment readiness so it inherits the installed provider environment. Use the `debug-inference` skill for endpoint, policy, credential-binding, or migration failures.
+
+For an ordinary static provider update, wait for the update and launch a new client process to obtain the new reference. Do not claim that readiness updates the environment of an existing process or retargets its old reference. Acknowledged detach revokes retained references and removes them from future process environments.
 
 ## Workflow 8: Gateway Management
 
@@ -730,6 +771,8 @@ openshell gateway select production
 openshell gateway info --name production
 openshell status
 ```
+
+`openshell gateway info` reports the immutable startup snapshot for compute drivers, credential drivers, gateway interceptors, and supervisor middleware. Use each entry's protocol version, implementation version, supported capabilities, and gateway requirements when diagnosing extension skew; implementation versions do not identify underlying Docker, Kubernetes, or credential backends.
 
 Register or remove gateways:
 
@@ -790,6 +833,14 @@ openshell forward start 127.0.0.1:8080 my-app -d
 # gRPC relay to a loopback TCP service, with an optional dynamic local port.
 openshell forward service my-app --target-port 8000 --local 127.0.0.1:0
 
+# Create a sandbox with its unnamed HTTP or WebSocket service exposed.
+openshell sandbox create \
+  --name my-app \
+  --from my-app:latest \
+  --expose 8080 \
+  --detach \
+  -- ./start-server.sh
+
 # Expose and manage an HTTP service through the gateway.
 openshell service expose my-app 8080 web
 openshell service list my-app
@@ -797,6 +848,14 @@ openshell service list my-app --output json
 openshell service get my-app web
 openshell service delete my-app web
 ```
+
+Use `openshell service list --all-workspaces` for a Platform Admin view across
+workspaces. A sandbox name and `--all-workspaces` are mutually exclusive.
+
+`sandbox create --expose PORT` registers the unnamed endpoint in the create
+request and keeps the sandbox running. Add `--output json` for automation; the
+result contains a `service_urls` map whose empty key is the unnamed endpoint.
+Use `openshell service expose` after creation to add or update named endpoints.
 
 Prefer loopback binds unless the user explicitly needs LAN-visible local access.
 
@@ -830,4 +889,4 @@ $ openshell sandbox upload --help
 |-------|------------|
 | `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration, and network middleware) |
 | `debug-openshell-cluster` | Diagnosing gateway deployment, runtime, or health failures |
-| `debug-inference` | Diagnosing attached-provider inference, native endpoints, host-backed models, and migration from `inference.local` |
+| `debug-inference` | Diagnosing attached-provider inference, native endpoints, host-backed models, and migration from the retired managed endpoint |

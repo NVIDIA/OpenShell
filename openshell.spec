@@ -58,6 +58,14 @@ lifecycle management. This package installs Podman-oriented defaults in
 gateway TOML while leaving compute driver selection to gateway auto-detection
 or explicit operator configuration.
 
+# --- Standalone policy prover sub-package ---
+%package prover
+Summary:        Standalone OpenShell policy boundary prover
+
+%description prover
+OpenShell policy prover for checking whether a local candidate policy stays
+within an operator-supplied maximum without connecting to a gateway.
+
 # --- Python SDK sub-package ---
 %package -n python3-%{name}
 Summary:        OpenShell Python SDK for agent execution and management
@@ -87,6 +95,7 @@ grep -q 'version = "%{openshell_cargo_version}"' Cargo.toml || (echo "ERROR: Car
 %build
 test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell"
 test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-gateway"
+test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-prover"
 
 # Generate vendored crate manifest and license metadata.
 # cargo-vendor.txt is consumed by an RPM generator (from cargo-rpm-macros)
@@ -103,6 +112,9 @@ pandoc -s -t man deploy/man/openshell-gateway.8.md -o openshell-gateway.8
 # --- CLI binary ---
 install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}" %{buildroot}%{_bindir}/%{name}
 
+# --- Standalone policy prover ---
+install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-prover" %{buildroot}%{_bindir}/%{name}-prover
+
 # --- Gateway binary ---
 install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-gateway" %{buildroot}%{_bindir}/%{name}-gateway
 
@@ -110,6 +122,8 @@ install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-gateway" %{buildro
 # Shipped as a read-only reference in %{_datadir}. The systemd unit seeds a
 # user-level copy at ~/.config/openshell/gateway.toml on first start.
 install -Dpm 0644 deploy/rpm/gateway.toml.default %{buildroot}%{_datadir}/%{name}-gateway/gateway.toml.default
+install -Dpm 0644 deploy/rpm/gateway.toml.default.v1 %{buildroot}%{_datadir}/%{name}-gateway/gateway.toml.default.v1
+install -Dpm 0755 deploy/rpm/migrate-gateway-config.sh %{buildroot}%{_libexecdir}/%{name}-gateway-migrate-config
 
 # --- Gateway systemd user unit ---
 # Installed to the systemd user unit directory so any user can run:
@@ -129,11 +143,14 @@ Type=exec
 # the CLI discovers them automatically.
 # See /usr/share/doc/openshell-gateway/ for details.
 
-# Seed a default TOML config on first start if the user has not created one.
-# The template ships at /usr/share/openshell-gateway/gateway.toml.default.
-# Edit ~/.config/openshell/gateway.toml to customize.
+# Seed a default TOML config on first start. On upgrade, replace only the exact
+# schema-v1 config previously seeded by this package; preserve edited files.
 # %%E expands to $XDG_CONFIG_HOME (~/.config) in user units.
-ExecStartPre=/bin/sh -c 'test -f %%E/openshell/gateway.toml || install -Dm644 /usr/share/openshell-gateway/gateway.toml.default %%E/openshell/gateway.toml'
+ExecStartPre=%{_libexecdir}/%{name}-gateway-migrate-config %%E/openshell/gateway.toml /usr/share/openshell-gateway/gateway.toml.default /usr/share/openshell-gateway/gateway.toml.default.v1
+
+# Reject an invalid selected configuration before generating certificates or
+# starting the gateway. The environment file below applies to every command.
+ExecStartPre=/usr/bin/openshell-gateway config preflight
 
 # Auto-generate PKI on first start if not present.
 # The default local TLS dir uses %%h because %%S resolves differently across
@@ -204,6 +221,9 @@ touch %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-in
 # Smoke-test the CLI binary
 %{buildroot}%{_bindir}/%{name} --version
 
+# Smoke-test the standalone policy prover
+%{buildroot}%{_bindir}/%{name}-prover --version
+
 # Smoke-test the gateway binary
 %{buildroot}%{_bindir}/%{name}-gateway --version
 
@@ -217,10 +237,12 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata
 # A missing template means first-start seeding silently falls back to the
 # binary default of 127.0.0.1, which breaks Podman sandbox connectivity.
 test -f %{buildroot}%{_datadir}/%{name}-gateway/gateway.toml.default
+test -f %{buildroot}%{_datadir}/%{name}-gateway/gateway.toml.default.v1
+test -x %{buildroot}%{_libexecdir}/%{name}-gateway-migrate-config
 
-# Verify the systemd unit references the template in its ExecStartPre seed step.
-# If this grep fails, the first-start seeding logic was removed from the unit.
-grep -q 'gateway.toml.default' %{buildroot}%{_userunitdir}/%{name}-gateway.service
+# Verify the systemd unit invokes exact-default migration before startup.
+grep -q '%{name}-gateway-migrate-config' %{buildroot}%{_userunitdir}/%{name}-gateway.service
+grep -q 'gateway.toml.default.v1' %{buildroot}%{_userunitdir}/%{name}-gateway.service
 
 %post gateway
 %systemd_user_post %{name}-gateway.service
@@ -239,6 +261,12 @@ grep -q 'gateway.toml.default' %{buildroot}%{_userunitdir}/%{name}-gateway.servi
 %{_bindir}/%{name}
 %{_mandir}/man1/openshell.1*
 
+%files prover
+%license LICENSE
+%license LICENSE.dependencies
+%license cargo-vendor.txt
+%{_bindir}/%{name}-prover
+
 %files gateway
 %license LICENSE
 %license LICENSE.dependencies
@@ -248,7 +276,9 @@ grep -q 'gateway.toml.default' %{buildroot}%{_userunitdir}/%{name}-gateway.servi
 %doc %{_docdir}/%{name}-gateway/TROUBLESHOOTING.md
 %{_bindir}/%{name}-gateway
 %{_userunitdir}/%{name}-gateway.service
+%{_libexecdir}/%{name}-gateway-migrate-config
 %{_datadir}/%{name}-gateway/gateway.toml.default
+%{_datadir}/%{name}-gateway/gateway.toml.default.v1
 %{_mandir}/man8/openshell-gateway.8*
 
 %files -n python3-%{name}

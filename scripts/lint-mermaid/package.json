@@ -9,6 +9,6 @@
     "mermaid": "^11.4.0"
   },
   "overrides": {
-    "dompurify": "3.4.12"
+    "dompurify": "3.4.15"
   }
 }

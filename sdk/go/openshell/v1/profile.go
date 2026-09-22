@@ -55,10 +55,11 @@ const (
 
 // ProfileInterface defines operations for managing provider profiles.
 type ProfileInterface interface {
-	List(ctx context.Context, workspace string, opts ...ListOptions) ([]*ProviderProfile, error)
+	List(workspace string, opts ...ListOptions) (*Pager[*ProviderProfile], error)
+	ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*ProviderProfile, error)
 	Get(ctx context.Context, workspace, id string) (*ProviderProfile, error)
 	Import(ctx context.Context, workspace string, items []ProfileImportItem) (*ImportResult, error)
 	Update(ctx context.Context, workspace, id string, expectedResourceVersion uint64, item ProfileImportItem) (*UpdateResult, error)
 	Lint(ctx context.Context, workspace string, items []ProfileImportItem) (*LintResult, error)
-	Delete(ctx context.Context, workspace, id string) (bool, error)
+	Delete(ctx context.Context, workspace, id string, opts ...DeleteOptions) (*DeletionResult, error)
 }

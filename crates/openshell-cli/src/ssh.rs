@@ -5,9 +5,10 @@
 
 use crate::color::Colorize;
 use crate::tls::{TlsOptions, grpc_client};
-use miette::{IntoDiagnostic, Result, WrapErr};
+use miette::{IntoDiagnostic, Report, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+use openshell_core::driver_mounts;
 use openshell_core::forward::{
     ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
     validate_ssh_session_response, write_forward_pid,
@@ -16,7 +17,6 @@ use openshell_core::proto::{
     CreateSshSessionRequest, GetSandboxRequest, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
     tcp_forward_init,
 };
-use openshell_core::{ObjectId, driver_mounts};
 use std::fs;
 use std::future::Future;
 use std::io::{IsTerminal, Write};
@@ -44,6 +44,8 @@ const FORWARD_LISTENER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 /// command has already reported its terminal result.
 const TERMINAL_RELAY_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_RELAY_REGISTRATION_INTERVAL: Duration = Duration::from_millis(50);
+const SYNC_RETRY_ATTEMPTS: usize = 4;
+const SYNC_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug)]
 pub enum Editor {
@@ -74,6 +76,7 @@ impl Editor {
 struct SshSessionConfig {
     proxy_command: String,
     sandbox_id: String,
+    sandbox_name: String,
     gateway_url: String,
     token: String,
     main_terminal: bool,
@@ -88,11 +91,13 @@ async fn ssh_session_config(
 ) -> Result<SshSessionConfig> {
     let mut client = grpc_client(server, tls).await?;
 
-    // Resolve sandbox name to id.
+    // Resolve the sandbox and retain its ID for local lifecycle tracking.
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                (workspace).to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -105,7 +110,10 @@ async fn ssh_session_config(
     let response = loop {
         match client
             .create_ssh_session(CreateSshSessionRequest {
-                sandbox_id: sandbox.object_id().to_string(),
+                sandbox: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (workspace).to_string(),
+                )),
             })
             .await
         {
@@ -150,7 +158,8 @@ async fn ssh_session_config(
     let proxy_command = build_proxy_command(
         &exe_command,
         &gateway_url,
-        &session.sandbox_id,
+        name,
+        workspace,
         &session.token,
         gateway_name,
     );
@@ -158,6 +167,7 @@ async fn ssh_session_config(
     Ok(SshSessionConfig {
         proxy_command,
         sandbox_id: session.sandbox_id.clone(),
+        sandbox_name: name.to_string(),
         gateway_url,
         token: session.token,
         main_terminal: sandbox.spec.as_ref().is_none_or(|spec| spec.tty),
@@ -391,6 +401,11 @@ pub async fn sandbox_forward(
         .arg("-N")
         .arg("-o")
         .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg(format!(
+            "SetEnv=OPENSHELL_FORWARD_SANDBOX_ID={}",
+            session.sandbox_id
+        ))
         .arg("-L")
         .arg(spec.ssh_forward_arg());
 
@@ -426,6 +441,7 @@ pub async fn sandbox_forward(
         }
 
         track_background_forward_or_cleanup(
+            workspace,
             name,
             port,
             pid,
@@ -561,6 +577,7 @@ fn terminate_owned_forward_child(child: &mut Child) {
 
 /// Track a verified background forward, cleaning it up if PID-file persistence fails.
 fn track_background_forward_or_cleanup(
+    workspace: &str,
     name: &str,
     port: u16,
     pid: u32,
@@ -568,7 +585,7 @@ fn track_background_forward_or_cleanup(
     bind_addr: &str,
     cleanup: impl FnOnce(),
 ) -> Result<()> {
-    if let Err(err) = write_forward_pid(name, port, pid, sandbox_id, bind_addr) {
+    if let Err(err) = write_forward_pid(workspace, name, port, pid, sandbox_id, bind_addr) {
         cleanup();
         return Err(err)
             .wrap_err("local forward listener was reachable but tracking the SSH process failed");
@@ -644,6 +661,7 @@ pub async fn sandbox_exec(
 }
 
 /// What to pack into the tar archive streamed to the sandbox.
+#[derive(Clone)]
 enum UploadSource {
     /// A single local file or directory.  `tar_name` controls the entry name
     /// inside the archive (e.g. the target basename for file-to-file uploads).
@@ -1021,18 +1039,15 @@ pub async fn sandbox_sync_up_files(
     if files.is_empty() {
         return Ok(());
     }
-    ssh_tar_upload(
-        server,
-        name,
-        dest,
-        UploadSource::FileList {
-            base_dir: base_dir.to_path_buf(),
-            files: files.to_vec(),
-            archive_prefix: file_list_archive_prefix(local_path),
-        },
-        tls,
-        workspace,
-    )
+    let source = UploadSource::FileList {
+        base_dir: base_dir.to_path_buf(),
+        files: files.to_vec(),
+        archive_prefix: file_list_archive_prefix(local_path),
+    };
+    retry_sandbox_sync("upload", || {
+        let source = source.clone();
+        async move { ssh_tar_upload(server, name, dest, source, tls, workspace).await }
+    })
     .await
 }
 
@@ -1067,17 +1082,16 @@ pub async fn sandbox_sync_up(
     {
         let (parent, target_name) = split_sandbox_path(path);
         if parent != "/" {
-            return ssh_tar_upload(
-                server,
-                name,
-                Some(parent),
-                UploadSource::SinglePath {
-                    local_path: local_path.to_path_buf(),
-                    tar_name: target_name.into(),
-                },
-                tls,
-                workspace,
-            )
+            let source = UploadSource::SinglePath {
+                local_path: local_path.to_path_buf(),
+                tar_name: target_name.into(),
+            };
+            return retry_sandbox_sync("upload", || {
+                let source = source.clone();
+                async move {
+                    ssh_tar_upload(server, name, Some(parent), source, tls, workspace).await
+                }
+            })
             .await;
         }
     }
@@ -1095,17 +1109,14 @@ pub async fn sandbox_sync_up(
         directory_upload_prefix(local_path)
     };
 
-    ssh_tar_upload(
-        server,
-        name,
-        sandbox_path,
-        UploadSource::SinglePath {
-            local_path: local_path.to_path_buf(),
-            tar_name,
-        },
-        tls,
-        workspace,
-    )
+    let source = UploadSource::SinglePath {
+        local_path: local_path.to_path_buf(),
+        tar_name,
+    };
+    retry_sandbox_sync("upload", || {
+        let source = source.clone();
+        async move { ssh_tar_upload(server, name, sandbox_path, source, tls, workspace).await }
+    })
     .await
 }
 
@@ -1245,6 +1256,20 @@ pub async fn sandbox_sync_down(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
+    retry_sandbox_sync("download", || async {
+        sandbox_sync_down_once(server, name, sandbox_path, dest, tls, workspace).await
+    })
+    .await
+}
+
+async fn sandbox_sync_down_once(
+    server: &str,
+    name: &str,
+    sandbox_path: &str,
+    dest: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<()> {
     let session = ssh_session_config(server, name, tls, workspace, None).await?;
     let sandbox_path = resolve_sandbox_source_path(&session, sandbox_path).await?;
     let kind = probe_sandbox_source_kind(&session, &sandbox_path).await?;
@@ -1255,6 +1280,54 @@ pub async fn sandbox_sync_down(
             sandbox_sync_down_directory(&session, &sandbox_path, dest).await
         }
     }
+}
+
+async fn retry_sandbox_sync<F, Fut>(operation: &str, mut run: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let mut attempt = 1;
+    loop {
+        match run().await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < SYNC_RETRY_ATTEMPTS && sync_error_is_retryable(&error) => {
+                tracing::warn!(
+                    operation,
+                    attempt,
+                    max_attempts = SYNC_RETRY_ATTEMPTS,
+                    error = %error,
+                    "sandbox sync operation failed; retrying"
+                );
+                tokio::time::sleep(SYNC_RETRY_DELAY).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn sync_error_is_retryable(error: &Report) -> bool {
+    let message = format!("{error:?}").to_ascii_lowercase();
+    [
+        "broken pipe",
+        "connection",
+        "early eof",
+        "http2",
+        "h2 protocol",
+        "reset before headers",
+        "service is currently unavailable",
+        "transport error",
+        "unexpected eof",
+        "unavailable",
+        "upstream connect error",
+        "ssh probe exited with status exit status: 255",
+        "ssh tar create exited",
+        "ssh tar extract exited",
+        "failed to extract tar archive from sandbox",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 /// Stream a tar archive from the sandbox and extract it into a fresh
@@ -1425,7 +1498,8 @@ async fn sandbox_sync_down_directory(
 /// Run the SSH proxy, connecting stdin/stdout to the gateway.
 pub async fn sandbox_ssh_proxy(
     gateway_url: &str,
-    sandbox_id: &str,
+    sandbox_name: &str,
+    workspace: &str,
     token: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -1436,8 +1510,9 @@ pub async fn sandbox_ssh_proxy(
     tx.send(TcpForwardFrame {
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
-                sandbox_id: sandbox_id.to_string(),
-                service_id: format!("ssh-proxy:{sandbox_id}"),
+                sandbox: sandbox_name.to_string(),
+                workspace: (workspace).to_string(),
+                service_id: format!("ssh-proxy:{sandbox_name}"),
                 target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget {})),
                 authorization_token: token.to_string(),
             },
@@ -1530,7 +1605,8 @@ pub async fn sandbox_ssh_proxy_by_name(
     let session = ssh_session_config(server, name, tls, workspace, None).await?;
     sandbox_ssh_proxy(
         &session.gateway_url,
-        &session.sandbox_id,
+        &session.sandbox_name,
+        workspace,
         &session.token,
         tls,
     )
@@ -1771,6 +1847,28 @@ mod tests {
     }
 
     #[test]
+    fn sync_error_retry_filter_accepts_transport_failures() {
+        let error = miette::miette!("transport error: connection reset by peer");
+        assert!(sync_error_is_retryable(&error));
+    }
+
+    #[test]
+    fn sync_error_retry_filter_accepts_transient_ssh_probe_failures() {
+        let error = Err::<(), _>(miette::miette!(
+            "ssh probe exited with status exit status: 255"
+        ))
+        .wrap_err("failed to resolve sandbox source path '/sandbox/ha-sync/ha-sync-upload'")
+        .unwrap_err();
+        assert!(sync_error_is_retryable(&error));
+    }
+
+    #[test]
+    fn sync_error_retry_filter_rejects_validation_failures() {
+        let error = miette::miette!("sandbox source path '/etc/passwd' resolves outside /sandbox");
+        assert!(!sync_error_is_retryable(&error));
+    }
+
+    #[test]
     #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
     fn install_ssh_config_adds_include_once_and_updates_managed_file() {
         let _guard = TEST_ENV_LOCK
@@ -1933,10 +2031,17 @@ mod tests {
         }
 
         let mut cleaned_up = false;
-        let result =
-            track_background_forward_or_cleanup("demo", 8080, 4242, "sbx-1", "127.0.0.1", || {
+        let result = track_background_forward_or_cleanup(
+            "default",
+            "demo",
+            8080,
+            4242,
+            "sbx-1",
+            "127.0.0.1",
+            || {
                 cleaned_up = true;
-            });
+            },
+        );
 
         unsafe {
             match old_xdg {
@@ -1969,12 +2074,19 @@ mod tests {
         }
 
         let mut cleaned_up = false;
-        let result =
-            track_background_forward_or_cleanup("demo", 8080, 4242, "sbx-1", "127.0.0.1", || {
+        let result = track_background_forward_or_cleanup(
+            "default",
+            "demo",
+            8080,
+            4242,
+            "sbx-1",
+            "127.0.0.1",
+            || {
                 cleaned_up = true;
-            });
-        let pid_file_exists =
-            openshell_core::forward::forward_pid_path("demo", 8080).is_ok_and(|path| path.exists());
+            },
+        );
+        let pid_file_exists = openshell_core::forward::forward_pid_path("default", "demo", 8080)
+            .is_ok_and(|path| path.exists());
 
         unsafe {
             match old_xdg {

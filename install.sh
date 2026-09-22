@@ -14,10 +14,15 @@ APP_NAME="openshell"
 REPO="NVIDIA/OpenShell"
 GITHUB_URL="https://github.com/${REPO}"
 RELEASE_TAG="${OPENSHELL_VERSION:-}"
+RELEASE_ASSET_DIR=""
 CHECKSUMS_NAME="openshell-checksums-sha256.txt"
 LOCAL_GATEWAY_PORT="17670"
 HOMEBREW_TAP="nvidia/openshell"
 HOMEBREW_FORMULA_NAME="openshell"
+HOMEBREW_CLI_ASSET="openshell-aarch64-apple-darwin.tar.gz"
+HOMEBREW_GATEWAY_ASSET="openshell-gateway-aarch64-apple-darwin.tar.gz"
+HOMEBREW_DRIVER_VM_ASSET="openshell-driver-vm-aarch64-apple-darwin.tar.gz"
+HOMEBREW_PROVER_ASSET="openshell-prover-aarch64-apple-darwin.tar.gz"
 BREAKING_RELEASE_VERSION="0.0.37"
 LINUX_PACKAGE_GLIBC_MIN_VERSION="2.28"
 UPGRADE_NOTICE_ACK="${OPENSHELL_ACK_BREAKING_UPGRADE:-}"
@@ -51,6 +56,8 @@ OPTIONS:
 ENVIRONMENT VARIABLES:
     OPENSHELL_VERSION   Release tag to install (default: latest tagged release).
                         Set OPENSHELL_VERSION=dev to install the rolling dev build.
+                        Set OPENSHELL_VERSION=pre to install the latest prerelease.
+                        Prereleases require an authenticated GitHub CLI session.
     OPENSHELL_ACK_BREAKING_UPGRADE
                         Set to 1 only after backing up and cleaning up a
                         pre-v0.0.37 installation.
@@ -328,6 +335,11 @@ guard_breaking_upgrade() {
 }
 
 resolve_release_tag() {
+  if [ "${OPENSHELL_VERSION:-}" = "pre" ]; then
+    resolve_latest_prerelease_tag
+    return 0
+  fi
+
   if [ -n "${OPENSHELL_VERSION:-}" ]; then
     echo "$OPENSHELL_VERSION"
     return 0
@@ -355,10 +367,137 @@ resolve_release_tag() {
   echo "$_version"
 }
 
+resolve_latest_prerelease_tag() {
+  require_prerelease_github_access
+
+  info "resolving latest prerelease..."
+  _artifact_platform="$(prerelease_artifact_platform)"
+  _successful_run_ids="$(gh api --paginate \
+    "repos/${REPO}/actions/workflows/release-tag.yml/runs?status=success&per_page=100" \
+    --jq '.workflow_runs[] | select(.status == "completed" and .conclusion == "success") | .id')" || {
+    error "failed to list successful Release Tag workflow runs"
+  }
+  _artifact_records="$(gh api --paginate \
+    "repos/${REPO}/actions/artifacts?per_page=100" \
+    --jq '.artifacts[] | select(.expired == false) | [.workflow_run.id, .name] | @tsv')" || {
+    error "failed to list prerelease artifacts"
+  }
+  _artifact_names="$(printf '%s\n--ARTIFACTS--\n%s\n' "$_successful_run_ids" "$_artifact_records" | awk -F '\t' '
+    $0 == "--ARTIFACTS--" {
+      reading_artifacts = 1
+      next
+    }
+    !reading_artifacts {
+      if ($1 ~ /^[0-9]+$/) successful_runs[$1] = 1
+      next
+    }
+    $1 in successful_runs {
+      print $2
+    }
+  ')"
+  _release_tags="$(printf '%s\n' "$_artifact_names" | sed -n "s/^openshell-\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*-pre\.[1-9][0-9]*\)-${_artifact_platform}$/\1/p" | sort -u)"
+
+  _latest_prerelease="$(printf '%s\n' "$_release_tags" | awk '
+    /^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$/ {
+      tag = $0
+      sub(/^v/, "", tag)
+      split(tag, version_parts, "-pre[.]")
+      split(version_parts[1], core, "[.]")
+      sequence = version_parts[2] + 0
+
+      if (!found || core[1] + 0 > major ||
+          (core[1] + 0 == major && core[2] + 0 > minor) ||
+          (core[1] + 0 == major && core[2] + 0 == minor && core[3] + 0 > patch) ||
+          (core[1] + 0 == major && core[2] + 0 == minor && core[3] + 0 == patch && sequence > prerelease)) {
+        selected = $0
+        major = core[1] + 0
+        minor = core[2] + 0
+        patch = core[3] + 0
+        prerelease = sequence
+        found = 1
+      }
+    }
+    END {
+      if (found) print selected
+    }
+  ')"
+
+  if [ -z "$_latest_prerelease" ]; then
+    error "no unexpired prerelease artifacts found"
+  fi
+
+  printf '%s\n' "$_latest_prerelease"
+}
+
+is_prerelease_tag() {
+  printf '%s\n' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$'
+}
+
+require_prerelease_github_access() {
+  require_cmd gh
+  if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+    error "GitHub CLI authentication is required for prerelease artifacts; run 'gh auth login' and try again"
+  fi
+}
+
+prerelease_artifact_platform() {
+  case "${PLATFORM}:$(uname -m)" in
+    linux:x86_64 | linux:amd64)
+      case "$(linux_package_method)" in
+        deb) echo "linux-amd64-deb" ;;
+        rpm) echo "linux-x86_64-rpm" ;;
+      esac
+      ;;
+    linux:aarch64 | linux:arm64)
+      case "$(linux_package_method)" in
+        deb) echo "linux-arm64-deb" ;;
+        rpm) echo "linux-aarch64-rpm" ;;
+      esac
+      ;;
+    darwin:arm64 | darwin:aarch64) echo "macos-arm64" ;;
+    *) error "no prerelease artifact is available for ${PLATFORM}/$(uname -m)" ;;
+  esac
+}
+
+prepare_prerelease_assets() {
+  _destination="$1"
+  is_prerelease_tag "$RELEASE_TAG" || return 0
+  require_prerelease_github_access
+
+  _artifact_name="openshell-${RELEASE_TAG}-$(prerelease_artifact_platform)"
+  info "locating ${_artifact_name}..."
+  _run_id="$(gh api \
+    "repos/${REPO}/actions/artifacts?name=${_artifact_name}&per_page=100" \
+    --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .workflow_run.id')" || {
+    error "failed to find prerelease artifact ${_artifact_name}"
+  }
+  if [ -z "$_run_id" ] || [ "$_run_id" = "null" ] || ! printf '%s\n' "$_run_id" | grep -Eq '^[0-9]+$'; then
+    error "no unexpired prerelease artifact found for ${RELEASE_TAG} on this platform"
+  fi
+
+  RELEASE_ASSET_DIR="${_destination}/release"
+  info "downloading ${_artifact_name}..."
+  gh run download "$_run_id" \
+    --repo "$REPO" \
+    --name "$_artifact_name" \
+    --dir "$RELEASE_ASSET_DIR" || {
+    error "failed to download prerelease artifact ${_artifact_name}"
+  }
+}
+
 download_release_asset() {
   _tag="$1"
   _filename="$2"
   _output="$3"
+
+  if [ -n "$RELEASE_ASSET_DIR" ]; then
+    _source="${RELEASE_ASSET_DIR}/${_filename}"
+    if [ -f "$_source" ]; then
+      cp "$_source" "$_output"
+      return 0
+    fi
+    return 1
+  fi
 
   if curl -fLs --retry 3 --max-redirs 5 -o "$_output" \
     "${GITHUB_URL}/releases/download/${_tag}/${_filename}"; then
@@ -583,6 +722,10 @@ find_rpm_asset() {
       _dev_name="openshell-gateway-dev-${_arch}.rpm"
       _fallback_re="^openshell-gateway-[0-9].*\\.${_arch}\\.rpm$"
       ;;
+    openshell-prover)
+      _dev_name="openshell-prover-dev-${_arch}.rpm"
+      _fallback_re="^openshell-prover-[0-9].*\\.${_arch}\\.rpm$"
+      ;;
     *)
       error "unknown RPM package selector: ${_package}"
       ;;
@@ -691,6 +834,28 @@ patch_homebrew_formula() {
     mv "$_patched_file" "$_formula_file"
   fi
 
+}
+
+patch_prerelease_homebrew_formula_urls() {
+  _formula_file="$1"
+  [ -n "$RELEASE_ASSET_DIR" ] || return 0
+
+  for _asset in "$HOMEBREW_CLI_ASSET" "$HOMEBREW_GATEWAY_ASSET" "$HOMEBREW_DRIVER_VM_ASSET" "$HOMEBREW_PROVER_ASSET"; do
+    if [ ! -f "${RELEASE_ASSET_DIR}/${_asset}" ]; then
+      error "prerelease artifact is missing the required macOS asset: ${_asset}"
+    fi
+  done
+
+  _release_asset_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}"
+  _local_asset_url="file://${RELEASE_ASSET_DIR}"
+  _patched_file="${_formula_file}.prerelease"
+  sed \
+    -e "s#${_release_asset_url}/${HOMEBREW_CLI_ASSET}#${_local_asset_url}/${HOMEBREW_CLI_ASSET}#g" \
+    -e "s#${_release_asset_url}/${HOMEBREW_GATEWAY_ASSET}#${_local_asset_url}/${HOMEBREW_GATEWAY_ASSET}#g" \
+    -e "s#${_release_asset_url}/${HOMEBREW_DRIVER_VM_ASSET}#${_local_asset_url}/${HOMEBREW_DRIVER_VM_ASSET}#g" \
+    -e "s#${_release_asset_url}/${HOMEBREW_PROVER_ASSET}#${_local_asset_url}/${HOMEBREW_PROVER_ASSET}#g" \
+    "$_formula_file" >"$_patched_file"
+  mv "$_patched_file" "$_formula_file"
 }
 
 start_user_gateway() {
@@ -887,11 +1052,10 @@ install_linux_deb() {
   _tmpdir="$(mktemp -d)"
   chmod 0755 "$_tmpdir"
   trap 'rm -rf "$_tmpdir"' EXIT
-
-  _checksums_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${CHECKSUMS_NAME}"
+  prepare_prerelease_assets "$_tmpdir"
   info "downloading ${RELEASE_TAG} release checksums..."
-  download "$_checksums_url" "${_tmpdir}/${CHECKSUMS_NAME}" || {
-    error "failed to download ${_checksums_url}"
+  download_release_asset "$RELEASE_TAG" "$CHECKSUMS_NAME" "${_tmpdir}/${CHECKSUMS_NAME}" || {
+    error "failed to download ${CHECKSUMS_NAME} for ${RELEASE_TAG}"
   }
 
   _deb_file="$(find_deb_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch")"
@@ -899,14 +1063,13 @@ install_linux_deb() {
     error "no Debian package found for architecture: ${_arch}"
   fi
 
-  _deb_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${_deb_file}"
   _deb_path="${_tmpdir}/${_deb_file}"
 
   info "selected ${_deb_file}"
 
   info "downloading ${_deb_file}..."
   download_release_asset "$RELEASE_TAG" "$_deb_file" "$_deb_path" || {
-    error "failed to download ${_deb_url}"
+    error "failed to download ${_deb_file} for ${RELEASE_TAG}"
   }
   chmod 0644 "$_deb_path"
 
@@ -927,11 +1090,10 @@ install_linux_rpm() {
   _tmpdir="$(mktemp -d)"
   chmod 0755 "$_tmpdir"
   trap 'rm -rf "$_tmpdir"' EXIT
-
-  _checksums_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${CHECKSUMS_NAME}"
+  prepare_prerelease_assets "$_tmpdir"
   info "downloading ${RELEASE_TAG} release checksums..."
-  download "$_checksums_url" "${_tmpdir}/${CHECKSUMS_NAME}" || {
-    error "failed to download ${_checksums_url}"
+  download_release_asset "$RELEASE_TAG" "$CHECKSUMS_NAME" "${_tmpdir}/${CHECKSUMS_NAME}" || {
+    error "failed to download ${CHECKSUMS_NAME} for ${RELEASE_TAG}"
   }
 
   _rpm_file="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" openshell)"
@@ -944,15 +1106,20 @@ install_linux_rpm() {
     error "no openshell-gateway RPM package found for architecture: ${_arch}"
   fi
 
-  info "selected ${_rpm_file} and ${_gateway_rpm_file}"
+  _prover_rpm_file="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" openshell-prover)"
+  if [ -z "$_prover_rpm_file" ]; then
+    error "no openshell-prover RPM package found for architecture: ${_arch}"
+  fi
 
-  for _package_file in "$_rpm_file" "$_gateway_rpm_file"; do
+  info "selected ${_rpm_file}, ${_gateway_rpm_file}, and ${_prover_rpm_file}"
+
+  for _package_file in "$_rpm_file" "$_gateway_rpm_file" "$_prover_rpm_file"; do
     _package_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${_package_file}"
     _package_path="${_tmpdir}/${_package_file}"
 
     info "downloading ${_package_file}..."
     download_release_asset "$RELEASE_TAG" "$_package_file" "$_package_path" || {
-      error "failed to download ${_package_url}"
+      error "failed to download ${_package_file} for ${RELEASE_TAG}"
     }
     chmod 0644 "$_package_path"
 
@@ -960,8 +1127,11 @@ install_linux_rpm() {
     verify_checksum "$_package_path" "${_tmpdir}/${CHECKSUMS_NAME}" "$_package_file"
   done
 
-  info "installing ${_rpm_file} and ${_gateway_rpm_file}..."
-  install_rpm_packages "${_tmpdir}/${_rpm_file}" "${_tmpdir}/${_gateway_rpm_file}"
+  info "installing ${_rpm_file}, ${_gateway_rpm_file}, and ${_prover_rpm_file}..."
+  install_rpm_packages \
+    "${_tmpdir}/${_rpm_file}" \
+    "${_tmpdir}/${_gateway_rpm_file}" \
+    "${_tmpdir}/${_prover_rpm_file}"
   info "installed ${APP_NAME} RPM packages from ${RELEASE_TAG}"
   start_user_gateway
 }
@@ -972,7 +1142,7 @@ install_macos_homebrew() {
   _tmpdir="$(mktemp -d)"
   chmod 0755 "$_tmpdir"
   trap 'rm -rf "$_tmpdir"' EXIT
-
+  prepare_prerelease_assets "$_tmpdir"
   _formula_file="${_tmpdir}/openshell.rb"
   _formula_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/openshell.rb"
 
@@ -981,6 +1151,7 @@ install_macos_homebrew() {
     error "failed to download ${_formula_url}; the selected release may not include a Homebrew formula"
   }
   chmod 0644 "$_formula_file"
+  patch_prerelease_homebrew_formula_urls "$_formula_file"
   patch_homebrew_formula "$_formula_file"
 
   _tap_formula_file="$(homebrew_formula_path "$HOMEBREW_TAP" "$HOMEBREW_FORMULA_NAME")"
@@ -1034,8 +1205,8 @@ main() {
   fi
 
   require_cmd curl
-  RELEASE_TAG="$(resolve_release_tag)"
   PLATFORM="$(detect_platform)"
+  RELEASE_TAG="$(resolve_release_tag)"
 
   TARGET_USER="$(target_user)"
   TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || true)"

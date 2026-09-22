@@ -11,6 +11,7 @@ import (
 	sbv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 // --- ProfileCategory ---
@@ -154,7 +155,7 @@ func TestProfileCredentialFromProto(t *testing.T) {
 			Audience:            "https://api.example.com",
 			JwtSvidAudience:     "spiffe://example.com",
 			Scopes:              []string{"read", "write"},
-			CacheTtlSeconds:     300,
+			CacheTtl:            DurationFromSeconds(300),
 			ClientAssertionType: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
 			GrantType:           pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE,
 			SubjectToken: &pb.ProviderCredentialTokenGrantSubjectToken{
@@ -187,7 +188,7 @@ func TestProfileCredentialFromProto(t *testing.T) {
 	assert.Equal(t, "https://api.example.com", cred.TokenGrant.Audience)
 	assert.Equal(t, "spiffe://example.com", cred.TokenGrant.JWTSVIDAudience)
 	assert.Equal(t, []string{"read", "write"}, cred.TokenGrant.Scopes)
-	assert.Equal(t, int64(300), cred.TokenGrant.CacheTTLSeconds)
+	assert.Equal(t, &v1.ProfileDuration{Seconds: 300}, cred.TokenGrant.CacheTTL)
 	assert.Equal(t, "urn:ietf:params:oauth:client-assertion-type:jwt-bearer", cred.TokenGrant.ClientAssertionType)
 	assert.Equal(t, v1.CredentialTokenGrantTypeTokenExchange, cred.TokenGrant.GrantType)
 	require.NotNil(t, cred.TokenGrant.SubjectToken)
@@ -201,6 +202,75 @@ func TestProfileCredentialFromProto(t *testing.T) {
 	assert.Equal(t, "/api", cred.TokenGrant.AudienceOverrides[0].Path)
 	assert.Equal(t, "https://special.example.com", cred.TokenGrant.AudienceOverrides[0].Audience)
 	assert.Equal(t, []string{"admin"}, cred.TokenGrant.AudienceOverrides[0].Scopes)
+}
+
+func TestProfileCredentialDurationRoundTripPreservesPresencePrecisionAndValidationSignal(t *testing.T) {
+	original := &pb.ProviderProfileCredential{
+		Refresh: &pb.ProviderCredentialRefresh{
+			RefreshBefore: &durationpb.Duration{Nanos: 500_000_000},
+			MaxLifetime:   &durationpb.Duration{Seconds: 1, Nanos: -1},
+		},
+		TokenGrant: &pb.ProviderCredentialTokenGrant{
+			CacheTtl: &durationpb.Duration{Seconds: 1, Nanos: -1},
+		},
+	}
+	credential := ProfileCredentialFromProto(original)
+
+	assert.Equal(t, &v1.ProfileDuration{Nanos: 500_000_000}, credential.Refresh.RefreshBefore)
+	assert.Equal(t, &v1.ProfileDuration{Seconds: 1, Nanos: -1}, credential.Refresh.MaxLifetime)
+	assert.Equal(t, &v1.ProfileDuration{Seconds: 1, Nanos: -1}, credential.TokenGrant.CacheTTL)
+
+	roundTripped := ProfileCredentialToProto(credential)
+	assert.Equal(t, original.Refresh.RefreshBefore.Seconds, roundTripped.Refresh.RefreshBefore.Seconds)
+	assert.Equal(t, original.Refresh.RefreshBefore.Nanos, roundTripped.Refresh.RefreshBefore.Nanos)
+	assert.Equal(t, original.Refresh.MaxLifetime.Seconds, roundTripped.Refresh.MaxLifetime.Seconds)
+	assert.Equal(t, original.Refresh.MaxLifetime.Nanos, roundTripped.Refresh.MaxLifetime.Nanos)
+	assert.Equal(t, original.TokenGrant.CacheTtl.Seconds, roundTripped.TokenGrant.CacheTtl.Seconds)
+	assert.Equal(t, original.TokenGrant.CacheTtl.Nanos, roundTripped.TokenGrant.CacheTtl.Nanos)
+}
+
+func TestProfileCredentialDurationRoundTripDistinguishesAbsentAndZero(t *testing.T) {
+	original := &pb.ProviderProfileCredential{
+		Refresh: &pb.ProviderCredentialRefresh{
+			RefreshBefore: &durationpb.Duration{},
+			MaxLifetime:   nil,
+		},
+	}
+
+	roundTripped := ProfileCredentialToProto(ProfileCredentialFromProto(original))
+	require.NotNil(t, roundTripped.Refresh.RefreshBefore)
+	assert.Equal(t, int64(0), roundTripped.Refresh.RefreshBefore.Seconds)
+	assert.Nil(t, roundTripped.Refresh.MaxLifetime)
+}
+
+func TestProfileCredentialDurationExactValuesAreAuthoritative(t *testing.T) {
+	credential := &v1.ProfileCredential{
+		Refresh: &v1.ProfileCredentialRefresh{
+			RefreshBefore: &v1.ProfileDuration{Seconds: 60},
+			MaxLifetime:   &v1.ProfileDuration{Seconds: 3600, Nanos: 500_000_000},
+		},
+		TokenGrant: &v1.CredentialTokenGrant{
+			CacheTTL: &v1.ProfileDuration{Nanos: 500_000_000},
+		},
+	}
+
+	converted := ProfileCredentialToProto(credential)
+	assert.Equal(t, &durationpb.Duration{Seconds: 60}, converted.Refresh.RefreshBefore)
+	assert.Equal(t, &durationpb.Duration{Seconds: 3600, Nanos: 500_000_000}, converted.Refresh.MaxLifetime)
+	assert.Equal(t, &durationpb.Duration{Nanos: 500_000_000}, converted.TokenGrant.CacheTtl)
+}
+
+func TestProfileCredentialDurationPreservesExactMutationAfterRead(t *testing.T) {
+	credential := ProfileCredentialFromProto(&pb.ProviderProfileCredential{
+		TokenGrant: &pb.ProviderCredentialTokenGrant{
+			CacheTtl: &durationpb.Duration{Seconds: 30, Nanos: 500_000_000},
+		},
+	})
+	credential.TokenGrant.CacheTTL.Seconds = 60
+
+	roundTripped := ProfileCredentialToProto(credential)
+	assert.Equal(t, int64(60), roundTripped.TokenGrant.CacheTtl.Seconds)
+	assert.Equal(t, int32(500_000_000), roundTripped.TokenGrant.CacheTtl.Nanos)
 }
 
 func TestProfileCredentialFromProto_DeepCopy(t *testing.T) {
@@ -255,13 +325,13 @@ func TestProfileCredentialToProto(t *testing.T) {
 		Required:    true,
 		Secret:      true,
 		Refresh: &v1.ProfileCredentialRefresh{
-			Strategy:             v1.RefreshStrategyOAuth2RefreshToken,
-			TokenURL:             "https://auth.example.com/token",
-			Scopes:               []string{"offline_access"},
-			RefreshBeforeSeconds: 60,
-			MaxLifetimeSeconds:   3600,
-			Material:             []v1.ProfileCredentialRefreshMaterial{{Name: "refresh_token", Required: true, Secret: true}},
-			AdditionalOutputs:    []v1.ProfileCredentialRefreshOutput{{Output: "session_token", Credential: "SESSION_TOKEN"}},
+			Strategy:          v1.RefreshStrategyOAuth2RefreshToken,
+			TokenURL:          "https://auth.example.com/token",
+			Scopes:            []string{"offline_access"},
+			RefreshBefore:     &v1.ProfileDuration{Seconds: 60},
+			MaxLifetime:       &v1.ProfileDuration{Seconds: 3600},
+			Material:          []v1.ProfileCredentialRefreshMaterial{{Name: "refresh_token", Required: true, Secret: true}},
+			AdditionalOutputs: []v1.ProfileCredentialRefreshOutput{{Output: "session_token", Credential: "SESSION_TOKEN"}},
 		},
 		AuthStyle:    "header",
 		HeaderName:   "X-API-Key",
@@ -272,7 +342,7 @@ func TestProfileCredentialToProto(t *testing.T) {
 			Audience:            "https://api.example.com",
 			JWTSVIDAudience:     "spiffe://example.com",
 			Scopes:              []string{"read"},
-			CacheTTLSeconds:     300,
+			CacheTTL:            &v1.ProfileDuration{Seconds: 300},
 			ClientAssertionType: "urn:custom",
 			GrantType:           v1.CredentialTokenGrantTypeTokenExchange,
 			SubjectToken: &v1.TokenGrantSubjectToken{
@@ -302,6 +372,8 @@ func TestProfileCredentialToProto(t *testing.T) {
 	assert.Equal(t, pb.ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN, proto.Refresh.Strategy)
 	assert.Equal(t, "https://auth.example.com/token", proto.Refresh.TokenUrl)
 	assert.Equal(t, []string{"offline_access"}, proto.Refresh.Scopes)
+	assert.Equal(t, &durationpb.Duration{Seconds: 60}, proto.Refresh.RefreshBefore)
+	assert.Equal(t, &durationpb.Duration{Seconds: 3600}, proto.Refresh.MaxLifetime)
 	require.Len(t, proto.Refresh.Material, 1)
 	require.Len(t, proto.Refresh.AdditionalOutputs, 1)
 
@@ -310,7 +382,7 @@ func TestProfileCredentialToProto(t *testing.T) {
 	assert.Equal(t, "https://api.example.com", proto.TokenGrant.Audience)
 	assert.Equal(t, "spiffe://example.com", proto.TokenGrant.JwtSvidAudience)
 	assert.Equal(t, []string{"read"}, proto.TokenGrant.Scopes)
-	assert.Equal(t, int64(300), proto.TokenGrant.CacheTtlSeconds)
+	assert.Equal(t, int64(300), proto.TokenGrant.CacheTtl.GetSeconds())
 	assert.Equal(t, "urn:custom", proto.TokenGrant.ClientAssertionType)
 	assert.Equal(t, pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE, proto.TokenGrant.GrantType)
 	require.NotNil(t, proto.TokenGrant.SubjectToken)
@@ -320,6 +392,22 @@ func TestProfileCredentialToProto(t *testing.T) {
 	assert.Equal(t, "urn:ietf:params:oauth:token-type:refresh_token", proto.TokenGrant.RequestedTokenType)
 	require.Len(t, proto.TokenGrant.AudienceOverrides, 1)
 	assert.Equal(t, "h", proto.TokenGrant.AudienceOverrides[0].Host)
+}
+
+func TestProfileCredentialToProto_PreservesInvalidDurationsForValidation(t *testing.T) {
+	proto := ProfileCredentialToProto(&v1.ProfileCredential{
+		Refresh: &v1.ProfileCredentialRefresh{
+			RefreshBefore: &v1.ProfileDuration{Seconds: -1},
+			MaxLifetime:   &v1.ProfileDuration{Seconds: 1, Nanos: -1},
+		},
+		TokenGrant: &v1.CredentialTokenGrant{
+			CacheTTL: &v1.ProfileDuration{Nanos: 1_000_000_000},
+		},
+	})
+
+	assert.Equal(t, &durationpb.Duration{Seconds: -1}, proto.Refresh.RefreshBefore)
+	assert.Equal(t, &durationpb.Duration{Seconds: 1, Nanos: -1}, proto.Refresh.MaxLifetime)
+	assert.Equal(t, &durationpb.Duration{Nanos: 1_000_000_000}, proto.TokenGrant.CacheTtl)
 }
 
 func TestProfileCredentialToProto_Nil(t *testing.T) {
@@ -574,7 +662,7 @@ func TestProviderProfileRoundTrip(t *testing.T) {
 					Audience:            "https://api.example.com",
 					JWTSVIDAudience:     "spiffe://example.com",
 					Scopes:              []string{"read"},
-					CacheTTLSeconds:     600,
+					CacheTTL:            &v1.ProfileDuration{Seconds: 600},
 					ClientAssertionType: "urn:custom",
 					AudienceOverrides: []v1.TokenGrantAudienceOverride{
 						{Host: "h", Port: 443, Path: "/p", Audience: "aud", Scopes: []string{"s"}},
@@ -626,7 +714,7 @@ func TestProviderProfileRoundTrip(t *testing.T) {
 	assert.Equal(t, original.Credentials[0].TokenGrant.Audience, c.TokenGrant.Audience)
 	assert.Equal(t, original.Credentials[0].TokenGrant.JWTSVIDAudience, c.TokenGrant.JWTSVIDAudience)
 	assert.Equal(t, original.Credentials[0].TokenGrant.Scopes, c.TokenGrant.Scopes)
-	assert.Equal(t, original.Credentials[0].TokenGrant.CacheTTLSeconds, c.TokenGrant.CacheTTLSeconds)
+	assert.Equal(t, original.Credentials[0].TokenGrant.CacheTTL, c.TokenGrant.CacheTTL)
 	assert.Equal(t, original.Credentials[0].TokenGrant.ClientAssertionType, c.TokenGrant.ClientAssertionType)
 	require.Len(t, c.TokenGrant.AudienceOverrides, 1)
 	assert.Equal(t, original.Credentials[0].TokenGrant.AudienceOverrides[0], c.TokenGrant.AudienceOverrides[0])

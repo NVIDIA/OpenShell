@@ -1,0 +1,109 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Run Keycloak provider refresh tests
+  hosts: all
+  gather_facts: false
+  roles:
+    - keycloak
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Create Keycloak provider refresh test directory
+      become: true
+      ansible.builtin.file:
+        path: /var/lib/openshell-provider-refresh/tests
+        state: directory
+        owner: tmachine
+        group: tmachine
+        mode: "0700"
+
+    - name: Install Keycloak provider refresh test bundle
+      become: true
+      ansible.builtin.copy:
+        src: "{{ provider_refresh_keycloak_test_bundle }}"
+        dest: /var/lib/openshell-provider-refresh/tests/bundle.tar
+        owner: tmachine
+        group: tmachine
+        mode: "0600"
+
+    - name: Extract Keycloak provider refresh test bundle
+      become: true
+      ansible.builtin.unarchive:
+        src: /var/lib/openshell-provider-refresh/tests/bundle.tar
+        dest: /var/lib/openshell-provider-refresh/tests
+        owner: tmachine
+        group: tmachine
+        remote_src: true
+
+    - name: Check Keycloak provider refresh test archive
+      ansible.builtin.stat:
+        path: /var/lib/openshell-provider-refresh/tests/tests.tar.zst
+      register: provider_refresh_keycloak_test_archive
+
+    - name: Require Keycloak provider refresh test archive
+      ansible.builtin.assert:
+        that:
+          - provider_refresh_keycloak_test_archive.stat.isreg | default(false)
+        fail_msg: Keycloak provider refresh test bundle did not contain tests.tar.zst
+
+    - name: Resolve installed OpenShell CLI
+      ansible.builtin.command:
+        argv:
+          - /bin/sh
+          - -c
+          - command -v openshell
+      register: openshell_cli
+      changed_when: false
+
+    - name: Run Keycloak provider refresh archive
+      ansible.builtin.command:
+        argv:
+          - cargo-nextest
+          - nextest
+          - run
+          - --archive-file
+          - /var/lib/openshell-provider-refresh/tests/tests.tar.zst
+          - --workspace-remap
+          - /var/lib/openshell-provider-refresh/tests
+          - --no-capture
+      environment:
+        OPENSHELL_BIN: "{{ openshell_cli.stdout }}"
+        OPENSHELL_E2E_OIDC_ISSUER: http://127.0.0.1:8180/realms/openshell
+        OPENSHELL_E2E_OIDC_USERNAME: admin@test
+        OPENSHELL_E2E_OIDC_PASSWORD: admin
+      register: provider_refresh_result
+      changed_when: false
+      failed_when: false
+
+    - name: Show Keycloak provider refresh result
+      ansible.builtin.debug:
+        var: provider_refresh_result
+      when: provider_refresh_result.rc != 0
+
+    - name: Read OpenShell gateway logs
+      become: true
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - --unit
+          - openshell-gateway.service
+          - --no-pager
+          - --lines
+          - "500"
+      register: openshell_gateway_logs
+      changed_when: false
+      failed_when: false
+      when: provider_refresh_result.rc != 0
+
+    - name: Show OpenShell gateway logs
+      ansible.builtin.debug:
+        var: openshell_gateway_logs.stdout_lines
+      when: provider_refresh_result.rc != 0
+
+    - name: Require Keycloak provider refresh success
+      ansible.builtin.assert:
+        that: provider_refresh_result.rc == 0
+        fail_msg: Keycloak provider refresh test failed

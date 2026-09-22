@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ObjectType, PersistenceError, Store, generate_name, test_store};
+use super::{ObjectListQuery, ObjectType, PersistenceError, Store, generate_name, test_store};
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use openshell_core::proto::datamodel::v1::ObjectMeta as ProtoObjectMeta;
 use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
@@ -125,6 +125,32 @@ async fn sqlite_put_get_round_trip() {
 }
 
 #[tokio::test]
+async fn collect_records_exhausts_multiple_keyset_pages_exactly_once() {
+    let store = test_store().await;
+    let expected = 1005_usize;
+    for index in 0..expected {
+        let id = format!("collect-{index:04}");
+        let name = format!("sandbox-{index:04}");
+        store
+            .put("sandbox", &id, &name, "collect-test", b"payload", None)
+            .await
+            .unwrap();
+    }
+
+    let records = store
+        .collect_records("sandbox", ObjectListQuery::Workspace("collect-test"))
+        .await
+        .unwrap();
+    let ids = records
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(records.len(), expected);
+    assert_eq!(ids.len(), expected, "every record is visited exactly once");
+}
+
+#[tokio::test]
 async fn sqlite_connect_runs_embedded_migrations() {
     let store = test_store().await;
 
@@ -178,6 +204,22 @@ fn embedded_migrators_include_inference_route_removal() {
         assert!(
             sql.contains("DELETE FROM objects WHERE object_type = 'inference_route'"),
             "{backend} migration 007 must purge managed inference route objects"
+        );
+    }
+}
+
+#[test]
+fn embedded_migrators_include_pagination_indexes() {
+    for (backend, migration) in [
+        ("sqlite", super::sqlite::embedded_migration_sql(8)),
+        ("postgres", super::postgres::embedded_migration_sql(8)),
+    ] {
+        let sql =
+            migration.unwrap_or_else(|| panic!("{backend} migrator is missing migration 008"));
+        assert!(
+            sql.contains("objects_workspace_page_idx")
+                && sql.contains("objects_all_workspaces_page_idx"),
+            "{backend} migration 008 must add both keyset pagination indexes"
         );
     }
 }
@@ -1040,7 +1082,7 @@ fn policy_test_sandbox(id: &str, name: &str) -> Sandbox {
         metadata: Some(ProtoObjectMeta {
             id: id.to_string(),
             name: name.to_string(),
-            created_at_ms: 1,
+            created_time: openshell_core::time::timestamp_from_millis(1).ok(),
             workspace: "default".to_string(),
             ..Default::default()
         }),
@@ -1912,12 +1954,12 @@ async fn cas_update_message_cas_succeeds() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "test-id".to_string(),
             name: "test-sandbox".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),
             workspace: "default".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,
@@ -1955,12 +1997,12 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "test-id".to_string(),
             name: "test-sandbox".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),
             workspace: "default".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,
@@ -2026,12 +2068,12 @@ async fn cas_update_message_cas_rejects_workspace_change() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "ws-immutable".to_string(),
             name: "test-sandbox".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             annotations: std::collections::HashMap::new(),
             resource_version: 0,
             workspace: "alpha".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,
@@ -2069,12 +2111,12 @@ async fn cas_update_message_cas_rejects_name_change() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "name-immutable".to_string(),
             name: "original".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             annotations: std::collections::HashMap::new(),
             resource_version: 0,
             workspace: "default".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,

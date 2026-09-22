@@ -5,20 +5,21 @@
 
 Verifies that:
 - /sandbox/.venv/bin is in PATH for both interactive and non-interactive sessions
-- pip install works inside the sandbox (pypi policy in dev-sandbox-policy.yaml)
+- pip install works inside the sandbox with an explicit PyPI policy
 - uv pip install works (validates Landlock V2 cross-directory rename support)
 - uv run --with works for ephemeral dependency injection
 - Installed packages are importable after installation
 
-All tests use the default dev sandbox policy -- no custom policy overrides.
-The SDK omits the policy field from the spec so the sandbox container discovers
-its policy from /etc/openshell/policy.yaml (the dev-sandbox-policy.yaml baked
-into the image), which already includes the pypi network policy.
+Package-install tests pass their policy explicitly. In the split sandbox and
+supervisor topology, trusted policy evaluation no longer discovers policy from
+the untrusted workload image filesystem.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+
+from openshell._proto import datamodel_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -26,11 +27,46 @@ if TYPE_CHECKING:
     from openshell import Sandbox
 
 
+def _pypi_spec() -> datamodel_pb2.SandboxSpec:
+    endpoints = [
+        "pypi.org",
+        "files.pythonhosted.org",
+        "github.com",
+        "objects.githubusercontent.com",
+        "api.github.com",
+        "downloads.python.org",
+    ]
+    return datamodel_pb2.SandboxSpec(
+        policy=sandbox_pb2.SandboxPolicy(
+            version=1,
+            filesystem=sandbox_pb2.FilesystemPolicy(
+                include_workdir=True,
+                read_only=["/usr", "/lib", "/etc", "/app", "/proc"],
+                read_write=["/sandbox", "/tmp"],
+            ),
+            landlock=sandbox_pb2.LandlockPolicy(compatibility="best_effort"),
+            process=sandbox_pb2.ProcessPolicy(
+                run_as_user="sandbox", run_as_group="sandbox"
+            ),
+            network_policies={
+                "pypi": sandbox_pb2.NetworkPolicyRule(
+                    name="pypi",
+                    endpoints=[
+                        sandbox_pb2.NetworkEndpoint(host=host, port=443)
+                        for host in endpoints
+                    ],
+                    binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+                )
+            },
+        )
+    )
+
+
 def test_sandbox_venv_in_path(
     sandbox: Callable[..., Sandbox],
 ) -> None:
     """Non-interactive exec sees /sandbox/.venv/bin in PATH."""
-    with sandbox(delete_on_exit=True) as sb:
+    with sandbox(spec=_pypi_spec(), delete_on_exit=True) as sb:
         result = sb.exec(["bash", "-c", "echo $PATH"], timeout_seconds=20)
         assert result.exit_code == 0, result.stderr
         path_dirs = result.stdout.strip().split(":")
@@ -43,7 +79,7 @@ def test_pip_install_in_sandbox(
     sandbox: Callable[..., Sandbox],
 ) -> None:
     """pip install works inside the sandbox and installed packages are importable."""
-    with sandbox(delete_on_exit=True) as sb:
+    with sandbox(spec=_pypi_spec(), delete_on_exit=True) as sb:
         install = sb.exec(
             ["pip", "install", "--quiet", "cowsay"],
             timeout_seconds=60,
@@ -72,7 +108,7 @@ def test_uv_pip_install_in_sandbox(
     because uv uses cross-directory rename() for cache population and installation.
     Landlock V2 adds the REFER right which permits this.
     """
-    with sandbox(delete_on_exit=True) as sb:
+    with sandbox(spec=_pypi_spec(), delete_on_exit=True) as sb:
         install = sb.exec(
             [
                 "uv",
@@ -105,7 +141,7 @@ def test_uv_run_with_ephemeral_dependency(
     sandbox: Callable[..., Sandbox],
 ) -> None:
     """uv run --with installs a dependency on-the-fly and runs a script using it."""
-    with sandbox(delete_on_exit=True) as sb:
+    with sandbox(spec=_pypi_spec(), delete_on_exit=True) as sb:
         result = sb.exec(
             [
                 "uv",

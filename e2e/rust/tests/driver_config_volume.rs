@@ -21,7 +21,7 @@ use openshell_e2e::harness::container::{ImageGuard, e2e_driver};
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serde_json::{Map, Value};
 
-const TEST_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
+const TEST_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
 const VOLUME_TARGET: &str = "/sandbox/e2e-volume";
 const BIND_TARGET: &str = "/sandbox/e2e-bind";
 #[cfg(feature = "e2e-docker")]
@@ -249,10 +249,20 @@ fn write_bind_mount_policy() -> Result<tempfile::NamedTempFile, String> {
     let mut file =
         tempfile::NamedTempFile::new().map_err(|err| format!("create bind policy: {err}"))?;
     file.write_all(
-        br"version: 1
+        br#"version: 1
 
 filesystem_policy:
   include_workdir: false
+  read_only:
+    - "/bin"
+    - "/dev"
+    - "/etc"
+    - "/lib"
+    - "/proc"
+    - "/usr"
+  read_write:
+    - "/sandbox/e2e-bind"
+    - "/tmp"
 
 landlock:
   compatibility: best_effort
@@ -260,7 +270,7 @@ landlock:
 process:
   run_as_user: sandbox
   run_as_group: sandbox
-",
+"#,
     )
     .map_err(|err| format!("write bind policy: {err}"))?;
     Ok(file)

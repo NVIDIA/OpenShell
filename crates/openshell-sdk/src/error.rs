@@ -5,6 +5,7 @@
 //! TUI, language bindings) can decide how to render or remap each kind.
 
 use miette::Diagnostic;
+pub use openshell_core::rpc_error::ErrorDetails;
 use thiserror::Error;
 
 /// SDK result type alias.
@@ -24,6 +25,8 @@ pub enum SdkError {
     InvalidConfig {
         /// Error message.
         message: String,
+        /// Original gateway status, when validation happened remotely.
+        status: Option<Box<tonic::Status>>,
     },
 
     /// TLS material parse or rustls config build failure.
@@ -57,6 +60,8 @@ pub enum SdkError {
         message: String,
         /// Whether retrying the same operation may succeed.
         retryable: bool,
+        /// Original gateway status, when authentication happened remotely.
+        status: Option<Box<tonic::Status>>,
     },
 
     /// Local IO failure (file read, listener bind, socket).
@@ -74,6 +79,8 @@ pub enum SdkError {
     NotFound {
         /// Error message.
         message: String,
+        /// Original gateway status, including details and metadata.
+        status: Box<tonic::Status>,
     },
 
     /// Gateway reported the requested object already exists (gRPC `AlreadyExists`).
@@ -82,6 +89,8 @@ pub enum SdkError {
     AlreadyExists {
         /// Error message.
         message: String,
+        /// Original gateway status, including details and metadata.
+        status: Box<tonic::Status>,
     },
 
     /// Catch-all for gRPC errors not mapped to a more specific variant.
@@ -92,6 +101,8 @@ pub enum SdkError {
         code: i32,
         /// Error message.
         message: String,
+        /// Original gateway status, including unknown details and metadata.
+        status: Box<tonic::Status>,
     },
 }
 
@@ -100,6 +111,7 @@ impl SdkError {
     pub fn invalid_config(message: impl Into<String>) -> Self {
         Self::InvalidConfig {
             message: message.into(),
+            status: None,
         }
     }
 
@@ -122,6 +134,7 @@ impl SdkError {
         Self::Auth {
             message: message.into(),
             retryable: false,
+            status: None,
         }
     }
 
@@ -130,7 +143,57 @@ impl SdkError {
         Self::Auth {
             message: message.into(),
             retryable,
+            status: None,
         }
+    }
+
+    /// Map a gateway failure while retaining its complete transport status.
+    pub fn from_status(status: tonic::Status) -> Self {
+        let message = status.message().to_owned();
+        let code = status.code();
+        let status = Box::new(status);
+        match code {
+            tonic::Code::NotFound => Self::NotFound { message, status },
+            tonic::Code::AlreadyExists => Self::AlreadyExists { message, status },
+            tonic::Code::InvalidArgument => Self::InvalidConfig {
+                message,
+                status: Some(status),
+            },
+            tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => Self::Auth {
+                message,
+                retryable: false,
+                status: Some(status),
+            },
+            _ => Self::Rpc {
+                code: code as i32,
+                message,
+                status,
+            },
+        }
+    }
+
+    /// Complete original status, including unrecognized details and metadata.
+    pub fn grpc_status(&self) -> Option<&tonic::Status> {
+        match self {
+            Self::InvalidConfig { status, .. } | Self::Auth { status, .. } => status.as_deref(),
+            Self::NotFound { status, .. }
+            | Self::AlreadyExists { status, .. }
+            | Self::Rpc { status, .. } => Some(status),
+            _ => None,
+        }
+    }
+
+    /// Decode standard rich details. Malformed details never replace the failure.
+    /// The original bytes remain accessible through [`Self::grpc_status`].
+    pub fn error_details(&self) -> Option<ErrorDetails> {
+        self.grpc_status()
+            .and_then(openshell_core::rpc_error::decode_details)
+    }
+
+    /// Server-suggested minimum retry delay, if supplied.
+    /// This does not establish that repeating a mutation is safe.
+    pub fn retry_delay(&self) -> Option<std::time::Duration> {
+        self.error_details()?.retry_info()?.retry_delay
     }
 
     /// Stable string code for cross-language binding consumers.
@@ -166,5 +229,69 @@ impl SdkError {
             Self::AlreadyExists { .. } => "already_exists",
             Self::Rpc { .. } => "rpc",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openshell_core::rpc_error;
+    use openshell_core::rpc_error::StatusExt;
+
+    #[test]
+    fn preserves_details_and_metadata_for_every_status_class() {
+        for code in [
+            tonic::Code::InvalidArgument,
+            tonic::Code::NotFound,
+            tonic::Code::AlreadyExists,
+            tonic::Code::Unauthenticated,
+            tonic::Code::PermissionDenied,
+            tonic::Code::Aborted,
+            tonic::Code::Unavailable,
+        ] {
+            let mut status = tonic::Status::with_error_details(
+                code,
+                "invalid name",
+                rpc_error::invalid_argument("name", "invalid name").get_error_details(),
+            );
+            status
+                .metadata_mut()
+                .insert("request-id", "test-correlation".parse().unwrap());
+            let original = status.details().to_vec();
+            let error = SdkError::from_status(status);
+            let raw = error.grpc_status().unwrap();
+            assert_eq!(raw.code(), code);
+            assert_eq!(raw.details(), original);
+            assert_eq!(
+                raw.metadata().get("request-id").unwrap(),
+                "test-correlation"
+            );
+            assert_eq!(
+                error
+                    .error_details()
+                    .unwrap()
+                    .bad_request()
+                    .unwrap()
+                    .field_violations[0]
+                    .field,
+                "name"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_details_do_not_replace_the_original_error() {
+        let status =
+            tonic::Status::with_details(tonic::Code::Unavailable, "offline", vec![255].into());
+        let error = SdkError::from_status(status);
+        assert_eq!(error.grpc_status().unwrap().details(), &[255]);
+        assert!(error.error_details().is_none());
+        assert!(error.retry_delay().is_none());
+    }
+
+    #[test]
+    fn local_errors_have_no_transport_status() {
+        assert!(SdkError::invalid_config("local").grpc_status().is_none());
+        assert!(SdkError::auth("local").error_details().is_none());
     }
 }

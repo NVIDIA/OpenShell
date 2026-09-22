@@ -47,6 +47,23 @@ pub enum ActivityId {
 }
 
 impl ActivityId {
+    /// Map an HTTP method to its HTTP Activity identifier.
+    #[must_use]
+    pub fn for_http_method(method: &str) -> Self {
+        match method.to_ascii_uppercase().as_str() {
+            "CONNECT" => Self::Open,
+            "DELETE" => Self::Close,
+            "GET" => Self::Reset,
+            "HEAD" => Self::Fail,
+            "OPTIONS" => Self::Refuse,
+            "POST" => Self::Traffic,
+            "PUT" => Self::Listen,
+            "TRACE" => Self::Trace,
+            "PATCH" => Self::Patch,
+            _ => Self::Other,
+        }
+    }
+
     /// Returns a human-readable label for this activity in a network context.
     #[must_use]
     pub fn network_label(self) -> &'static str {
@@ -161,6 +178,13 @@ mod tests {
         assert_eq!(ActivityId::Traffic.http_label(), "Post");
         assert_eq!(ActivityId::Listen.http_label(), "Put");
         assert_eq!(ActivityId::Patch.http_label(), "Patch");
+    }
+
+    #[test]
+    fn maps_http_methods_to_http_activity_ids() {
+        assert_eq!(ActivityId::for_http_method("GET"), ActivityId::Reset);
+        assert_eq!(ActivityId::for_http_method("post"), ActivityId::Traffic);
+        assert_eq!(ActivityId::for_http_method("PROPFIND"), ActivityId::Other);
     }
 
     #[test]

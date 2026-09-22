@@ -9,6 +9,12 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: includes the release namespace in the ClusterRole name
+    asserts:
+      - equal:
+          path: metadata.name
+          value: openshell-node-reader-my-namespace
+
   - it: grants managed namespace NetworkPolicy apply permissions
     set:
       server.drivers.kubernetes.workspaceMode: managed
@@ -20,17 +26,23 @@ tests:
             resources: ["networkpolicies"]
             verbs: ["get", "create", "patch", "update"]
 
-  - it: omits managed NetworkPolicy permissions when isolation is disabled
+  - it: preserves sandbox-runtime fence permissions when gateway isolation is disabled
     set:
       server.drivers.kubernetes.workspaceMode: managed
       networkPolicy.enabled: false
     asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+            verbs: ["create", "get"]
       - notContains:
           path: rules
           content:
             apiGroups: ["networking.k8s.io"]
             resources: ["networkpolicies"]
-          any: true
+            verbs: ["get", "create", "patch", "update"]
 
   - it: grants broad secret access when credential driver is enabled (operator)
     set:
@@ -57,17 +69,23 @@ tests:
             resourceNames: ["custom-client-tls"]
             verbs: ["get", "patch"]
 
-  - it: omits operator secret access when TLS and credential storage are disabled
+  - it: grants operator bootstrap secret lifecycle permissions when TLS and credential storage are disabled
     set:
       server.drivers.kubernetes.workspaceMode: operator
       server.disableTls: true
     asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "list", "delete"]
       - notContains:
           path: rules
           content:
             apiGroups: [""]
             resources: ["secrets"]
-          any: true
+            verbs: ["get", "create", "patch", "delete"]
 
   - it: restricts managed copies to TLS and configured image-pull secrets
     set:
@@ -89,7 +107,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create"]
+            verbs: ["create", "list", "delete"]
 
   - it: restricts managed copies to image-pull secrets when TLS is disabled
     set:
@@ -110,7 +128,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create"]
+            verbs: ["create", "list", "delete"]
 
   - it: omits secrets rule entirely in shared mode
     set:
@@ -122,3 +140,49 @@ tests:
             apiGroups: [""]
             resources: ["secrets"]
           any: true
+
+  - it: grants managed sandbox-runtime companion permissions
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["pods"]
+            verbs: ["create", "delete", "get", "list", "patch", "watch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["services"]
+            verbs: ["create", "get"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "list", "delete"]
+
+  - it: grants operator sandbox-runtime companion permissions
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["pods"]
+            verbs: ["create", "delete", "get", "list", "patch", "watch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["services"]
+            verbs: ["create", "get"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "list", "delete"]

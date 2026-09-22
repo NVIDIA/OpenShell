@@ -33,10 +33,12 @@
 # configuration on top of ci/values-skaffold.yaml.
 #
 # Image source:
-#   - Ephemeral k3d mode builds local `openshell/{gateway,supervisor}:${IMAGE_TAG}`
+#   - Ephemeral k3d mode builds local
+#     `openshell/{gateway,sandbox,supervisor}:${IMAGE_TAG}`
 #     images by default, imports them into k3d, then installs the chart. This
 #     mirrors the Skaffold local-dev path.
-#   - Existing-context mode pulls from ${OPENSHELL_REGISTRY}/{gateway,supervisor}:${IMAGE_TAG}
+#   - Existing-context mode pulls from
+#     ${OPENSHELL_REGISTRY}/{gateway,sandbox,supervisor}:${IMAGE_TAG}
 #     (defaults: ghcr.io/nvidia/openshell, latest). CI sets IMAGE_TAG to the
 #     commit SHA and preloads or publishes the images before running this script.
 #
@@ -99,11 +101,20 @@ EXTERNAL_PG_FIXTURE_SERVICE="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_USER="openshell"
 EXTERNAL_PG_FIXTURE_PASSWORD="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_DATABASE="openshell"
+ENVOY_RELEASE_NAME="${OPENSHELL_E2E_ENVOY_RELEASE_NAME:-envoy-gateway}"
+ENVOY_NAMESPACE="${OPENSHELL_E2E_ENVOY_NAMESPACE:-envoy-gateway-system}"
+ENVOY_CHART_VERSION="${OPENSHELL_E2E_ENVOY_VERSION:-v1.7.2}"
+ENVOY_GATEWAY_MANIFEST="${ROOT}/deploy/kube/manifests/envoy-gateway-openshell.yaml"
+ENVOY_HELM_INSTALLED=0
+ENVOY_GATEWAY_CONFIG_APPLIED=0
 VAULT_FIXTURE_DEPLOYED=0
 VAULT_NAMESPACE="${OPENSHELL_E2E_VAULT_NAMESPACE:-openbao}"
 VAULT_RELEASE_NAME="${OPENSHELL_E2E_VAULT_RELEASE_NAME:-openbao}"
 VAULT_CHART_VERSION="${OPENSHELL_E2E_OPENBAO_CHART_VERSION:-0.28.3}"
 VAULT_DEV_ROOT_TOKEN="${OPENSHELL_E2E_VAULT_DEV_ROOT_TOKEN:-root}"
+VAULT_CA_CONFIG_MAP="openbao-ca"
+VAULT_DNS_ALIAS="${VAULT_RELEASE_NAME}-0"
+VAULT_CA_FILE="${WORKDIR}/openbao-ca.crt"
 CORPORATE_PROXY_FIXTURE_DEPLOYED=0
 CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
 OPENSHIFT_DETECTED=0
@@ -176,6 +187,122 @@ deploy_postgres_fixture() {
     --from-literal=uri="${pg_uri}"
 }
 
+use_envoy_gateway() {
+  case "${OPENSHELL_E2E_KUBE_USE_ENVOY:-0}" in
+    1 | true | TRUE | yes | YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+install_envoy_gateway() {
+  echo "Installing Envoy Gateway (${ENVOY_CHART_VERSION})..."
+  helmctl upgrade --install "${ENVOY_RELEASE_NAME}" \
+    oci://docker.io/envoyproxy/gateway-helm \
+    --version "${ENVOY_CHART_VERSION}" \
+    --namespace "${ENVOY_NAMESPACE}" --create-namespace \
+    --wait --timeout 5m
+  ENVOY_HELM_INSTALLED=1
+
+  if ! kctl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+    kctl create namespace "${NAMESPACE}"
+  fi
+
+  kctl apply -f "${ENVOY_GATEWAY_MANIFEST}"
+  ENVOY_GATEWAY_CONFIG_APPLIED=1
+}
+
+wait_for_envoy_service() {
+  local svc_ref=""
+  local svc_namespace=""
+
+  for _ in $(seq 1 60); do
+    svc_ref="$(kctl get svc -A \
+      -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+      -o jsonpath='{range .items[0]}{.metadata.namespace}{"/"}{.metadata.name}{end}' \
+      2>/dev/null || true)"
+    if [ -n "${svc_ref}" ]; then
+      svc_namespace="${svc_ref%%/*}"
+      if kctl -n "${svc_namespace}" wait --for=condition=Ready pod \
+        -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+        --timeout=5s >/dev/null 2>&1; then
+        printf '%s\n' "${svc_ref}"
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+
+  echo "ERROR: Envoy proxy Service for Gateway ${RELEASE_NAME} was not ready." >&2
+  kctl -n "${NAMESPACE}" get gateway,grpcroute -o wide >&2 || true
+  kctl get svc -A \
+    -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+    -o wide >&2 || true
+  kctl get pods -A \
+    -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+    -o wide >&2 || true
+  return 1
+}
+
+start_gateway_portforward() {
+  local elapsed=0
+  local pf_timeout=30
+  local target_port=8080
+  local target_namespace="${NAMESPACE}"
+  local target_service="${RELEASE_NAME}"
+  local target_service_ref=""
+
+  LOCAL_PORT="$(e2e_pick_port)"
+  if use_envoy_gateway; then
+    target_service_ref="$(wait_for_envoy_service)"
+    target_namespace="${target_service_ref%%/*}"
+    target_service="${target_service_ref#*/}"
+    target_port=80
+    echo "Starting kubectl port-forward -n ${target_namespace} svc/${target_service} ${LOCAL_PORT}:${target_port} (Envoy Gateway)..."
+  else
+    echo "Starting kubectl port-forward svc/${target_service} ${LOCAL_PORT}:${target_port}..."
+  fi
+
+  kctl -n "${target_namespace}" port-forward "svc/${target_service}" \
+    "${LOCAL_PORT}:${target_port}" >"${PORTFORWARD_LOG}" 2>&1 &
+  PORTFORWARD_PID=$!
+
+  while [ "${elapsed}" -lt "${pf_timeout}" ]; do
+    if ! kill -0 "${PORTFORWARD_PID}" 2>/dev/null; then
+      echo "ERROR: kubectl port-forward exited before becoming reachable" >&2
+      cat "${PORTFORWARD_LOG}" >&2 || true
+      return 1
+    fi
+    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  echo "ERROR: port-forward did not accept TCP within ${pf_timeout}s" >&2
+  cat "${PORTFORWARD_LOG}" >&2 || true
+  return 1
+}
+
+stop_gateway_portforward() {
+  local pid
+  local pid_var
+  for pid_var in PORTFORWARD_PID PORTFORWARD_HEALTH_PID; do
+    pid="${!pid_var}"
+    [ -n "${pid}" ] || continue
+    kill "${pid}" >/dev/null 2>&1 || true
+    for _ in $(seq 1 10); do
+      if ! kill -0 "${pid}" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 0.5
+    done
+    kill -KILL "${pid}" >/dev/null 2>&1 || true
+    wait "${pid}" >/dev/null 2>&1 || true
+    printf -v "${pid_var}" '%s' ""
+  done
+}
+
 cleanup_postgres_fixture() {
   local secret_name="$1"
 
@@ -202,15 +329,23 @@ cleanup_postgres_fixture() {
 deploy_vault_fixture() {
   echo "Deploying OpenBao fixture for Vault credential-driver validation..."
 
+  local openshift_flag="false"
+  if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
+    echo "Enabling OpenBao chart OpenShift mode for restricted-v2 compatibility."
+    openshift_flag="true"
+  fi
+
   helmctl repo add openbao https://openbao.github.io/openbao-helm \
     >/dev/null 2>&1 || true
   helmctl repo update openbao >/dev/null
   helmctl upgrade --install "${VAULT_RELEASE_NAME}" openbao/openbao \
     --namespace "${VAULT_NAMESPACE}" --create-namespace \
     --version "${VAULT_CHART_VERSION}" \
+    --values "${ROOT}/e2e/kubernetes/openbao-tls-values.yaml" \
     --set "server.dev.enabled=true" \
     --set "server.dev.devRootToken=${VAULT_DEV_ROOT_TOKEN}" \
     --set "injector.enabled=false" \
+    --set "global.openshift=${openshift_flag}" \
     --wait --timeout 5m
   VAULT_FIXTURE_DEPLOYED=1
 
@@ -219,14 +354,78 @@ deploy_vault_fixture() {
     -l "app.kubernetes.io/name=openbao,component=server" \
     --timeout=300s
 
+  kctl -n "${VAULT_NAMESPACE}" exec "${VAULT_RELEASE_NAME}-0" -- \
+    cat /openbao/tls/vault-ca.pem >"${VAULT_CA_FILE}"
+  kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+  kctl -n "${NAMESPACE}" create configmap "${VAULT_CA_CONFIG_MAP}" \
+    --from-file="ca.crt=${VAULT_CA_FILE}" --dry-run=client -o yaml | kctl apply -f -
+  kctl -n "${NAMESPACE}" create service externalname "${VAULT_DNS_ALIAS}" \
+    --external-name="${VAULT_RELEASE_NAME}-0.${VAULT_RELEASE_NAME}-internal.${VAULT_NAMESPACE}.svc.cluster.local" \
+    --dry-run=client -o yaml | kctl apply -f -
+
+  provision_vault_auth
+
   export OPENSHELL_E2E_VAULT_NAMESPACE="${VAULT_NAMESPACE}"
   export OPENSHELL_E2E_VAULT_POD="${VAULT_RELEASE_NAME}-0"
   export OPENSHELL_E2E_VAULT_TOKEN="${VAULT_DEV_ROOT_TOKEN}"
 }
 
+# Run a `bao` command in the fixture pod. Tolerates the "path is already in use"
+# error from re-enabling a mount on rerun, but surfaces any other failure.
+openbao_exec() {
+  local out
+  if out="$(kctl -n "${VAULT_NAMESPACE}" exec "${VAULT_RELEASE_NAME}-0" -- \
+    env "BAO_TOKEN=${VAULT_DEV_ROOT_TOKEN}" bao "$@" 2>&1)"; then
+    [ -n "${out}" ] && printf '%s\n' "${out}"
+    return 0
+  fi
+  case "${out}" in
+    *"path is already in use"*) return 0 ;;
+    *) printf '%s\n' "${out}" >&2; return 1 ;;
+  esac
+}
+
+# Provision the KV store, Kubernetes auth method, storage policy, and login role
+# the gateway's Vault credential driver uses, so every provider-creating test in
+# the suite can authenticate. The role binds ServiceAccount `openshell` in the
+# gateway namespace, matching ci/values-credential-driver-vault.yaml.
+provision_vault_auth() {
+  echo "Provisioning OpenBao Kubernetes auth for the gateway service account..."
+
+  openbao_exec secrets enable -path=secret kv-v2 >/dev/null
+  openbao_exec auth enable kubernetes >/dev/null
+
+  openbao_exec write auth/kubernetes/config \
+    kubernetes_host=https://kubernetes.default.svc \
+    kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+    >/dev/null
+
+  printf '%s\n' \
+    'path "secret/data/openshell/provider-credentials/*" {' \
+    '  capabilities = ["create", "read", "update", "delete"]' \
+    '}' \
+    'path "secret/metadata/openshell/provider-credentials/*" {' \
+    '  capabilities = ["read", "delete", "list"]' \
+    '}' \
+    | kctl -n "${VAULT_NAMESPACE}" exec -i "${VAULT_RELEASE_NAME}-0" -- \
+        env "BAO_TOKEN=${VAULT_DEV_ROOT_TOKEN}" \
+        bao policy write openshell-provider-storage - >/dev/null
+
+  openbao_exec write auth/kubernetes/role/openshell-gateway \
+    bound_service_account_names=openshell \
+    "bound_service_account_namespaces=${NAMESPACE}" \
+    policies=openshell-provider-storage \
+    ttl=1h >/dev/null
+}
+
 cleanup_vault_fixture() {
   [ -n "${KUBE_CONTEXT}" ] || return 0
   [ -n "${VAULT_NAMESPACE}" ] || return 0
+
+  kctl -n "${NAMESPACE}" delete service "${VAULT_DNS_ALIAS}" \
+    --ignore-not-found >/dev/null 2>&1 || true
+  kctl -n "${NAMESPACE}" delete configmap "${VAULT_CA_CONFIG_MAP}" \
+    --ignore-not-found >/dev/null 2>&1 || true
 
   if command -v helm >/dev/null 2>&1; then
     helmctl uninstall "${VAULT_RELEASE_NAME}" \
@@ -243,24 +442,41 @@ cleanup_vault_fixture() {
 cleanup() {
   local exit_code=$?
 
-  if [ -n "${PORTFORWARD_PID}" ]; then
-    kill "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
-    wait "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
-  fi
-
-  if [ -n "${PORTFORWARD_HEALTH_PID}" ]; then
-    kill "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
-    wait "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
-  fi
+  stop_gateway_portforward
 
   if [ "${exit_code}" -ne 0 ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
     if command -v kubectl >/dev/null 2>&1 \
        && kctl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
       echo "=== gateway pod state (preserved for debugging) ==="
       kctl -n "${NAMESPACE}" get pods -o wide 2>&1 || true
+      echo "=== Agent Sandbox resources ==="
+      kctl -n "${NAMESPACE}" get sandboxes.agents.x-k8s.io -o yaml 2>&1 || true
+      echo "=== gateway sandbox records ==="
+      "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" \
+        sandbox list --all-workspaces --output json 2>&1 || true
+      echo "=== sandbox-runtime supervisor Pods ==="
+      kctl -n "${NAMESPACE}" get pods \
+        -l "openshell.ai/boundary-role=supervisor" -o yaml 2>&1 || true
+      echo "=== sandbox-runtime supervisor logs (last 200 lines each) ==="
+      while IFS= read -r supervisor_pod; do
+        [ -n "${supervisor_pod}" ] || continue
+        echo "--- ${supervisor_pod} ---"
+        kctl -n "${NAMESPACE}" logs "${supervisor_pod}" \
+          --all-containers --prefix --tail=200 2>&1 || true
+        echo "--- ${supervisor_pod} (previous containers) ---"
+        kctl -n "${NAMESPACE}" logs "${supervisor_pod}" --previous \
+          --all-containers --prefix --tail=200 2>&1 || true
+      done < <(kctl -n "${NAMESPACE}" get pods \
+        -l "openshell.ai/boundary-role=supervisor" -o name 2>/dev/null || true)
       echo "=== gateway events ==="
       kctl -n "${NAMESPACE}" get events --sort-by=.lastTimestamp 2>&1 \
         | tail -n 80 || true
+      echo "=== gateway lifecycle and supervisor-session logs ==="
+      kctl -n "${NAMESPACE}" logs "$(kube_workload_ref "${RELEASE_NAME}")" \
+        --since=20m \
+        --all-containers --prefix 2>&1 \
+        | grep -Ei "sandbox phase changed|start_sandbox|stop_sandbox|supervisor session|sandbox-runtime|bootstrap" \
+        || true
       echo "=== gateway logs (last 200 lines) ==="
       kctl -n "${NAMESPACE}" logs \
         -l "app.kubernetes.io/instance=${RELEASE_NAME}" --tail=200 \
@@ -286,6 +502,17 @@ cleanup() {
 
   if [ "${VAULT_FIXTURE_DEPLOYED}" = "1" ]; then
     cleanup_vault_fixture
+  fi
+
+  if [ "${ENVOY_GATEWAY_CONFIG_APPLIED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
+    if command -v kubectl >/dev/null 2>&1; then
+      kctl -n "${NAMESPACE}" delete backendtrafficpolicy.gateway.envoyproxy.io \
+        openshell-grpc-timeouts --ignore-not-found --wait=false \
+        >/dev/null 2>&1 || true
+      kctl delete gatewayclass.gateway.networking.k8s.io eg \
+        --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    fi
+    ENVOY_GATEWAY_CONFIG_APPLIED=0
   fi
 
   if [ "${CORPORATE_PROXY_FIXTURE_DEPLOYED}" = "1" ]; then
@@ -336,6 +563,18 @@ cleanup() {
     fi
   fi
 
+  if [ "${ENVOY_HELM_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
+    if command -v helm >/dev/null 2>&1; then
+      helmctl uninstall "${ENVOY_RELEASE_NAME}" --namespace "${ENVOY_NAMESPACE}" \
+        --wait --timeout 60s >/dev/null 2>&1 || true
+    fi
+    if command -v kubectl >/dev/null 2>&1; then
+      kctl delete namespace "${ENVOY_NAMESPACE}" --wait=true --timeout=60s \
+        --ignore-not-found >/dev/null 2>&1 || true
+    fi
+    ENVOY_HELM_INSTALLED=0
+  fi
+
   if [ "${CLUSTER_CREATED_BY_US}" = "1" ] && [ -n "${CLUSTER_NAME}" ]; then
     if command -v k3d >/dev/null 2>&1 && k3d cluster list "${CLUSTER_NAME}" \
         >/dev/null 2>&1; then
@@ -351,16 +590,7 @@ trap cleanup EXIT
 # --- DB-scenario helpers (used only when OPENSHELL_E2E_KUBE_DB_SCENARIOS=1) ---
 
 scenario_stop_portforward() {
-  if [ -n "${PORTFORWARD_PID}" ]; then
-    kill "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
-    wait "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
-    PORTFORWARD_PID=""
-  fi
-  if [ -n "${PORTFORWARD_HEALTH_PID}" ]; then
-    kill "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
-    wait "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
-    PORTFORWARD_HEALTH_PID=""
-  fi
+  stop_gateway_portforward
 }
 
 scenario_cleanup_release() {
@@ -417,6 +647,8 @@ run_scenario() {
     --set "fullnameOverride=openshell" \
     --set "image.repository=${REGISTRY_VALUE}/gateway" \
     --set "image.tag=${IMAGE_TAG_VALUE}" \
+    --set "sandboxRuntime.image.repository=${REGISTRY_VALUE}/sandbox" \
+    --set "sandboxRuntime.image.tag=${IMAGE_TAG_VALUE}" \
     --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
     --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
     "${helm_post_renderer_args[@]}" \
@@ -433,7 +665,7 @@ run_scenario() {
     fi
   else
     # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
-    if ! start_grpc_portforward; then
+    if ! start_gateway_portforward; then
       scenario_record_failure "${scenario_label}" "port-forward failed"
       return
     fi
@@ -460,7 +692,13 @@ run_scenario() {
   export CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
   export OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
+  export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
+  export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
+  export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
+
+  e2e_import_example_provider_profiles \
+    "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" "${ROOT}" || return 1
 
   echo "Running e2e command against ${GATEWAY_ENDPOINT}: ${E2E_CMD[*]}"
   "${E2E_CMD[@]}" || scenario_exit=$?
@@ -685,6 +923,7 @@ if [ -z "${OPENSHELL_E2E_KUBE_BUILD_IMAGES+x}" ]; then
   fi
 fi
 
+reuse_sandbox_image=0
 reuse_supervisor_image=0
 if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
   REGISTRY_VALUE="${OPENSHELL_REGISTRY:-openshell}"
@@ -770,7 +1009,7 @@ if [ -z "${HOST_GATEWAY_IP}" ]; then
   echo "         Set OPENSHELL_E2E_HOST_GATEWAY_IP to override." >&2
 fi
 
-# Import locally-available gateway/supervisor images into the k3d cluster so
+# Import locally available gateway, sandbox, and supervisor images into the k3d cluster so
 # devs working off local builds don't depend on the configured registry. For
 # kind clusters (used by CI), images must be loaded before this script runs —
 # the workflow handles that via `kind load docker-image`. Best-effort: when an
@@ -786,7 +1025,7 @@ elif [[ "${KUBE_CONTEXT}" == k3d-* ]] && command -v k3d >/dev/null 2>&1; then
 fi
 if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
   require_cmd docker
-  echo "Building local Kubernetes e2e images (${REGISTRY_VALUE}/{gateway,supervisor}:${IMAGE_TAG_VALUE})..."
+  echo "Building local Kubernetes e2e images (${REGISTRY_VALUE}/{gateway,sandbox,supervisor}:${IMAGE_TAG_VALUE})..."
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     if [ "$(uname -s)" != "Linux" ]; then
       echo "ERROR: external Kubernetes driver image composition currently requires a Linux build host." >&2
@@ -816,6 +1055,7 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
     docker build \
       --build-arg "TARGETARCH=${external_arch}" \
       --build-arg "SUPERVISOR_IMAGE=${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}" \
+      --build-arg "SANDBOX_RUNTIME_IMAGE=${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}" \
       --tag "${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}" \
       --file "${ROOT}/e2e/docker/Dockerfile.external-kubernetes-gateway" \
       "${ROOT}"
@@ -823,7 +1063,16 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
     CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
       bash "${ROOT}/tasks/scripts/docker-build-image.sh" gateway
   fi
+  sandbox_image="${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}"
   supervisor_image="${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}"
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" != "1" ] \
+     || ! docker image inspect "${sandbox_image}" >/dev/null 2>&1; then
+    CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
+      bash "${ROOT}/tasks/scripts/docker-build-image.sh" sandbox
+  else
+    reuse_sandbox_image=1
+    echo "Reusing existing sandbox image ${sandbox_image}"
+  fi
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" != "1" ] \
      || ! docker image inspect "${supervisor_image}" >/dev/null 2>&1; then
     CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
@@ -837,6 +1086,7 @@ fi
 if [ -n "${import_cluster_name}" ]; then
   for image in \
     "${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}" \
+    "${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}" \
     "${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}"; do
     if docker image inspect "${image}" >/dev/null 2>&1; then
       echo "Importing ${image} into k3d cluster ${import_cluster_name}..."
@@ -849,6 +1099,11 @@ elif [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ] \
    && command -v kind >/dev/null 2>&1; then
   kind_cluster_name="${KUBE_CONTEXT#kind-}"
   kind_images=("${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}")
+  # The CI workflow loads its published sandbox archive before invoking this
+  # wrapper. Only load a sandbox image here when this script rebuilt it.
+  if [ "${reuse_sandbox_image}" != "1" ]; then
+    kind_images+=("${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}")
+  fi
   # The CI workflow loads its published supervisor archive before invoking this
   # wrapper. Only load a supervisor image here when this script rebuilt it.
   if [ "${reuse_supervisor_image}" != "1" ]; then
@@ -865,6 +1120,16 @@ fi
 # every gateway K8s call 404s and CreateSandbox never produces a Pod.
 AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION}" \
   bash "${ROOT}/e2e/support/install-agent-sandbox.sh" --context "${KUBE_CONTEXT}"
+
+# Detect OpenShift up front so fixtures deployed below can apply SCC-compatible
+# handling; the gateway setup further down reuses this flag.
+if kctl api-resources --api-group=route.openshift.io --no-headers 2>/dev/null | grep -q .; then
+  OPENSHIFT_DETECTED=1
+  if ! command -v oc >/dev/null 2>&1; then
+    echo "ERROR: oc CLI is required for OpenShift SCC management but was not found." >&2
+    exit 2
+  fi
+fi
 
 ACTIVE_CREDENTIAL_DRIVER="${OPENSHELL_E2E_CREDENTIAL_DRIVER:-kubernetes-secrets}"
 if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ] \
@@ -890,15 +1155,9 @@ if [ -n "${HOST_GATEWAY_IP}" ]; then
 fi
 
 helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
-if kctl api-resources --api-group=route.openshift.io --no-headers 2>/dev/null | grep -q .; then
-  OPENSHIFT_DETECTED=1
+if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
   echo "OpenShift detected — applying SCC-compatible security context overrides."
   helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-openshift-scc.yaml")
-
-  if ! command -v oc >/dev/null 2>&1; then
-    echo "ERROR: oc CLI is required for OpenShift SCC management but was not found." >&2
-    exit 2
-  fi
 
   kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
 
@@ -994,6 +1253,10 @@ if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
     helm_values_args+=(--values "${values_file}")
   done
 fi
+if use_envoy_gateway; then
+  helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway.yaml")
+  install_envoy_gateway
+fi
 
 if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
   # --- Multi-scenario mode: test all database backends ---
@@ -1038,6 +1301,8 @@ else
     --set "fullnameOverride=openshell" \
     --set "image.repository=${REGISTRY_VALUE}/gateway" \
     --set "image.tag=${IMAGE_TAG_VALUE}" \
+    --set "sandboxRuntime.image.repository=${REGISTRY_VALUE}/sandbox" \
+    --set "sandboxRuntime.image.tag=${IMAGE_TAG_VALUE}" \
     --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
     --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
     "${helm_extra_args[@]}" \
@@ -1059,7 +1324,7 @@ else
     openshift_register_route_gateway || exit 1
   else
     # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
-    start_grpc_portforward || exit 1
+    start_gateway_portforward || exit 1
     GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
     GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
     e2e_register_plaintext_gateway \
@@ -1080,7 +1345,13 @@ else
   export CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
   export OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
+  export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
+  export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
+  export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
+
+  e2e_import_example_provider_profiles \
+    "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" "${ROOT}" || exit 1
 
   echo "Running e2e command against ${GATEWAY_ENDPOINT}: $*"
   "$@"

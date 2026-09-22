@@ -82,7 +82,10 @@ pub const CONDITION_STOPPED: &str = "ContainerStopped";
 /// All compute drivers must launch this binary as the container entrypoint to
 /// start the sandboxed environment.  The value must be kept in sync with the
 /// path used when building the `openshell-sandbox` image layer.
-pub const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
+pub const SANDBOX_RUNTIME_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
+
+/// Legacy name for [`SANDBOX_RUNTIME_IMAGE_BINARY_PATH`].
+pub const SUPERVISOR_IMAGE_BINARY_PATH: &str = SANDBOX_RUNTIME_IMAGE_BINARY_PATH;
 
 /// Directory inside sandbox containers where the supervisor binary is mounted.
 ///
@@ -674,6 +677,68 @@ pub fn validate_upstream_proxy_settings(
 /// Container-side directory where the provider SPIFFE Workload API socket is mounted.
 pub const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str = "/spiffe-workload-api";
 
+/// Validate a host UNIX socket selected for provider SPIFFE projection.
+///
+/// Local container drivers bind-mount the socket's dedicated parent directory,
+/// not a broad host root. TCP endpoints are deliberately rejected here: a
+/// container projection must be a filesystem socket, while VM guest TCP
+/// exposure has its own explicit acknowledgement contract.
+pub fn validate_provider_spiffe_unix_socket(path: &Path) -> Result<(), String> {
+    let raw = path
+        .to_str()
+        .ok_or_else(|| "provider_spiffe_workload_api_socket must be valid UTF-8".to_string())?;
+    if raw.trim() != raw || raw.is_empty() {
+        return Err("provider_spiffe_workload_api_socket must not be empty or contain surrounding whitespace".to_string());
+    }
+    if raw.starts_with("tcp:") || raw.starts_with("unix:") {
+        return Err("provider_spiffe_workload_api_socket must be an absolute host UNIX socket path, not a URI".to_string());
+    }
+    if !path.is_absolute() || path.parent().is_none_or(|parent| parent == Path::new("/")) {
+        return Err("provider_spiffe_workload_api_socket must be an absolute UNIX socket path below a dedicated parent directory".to_string());
+    }
+    Ok(())
+}
+
+/// Return the guest/container path for a projected provider SPIFFE socket.
+pub fn projected_provider_spiffe_socket_path(path: &Path) -> Result<String, String> {
+    validate_provider_spiffe_unix_socket(path)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "provider_spiffe_workload_api_socket must name a socket file".to_string())?;
+    Ok(format!(
+        "{PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR}/{file_name}"
+    ))
+}
+
+/// Validate an explicitly operator-acknowledged guest-reachable SPIFFE TCP endpoint.
+///
+/// The `tcp:` spelling is the SPIFFE Workload API endpoint grammar accepted by
+/// the client. The address must be concrete; wildcard and host-only UNIX
+/// sockets are never silently exposed to VM guests.
+pub fn validate_guest_spiffe_tcp_endpoint(
+    endpoint: &str,
+    acknowledged: bool,
+) -> Result<(), String> {
+    if endpoint.trim() != endpoint || endpoint.is_empty() {
+        return Err("provider_spiffe_workload_api_tcp_endpoint must not be empty or contain surrounding whitespace".to_string());
+    }
+    if !acknowledged {
+        return Err("provider_spiffe_workload_api_tcp_endpoint exposes a Workload API to VM guests; set provider_spiffe_allow_guest_tcp = true only after explicitly acknowledging that exposure".to_string());
+    }
+    let address = endpoint.strip_prefix("tcp:").ok_or_else(|| {
+        "provider_spiffe_workload_api_tcp_endpoint must use tcp:host:port (for example tcp:192.0.2.10:8081)".to_string()
+    })?;
+    let address: std::net::SocketAddr = address.parse().map_err(|_| {
+        "provider_spiffe_workload_api_tcp_endpoint must use a concrete IP address and non-zero port".to_string()
+    })?;
+    if address.ip().is_unspecified() || address.port() == 0 {
+        return Err("provider_spiffe_workload_api_tcp_endpoint must not use an unspecified address or port 0".to_string());
+    }
+    Ok(())
+}
+
 /// Return the XDG state path for a driver's sandbox JWT token file.
 ///
 /// The resulting path is `$XDG_STATE_HOME/openshell/<driver_subdir>[/<namespace>]/<sandbox_id>/sandbox.jwt`.
@@ -1109,6 +1174,29 @@ mod tests {
     fn credential_file_missing_path_is_an_error() {
         let err = read_upstream_proxy_credential_file("/nonexistent/proxy-auth").unwrap_err();
         assert!(err.contains("open proxy auth file"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projected_spiffe_socket_requires_dedicated_absolute_unix_path() {
+        assert_eq!(
+            projected_provider_spiffe_socket_path(Path::new("/run/spire/agent.sock")).unwrap(),
+            "/spiffe-workload-api/agent.sock"
+        );
+        for path in ["relative.sock", "/agent.sock", "tcp:127.0.0.1:8081"] {
+            assert!(
+                validate_provider_spiffe_unix_socket(Path::new(path)).is_err(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn guest_spiffe_tcp_requires_acknowledgement_and_concrete_endpoint() {
+        assert!(validate_guest_spiffe_tcp_endpoint("tcp:192.0.2.10:8081", true).is_ok());
+        assert!(validate_guest_spiffe_tcp_endpoint("tcp:192.0.2.10:8081", false).is_err());
+        assert!(validate_guest_spiffe_tcp_endpoint("tcp:0.0.0.0:8081", true).is_err());
+        assert!(validate_guest_spiffe_tcp_endpoint("unix:/run/spire/agent.sock", true).is_err());
     }
 
     #[cfg(unix)]

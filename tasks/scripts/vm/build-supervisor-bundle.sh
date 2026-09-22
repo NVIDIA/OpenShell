@@ -46,10 +46,10 @@ fi
 
 case "${GUEST_ARCH}" in
     aarch64|arm64)
-        RUST_TARGET="aarch64-unknown-linux-gnu"
+        SANDBOX_RUST_TARGET="aarch64-unknown-linux-musl"
         ;;
     x86_64|amd64)
-        RUST_TARGET="x86_64-unknown-linux-gnu"
+        SANDBOX_RUST_TARGET="x86_64-unknown-linux-musl"
         ;;
     *)
         echo "ERROR: Unsupported guest architecture: ${GUEST_ARCH}" >&2
@@ -58,12 +58,17 @@ case "${GUEST_ARCH}" in
         ;;
 esac
 
-SUPERVISOR_BIN="${ROOT}/target/${RUST_TARGET}/release/openshell-sandbox"
+SUPERVISOR_BIN="${ROOT}/target/${SANDBOX_RUST_TARGET}/release/openshell-sandbox"
 SUPERVISOR_OUTPUT="${OUTPUT_DIR}/openshell-sandbox.zst"
+VM_INIT_BIN="${ROOT}/target/${SANDBOX_RUST_TARGET}/release/openshell-vm-init"
+VM_INIT_OUTPUT="${OUTPUT_DIR}/openshell-vm-init.zst"
+HOST_SUPERVISOR_BIN="${ROOT}/target/release/openshell-supervisor"
+HOST_SUPERVISOR_OUTPUT="${OUTPUT_DIR}/openshell-supervisor.zst"
 
 echo "==> Building openshell-sandbox supervisor bundle"
 echo "    Guest arch: ${GUEST_ARCH}"
-echo "    Rust target: ${RUST_TARGET}"
+echo "    Sandbox target: ${SANDBOX_RUST_TARGET} (static musl)"
+echo "    Host supervisor target: native"
 echo "    Output: ${SUPERVISOR_OUTPUT}"
 
 mkdir -p "${OUTPUT_DIR}"
@@ -79,13 +84,19 @@ run_supervisor_build() {
     fi
 
     if command -v cargo-zigbuild >/dev/null 2>&1; then
-        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p openshell-sandbox --target "${RUST_TARGET}" \
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p openshell-sandbox --target "${SANDBOX_RUST_TARGET}" \
+            --manifest-path "${ROOT}/Cargo.toml"
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p openshell-driver-vm --bin openshell-vm-init --no-default-features --target "${SANDBOX_RUST_TARGET}" \
             --manifest-path "${ROOT}/Cargo.toml"
     else
         echo "    cargo-zigbuild not found, falling back to cargo build..."
-        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-sandbox --target "${RUST_TARGET}" \
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-sandbox --target "${SANDBOX_RUST_TARGET}" \
+            --manifest-path "${ROOT}/Cargo.toml"
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-driver-vm --bin openshell-vm-init --no-default-features --target "${SANDBOX_RUST_TARGET}" \
             --manifest-path "${ROOT}/Cargo.toml"
     fi
+    ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-supervisor \
+        --manifest-path "${ROOT}/Cargo.toml"
 }
 
 print_build_failure() {
@@ -116,13 +127,25 @@ else
     fi
 fi
 
-if [ ! -f "${SUPERVISOR_BIN}" ]; then
-    echo "ERROR: supervisor binary not found at ${SUPERVISOR_BIN}" >&2
+if [ ! -f "${SUPERVISOR_BIN}" ] || [ ! -f "${VM_INIT_BIN}" ] || [ ! -f "${HOST_SUPERVISOR_BIN}" ]; then
+    echo "ERROR: sandbox, VM init, or supervisor binary not found after build" >&2
+    exit 1
+fi
+
+if readelf -l "${SUPERVISOR_BIN}" 2>/dev/null | grep -q 'Requesting program interpreter'; then
+    echo "ERROR: VM guest openshell-sandbox must be statically linked" >&2
+    exit 1
+fi
+if readelf -l "${VM_INIT_BIN}" 2>/dev/null | grep -q 'Requesting program interpreter'; then
+    echo "ERROR: openshell-vm-init must be statically linked" >&2
     exit 1
 fi
 
 zstd -19 -T0 -f "${SUPERVISOR_BIN}" -o "${SUPERVISOR_OUTPUT}"
+zstd -19 -T0 -f "${VM_INIT_BIN}" -o "${VM_INIT_OUTPUT}"
+zstd -19 -T0 -f "${HOST_SUPERVISOR_BIN}" -o "${HOST_SUPERVISOR_OUTPUT}"
 
 echo "==> Bundled supervisor ready"
 echo "    Binary: $(du -sh "${SUPERVISOR_BIN}" | cut -f1)"
 echo "    Compressed: $(du -sh "${SUPERVISOR_OUTPUT}" | cut -f1)"
+echo "    VM init: $(du -sh "${VM_INIT_OUTPUT}" | cut -f1)"

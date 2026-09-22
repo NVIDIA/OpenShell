@@ -16,9 +16,12 @@ description = "Check if the local Keycloak instance is running"
 run = "scripts/keycloak-dev.sh status"
 
 ["keycloak:k8s:setup"]
-description = "Install Keycloak in the local k3s cluster and import the openshell realm (one-time setup)"
+description = "Install TLS-enabled Keycloak in the local k3s cluster and import the openshell realm"
 run = "tasks/scripts/keycloak-k8s-setup.sh"
 
 ["keycloak:k8s:teardown"]
 description = "Remove Keycloak from the local k3s cluster"
-run = "kubectl delete namespace keycloak --ignore-not-found"
+run = '''
+kubectl delete namespace keycloak --ignore-not-found
+kubectl -n "${OPENSHELL_NAMESPACE:-openshell}" delete configmap openshell-keycloak-ca --ignore-not-found
+'''

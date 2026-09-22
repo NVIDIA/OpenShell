@@ -1,0 +1,40 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.internal.pagination.v1;
+
+// Private, versioned state carried by an opaque public page token.
+//
+// This message is an implementation detail. Public list RPCs expose only the
+// AIP-158 string page_token and next_page_token fields.
+message PageToken {
+  uint32 version = 1;
+  string method = 2;
+  bytes request_fingerprint = 3;
+
+  oneof cursor {
+    ObjectCursor object = 4;
+    PolicyCursor policy = 5;
+    ProfileCursor profile = 6;
+  }
+}
+
+// Cursor for the total object-store order.
+message ObjectCursor {
+  int64 created_at_ms = 1;
+  string name = 2;
+  string workspace = 3;
+  string id = 4;
+}
+
+// Cursor for descending policy revision order.
+message PolicyCursor {
+  int64 version = 1;
+}
+
+// Cursor for a deterministically ordered provider-profile catalog.
+message ProfileCursor {
+  string key = 1;
+}

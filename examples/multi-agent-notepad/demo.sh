@@ -12,6 +12,7 @@ PROMPTS_DIR="${SCRIPT_DIR}/prompts"
 OPENSHELL_BIN="${OPENSHELL_BIN:-openshell}"
 DEMO_TOPIC="${DEMO_TOPIC:-How should teams evaluate sandboxed coding agents?}"
 DEMO_AGENT_COUNT="${DEMO_AGENT_COUNT:-5}"
+DEMO_AGENT_IMAGE="${DEMO_AGENT_IMAGE:-}"
 DEMO_BRANCH="${DEMO_BRANCH:-main}"
 DEMO_RUN_ID="${DEMO_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 # Sandbox names are capped at 19 characters. Derive a short tag from the
@@ -157,9 +158,10 @@ create_providers() {
 run_sandbox() {
     local name="$1"
     shift
+    [[ -n "$DEMO_AGENT_IMAGE" ]] || fail "set DEMO_AGENT_IMAGE to an OCI image containing Codex, curl, and bash"
     "$OPENSHELL_BIN" sandbox create \
         --name "$name" \
-        --from base \
+        --from "$DEMO_AGENT_IMAGE" \
         --provider "$DEMO_CODEX_PROVIDER_NAME" \
         --provider "$DEMO_GITHUB_PROVIDER_NAME" \
         --policy "$POLICY_FILE" \

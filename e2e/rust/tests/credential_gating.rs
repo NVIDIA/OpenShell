@@ -79,7 +79,7 @@ async fn delete_until_gone(args: &[&str]) -> Result<(), String> {
 /// before it is recreated, otherwise creation fails with "already exists".
 async fn ensure_provider_resources_absent() -> Result<(), String> {
     delete_until_gone(&["provider", "delete", PROVIDER_NAME]).await?;
-    delete_until_gone(&["provider", "profile", "delete", PROFILE_ID]).await
+    delete_until_gone(&["profile", "delete", PROFILE_ID]).await
 }
 
 /// Best-effort teardown. Never fails the test: it also runs on the failure
@@ -134,8 +134,7 @@ async fn install_provider(rest_port: u16, websocket_port: u16) -> Result<(), Str
         .path()
         .to_str()
         .ok_or_else(|| "profile path is not UTF-8".to_string())?;
-    let (imported, output) =
-        run_cli(&["provider", "profile", "import", "--file", profile_path]).await;
+    let (imported, output) = run_cli(&["profile", "import", "--file", profile_path]).await;
     if !imported {
         return Err(format!("profile import failed:\n{output}"));
     }
@@ -192,8 +191,7 @@ async fn install_endpointless_provider() -> Result<(), String> {
         .path()
         .to_str()
         .ok_or_else(|| "endpointless profile path is not UTF-8".to_string())?;
-    let (imported, output) =
-        run_cli(&["provider", "profile", "import", "--file", profile_path]).await;
+    let (imported, output) = run_cli(&["profile", "import", "--file", profile_path]).await;
     if !imported {
         return Err(format!("endpointless profile import failed:\n{output}"));
     }
@@ -221,6 +219,7 @@ enum EndpointMode {
     TlsSkip,
     L4OptIn,
     RestBody { rewrite: bool },
+    WebSocket,
 }
 
 #[derive(Clone, Copy)]
@@ -244,6 +243,9 @@ fn write_policy(
         EndpointMode::RestBody { rewrite } => format!(
             "        protocol: rest\n        access: full\n        request_body_credential_rewrite: {rewrite}\n"
         ),
+        EndpointMode::WebSocket => {
+            "        protocol: websocket\n        access: read-write\n".to_string()
+        }
     };
     let credential_binding = match credential_source {
         CredentialSource::ProviderProfile => String::new(),
@@ -268,12 +270,7 @@ network_policies:
     endpoints:
       - host: {TEST_HOST}
         port: {port}
-{endpoint_options}{credential_binding}        allowed_ips:
-          - "10.0.0.0/8"
-          - "172.0.0.0/8"
-          - "192.168.0.0/16"
-          - "fc00::/7"
-    binaries:
+{endpoint_options}{credential_binding}    binaries:
       - path: /usr/bin/python*
       - path: /usr/local/bin/python*
       - path: /sandbox/.uv/python/*/bin/python*
@@ -281,27 +278,6 @@ network_policies:
     );
     file.write_all(policy.as_bytes())
         .map_err(|error| format!("write policy: {error}"))?;
-    file.flush()
-        .map_err(|error| format!("flush policy: {error}"))?;
-    Ok(file)
-}
-
-fn write_base_policy() -> Result<NamedTempFile, String> {
-    let mut file = NamedTempFile::new().map_err(|error| format!("create policy: {error}"))?;
-    file.write_all(
-        br#"version: 1
-filesystem_policy:
-  include_workdir: true
-  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
-  read_write: [/sandbox, /tmp, /dev/null]
-landlock:
-  compatibility: best_effort
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-"#,
-    )
-    .map_err(|error| format!("write policy: {error}"))?;
     file.flush()
         .map_err(|error| format!("flush policy: {error}"))?;
     Ok(file)
@@ -540,6 +516,8 @@ async fn handle_http_probe(
     if expected_total.is_some_and(|expected| received.len() >= expected) {
         let result = if observation.saw_secret && !observation.saw_placeholder {
             "BODY_REWRITTEN"
+        } else if observation.saw_placeholder && !observation.saw_secret {
+            "BODY_TEXT"
         } else {
             "BODY_BAD"
         };
@@ -557,27 +535,13 @@ fn body_client_script(port: u16) -> String {
         r#"
 import os
 import socket
-import urllib.parse
 
 host = {TEST_HOST:?}
 port = {port}
 token = os.environ[{TOKEN_ENV:?}]
-proxy_url = next(os.environ[name] for name in
-                 ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
-                 if os.environ.get(name))
-proxy = urllib.parse.urlparse(proxy_url)
 
-with socket.create_connection((proxy.hostname, proxy.port or 80), timeout=10) as sock:
+with socket.create_connection((host, port), timeout=10) as sock:
     target = f"{{host}}:{{port}}"
-    sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode("ascii"))
-    response = b""
-    while b"\r\n\r\n" not in response:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        response += chunk
-    if not response.startswith(b"HTTP/1.1 200"):
-        raise RuntimeError("CONNECT failed")
     body = ("prefix-" + token + "-suffix").encode("utf-8")
     request = (
         f"POST /token HTTP/1.1\r\nHost: {{target}}\r\n"
@@ -594,7 +558,7 @@ with socket.create_connection((proxy.hostname, proxy.port or 80), timeout=10) as
         if not chunk:
             break
         response += chunk
-    print("BODY_REWRITTEN" if b"BODY_REWRITTEN" in response else "BODY_DENIED")
+    print("BODY_REWRITTEN" if b"BODY_REWRITTEN" in response else "BODY_TEXT" if b"BODY_TEXT" in response else "BODY_DENIED")
 "#
     )
 }
@@ -606,14 +570,9 @@ import base64
 import os
 import socket
 import struct
-import urllib.parse
 
 host = {TEST_HOST:?}
 port = {port}
-proxy_url = next(os.environ[name] for name in
-                 ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
-                 if os.environ.get(name))
-proxy = urllib.parse.urlparse(proxy_url)
 
 def recv_until(sock, marker):
     data = b""
@@ -633,11 +592,8 @@ def recv_exact(sock, size):
         data += chunk
     return data
 
-with socket.create_connection((proxy.hostname, proxy.port or 80), timeout=10) as sock:
+with socket.create_connection((host, port), timeout=10) as sock:
     target = f"{{host}}:{{port}}"
-    sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode("ascii"))
-    if not recv_until(sock, b"\r\n\r\n").startswith(b"HTTP/1.1 200"):
-        raise RuntimeError("CONNECT failed")
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     request = (
         f"GET /ws HTTP/1.1\r\nHost: {{target}}\r\n"
@@ -858,7 +814,11 @@ async fn run_body_sandbox(
 }
 
 async fn run_profile_body_sandbox(port: u16) -> Result<String, String> {
-    let policy = write_base_policy()?;
+    let policy = write_policy(
+        port,
+        EndpointMode::RestBody { rewrite: false },
+        CredentialSource::ProviderProfile,
+    )?;
     let policy_path = policy
         .path()
         .to_str()
@@ -880,18 +840,22 @@ async fn run_profile_body_sandbox(port: u16) -> Result<String, String> {
     Ok(output)
 }
 
-async fn assert_rest_body_backstop(server: &HttpProbeServer) -> Result<(), String> {
-    let denied = run_profile_body_sandbox(server.port).await?;
-    assert!(denied.contains("BODY_DENIED"));
+async fn assert_rest_body_preserves_placeholder(server: &HttpProbeServer) -> Result<(), String> {
+    let output = run_profile_body_sandbox(server.port).await?;
+    assert!(output.contains("BODY_TEXT"));
     let observations = server.wait_for_observations(1).await;
     assert_eq!(observations.len(), 1, "observations: {observations:?}");
-    assert!(!observations[0].saw_placeholder);
+    assert!(observations[0].saw_placeholder);
     assert!(!observations[0].saw_secret);
     Ok(())
 }
 
 async fn assert_websocket_binary_denied(server: &BinaryWebSocketProbeServer) -> Result<(), String> {
-    let policy = write_base_policy()?;
+    let policy = write_policy(
+        server.port,
+        EndpointMode::WebSocket,
+        CredentialSource::ProviderProfile,
+    )?;
     let policy_path = policy
         .path()
         .to_str()
@@ -932,7 +896,7 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         .expect("install credentialed provider");
 
     let result = async {
-        assert_rest_body_backstop(&server).await?;
+        assert_rest_body_preserves_placeholder(&server).await?;
         assert_websocket_binary_denied(&websocket_server).await
     }
     .await;
@@ -945,13 +909,13 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         .expect("install endpointless provider");
     let endpointless_result = async {
         assert_gateway_admission(server.port, CredentialSource::PolicyBinding).await?;
-        let denied = run_body_sandbox(
+        let literal = run_body_sandbox(
             server.port,
             EndpointMode::RestBody { rewrite: false },
             CredentialSource::PolicyBinding,
         )
         .await?;
-        assert!(denied.contains("BODY_DENIED"));
+        assert!(literal.contains("BODY_TEXT"));
         let rewritten = run_body_sandbox(
             server.port,
             EndpointMode::RestBody { rewrite: true },
@@ -963,7 +927,7 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         assert!(!rewritten.contains(PLACEHOLDER_PREFIX));
         let observations = server.wait_for_observations(3).await;
         assert_eq!(observations.len(), 3, "observations: {observations:?}");
-        assert!(!observations[1].saw_placeholder);
+        assert!(observations[1].saw_placeholder);
         assert!(!observations[1].saw_secret);
         assert!(!observations[2].saw_placeholder);
         assert!(observations[2].saw_secret);

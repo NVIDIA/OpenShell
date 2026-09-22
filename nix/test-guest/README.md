@@ -53,8 +53,7 @@ nix/test-guest/
     └── roles/
         ├── gateway-podman/
         ├── openshell-development/
-        ├── openshell-rpm/
-        └── openshell-rpm-gateway-upgrade/
+        └── openshell-rpm/
 ```
 
 - `default.nix` assembles the guest and cache flake apps. It selects host architecture and acceleration, supplies the runtime tools, and exposes distro profiles and configuration playbooks as Nix-store catalogs.
@@ -167,31 +166,6 @@ copied artifacts are present. Unlike `--with`, provisioners are not cached.
 They can therefore install and start an OpenShell system without coupling the
 prepared guest image to a particular build or driver configuration.
 
-Provisioners that support gateway continuity install a target-control command:
-
-```text
-/home/openshell/.local/bin/openshell-test-guest-gateway-restart
-```
-
-It restarts an already-provisioned gateway and exits only after CLI health
-succeeds. An explicit conformance plan consumes that stable test-guest contract
-without knowing how the provisioner implements it:
-
-```shell
-openshell-conformance run --plan - <<'EOF'
-version = 1
-
-[[runs]]
-scenario = "sandbox-continuity"
-workload_expectation = "reconciled"
-
-[[runs.actions]]
-name = "gateway-restart"
-command = "/home/openshell/.local/bin/openshell-test-guest-gateway-restart"
-timeout_secs = 120
-EOF
-```
-
 `openshell-development` expects these copied guest paths:
 
 - `/usr/local/bin/openshell`
@@ -213,36 +187,14 @@ nix run .#test-guest -- \
   --copy ./openshell-sandbox.tar:/usr/local/lib/openshell-sandbox.tar \
   --provision openshell-development \
   --provision gateway-podman \
-  -- /usr/local/bin/openshell-conformance run --plan - <<'EOF'
-version = 1
-
-[[runs]]
-scenario = "sandbox-continuity"
-workload_expectation = "reconciled"
-
-[[runs.actions]]
-name = "gateway-restart"
-command = "/home/openshell/.local/bin/openshell-test-guest-gateway-restart"
-timeout_secs = 120
-EOF
+  -- /usr/local/bin/openshell-conformance run smoke
 ```
 
 `openshell-rpm` expects OpenShell to have been installed with `--install`. It
 uses the RPM-owned `/usr/bin` binaries and `openshell-gateway` user service,
 without copied development artifacts or a supervisor archive. Compose it with
-`gateway-podman` to start the installed version. The existing upgrade flow uses
-the same role with the rootless configuration before
-`openshell-rpm-gateway-upgrade`.
-
-`openshell-rpm-latest-release` downloads and installs the latest stable
-OpenShell GitHub release for the guest architecture, then publishes the same
-RPM installation contract. Compose it with `gateway-podman` and an RPM gateway
-action when testing an upgrade from the current release.
-
-Versioned plans under `nix/test-guest/conformance-plans/` bind conformance
-scenarios to the stable action-command contracts installed by provisioners.
-Copy the applicable plan to the guest and pass it to `openshell-conformance run
---plan`.
+`gateway-podman` to start the installed version before running smoke
+conformance.
 
 ## Prepared VM cache
 

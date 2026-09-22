@@ -35,7 +35,8 @@ where Helm cannot discover cluster APIs.
 ## Install on Kubernetes
 
 ```shell
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version>
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
 ```
 
 ## Install on OpenShift
@@ -43,28 +44,30 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
 See the full [OpenShift install guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) for details. Quick start:
 
 ```shell
-# Precreate the openshell namespace so we can create the SCC cluster role
+# Precreate the openshell namespace
 oc create ns openshell
-
-# Sandboxes are deployed into the openshell namespace and use the openshell-sandbox service account
-oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
 
 # Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set server.disableTls=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null
 ```
 
+On OpenShift 4.22+, end-to-end TLS is supported via `BackendTLSPolicy`. See the
+[OpenShift install guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift#end-to-end-tls-openshift-422) for details.
+
 ## Available versions
 
 | Tag | Source | Notes |
 | --- | --- | --- |
-| `<semver>` (e.g. `0.6.0`) | Tagged GitHub release | Tracks the matching gateway and supervisor image versions. Recommended for production. |
+| `<semver>` (e.g. `0.6.0`) | Tagged GitHub release | Tracks the matching gateway, sandbox, and supervisor image versions. Recommended for production. |
+| `<semver>-pre.N` (e.g. `0.1.0-pre.3`) | A specific prerelease candidate | Immutable candidate pin that tracks images with the same exact version. |
 | `0.0.0-dev` | Latest commit on `main` | Floating tag, overwritten on every push. `appVersion` is `dev`, so images resolve to the `:dev` tag. |
 | `0.0.0-dev.<commit-sha>` | A specific commit on `main` | Per-commit pin. Chart version and `appVersion` both use the full 40-character commit SHA, which matches the image tag pushed by CI. |
 
-The `dev` tags are intended for testing changes ahead of a release. Production deployments should pin to a tagged release.
+Prerelease and `dev` tags are intended for testing changes ahead of a release. Production deployments should pin to a stable tagged release.
 
 ## Configuration
 
@@ -107,6 +110,7 @@ Then install the chart pointing at that Secret:
 ```bash
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
   -n openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set workload.kind=deployment \
   --set server.externalDbSecret=my-pg-credentials
 ```
@@ -137,6 +141,28 @@ Append these flags to any of the PostgreSQL commands above for OpenShift:
 --set podSecurityContext.fsGroup=null \
 --set securityContext.runAsUser=null
 ```
+
+### High availability
+
+Set `replicaCount` above `1` only with `server.externalDbSecret`; the default
+SQLite database is per pod and cannot coordinate multiple gateway replicas.
+The chart creates a headless peer Service for gateway-to-gateway relay traffic.
+StatefulSet pods use stable pod DNS names through that headless Service.
+Deployment pods advertise their pod IP with `OPENSHELL_PEER_ENDPOINT`, because
+Kubernetes does not assign stable per-pod DNS names to Deployment replicas.
+
+Gateway peer traffic uses Kubernetes ServiceAccount identity. Each gateway pod
+mounts a projected, pod-bound ServiceAccount token with audience
+`openshell-gateway-peer`; receiving replicas validate that token with the
+Kubernetes TokenReview API, verify the live pod UID and Helm selector labels,
+and authorize only the internal `PeerRelay` RPC. The chart does not create or
+accept a shared gateway peer Secret.
+
+With gateway TLS enabled, peer calls use the chart CA and client TLS Secret for
+server verification and mTLS. The client verifies the stable gateway Service
+DNS name while connecting directly to the owning pod. Custom TLS Secrets must
+include that Service DNS name in the server certificate and provide the CA and
+client credentials configured by `server.tls`.
 
 ## Secret bootstrap
 

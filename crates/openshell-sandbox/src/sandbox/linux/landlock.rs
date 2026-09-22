@@ -1,0 +1,888 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Landlock filesystem sandboxing.
+
+use landlock::{
+    ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, PathFdError,
+    Ruleset, RulesetAttr, RulesetCreatedAttr,
+};
+use miette::{IntoDiagnostic, Result};
+use openshell_core::policy::{LandlockCompatibility, SandboxPolicy};
+use std::os::fd::{AsFd, OwnedFd};
+use std::path::{Path, PathBuf};
+use tracing::debug;
+
+/// Result of probing the kernel for Landlock support.
+#[derive(Debug)]
+pub enum LandlockAvailability {
+    /// Landlock is available with the given ABI version.
+    Available { abi: i32 },
+    /// Kernel does not implement Landlock (ENOSYS).
+    NotImplemented,
+    /// Landlock is compiled in but not enabled at boot (EOPNOTSUPP).
+    NotEnabled,
+    /// Landlock syscall is blocked, likely by a container seccomp profile (EPERM).
+    Blocked,
+    /// Unexpected error from the probe syscall.
+    Unknown(i32),
+}
+
+impl std::fmt::Display for LandlockAvailability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Available { abi } => write!(f, "available (ABI v{abi})"),
+            Self::NotImplemented => {
+                write!(f, "not implemented (kernel lacks CONFIG_SECURITY_LANDLOCK)")
+            }
+            Self::NotEnabled => write!(
+                f,
+                "not enabled (Landlock built into kernel but not in active LSM list)"
+            ),
+            Self::Blocked => write!(
+                f,
+                "blocked (container seccomp profile denies Landlock syscalls)"
+            ),
+            Self::Unknown(errno) => write!(f, "unexpected probe error (errno {errno})"),
+        }
+    }
+}
+
+/// Probe the kernel for Landlock support by issuing the `landlock_create_ruleset`
+/// syscall with the version-check flag.
+///
+/// This is safe to call from the parent process and does not create any file
+/// descriptors or modify process state.
+pub fn probe_availability() -> LandlockAvailability {
+    // landlock_create_ruleset syscall number (same on x86_64 and aarch64).
+    const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
+    // Flag: return the highest supported ABI version instead of creating a ruleset.
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1 << 0;
+
+    // SAFETY: landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)
+    // is a read-only probe that returns the ABI version or an error code.
+    // It does not allocate file descriptors or modify process state.
+    #[allow(unsafe_code)]
+    let ret = unsafe {
+        libc::syscall(
+            SYS_LANDLOCK_CREATE_RULESET,
+            std::ptr::null::<libc::c_void>(),
+            0_usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+
+    if ret >= 0 {
+        #[allow(clippy::cast_possible_truncation)]
+        LandlockAvailability::Available { abi: ret as i32 }
+    } else {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        match errno {
+            libc::ENOSYS => LandlockAvailability::NotImplemented,
+            libc::EOPNOTSUPP => LandlockAvailability::NotEnabled,
+            libc::EPERM => LandlockAvailability::Blocked,
+            other => LandlockAvailability::Unknown(other),
+        }
+    }
+}
+
+/// A prepared Landlock ruleset ready to be enforced via `restrict_self()`.
+///
+/// Created by [`prepare`] while running as root (so `PathFd::new()` can open
+/// any path regardless of DAC permissions). Enforced by [`enforce`] after
+/// `drop_privileges()` — `restrict_self()` does not require elevated privileges.
+pub struct PreparedRuleset {
+    ruleset: landlock::RulesetCreated,
+    compatibility: LandlockCompatibility,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathOpenMode {
+    Privileged,
+    CurrentUser,
+}
+
+/// Phase 1: Open `PathFds` and build the Landlock ruleset **as root**.
+///
+/// This must run before `drop_privileges()` so that `PathFd::new()` can open
+/// paths that are only accessible to root (e.g. mode 700 directories).
+///
+/// Returns `None` if there are no filesystem paths to restrict (no-op).
+/// Returns `Some(PreparedRuleset)` on success, or an error.
+pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<PreparedRuleset>> {
+    prepare_with_path_open_mode(policy, workdir, PathOpenMode::Privileged)
+}
+
+/// Phase 1 for already-unprivileged workloads.
+///
+/// The sandbox boundary starts as the workload UID, so Landlock path FDs are
+/// opened as the same UID that will run the workload.
+/// Paths this UID cannot open are already unavailable to the workload; omit
+/// them from the allowlist and let the resulting ruleset deny everything else.
+pub fn prepare_current_user(
+    policy: &SandboxPolicy,
+    workdir: Option<&str>,
+) -> Result<Option<PreparedRuleset>> {
+    prepare_with_path_open_mode(policy, workdir, PathOpenMode::CurrentUser)
+}
+
+/// Build the mandatory same-UID self-protection baseline.
+///
+/// Landlock is allow-list only. Granting `/` would also grant the protected
+/// `/.openshell` subtree, so enumerate the root's children and omit that one
+/// hierarchy. Entries the final UID cannot open are already inaccessible and
+/// are safely omitted by [`PathOpenMode::CurrentUser`].
+pub fn prepare_capability_free_baseline() -> Result<PreparedRuleset> {
+    prepare_capability_free_baseline_at(Path::new("/"))
+}
+
+fn prepare_capability_free_baseline_at(root: &Path) -> Result<PreparedRuleset> {
+    // Unlike optional filesystem policy, self-protection must cover pathname
+    // truncation as well as opens. Never silently downgrade this ABI requirement.
+    let abi = ABI::V3;
+    let access = AccessFs::from_all(abi);
+    let mut ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(access)
+        .into_diagnostic()?
+        .create()
+        .into_diagnostic()?;
+    let entries = capability_free_baseline_entries(root)?;
+    if entries.is_empty() {
+        return Err(miette::miette!(
+            "capability-free Landlock baseline found no usable root entries"
+        ));
+    }
+    for (_, fd) in entries {
+        let allowed = access_for_path_fd(&fd, access, abi)?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(fd, allowed))
+            .into_diagnostic()?;
+    }
+    Ok(PreparedRuleset {
+        ruleset,
+        compatibility: LandlockCompatibility::HardRequirement,
+    })
+}
+
+fn capability_free_baseline_entries(root: &Path) -> Result<Vec<(PathBuf, OwnedFd)>> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+    const PRIVATE_ROOT: &str = ".openshell";
+
+    let root_fd = open(
+        root,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .into_diagnostic()?;
+    // The reserved root itself must not redirect private child mounts into an
+    // allowed subtree. Pin and validate it independently of the public entries.
+    // Absence is allowed for qualification before driver bootstrap is staged.
+    let _private_root = match openat(
+        &root_fd,
+        PRIVATE_ROOT,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => Some(fd),
+        Err(rustix::io::Errno::NOENT) => None,
+        Err(error) => {
+            return Err(miette::miette!(
+                "private sandbox root must be a real directory: {error}"
+            ));
+        }
+    };
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(root).into_diagnostic()? {
+        let entry = entry.into_diagnostic()?;
+        if entry.file_name() == PRIVATE_ROOT {
+            continue;
+        }
+        // Open relative to the pinned root and classify this exact descriptor.
+        // O_PATH|O_NOFOLLOW opens a symlink itself, never its target. A root
+        // alias to `/` or `/.openshell` therefore cannot broaden the allowlist.
+        let fd = match openat(
+            &root_fd,
+            entry.file_name(),
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::ACCESS) => continue,
+            Err(error) => return Err(error).into_diagnostic(),
+        };
+        let stat = rustix::fs::fstat(&fd).into_diagnostic()?;
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Symlink {
+            continue;
+        }
+        entries.push((entry.path(), fd));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(entries)
+}
+
+fn prepare_with_path_open_mode(
+    policy: &SandboxPolicy,
+    workdir: Option<&str>,
+    path_open_mode: PathOpenMode,
+) -> Result<Option<PreparedRuleset>> {
+    let read_only = policy.filesystem.read_only.clone();
+    let mut read_write = policy.filesystem.read_write.clone();
+
+    if policy.filesystem.include_workdir
+        && let Some(dir) = workdir
+    {
+        let workdir_path = PathBuf::from(dir);
+        if !read_write.contains(&workdir_path) {
+            read_write.push(workdir_path);
+        }
+    }
+
+    if read_only.is_empty() && read_write.is_empty() {
+        return Ok(None);
+    }
+
+    let compatibility = &policy.landlock.compatibility;
+
+    // Probe first: kernels without Landlock (e.g. gVisor's sentry returns
+    // ENOSYS) would otherwise log misleading "Applying"+"Built" events.
+    let availability = probe_availability();
+    if !matches!(availability, LandlockAvailability::Available { .. }) {
+        match compatibility {
+            LandlockCompatibility::BestEffort => {
+                openshell_ocsf::ocsf_emit!(
+                    openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(openshell_ocsf::ActivityId::Open)
+                        .severity(openshell_ocsf::SeverityId::High)
+                        .confidence(openshell_ocsf::ConfidenceId::High)
+                        .is_alert(true)
+                        .finding_info(
+                            openshell_ocsf::FindingInfo::new(
+                                "landlock-unavailable",
+                                "Landlock Filesystem Sandbox Unavailable",
+                            )
+                            .with_desc(&format!(
+                                "Running WITHOUT filesystem restrictions: Landlock is {availability}. \
+                                 Set landlock.compatibility to 'hard_requirement' to make this fatal."
+                            )),
+                        )
+                        .message(format!(
+                            "Landlock filesystem sandbox unavailable: {availability}"
+                        ))
+                        .build()
+                );
+                return Ok(None);
+            }
+            LandlockCompatibility::HardRequirement => {
+                return Err(miette::miette!(
+                    "Landlock unavailable in hard_requirement mode: {availability}"
+                ));
+            }
+        }
+    }
+
+    let total_paths = read_only.len() + read_write.len();
+    // Read-only policy must also deny pathname truncation. The mandatory
+    // baseline already qualifies ABI v3; optional best-effort policy keeps its
+    // independent compatibility behavior for other callers.
+    let abi = ABI::V3;
+    openshell_ocsf::ocsf_emit!(
+        openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+            .severity(openshell_ocsf::SeverityId::Informational)
+            .status(openshell_ocsf::StatusId::Success)
+            .state(openshell_ocsf::StateId::Enabled, "applying")
+            .message(format!(
+                "Applying Landlock filesystem sandbox [abi:{abi:?} compat:{:?} ro:{} rw:{}]",
+                policy.landlock.compatibility,
+                read_only.len(),
+                read_write.len(),
+            ))
+            .build()
+    );
+
+    let result: Result<PreparedRuleset> = (|| {
+        let access_all = AccessFs::from_all(abi);
+        let access_read = AccessFs::from_read(abi);
+
+        let mut ruleset = Ruleset::default();
+        ruleset = ruleset
+            .set_compatibility(compat_level(compatibility))
+            .handle_access(access_all)
+            .into_diagnostic()?;
+
+        let mut ruleset = ruleset.create().into_diagnostic()?;
+        let mut rules_applied: usize = 0;
+
+        for path in &read_only {
+            if let Some(path_fd) = try_open_path(path, compatibility, path_open_mode)? {
+                let allowed_access = access_for_path_fd(&path_fd, access_read, abi)?;
+                debug!(path = %path.display(), "Landlock allow read-only");
+                ruleset = ruleset
+                    .add_rule(PathBeneath::new(path_fd, allowed_access))
+                    .into_diagnostic()?;
+                rules_applied += 1;
+            }
+        }
+
+        for path in &read_write {
+            if let Some(path_fd) = try_open_path(path, compatibility, path_open_mode)? {
+                let allowed_access = access_for_path_fd(&path_fd, access_all, abi)?;
+                debug!(path = %path.display(), "Landlock allow read-write");
+                ruleset = ruleset
+                    .add_rule(PathBeneath::new(path_fd, allowed_access))
+                    .into_diagnostic()?;
+                rules_applied += 1;
+            }
+        }
+
+        if rules_applied == 0 {
+            return Err(miette::miette!(
+                "Landlock ruleset has zero valid paths — all {} path(s) failed to open. \
+                 Refusing to apply an empty ruleset that would block all filesystem access.",
+                total_paths,
+            ));
+        }
+
+        let skipped = total_paths - rules_applied;
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "built")
+                .message(format!(
+                    "Landlock ruleset built [rules_applied:{rules_applied} skipped:{skipped}]"
+                ))
+                .build()
+        );
+
+        Ok(PreparedRuleset {
+            ruleset,
+            compatibility: compatibility.clone(),
+        })
+    })();
+
+    match result {
+        Ok(prepared) => Ok(Some(prepared)),
+        Err(err) => {
+            if matches!(compatibility, LandlockCompatibility::BestEffort) {
+                openshell_ocsf::ocsf_emit!(
+                    openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(openshell_ocsf::ActivityId::Open)
+                        .severity(openshell_ocsf::SeverityId::High)
+                        .confidence(openshell_ocsf::ConfidenceId::High)
+                        .is_alert(true)
+                        .finding_info(
+                            openshell_ocsf::FindingInfo::new(
+                                "landlock-unavailable",
+                                "Landlock Filesystem Sandbox Unavailable",
+                            )
+                            .with_desc(&format!(
+                                "Running WITHOUT filesystem restrictions: {err}. \
+                                 Set landlock.compatibility to 'hard_requirement' to make this fatal."
+                            )),
+                        )
+                        .message(format!("Landlock filesystem sandbox unavailable: {err}"))
+                        .build()
+                );
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Phase 2: Enforce a prepared Landlock ruleset by calling `restrict_self()`.
+///
+/// This runs **after** `drop_privileges()`. The `restrict_self()` syscall does
+/// not require root — it only restricts the calling thread (and its future
+/// children), which is always permitted.
+///
+/// Respects the same `best_effort` / `hard_requirement` compatibility as
+/// [`prepare`]: if `restrict_self()` fails and the policy is `best_effort`,
+/// the error is logged and the sandbox continues without Landlock.
+pub fn enforce(prepared: PreparedRuleset) -> Result<()> {
+    let result = prepared.ruleset.restrict_self().into_diagnostic();
+    if let Err(err) = result {
+        if matches!(prepared.compatibility, LandlockCompatibility::BestEffort) {
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(openshell_ocsf::ActivityId::Open)
+                    .severity(openshell_ocsf::SeverityId::High)
+                    .confidence(openshell_ocsf::ConfidenceId::High)
+                    .is_alert(true)
+                    .finding_info(
+                        openshell_ocsf::FindingInfo::new(
+                            "landlock-enforce-failed",
+                            "Landlock restrict_self Failed",
+                        )
+                        .with_desc(&format!(
+                            "Ruleset was prepared but restrict_self() failed: {err}. \
+                             Running WITHOUT filesystem restrictions. \
+                             Set landlock.compatibility to 'hard_requirement' to make this fatal."
+                        )),
+                    )
+                    .message(format!(
+                        "Landlock restrict_self failed (best_effort): {err}"
+                    ))
+                    .build()
+            );
+            return Ok(());
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Tailor a rule's access mask to the inode referenced by its already-open FD.
+///
+/// Landlock directory-only rights such as `ReadDir` are invalid for regular
+/// files and device nodes in hard-requirement mode. Classifying through the
+/// same `PathFd` used by the rule avoids a pathname TOCTOU race.
+fn access_for_path_fd(
+    path_fd: &impl AsFd,
+    requested_access: BitFlags<AccessFs>,
+    abi: ABI,
+) -> Result<BitFlags<AccessFs>> {
+    let stat = rustix::fs::fstat(path_fd.as_fd()).into_diagnostic()?;
+    Ok(match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+        rustix::fs::FileType::Directory => requested_access,
+        _ => requested_access & AccessFs::from_file(abi),
+    })
+}
+
+/// Attempt to open a path for Landlock rule creation.
+///
+/// In `BestEffort` mode, inaccessible paths (missing, permission denied, symlink
+/// loops, etc.) are skipped with a warning and `Ok(None)` is returned so the
+/// caller can continue building the ruleset from the remaining valid paths.
+///
+/// In `HardRequirement` mode, any failure is fatal — the caller propagates the
+/// error, which ultimately aborts sandbox startup.
+fn try_open_path(
+    path: &Path,
+    compatibility: &LandlockCompatibility,
+    path_open_mode: PathOpenMode,
+) -> Result<Option<PathFd>> {
+    match PathFd::new(path) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(err) => {
+            let reason = classify_path_fd_error(&err);
+            let is_not_found = matches!(
+                &err,
+                PathFdError::OpenCall { source, .. }
+                    if source.kind() == std::io::ErrorKind::NotFound
+            );
+            if matches!(path_open_mode, PathOpenMode::CurrentUser) {
+                if is_not_found {
+                    debug!(
+                        path = %path.display(),
+                        reason,
+                        "Skipping non-existent Landlock path for current user"
+                    );
+                } else {
+                    openshell_ocsf::ocsf_emit!(
+                        openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                            .severity(openshell_ocsf::SeverityId::Informational)
+                            .status(openshell_ocsf::StatusId::Success)
+                            .state(openshell_ocsf::StateId::Other, "already-denied")
+                            .message(format!(
+                                "Skipping inaccessible Landlock path for current user [path:{} error:{err}]",
+                                path.display()
+                            ))
+                            .build()
+                    );
+                }
+                return Ok(None);
+            }
+            match compatibility {
+                LandlockCompatibility::BestEffort => {
+                    // NotFound is expected for stale baseline paths (e.g.
+                    // /app baked into the server-stored policy but absent
+                    // in this container image).  Log at debug! to avoid
+                    // polluting SSH exec stdout — the pre_exec hook
+                    // inherits the tracing subscriber whose writer targets
+                    // fd 1 (the pipe/PTY).
+                    //
+                    // Other errors (permission denied, symlink loops, etc.)
+                    // are genuinely unexpected and logged at warn!.
+                    if is_not_found {
+                        debug!(
+                            path = %path.display(),
+                            reason,
+                            "Skipping non-existent Landlock path (best-effort mode)"
+                        );
+                    } else {
+                        openshell_ocsf::ocsf_emit!(
+                            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                                .severity(openshell_ocsf::SeverityId::Medium)
+                                .status(openshell_ocsf::StatusId::Failure)
+                                .state(openshell_ocsf::StateId::Other, "degraded")
+                                .message(format!(
+                                    "Skipping inaccessible Landlock path (best-effort) [path:{} error:{err}]",
+                                    path.display()
+                                ))
+                                .build()
+                        );
+                    }
+                    Ok(None)
+                }
+                LandlockCompatibility::HardRequirement => Err(miette::miette!(
+                    "Landlock path unavailable in hard_requirement mode: {} ({}): {}",
+                    path.display(),
+                    reason,
+                    err,
+                )),
+            }
+        }
+    }
+}
+
+/// Classify a [`PathFdError`] into a human-readable reason.
+///
+/// `PathFd::new()` wraps `open(path, O_PATH | O_CLOEXEC)` which can fail for
+/// several reasons beyond simple non-existence. The `PathFdError::OpenCall`
+/// variant wraps the underlying `std::io::Error`.
+fn classify_path_fd_error(err: &PathFdError) -> &'static str {
+    match err {
+        PathFdError::OpenCall { source, .. } => classify_io_error(source),
+        // PathFdError is #[non_exhaustive], handle future variants gracefully.
+        _ => "unexpected error",
+    }
+}
+
+/// Classify a `std::io::Error` into a human-readable reason string.
+fn classify_io_error(err: &std::io::Error) -> &'static str {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => "path does not exist",
+        std::io::ErrorKind::PermissionDenied => "permission denied",
+        _ => match err.raw_os_error() {
+            Some(40) => "too many symlink levels",           // ELOOP
+            Some(36) => "path name too long",                // ENAMETOOLONG
+            Some(20) => "path component is not a directory", // ENOTDIR
+            _ => "unexpected error",
+        },
+    }
+}
+
+fn compat_level(level: &LandlockCompatibility) -> CompatLevel {
+    match level {
+        LandlockCompatibility::BestEffort => CompatLevel::BestEffort,
+        LandlockCompatibility::HardRequirement => CompatLevel::HardRequirement,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openshell_core::policy::{FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy};
+
+    fn hard_requirement_policy(read_only: Vec<PathBuf>, read_write: Vec<PathBuf>) -> SandboxPolicy {
+        SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy {
+                read_only,
+                read_write,
+                include_workdir: false,
+            },
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy {
+                compatibility: LandlockCompatibility::HardRequirement,
+            },
+            process: ProcessPolicy::default(),
+        }
+    }
+
+    #[test]
+    fn prepare_hard_requirement_accepts_device_paths() {
+        if !matches!(probe_availability(), LandlockAvailability::Available { .. }) {
+            return;
+        }
+
+        let policy = hard_requirement_policy(
+            vec![PathBuf::from("/tmp"), PathBuf::from("/dev/urandom")],
+            vec![PathBuf::from("/dev/null")],
+        );
+
+        let result = prepare(&policy, None);
+        if let Err(err) = result {
+            panic!("hard_requirement should accept mixed directory and device paths: {err}");
+        }
+    }
+
+    #[test]
+    fn capability_free_baseline_omits_only_private_root() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["bin", "etc", "sandbox", ".openshell"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+        }
+
+        std::os::unix::fs::symlink(root.path(), root.path().join("root-alias")).unwrap();
+        std::os::unix::fs::symlink(
+            root.path().join(".openshell"),
+            root.path().join("private-alias"),
+        )
+        .unwrap();
+        let paths: Vec<_> = capability_free_baseline_entries(root.path())
+            .unwrap()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(
+            paths,
+            ["bin", "etc", "sandbox"]
+                .map(|name| root.path().join(name))
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn capability_free_baseline_rejects_private_root_redirect() {
+        let root = tempfile::tempdir().unwrap();
+        let public = root.path().join("public");
+        let private = root.path().join(".openshell");
+        std::fs::create_dir(&public).unwrap();
+        std::fs::write(public.join("secret"), b"private mount contents").unwrap();
+        std::os::unix::fs::symlink(&public, &private).unwrap();
+        assert!(capability_free_baseline_entries(root.path()).is_err());
+        std::fs::remove_file(&private).unwrap();
+        std::fs::write(&private, b"not a directory").unwrap();
+        assert!(capability_free_baseline_entries(root.path()).is_err());
+    }
+
+    #[test]
+    fn capability_free_baseline_denies_alias_reads_and_path_truncation() {
+        if !matches!(probe_availability(), LandlockAvailability::Available { abi } if abi >= 3) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let public = root.path().join("public");
+        let private = root.path().join(".openshell");
+        std::fs::create_dir(&public).unwrap();
+        std::fs::create_dir(&private).unwrap();
+        std::fs::write(public.join("sentinel"), b"allowed").unwrap();
+        std::fs::write(private.join("secret"), b"protected").unwrap();
+        std::os::unix::fs::symlink(root.path(), root.path().join("root-alias")).unwrap();
+        std::os::unix::fs::symlink(&private, root.path().join("private-alias")).unwrap();
+        let path = root.path().to_path_buf();
+        std::thread::spawn(move || {
+            enforce(prepare_capability_free_baseline_at(&path).unwrap()).unwrap();
+            assert_eq!(
+                std::fs::read(path.join("public/sentinel")).unwrap(),
+                b"allowed"
+            );
+            for name in [
+                ".openshell/secret",
+                "root-alias/.openshell/secret",
+                "private-alias/secret",
+            ] {
+                let target = path.join(name);
+                assert_eq!(
+                    std::fs::read(&target).unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+                let target = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()).unwrap();
+                // SAFETY: target is a live, NUL-terminated path. The syscall
+                // tests pathname truncation without opening a file first.
+                #[allow(unsafe_code)]
+                let result = unsafe { libc::truncate(target.as_ptr(), 0) };
+                assert_eq!(result, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+            }
+            let policy = hard_requirement_policy(vec![path.join("public")], Vec::new());
+            enforce(prepare_current_user(&policy, None).unwrap().unwrap()).unwrap();
+            let read_only =
+                std::ffi::CString::new(path.join("public/sentinel").as_os_str().as_encoded_bytes())
+                    .unwrap();
+            // SAFETY: live NUL-terminated pathname; optional read-only policy
+            // must handle truncation independently of the protected baseline.
+            #[allow(unsafe_code)]
+            let truncated = unsafe { libc::truncate(read_only.as_ptr(), 0) };
+            assert_eq!(truncated, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        })
+        .join()
+        .unwrap();
+        assert_eq!(std::fs::read(private.join("secret")).unwrap(), b"protected");
+    }
+    fn tailored_access(path: &Path, requested_access: BitFlags<AccessFs>) -> BitFlags<AccessFs> {
+        let path_fd = PathFd::new(path).unwrap();
+        access_for_path_fd(&path_fd, requested_access, ABI::V2).unwrap()
+    }
+
+    #[test]
+    fn access_for_path_fd_preserves_directory_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let requested_access = AccessFs::from_all(ABI::V2);
+
+        assert_eq!(
+            tailored_access(dir.path(), requested_access),
+            requested_access
+        );
+    }
+
+    #[test]
+    fn access_for_path_fd_limits_regular_file_access() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let requested_access = AccessFs::from_all(ABI::V2);
+
+        assert_eq!(
+            tailored_access(file.path(), requested_access),
+            requested_access & AccessFs::from_file(ABI::V2)
+        );
+    }
+
+    #[test]
+    fn access_for_path_fd_limits_character_device_access() {
+        let requested_read = AccessFs::from_read(ABI::V2);
+        let requested_write = AccessFs::from_all(ABI::V2);
+
+        assert_eq!(
+            tailored_access(Path::new("/dev/urandom"), requested_read),
+            requested_read & AccessFs::from_file(ABI::V2)
+        );
+        assert_eq!(
+            tailored_access(Path::new("/dev/null"), requested_write),
+            requested_write & AccessFs::from_file(ABI::V2)
+        );
+    }
+
+    #[test]
+    fn access_for_path_fd_classifies_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::File::create(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let requested_access = AccessFs::from_all(ABI::V2);
+        assert_eq!(
+            tailored_access(&link, requested_access),
+            requested_access & AccessFs::from_file(ABI::V2)
+        );
+    }
+
+    #[test]
+    fn try_open_path_best_effort_returns_none_for_missing_path() {
+        let result = try_open_path(
+            &PathBuf::from("/nonexistent/openshell/test/path"),
+            &LandlockCompatibility::BestEffort,
+            PathOpenMode::Privileged,
+        );
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn try_open_path_hard_requirement_errors_for_missing_path() {
+        let result = try_open_path(
+            &PathBuf::from("/nonexistent/openshell/test/path"),
+            &LandlockCompatibility::HardRequirement,
+            PathOpenMode::Privileged,
+        );
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("hard_requirement"),
+            "error should mention hard_requirement mode: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("does not exist"),
+            "error should include the classified reason: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn try_open_path_succeeds_for_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = try_open_path(
+            dir.path(),
+            &LandlockCompatibility::BestEffort,
+            PathOpenMode::Privileged,
+        );
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn try_open_path_current_user_skips_missing_path_in_hard_requirement() {
+        let result = try_open_path(
+            &PathBuf::from("/nonexistent/openshell/test/path"),
+            &LandlockCompatibility::HardRequirement,
+            PathOpenMode::CurrentUser,
+        );
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn classify_not_found() {
+        let err = std::io::Error::from_raw_os_error(libc::ENOENT);
+        assert_eq!(classify_io_error(&err), "path does not exist");
+    }
+
+    #[test]
+    fn classify_permission_denied() {
+        let err = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert_eq!(classify_io_error(&err), "permission denied");
+    }
+
+    #[test]
+    fn classify_symlink_loop() {
+        let err = std::io::Error::from_raw_os_error(libc::ELOOP);
+        assert_eq!(classify_io_error(&err), "too many symlink levels");
+    }
+
+    #[test]
+    fn classify_name_too_long() {
+        let err = std::io::Error::from_raw_os_error(libc::ENAMETOOLONG);
+        assert_eq!(classify_io_error(&err), "path name too long");
+    }
+
+    #[test]
+    fn classify_not_a_directory() {
+        let err = std::io::Error::from_raw_os_error(libc::ENOTDIR);
+        assert_eq!(classify_io_error(&err), "path component is not a directory");
+    }
+
+    #[test]
+    fn classify_unknown_error() {
+        let err = std::io::Error::from_raw_os_error(libc::EIO);
+        assert_eq!(classify_io_error(&err), "unexpected error");
+    }
+
+    #[test]
+    fn classify_path_fd_error_extracts_io_error() {
+        // Use PathFd::new on a non-existent path to get a real PathFdError
+        // (the OpenCall variant is #[non_exhaustive] and can't be constructed directly).
+        let err = PathFd::new("/nonexistent/openshell/classify/test").unwrap_err();
+        assert_eq!(classify_path_fd_error(&err), "path does not exist");
+    }
+
+    #[test]
+    fn probe_availability_returns_a_result() {
+        // The probe should not panic regardless of whether Landlock is available.
+        // On Linux hosts with Landlock, this returns Available; on Docker Desktop
+        // linuxkit or older kernels, it returns NotImplemented/NotEnabled/Blocked.
+        let result = probe_availability();
+        let display = format!("{result}");
+        assert!(
+            !display.is_empty(),
+            "probe_availability Display should produce output"
+        );
+        // Verify the Debug impl works too.
+        let debug = format!("{result:?}");
+        assert!(
+            !debug.is_empty(),
+            "probe_availability Debug should produce output"
+        );
+    }
+}

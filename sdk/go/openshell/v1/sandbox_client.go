@@ -34,19 +34,24 @@ func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
 	}
 	req := &pb.CreateSandboxRequest{
-		Name:      name,
-		Spec:      protoSpec,
-		Labels:    labels,
-		Workspace: workspace,
+		Name:           name,
+		Spec:           protoSpec,
+		Labels:         labels,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	}
 	if len(opts) > 0 {
 		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
+		req.ServiceExposures = serviceExposuresToProto(opts[0].ServiceExposures)
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
-	return converter.SandboxFromProto(resp.GetSandbox()), nil
+	sandbox := converter.SandboxFromProto(resp.GetSandbox())
+	if sandbox != nil {
+		sandbox.ServiceURLs = converter.CopyStringMap(resp.GetServiceUrls())
+	}
+	return sandbox, nil
 }
 
 func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
@@ -61,20 +66,36 @@ func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name,
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
 	}
 	req := &pb.CreateSandboxRequest{
-		Name:                 name,
-		Spec:                 protoSpec,
-		Labels:               labels,
-		Workspace:            workspace,
-		WorkloadTemplateName: templateName,
+		Name:             name,
+		Spec:             protoSpec,
+		Labels:           labels,
+		WorkspaceScope:   namedWorkspaceScope(workspace),
+		WorkloadTemplate: templateName,
 	}
 	if len(opts) > 0 {
 		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
+		req.ServiceExposures = serviceExposuresToProto(opts[0].ServiceExposures)
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
-	return converter.SandboxFromProto(resp.GetSandbox()), nil
+	sandbox := converter.SandboxFromProto(resp.GetSandbox())
+	if sandbox != nil {
+		sandbox.ServiceURLs = converter.CopyStringMap(resp.GetServiceUrls())
+	}
+	return sandbox, nil
+}
+
+func serviceExposuresToProto(exposures []types.ServiceExposure) []*pb.SandboxServiceExposure {
+	result := make([]*pb.SandboxServiceExposure, 0, len(exposures))
+	for _, exposure := range exposures {
+		result = append(result, &pb.SandboxServiceExposure{
+			Service:    exposure.Service,
+			TargetPort: exposure.TargetPort,
+		})
+	}
+	return result
 }
 
 func validateTemplateCreateSpec(spec *SandboxSpec) error {
@@ -89,8 +110,8 @@ func validateTemplateCreateSpec(spec *SandboxSpec) error {
 
 func (s *sandboxClient) Get(ctx context.Context, workspace, name string) (*Sandbox, error) {
 	resp, err := s.client.GetSandbox(ctx, &pb.GetSandboxRequest{
-		Name:      name,
-		Workspace: workspace,
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -98,50 +119,65 @@ func (s *sandboxClient) Get(ctx context.Context, workspace, name string) (*Sandb
 	return converter.SandboxFromProto(resp.GetSandbox()), nil
 }
 
-func (s *sandboxClient) List(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error) {
-	req := &pb.ListSandboxesRequest{
-		Workspace: workspace,
+func (s *sandboxClient) List(workspace string, opts ...ListOptions) (*Pager[*Sandbox], error) {
+	pageSize, err := listPageSize(opts)
+	if err != nil {
+		return nil, err
 	}
+	var pageToken, labelSelector string
+	var allWorkspaces bool
 	if len(opts) > 0 {
-		if opts[0].Limit < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
-		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
-		}
-		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
-		req.LabelSelector = opts[0].LabelSelector
-		req.AllWorkspaces = opts[0].AllWorkspaces
+		pageToken = opts[0].PageToken
+		labelSelector = opts[0].LabelSelector
+		allWorkspaces = opts[0].AllWorkspaces
 	}
+	workspaceScope := namedWorkspaceScope(workspace)
+	if allWorkspaces {
+		workspaceScope = allWorkspacesScope()
+	}
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*Sandbox], error) {
+		req := &pb.ListSandboxesRequest{
+			WorkspaceScope: workspaceScope,
+			PageSize:       pageSize,
+			PageToken:      pageToken,
+			LabelSelector:  labelSelector,
+		}
+		resp, err := s.client.ListSandboxes(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		sandboxes := make([]*Sandbox, 0, len(resp.GetSandboxes()))
+		for _, proto := range resp.GetSandboxes() {
+			sandboxes = append(sandboxes, converter.SandboxFromProto(proto))
+		}
+		return &Page[*Sandbox]{Items: sandboxes, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
 
-	resp, err := s.client.ListSandboxes(ctx, req)
+func (s *sandboxClient) ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error) {
+	pager, err := s.List(workspace, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return pager.All(ctx)
+}
+
+func (s *sandboxClient) Delete(ctx context.Context, workspace, name string, opts ...DeleteOptions) (*DeletionResult, error) {
+	resp, err := s.client.DeleteSandbox(ctx, &pb.DeleteSandboxRequest{
+		AllowMissing:   allowMissing(opts),
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
-
-	sandboxes := make([]*Sandbox, 0, len(resp.GetSandboxes()))
-	for _, proto := range resp.GetSandboxes() {
-		sandboxes = append(sandboxes, converter.SandboxFromProto(proto))
-	}
-	return sandboxes, nil
-}
-
-func (s *sandboxClient) Delete(ctx context.Context, workspace, name string) error {
-	_, err := s.client.DeleteSandbox(ctx, &pb.DeleteSandboxRequest{
-		Name:      name,
-		Workspace: workspace,
-	})
-	if err != nil {
-		return converter.FromGRPCError(err)
-	}
-	return nil
+	return &DeletionResult{Outcome: DeletionOutcome(resp.GetOutcome()), SandboxID: resp.GetSandboxId()}, nil
 }
 
 func (s *sandboxClient) Stop(ctx context.Context, workspace, name string) (*Sandbox, error) {
 	resp, err := s.client.StopSandbox(ctx, &pb.StopSandboxRequest{
-		Name:      name,
-		Workspace: workspace,
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -151,8 +187,8 @@ func (s *sandboxClient) Stop(ctx context.Context, workspace, name string) (*Sand
 
 func (s *sandboxClient) Start(ctx context.Context, workspace, name string) (*Sandbox, error) {
 	resp, err := s.client.StartSandbox(ctx, &pb.StartSandboxRequest{
-		Name:      name,
-		Workspace: workspace,
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -162,10 +198,10 @@ func (s *sandboxClient) Start(ctx context.Context, workspace, name string) (*San
 
 func (s *sandboxClient) AttachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*AttachProviderResult, error) {
 	resp, err := s.client.AttachSandboxProvider(ctx, &pb.AttachSandboxProviderRequest{
-		SandboxName:             sandboxName,
-		ProviderName:            providerName,
+		Provider:                providerName,
 		ExpectedResourceVersion: expectedResourceVersion,
-		Workspace:               workspace,
+		Sandbox:                 sandboxName,
+		WorkspaceScope:          namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -178,10 +214,10 @@ func (s *sandboxClient) AttachProvider(ctx context.Context, workspace, sandboxNa
 
 func (s *sandboxClient) DetachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*DetachProviderResult, error) {
 	resp, err := s.client.DetachSandboxProvider(ctx, &pb.DetachSandboxProviderRequest{
-		SandboxName:             sandboxName,
-		ProviderName:            providerName,
+		Provider:                providerName,
 		ExpectedResourceVersion: expectedResourceVersion,
-		Workspace:               workspace,
+		Sandbox:                 sandboxName,
+		WorkspaceScope:          namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -194,8 +230,8 @@ func (s *sandboxClient) DetachProvider(ctx context.Context, workspace, sandboxNa
 
 func (s *sandboxClient) ListProviders(ctx context.Context, workspace, sandboxName string) ([]*Provider, error) {
 	resp, err := s.client.ListSandboxProviders(ctx, &pb.ListSandboxProvidersRequest{
-		SandboxName: sandboxName,
-		Workspace:   workspace,
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -280,15 +316,14 @@ func (s *sandboxClient) Watch(ctx context.Context, workspace, name string, opts 
 	if len(opts) > 0 {
 		watchOpts = opts[0]
 	}
-
-	sb, err := s.Get(ctx, workspace, name)
-	if err != nil {
+	if _, err := s.Get(ctx, workspace, name); err != nil {
 		return nil, err
 	}
 
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	stream, err := s.client.WatchSandbox(streamCtx, &pb.WatchSandboxRequest{
-		Id:             sb.ID,
+		Sandbox:        name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 		FollowStatus:   true,
 		StopOnTerminal: watchOpts.StopOnTerminal,
 	})
@@ -354,21 +389,19 @@ func (s *sandboxClient) Watch(ctx context.Context, workspace, name string, opts 
 }
 
 func (s *sandboxClient) GetLogs(ctx context.Context, workspace, sandboxName string, opts ...LogOption) (*LogResult, error) {
-	sb, err := s.Get(ctx, workspace, sandboxName)
-	if err != nil {
+	if _, err := s.Get(ctx, workspace, sandboxName); err != nil {
 		return nil, err
 	}
-
 	cfg := types.ApplyLogOptions(opts)
 	req := &pb.GetSandboxLogsRequest{
-		SandboxId: sb.ID,
-		Lines:     cfg.Lines(),
-		Sources:   cfg.Sources(),
-		MinLevel:  cfg.MinLevel(),
-		Workspace: workspace,
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
+		Lines:          cfg.Lines(),
+		Sources:        cfg.Sources(),
+		MinLevel:       cfg.MinLevel(),
 	}
 	if !cfg.Since().IsZero() {
-		req.SinceMs = converter.MillisFromTime(cfg.Since())
+		req.SinceTime = converter.TimestampFromTime(cfg.Since())
 	}
 
 	resp, err := s.client.GetSandboxLogs(ctx, req)

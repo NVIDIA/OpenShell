@@ -13,13 +13,14 @@ use openshell_core::config::ServiceRoutingConfig;
 use openshell_core::proto::{Sandbox, SandboxPhase, ServiceEndpoint, TcpRelayTarget, relay_open};
 use openshell_core::{ObjectId, VERSION};
 use openshell_ocsf::{
-    ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint, HttpActivityBuilder,
-    HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder, OCSF_TARGET, OcsfEvent,
-    SandboxContext, SeverityId, StateId, StatusId, Url as OcsfUrl,
+    ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint, EventContext,
+    HttpActivityBuilder, HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder,
+    OCSF_TARGET, OcsfEvent, SeverityId, StateId, StatusId, Url as OcsfUrl,
 };
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 
@@ -31,6 +32,113 @@ const ROUTING_RULE_NAME: &str = "sandbox_service_routing";
 const ROUTING_RULE_TYPE: &str = "gateway";
 const RELAY_RULE_NAME: &str = "sandbox_service_relay";
 const RELAY_TARGET_HOST: &str = "127.0.0.1";
+/// How long an idle upstream is kept. Deliberately short: a sandbox app can
+/// close its side at any time, and a connection we hand out after it died
+/// fails the request.
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Idle upstreams kept per endpoint. Concurrent requests need one each,
+/// because HTTP/1 serves a single request at a time per connection.
+const UPSTREAM_MAX_IDLE_PER_ENDPOINT: usize = 8;
+/// Minimum gap between full sweeps of the pool.
+const UPSTREAM_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+type UpstreamSender = hyper::client::conn::http1::SendRequest<Body>;
+
+struct PooledUpstream {
+    sender: UpstreamSender,
+    idle_since: Instant,
+}
+
+#[derive(Default)]
+struct UpstreamPoolInner {
+    idle: HashMap<String, Vec<PooledUpstream>>,
+    last_sweep: Option<Instant>,
+}
+
+impl UpstreamPoolInner {
+    /// Full sweeps are rate-limited so a large pool can't turn every insert
+    /// into a scan of every endpoint.
+    fn sweep_if_due(&mut self, now: Instant) {
+        if let Some(last) = self.last_sweep
+            && now.duration_since(last) < UPSTREAM_SWEEP_INTERVAL
+        {
+            return;
+        }
+        self.last_sweep = Some(now);
+        self.idle.retain(|_, entries| {
+            entries.retain(|entry| is_reusable(entry, now));
+            !entries.is_empty()
+        });
+    }
+}
+
+/// Idle upstream connections to sandbox services, keyed by endpoint.
+///
+/// Without this every HTTP request opened its own supervisor relay, which
+/// meant a new TCP connection inside the sandbox and a new HTTP/1 handshake
+/// per request, and counted against the 32 in-flight relay cap per sandbox.
+#[derive(Default)]
+pub struct ServiceUpstreamPool {
+    inner: Mutex<UpstreamPoolInner>,
+}
+
+impl std::fmt::Debug for ServiceUpstreamPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceUpstreamPool")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServiceUpstreamPool {
+    /// Takes an upstream that is connected and free.
+    ///
+    /// `is_ready` is what makes reuse safe: HTTP/1 can't start a request until
+    /// the previous response body has been read, and hyper only reports ready
+    /// once that has happened.
+    fn take(&self, key: &str) -> Option<UpstreamSender> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        let entries = inner.idle.get_mut(key)?;
+        entries.retain(|entry| is_reusable(entry, now));
+        let taken = entries
+            .iter()
+            .position(|entry| entry.sender.is_ready())
+            .map(|index| entries.swap_remove(index).sender);
+        if entries.is_empty() {
+            inner.idle.remove(key);
+        }
+        taken
+    }
+
+    fn put(&self, key: &str, sender: UpstreamSender) {
+        if sender.is_closed() {
+            return;
+        }
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        inner.sweep_if_due(now);
+        let entries = inner.idle.entry(key.to_string()).or_default();
+        if entries.len() >= UPSTREAM_MAX_IDLE_PER_ENDPOINT {
+            return;
+        }
+        entries.push(PooledUpstream {
+            sender,
+            idle_since: now,
+        });
+    }
+
+    fn evict(&self, key: &str) {
+        self.inner.lock().unwrap().idle.remove(key);
+    }
+}
+
+fn is_reusable(entry: &PooledUpstream, now: Instant) -> bool {
+    !entry.sender.is_closed() && now.duration_since(entry.idle_since) <= UPSTREAM_IDLE_TIMEOUT
+}
+
+fn upstream_pool_key(endpoint_id: &str, target_port: u16) -> String {
+    format!("{endpoint_id}|{target_port}")
+}
 
 impl ObjectType for ServiceEndpoint {
     fn object_type() -> &'static str {
@@ -325,75 +433,57 @@ async fn proxy_to_endpoint(
     let websocket_upgrade = is_websocket_upgrade(&req);
     let downstream_upgrade = websocket_upgrade.then(|| hyper::upgrade::on(&mut req));
 
-    let (_channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay_with_target(
-            sandbox.object_id(),
-            relay_open::Target::Tcp(TcpRelayTarget {
-                host: RELAY_TARGET_HOST.to_string(),
-                port: u32::from(target_port),
-            }),
-            endpoint.object_id().to_string(),
-            Duration::from_secs(15),
-        )
-        .await
-        .map_err(|err| {
-            warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "sandbox service routing: supervisor relay unavailable");
-            let route_err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(&endpoint, target_port, route_err.reason);
-            route_err
-        })?;
-
-    let relay = tokio::time::timeout(Duration::from_secs(10), relay_rx)
-        .await
-        .map_err(|_| {
-            let err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(&endpoint, target_port, "relay claim timed out");
-            err
-        })?
-        .map_err(|_| {
-            let err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(&endpoint, target_port, "relay claim canceled");
-            err
-        })?
-        .map_err(|err| {
-            warn!(error = %err, "sandbox service routing: relay target open failed");
-            let route_err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(&endpoint, target_port, route_err.reason);
-            route_err
-        })?;
-
-    let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
-        .handshake(TokioIo::new(relay))
-        .await
-        .map_err(|err| {
-            warn!(error = %err, "sandbox service routing: failed to start upstream HTTP client");
-            let route_err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(&endpoint, target_port, route_err.reason);
-            route_err
-        })?;
-
-    if websocket_upgrade {
-        tokio::spawn(async move {
-            if let Err(err) = conn.with_upgrades().await {
-                warn!(error = %err, "sandbox service routing: upstream WebSocket connection failed");
-            }
-        });
+    // An upgrade takes the connection over, so it is never pooled.
+    let pool_key = upstream_pool_key(endpoint.object_id(), target_port);
+    let pooled = if websocket_upgrade {
+        None
     } else {
-        tokio::spawn(async move {
-            if let Err(err) = conn.await {
-                warn!(error = %err, "sandbox service routing: upstream HTTP connection failed");
-            }
-        });
-    }
+        state.service_upstreams.take(&pool_key)
+    };
+
+    let reused = pooled.is_some();
+    let mut sender = match pooled {
+        Some(sender) => sender,
+        None => open_upstream(&state, &sandbox, &endpoint, target_port, websocket_upgrade).await?,
+    };
 
     let upstream = build_upstream_request(req, target_port, websocket_upgrade)?;
-    let mut response = sender.send_request(upstream).await.map_err(|err| {
-        warn!(error = %err, "sandbox service routing: upstream HTTP request failed");
-        let route_err = ServiceRouteError::service_unreachable();
-        emit_service_relay_failure(&endpoint, target_port, route_err.reason);
-        route_err
-    })?;
+    let replay = reused.then(|| replayable_request(&upstream)).flatten();
+    let first_attempt = if reused {
+        sender.try_send_request(upstream).await.map_err(|mut err| {
+            let request = err.take_message();
+            (err.into_error(), request)
+        })
+    } else {
+        sender
+            .send_request(upstream)
+            .await
+            .map_err(|err| (err, None))
+    };
+    let mut response = match first_attempt {
+        Ok(response) => response,
+        Err((err, recovered)) => {
+            warn!(error = %err, "sandbox service routing: upstream HTTP request failed");
+            state.service_upstreams.evict(&pool_key);
+            let Some(retry_request) = recovered.or(replay) else {
+                let route_err = ServiceRouteError::service_unreachable();
+                emit_service_relay_failure(&endpoint, target_port, route_err.reason);
+                return Err(route_err);
+            };
+            sender =
+                open_upstream(&state, &sandbox, &endpoint, target_port, websocket_upgrade).await?;
+            sender.send_request(retry_request).await.map_err(|err| {
+                warn!(error = %err, "sandbox service routing: upstream HTTP retry failed");
+                let route_err = ServiceRouteError::service_unreachable();
+                emit_service_relay_failure(&endpoint, target_port, route_err.reason);
+                route_err
+            })?
+        }
+    };
+
+    if !websocket_upgrade {
+        state.service_upstreams.put(&pool_key, sender);
+    }
 
     if websocket_upgrade && response.status() == StatusCode::SWITCHING_PROTOCOLS {
         let upstream_upgrade = hyper::upgrade::on(&mut response);
@@ -428,6 +518,77 @@ async fn proxy_to_endpoint(
     Ok(Response::from_parts(parts, Body::new(body)))
 }
 
+async fn open_upstream(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+    endpoint: &ServiceEndpoint,
+    target_port: u16,
+    websocket_upgrade: bool,
+) -> Result<UpstreamSender, ServiceRouteError> {
+    let (_channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
+        state,
+        sandbox.object_id(),
+        relay_open::Target::Tcp(TcpRelayTarget {
+            host: RELAY_TARGET_HOST.to_string(),
+            port: u32::from(target_port),
+        }),
+        endpoint.object_id().to_string(),
+        Duration::from_secs(15),
+    )
+    .await
+    .map_err(|err| {
+        warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "sandbox service routing: supervisor relay unavailable");
+        let route_err = ServiceRouteError::service_unreachable();
+        emit_service_relay_failure(endpoint, target_port, route_err.reason);
+        route_err
+    })?;
+
+    let relay = tokio::time::timeout(Duration::from_secs(10), relay_rx)
+        .await
+        .map_err(|_| {
+            let err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(endpoint, target_port, "relay claim timed out");
+            err
+        })?
+        .map_err(|_| {
+            let err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(endpoint, target_port, "relay claim canceled");
+            err
+        })?
+        .map_err(|err| {
+            warn!(error = %err, "sandbox service routing: relay target open failed");
+            let route_err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(endpoint, target_port, route_err.reason);
+            route_err
+        })?;
+
+    let (sender, conn) = hyper::client::conn::http1::Builder::new()
+        .handshake(TokioIo::new(relay))
+        .await
+        .map_err(|err| {
+            warn!(error = %err, "sandbox service routing: failed to start upstream HTTP client");
+            let route_err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(endpoint, target_port, route_err.reason);
+            route_err
+        })?;
+
+    if websocket_upgrade {
+        tokio::spawn(async move {
+            if let Err(err) = conn.with_upgrades().await {
+                warn!(error = %err, "sandbox service routing: upstream WebSocket connection failed");
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            if let Err(err) = conn.await {
+                warn!(error = %err, "sandbox service routing: upstream HTTP connection failed");
+            }
+        });
+    }
+
+    Ok(sender)
+}
+
 async fn load_endpoint(
     store: &Store,
     workspace: &str,
@@ -443,6 +604,23 @@ async fn load_endpoint(
             ServiceRouteError::internal_error()
         })?
         .ok_or_else(ServiceRouteError::endpoint_not_found)
+}
+
+/// Copies a request that can be sent again on a fresh connection.
+///
+/// A pooled connection can be closed by the sandbox between the liveness check
+/// and the send. Only bodyless methods are replayable, because the original
+/// body is consumed by the failed attempt.
+fn replayable_request(request: &Request<Body>) -> Option<Request<Body>> {
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        return None;
+    }
+    let mut replay = Request::new(Body::empty());
+    *replay.method_mut() = request.method().clone();
+    *replay.uri_mut() = request.uri().clone();
+    *replay.version_mut() = request.version();
+    *replay.headers_mut() = request.headers().clone();
+    Some(replay)
 }
 
 fn build_upstream_request(
@@ -637,13 +815,13 @@ fn build_service_endpoint_config_event(
     url: &str,
     created: bool,
 ) -> OcsfEvent {
-    let service_label = service_display_name(&endpoint.sandbox_name, &endpoint.service_name);
+    let service_label = service_display_name(&endpoint.sandbox, &endpoint.name);
     let state_label = if created {
         "service_endpoint_created"
     } else {
         "service_endpoint_updated"
     };
-    let ctx = gateway_ocsf_ctx(&endpoint.sandbox_id, &endpoint.sandbox_name);
+    let ctx = gateway_ocsf_ctx(&endpoint.sandbox_id, &endpoint.sandbox);
     let mut builder = ConfigStateChangeBuilder::new(&ctx)
         .state(StateId::Enabled, state_label)
         .severity(SeverityId::Informational)
@@ -653,7 +831,7 @@ fn build_service_endpoint_config_event(
             endpoint.target_port
         ))
         .unmapped("endpoint_name", endpoint_name(endpoint))
-        .unmapped("service_name", endpoint.service_name.clone())
+        .unmapped("service_name", endpoint.name.clone())
         .unmapped("target_port", u64::from(endpoint.target_port));
 
     if !url.is_empty() {
@@ -664,19 +842,16 @@ fn build_service_endpoint_config_event(
 }
 
 fn build_service_endpoint_delete_event(endpoint: &ServiceEndpoint) -> OcsfEvent {
-    let service_label = service_display_name(&endpoint.sandbox_name, &endpoint.service_name);
-    ConfigStateChangeBuilder::new(&gateway_ocsf_ctx(
-        &endpoint.sandbox_id,
-        &endpoint.sandbox_name,
-    ))
-    .state(StateId::Disabled, "service_endpoint_deleted")
-    .severity(SeverityId::Informational)
-    .status(StatusId::Success)
-    .message(format!("Service endpoint deleted {service_label}"))
-    .unmapped("endpoint_name", endpoint_name(endpoint))
-    .unmapped("service_name", endpoint.service_name.clone())
-    .unmapped("target_port", u64::from(endpoint.target_port))
-    .build()
+    let service_label = service_display_name(&endpoint.sandbox, &endpoint.name);
+    ConfigStateChangeBuilder::new(&gateway_ocsf_ctx(&endpoint.sandbox_id, &endpoint.sandbox))
+        .state(StateId::Disabled, "service_endpoint_deleted")
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .message(format!("Service endpoint deleted {service_label}"))
+        .unmapped("endpoint_name", endpoint_name(endpoint))
+        .unmapped("service_name", endpoint.name.clone())
+        .unmapped("target_port", u64::from(endpoint.target_port))
+        .build()
 }
 
 fn build_service_http_failure_event(
@@ -730,25 +905,22 @@ fn build_service_relay_failure_event(
     target_port: u16,
     reason: &str,
 ) -> OcsfEvent {
-    NetworkActivityBuilder::new(&gateway_ocsf_ctx(
-        &endpoint.sandbox_id,
-        &endpoint.sandbox_name,
-    ))
-    .activity(ActivityId::Open)
-    .action(ActionId::Denied)
-    .disposition(DispositionId::Error)
-    .severity(SeverityId::Low)
-    .status(StatusId::Failure)
-    .dst_endpoint(Endpoint::from_ip_str(RELAY_TARGET_HOST, target_port))
-    .firewall_rule(RELAY_RULE_NAME, ROUTING_RULE_TYPE)
-    .status_detail(reason)
-    .message(format!(
-        "Service endpoint is not reachable: {}",
-        service_display_name(&endpoint.sandbox_name, &endpoint.service_name)
-    ))
-    .unmapped("endpoint_name", endpoint_name(endpoint))
-    .unmapped("service_name", endpoint.service_name.clone())
-    .build()
+    NetworkActivityBuilder::new(&gateway_ocsf_ctx(&endpoint.sandbox_id, &endpoint.sandbox))
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Error)
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_ip_str(RELAY_TARGET_HOST, target_port))
+        .firewall_rule(RELAY_RULE_NAME, ROUTING_RULE_TYPE)
+        .status_detail(reason)
+        .message(format!(
+            "Service endpoint is not reachable: {}",
+            service_display_name(&endpoint.sandbox, &endpoint.name)
+        ))
+        .unmapped("endpoint_name", endpoint_name(endpoint))
+        .unmapped("service_name", endpoint.name.clone())
+        .build()
 }
 
 fn emit_gateway_ocsf_event(sandbox_id: &str, event: OcsfEvent) {
@@ -760,8 +932,8 @@ fn emit_gateway_ocsf_event(sandbox_id: &str, event: OcsfEvent) {
     );
 }
 
-fn gateway_ocsf_ctx(sandbox_id: &str, sandbox_name: &str) -> SandboxContext {
-    SandboxContext {
+fn gateway_ocsf_ctx(sandbox_id: &str, sandbox_name: &str) -> EventContext {
+    EventContext {
         sandbox_id: sandbox_id.to_string(),
         sandbox_name: sandbox_name.to_string(),
         container_image: "openshell/gateway".to_string(),
@@ -774,7 +946,7 @@ fn gateway_ocsf_ctx(sandbox_id: &str, sandbox_name: &str) -> SandboxContext {
 
 fn endpoint_name(endpoint: &ServiceEndpoint) -> String {
     endpoint.metadata.as_ref().map_or_else(
-        || endpoint_key(&endpoint.sandbox_name, &endpoint.service_name),
+        || endpoint_key(&endpoint.sandbox, &endpoint.name),
         |metadata| metadata.name.clone(),
     )
 }
@@ -825,16 +997,16 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "endpoint-id".to_string(),
                 name: "my-sandbox--web".to_string(),
-                created_at_ms: 1_700_000_000_000,
-                labels: std::collections::HashMap::default(),
+                created_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+                labels: HashMap::default(),
                 resource_version: 0,
-                annotations: std::collections::HashMap::new(),
+                annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             sandbox_id: "sandbox-id".to_string(),
-            sandbox_name: "my-sandbox".to_string(),
-            service_name: "web".to_string(),
+            sandbox: "my-sandbox".to_string(),
+            name: "web".to_string(),
             target_port: 8080,
             domain: true,
         }
@@ -1210,16 +1382,16 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "ep-1".to_string(),
                 name: "my-sandbox--web".to_string(),
-                created_at_ms: 1_700_000_000_000,
-                labels: std::collections::HashMap::default(),
+                created_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+                labels: HashMap::default(),
                 resource_version: 0,
-                annotations: std::collections::HashMap::new(),
+                annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             sandbox_id: "sandbox-1".to_string(),
-            sandbox_name: "my-sandbox".to_string(),
-            service_name: "web".to_string(),
+            sandbox: "my-sandbox".to_string(),
+            name: "web".to_string(),
             target_port: 8080,
             domain: true,
         };
@@ -1232,6 +1404,192 @@ mod tests {
         assert!(
             not_found.is_err(),
             "should not find endpoint in wrong workspace"
+        );
+    }
+
+    /// Returns a live upstream plus the sandbox end of the connection. Hold
+    /// the returned half: dropping it closes the upstream.
+    async fn test_upstream() -> (UpstreamSender, tokio::io::DuplexStream) {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let (sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client_io))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (sender, server_io)
+    }
+
+    #[test]
+    fn upstream_pool_key_separates_endpoints_and_ports() {
+        assert_eq!(upstream_pool_key("ep-a", 8080), "ep-a|8080");
+        assert_ne!(
+            upstream_pool_key("ep-a", 8080),
+            upstream_pool_key("ep-b", 8080)
+        );
+        assert_ne!(
+            upstream_pool_key("ep-a", 8080),
+            upstream_pool_key("ep-a", 9090)
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_hands_back_a_ready_upstream() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, _sandbox) = test_upstream().await;
+
+        pool.put("ep-a|8080", sender);
+
+        assert!(
+            pool.take("ep-a|8080").is_some(),
+            "put upstream should be reusable"
+        );
+        assert!(
+            pool.take("ep-a|8080").is_none(),
+            "an upstream in use must not be handed out twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_removes_an_endpoint_left_with_no_upstreams() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, _sandbox) = test_upstream().await;
+        pool.put("ep-a|8080", sender);
+
+        assert!(pool.take("ep-a|8080").is_some());
+        assert!(
+            !pool.inner.lock().unwrap().idle.contains_key("ep-a|8080"),
+            "an emptied endpoint must not linger until the next sweep"
+        );
+    }
+
+    #[test]
+    fn only_bodyless_requests_are_replayable() {
+        for method in [Method::GET, Method::HEAD] {
+            let mut request = Request::new(Body::empty());
+            *request.method_mut() = method.clone();
+            *request.uri_mut() = "/health".parse().unwrap();
+            request
+                .headers_mut()
+                .insert(header::HOST, HeaderValue::from_static("svc"));
+
+            let replay =
+                replayable_request(&request).expect("bodyless method should be replayable");
+            assert_eq!(*replay.method(), method);
+            assert_eq!(replay.uri().path(), "/health");
+            assert_eq!(replay.headers().get(header::HOST).unwrap(), "svc");
+        }
+
+        let mut post = Request::new(Body::empty());
+        *post.method_mut() = Method::POST;
+        assert!(
+            replayable_request(&post).is_none(),
+            "a request with a body cannot be replayed"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_does_not_hand_out_another_endpoints_upstream() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, _sandbox) = test_upstream().await;
+
+        pool.put("ep-a|8080", sender);
+
+        assert!(pool.take("ep-b|8080").is_none());
+    }
+
+    #[tokio::test]
+    async fn pool_drops_an_upstream_the_sandbox_closed() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, sandbox) = test_upstream().await;
+        pool.put("ep-a|8080", sender);
+
+        drop(sandbox);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            pool.take("ep-a|8080").is_none(),
+            "a closed upstream must never be reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_upstream_recovers_an_unsent_post_for_retry() {
+        let (mut sender, sandbox) = test_upstream().await;
+        drop(sandbox);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut request = Request::new(Body::from("payload"));
+        *request.method_mut() = Method::POST;
+        *request.uri_mut() = "/write".parse().unwrap();
+        let mut error = sender
+            .try_send_request(request)
+            .await
+            .expect_err("a closed connection must reject the request");
+        let recovered = error
+            .take_message()
+            .expect("an unsent request must be recoverable for a fresh connection");
+
+        assert_eq!(recovered.method(), Method::POST);
+        assert_eq!(recovered.uri().path(), "/write");
+    }
+
+    #[tokio::test]
+    async fn pool_drops_upstreams_past_the_idle_timeout() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, _sandbox) = test_upstream().await;
+        pool.inner.lock().unwrap().idle.insert(
+            "ep-a|8080".to_string(),
+            vec![PooledUpstream {
+                sender,
+                idle_since: Instant::now()
+                    .checked_sub(UPSTREAM_IDLE_TIMEOUT + Duration::from_secs(1))
+                    .unwrap(),
+            }],
+        );
+
+        assert!(pool.take("ep-a|8080").is_none());
+    }
+
+    #[tokio::test]
+    async fn pool_caps_idle_upstreams_per_endpoint() {
+        let pool = ServiceUpstreamPool::default();
+        let mut sandboxes = Vec::new();
+        for _ in 0..(UPSTREAM_MAX_IDLE_PER_ENDPOINT + 4) {
+            let (sender, sandbox) = test_upstream().await;
+            sandboxes.push(sandbox);
+            pool.put("ep-a|8080", sender);
+        }
+
+        let held = pool
+            .inner
+            .lock()
+            .unwrap()
+            .idle
+            .get("ep-a|8080")
+            .map_or(0, Vec::len);
+        assert_eq!(held, UPSTREAM_MAX_IDLE_PER_ENDPOINT);
+        // Every connection stayed open, so the cap dropped the surplus rather
+        // than the pool losing entries to closure.
+        assert_eq!(sandboxes.len(), UPSTREAM_MAX_IDLE_PER_ENDPOINT + 4);
+    }
+
+    #[tokio::test]
+    async fn evict_drops_every_upstream_for_an_endpoint() {
+        let pool = ServiceUpstreamPool::default();
+        let (first, _sandbox_a) = test_upstream().await;
+        let (second, _sandbox_b) = test_upstream().await;
+        pool.put("ep-a|8080", first);
+        pool.put("ep-b|8080", second);
+
+        pool.evict("ep-a|8080");
+
+        assert!(pool.take("ep-a|8080").is_none());
+        assert!(
+            pool.take("ep-b|8080").is_some(),
+            "eviction must be scoped to one endpoint"
         );
     }
 }

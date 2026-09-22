@@ -43,9 +43,10 @@ mTLS (client certificates) is not supported.
 ## Public surface
 
 `OpenShellClient::connect(ClientConfig)` returns a connected client exposing
-`health`, `create_sandbox`, `get_sandbox`, `list_sandboxes`, `delete_sandbox`,
+`health`, `create_sandbox`, `get_sandbox`, `list_sandboxes`, `list_all_sandboxes`, `delete_sandbox`,
 `create_sandbox_from_template`, `create_sandbox_template`,
 `get_sandbox_template`, `list_sandbox_templates`, `delete_sandbox_template`,
+`list_sandboxes_all_workspaces`, `list_sandbox_templates_all_workspaces`,
 `wait_ready`, `wait_deleted`, and `exec`. Curated types (`SandboxSpec`,
 `SandboxRef`, `Health`, `ListOptions`, `SandboxTemplateListOptions`,
 `ExecOptions`, `SandboxPhase`) use SDK-shaped enums rather than raw proto
@@ -53,6 +54,48 @@ integers where practical. Reusable template resources are exposed as
 `SandboxWorkloadTemplate` proto aliases so callers can populate the full
 portable workload shape and driver config. Failures map to a typed `SdkError`
 with a discriminable kind.
+
+Set `SandboxSpec::service_exposures` to register named or unnamed loopback HTTP
+services during creation. Each `ServiceExposure` contains a service name and a
+target port; an empty name selects the unnamed endpoint. The returned
+`SandboxRef::service_urls` map contains each routed URL under the same name.
+
+Curated calls without a workspace argument explicitly select the `default`
+workspace. Cross-workspace listing uses the separate `*_all_workspaces`
+methods and requires Platform Admin access.
+
+For an accepted sandbox deletion, pass its original ID to `wait_deleted` so a
+same-name replacement does not extend the wait. Both the default and
+workspace-scoped clients accept the optional third argument; pass `None` to wait
+for name absence instead.
+
+```rust
+let deletion = client.delete_sandbox(name, openshell_sdk::DeleteOptions::default()).await?;
+if deletion.outcome == openshell_sdk::DeletionOutcome::Accepted {
+    client.wait_deleted(
+        name,
+        std::time::Duration::from_secs(60),
+        deletion.sandbox_id.as_deref(),
+    ).await?;
+}
+```
+
+Curated `list_*` methods return a lazy `Pager<T>`. Each `next_page()` call
+issues at most one RPC and returns a `Page<T>` with its opaque continuation
+token. The explicit `list_all_*` conveniences exhaust that pager; `page_size`
+always controls one gateway request, and `page_token` resumes a saved traversal.
+
+```rust
+let mut pages = client.list_sandboxes(ListOptions {
+    page_size: 100,
+    ..Default::default()
+});
+while let Some(page) = pages.next_page().await? {
+    for sandbox in page.items {
+        println!("{}", sandbox.name);
+    }
+}
+```
 
 ```rust
 use openshell_sdk::{
@@ -70,7 +113,7 @@ client
         }),
         spec: Some(SandboxWorkloadTemplateSpec {
             workload: Some(SandboxWorkloadConfig {
-                image: "ghcr.io/nvidia/openshell-community/sandboxes/python:latest".to_string(),
+                image: "registry.example.com/agents/python:latest".to_string(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -92,6 +135,40 @@ let _sandbox = client
 # }
 ```
 
+## Wait for a provider change
+
+Provider attach, detach, and update responses include a `ProviderMutationReceipt`: a saved record identifying the exact change requested for one sandbox. Pass that record to `provider_readiness::wait_for_provider` to wait until the current sandbox runtime confirms it applied the change. Detach completes with `Revoked`; attach and update complete with `Ready`.
+
+```rust
+use std::time::Duration;
+use openshell_sdk::{OpenShellClient, raw::ProviderMutationReceipt};
+use openshell_sdk::provider_readiness::{
+    ProviderWaitOutcome, wait_for_provider,
+};
+
+async fn wait_for_change(
+    client: &OpenShellClient,
+    change: &ProviderMutationReceipt,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut grpc = client.raw_grpc_fresh().await?;
+    let result = wait_for_provider(&mut grpc, change, Duration::from_secs(30)).await?;
+    match result.outcome {
+        ProviderWaitOutcome::Complete => println!("The sandbox applied the change."),
+        ProviderWaitOutcome::TimedOut => println!("Still waiting; check the same change again."),
+        ProviderWaitOutcome::Terminal => println!("The change failed, was withheld, or was replaced."),
+    }
+    Ok(())
+}
+```
+
+The result preserves the last known status when the deadline expires. A later change cannot satisfy a wait for the original request. `provider_status` queries once, and `wait_for_provider_until` accepts a shared deadline for waiting on the sandboxes selected by one provider update. Status responses contain configuration identities and safe reason categories, without credentials or raw installation errors.
+
+For ordinary static credentials, launch a new client after update readiness to receive the updated reference. Existing processes keep their revision-scoped references; a successful wait does not retarget them or prove that the old upstream key can be retired. After detach completes, retained references cannot resolve and new processes do not receive them.
+
+The status's `operation` field is the common operation's historical outcome, keyed by the receipt ID. These helpers complete from the live provider state and its matching evidence; a historical applied operation cannot override a disconnected, expired, or superseded live result.
+
+These helpers use the raw client's authentication slot. They do not perform OIDC refresh themselves. Follow the raw-client refresh guidance above if a request returns `Unauthenticated`, then resume waiting for the same change ID.
+
 ## Modules
 
 | Module | Purpose |
@@ -104,8 +181,10 @@ let _sandbox = client
 | `refresh` | `Refresh` trait and single-flight refresh coalescing. |
 | `edge_tunnel` | Cloudflare Access tunnel dialer. |
 | `error` | `SdkError` taxonomy. |
+| `pagination` | Lazy `Pager<T>` and response `Page<T>`. |
 | `types` | Curated request/response types and proto conversions. |
 | `raw` | Escape hatch re-exporting the generated tonic clients. |
+| `provider_readiness` | Check and wait for an exact provider change to take effect. |
 
 ## Notes
 

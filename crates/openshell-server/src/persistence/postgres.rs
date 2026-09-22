@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectCursor, ObjectRecord, PersistenceError, PersistenceResult,
-    PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error, map_migrate_error,
+    DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
+    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
+    map_migrate_error,
 };
 use crate::policy_store::{
     AtomicPolicyRevisionWrite, draft_chunk_payload_from_record, draft_chunk_record_from_parts,
@@ -13,6 +14,7 @@ use crate::policy_store::{
 use openshell_core::SetResourceVersion;
 use openshell_core::proto::Sandbox;
 use prost::Message;
+use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, PgPool, Postgres, QueryBuilder, Row};
 
@@ -33,6 +35,23 @@ pub struct PostgresStore {
     pool: PgPool,
 }
 
+// Stable cluster-wide key for serializing sandbox/provider cross-object
+// mutations. The bytes spell "OPENSHLL" and stay within PostgreSQL's signed
+// 64-bit advisory-lock key space.
+const CROSS_OBJECT_ADVISORY_LOCK_KEY: i64 = 0x4f50_454e_5348_4c4c;
+
+// Bounds the wait for the cross-object lock. The holder only validates and
+// writes, so a wait this long means a stuck replica; failing beats blocking
+// every sandbox and provider mutation in the fleet indefinitely.
+const CROSS_OBJECT_ADVISORY_LOCK_TIMEOUT: &str = "10s";
+
+pub(super) struct PostgresAdvisoryLockGuard {
+    // `close_on_drop` is set before this guard is constructed. Closing the
+    // dedicated session releases the session-level advisory lock even when a
+    // request is cancelled or returns early.
+    _connection: PoolConnection<Postgres>,
+}
+
 impl PostgresStore {
     pub async fn connect(url: &str) -> PersistenceResult<Self> {
         let pool = PgPoolOptions::new()
@@ -48,7 +67,44 @@ impl PostgresStore {
         POSTGRES_MIGRATOR
             .run(&self.pool)
             .await
-            .map_err(|e| map_migrate_error(&e))
+            .map_err(|e| map_migrate_error(&e))?;
+        self.migrate_legacy_time_payloads().await
+    }
+
+    async fn migrate_legacy_time_payloads(&self) -> PersistenceResult<()> {
+        let mut transaction = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        // Serialize this application-level data migration across gateway replicas.
+        sqlx::query("SELECT pg_advisory_xact_lock(3052)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        let rows =
+            sqlx::query("SELECT id, object_type, payload FROM objects ORDER BY id FOR UPDATE")
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+
+        for row in rows {
+            let id: String = row.try_get("id").map_err(|e| map_db_error(&e))?;
+            let object_type: String = row.try_get("object_type").map_err(|e| map_db_error(&e))?;
+            let payload: Vec<u8> = row.try_get("payload").map_err(|e| map_db_error(&e))?;
+            let migrated =
+                super::legacy_time_wire::migrate(&object_type, &payload).map_err(|error| {
+                    PersistenceError::Migration(format!(
+                        "failed to migrate {object_type} record {id}: {error}"
+                    ))
+                })?;
+            if migrated != payload {
+                sqlx::query("UPDATE objects SET payload = $1 WHERE id = $2")
+                    .bind(migrated)
+                    .bind(id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+            }
+        }
+
+        transaction.commit().await.map_err(|e| map_db_error(&e))
     }
 
     /// Verify the database is reachable by acquiring a pooled connection
@@ -56,6 +112,26 @@ impl PostgresStore {
     pub async fn ping(&self) -> PersistenceResult<()> {
         let mut conn = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
         conn.ping().await.map_err(|e| map_db_error(&e))
+    }
+
+    pub(super) async fn acquire_cross_object_lock(
+        &self,
+    ) -> PersistenceResult<PostgresAdvisoryLockGuard> {
+        let mut connection = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
+        connection.close_on_drop();
+        sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+            .bind(CROSS_OBJECT_ADVISORY_LOCK_TIMEOUT)
+            .execute(&mut *connection)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(CROSS_OBJECT_ADVISORY_LOCK_KEY)
+            .execute(&mut *connection)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(PostgresAdvisoryLockGuard {
+            _connection: connection,
+        })
     }
 
     /// Test support only: close the underlying connection pool.
@@ -625,6 +701,103 @@ LIMIT $2 OFFSET $3
         Ok(rows.into_iter().map(row_to_object_record).collect())
     }
 
+    pub async fn list_object_page(
+        &self,
+        object_type: &str,
+        query: ObjectListQuery<'_>,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        use super::parse_label_selector;
+
+        let mut sql = QueryBuilder::<Postgres>::new(
+            "SELECT o.object_type, o.id, o.name, o.workspace, o.payload, \
+             o.created_at_ms, o.updated_at_ms, o.labels, o.resource_version \
+             FROM objects o WHERE o.object_type = ",
+        );
+        sql.push_bind(object_type);
+
+        match query {
+            ObjectListQuery::Workspace(workspace) => {
+                sql.push(" AND o.workspace = ").push_bind(workspace);
+            }
+            ObjectListQuery::AllWorkspaces => {}
+            ObjectListQuery::Scope(scope) => {
+                sql.push(" AND o.scope = ").push_bind(scope);
+            }
+            ObjectListQuery::WorkspaceSelector {
+                workspace,
+                label_selector,
+            } => {
+                let labels = serde_json::to_value(parse_label_selector(label_selector)?)
+                    .map_err(|e| PersistenceError::Encode(e.to_string()))?;
+                sql.push(" AND o.workspace = ")
+                    .push_bind(workspace)
+                    .push(" AND o.labels @> ")
+                    .push_bind(labels);
+            }
+            ObjectListQuery::AllWorkspacesSelector(label_selector) => {
+                let labels = serde_json::to_value(parse_label_selector(label_selector)?)
+                    .map_err(|e| PersistenceError::Encode(e.to_string()))?;
+                sql.push(" AND o.labels @> ").push_bind(labels);
+            }
+            ObjectListQuery::Membership {
+                member_type,
+                member_name,
+            } => {
+                sql.push(
+                    " AND o.workspace = '' AND EXISTS (SELECT 1 FROM objects m \
+                          WHERE m.object_type = ",
+                )
+                .push_bind(member_type)
+                .push(" AND m.workspace = o.name AND m.name = ")
+                .push_bind(member_name)
+                .push(")");
+            }
+            ObjectListQuery::MembershipSelector {
+                member_type,
+                member_name,
+                label_selector,
+            } => {
+                let labels = serde_json::to_value(parse_label_selector(label_selector)?)
+                    .map_err(|e| PersistenceError::Encode(e.to_string()))?;
+                sql.push(
+                    " AND o.workspace = '' AND EXISTS (SELECT 1 FROM objects m \
+                          WHERE m.object_type = ",
+                )
+                .push_bind(member_type)
+                .push(" AND m.workspace = o.name AND m.name = ")
+                .push_bind(member_name)
+                .push(") AND o.labels @> ")
+                .push_bind(labels);
+            }
+        }
+
+        if let Some(cursor) = after {
+            sql.push(" AND (o.created_at_ms, COALESCE(o.name, ''), o.workspace, o.id) > (")
+                .push_bind(cursor.created_at_ms)
+                .push(", ")
+                .push_bind(&cursor.name)
+                .push(", ")
+                .push_bind(&cursor.workspace)
+                .push(", ")
+                .push_bind(&cursor.id)
+                .push(")");
+        }
+        sql.push(
+            " ORDER BY o.created_at_ms ASC, COALESCE(o.name, '') ASC, \
+             o.workspace ASC, o.id ASC LIMIT ",
+        )
+        .push_bind(i64::from(limit));
+
+        let rows = sql
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+
     pub async fn list_with_membership(
         &self,
         object_type: &str,
@@ -1031,6 +1204,32 @@ LIMIT $3 OFFSET $4
         .bind(sandbox_id)
         .bind(i64::from(limit))
         .bind(i64::from(offset))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        rows.into_iter().map(row_to_policy_record).collect()
+    }
+
+    pub async fn list_policies_before(
+        &self,
+        sandbox_id: &str,
+        limit: u32,
+        before_version: Option<i64>,
+    ) -> PersistenceResult<Vec<PolicyRecord>> {
+        let rows = sqlx::query(
+            r"
+SELECT id, scope, version, status, payload, created_at_ms
+FROM objects
+WHERE object_type = $1 AND scope = $2 AND ($3::BIGINT IS NULL OR version < $3)
+ORDER BY version DESC
+LIMIT $4
+",
+        )
+        .bind(POLICY_OBJECT_TYPE)
+        .bind(sandbox_id)
+        .bind(before_version)
+        .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| map_db_error(&e))?;

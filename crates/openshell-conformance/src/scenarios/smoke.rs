@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::{OpenShellRunner, PlanRun, STATUS_TIMEOUT, Scenario, ScenarioFuture};
+use crate::{OpenShellRunner, STATUS_TIMEOUT, Scenario, ScenarioFuture};
 use serde::Deserialize;
 use tokio::time::sleep;
 
@@ -22,16 +22,20 @@ struct SandboxListEntry {
     phase: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SandboxListPage {
+    sandboxes: Vec<SandboxListEntry>,
+    next_page_token: String,
+}
+
 /// Certify status -> create -> list Ready -> exec -> delete -> list empty.
 pub const SMOKE_SCENARIO: Scenario = Scenario {
     name: "smoke",
     description: "Create, inspect, execute in, and delete a base sandbox.",
-    requires_plan: false,
     run: run_smoke,
-    validate_plan_run: None,
 };
 
-fn run_smoke<'a>(runner: &'a mut OpenShellRunner, _plan_run: &'a PlanRun) -> ScenarioFuture<'a> {
+fn run_smoke(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(async move { run_smoke_inner(runner).await })
 }
 
@@ -51,15 +55,7 @@ async fn run_smoke_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
         .step("create")
         .description("sandbox creation succeeds")
         .with_timeout(CREATE_TIMEOUT)
-        .run(&[
-            "sandbox",
-            "create",
-            "--name",
-            &sandbox_name,
-            "--from",
-            "base",
-            "--detach",
-        ])
+        .run(&["sandbox", "create", "--name", &sandbox_name, "--detach"])
         .await
         .map_err(|error| error.to_string())?;
     create.require_success()?;
@@ -162,22 +158,22 @@ async fn find_sandbox(
     sandbox_name: &str,
     step: &str,
 ) -> Result<Option<SandboxListEntry>, String> {
-    let mut offset = 0u32;
+    let mut page_token = String::new();
+    let mut page = 0u32;
 
     loop {
-        let limit = LIST_PAGE_SIZE.to_string();
-        let page_offset = offset.to_string();
+        let page_size = LIST_PAGE_SIZE.to_string();
         let result = runner
-            .step(format!("{step}/{offset}"))
-            .description(format!("sandbox list page at offset {offset} succeeds"))
+            .step(format!("{step}/{page}"))
+            .description(format!("sandbox list page {page} succeeds"))
             .with_timeout(LIST_ATTEMPT_TIMEOUT)
             .run(&[
                 "sandbox",
                 "list",
-                "--limit",
-                &limit,
-                "--offset",
-                &page_offset,
+                "--page-size",
+                &page_size,
+                "--page-token",
+                &page_token,
                 "--output",
                 "json",
             ])
@@ -185,10 +181,11 @@ async fn find_sandbox(
             .map_err(|error| error.to_string())?;
         result.require_success()?;
 
-        let sandboxes = result
-            .json::<Vec<SandboxListEntry>>()
+        let response = result
+            .json::<SandboxListPage>()
             .map_err(|error| error.to_string())?;
-        if let Some(sandbox) = sandboxes
+        if let Some(sandbox) = response
+            .sandboxes
             .iter()
             .find(|sandbox| sandbox.name == sandbox_name)
         {
@@ -197,12 +194,13 @@ async fn find_sandbox(
                 phase: sandbox.phase.clone(),
             }));
         }
-        if sandboxes.len() < LIST_PAGE_SIZE as usize {
+        if response.next_page_token.is_empty() {
             return Ok(None);
         }
 
-        offset = offset
-            .checked_add(LIST_PAGE_SIZE)
-            .ok_or_else(|| "sandbox list pagination offset overflowed".to_string())?;
+        page_token = response.next_page_token;
+        page = page
+            .checked_add(1)
+            .ok_or_else(|| "sandbox list page counter overflowed".to_string())?;
     }
 }

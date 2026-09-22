@@ -110,4 +110,142 @@ if [ "$(PLATFORM=linux local_gateway_endpoint)" != "https://127.0.0.1:17670" ]; 
   exit 1
 fi
 
+cat >"${tmpdir}/checksums" <<'EOF'
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  openshell-dev-x86_64.rpm
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  openshell-gateway-dev-x86_64.rpm
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  openshell-prover-dev-x86_64.rpm
+EOF
+
+if [ "$(find_rpm_asset "${tmpdir}/checksums" x86_64 openshell-prover)" != "openshell-prover-dev-x86_64.rpm" ]; then
+  echo "FAIL: RPM prover package selection" >&2
+  exit 1
+fi
+
+mock_gh_log="${tmpdir}/gh.log"
+PLATFORM=linux
+linux_package_method() {
+  printf 'deb\n'
+}
+uname() {
+  case "${1:-}" in
+    -m) printf 'x86_64\n' ;;
+    *) command uname "$@" ;;
+  esac
+}
+gh() {
+  printf '%s\n' "$*" >>"$mock_gh_log"
+  case "$1:$2" in
+    auth:status)
+      return 0
+      ;;
+    api:*)
+      case "$*" in
+        *"?name="*) printf '123456\n' ;;
+        *"actions/workflows/release-tag.yml/runs?status=success"*)
+          printf '%s\n' 100 101
+          ;;
+        *)
+          if [ "${MOCK_NO_PRERELEASE:-0}" != "1" ]; then
+            printf '%b\n' \
+              '100\topenshell-v0.1.0-pre.9-linux-amd64-deb' \
+              '101\topenshell-v1.0.0-pre.2-linux-amd64-deb' \
+              '101\topenshell-v1.0.0-pre.1-macos-arm64' \
+              '101\topenshell-v0.2.0-pre.10-linux-aarch64-rpm' \
+              '999\topenshell-v2.0.0-pre.1-linux-amd64-deb'
+          fi
+          ;;
+      esac
+      ;;
+    run:download)
+      while [ "$#" -gt 0 ]; do
+        if [ "$1" = "--dir" ]; then
+          shift
+          mkdir -p "$1"
+          printf 'checksums\n' >"$1/$CHECKSUMS_NAME"
+          return 0
+        fi
+        shift
+      done
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+resolved_prerelease="$(OPENSHELL_VERSION=pre resolve_release_tag)"
+if [ "$resolved_prerelease" != "v1.0.0-pre.2" ]; then
+  echo "FAIL: pre alias resolved to ${resolved_prerelease}, expected v1.0.0-pre.2" >&2
+  exit 1
+fi
+if ! grep -Fq 'actions/workflows/release-tag.yml/runs?status=success' "$mock_gh_log"; then
+  echo "FAIL: pre alias did not query successful Release Tag workflow runs" >&2
+  cat "$mock_gh_log" >&2
+  exit 1
+fi
+if ! grep -Fq 'select(.status == "completed" and .conclusion == "success")' "$mock_gh_log"; then
+  echo "FAIL: pre alias did not require completed successful workflow runs" >&2
+  cat "$mock_gh_log" >&2
+  exit 1
+fi
+
+if (MOCK_NO_PRERELEASE=1 OPENSHELL_VERSION=pre resolve_release_tag) >"$out" 2>"$err"; then
+  echo "FAIL: pre alias should fail when no unexpired prerelease artifacts exist" >&2
+  exit 1
+fi
+if ! grep -Fq 'no unexpired prerelease artifacts found' "$err"; then
+  echo "FAIL: missing prerelease resolution failure was not explained" >&2
+  cat "$err" >&2
+  exit 1
+fi
+
+RELEASE_TAG=v0.1.0-pre.9
+prerelease_tmp="${tmpdir}/prerelease"
+prepare_prerelease_assets "$prerelease_tmp"
+if [ "$RELEASE_ASSET_DIR" != "${prerelease_tmp}/release" ]; then
+  echo "FAIL: prerelease artifact directory was not recorded" >&2
+  exit 1
+fi
+if ! grep -Fq 'select(.expired == false)' "$mock_gh_log"; then
+  echo "FAIL: prerelease lookup did not filter expired artifacts" >&2
+  cat "$mock_gh_log" >&2
+  exit 1
+fi
+if ! grep -Fq 'actions/artifacts?name=openshell-v0.1.0-pre.9-linux-amd64-deb' "$mock_gh_log"; then
+  echo "FAIL: prerelease lookup did not select the current platform artifact" >&2
+  cat "$mock_gh_log" >&2
+  exit 1
+fi
+if ! grep -Fq 'run download 123456 --repo NVIDIA/OpenShell --name openshell-v0.1.0-pre.9-linux-amd64-deb' "$mock_gh_log"; then
+  echo "FAIL: prerelease download did not select the current platform artifact" >&2
+  cat "$mock_gh_log" >&2
+  exit 1
+fi
+
+downloaded_checksum="${tmpdir}/downloaded-checksums.txt"
+download_release_asset "$RELEASE_TAG" "$CHECKSUMS_NAME" "$downloaded_checksum"
+if [ "$(cat "$downloaded_checksum")" != "checksums" ]; then
+  echo "FAIL: prerelease checksum was not copied from the platform artifact" >&2
+  exit 1
+fi
+
+for asset in "$HOMEBREW_CLI_ASSET" "$HOMEBREW_GATEWAY_ASSET" "$HOMEBREW_DRIVER_VM_ASSET" "$HOMEBREW_PROVER_ASSET"; do
+  : >"${RELEASE_ASSET_DIR}/${asset}"
+done
+prerelease_formula="${tmpdir}/openshell.rb"
+printf '%s\n' \
+  "  url \"${GITHUB_URL}/releases/download/${RELEASE_TAG}/${HOMEBREW_CLI_ASSET}\"" \
+  "    url \"${GITHUB_URL}/releases/download/${RELEASE_TAG}/${HOMEBREW_GATEWAY_ASSET}\"" \
+  "    url \"${GITHUB_URL}/releases/download/${RELEASE_TAG}/${HOMEBREW_DRIVER_VM_ASSET}\"" \
+  "    url \"${GITHUB_URL}/releases/download/${RELEASE_TAG}/${HOMEBREW_PROVER_ASSET}\"" \
+  >"$prerelease_formula"
+patch_prerelease_homebrew_formula_urls "$prerelease_formula"
+for asset in "$HOMEBREW_CLI_ASSET" "$HOMEBREW_GATEWAY_ASSET" "$HOMEBREW_DRIVER_VM_ASSET" "$HOMEBREW_PROVER_ASSET"; do
+  if ! grep -Fq "file://${RELEASE_ASSET_DIR}/${asset}" "$prerelease_formula"; then
+    echo "FAIL: prerelease formula did not use local asset ${asset}" >&2
+    exit 1
+  fi
+done
+
+unset -f gh uname linux_package_method
+
 echo "install.sh focused tests passed"

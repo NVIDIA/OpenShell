@@ -9,6 +9,7 @@
 version: v2
 modules:
   - path: proto
+  - path: crates/openshell-server/proto
 lint:
   use:
     - STANDARD

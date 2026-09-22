@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Keep these values aligned with scripts/keycloak-dev.sh.  The role provisions
+# an isolated guest fixture, while the script manages a developer-host fixture.
+keycloak_container_name: openshell-keycloak
+keycloak_image: quay.io/keycloak/keycloak:24.0
+keycloak_port: 8180
+keycloak_realm: openshell
+keycloak_admin_username: admin
+keycloak_admin_password: admin
+keycloak_state_directory: /var/lib/openshell-keycloak
+keycloak_health_retries: 45
+keycloak_health_delay: 2

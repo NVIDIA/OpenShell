@@ -144,7 +144,7 @@ where
         let ts = openshell_core::time::now_ms();
         let log = SandboxLogLine {
             sandbox_id: sandbox_id.clone(),
-            timestamp_ms: ts,
+            event_time: openshell_core::time::timestamp_from_millis(ts).ok(),
             level,
             target: meta.target().to_string(),
             message: msg,
@@ -199,7 +199,7 @@ mod tests {
     fn make_log_event(sandbox_id: &str, message: &str) -> SandboxLogLine {
         SandboxLogLine {
             sandbox_id: sandbox_id.to_string(),
-            timestamp_ms: 1000,
+            event_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             level: "INFO".to_string(),
             target: "test".to_string(),
             message: message.to_string(),
@@ -331,7 +331,7 @@ mod tests {
         for i in 0..5 {
             let evt = SandboxStreamEvent {
                 payload: Some(sandbox_stream_event::Payload::Event(PlatformEvent {
-                    timestamp_ms: i,
+                    event_time: openshell_core::time::timestamp_from_millis(i).ok(),
                     source: "test".to_string(),
                     r#type: "Normal".to_string(),
                     reason: format!("Event{i}"),

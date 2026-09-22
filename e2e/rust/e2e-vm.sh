@@ -5,15 +5,10 @@
 # Run the Rust e2e smoke test against an openshell-gateway running the
 # standalone VM compute driver (`openshell-driver-vm`).
 #
-# Architecture (post supervisor-initiated relay, PR #867):
-#   * The gateway never dials the sandbox. Instead, the in-guest
-#     supervisor opens an outbound `ConnectSupervisor` gRPC stream to
-#     the gateway on startup and keeps it alive for the sandbox
-#     lifetime. SSH (`/connect/ssh`) and `ExecSandbox` traffic ride the
-#     same TCP+TLS+HTTP/2 connection as multiplexed HTTP/2 streams.
-#   * There is no host-side SSH port forward. gvproxy still provides
-#     guest egress so the supervisor can reach the gateway, but it no
-#     longer forwards any TCP port back to the guest.
+# Architecture:
+#   * `openshell-sandbox` runs inside a NIC-less guest.
+#   * The host `openshell-supervisor` connects over virtio-vsock and owns
+#     gateway registration, policy evaluation, DNS, and external networking.
 #   * Readiness is authoritative on the gateway: a sandbox's phase
 #     flips to `Ready` the moment `ConnectSupervisor` registers, and
 #     back to `Provisioning` when the session drops. The VM driver
@@ -24,11 +19,12 @@
 #
 # What the script does:
 #   1. When no prebuilt VM driver is supplied, ensures the VM runtime
-#      (libkrun + gvproxy) and bundled supervisor are staged.
-#   2. Builds `openshell-gateway`, `openshell-driver-vm`, and the
-#      `openshell` CLI with the embedded runtime as needed. When CI supplies
-#      OPENSHELL_GATEWAY_BIN, OPENSHELL_VM_DRIVER_BIN, or OPENSHELL_BIN, the
-#      matching prebuilt binary is reused instead of rebuilt.
+#      (libkrun) and bundled sandbox/supervisor binaries are staged.
+#   2. Builds `openshell-gateway`, `openshell-driver-vm`, the native host
+#      `openshell-supervisor` host control, and the `openshell` CLI with the
+#      embedded runtime as needed. When CI supplies OPENSHELL_GATEWAY_BIN,
+#      OPENSHELL_VM_DRIVER_BIN, OPENSHELL_VM_SUPERVISOR_BIN, or OPENSHELL_BIN,
+#      the matching prebuilt binary is reused instead of rebuilt.
 #   3. On macOS, codesigns the VM driver (libkrun needs the
 #      `com.apple.security.hypervisor` entitlement).
 #   4. Writes a per-run gateway config with `[openshell.drivers.vm]`
@@ -55,7 +51,7 @@ DRIVER_BIN="${OPENSHELL_VM_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}
 CLI_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
 E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
 E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES-e2e-vm}"
-SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-${COMMUNITY_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}}"
+SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
 
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
 # AF_UNIX SUN_LEN is 104 bytes on macOS (108 on Linux), so paths anchored
@@ -88,10 +84,10 @@ if [ -z "${OPENSHELL_VM_DRIVER_BIN:-}" ]; then
     mise run vm:setup
   fi
 
-  if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ]; then
-    echo "==> Building bundled VM supervisor (mise run vm:supervisor)"
-    mise run vm:supervisor
-  fi
+  # Always rebuild the guest bundle so an e2e run cannot silently exercise a
+  # stale boundary binary after supervisor or isolation-interface changes.
+  echo "==> Building bundled VM supervisor (mise run vm:supervisor)"
+  mise run vm:supervisor
 
   export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${COMPRESSED_DIR}}"
 else
@@ -115,6 +111,14 @@ if [ -z "${OPENSHELL_VM_DRIVER_BIN:-}" ]; then
   build_packages+=(-p openshell-driver-vm)
 else
   echo "==> Using prebuilt openshell-driver-vm at ${DRIVER_BIN}"
+fi
+if [ -z "${OPENSHELL_VM_SUPERVISOR_BIN:-}" ]; then
+  # The VM driver prefers a native sibling `openshell-supervisor`. Build it
+  # explicitly so a stale target/debug binary cannot disagree with the
+  # freshly embedded guest sandbox protocol.
+  build_packages+=(-p openshell-supervisor)
+else
+  echo "==> Using prebuilt VM host supervisor at ${OPENSHELL_VM_SUPERVISOR_BIN}"
 fi
 if [ -z "${OPENSHELL_BIN:-}" ]; then
   build_packages+=(-p openshell-cli)
@@ -226,7 +230,7 @@ cleanup() {
 
   rm -f "${GATEWAY_LOG}" 2>/dev/null || true
   # Only wipe the per-run state dir on success. On failure, leave it for
-  # post-mortem (serial console logs, gvproxy logs, root disk images).
+  # post-mortem (serial console logs and root disk images).
   if [ "${exit_code}" -eq 0 ]; then
     rm -rf "${RUN_STATE_DIR}" 2>/dev/null || true
   else
@@ -245,22 +249,21 @@ echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STA
 # `~/.local/libexec/openshell/openshell-driver-vm` when present,
 # which silently shadows development builds — a subtle source of
 # stale-binary bugs in e2e runs.
-# `grpc_endpoint` is the URL the VM driver passes into each guest as
-# OPENSHELL_ENDPOINT. The supervisor inside the VM dials this address.
-# Use `host.openshell.internal` rather than `127.0.0.1` so gvproxy's
-# host-loopback proxy carries the connection while keeping the endpoint aligned
-# with package-managed gateway certificates. gvproxy's bare gateway IP
-# (192.168.127.1) does NOT forward arbitrary host ports.
+# `grpc_endpoint` is consumed by the host supervisor. The host alias is
+# normalized to loopback while keeping package-managed certificate naming.
 e2e_generate_gateway_jwt "${JWT_DIR}"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
 
 cat >"${GATEWAY_CONFIG}" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 bind_address = "127.0.0.1:${HOST_PORT}"
-compute_drivers = ["vm"]
+compute_driver = "vm"
+guest_tls_ca = "${PKI_DIR}/ca.crt"
+guest_tls_cert = "${PKI_DIR}/client/tls.crt"
+guest_tls_key = "${PKI_DIR}/client/tls.key"
 
 [openshell.gateway.tls]
 cert_path = "${PKI_DIR}/server/tls.crt"
@@ -277,7 +280,6 @@ kid_path = "${JWT_DIR}/kid"
 gateway_id = "${GATEWAY_NAME}"
 # Local VM e2e gateways exercise the single-player default: sandbox JWTs
 # identify the supervisor and do not expire.
-ttl_secs = 0
 
 [openshell.drivers.vm]
 EOF
@@ -288,9 +290,6 @@ else
 grpc_endpoint = "https://host.openshell.internal:${HOST_PORT}"
 driver_dir = "${DRIVER_DIR}"
 state_dir = "${RUN_STATE_DIR}"
-guest_tls_ca = "${PKI_DIR}/ca.crt"
-guest_tls_cert = "${PKI_DIR}/client/tls.crt"
-guest_tls_key = "${PKI_DIR}/client/tls.key"
 EOF
 fi
 
@@ -298,7 +297,7 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   "${DRIVER_BIN}" \
     --bind-socket "${DRIVER_SOCKET}" \
     --allow-same-uid-peer \
-    --openshell-endpoint "https://host.openshell.internal:${HOST_PORT}" \
+    --grpc-endpoint "https://host.openshell.internal:${HOST_PORT}" \
     --default-image "${SANDBOX_IMAGE}" \
     --state-dir "${RUN_STATE_DIR}" \
     --guest-tls-ca "${PKI_DIR}/ca.crt" \
@@ -388,6 +387,12 @@ e2e_export_gateway_restart_metadata \
 export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
 e2e_run_openshell_conformance "VM"
+
+# Seed the catalog once for the whole lane. The profiles live in the gateway
+# for as long as it runs, and the import is create-only: a second import of
+# the same directory fails with "custom provider profile '<id>' already
+# exists", so this cannot move inside the per-target helper below.
+e2e_import_example_provider_profiles "${CLI_BIN}" "${ROOT}" || exit 1
 
 run_e2e_test() {
   local test_target="$1"

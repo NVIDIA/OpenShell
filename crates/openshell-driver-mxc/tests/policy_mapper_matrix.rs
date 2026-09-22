@@ -393,11 +393,9 @@ fn a_split_proxy_localhost_port() {
         result.mxc_config["network"]["proxy"]["localhost"], 18080,
         "split must emit network.proxy.localhost == port"
     );
-    // allowedHosts stays empty on the split path.
-    assert!(
-        str_list(&result.mxc_config["network"]["allowedHosts"]).is_empty(),
-        "split path must have empty allowedHosts"
-    );
+    // Released wxc-exec rejects host-list fields, even when empty.
+    assert!(result.mxc_config["network"].get("allowedHosts").is_none());
+    assert!(result.mxc_config["network"].get("blockedHosts").is_none());
 }
 
 // ─── QUADRANT B: OpenShell features MXC cannot express ──────────────────────
@@ -444,7 +442,7 @@ fn b_tls_skip_warning() {
         "r",
         NetworkEndpoint {
             host: "api.example.com".into(),
-            tls: "skip".into(),
+            tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
             ..Default::default()
         },
     );
@@ -454,12 +452,13 @@ fn b_tls_skip_warning() {
 
 /// endpoint.tls = "full" (any non-skip) → "error".
 #[test]
+#[allow(deprecated)]
 fn b_tls_non_skip_error() {
     let policy = net_policy(
         "r",
         NetworkEndpoint {
             host: "api.example.com".into(),
-            tls: "terminate".into(),
+            tls: openshell_core::proto::NetworkTlsMode::Terminate as i32,
             ..Default::default()
         },
     );
@@ -474,7 +473,7 @@ fn b_enforcement_audit_error() {
         "r",
         NetworkEndpoint {
             host: "api.example.com".into(),
-            enforcement: "audit".into(),
+            enforcement: openshell_core::proto::NetworkEnforcementMode::Audit as i32,
             ..Default::default()
         },
     );
@@ -494,7 +493,7 @@ fn b_enforcement_non_audit_warning() {
         "r",
         NetworkEndpoint {
             host: "api.example.com".into(),
-            enforcement: "enforce".into(),
+            enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
             ..Default::default()
         },
     );
@@ -514,7 +513,7 @@ fn b_access_error() {
         "r",
         NetworkEndpoint {
             host: "api.example.com".into(),
-            access: "read-only".into(),
+            access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
             ..Default::default()
         },
     );
@@ -766,11 +765,9 @@ fn b_binaries_error_per_binary() {
             binaries: vec![
                 NetworkBinary {
                     path: "/usr/bin/curl".into(),
-                    ..Default::default()
                 },
                 NetworkBinary {
                     path: "/usr/bin/wget".into(),
-                    ..Default::default()
                 },
             ],
         },
@@ -1011,7 +1008,7 @@ fn c_empty_policy_default_deny_posture() {
     );
 }
 
-/// Split path with network rules present: allowedHosts stays empty.
+/// Split path with network rules present: unsupported host lists stay absent.
 #[test]
 fn c_split_empty_allowed_hosts_with_network_rules() {
     let mut policy = SandboxPolicy::default();
@@ -1027,11 +1024,8 @@ fn c_split_empty_allowed_hosts_with_network_rules() {
         },
     );
     let result = split_policy(&policy, &pc_split_opts()).expect("split must return Some");
-    assert!(
-        str_list(&result.mxc_config["network"]["allowedHosts"]).is_empty(),
-        "split path allowedHosts must be empty even with network rules; got: {:?}",
-        result.mxc_config["network"]["allowedHosts"]
-    );
+    assert!(result.mxc_config["network"].get("allowedHosts").is_none());
+    assert!(result.mxc_config["network"].get("blockedHosts").is_none());
     // But proxy redirect is present.
     assert_eq!(
         result.mxc_config["network"]["proxy"]["localhost"], 18080,
@@ -1200,9 +1194,9 @@ fn handled_fields_inventory() {
         // Two ports → serializes as `ports: [80, 443]` (array form).
         ports: vec![80, 443],
         protocol: "graphql".into(),
-        tls: "skip".into(),
-        enforcement: "enforce".into(),
-        access: "full".into(),
+        tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
+        enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+        access: openshell_core::proto::NetworkAccessPreset::Full as i32,
         allowed_ips: vec!["10.0.0.1".into()],
         allow_encoded_slash: true,
         websocket_credential_rewrite: true,
@@ -1248,7 +1242,6 @@ fn handled_fields_inventory() {
                     endpoints: vec![full_ep, single_port_ep],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/curl".into(),
-                        ..Default::default()
                     }],
                 },
             );

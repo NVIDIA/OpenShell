@@ -20,6 +20,9 @@ RUN_MODE="${OPENSHELL_AGENT_RUN_MODE:-once}"
 POLL_INTERVAL_SECONDS="${OPENSHELL_AGENT_POLL_INTERVAL_SECONDS:-900}"
 MAX_TRANSIENT_FAILURES="${OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES:-5}"
 HEARTBEAT_SECONDS="${OPENSHELL_AGENT_HEARTBEAT_SECONDS:-60}"
+STATE_DIR="${OPENSHELL_AGENT_STATE_DIR:-/sandbox/.openshell-agent}"
+STATE_HISTORY_LIMIT="${OPENSHELL_AGENT_STATE_HISTORY_LIMIT:-100}"
+MAX_NOTES_LENGTH="${OPENSHELL_AGENT_MAX_NOTES_LENGTH:-2048}"
 MAX_SLEEP_SECONDS=86400
 
 [[ -f "$PROMPT_FILE" ]] || { echo "missing agent prompt: $PROMPT_FILE" >&2; exit 1; }
@@ -32,7 +35,11 @@ esac
 [[ "$POLL_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || { echo "OPENSHELL_AGENT_POLL_INTERVAL_SECONDS must be an integer" >&2; exit 2; }
 [[ "$MAX_TRANSIENT_FAILURES" =~ ^[0-9]+$ ]] || { echo "OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES must be an integer" >&2; exit 2; }
 [[ "$HEARTBEAT_SECONDS" =~ ^[0-9]+$ ]] || { echo "OPENSHELL_AGENT_HEARTBEAT_SECONDS must be an integer" >&2; exit 2; }
+[[ "$STATE_HISTORY_LIMIT" =~ ^[0-9]+$ ]] || { echo "OPENSHELL_AGENT_STATE_HISTORY_LIMIT must be an integer" >&2; exit 2; }
+[[ "$MAX_NOTES_LENGTH" =~ ^[0-9]+$ ]] || { echo "OPENSHELL_AGENT_MAX_NOTES_LENGTH must be an integer" >&2; exit 2; }
 [[ "$POLL_INTERVAL_SECONDS" -gt 0 ]] || { echo "OPENSHELL_AGENT_POLL_INTERVAL_SECONDS must be greater than zero" >&2; exit 2; }
+[[ "$STATE_HISTORY_LIMIT" -gt 0 ]] || { echo "OPENSHELL_AGENT_STATE_HISTORY_LIMIT must be greater than zero" >&2; exit 2; }
+[[ "$MAX_NOTES_LENGTH" -gt 0 ]] || { echo "OPENSHELL_AGENT_MAX_NOTES_LENGTH must be greater than zero" >&2; exit 2; }
 
 json_string_field() {
     local json="$1"
@@ -68,6 +75,110 @@ sys.exit(0 if isinstance(value, dict) else 1)
         return
     fi
     return 1
+}
+
+normalize_result_json() {
+    local json="$1"
+
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$json" | jq -c --argjson max "$MAX_NOTES_LENGTH" '
+            .notes = if (.notes | type) == "string" then .notes[:$max]
+                     else "No cycle notes were provided by the agent." end
+        '
+        return
+    fi
+    printf '%s' "$json" | python3 -c '
+import json
+import sys
+
+maximum = int(sys.argv[1])
+value = json.load(sys.stdin)
+notes = value.get("notes")
+value["notes"] = notes[:maximum] if isinstance(notes, str) else "No cycle notes were provided by the agent."
+print(json.dumps(value, separators=(",", ":")))
+' "$MAX_NOTES_LENGTH"
+}
+
+state_record_json() {
+    local supervisor_state="$1"
+    local harness_status="$2"
+    local result_json="$3"
+    local recorded_at
+    recorded_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    if command -v jq >/dev/null 2>&1; then
+        jq -cn \
+            --arg recorded_at "$recorded_at" \
+            --arg agent_id "${OPENSHELL_AGENT_ID:-unknown}" \
+            --arg harness "$OPENSHELL_AGENT_HARNESS" \
+            --arg run_mode "$RUN_MODE" \
+            --argjson cycle "$cycle" \
+            --arg supervisor_state "$supervisor_state" \
+            --arg harness_status "$harness_status" \
+            --argjson result "$result_json" \
+            '{schema_version:1, recorded_at:$recorded_at, agent_id:$agent_id,
+              harness:$harness, run_mode:$run_mode, cycle:$cycle,
+              supervisor_state:$supervisor_state,
+              harness_exit_code:(if $harness_status == "" then null else ($harness_status | tonumber) end),
+              result:$result}'
+        return
+    fi
+    python3 -c '
+import json
+import sys
+
+recorded_at, agent_id, harness, run_mode, cycle, state, harness_status, result = sys.argv[1:]
+print(json.dumps({
+    "schema_version": 1,
+    "recorded_at": recorded_at,
+    "agent_id": agent_id,
+    "harness": harness,
+    "run_mode": run_mode,
+    "cycle": int(cycle),
+    "supervisor_state": state,
+    "harness_exit_code": int(harness_status) if harness_status else None,
+    "result": json.loads(result),
+}, separators=(",", ":")))
+' "$recorded_at" "${OPENSHELL_AGENT_ID:-unknown}" "$OPENSHELL_AGENT_HARNESS" \
+        "$RUN_MODE" "$cycle" "$supervisor_state" "$harness_status" "$result_json"
+}
+
+persist_state() {
+    local supervisor_state="$1"
+    local harness_status="${2:-}"
+    local result_json="${3:-}"
+    local record snapshot_tmp history_tmp
+
+    [[ -n "$result_json" ]] || result_json='{}'
+
+    mkdir -p "$STATE_DIR"
+    record="$(state_record_json "$supervisor_state" "$harness_status" "$result_json")"
+
+    snapshot_tmp="$(mktemp "$STATE_DIR/.status.XXXXXX")"
+    printf '%s\n' "$record" > "$snapshot_tmp"
+    mv "$snapshot_tmp" "$STATE_DIR/status.json"
+
+    printf '%s\n' "$record" >> "$STATE_DIR/history.jsonl"
+    history_tmp="$(mktemp "$STATE_DIR/.history.XXXXXX")"
+    tail -n "$STATE_HISTORY_LIMIT" "$STATE_DIR/history.jsonl" > "$history_tmp"
+    mv "$history_tmp" "$STATE_DIR/history.jsonl"
+}
+
+diagnostic_result_json() {
+    local status="$1"
+    local reason="$2"
+    local notes="$3"
+
+    if command -v jq >/dev/null 2>&1; then
+        jq -cn --arg status "$status" --arg reason "$reason" --arg notes "$notes" \
+            '{status:$status, reason:$reason, notes:$notes}'
+        return
+    fi
+    python3 -c '
+import json
+import sys
+print(json.dumps({"status": sys.argv[1], "reason": sys.argv[2], "notes": sys.argv[3]}, separators=(",", ":")))
+' "$status" "$reason" "$notes"
 }
 
 classify_transient_failure() {
@@ -192,6 +303,7 @@ cap_transient_backoff
 while true; do
     cycle=$((cycle + 1))
     echo "openshell-agent: starting $RUN_MODE cycle $cycle with harness $OPENSHELL_AGENT_HARNESS" >&2
+    persist_state "running"
     output_file="$(mktemp /tmp/openshell-agent-cycle.XXXXXX)"
 
     if run_cycle "$output_file"; then
@@ -204,6 +316,12 @@ while true; do
     result_json="${result_line#OPENSHELL_AGENT_RESULT }"
 
     if [[ -z "$result_line" ]]; then
+        retry_reason="missing OPENSHELL_AGENT_RESULT after harness exit $harness_status"
+        if classify_transient_failure "$output_file"; then
+            retry_reason="$retry_reason; upstream transport failure detected"
+        fi
+        diagnostic_json="$(diagnostic_result_json transient_failure missing_agent_result "$retry_reason")"
+        persist_state "$([[ "$RUN_MODE" == "once" ]] && printf terminal || printf sleeping)" "$harness_status" "$diagnostic_json"
         if [[ "$RUN_MODE" == "once" ]]; then
             rm -f "$output_file"
             if [[ "$harness_status" -ne 0 ]]; then
@@ -211,16 +329,14 @@ while true; do
             fi
             exit 1
         fi
-        retry_reason="missing OPENSHELL_AGENT_RESULT after harness exit $harness_status"
-        if classify_transient_failure "$output_file"; then
-            retry_reason="$retry_reason; upstream transport failure detected"
-        fi
         rm -f "$output_file"
         retry_watch_cycle "$retry_reason"
         continue
     fi
 
     if ! valid_result_json "$result_json"; then
+        diagnostic_json="$(diagnostic_result_json transient_failure malformed_agent_result "The harness returned malformed result JSON; the supervisor will retry.")"
+        persist_state "$([[ "$RUN_MODE" == "once" ]] && printf terminal || printf sleeping)" "$harness_status" "$diagnostic_json"
         rm -f "$output_file"
         if [[ "$RUN_MODE" == "once" ]]; then
             echo "openshell-agent: malformed OPENSHELL_AGENT_RESULT JSON" >&2
@@ -229,6 +345,8 @@ while true; do
         retry_watch_cycle "malformed OPENSHELL_AGENT_RESULT JSON"
         continue
     fi
+
+    result_json="$(normalize_result_json "$result_json")"
 
     status="$(json_string_field "$result_json" status)"
     reason="$(json_string_field "$result_json" reason)"
@@ -240,10 +358,12 @@ while true; do
 
     case "$status" in
         complete)
+            persist_state "terminal" "$harness_status" "$result_json"
             echo "openshell-agent: complete ($reason)" >&2
             exit 0
             ;;
         waiting|blocked)
+            persist_state "$([[ "$RUN_MODE" == "once" ]] && printf terminal || printf sleeping)" "$harness_status" "$result_json"
             if [[ "$RUN_MODE" == "once" ]]; then
                 echo "openshell-agent: $status ($reason)" >&2
                 exit 0
@@ -254,6 +374,7 @@ while true; do
             sleep_with_heartbeat "$next_poll_seconds" "$reason"
             ;;
         transient_failure)
+            persist_state "$([[ "$RUN_MODE" == "once" ]] && printf terminal || printf sleeping)" "$harness_status" "$result_json"
             if [[ "$RUN_MODE" == "once" ]]; then
                 echo "openshell-agent: transient failure ($reason)" >&2
                 exit 1
@@ -261,10 +382,12 @@ while true; do
             retry_watch_cycle "$reason" "$next_poll_seconds" false
             ;;
         terminal_failure)
+            persist_state "terminal" "$harness_status" "$result_json"
             echo "openshell-agent: terminal failure ($reason)" >&2
             exit 1
             ;;
         *)
+            persist_state "$([[ "$RUN_MODE" == "once" ]] && printf terminal || printf sleeping)" "$harness_status" "$result_json"
             if [[ "$RUN_MODE" == "once" ]]; then
                 echo "openshell-agent: invalid OPENSHELL_AGENT_RESULT status: ${status:-<missing>}" >&2
                 exit 1

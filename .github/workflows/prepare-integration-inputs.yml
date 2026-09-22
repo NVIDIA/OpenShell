@@ -1,0 +1,117 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Prepare Integration Inputs
+
+on:
+  workflow_call:
+    inputs:
+      artifact-run-id:
+        description: Workflow run containing the candidate artifacts
+        required: false
+        type: string
+        default: ""
+      deb-artifact-name:
+        description: Debian package artifact to include in the tmachine inputs
+        required: false
+        type: string
+        default: ""
+    outputs:
+      source_sha:
+        description: Source revision of the candidate artifacts
+        value: ${{ jobs.prepare.outputs.source_sha }}
+      integration_inputs_artifact_id:
+        description: Immutable ID of the prepared integration inputs artifact
+        value: ${{ jobs.prepare.outputs.integration_inputs_artifact_id }}
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+
+jobs:
+  prepare:
+    name: Prepare tmachine inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      source_sha: ${{ steps.artifact-run.outputs.source_sha }}
+      integration_inputs_artifact_id: ${{ steps.upload-integration-inputs.outputs.artifact-id }}
+    steps:
+      - name: Resolve artifact run
+        id: artifact-run
+        env:
+          ARTIFACT_RUN_ID: ${{ inputs['artifact-run-id'] || github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head_sha=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ARTIFACT_RUN_ID}" --jq .head_sha)
+          echo "source_sha=${head_sha}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.artifact-run.outputs.source_sha }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-nix
+
+      - name: Download CLI artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-x86_64-unknown-linux-musl
+          path: artifacts/binaries/x86_64-unknown-linux-musl
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs['artifact-run-id'] || github.run_id }}
+
+      - name: Download gateway artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-gateway-x86_64-unknown-linux-gnu
+          path: artifacts/binaries/x86_64-unknown-linux-gnu
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs['artifact-run-id'] || github.run_id }}
+
+      - name: Download Debian package artifact
+        if: inputs['deb-artifact-name'] != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs['deb-artifact-name'] }}
+          path: artifacts/packages/download
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs['artifact-run-id'] || github.run_id }}
+
+      - name: Stage Debian package input
+        if: inputs['deb-artifact-name'] != ''
+        run: |
+          set -euo pipefail
+          mv artifacts/packages/download/*.deb artifacts/packages/openshell.deb
+          rmdir artifacts/packages/download
+
+      - name: Log in to GHCR
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Export runtime images
+        env:
+          IMAGE_TAG: ${{ steps.artifact-run.outputs.source_sha }}
+        run: |
+          mkdir -p artifacts/images
+
+          docker pull "ghcr.io/nvidia/openshell/sandbox:${IMAGE_TAG}"
+          docker tag "ghcr.io/nvidia/openshell/sandbox:${IMAGE_TAG}" openshell/sandbox:tmachine
+          docker save --output artifacts/images/openshell-sandbox-tmachine.tar openshell/sandbox:tmachine
+
+          docker pull "ghcr.io/nvidia/openshell/supervisor:${IMAGE_TAG}"
+          docker tag "ghcr.io/nvidia/openshell/supervisor:${IMAGE_TAG}" openshell/supervisor:tmachine
+          docker save --output artifacts/images/openshell-supervisor-tmachine.tar openshell/supervisor:tmachine
+
+      - name: Build test archives
+        run: nix run .#build-artifacts-test-archives
+
+      - name: Upload integration inputs
+        id: upload-integration-inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openshell-tmachine-inputs
+          path: artifacts
+          compression-level: 0
+          retention-days: 5
+          if-no-files-found: error

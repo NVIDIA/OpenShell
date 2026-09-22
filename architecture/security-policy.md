@@ -21,6 +21,26 @@ For the field-by-field YAML reference, use
 Filesystem and process policy are startup-time controls. Network policy is
 dynamic and can be hot-reloaded when the new policy validates successfully.
 
+### Authored policy boundary
+
+`openshell-policy-schema` is the sole owner of the authored YAML and JSON
+representation. It preserves authored distinctions such as an absent
+`filesystem_policy` versus an explicitly empty object, rejects duplicate keys,
+and applies parser budgets while noyalib constructs the document. It also owns
+pure language semantics such as access presets, MCP revision vocabulary,
+effective ports and rule names, protocol classification, and lexical policy
+path normalization.
+
+Consumers project that syntax into purpose-specific models. `openshell-policy`
+owns protobuf conversion, composition, merge behavior, raw-protobuf checks, and
+validation that depends on runtime components. Both the proposal-risk prover and
+standalone containment checker project the shared schema into their own models
+using the same fail-closed parser as the runtime. The parser
+requires `version: 1` and rejects managed annotations and every unknown field
+before any consumer-specific projection runs. There is no permissive parsing
+profile: unsupported policy fields always invalidate the document. Middleware `config`, query and persisted-query names, and recursive MCP
+parameter names are open user-data maps rather than schema extensions.
+
 Before applying Landlock, the supervisor enriches baseline filesystem paths that
 the runtime needs. Missing baseline paths are skipped so one absent runtime path
 does not weaken the whole ruleset. When GPU devices are present, GPU baseline
@@ -70,9 +90,7 @@ proxy.
 | `foo.**.example.com` | No | — | Recursive wildcard outside the first label is not allowed. |
 | `foo**.example.com` | No | — | Recursive `**` mixed inside a label; allowed only as the entire first label. |
 
-Validation rejects the disallowed patterns at policy load time with a message
-that names the offending host. Exact hosts and IP addresses do not use this
-path.
+Validation rejects the disallowed patterns at policy load time. OPA load errors omit the supplied hostname. Exact hosts and IP addresses do not use this wildcard-validation path.
 
 ## TLS and L7 Inspection
 
@@ -142,15 +160,35 @@ flag defaults to `false` and is security-flagged in policy approval flows.
 Incremental merges only ever add the flag to a matching endpoint; clearing it
 requires removing the endpoint or replacing the policy.
 
+Image discovery may persist a desired policy for repair, but does not authorize
+workload activation. The gateway applies the credential gate after full provider
+composition and provenance derivation. A rejected effective configuration keeps
+startup blocked with a bounded diagnostic; the supervisor waits for management
+repair instead of launching with connection-time denials or a fallback policy.
+Accepted runtime state includes the matching provider-environment revision, so
+policy and credential updates cannot activate independently.
+
 The network supervisor independently enforces the same boundary. Credentialed
 WebSocket upgrades use the parsed relay, binary frames fail closed, and text
-placeholders require rewrite. REST bodies can continue streaming when body
-rewrite is disabled, but the relay withholds enough trailing bytes to detect a
-placeholder split across reads before forwarding its marker. Explicitly opted-in
+placeholders require rewrite. REST bodies continue streaming when body rewrite is disabled. The relay holds
+complete placeholder candidates until a request-scoped metadata snapshot can
+classify them. Authoritatively unknown keys and valid credentials with a current
+binding pass unchanged, including references bound to the destination itself.
+Revoked or invalid identities and unavailable classification state
+fail closed. Classification never substitutes secret values and shares the request's
+credential revision; stale credential or policy generations terminate forwarding.
+Header rewriting scans only headers. Body bytes received in the initial proxy
+read follow the same body classifier or explicit rewriter as later reads.
+Candidates are limited to 4096 wire bytes, including percent encoding. Malformed
+or oversized candidates fail closed; HTTP trailers retain prefix-based rejection. Explicitly opted-in
 endpoints retain raw passthrough behavior.
 
+Body denials return `credential_placeholder_in_request_body` in a local HTTP 403
+response and discard any partially written upstream request. Safe preceding bytes
+may already have reached upstream.
+
 Denials emit both the relevant network activity and a detection finding. Events
-identify only the destination, policy, and traffic surface; they never include
+identify only the destination, policy, traffic surface, and controlled denial reason; they never include
 credential names, placeholders, body content, or secret values.
 
 Credential provenance is gateway-derived and deliberately absent from the policy
@@ -160,13 +198,23 @@ policy without provenance applies neither the raw-tunnel refusal nor the
 WebSocket binary-frame refusal. The request-body backstop still applies, because
 it keys off the presence of a secret resolver rather than endpoint provenance.
 
-Two paths load a policy without provenance. A supervisor booting from a
-container-image policy is a bounded window: that policy is resynchronized to the
-gateway, which then serves a stamped effective policy. An explicit local Rego and
-data override is permanent, because gateway revisions are observed for settings
-and providers but never replace the local policy. When that override is combined
-with injected provider credentials, the supervisor emits a high-severity
-detection finding at startup naming the inactive controls.
+Two supervisor-local paths load a policy without provenance. A supervisor
+booting from an explicitly provisioned policy file has a bounded window before
+that policy is resynchronized to the gateway, which then serves a stamped
+effective policy. An explicit supervisor Rego and data override is permanent,
+because gateway revisions are observed for settings and providers but never
+replace the local policy. Workload-image files and environment variables cannot
+configure the separately isolated supervisor. When a supervisor override is
+combined with injected provider credentials, the supervisor emits a
+high-severity detection finding at startup naming the inactive controls.
+
+## Policy Load Diagnostics
+
+`OpaEngine` bounds the error messages returned when loading or reloading policy from files, strings, or protobuf. Each message contains at most eight error items and 512 UTF-8 bytes, including its heading, separators, and any `additional violations omitted` marker. The loader reports complete, fixed categories and discards authored names, values, paths, source snippets, and nested error chains.
+
+Typed validation categories distinguish process identity, filesystem paths and limits, Landlock compatibility, endpoint hosts and ports, credential signing and rewriting, MCP configuration, and middleware configuration. Opaque L7 errors identify the protocol-configuration or policy-validation stage; endpoint conflicts report ambiguous selectors. YAML errors retain a fixed parser category and numeric line and column when available. File I/O, Rego loading, and internal policy-data errors use fixed messages.
+
+A candidate rejected during validation does not replace the active engine or advance its generation. The supervisor separately applies `policy_validation_failure_mode` and may publish a quarantine generation as described below. The diagnostic bounds cover returned OPA load errors; accepted-policy warnings, runtime request diagnostics, and gateway-authored policy parser messages have separate reporting contracts.
 
 ## Live Updates
 
@@ -176,6 +224,12 @@ gateway-global policy overrides and provider-profile policy layers. The
 supervisor polls for config revisions and attempts to load new dynamic policy
 into the in-process OPA engine; CLI reads of the latest sandbox policy use the
 same effective configuration path.
+
+The OPA loader checks the object and list shapes of raw policy data before injecting runtime fields, normalizing values, or expanding access presets. It rejects the first malformed container with a fixed structural error that excludes authored keys and values. This check preserves valid versionless OPA data and runtime-only fields. A rejected OPA engine reload leaves that engine's installed policy, generation, and decisions unchanged; the supervisor separately applies its configured runtime rejection mode.
+
+After validating L7 rules, the OPA loader converts nonempty string query and MCP parameter matchers into explicit `glob` objects, including MCP `tool` aliases and deny rules. Matchers representable in both YAML and protobuf therefore expose the same representation to endpoint configuration consumers. Already lowered `glob` and `any` matchers retain their values across reloads; normalization preserves runtime endpoint provenance. Empty scalar query matchers remain an OPA-only form because Rego gives them different behavior from empty `glob` objects.
+
+An explicitly supplied MCP rule `params` value must be a map in both allow and deny rules. Omit the field when using only the `tool` alias; `params: null` is rejected before alias lowering. A rejected raw policy reload preserves the active evaluator and its generation.
 
 The supervisor validates complete effective policy generations before
 activation. Overlapping endpoint selectors may contribute request allow and
@@ -187,12 +241,20 @@ connection metadata agrees. When request paths overlap, a path endpoint with a
 higher specificity rank deterministically overrides broader request-processing
 metadata. Equally specific overlapping endpoints must agree.
 
+Endpoint `tls`, `enforcement`, and `access` use protobuf enums and retain their
+named YAML spellings. `protocol` remains a string so the supported protocol set
+can evolve, but every ingress validates it before persistence or activation.
+The supervisor also refuses unknown enum numbers and protocol values
+defensively; an unrecognized enforcement value never falls back to audit.
+
 Gateway mutation paths validate the complete effective candidate before
 persistence when the affected sandbox scope is known. Direct replacements,
 incremental merges and approvals, provider attachment, and profile fanout reject
 ambiguity atomically, without creating an invalid revision or partially
 activating an update. Supervisor validation remains the defense-in-depth
 boundary for startup, concurrent changes, and sources outside those mutations.
+
+L7 allow and deny append operations carry an explicit rule target and the complete affected binary and port scope. The merge engine resolves one non-provider endpoint within that rule, optionally by exact endpoint path, and compares both scope sets before mutation. A partial declaration, ambiguous target, or changed scope rejects the batch before revision persistence. The declaration records operator intent; it does not grant policy-writing authority or change the stored binary and port sets.
 
 The `[openshell.gateway] policy_validation_failure_mode` configuration controls
 candidates rejected by supervisor runtime validation. Gateway preflight
@@ -281,21 +343,23 @@ After any successful policy write, pending chunks already covered by the new
 live effective policy are rejected as redundant. This keeps the review inbox
 aligned with what the sandbox currently enforces.
 
-Endpoint and binary advisor markers are provenance, not authorization or
-connection metadata. Provider- or user-authored declarations carry explicit
-provenance; `policy.local` declarations carry advisor provenance. A difference
-in endpoint provenance alone is compatible during effective-policy ambiguity
-validation. When identical endpoint or binary identities merge, an explicit
-declaration dominates an advisor declaration. Proposal coverage likewise
-ignores provenance so an approved overlay converges when an existing explicit
-declaration already supplies the same identity.
+Endpoint advisor markers are provenance, not authorization or connection
+metadata. Provider- or user-authored endpoints carry explicit provenance;
+`policy.local` endpoints carry advisor provenance. A difference in endpoint
+provenance alone is compatible during effective-policy ambiguity validation.
+When identical endpoints merge, an explicit declaration dominates an advisor
+declaration. Proposal coverage likewise ignores provenance so an approved
+overlay converges when an existing explicit declaration already supplies the
+same identity.
 
 This compatibility does not weaken SSRF classification. Exact-host trust
-requires one matching rule to contain both an exact explicit endpoint and an
-explicit binary identity. An advisor-only endpoint or binary cannot assemble
-that trust from unrelated rules. A provider rule may independently establish
-trust for its own explicit endpoint and binary pair, but an advisor overlay
-does not broaden that pair to a different binary.
+requires one matching rule to contain both an exact explicit endpoint and a
+matching binary identity. An advisor endpoint cannot assemble that trust from
+an unrelated explicit endpoint. When the advisor observes a new binary for an
+existing explicit endpoint contract, canonicalization keeps the observation in
+a separate rule whose endpoint retains advisor provenance. A provider or user
+rule may independently establish trust for its own explicit endpoint and binary
+pair, but an advisor overlay does not broaden that pair to a different binary.
 
 ### Security-notes gate
 
@@ -321,7 +385,43 @@ may store such a draft, but existing merge validation rejects it when an
 approval attempts to add it to policy; runtime SSRF protections remain the
 final enforcement boundary.
 
-## What the prover decides
+## Standalone boundary checks
+
+The standalone `openshell-prover check` command compares a fully composed local
+candidate policy with an operator-supplied local boundary. It establishes
+`Allowed(candidate) ⊆ Allowed(boundary)` for the policy domains reported in its
+result. It does not fetch gateway state, compose provider rules, apply policy,
+or decide whether an in-boundary change is eligible for automatic approval.
+
+The containment model covers filesystem paths, supported process identities,
+Landlock compatibility requirements, L4 destinations including IP ranges, and
+enforced REST method and path authority. Identity comparisons assume consistent
+user and group resolution. Compatibility checks compare requested enforcement
+requirements, not the actual kernel state of a running sandbox.
+It returns explicit unsupported or inconclusive
+results when a sound decision depends on authority or runtime context outside
+the model. The result records the covered domains so callers can require the
+authority relevant to their decision. The JSON `schema_version` versions the
+result contract, while `prover_version` identifies the producing implementation.
+
+Before semantic validation, the checker observes cancellation and applies
+aggregate limits across both inputs. Oversized checks therefore return
+`resource_limit` without building validation indexes. Cross-protocol ambiguity
+validation indexes host and port authority rather than comparing every endpoint
+pair, and it checks cancellation while scanning admitted policies.
+
+The Rust containment API has an explicit extensibility contract: options and
+modeled-domain evidence permit additive growth, while the four `CheckResult`
+states remain exhaustive and authorization accepts only `Within`. This Rust
+source-compatibility boundary is separate from the CLI JSON schema and the
+reported modeled domains. See the `openshell-prover` crate README for the
+supported construction and matching patterns.
+
+This containment operation is separate from the proposal-risk queries below.
+See the [standalone policy prover documentation](../docs/reference/policy-prover.mdx)
+for installation, command behavior, model limitations, evidence, and exit codes.
+
+## What the proposal prover decides
 
 The prover answers four formal questions about each proposed policy
 change. Each "yes" answer becomes its own categorical finding — there is
@@ -377,3 +477,19 @@ record for the same request.
 
 Never log secrets, credentials, bearer tokens, or query parameters in OCSF
 messages. OCSF JSONL output may be shipped to external systems.
+The gateway-local OCSF JSONL file sink is restricted to the Windows/MXC path
+and requires an explicit `OPENSHELL_OCSF_JSON=1` opt-in. Other gateway
+deployments do not initialize this gateway file sink; a cross-platform gateway
+sink requires its own storage and configuration integration.
+MXC ETW process events record executable identity but omit command-line
+arguments from structured fields and messages. Raw ETW debug summaries replace
+the `commandLine` value with `[REDACTED]`, including pending-buffer eviction
+diagnostics.
+MXC ETW attribution never treats command text as ownership evidence. It uses the
+driver-owned `wxc-exec` PID plus its kernel process start key as the initial
+anchor. ETW attaches that generation key to each record, and the driver queries
+the same key from its child process handle. PID attribution requires both values
+to match, so reuse cannot transfer ownership between process generations.
+Retired PID evidence is discarded; established identity, activity, and
+correlation-vector links remain eligible during the five-second late-event
+window. Records without matching generation evidence fail closed.

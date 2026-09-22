@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 {{/*
 Expand the name of the chart.
 */}}
@@ -91,6 +94,25 @@ so a released chart automatically pulls the matching image without extra overrid
 {{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) }}
 {{- end }}
 
+{{/* Official sandbox runtime repository used by the gateway's built-in default. */}}
+{{- define "openshell.defaultSandboxRuntimeRepository" -}}
+ghcr.io/nvidia/openshell/sandbox
+{{- end }}
+
+{{/* Whether Helm must propagate a sandbox runtime image override. */}}
+{{- define "openshell.sandboxRuntimeImageOverrideEnabled" -}}
+{{- $defaultRepository := include "openshell.defaultSandboxRuntimeRepository" . -}}
+{{- $repository := .Values.sandboxRuntime.image.repository | default $defaultRepository -}}
+{{- if or (ne $repository $defaultRepository) .Values.sandboxRuntime.image.tag -}}true{{- end -}}
+{{- end }}
+
+{{/* Sandbox runtime image override. */}}
+{{- define "openshell.sandboxRuntimeImage" -}}
+{{- $repository := .Values.sandboxRuntime.image.repository | default (include "openshell.defaultSandboxRuntimeRepository" .) -}}
+{{- $tag := .Values.sandboxRuntime.image.tag | default .Values.image.tag | default .Chart.AppVersion -}}
+{{- printf "%s:%s" $repository $tag }}
+{{- end }}
+
 {{/* Official supervisor repository used by the gateway's built-in default. */}}
 {{- define "openshell.defaultSupervisorRepository" -}}
 ghcr.io/nvidia/openshell/supervisor
@@ -104,6 +126,7 @@ defaults.
 */}}
 {{- define "openshell.gatewayClientCaEnabled" -}}
 {{- if .Values.server.disableTls -}}
+{{- else if not .Values.server.tls.enableMtls -}}
 {{- else if eq .Values.server.tls.clientCaSecretName "" -}}
 {{- else if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) -}}
 true
@@ -187,6 +210,10 @@ Name of the Secret holding gateway-minted sandbox JWT signing material.
 {{- .Values.server.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) -}}
 {{- end }}
 
+{{- define "openshell.peerServiceName" -}}
+{{- printf "%s-peer" (include "openshell.fullname" .) -}}
+{{- end }}
+
 {{/*
 gRPC endpoint sandbox pods use to call back into the gateway. An explicit
 .Values.server.grpcEndpoint is used verbatim. Otherwise it is derived from
@@ -194,25 +221,6 @@ the in-cluster Service DNS, release namespace, service port, and disableTls
 flag — so the default value works for any release name or namespace without
 override.
 */}}
-{{/*
-Supervisor sideload method. When supervisor.sideloadMethod is set, use it
-verbatim. Otherwise auto-detect from the cluster version: the ImageVolume
-feature gate is enabled by default starting in K8s v1.35 (GA in v1.36).
-Clusters on v1.33-v1.34 can opt in by setting sideloadMethod explicitly
-after enabling the feature gate.
-*/}}
-{{- define "openshell.supervisorSideloadMethod" -}}
-{{- if .Values.supervisor.sideloadMethod -}}
-{{- .Values.supervisor.sideloadMethod -}}
-{{- else -}}
-{{- if semverCompare ">=1.35-0" .Capabilities.KubeVersion.Version -}}
-image-volume
-{{- else -}}
-init-container
-{{- end -}}
-{{- end -}}
-{{- end }}
-
 {{- define "openshell.grpcEndpoint" -}}
 {{- if .Values.server.grpcEndpoint -}}
 {{- .Values.server.grpcEndpoint -}}
@@ -241,6 +249,13 @@ Returns a YAML list. Append extra SANs from values with range loops.
 {{- end }}
 
 {{/*
+Name of the ConfigMap holding the backend CA for BackendTLSPolicy validation.
+*/}}
+{{- define "openshell.backendCaConfigMapName" -}}
+{{- .Values.grpcRoute.backendTLSPolicy.caCertificateConfigMapName | default (printf "%s-backend-ca" (include "openshell.fullname" .)) -}}
+{{- end }}
+
+{{/*
 Gateway workload kind. StatefulSet is the default because the default SQLite
 database requires persistent per-pod storage.
 */}}
@@ -250,6 +265,26 @@ database requires persistent per-pod storage.
 {{- fail "workload must be a map with kind and allowMultiReplicaStatefulSet fields." -}}
 {{- end -}}
 {{- default "statefulset" (get $workload "kind") | lower -}}
+{{- end }}
+
+{{/*
+Translate chart image pull policy values to the canonical gateway vocabulary.
+The Kubernetes spellings remain accepted so existing values files continue to
+work across the schema-v2 chart upgrade.
+*/}}
+{{- define "openshell.canonicalImagePullPolicy" -}}
+{{- $policy := printf "%v" . -}}
+{{- if eq $policy "Always" -}}
+always
+{{- else if eq $policy "IfNotPresent" -}}
+if_not_present
+{{- else if eq $policy "Never" -}}
+never
+{{- else if has $policy (list "always" "if_not_present" "never") -}}
+{{- $policy -}}
+{{- else -}}
+{{- fail (printf "image pull policy %q must be one of: always, if_not_present, never, Always, IfNotPresent, Never" $policy) -}}
+{{- end -}}
 {{- end }}
 
 {{/*

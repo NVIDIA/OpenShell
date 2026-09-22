@@ -34,8 +34,7 @@ Each agent has an `agent.yaml` manifest. The launcher currently reads these
 sections:
 
 - `id`, `display_name`, `description`: human and runtime identity.
-- `sandbox`: default sandbox name prefix, gateway, source image or Dockerfile,
-  and background log directory.
+- `sandbox`: default sandbox name prefix, gateway, and source image or Dockerfile.
 - `harness`: default harness and per-harness settings such as model and
   reasoning effort.
 - `runtime`: in-sandbox run mode (`once` or `watch`), watch poll interval, and
@@ -86,14 +85,17 @@ Manifest paths support these prefixes:
      to the sandbox.
 15. Configure and rotate refresh-backed provider credentials when declared by
      the manifest.
-16. Run `openshell sandbox create` from the resulting image reference.
-17. Inside the sandbox, run `/etc/openshell/agent-payload/runtime/entrypoint.sh`.
-18. The runtime entrypoint starts
+16. Run `openshell sandbox create` from the resulting image reference, with the
+    runtime entrypoint persisted as the detached canonical main process.
+17. Mark the sandbox ephemeral unless `--keep` was supplied, allowing the
+    gateway to delete it after the canonical process exits.
+18. Inside the sandbox, run `/etc/openshell/agent-payload/runtime/entrypoint.sh`.
+19. The runtime entrypoint starts
     `/etc/openshell/agent-payload/runtime/supervisor.sh`.
-19. The supervisor invokes
+20. The supervisor invokes
     `/etc/openshell/agent-payload/runtime/harnesses/<harness>/exec.sh` as a
     bounded child execution.
-20. Harness adapters prepare harness-local auth/config and execute the agent
+21. Harness adapters prepare harness-local auth/config and execute the agent
     prompt headlessly.
 
 The payload directory is baked into the image under `/etc/openshell`, which the
@@ -113,7 +115,7 @@ bounded harness cycles. The harness must not sleep or poll indefinitely. Instead
 it performs one reconciliation cycle, then prints a final-line sentinel:
 
 ```text
-OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending"}
+OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending","notes":"Required checks are still running. The agent will inspect them next cycle."}
 ```
 
 Supported statuses are `complete`, `waiting`, `blocked`, `transient_failure`, and
@@ -128,6 +130,17 @@ retried indefinitely with bounded backoff; only `complete` and
 `terminal_failure` stop the supervisor. This keeps long-lived agents resilient
 to upstream model errors while leaving durable state ownership to the agent
 domain.
+
+The supervisor writes an atomic current snapshot to
+`/sandbox/.openshell-agent/status.json` and keeps the latest 100 supervisor
+transitions in `/sandbox/.openshell-agent/history.jsonl`. Each record identifies
+the cycle, supervisor state, harness exit code, and structured agent result.
+Agents should include a concise `notes` field in every result to capture their
+human-readable current diagnosis, notable issues or questions, and next useful
+action. The supervisor caps notes at 2,048 characters and records a diagnostic
+placeholder when an agent omits them. Override the state directory, history
+limit, or notes limit with `OPENSHELL_AGENT_STATE_DIR`,
+`OPENSHELL_AGENT_STATE_HISTORY_LIMIT`, or `OPENSHELL_AGENT_MAX_NOTES_LENGTH`.
 
 The shared runtime does not prescribe the durable state store. Gator uses GitHub
 labels, comments, reviews, and checks. Other agents can use a repository branch,

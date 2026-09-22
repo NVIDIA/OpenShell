@@ -22,6 +22,8 @@ use std::sync::Mutex;
 
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::output::{extract_field, strip_ansi};
+#[cfg(feature = "e2e-docker")]
+use openshell_e2e::harness::sandbox::E2E_WORKLOAD_IMAGE;
 
 const TEST_API_KEY: &str = "sk-e2e-auto-provider-test-key";
 static CLAUDE_PROVIDER_LOCK: Mutex<()> = Mutex::new(());
@@ -84,12 +86,36 @@ async fn auto_created_provider_credential_available_in_sandbox() {
     // Clean up any leftover from a previous run.
     delete_provider("claude-code").await;
 
+    // This test only reads the injected environment placeholder. Do not inherit
+    // the published image's network rules, which may be incompatible with the
+    // attached credential provider's startup validation.
+    let policy = tempfile::NamedTempFile::new().expect("create provider test policy");
+    std::fs::write(
+        policy.path(),
+        r"version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /etc, /proc]
+  read_write: [/sandbox, /tmp, /dev/null]
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+network_policies: {}
+",
+    )
+    .expect("write provider test policy");
+
     // Create a sandbox that prints the ANTHROPIC_API_KEY env var.
     // --auto-providers skips the interactive prompt.
     let mut cmd = openshell_cmd();
-    cmd.arg("sandbox")
-        .arg("create")
-        .arg("--detach")
+    cmd.arg("sandbox").arg("create");
+    #[cfg(feature = "e2e-docker")]
+    cmd.arg("--from").arg(E2E_WORKLOAD_IMAGE);
+    cmd.arg("--detach")
+        .arg("--policy")
+        .arg(policy.path())
         .arg("--provider")
         .arg("claude-code")
         .arg("--auto-providers")

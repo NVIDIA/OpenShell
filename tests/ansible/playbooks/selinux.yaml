@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Verify SELinux
+  hosts: all
+  gather_facts: false
+
+  tasks:
+    - name: Read the current SELinux mode
+      ansible.builtin.command:
+        cmd: getenforce
+      register: selinux_mode
+      changed_when: false
+
+    - name: Verify enforcing mode
+      ansible.builtin.assert:
+        that:
+          - selinux_mode.stdout == "Enforcing"
+        fail_msg: SELinux is not enforcing.

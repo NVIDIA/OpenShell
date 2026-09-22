@@ -52,10 +52,17 @@ In terminal 2, create a new sandbox with Claude Code. The [default policy](/refe
 Create a [credential provider](/sandboxes/manage-providers) that injects your GitHub token into the sandbox automatically. The provider reads `GITHUB_TOKEN` from your host environment and sets it as an environment variable inside the sandbox:
 
 ```shell
+curl -LsSfO https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/github.yaml
+openshell provider profile import -f github.yaml --global
+
 GITHUB_TOKEN=<your-token>
 openshell provider create --name my-github --type github --from-existing
-openshell sandbox create --provider my-github -- claude
+openshell sandbox create --from registry.example.com/your-org/claude-agent:latest --provider my-github -- claude
 ```
+
+The import step registers the `github` profile on your gateway. OpenShell ships
+no profiles inside the gateway binary, so `--type github` resolves only after the
+profile is imported. Import it once per gateway.
 
 `openshell sandbox create` keeps the sandbox running after Claude Code exits, so you can apply policy updates later without recreating the environment. Add `--no-keep` if you want the sandbox deleted automatically instead.
 

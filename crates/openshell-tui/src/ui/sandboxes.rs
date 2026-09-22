@@ -94,7 +94,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             Constraint::Percentage(7),
             Constraint::Percentage(18),
             Constraint::Percentage(15),
-            Constraint::Percentage(12),
+            Constraint::Length(18),
         ]
     } else {
         vec![
@@ -104,7 +104,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             Constraint::Percentage(8),
             Constraint::Percentage(20),
             Constraint::Percentage(15),
-            Constraint::Percentage(12),
+            Constraint::Length(18),
         ]
     };
 

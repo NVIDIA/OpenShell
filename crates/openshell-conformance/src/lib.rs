@@ -4,7 +4,6 @@
 //! Reusable support for portable `OpenShell` CLI conformance scenarios.
 
 pub mod executor;
-pub mod plan;
 mod scenarios;
 
 use std::collections::BTreeSet;
@@ -24,56 +23,25 @@ use tokio::time::sleep;
 
 use self::executor::{CliExecutionError, CliExecutor, ProcessCli};
 
-pub use plan::{ConformancePlan, HostAction, PlanDiagnostics, PlanRun, WorkloadExpectation};
-pub use scenarios::{SANDBOX_CONTINUITY_SCENARIO, SMOKE_SCENARIO};
+pub use scenarios::{SANDBOX_LIFECYCLE_SCENARIO, SMOKE_SCENARIO};
 
 /// An installed conformance scenario.
 #[derive(Debug)]
 pub struct Scenario {
     pub name: &'static str,
     pub description: &'static str,
-    requires_plan: bool,
-    run: for<'a> fn(&'a mut OpenShellRunner, &'a PlanRun) -> ScenarioFuture<'a>,
-    validate_plan_run: Option<PlanRunValidator>,
+    run: for<'a> fn(&'a mut OpenShellRunner) -> ScenarioFuture<'a>,
 }
 
 pub type ScenarioFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
-type PlanRunValidator = fn(&PlanRun) -> Result<(), String>;
 
 impl Scenario {
-    pub async fn run(
-        &self,
-        runner: &mut OpenShellRunner,
-        plan_run: &PlanRun,
-    ) -> Result<(), String> {
-        self.validate_plan_run(plan_run)?;
-        (self.run)(runner, plan_run).await
-    }
-
-    pub fn validate_plan_run(&self, plan_run: &PlanRun) -> Result<(), String> {
-        self.validate_plan_run.map_or_else(
-            || default_validate_plan_run(plan_run),
-            |validate| validate(plan_run),
-        )
-    }
-
-    /// Whether this scenario may run only through an explicit target plan.
-    pub fn requires_plan(&self) -> bool {
-        self.requires_plan
+    pub async fn run(&self, runner: &mut OpenShellRunner) -> Result<(), String> {
+        (self.run)(runner).await
     }
 }
 
-fn default_validate_plan_run(plan_run: &PlanRun) -> Result<(), String> {
-    if plan_run.workload_expectation.is_some() || !plan_run.actions.is_empty() {
-        return Err(format!(
-            "scenario {:?} does not accept workload_expectation or actions",
-            plan_run.scenario
-        ));
-    }
-    Ok(())
-}
-
-const SCENARIOS: &[Scenario] = &[SMOKE_SCENARIO, SANDBOX_CONTINUITY_SCENARIO];
+const SCENARIOS: &[Scenario] = &[SMOKE_SCENARIO, SANDBOX_LIFECYCLE_SCENARIO];
 
 /// Returns every scenario compiled into this distribution.
 pub fn scenarios() -> &'static [Scenario] {
@@ -83,13 +51,6 @@ pub fn scenarios() -> &'static [Scenario] {
 /// Finds a scenario by its stable command-line name.
 pub fn scenario(name: &str) -> Option<&'static Scenario> {
     scenarios().iter().find(|candidate| candidate.name == name)
-}
-
-/// Returns scenarios that need no host-level disruption capability.
-pub fn default_scenarios() -> impl Iterator<Item = &'static Scenario> {
-    scenarios()
-        .iter()
-        .filter(|scenario| !scenario.requires_plan)
 }
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_mins(2);
@@ -284,24 +245,12 @@ struct AuthenticationOutput {
 /// Runs `OpenShell` commands for one conformance scenario and owns its cleanup.
 pub struct OpenShellRunner {
     cli: Arc<dyn CliExecutor>,
-    host_action_executor: Option<Arc<dyn HostActionExecutor>>,
     run_id: String,
     scenario: String,
     known_sandboxes: BTreeSet<String>,
+    known_providers: BTreeSet<String>,
+    known_provider_profiles: BTreeSet<String>,
     finished: bool,
-}
-
-/// Executes one target-supplied host-side action from an explicit plan.
-///
-/// This intentionally differs from [`CliExecutor`]: that executor models
-/// `OpenShell` CLI invocations through the runner's configured binary and emits
-/// structured command results, while an action is a plan-owned executable with
-/// no caller-provided arguments.
-pub trait HostActionExecutor: Send + Sync {
-    fn execute(
-        &self,
-        action: &HostAction,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 }
 
 /// A runner command with diagnostic context but no timeout yet.
@@ -341,46 +290,33 @@ impl OpenShellRunner {
         ))
     }
 
+    /// Uses the candidate CLI selected by the archive test runner.
+    ///
+    /// Archive-based tests set `OPENSHELL_BIN` to the candidate artifact
+    /// installed in the guest. Requiring it here prevents a test from silently
+    /// resolving a different `openshell` binary from `PATH`.
+    pub fn from_env(scenario: &str) -> Result<Self, RunnerError> {
+        let binary = std::env::var_os("OPENSHELL_BIN")
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                RunnerError::BinaryUnavailable(
+                    "OPENSHELL_BIN must name the candidate openshell CLI".to_string(),
+                )
+            })?;
+        Self::with_binary(binary, scenario)
+    }
+
     /// Creates a runner with an injected executor. This is useful for harness tests.
     pub fn with_executor(cli: Arc<dyn CliExecutor>, scenario: &str) -> Self {
         Self {
             cli,
-            host_action_executor: None,
             run_id: generate_run_id(),
             scenario: scenario.to_string(),
             known_sandboxes: BTreeSet::new(),
+            known_providers: BTreeSet::new(),
+            known_provider_profiles: BTreeSet::new(),
             finished: false,
         }
-    }
-
-    /// Attaches the target-side executor used only by explicit plan actions.
-    #[must_use]
-    pub fn with_host_action_executor(
-        mut self,
-        host_action_executor: Arc<dyn HostActionExecutor>,
-    ) -> Self {
-        self.host_action_executor = Some(host_action_executor);
-        self
-    }
-
-    /// Execute a target-supplied action declared by the active plan.
-    pub async fn execute_host_action(&self, action: &HostAction) -> Result<(), String> {
-        let Some(host_action_executor) = &self.host_action_executor else {
-            return Err(format!(
-                "{} requires a host action executor; run this scenario through an explicit plan",
-                self.context(&format!("action/{}", action.name))
-            ));
-        };
-        eprintln!(
-            "{} applying target host action",
-            self.context(&format!("action/{}", action.name))
-        );
-        host_action_executor.execute(action).await.map_err(|error| {
-            format!(
-                "{} failed: {error}",
-                self.context(&format!("action/{}", action.name))
-            )
-        })
     }
 
     pub fn id(&self) -> &str {
@@ -461,6 +397,16 @@ impl OpenShellRunner {
         self.known_sandboxes.remove(name);
     }
 
+    /// Register a provider name for cleanup.
+    pub fn track_provider(&mut self, name: &str) {
+        self.known_providers.insert(name.to_string());
+    }
+
+    /// Register a provider profile ID for cleanup.
+    pub fn track_provider_profile(&mut self, id: &str) {
+        self.known_provider_profiles.insert(id.to_string());
+    }
+
     pub async fn poll_until<T, F>(
         &mut self,
         step: &str,
@@ -508,6 +454,7 @@ impl OpenShellRunner {
         step: &str,
         expectation: &str,
         args: Vec<String>,
+        environment: Vec<(String, String)>,
         command_timeout: Duration,
     ) -> Result<CommandResult, RunnerError> {
         let context = self.context(step);
@@ -515,22 +462,22 @@ impl OpenShellRunner {
         eprintln!("{context} running: {command}");
 
         let started = Instant::now();
-        let output =
-            self.cli
-                .execute(args, command_timeout)
-                .await
-                .map_err(|error| match error {
-                    CliExecutionError::Timeout => RunnerError::Timeout {
-                        context: context.clone(),
-                        command: command.clone(),
-                        timeout: command_timeout,
-                    },
-                    CliExecutionError::Spawn(source) => RunnerError::Spawn {
-                        context: context.clone(),
-                        command: command.clone(),
-                        source,
-                    },
-                })?;
+        let output = self
+            .cli
+            .execute(args, environment, command_timeout)
+            .await
+            .map_err(|error| match error {
+                CliExecutionError::Timeout => RunnerError::Timeout {
+                    context: context.clone(),
+                    command: command.clone(),
+                    timeout: command_timeout,
+                },
+                CliExecutionError::Spawn(source) => RunnerError::Spawn {
+                    context: context.clone(),
+                    command: command.clone(),
+                    source,
+                },
+            })?;
         let elapsed = started.elapsed();
         eprintln!(
             "{context} completed in {:.1?}: exit {}",
@@ -552,7 +499,10 @@ impl OpenShellRunner {
     }
 
     async fn cleanup(&self) -> Result<(), String> {
-        if self.known_sandboxes.is_empty() {
+        if self.known_sandboxes.is_empty()
+            && self.known_providers.is_empty()
+            && self.known_provider_profiles.is_empty()
+        {
             return Ok(());
         }
 
@@ -580,6 +530,56 @@ impl OpenShellRunner {
                         "sandbox '{name}' is deleted or already absent"
                     )));
                 }
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+
+        for name in self.known_providers.clone() {
+            let remaining = remaining_cleanup_time(cleanup_started);
+            if remaining.is_zero() {
+                failures.push(format!(
+                    "{} cleanup budget expired before deleting provider '{name}'",
+                    self.context("cleanup/delete-provider")
+                ));
+                break;
+            }
+            match self
+                .step("cleanup/delete-provider")
+                .description(format!("provider '{name}' is deleted or already absent"))
+                .with_timeout(remaining)
+                .run(&["provider", "delete", &name])
+                .await
+            {
+                Ok(result) if result.success() || output_reports_not_found(&result) => {}
+                Ok(result) => failures.push(result.failure_diagnostic(&format!(
+                    "provider '{name}' is deleted or already absent"
+                ))),
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+
+        for id in self.known_provider_profiles.clone() {
+            let remaining = remaining_cleanup_time(cleanup_started);
+            if remaining.is_zero() {
+                failures.push(format!(
+                    "{} cleanup budget expired before deleting provider profile '{id}'",
+                    self.context("cleanup/delete-provider-profile")
+                ));
+                break;
+            }
+            match self
+                .step("cleanup/delete-provider-profile")
+                .description(format!(
+                    "provider profile '{id}' is deleted or already absent"
+                ))
+                .with_timeout(remaining)
+                .run(&["provider", "profile", "delete", &id])
+                .await
+            {
+                Ok(result) if result.success() || output_reports_not_found(&result) => {}
+                Ok(result) => failures.push(result.failure_diagnostic(&format!(
+                    "provider profile '{id}' is deleted or already absent"
+                ))),
                 Err(error) => failures.push(error.to_string()),
             }
         }
@@ -618,11 +618,24 @@ impl<'a> CommandStep<'a> {
 
 impl OpenShellCommand<'_> {
     pub async fn run(&self, args: &[&str]) -> Result<CommandResult, RunnerError> {
+        self.run_with_env(args, &[]).await
+    }
+
+    /// Run a command with environment values that are excluded from diagnostics.
+    pub async fn run_with_env(
+        &self,
+        args: &[&str],
+        environment: &[(&str, &str)],
+    ) -> Result<CommandResult, RunnerError> {
         self.runner
             .run_strings(
                 &self.step,
                 &self.description,
                 args.iter().map(|arg| (*arg).to_string()).collect(),
+                environment
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect(),
                 self.timeout,
             )
             .await
@@ -792,7 +805,12 @@ mod tests {
     }
 
     impl CliExecutor for MockCli {
-        fn execute(&self, args: Vec<String>, _command_timeout: Duration) -> CliExecution<'_> {
+        fn execute(
+            &self,
+            args: Vec<String>,
+            _environment: Vec<(String, String)>,
+            _command_timeout: Duration,
+        ) -> CliExecution<'_> {
             let response = {
                 let mut state = self.state.lock().expect("lock mock CLI state");
                 state.invocations.push(args);

@@ -14,6 +14,9 @@
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen)](https://docs.nvidia.com/openshell/latest/index.html)
 [![Project Status](https://img.shields.io/badge/status-alpha-orange)](https://docs.nvidia.com/openshell/latest/about/release-notes.html)
 
+> [!IMPORTANT]
+> **OpenShell 0.1.0 is coming soon.** [Track progress in the 0.1.0 milestone](https://github.com/NVIDIA/OpenShell/milestone/10), [read the prerelease documentation](https://docs.nvidia.com/openshell/dev/index.html), or [install a prerelease](#prerelease-and-development-builds).
+
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure — governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
 
 OpenShell is built agent-first. It ships public agent skills for using and operating OpenShell, plus separate repository-aware workflows for contributors and maintainers.
@@ -27,28 +30,23 @@ OpenShell is built agent-first. It ships public agent skills for using and opera
 
 ### Install
 
-**Binary (recommended):**
+**Local installation:**
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
-The installer installs the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
+The installer installs the latest stable release by default. See [Prerelease and development builds](#prerelease-and-development-builds) to install an upcoming release or the latest commit on `main`.
 
-The `openshell` package on PyPI provides the Python SDK only. It does not install the `openshell` CLI. Add the SDK to a Python project with [uv](https://docs.astral.sh/uv/):
-
-```bash
-uv add openshell
-```
-
-**Helm chart:**
+**Kubernetes installation:**
 
 > **Experimental** — the Kubernetes deployment path is under active development. Expect rough edges and breaking changes.
 
 Deploy the OpenShell gateway into a Kubernetes cluster from the OCI chart published to GHCR:
 
 ```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
 ```
 
 See [`deploy/helm/openshell/README.md`](deploy/helm/openshell/README.md) for available versions, dev tag conventions, and configuration.
@@ -58,19 +56,18 @@ For deploying OpenShell on OpenShift, see [`deploy/helm/openshell/README.md#inst
 ### Create a sandbox
 
 ```bash
-openshell sandbox create -- claude  # or opencode, codex, copilot
+openshell sandbox create --name demo
 ```
 
-The sandbox container includes the following tools by default:
+The gateway defaults to `nvcr.io/nvidia/base/ubuntu:24.04`, a minimal Ubuntu
+Noble workload. To run an agent, build or select an OCI image that contains the
+agent and pass its explicit reference:
 
-| Category   | Tools                                                    |
-| ---------- | -------------------------------------------------------- |
-| Agent      | `claude`, `opencode`, `codex`, `copilot`                 |
-| Language   | `python` (3.14), `node` (22)                             |
-| Developer  | `gh`, `git`, `vim`, `nano`                               |
-| Networking | `ping`, `dig`, `nslookup`, `nc`, `traceroute`, `netstat` |
+```bash
+openshell sandbox create --from registry.example.com/agents/my-agent:1.0 -- my-agent
+```
 
-For more details see https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base.
+Attach the providers and policy required by that workload.
 
 ### See network policy in action
 
@@ -101,6 +98,44 @@ See the [full walkthrough](examples/sandbox-policy-quickstart/) or run the autom
 
 ```bash
 bash examples/sandbox-policy-quickstart/demo.sh
+```
+
+## SDKs
+
+OpenShell provides client SDKs for Python, TypeScript, Go, and Rust. SDK packages connect applications to an OpenShell gateway; they do not install the `openshell` CLI. Use the SDK and gateway from the same OpenShell release when possible.
+
+### Python
+
+The [Python SDK](python/openshell/) is published to [PyPI](https://pypi.org/project/openshell/):
+
+```shell
+uv add openshell
+```
+
+### TypeScript
+
+The [TypeScript SDK](sdk/typescript/README.md) is published to GitHub Packages as `@nvidia/openshell-sdk`. Configure the `@nvidia` npm scope for `https://npm.pkg.github.com`, authenticate with a token that has `read:packages`, and install it:
+
+```shell
+npm install @nvidia/openshell-sdk
+```
+
+### Go
+
+Add the [Go SDK](sdk/go/README.md) to a Go module:
+
+```shell
+go get github.com/NVIDIA/OpenShell/sdk/go@latest
+```
+
+### Rust
+
+The [Rust SDK](crates/openshell-sdk/README.md) is currently consumed from source. Pin the Git dependency to the same OpenShell release as the gateway:
+
+```shell
+cargo add openshell-sdk \
+  --git https://github.com/NVIDIA/OpenShell \
+  --tag <release-tag>
 ```
 
 ## How It Works
@@ -135,7 +170,9 @@ Policies are declarative YAML files. Static sections (filesystem, process) are l
 
 ## Providers
 
-Agents need credentials — API keys, tokens, service accounts. OpenShell manages these as **providers**: named credential bundles that are injected into sandboxes at creation. The CLI auto-discovers credentials for recognized agents (Claude, Codex, OpenCode, Copilot) from your shell environment, or you can create providers explicitly with `openshell provider create`. Credentials never leak into the sandbox filesystem; they are injected as environment variables at runtime.
+Agents need credentials — API keys, tokens, service accounts. OpenShell manages these as **providers**: named credential bundles that are injected into sandboxes at creation. Credentials never leak into the sandbox filesystem; they are injected as environment variables at runtime.
+
+A provider is created from a **provider profile**, which declares the credentials, endpoints, and client binaries the provider needs. Profiles are import-only: a gateway serves exactly the profiles you imported with `openshell provider profile import`, and ships none of its own. The [`providers/`](providers/) directory holds reviewable examples to copy and adapt. Once a profile is imported, the CLI can auto-discover credentials for its provider from your shell environment, or you can create providers explicitly with `openshell provider create`.
 
 Inference access uses the same provider workflow. Attach an inference-capable provider to a sandbox, call the provider's native endpoint, and select the model in the client. Provider profiles contribute the endpoint policy and bind credential placeholders to the authorized destination.
 
@@ -146,25 +183,27 @@ Inference access uses the same provider workflow. Attach an inference-capable pr
 OpenShell can pass host GPUs into sandboxes for local inference, fine-tuning, or any GPU workload. Add `--gpu` when creating a sandbox:
 
 ```bash
-openshell sandbox create --gpu --from [gpu-enabled-sandbox] -- claude
+openshell sandbox create --gpu --from registry.example.com/your-org/gpu-agent:latest -- claude
 ```
 
 Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall back to Docker's NVIDIA GPU request path (`--gpus all`).
 
-**Requirements:** NVIDIA drivers and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) must be installed on the host. The sandbox image itself must include the appropriate GPU drivers and libraries for your workload — the default `base` image does not. See the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for building a custom sandbox image with GPU support.
+**Requirements:** NVIDIA drivers and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) must be installed on the host. The sandbox image itself must include the appropriate GPU drivers and libraries for your workload — the default Ubuntu image does not. See the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for building a custom sandbox image with GPU support.
 
 ## Supported Agents
 
-| Agent                                                         | Source                                                                           | Notes                                                                         |
-| ------------------------------------------------------------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `ANTHROPIC_API_KEY`.                      |
-| [OpenCode](https://opencode.ai/)                              | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `OPENAI_API_KEY` or `OPENROUTER_API_KEY`. |
-| [Codex](https://developers.openai.com/codex)                  | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `OPENAI_API_KEY`.                         |
-| [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN`. |
-| [OpenClaw](https://openclaw.ai/)                 | [NemoClaw](https://github.com/NVIDIA/NemoClaw)                                   | Run OpenClaw more securely inside NVIDIA OpenShell with the NemoClaw blueprint.       |
-| [Hermes Agent](https://github.com/NousResearch/hermes-agent)   | [NemoClaw](https://github.com/NVIDIA/NemoClaw)                                   | Run Hermes Agent more securely inside NVIDIA OpenShell with the NemoClaw blueprint.   |
-| [Ollama](https://ollama.com/)                                 | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from ollama`.                         |
-| [Pi](https://pi.dev/)                                 | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from pi`.                         |
+OpenShell can run Linux agents packaged in OCI images. The default Ubuntu
+workload does not bundle agent CLIs. Build or select an image containing your
+agent, then authorize its binary paths, service endpoints, and credentials.
+
+| Agent | Integration |
+| ----- | ----------- |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Package Claude Code in a workload image and attach a `claude-code` provider or another endpoint-bearing model profile. |
+| [OpenCode](https://opencode.ai/) | Package OpenCode in a workload image and attach its model provider and policy. |
+| [Codex](https://developers.openai.com/codex) | Package Codex in a workload image and attach an OpenAI provider and policy. |
+| [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) | Package the CLI in a workload image and attach GitHub credentials and policy. |
+| [OpenClaw](https://openclaw.ai/) | Use the [NemoClaw](https://github.com/NVIDIA/NemoClaw) blueprint. |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent) | Use the [NemoClaw](https://github.com/NVIDIA/NemoClaw) blueprint. |
 
 ## Key Commands
 
@@ -196,23 +235,23 @@ openshell term
 
 The TUI gives you a live, keyboard-driven view of your gateway and sandboxes. Navigate with `Tab` to switch panels, `j`/`k` to move through lists, `Enter` to select, and `:` for command mode. Gateway health and sandbox status auto-refresh every two seconds.
 
-## Community Sandboxes and BYOC
+## Workload Images and BYOC
 
-Use `--from` to create sandboxes from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog or a container image:
+Use `--from` with an explicit OCI image reference:
 
 ```bash
-openshell sandbox create --from gemini             # community catalog
-docker build -t my-sandbox:latest ./my-sandbox-dir # Docker gateway
-openshell sandbox create --from my-sandbox:latest  # Docker built image
-podman build -t localhost/my-sandbox:latest ./my-sandbox-dir # Podman gateway
-openshell sandbox create --from localhost/my-sandbox:latest  # Podman built image
-openshell sandbox create --from registry.io/img:v1 # container image
+docker build -t my-sandbox:latest ./my-sandbox-dir
+openshell sandbox create --from my-sandbox:latest
+
+podman build -t localhost/my-sandbox:latest ./my-sandbox-dir
+openshell sandbox create --from localhost/my-sandbox:latest
+
+openshell sandbox create --from registry.example.com/agents/my-agent:1.0
 ```
 
 Build with the container engine used by your local gateway. For a remote
-gateway, push the image to a registry that the gateway can pull from.
-
-See the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for details.
+gateway, push the image to a registry that the gateway can pull from. See the
+[BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container).
 
 ## Use OpenShell with Your Agent
 
@@ -254,6 +293,43 @@ Agent implementation is human-directed: a user may request a phase directly, or 
 - [Brev Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg) — try OpenShell on cloud compute without local setup
 - [Agent Instructions](AGENTS.md) — system prompt and workflow documentation for agent contributors
 
+## Prerelease and development builds
+
+Use a prerelease candidate to evaluate an upcoming release, or use the rolling development build to test the latest commit on `main`. These builds may change before the next stable release. The matching documentation is published in the [development channel](https://docs.nvidia.com/openshell/dev/index.html).
+
+Prerelease packages are retained as GitHub Actions artifacts for 90 days and require an authenticated [GitHub CLI](https://cli.github.com/) session. The `pre` alias installs the latest prerelease:
+
+```shell
+gh auth login
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
+  OPENSHELL_VERSION=pre sh
+```
+
+The installer downloads only the artifact for the current platform and rejects expired candidates during discovery. Installed packages retain the candidate's exact version, such as `0.1.0-pre.3`. Prerelease tags do not create entries on the GitHub Releases page.
+
+The rolling [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) does not require GitHub authentication:
+
+```shell
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
+  OPENSHELL_VERSION=dev sh
+```
+
+For Kubernetes, select the corresponding Helm chart version. Helm chart versions omit the leading `v` from release tags:
+
+```shell
+# Pin an exact candidate
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version 0.1.0-pre.3
+
+# Rolling development build
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version 0.0.0-dev
+```
+
+Prerelease charts use exact `<version>-pre.N` versions. Development charts are also published as immutable `0.0.0-dev.<commit-sha>` versions when you need to pin a specific commit. See the [Helm chart documentation](deploy/helm/openshell/README.md#available-versions) for version and configuration details.
+
 ## Contributing
 
 OpenShell is built agent-first. Issues should include a user story, problem statement, impact, and acceptance criteria. The impact should explain the consequences of the current behavior and why existing workarounds are insufficient. Feature requests also require a workflow-level proposed design and alternatives; bug reports add reproduction steps, environment details, and relevant logs. Once work is authorized through the project workflow or a direct request, contributors should use the skills in `.agents/skills/` to investigate the current code and behavior, implement the change, and verify it. If an issue contains earlier diagnostics, verify them rather than relying on them. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full agent skills table, contribution workflow, and development setup.
@@ -273,6 +349,21 @@ cargo build --release -p openshell-driver-vm --no-default-features --features de
 ```
 
 The resulting binaries contain no telemetry endpoint, no telemetry HTTP client, and no emission code. With telemetry compiled out, the gateway emits nothing and reports telemetry disabled to the sandboxes it launches. Cargo has no way to subtract a single default feature, so `defaults-without-telemetry` must be paired with `--no-default-features`; passing it on its own leaves the defaults in place and fails the build rather than producing a binary that still emits.
+
+The gateway also exposes separate Cargo features for its built-in compute drivers: `compute-driver-kubernetes`, `compute-driver-docker`, `compute-driver-podman`, `compute-driver-vm`, and `compute-driver-mxc`. Disable the default feature set, then enable only the drivers and telemetry mode required by the target binary. For example:
+
+```shell
+# Docker only, with telemetry support.
+cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-docker
+
+# Docker and VM only, with telemetry compiled out.
+cargo build --release -p openshell-gateway --no-default-features --features compute-driver-docker,compute-driver-vm
+
+# Windows MXC only, with telemetry support and bundled Z3.
+cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-mxc,bundled-z3
+```
+
+Regular builds retain their platform driver set through the default `in-tree-compute-drivers` compatibility feature. On Windows, `compute-driver-mxc` selects MXC; the other four features install unsupported-driver stubs. On other platforms, MXC is excluded.
 
 Telemetry events are limited to anonymous operational categories and counts, such as sandbox lifecycle outcomes, provider profile buckets, policy decision counts, and aggregate network activity denial categories. OpenShell telemetry does not collect sandbox names or IDs, hostnames, file paths, binary paths, prompts, credentials, provider names, model names, or user content.
 

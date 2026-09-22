@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The static musl sandbox binary is staged under
+# deploy/docker/.build/prebuilt-binaries/<arch>/. Runtime-specific bootstrap
+# tools belong to their compute drivers rather than this portable image.
+
+FROM scratch AS sandbox
+
+ARG TARGETARCH
+
+# Keep the binary root-owned for image-volume mounts and executable by the
+# sandbox runtime's non-root UID.
+COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /openshell-sandbox
+
+# Drivers may override this identity to match the admitted workload. Keep the
+# standalone image non-root by default.
+USER 65532:65532
+
+ENTRYPOINT ["/openshell-sandbox"]

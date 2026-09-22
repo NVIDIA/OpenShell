@@ -94,10 +94,6 @@ pub mod rpc {
         "GetCapabilities",
         "openshell.compute.v1.ComputeDriver/GetCapabilities",
     );
-    pub const GET_GATEWAY_LISTENER_REQUIREMENTS: ComputeDriverRpc = ComputeDriverRpc::new(
-        "GetGatewayListenerRequirements",
-        "openshell.compute.v1.ComputeDriver/GetGatewayListenerRequirements",
-    );
     pub const VALIDATE_SANDBOX_CREATE: ComputeDriverRpc = ComputeDriverRpc::new(
         "ValidateSandboxCreate",
         "openshell.compute.v1.ComputeDriver/ValidateSandboxCreate",
@@ -192,7 +188,6 @@ pub fn compute_driver_rpc_operation(path: &str) -> Option<ComputeDriverRpc> {
     match path.rsplit('/').next() {
         Some("AuthenticateSandbox") => Some(rpc::AUTHENTICATE_SANDBOX),
         Some("GetCapabilities") => Some(rpc::GET_CAPABILITIES),
-        Some("GetGatewayListenerRequirements") => Some(rpc::GET_GATEWAY_LISTENER_REQUIREMENTS),
         Some("ValidateSandboxCreate") => Some(rpc::VALIDATE_SANDBOX_CREATE),
         Some("CreateSandbox") => Some(rpc::CREATE_SANDBOX),
         Some("GetSandbox") => Some(rpc::GET_SANDBOX),
@@ -315,7 +310,6 @@ mod tests {
         for rpc in [
             rpc::AUTHENTICATE_SANDBOX,
             rpc::GET_CAPABILITIES,
-            rpc::GET_GATEWAY_LISTENER_REQUIREMENTS,
             rpc::VALIDATE_SANDBOX_CREATE,
             rpc::CREATE_SANDBOX,
             rpc::GET_SANDBOX,

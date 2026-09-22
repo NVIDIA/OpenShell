@@ -18,6 +18,7 @@ pub mod certgen;
 pub mod cli;
 mod compute;
 pub mod config_file;
+mod config_update_operation;
 mod credentials;
 mod defaults;
 mod gateway_listener;
@@ -26,6 +27,7 @@ mod http;
 mod middleware;
 mod multiplex;
 mod otel_tracing;
+mod pagination;
 mod persistence;
 pub(crate) mod policy_store;
 mod provider_profile_sources;
@@ -35,6 +37,8 @@ mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
 mod ssh_sessions;
+mod storage_proto;
+mod supervisor_owner;
 pub mod supervisor_session;
 mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
@@ -81,7 +85,7 @@ pub(crate) fn install_jsonwebtoken_crypto_provider() {
 }
 
 use compute::ComputeRuntime;
-use gateway_listener::{BoundGatewayListener, GatewayListenerScope, bind_gateway_listeners};
+use gateway_listener::{BoundGatewayListener, bind_gateway_listener};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
 
@@ -96,11 +100,11 @@ struct GatewayExtensionCredential {
 }
 
 fn extension_token_ttl(issuer: &auth::sandbox_jwt::SandboxJwtIssuer) -> Duration {
-    if issuer.ttl().is_zero() {
-        Duration::from_mins(15)
-    } else {
-        issuer.ttl().min(MAX_EXTENSION_TOKEN_TTL)
-    }
+    issuer
+        .sandbox_token_ttl()
+        .map_or(Duration::from_mins(15), |ttl| {
+            ttl.min(MAX_EXTENSION_TOKEN_TTL)
+        })
 }
 
 /// Mint the gateway-caller credential for one extension registration.
@@ -248,6 +252,7 @@ pub(crate) struct ServerStartupConfig {
     pub config_file: Option<config_file::ConfigFile>,
     pub guest_tls: Option<compute::driver_config::GuestTlsPaths>,
     pub compute_driver: ComputeDriverSelection,
+    pub legacy_compute_driver_env_seen: bool,
 }
 
 /// Server state shared across handlers.
@@ -300,6 +305,20 @@ pub struct ServerState {
     /// distinguish expected transport closes from runtime failures.
     pub(crate) gateway_shutting_down: AtomicBool,
 
+    /// Stable identity for this gateway process.
+    pub replica_id: String,
+
+    /// Internal endpoint other gateway replicas can dial for peer RPCs.
+    pub peer_endpoint: Option<String>,
+
+    /// Reused peer connections, peer token, and owner lookups for relay
+    /// forwarding. Keeps per-relay cost off the connection and auth paths.
+    pub peer_routes: Arc<supervisor_session::PeerRouteCache>,
+
+    /// Idle HTTP/1 upstreams to sandbox services, so routed requests reuse a
+    /// relay instead of opening one per request.
+    pub service_upstreams: Arc<service_routing::ServiceUpstreamPool>,
+
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
@@ -312,6 +331,9 @@ pub struct ServerState {
     /// material that `certgen` writes.
     pub sandbox_jwt_issuer: Option<Arc<auth::sandbox_jwt::SandboxJwtIssuer>>,
 
+    /// Launch-scoped gateway and Sandbox Protocol token authority.
+    pub sandbox_session_jwt_authority: Option<Arc<auth::sandbox_jwt::SandboxSessionJwtAuthority>>,
+
     /// Authenticator that validates gateway-minted sandbox JWTs on every
     /// inbound request. Always set when `sandbox_jwt_issuer` is, so callers
     /// presenting a freshly minted token are recognized.
@@ -320,6 +342,9 @@ pub struct ServerState {
     /// Optional selected-driver authenticator for the `IssueSandboxToken`
     /// bootstrap path.
     pub compute_driver_authenticator: Option<Arc<auth::compute_driver::ComputeDriverAuthenticator>>,
+
+    /// Optional K8s `ServiceAccount` authenticator for gateway peer RPCs.
+    pub peer_authenticator: Option<Arc<auth::peer::PeerServiceAccountAuthenticator>>,
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
@@ -397,6 +422,8 @@ impl ServerState {
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
         credentials: credentials::CredentialRuntime,
     ) -> Self {
+        let replica_id = compute::lease::replica_id();
+        let peer_endpoint = derive_peer_endpoint(&config);
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         let admin_role = config
             .oidc
@@ -416,12 +443,18 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
+            replica_id,
+            peer_endpoint,
+            peer_routes: Arc::new(supervisor_session::PeerRouteCache::default()),
+            service_upstreams: Arc::new(service_routing::ServiceUpstreamPool::default()),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
             sandbox_jwt_issuer: None,
+            sandbox_session_jwt_authority: None,
             sandbox_jwt_authenticator: None,
             compute_driver_authenticator: None,
+            peer_authenticator: None,
             grpc_rate_limiter,
             gateway_interceptors: None,
             provider_profile_sources:
@@ -429,6 +462,55 @@ impl ServerState {
             admin_role,
         }
     }
+}
+
+fn derive_peer_endpoint(config: &Config) -> Option<String> {
+    if let Ok(endpoint) = std::env::var("OPENSHELL_PEER_ENDPOINT")
+        && !endpoint.trim().is_empty()
+    {
+        return Some(endpoint.trim().to_string());
+    }
+
+    let pod_name = std::env::var("OPENSHELL_POD_NAME").ok()?;
+    let namespace = std::env::var("OPENSHELL_POD_NAMESPACE").ok()?;
+    let service = std::env::var("OPENSHELL_PEER_SERVICE_NAME").ok()?;
+    if pod_name.trim().is_empty() || namespace.trim().is_empty() || service.trim().is_empty() {
+        return None;
+    }
+
+    let scheme = if config.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    Some(format!(
+        "{scheme}://{pod}.{service}.{namespace}.svc.cluster.local:{port}",
+        pod = pod_name.trim(),
+        service = service.trim(),
+        namespace = namespace.trim(),
+        port = config.bind_address.port()
+    ))
+}
+
+/// Reject a plaintext peer endpoint on a gateway that serves TLS.
+///
+/// Peer relay traffic carries whole supervisor sessions between replicas. The
+/// chart renders a plaintext peer endpoint only when the gateway itself serves
+fn validate_peer_endpoint_scheme(config: &Config, peer_endpoint: &str) -> Result<()> {
+    if peer_endpoint.starts_with("https://") {
+        return Ok(());
+    }
+    if config.tls.is_some() {
+        return Err(Error::config(format!(
+            "gateway peer endpoint {peer_endpoint} is plaintext but this gateway serves TLS; \
+             set an https:// OPENSHELL_PEER_ENDPOINT so peer relay traffic is not downgraded"
+        )));
+    }
+    warn!(
+        peer_endpoint,
+        "gateway peer relay traffic is plaintext because this gateway does not serve TLS"
+    );
+    Ok(())
 }
 
 /// Run the `OpenShell` server.
@@ -448,6 +530,7 @@ pub(crate) async fn run_server(
         config_file,
         guest_tls,
         compute_driver,
+        legacy_compute_driver_env_seen: _,
     } = startup;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -461,57 +544,71 @@ pub(crate) async fn run_server(
 
     // Load signing material before connecting remote extensions so their
     // startup Describe calls can authenticate with gateway-caller tokens.
-    let (sandbox_jwt_issuer, sandbox_jwt_authenticator) = if let Some(ref jwt) = config.gateway_jwt
-    {
-        let signing_pem = std::fs::read(&jwt.signing_key_path).map_err(|e| {
-            Error::config(format!(
-                "failed to read sandbox JWT signing key from {}: {e}",
-                jwt.signing_key_path.display()
-            ))
-        })?;
-        let public_pem = std::fs::read(&jwt.public_key_path).map_err(|e| {
-            Error::config(format!(
-                "failed to read sandbox JWT public key from {}: {e}",
-                jwt.public_key_path.display()
-            ))
-        })?;
-        let kid = std::fs::read_to_string(&jwt.kid_path)
-            .map_err(|e| {
+    let (sandbox_jwt_issuer, sandbox_jwt_authenticator, sandbox_session_jwt_authority) =
+        if let Some(ref jwt) = config.gateway_jwt {
+            let signing_pem = std::fs::read(&jwt.signing_key_path).map_err(|e| {
                 Error::config(format!(
-                    "failed to read sandbox JWT kid from {}: {e}",
-                    jwt.kid_path.display()
+                    "failed to read sandbox JWT signing key from {}: {e}",
+                    jwt.signing_key_path.display()
                 ))
-            })?
-            .trim()
-            .to_string();
-        if kid.is_empty() {
-            return Err(Error::config(format!(
-                "sandbox JWT kid file {} is empty",
-                jwt.kid_path.display()
-            )));
-        }
-        let issuer = Arc::new(
-            auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
-                &signing_pem,
-                kid.clone(),
-                &jwt.gateway_id,
-                Duration::from_secs(jwt.ttl_secs),
-            )
-            .map_err(Error::config)?,
-        );
-        let authenticator = Arc::new(
-            auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(&public_pem, kid, &jwt.gateway_id)
+            })?;
+            let public_pem = std::fs::read(&jwt.public_key_path).map_err(|e| {
+                Error::config(format!(
+                    "failed to read sandbox JWT public key from {}: {e}",
+                    jwt.public_key_path.display()
+                ))
+            })?;
+            let kid = std::fs::read_to_string(&jwt.kid_path)
+                .map_err(|e| {
+                    Error::config(format!(
+                        "failed to read sandbox JWT kid from {}: {e}",
+                        jwt.kid_path.display()
+                    ))
+                })?
+                .trim()
+                .to_string();
+            if kid.is_empty() {
+                return Err(Error::config(format!(
+                    "sandbox JWT kid file {} is empty",
+                    jwt.kid_path.display()
+                )));
+            }
+            let issuer = Arc::new(
+                auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+                    &signing_pem,
+                    kid.clone(),
+                    &jwt.gateway_id,
+                    jwt.sandbox_token_ttl(),
+                )
                 .map_err(Error::config)?,
-        );
-        info!(
-            gateway_id = %jwt.gateway_id,
-            ttl_secs = jwt.ttl_secs,
-            "gateway-minted sandbox JWT enabled"
-        );
-        (Some(issuer), Some(authenticator))
-    } else {
-        (None, None)
-    };
+            );
+            let authenticator = Arc::new(
+                auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(
+                    &public_pem,
+                    kid.clone(),
+                    &jwt.gateway_id,
+                )
+                .map_err(Error::config)?,
+            );
+            let session_authority = Arc::new(
+                auth::sandbox_jwt::SandboxSessionJwtAuthority::from_pem(
+                    &signing_pem,
+                    &public_pem,
+                    kid,
+                    &jwt.gateway_id,
+                    jwt.sandbox_token_ttl().unwrap_or(Duration::from_mins(15)),
+                )
+                .map_err(Error::config)?,
+            );
+            info!(
+                gateway_id = %jwt.gateway_id,
+                ttl_secs = jwt.ttl_secs.map(std::num::NonZeroU64::get),
+                "gateway-minted sandbox JWT enabled"
+            );
+            (Some(issuer), Some(authenticator), Some(session_authority))
+        } else {
+            (None, None, None)
+        };
 
     let middleware_registrations = config_file
         .as_ref()
@@ -662,6 +759,7 @@ pub(crate) async fn run_server(
     state.provider_profile_sources = provider_profile_sources;
     state.sandbox_jwt_issuer = sandbox_jwt_issuer.clone();
     state.sandbox_jwt_authenticator = sandbox_jwt_authenticator;
+    state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;
     if let Some(issuer) = sandbox_jwt_issuer {
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
     }
@@ -674,6 +772,91 @@ pub(crate) async fn run_server(
             driver = state.compute.configured_driver_name(),
             "compute-driver sandbox bootstrap authenticator enabled"
         );
+    }
+
+    let peer_routing_expected = state.peer_endpoint.is_some() && !state.store.is_single_replica();
+    if let Some(peer_endpoint) = state.peer_endpoint.as_deref()
+        && peer_routing_expected
+    {
+        validate_peer_endpoint_scheme(&state.config, peer_endpoint)?;
+    }
+    if state.peer_endpoint.is_none() && !state.store.is_single_replica() {
+        warn!(
+            "no gateway peer endpoint configured; this replica owns its supervisor sessions but \
+             peers cannot reach it. Single-gateway deployments are unaffected; set \
+             OPENSHELL_PEER_ENDPOINT on every replica when running more than one."
+        );
+    }
+
+    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+        let namespace = std::env::var("OPENSHELL_POD_NAMESPACE").ok();
+        let service_account = std::env::var("OPENSHELL_SERVICE_ACCOUNT_NAME").ok();
+        match (namespace, service_account) {
+            (Some(namespace), Some(service_account))
+                if !namespace.trim().is_empty() && !service_account.trim().is_empty() =>
+            {
+                let required_labels =
+                    auth::peer::required_pod_labels_from_env().map_err(Error::config)?;
+                match kube::Client::try_default().await {
+                    Ok(client) => {
+                        let audience = auth::peer::peer_token_audience_from_env();
+                        let resolver = Arc::new(auth::peer::LiveGatewayPeerResolver::new(
+                            client,
+                            namespace.trim(),
+                            audience.clone(),
+                            service_account.trim().to_string(),
+                            required_labels,
+                        ));
+                        let cache_ttl = auth::peer::peer_token_cache_ttl_from_env();
+                        let resolver = Arc::new(auth::peer::CachingGatewayPeerResolver::new(
+                            resolver, cache_ttl,
+                        ));
+                        let authenticator =
+                            auth::peer::PeerServiceAccountAuthenticator::new(resolver);
+                        state.peer_authenticator = Some(Arc::new(authenticator));
+                        info!(
+                            namespace = %namespace.trim(),
+                            service_account = %service_account.trim(),
+                            audience,
+                            token_cache_ttl_secs = cache_ttl.as_secs(),
+                            "gateway peer ServiceAccount TokenReview authentication enabled"
+                        );
+                    }
+                    Err(err) if peer_routing_expected => {
+                        return Err(Error::config(format!(
+                            "in-cluster K8s client construction failed ({err}); \
+                             gateway peer authentication is required because \
+                             OPENSHELL_PEER_ENDPOINT is configured"
+                        )));
+                    }
+                    Err(err) => warn!(
+                        error = %err,
+                        "in-cluster K8s client construction failed; \
+                         gateway peer ServiceAccount authentication is disabled"
+                    ),
+                }
+            }
+            _ if peer_routing_expected => {
+                return Err(Error::config(
+                    "OPENSHELL_POD_NAMESPACE or OPENSHELL_SERVICE_ACCOUNT_NAME missing; \
+                     both are required for gateway peer authentication because \
+                     OPENSHELL_PEER_ENDPOINT is configured"
+                        .to_string(),
+                ));
+            }
+            _ => {
+                debug!(
+                    "OPENSHELL_POD_NAMESPACE or OPENSHELL_SERVICE_ACCOUNT_NAME missing; \
+                     gateway peer ServiceAccount authentication disabled"
+                );
+            }
+        }
+    } else if peer_routing_expected {
+        return Err(Error::config(
+            "OPENSHELL_PEER_ENDPOINT is configured but the gateway is not running in a \
+             Kubernetes cluster, so gateway peer authentication is unavailable"
+                .to_string(),
+        ));
     }
 
     let state = Arc::new(state);
@@ -690,21 +873,16 @@ pub(crate) async fn run_server(
                 error.message()
             ))
         })?;
+    grpc::policy::invalidate_endpoint_status_on_startup(&state)
+        .await
+        .map_err(|error| {
+            Error::execution(format!(
+                "tool server endpoint-status startup reconciliation failed: {}",
+                error.message()
+            ))
+        })?;
 
-    let gateway_listeners = bind_gateway_listeners(
-        config.bind_address,
-        state.compute.gateway_listener_requirements(),
-    )
-    .await?;
-
-    if let Err(err) = state.compute.start_persisted_sandboxes().await {
-        warn!(error = %err, "Failed to start persisted sandboxes during startup");
-    }
-
-    state.compute.spawn_watchers(shutdown_rx.clone());
-    ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
-    supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
-    provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
+    let gateway_listener = bind_gateway_listener(config.bind_address).await?;
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
@@ -778,27 +956,69 @@ pub(crate) async fn run_server(
         None
     };
 
-    let mut listener_tasks = Vec::with_capacity(gateway_listeners.len());
     let enable_loopback_service_http = config.service_routing.enable_loopback_service_http;
-    for listener in gateway_listeners {
-        listener_tasks.push(tokio::spawn(serve_gateway_listener(
-            listener,
-            service.clone(),
-            tls_acceptor.clone(),
-            enable_loopback_service_http,
-            shutdown_rx.clone(),
-        )));
+    let listener_task = tokio::spawn(serve_gateway_listener(
+        gateway_listener,
+        service.clone(),
+        tls_acceptor.clone(),
+        enable_loopback_service_http,
+        shutdown_rx.clone(),
+    ));
+
+    // Deadlines must run while restored supervisors wait for policy repair.
+    let (startup_tx, startup_rx) = watch::channel(false);
+    state
+        .compute
+        .spawn_watchers(shutdown_rx.clone(), startup_rx);
+
+    // Serve the gateway before reconciling persisted sandboxes so restored
+    // supervisors can fetch policy and register their sessions.
+    if let Err(err) = state
+        .compute
+        .start_persisted_sandboxes_with_authentication(
+            |sandbox| {
+                let state = state.clone();
+                let sandbox = sandbox.clone();
+                async move {
+                    if state.sandbox_session_jwt_authority.is_none() {
+                        return Ok(Vec::new());
+                    }
+                    let authentication = grpc::mint_persisted_authentication(&state, &sandbox)
+                        .map_err(|error| error.to_string())?;
+                    serde_json::to_vec(&authentication)
+                        .map_err(|error| format!("encode launch authentication: {error}"))
+                }
+            },
+            |_| async { Ok(()) },
+            |_| {},
+        )
+        .await
+    {
+        warn!(error = %err, "Failed to start persisted sandboxes during startup");
     }
+
+    startup_tx.send_replace(true);
+    // The poller exists to observe writes made by other replicas. Single-
+    // replica backends have none, so it would only add load.
+    if !store.is_single_replica() {
+        sandbox_watch::spawn_store_poller(
+            store.clone(),
+            state.sandbox_watch_bus.clone(),
+            sandbox_watch::DEFAULT_STORE_POLL_INTERVAL,
+            shutdown_rx.clone(),
+        );
+    }
+    ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
+    supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
+    provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
     shutdown_signal().await;
     info!("Shutdown signal received; stopping gateway");
     state.gateway_shutting_down.store(true, Ordering::Release);
     let _ = shutdown_tx.send(true);
 
-    for task in listener_tasks {
-        if let Err(err) = task.await {
-            warn!(error = %err, "Gateway listener task failed during shutdown");
-        }
+    if let Err(err) = listener_task.await {
+        warn!(error = %err, "Gateway listener task failed during shutdown");
     }
 
     state
@@ -817,8 +1037,10 @@ async fn serve_gateway_listener(
     enable_loopback_service_http: bool,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let BoundGatewayListener { listener, spec } = bound_listener;
-    let listen_addr = spec.address;
+    let BoundGatewayListener {
+        listener,
+        address: listen_addr,
+    } = bound_listener;
 
     loop {
         let accepted = tokio::select! {
@@ -838,21 +1060,12 @@ async fn serve_gateway_listener(
                 continue;
             }
         };
-        let listener_scope = match stream.local_addr() {
-            Ok(local_addr) => spec.scope_for_local_addr(local_addr),
-            Err(e) => {
-                debug!(error = %e, client = %addr, listen = %listen_addr, "Failed to inspect accepted local address");
-                spec.scope
-            }
-        };
-
         set_tcp_nodelay_best_effort(&stream);
 
         spawn_gateway_connection(
             stream,
             addr,
             listen_addr,
-            listener_scope,
             service.clone(),
             tls_acceptor.clone(),
             enable_loopback_service_http,
@@ -913,19 +1126,14 @@ fn allow_plaintext_service_http(
     enabled: bool,
     listen_addr: SocketAddr,
     peer_addr: SocketAddr,
-    listener_scope: GatewayListenerScope,
 ) -> bool {
-    enabled
-        && matches!(listener_scope, GatewayListenerScope::Primary)
-        && listen_addr.ip().is_loopback()
-        && peer_addr.ip().is_loopback()
+    enabled && listen_addr.ip().is_loopback() && peer_addr.ip().is_loopback()
 }
 
 fn spawn_gateway_connection(
     stream: TcpStream,
     addr: SocketAddr,
     listen_addr: SocketAddr,
-    listener_scope: GatewayListenerScope,
     service: MultiplexService,
     tls_acceptor: Option<TlsAcceptor>,
     enable_loopback_service_http: bool,
@@ -938,13 +1146,9 @@ fn spawn_gateway_connection(
                         enable_loopback_service_http,
                         listen_addr,
                         addr,
-                        listener_scope,
                     ) =>
                 {
-                    if let Err(e) = service
-                        .serve_service_http_on_listener(stream, listener_scope)
-                        .await
-                    {
+                    if let Err(e) = service.serve_service_http(stream).await {
                         if is_benign_connection_close(e.as_ref()) {
                             debug!(error = %e, client = %addr, listen = %listen_addr, "Plaintext service HTTP connection closed");
                         } else {
@@ -956,7 +1160,6 @@ fn spawn_gateway_connection(
                     warn!(
                         client = %addr,
                         listen = %listen_addr,
-                        scope = ?listener_scope,
                         "Rejected plaintext HTTP on gateway listener"
                     );
                 }
@@ -968,11 +1171,7 @@ fn spawn_gateway_connection(
                         Ok(tls_stream) => {
                             let peer_identity = multiplex::extract_peer_identity(&tls_stream);
                             if let Err(e) = service
-                                .serve_with_peer_identity_on_listener(
-                                    tls_stream,
-                                    peer_identity,
-                                    listener_scope,
-                                )
+                                .serve_with_peer_identity(tls_stream, peer_identity)
                                 .await
                             {
                                 if is_benign_connection_close(e.as_ref()) {
@@ -998,7 +1197,7 @@ fn spawn_gateway_connection(
         });
     } else {
         tokio::spawn(async move {
-            if let Err(e) = service.serve_on_listener(stream, listener_scope).await {
+            if let Err(e) = service.serve(stream).await {
                 if is_benign_connection_close(e.as_ref()) {
                     debug!(error = %e, client = %addr, "Connection closed");
                 } else {
@@ -1057,6 +1256,23 @@ pub enum ComputeDriverInstance {
 /// Factory for a compute driver linked into a gateway binary.
 #[async_trait::async_trait]
 pub trait ComputeDriverFactory: Send + Sync {
+    /// Validate selected-driver configuration without starting a driver,
+    /// connecting a transport, or modifying runtime state.
+    ///
+    /// The default preserves source compatibility for existing out-of-tree
+    /// factories during normal startup. Package preflight rejects a selected
+    /// factory unless [`Self::supports_config_preflight`] is also overridden
+    /// to return `true`.
+    fn validate_config(&self, _context: ComputeDriverConfigContext<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether [`Self::validate_config`] fully validates this factory's
+    /// configuration without runtime side effects.
+    fn supports_config_preflight(&self) -> bool {
+        false
+    }
+
     async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
 }
 
@@ -1068,7 +1284,6 @@ pub struct ComputeDriverRegistration {
     detect: Option<fn() -> bool>,
     factory: Arc<dyn ComputeDriverFactory>,
     telemetry_category: TelemetryComputeDriver,
-    inherited_config_keys: &'static [&'static str],
     local_singleplayer: bool,
     supports_mtls_user_auth: bool,
     in_process_tracing: Option<openshell_otel::ComputeDriverTracing>,
@@ -1101,17 +1316,22 @@ impl ComputeDriverRegistration {
             detect,
             factory: Arc::new(factory),
             telemetry_category: TelemetryComputeDriver::custom(),
-            inherited_config_keys: &[],
             local_singleplayer: false,
             supports_mtls_user_auth: true,
             in_process_tracing: None,
         })
     }
 
-    /// Select gateway-wide defaults understood by this driver's config type.
+    /// Compatibility no-op retained for source compatibility with schema-v1
+    /// factory registrations. Schema v2 never inherits gateway keys into a
+    /// driver table; move every driver setting under
+    /// `[openshell.drivers.<name>]`.
+    #[deprecated(
+        since = "0.0.0",
+        note = "schema v2 does not inherit gateway keys into driver configuration"
+    )]
     #[must_use]
-    pub fn with_inherited_config_keys(mut self, keys: &'static [&'static str]) -> Self {
-        self.inherited_config_keys = keys;
+    pub fn with_inherited_config_keys(self, _keys: &'static [&'static str]) -> Self {
         self
     }
 
@@ -1225,6 +1445,18 @@ impl ComputeDriverRegistry {
         self.drivers.keys().map(String::as_str)
     }
 
+    /// Names whose runtime registrations participate in auto-detection.
+    ///
+    /// This does not execute detection probes. Package preflight uses it to
+    /// validate configured candidate tables without connecting local sockets
+    /// or starting discovery commands.
+    pub(crate) fn auto_detectable_driver_names(&self) -> impl Iterator<Item = &str> {
+        self.drivers
+            .values()
+            .filter(|registration| registration.detect.is_some())
+            .map(|registration| registration.name.as_str())
+    }
+
     pub(crate) fn get(&self, name: &str) -> Option<&ComputeDriverRegistration> {
         self.drivers.get(name)
     }
@@ -1261,45 +1493,45 @@ impl ComputeDriverRegistry {
         ComputeDriverDetection { available }
     }
 
-    pub(crate) fn select(&self, configured_drivers: &[String]) -> Result<ComputeDriverSelection> {
-        match configured_drivers {
-            [] => {
+    pub(crate) fn select(&self, configured_driver: Option<&str>) -> Result<ComputeDriverSelection> {
+        match configured_driver {
+            None => {
                 let detection = self.detect();
                 if detection.selected().is_none() {
                     return Err(Error::config(
                         "no compute driver configured and auto-detection found no suitable installed \
-                         driver; set --drivers <name> or OPENSHELL_DRIVERS=<name>",
+                        driver; set --compute-driver <name> or OPENSHELL_COMPUTE_DRIVER=<name>",
                     ));
                 }
                 Ok(ComputeDriverSelection::AutoDetected(detection))
             }
-            [driver] => {
+            Some(driver) => {
                 let name = openshell_core::config::normalize_compute_driver_name(driver)
                     .map_err(Error::config)?;
                 Ok(ComputeDriverSelection::Configured { name })
             }
-            drivers => Err(Error::config(format!(
-                "multiple compute drivers are not supported yet; configured drivers: {}",
-                drivers.join(",")
-            ))),
         }
     }
 }
 
-pub struct ComputeDriverBuildContext<'a> {
-    driver_name: String,
+/// Read-only inputs available while validating a selected compute driver.
+///
+/// This context deliberately exposes no shutdown handle, runtime store, or
+/// transport client. Implementations must remain deterministic and must not
+/// start processes, connect sockets, or modify state.
+#[derive(Clone, Copy)]
+pub struct ComputeDriverConfigContext<'a> {
+    driver_name: &'a str,
     gateway_name: &'a str,
     gateway_bind_address: SocketAddr,
     gateway_log_level: &'a str,
     driver_startup: compute::driver_config::DriverStartupContext<'a>,
-    shutdown_rx: watch::Receiver<bool>,
-    inherited_config_keys: &'static [&'static str],
 }
 
-impl ComputeDriverBuildContext<'_> {
+impl ComputeDriverConfigContext<'_> {
     #[must_use]
     pub fn driver_name(&self) -> &str {
-        &self.driver_name
+        self.driver_name
     }
 
     #[must_use]
@@ -1327,10 +1559,61 @@ impl ComputeDriverBuildContext<'_> {
         self.driver_startup.gateway_tls_enabled
     }
 
+    /// Deserialize the selected driver's merged TOML table.
+    pub fn driver_config<T>(&self) -> Result<T>
+    where
+        T: Default + serde::de::DeserializeOwned,
+    {
+        compute::driver_config::driver_config_from_context(self.driver_startup, self.driver_name)
+    }
+}
+
+pub struct ComputeDriverBuildContext<'a> {
+    config: ComputeDriverConfigContext<'a>,
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+impl ComputeDriverBuildContext<'_> {
+    #[must_use]
+    pub fn config_context(&self) -> ComputeDriverConfigContext<'_> {
+        self.config
+    }
+
+    #[must_use]
+    pub fn driver_name(&self) -> &str {
+        self.config.driver_name()
+    }
+
+    #[must_use]
+    pub fn gateway_name(&self) -> &str {
+        self.config.gateway_name()
+    }
+
+    #[must_use]
+    pub fn gateway_bind_address(&self) -> SocketAddr {
+        self.config.gateway_bind_address()
+    }
+
+    #[must_use]
+    pub fn gateway_log_level(&self) -> &str {
+        self.config.gateway_log_level()
+    }
+
+    #[must_use]
+    pub fn gateway_port(&self) -> u16 {
+        self.config.gateway_port()
+    }
+
+    #[must_use]
+    pub fn gateway_tls_enabled(&self) -> bool {
+        self.config.gateway_tls_enabled()
+    }
+
     /// Gateway client credentials that a local driver may mount into guests.
     #[must_use]
     pub fn guest_tls_paths(&self) -> Option<(&Path, &Path, &Path)> {
-        self.driver_startup
+        self.config
+            .driver_startup
             .guest_tls
             .map(compute::driver_config::GuestTlsPaths::as_paths)
     }
@@ -1340,11 +1623,7 @@ impl ComputeDriverBuildContext<'_> {
     where
         T: Default + serde::de::DeserializeOwned,
     {
-        compute::driver_config::driver_config_from_context(
-            self.driver_startup,
-            &self.driver_name,
-            self.inherited_config_keys,
-        )
+        self.config.driver_config()
     }
 
     #[must_use]
@@ -1354,7 +1633,8 @@ impl ComputeDriverBuildContext<'_> {
 
     #[must_use]
     pub fn otlp_config(&self) -> Option<&config_file::OtlpConfig> {
-        self.driver_startup
+        self.config
+            .driver_startup
             .file
             .and_then(|file| file.openshell.gateway.otlp.as_ref())
     }
@@ -1373,30 +1653,39 @@ async fn build_compute_runtime(
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<ComputeRuntime> {
-    let driver = resolve_configured_compute_driver(registry, selection.name(), driver_startup)?;
+    let driver = validate_compute_driver_config(
+        registry,
+        selection.name(),
+        &config.name,
+        config.bind_address,
+        &config.log_level,
+        driver_startup,
+        false,
+    )?;
     let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
     info!(driver = %driver.name(), "Using compute driver");
     if config
         .gateway_jwt
         .as_ref()
-        .is_some_and(|jwt| jwt.ttl_secs == 0)
+        .is_some_and(|jwt| jwt.sandbox_token_ttl().is_none())
         && !driver.is_local_singleplayer(registry)
     {
         warn!(
-            "Gateway configured with non-expiring sandbox JWTs; set gateway_jwt.ttl_secs > 0 for shared deployments"
+            "Gateway configured with non-expiring sandbox JWTs (gateway_jwt.ttl_secs is omitted); set gateway_jwt.ttl_secs > 0 for shared deployments"
         );
     }
 
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
             let build_context = ComputeDriverBuildContext {
-                driver_name: registration.name.clone(),
-                gateway_name: &config.name,
-                gateway_bind_address: config.bind_address,
-                gateway_log_level: &config.log_level,
-                driver_startup,
+                config: ComputeDriverConfigContext {
+                    driver_name: &registration.name,
+                    gateway_name: &config.name,
+                    gateway_bind_address: config.bind_address,
+                    gateway_log_level: &config.log_level,
+                    driver_startup,
+                },
                 shutdown_rx,
-                inherited_config_keys: registration.inherited_config_keys,
             };
             let instance = registration.factory.build(build_context).await?;
             match instance {
@@ -1499,8 +1788,44 @@ fn configured_compute_driver(
     config: &Config,
     driver_startup: compute::driver_config::DriverStartupContext<'_>,
 ) -> Result<ConfiguredComputeDriver> {
-    let selection = registry.select(&config.compute_drivers)?;
+    let selection = registry.select(config.compute_driver.as_deref())?;
     resolve_configured_compute_driver(registry, selection.name(), driver_startup)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_compute_driver_config(
+    registry: &ComputeDriverRegistry,
+    driver_name: &str,
+    gateway_name: &str,
+    gateway_bind_address: SocketAddr,
+    gateway_log_level: &str,
+    driver_startup: compute::driver_config::DriverStartupContext<'_>,
+    require_preflight_support: bool,
+) -> Result<ConfiguredComputeDriver> {
+    let driver = resolve_configured_compute_driver(registry, driver_name, driver_startup)?;
+    match &driver {
+        ConfiguredComputeDriver::Registered(registration) => {
+            if require_preflight_support && !registration.factory.supports_config_preflight() {
+                return Err(Error::config(format!(
+                    "compute driver '{}' does not support side-effect-free configuration preflight",
+                    registration.name
+                )));
+            }
+            registration
+                .factory
+                .validate_config(ComputeDriverConfigContext {
+                    driver_name: &registration.name,
+                    gateway_name,
+                    gateway_bind_address,
+                    gateway_log_level,
+                    driver_startup,
+                })?;
+        }
+        ConfiguredComputeDriver::Remote { name } => {
+            compute::driver_config::remote_driver_config_from_context(driver_startup, name)?;
+        }
+    }
+    Ok(driver)
 }
 
 fn resolve_configured_compute_driver(
@@ -1535,12 +1860,15 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
         metadata: Some(ObjectMeta {
             id: id.clone(),
             name: DEFAULT_WORKSPACE_NAME.to_string(),
-            created_at_ms: persistence::current_time_ms(),
+            created_time: openshell_core::time::timestamp_from_millis(
+                persistence::current_time_ms(),
+            )
+            .ok(),
             labels: HashMap::new(),
             annotations: HashMap::new(),
             resource_version: 0,
             workspace: String::new(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         status: Some(openshell_core::proto::datamodel::v1::WorkspaceStatus {
             phase: openshell_core::proto::datamodel::v1::WorkspacePhase::Active.into(),
@@ -1587,10 +1915,10 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
 mod tests {
     use super::{
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
-        GatewayListenerScope, MultiplexService, ServerState, TlsAcceptor,
-        allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
-        configured_compute_driver, is_benign_tls_handshake_failure,
-        mint_gateway_extension_credential, serve_gateway_listener,
+        MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
+        bind_gateway_listener, classify_initial_bytes, configured_compute_driver,
+        extension_token_ttl, is_benign_tls_handshake_failure, mint_gateway_extension_credential,
+        serve_gateway_listener, validate_peer_endpoint_scheme,
     };
     use openshell_core::{
         Config,
@@ -1608,10 +1936,41 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::watch;
 
-    use crate::{
-        compute::GatewayListenerRequirement, gateway_listener::GatewayListenerSpec,
-        tls_test_utils::generate_test_certs_with_ca,
-    };
+    use crate::tls_test_utils::generate_test_certs_with_ca;
+
+    fn tls_enabled_config() -> Config {
+        Config::new(Some(openshell_core::TlsConfig {
+            cert_path: "/tmp/cert.pem".into(),
+            key_path: "/tmp/key.pem".into(),
+            client_ca_path: None,
+            require_client_auth: false,
+            external_cert_path: None,
+            external_key_path: None,
+            external_server_names: Vec::new(),
+        }))
+    }
+
+    #[test]
+    fn plaintext_peer_endpoint_is_rejected_on_a_tls_gateway() {
+        let error = validate_peer_endpoint_scheme(&tls_enabled_config(), "http://10.0.0.1:8080")
+            .expect_err("plaintext peer endpoint must not be accepted alongside gateway TLS");
+        assert!(
+            error.to_string().contains("plaintext"),
+            "error should name the downgrade: {error}"
+        );
+    }
+
+    #[test]
+    fn https_peer_endpoint_is_accepted_on_a_tls_gateway() {
+        validate_peer_endpoint_scheme(&tls_enabled_config(), "https://10.0.0.1:8080").unwrap();
+    }
+
+    #[test]
+    fn plaintext_peer_endpoint_is_allowed_on_a_plaintext_gateway() {
+        let config = Config::new(None);
+        assert!(config.tls.is_none());
+        validate_peer_endpoint_scheme(&config, "http://10.0.0.1:8080").unwrap();
+    }
 
     static DETECTION_PROBE_ORDER: LazyLock<Mutex<Vec<&'static str>>> =
         LazyLock::new(|| Mutex::new(Vec::new()));
@@ -1634,16 +1993,37 @@ mod tests {
     }
 
     fn extension_test_issuer() -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
+        extension_test_issuer_with_ttl(Some(Duration::from_mins(15)))
+    }
+
+    fn extension_test_issuer_with_ttl(
+        ttl: Option<Duration>,
+    ) -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
         let material = openshell_bootstrap::jwt::generate_jwt_key().expect("jwt key");
         Arc::new(
             crate::auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
                 material.signing_key_pem.as_bytes(),
                 material.kid,
                 "gateway-a",
-                Duration::from_mins(15),
+                ttl,
             )
             .expect("issuer"),
         )
+    }
+
+    #[test]
+    fn non_expiring_sandbox_tokens_use_finite_extension_ttl() {
+        let issuer = extension_test_issuer_with_ttl(None);
+        assert_eq!(extension_token_ttl(&issuer), Duration::from_mins(15));
+    }
+
+    #[test]
+    fn extension_token_ttl_is_capped_at_one_hour() {
+        let issuer = extension_test_issuer_with_ttl(Some(Duration::from_hours(24)));
+        assert_eq!(extension_token_ttl(&issuer), Duration::from_hours(1));
+
+        let short = extension_test_issuer_with_ttl(Some(Duration::from_mins(5)));
+        assert_eq!(extension_token_ttl(&short), Duration::from_mins(5));
     }
 
     #[test]
@@ -1760,6 +2140,8 @@ mod tests {
     #[derive(Clone, Copy)]
     struct TestComputeDriverFactory;
 
+    // Omitting validate_config exercises source compatibility for out-of-tree
+    // factories written before package preflight introduced that hook.
     #[async_trait::async_trait]
     impl super::ComputeDriverFactory for TestComputeDriverFactory {
         async fn build(
@@ -1835,7 +2217,7 @@ mod tests {
         let handle = tokio::spawn(serve_gateway_listener(
             BoundGatewayListener {
                 listener,
-                spec: GatewayListenerSpec::new(listen_addr, GatewayListenerScope::Primary),
+                address: listen_addr,
             },
             service,
             Some(tls_acceptor),
@@ -1933,23 +2315,10 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:54000".parse().unwrap();
         let wildcard: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let remote_peer: SocketAddr = "192.0.2.10:54000".parse().unwrap();
-        let primary = GatewayListenerScope::Primary;
-        let callback = GatewayListenerScope::ComputeDriverCallback;
-
-        assert!(allow_plaintext_service_http(true, loopback, peer, primary));
-        assert!(!allow_plaintext_service_http(
-            false, loopback, peer, primary
-        ));
-        assert!(!allow_plaintext_service_http(true, wildcard, peer, primary));
-        assert!(!allow_plaintext_service_http(
-            true,
-            loopback,
-            remote_peer,
-            primary
-        ));
-        assert!(!allow_plaintext_service_http(
-            true, loopback, peer, callback
-        ));
+        assert!(allow_plaintext_service_http(true, loopback, peer));
+        assert!(!allow_plaintext_service_http(false, loopback, peer));
+        assert!(!allow_plaintext_service_http(true, wildcard, peer));
+        assert!(!allow_plaintext_service_http(true, loopback, remote_peer));
     }
 
     #[tokio::test]
@@ -2093,7 +2462,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let config = Config::new(None).with_compute_drivers(std::iter::empty::<String>());
+        let config = Config::new(None);
         let result =
             configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
                 .unwrap();
@@ -2163,24 +2532,8 @@ mod tests {
     }
 
     #[test]
-    fn configured_compute_driver_rejects_multiple_entries() {
-        let config = Config::new(None).with_compute_drivers(["alpha", "beta"]);
-        let err = configured_compute_driver(
-            &test_compute_drivers(),
-            &config,
-            test_driver_startup(&config, None),
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("multiple compute drivers are not supported yet")
-        );
-        assert!(err.to_string().contains("alpha,beta"));
-    }
-
-    #[test]
     fn configured_compute_driver_accepts_registered_name() {
-        let config = Config::new(None).with_compute_drivers(["beta"]);
+        let config = Config::new(None).with_compute_driver("beta");
         let registry = test_compute_drivers();
         let driver =
             configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
@@ -2197,7 +2550,7 @@ mod tests {
 
     #[test]
     fn configured_compute_driver_resolves_named_remote() {
-        let config = Config::new(None).with_compute_drivers(["kyma"]);
+        let config = Config::new(None).with_compute_driver("kyma");
         let registry = test_compute_drivers();
 
         let driver =
@@ -2224,7 +2577,7 @@ mod tests {
     #[test]
     fn configured_compute_driver_uses_endpoint_override() {
         let config = Config::new(None)
-            .with_compute_drivers(["alpha"])
+            .with_compute_driver("alpha")
             .with_compute_driver_endpoint("alpha", "/run/openshell/alpha.sock");
         let registry = test_compute_drivers();
 
@@ -2244,7 +2597,7 @@ mod tests {
     #[test]
     fn configured_compute_driver_uses_builtin_endpoint_override() {
         let config = Config::new(None)
-            .with_compute_drivers(["beta"])
+            .with_compute_driver("beta")
             .with_compute_driver_endpoint("beta", "/run/openshell/beta.sock");
 
         let driver = configured_compute_driver(
@@ -2264,14 +2617,8 @@ mod tests {
         let occupied_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let occupied_address = occupied_listener.local_addr().unwrap();
         let start_attempted = AtomicBool::new(false);
-        let primary_address: SocketAddr = "127.0.0.1:0".parse().unwrap();
-
         let result: openshell_core::Result<()> = async {
-            let _listeners = bind_gateway_listeners(
-                primary_address,
-                &[docker_listener_requirement(occupied_address)],
-            )
-            .await?;
+            let _listener = bind_gateway_listener(occupied_address).await?;
             start_attempted.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -2279,19 +2626,11 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "binding the occupied extra gateway address should fail"
+            "binding the occupied gateway address should fail"
         );
         assert!(
             !start_attempted.load(Ordering::SeqCst),
-            "persisted sandbox start must not run before every gateway listener is bound"
+            "persisted sandbox start must not run before the gateway listener is bound"
         );
-    }
-
-    fn docker_listener_requirement(address: SocketAddr) -> GatewayListenerRequirement {
-        GatewayListenerRequirement::Exact {
-            address,
-            driver_name: "docker".to_string(),
-            reason: "managed bridge".to_string(),
-        }
     }
 }

@@ -126,7 +126,9 @@ openshell workspace member remove \
 
 Add `--output json` or `--output yaml` to list membership records for
 automation. Each record contains `subject` and a normalized `role` of `admin`,
-`user`, or `unknown`. An empty result is an empty collection.
+`user`, or `unknown`. Structured output is an envelope with `members` and
+`next_page_token` fields; pass the returned token to `--page-token` to
+continue. An empty result has an empty `members` collection.
 
 To change a member's role, remove the existing membership and add it again
 with the new role. A Platform Admin must perform any change to `admin`.
@@ -149,8 +151,9 @@ export OPENSHELL_WORKSPACE=team-ml
 openshell sandbox list
 ```
 
-An empty workspace value resolves to `default`. It never means all
-workspaces.
+When `--workspace` is omitted, the CLI intentionally selects the `default`
+workspace. An empty workspace name is invalid and never means either `default`
+or all workspaces.
 
 Platform Admins can opt into cross-workspace list operations:
 
@@ -159,6 +162,36 @@ openshell sandbox list --all-workspaces
 openshell provider list --all-workspaces
 openshell service list --all-workspaces
 ```
+
+Workspace-scoped public requests use the `workspace_scope` field with a
+`WorkspaceSelector`. Single-workspace requests select a non-empty canonical
+name, including the literal `default`. Only sandbox, sandbox template,
+provider, and service collection list requests also accept `all_workspaces`.
+The all-workspaces selection requires Platform Admin access. For services,
+choose either a sandbox name or `--all-workspaces`; the options are mutually
+exclusive.
+
+Every sandbox-scoped RPC identifies the sandbox by its human-readable name and
+keeps workspace selection in a separate field:
+
+```json
+{
+  "workspaceScope": { "workspace": "team-ml" },
+  "name": "agent"
+}
+```
+
+Public requests do not accept canonical sandbox IDs as references. This is a
+breaking API change: regenerate protobuf clients and replace stored ID
+references with sandbox names before calling the public API. The four collection
+list RPCs use the request-level `workspace_scope` selector.
+
+The Rust and Python SDKs expose separate all-workspaces list methods. The Go
+SDK passes `AllWorkspaces: true` in `ListOptions` to `ListAll`, and the
+TypeScript SDK uses a discriminated option type, so a caller cannot select a
+named workspace and all workspaces in one typed call.
+The TUI starts in the `default` workspace and sends that name explicitly. Its
+all-workspaces collection views send the selector marker instead.
 
 Provider profiles and policy also have explicit `--global` operations. Those
 operations target platform scope and require Platform Admin access. A

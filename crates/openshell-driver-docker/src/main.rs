@@ -22,7 +22,7 @@ struct Args {
     #[arg(long, env = "OPENSHELL_DOCKER_DRIVER_CONFIG")]
     config: PathBuf,
 
-    /// Gateway listener address used to derive sandbox callback routing.
+    /// Gateway listener address used to derive the supervisor endpoint.
     #[arg(
         long,
         env = "OPENSHELL_GATEWAY_BIND",

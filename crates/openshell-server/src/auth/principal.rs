@@ -28,6 +28,8 @@ pub enum Principal {
     /// sandbox UUID. The wrapped `sandbox_id` MUST match any sandbox referenced
     /// in the request body for sandbox-class methods.
     Sandbox(#[allow(dead_code)] SandboxPrincipal),
+    /// Gateway replica authenticated for internal peer RPCs.
+    Peer(PeerPrincipal),
     /// Truly unauthenticated caller (health probes, reflection). Sandbox-class
     /// and user-class methods reject this variant.
     #[allow(dead_code)]
@@ -57,6 +59,15 @@ pub struct SandboxPrincipal {
     pub trust_domain: Option<String>,
 }
 
+/// Gateway peer caller.
+#[derive(Debug, Clone)]
+pub struct PeerPrincipal {
+    /// Peer replica id supplied by the authenticated caller.
+    pub replica_id: String,
+    /// UID of the authenticated Kubernetes pod.
+    pub pod_uid: String,
+}
+
 /// How a [`SandboxPrincipal`] was authenticated.
 ///
 /// Variant fields are populated by the producing authenticator and consumed
@@ -72,6 +83,10 @@ pub enum SandboxIdentitySource {
     BootstrapCert { fingerprint: String },
     /// Driver-native credential used to bootstrap a gateway-minted JWT via
     /// `IssueSandboxToken`. The named compute driver authenticated only the
-    /// sandbox identity; the gateway still authorizes the exchange.
-    ComputeDriver { driver_name: String },
+    /// sandbox identity and its concrete runtime binding; the gateway still
+    /// authorizes the exchange against the binding recorded at creation.
+    ComputeDriver {
+        driver_name: String,
+        runtime_identity: String,
+    },
 }

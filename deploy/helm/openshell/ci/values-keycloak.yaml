@@ -3,19 +3,21 @@
 
 # OIDC configuration overlay for a local Keycloak instance in k3s.
 #
-# Run the one-time setup task first:
+# Run the setup task first (rerun it to rotate the development CA):
 #   mise run keycloak:k8s:setup
 #
 # Then layer this file on top of values.yaml when deploying:
 #   helm upgrade --install openshell . \
-#     -f values.yaml -f ci/values-skaffold.yaml -f ci/values-keycloak.yaml
+#     -f values.yaml -f ci/values-skaffold.yaml -f ci/values-keycloak.yaml \
+#     --set supervisor.sandboxRuntime.networkPolicyEnforced=true
 #
 # Or add this file to skaffold.yaml valuesFiles for iterative dev.
 #
 # Issuer note: the setup task configures Keycloak with KC_HOSTNAME set to the
 # in-cluster service hostname, so tokens always carry that hostname as `iss`
 # regardless of how they were obtained (e.g. via a localhost port-forward).
-# The gateway fetches JWKS from this URL inside the cluster.
+# The gateway fetches JWKS over TLS from this URL inside the cluster. The setup
+# task creates the Keycloak development CA ConfigMap referenced below.
 #
 # CLI token acquisition: keep a port-forward running while using openshell login:
 #   kubectl -n keycloak port-forward svc/keycloak 9090:80
@@ -23,7 +25,8 @@
 server:
   oidc:
     # Must match KC_HOSTNAME set by keycloak:k8s:setup (in-cluster service hostname).
-    issuer: "http://keycloak.keycloak.svc.cluster.local/realms/openshell"
+    issuer: "https://keycloak.keycloak.svc.cluster.local:443/realms/openshell"
+    caConfigMapName: "openshell-keycloak-ca"
     # Must match the client ID in the imported realm (openshell-cli).
     audience: "openshell-cli"
     # Short TTL for dev so JWKS key rotation is picked up quickly.

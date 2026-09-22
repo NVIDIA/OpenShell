@@ -51,11 +51,12 @@ class TestRbac:
         token = get_token("admin@test", "admin", scopes="openid openshell:all")
         stub, metadata = stub_with_token(token)
         req = openshell_pb2.CreateProviderRequest(
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-admin-test"),
-                type="claude",
+                type="claude-code",
                 credentials={"ANTHROPIC_API_KEY": "test-value"},
-            )
+            ),
         )
         try:
             stub.CreateProvider(req, metadata=metadata)
@@ -67,7 +68,12 @@ class TestRbac:
         finally:
             with contextlib.suppress(grpc.RpcError):
                 stub.DeleteProvider(
-                    openshell_pb2.DeleteProviderRequest(name="e2e-oidc-admin-test"),
+                    openshell_pb2.DeleteProviderRequest(
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
+                        name="e2e-oidc-admin-test",
+                    ),
                     metadata=metadata,
                 )
 
@@ -75,11 +81,12 @@ class TestRbac:
         token = get_token("user@test", "user", scopes="openid openshell:all")
         stub, metadata = stub_with_token(token)
         req = openshell_pb2.CreateProviderRequest(
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-user-blocked"),
-                type="claude",
+                type="claude-code",
                 credentials={"ANTHROPIC_API_KEY": "test-value"},
-            )
+            ),
         )
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.CreateProvider(req, metadata=metadata)
@@ -95,7 +102,9 @@ class TestRbac:
         with contextlib.suppress(grpc.RpcError):
             admin_stub.AddWorkspaceMember(
                 openshell_pb2.AddWorkspaceMemberRequest(
-                    workspace="default",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
                     principal_subject=user_sub,
                     role=openshell_pb2.WORKSPACE_ROLE_USER,
                 ),
@@ -103,13 +112,19 @@ class TestRbac:
             )
         try:
             user_stub.ListSandboxes(
-                openshell_pb2.ListSandboxesRequest(), metadata=user_md
+                openshell_pb2.ListSandboxesRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+                ),
+                metadata=user_md,
             )
         finally:
             with contextlib.suppress(grpc.RpcError):
                 admin_stub.RemoveWorkspaceMember(
                     openshell_pb2.RemoveWorkspaceMemberRequest(
-                        workspace="default", principal_subject=user_sub
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
+                        principal_subject=user_sub,
                     ),
                     metadata=admin_md,
                 )
@@ -118,7 +133,11 @@ class TestRbac:
         channel = grpc_channel()
         stub = openshell_pb2_grpc.OpenShellStub(channel)
         with pytest.raises(grpc.RpcError) as exc_info:
-            stub.ListSandboxes(openshell_pb2.ListSandboxesRequest())
+            stub.ListSandboxes(
+                openshell_pb2.ListSandboxesRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+                )
+            )
         assert exc_info.value.code() in (
             grpc.StatusCode.UNAUTHENTICATED,
             grpc.StatusCode.PERMISSION_DENIED,
@@ -151,7 +170,12 @@ class TestScopes:
             "admin@test", "admin", scopes="openid sandbox:read sandbox:write"
         )
         stub, metadata = stub_with_token(token)
-        stub.ListSandboxes(openshell_pb2.ListSandboxesRequest(), metadata=metadata)
+        stub.ListSandboxes(
+            openshell_pb2.ListSandboxesRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+            ),
+            metadata=metadata,
+        )
 
     def test_sandbox_scoped_token_cannot_list_providers(self) -> None:
         token = get_token(
@@ -159,21 +183,41 @@ class TestScopes:
         )
         stub, metadata = stub_with_token(token)
         with pytest.raises(grpc.RpcError) as exc_info:
-            stub.ListProviders(openshell_pb2.ListProvidersRequest(), metadata=metadata)
+            stub.ListProviders(
+                openshell_pb2.ListProvidersRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+                ),
+                metadata=metadata,
+            )
         assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
         assert "provider:read" in exc_info.value.details()
 
     def test_openshell_all_grants_full_access(self) -> None:
         token = get_token("admin@test", "admin", scopes="openid openshell:all")
         stub, metadata = stub_with_token(token)
-        stub.ListSandboxes(openshell_pb2.ListSandboxesRequest(), metadata=metadata)
-        stub.ListProviders(openshell_pb2.ListProvidersRequest(), metadata=metadata)
+        stub.ListSandboxes(
+            openshell_pb2.ListSandboxesRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+            ),
+            metadata=metadata,
+        )
+        stub.ListProviders(
+            openshell_pb2.ListProvidersRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+            ),
+            metadata=metadata,
+        )
 
     def test_no_openshell_scopes_denied(self) -> None:
         token = get_token("admin@test", "admin")
         stub, metadata = stub_with_token(token)
         with pytest.raises(grpc.RpcError) as exc_info:
-            stub.ListSandboxes(openshell_pb2.ListSandboxesRequest(), metadata=metadata)
+            stub.ListSandboxes(
+                openshell_pb2.ListSandboxesRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default")
+                ),
+                metadata=metadata,
+            )
         assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
 
 
@@ -212,20 +256,25 @@ class TestClientCredentials:
         with contextlib.suppress(grpc.RpcError):
             admin_stub.AddWorkspaceMember(
                 openshell_pb2.AddWorkspaceMemberRequest(
-                    workspace="default",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
                     principal_subject=ci_sub,
                     role=openshell_pb2.WORKSPACE_ROLE_USER,
                 ),
                 metadata=admin_md,
             )
         try:
-            ci_client.list(workspace="default")
+            ci_client.list_all(workspace="default")
         finally:
             ci_client.close()
             with contextlib.suppress(grpc.RpcError):
                 admin_stub.RemoveWorkspaceMember(
                     openshell_pb2.RemoveWorkspaceMemberRequest(
-                        workspace="default", principal_subject=ci_sub
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            workspace="default"
+                        ),
+                        principal_subject=ci_sub,
                     ),
                     metadata=admin_md,
                 )

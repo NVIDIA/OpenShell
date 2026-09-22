@@ -4,8 +4,8 @@
 
 # Package VM runtime artifacts into a release tarball.
 #
-# Used by CI (release-vm-kernel.yml) to bundle libkrun, libkrunfw, gvproxy,
-# and the guest OCI unpacker into a platform-specific tarball for the
+# Used by CI (release-vm-kernel.yml) to bundle libkrun, libkrunfw, and the
+# guest OCI unpacker into a platform-specific tarball for the
 # vm-runtime GitHub Release. Handles tool downloads, provenance metadata
 # generation, and tarball creation.
 #
@@ -31,7 +31,6 @@ ROOT="$(vm_lib_root)"
 
 # Source pins for runtime tool versions.
 source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
-GVPROXY_VERSION="${GVPROXY_VERSION:-v0.8.8}"
 UMOCI_VERSION="${UMOCI_VERSION:-v0.6.0}"
 
 PLATFORM=""
@@ -106,18 +105,6 @@ case "$PLATFORM" in
         ;;
 esac
 
-# ── Download gvproxy ────────────────────────────────────────────────────
-
-echo "==> Downloading gvproxy ${GVPROXY_VERSION} for ${PLATFORM}..."
-case "$PLATFORM" in
-    linux-aarch64)  GVPROXY_SUFFIX="linux-arm64" ;;
-    linux-x86_64)   GVPROXY_SUFFIX="linux-amd64" ;;
-    darwin-aarch64)  GVPROXY_SUFFIX="darwin" ;;
-esac
-
-curl -fsSL -o "${PACKAGE_DIR}/gvproxy" \
-    "https://github.com/containers/gvisor-tap-vsock/releases/download/${GVPROXY_VERSION}/gvproxy-${GVPROXY_SUFFIX}"
-chmod +x "${PACKAGE_DIR}/gvproxy"
 
 # ── Download umoci for the Linux guest ───────────────────────────────────
 
@@ -162,11 +149,10 @@ jq -n \
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg kfw_commit "$LIBKRUNFW_COMMIT" \
     --arg kver "$KERNEL_VERSION" \
-    --arg gvproxy "$GVPROXY_VERSION" \
     --arg umoci "$UMOCI_VERSION" \
     --arg sha "${GITHUB_SHA:-unknown}" \
     --arg run "${GITHUB_RUN_ID:-unknown}" \
-    '{artifact: $artifact, platform: $platform, build_timestamp: $ts, libkrunfw_commit: $kfw_commit, kernel_version: $kver, gvproxy_version: $gvproxy, umoci_version: $umoci, github_sha: $sha, github_run_id: $run}' \
+    '{artifact: $artifact, platform: $platform, build_timestamp: $ts, libkrunfw_commit: $kfw_commit, kernel_version: $kver, umoci_version: $umoci, github_sha: $sha, github_run_id: $run}' \
     > "${PACKAGE_DIR}/provenance.json"
 
 # ── Create tarball ──────────────────────────────────────────────────────

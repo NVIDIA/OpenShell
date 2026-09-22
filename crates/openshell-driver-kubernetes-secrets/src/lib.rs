@@ -182,7 +182,7 @@ impl KubernetesSecretsCredentialDriver {
         let owner_id = credential_owner_id(
             &request.workspace,
             &request.provider_id,
-            &request.provider_name,
+            &request.provider,
             &request.credential_key,
         );
         let object_id = if let Some(existing_handle) = request.existing_handle.as_ref() {
@@ -195,7 +195,7 @@ impl KubernetesSecretsCredentialDriver {
             validate_expected_secret_name(
                 &request.workspace,
                 &request.provider_id,
-                &request.provider_name,
+                &request.provider,
                 &request.credential_key,
                 &object_id,
                 &reference.secret_name,
@@ -207,7 +207,7 @@ impl KubernetesSecretsCredentialDriver {
                 secret_name: managed_secret_name(
                     &request.workspace,
                     &request.provider_id,
-                    &request.provider_name,
+                    &request.provider,
                     &request.credential_key,
                     &object_id,
                 ),
@@ -247,7 +247,7 @@ impl KubernetesSecretsCredentialDriver {
         validate_expected_secret_name(
             &request.workspace,
             &request.provider_id,
-            &request.provider_name,
+            &request.provider,
             &request.credential_key,
             &object_id,
             &reference.secret_name,
@@ -255,7 +255,7 @@ impl KubernetesSecretsCredentialDriver {
         let owner_id = credential_owner_id(
             &request.workspace,
             &request.provider_id,
-            &request.provider_name,
+            &request.provider,
             &request.credential_key,
         );
         let api: Api<Secret> = Api::namespaced(self.client.clone(), &reference.namespace);
@@ -314,7 +314,7 @@ impl KubernetesSecretsCredentialDriver {
             validate_expected_secret_name(
                 &request.workspace,
                 &request.provider_id,
-                &request.provider_name,
+                &request.provider,
                 &request.credential_key,
                 &object_id,
                 &reference.secret_name,
@@ -322,14 +322,14 @@ impl KubernetesSecretsCredentialDriver {
             let owner_id = credential_owner_id(
                 &request.workspace,
                 &request.provider_id,
-                &request.provider_name,
+                &request.provider,
                 &request.credential_key,
             );
             let value = self.resolve_secret_value(&reference, &owner_id).await?;
             Ok::<_, Status>(ResolvedCredential {
                 request_id: request.request_id,
                 value,
-                expires_at_ms: 0,
+                expiration_time: None,
             })
         });
         futures::future::try_join_all(futures).await
@@ -461,15 +461,29 @@ impl Clone for KubernetesSecretsCredentialDriver {
 impl CredentialDriver for CredentialDriverService {
     async fn get_capabilities(
         &self,
-        _request: Request<GetCredentialDriverCapabilitiesRequest>,
+        request: Request<GetCredentialDriverCapabilitiesRequest>,
     ) -> Result<Response<GetCredentialDriverCapabilitiesResponse>, Status> {
-        Ok(Response::new(GetCredentialDriverCapabilitiesResponse {
+        let capabilities = GetCredentialDriverCapabilitiesResponse {
             driver_name: KubernetesSecretsCredentialDriver::NAME.to_string(),
             driver_version: VERSION.to_string(),
             backend_kind: KubernetesSecretsCredentialDriver::NAME.to_string(),
             supports_list: false,
             supports_expires_at: false,
-        }))
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::Credentials,
+                "openshell/kubernetes-secrets",
+                VERSION,
+                [],
+            )),
+        };
+        openshell_core::extension_protocol::validate_gateway_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::Credentials,
+            KubernetesSecretsCredentialDriver::NAME,
+            capabilities.extension.as_ref(),
+            request.into_inner().gateway,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(capabilities))
     }
 
     async fn store_credential(

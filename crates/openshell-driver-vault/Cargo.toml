@@ -30,9 +30,12 @@ toml = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
 tempfile = "3"
+tokio-rustls = { workspace = true }
 wiremock = "0.6"
 
 [lints]

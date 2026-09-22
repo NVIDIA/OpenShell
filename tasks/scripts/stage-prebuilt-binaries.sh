@@ -28,9 +28,7 @@ target_triple() {
   local suffix
   case "$libc" in
     musl) suffix=musl ;;
-    # gnu-static builds the GNU target with +crt-static, so it shares the
-    # gnu triple.
-    gnu|gnu-static) suffix=gnu ;;
+    gnu) suffix=gnu ;;
     *)
       echo "unsupported libc: $libc" >&2
       exit 1
@@ -41,25 +39,6 @@ target_triple() {
     arm64) echo "aarch64-unknown-linux-${suffix}" ;;
     *)
       echo "unsupported architecture: $1" >&2
-      exit 1
-      ;;
-  esac
-}
-
-# Resolve the supervisor libc variant. Both options produce a fully static
-# binary because the supervisor is executed from inside arbitrary sandbox
-# images; see verify-static-binary.sh.
-#
-# Scope: this selects the libc for the supervisor *image* binary. The VM driver
-# bundles its own supervisor build (tasks/scripts/vm/build-supervisor-bundle.sh)
-# and is not affected by this setting.
-supervisor_libc() {
-  local selection=${SUPERVISOR_LIBC:-musl}
-  case "$selection" in
-    musl) echo "musl" ;;
-    glibc-static) echo "gnu-static" ;;
-    *)
-      echo "unsupported SUPERVISOR_LIBC: ${selection} (expected musl or glibc-static)" >&2
       exit 1
       ;;
   esac
@@ -108,11 +87,14 @@ components_for_target() {
     gateway)
       echo "gateway"
       ;;
-    sandbox|supervisor|supervisor-output)
+    sandbox)
+      echo "sandbox"
+      ;;
+    supervisor|supervisor-output)
       echo "supervisor"
       ;;
     all)
-      echo "gateway supervisor"
+      echo "gateway sandbox supervisor"
       ;;
     *)
       usage
@@ -128,10 +110,15 @@ resolve_component() {
       binary=openshell-gateway
       target_libc=gnu
       ;;
-    supervisor)
+    sandbox)
       crate=openshell-sandbox
       binary=openshell-sandbox
-      target_libc=$(supervisor_libc)
+      target_libc=musl
+      ;;
+    supervisor)
+      crate=openshell-supervisor
+      binary=openshell-supervisor
+      target_libc=gnu
       ;;
     *)
       echo "unsupported binary component: $1" >&2
@@ -149,7 +136,9 @@ patch_workspace_version() {
   cargo_toml_backup="$(mktemp)"
   cp "$cargo_toml" "$cargo_toml_backup"
   restore_cargo_toml=1
-  sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' "$cargo_toml"
+  sed -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' \
+    "$cargo_toml" >"${cargo_toml}.updated"
+  mv "${cargo_toml}.updated" "$cargo_toml"
 }
 
 restore_workspace_version() {
@@ -171,6 +160,7 @@ build_component_for_arch() {
   local current_host_os
   local current_host_arch
   local binary_path
+  local cargo_output_dir
   local build_rustflags
 
   resolve_component "$component"
@@ -188,26 +178,12 @@ build_component_for_arch() {
   build_target="$target"
   build_rustflags="${RUSTFLAGS:-}"
 
-  if [[ "$component" == "gateway" ]]; then
+  if [[ "$target_libc" == "gnu" ]]; then
     if has_cargo_zigbuild; then
       cargo_subcommand=(cargo zigbuild)
       build_target="${target}.2.28"
     else
       echo "Error: cargo-zigbuild + zig are required to build ${binary} with the glibc 2.28 floor." >&2
-      exit 1
-    fi
-  elif [[ "$target_libc" == "gnu-static" ]]; then
-    # `zig cc` accepts `-static` for *-linux-gnu and emits a dynamically linked
-    # binary anyway, so cargo-zigbuild cannot produce this variant and there is
-    # no cross-compile fallback. Require a native toolchain that can link glibc
-    # statically (Fedora/RHEL: glibc-static, Debian/Ubuntu: libc6-dev).
-    build_rustflags="${build_rustflags} -C target-feature=+crt-static"
-    if [[ "$current_host_os" != "Linux" || "$current_host_arch" != "$arch" ]]; then
-      echo "Error: SUPERVISOR_LIBC=glibc-static cannot build ${binary} for linux/${arch} on ${current_host_os}/${current_host_arch}." >&2
-      echo "cargo-zigbuild cannot statically link glibc, so this variant has no cross-compile path." >&2
-      echo "Build on a linux/${arch} host with glibc static libraries installed, use SUPERVISOR_LIBC=musl," >&2
-      echo "or provide prebuilt binaries in:" >&2
-      echo "  deploy/docker/.build/prebuilt-binaries/${arch}/" >&2
       exit 1
     fi
   elif [[ "$target_libc" == "musl" ]] && has_cargo_zigbuild; then
@@ -245,7 +221,7 @@ build_component_for_arch() {
 
   (
     cd "$ROOT"
-    if [[ "$component" == "gateway" ]]; then
+    if [[ "$target_libc" == "gnu" ]]; then
       eval "$("$SCRIPT_DIR/setup-zig-cc-wrapper.sh" "$build_target" "$build_target" "$ROOT/target/zig-gnu-wrapper/$arch")"
     fi
     if [[ -n "${OPENSHELL_CARGO_VERSION:-}" ]]; then
@@ -257,10 +233,11 @@ build_component_for_arch() {
     CARGO_INCREMENTAL=0 mise x -- ${cargo_env[@]+"${cargo_env[@]}"} "${cargo_subcommand[@]}" "${args[@]}"
   )
 
-  binary_path="${ROOT}/target/${target}/release/${binary}"
-  if [[ "$component" == "gateway" ]]; then
+  cargo_output_dir="$(cd "$ROOT" && mise x -- cargo metadata --format-version=1 --no-deps | jq -er '.target_directory')"
+  binary_path="${cargo_output_dir}/${target}/release/${binary}"
+  if [[ "$target_libc" == "gnu" ]]; then
     "$SCRIPT_DIR/verify-glibc-symbols.sh" 2.28 "$binary_path"
-  elif [[ "$component" == "supervisor" ]]; then
+  else
     "$SCRIPT_DIR/verify-static-binary.sh" "$binary_path"
   fi
 

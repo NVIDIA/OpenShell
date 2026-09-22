@@ -36,6 +36,7 @@ class VersionEntry:
     display_name: str
     path: str
     availability: str | None = None
+    announcement: YamlMapping | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -312,6 +313,7 @@ def parse_versions(raw_versions: object) -> list[VersionEntry]:
         display_name = entry.get("display-name")
         path = entry.get("path")
         availability = entry.get("availability")
+        announcement = entry.get("announcement")
         if (
             isinstance(slug, str)
             and isinstance(display_name, str)
@@ -324,6 +326,9 @@ def parse_versions(raw_versions: object) -> list[VersionEntry]:
                     path=path,
                     availability=availability
                     if isinstance(availability, str)
+                    else None,
+                    announcement=cast("YamlMapping", announcement)
+                    if isinstance(announcement, dict)
                     else None,
                 )
             )
@@ -349,8 +354,8 @@ def ordered_entries(
     return [by_slug[slug] for slug in order]
 
 
-def render_versions(entries: list[VersionEntry]) -> list[dict[str, str]]:
-    rendered: list[dict[str, str]] = []
+def render_versions(entries: list[VersionEntry]) -> list[YamlMapping]:
+    rendered: list[YamlMapping] = []
     for entry in entries:
         item = {
             "display-name": entry.display_name,
@@ -359,8 +364,34 @@ def render_versions(entries: list[VersionEntry]) -> list[dict[str, str]]:
         }
         if entry.availability is not None:
             item["availability"] = entry.availability
+        if entry.announcement is not None:
+            item["announcement"] = entry.announcement
         rendered.append(item)
     return rendered
+
+
+def sync_global_announcement(source_docs_yml: Path, target_docs_yml: Path) -> None:
+    source_data = read_yaml(source_docs_yml)
+    source_announcement = source_data.get("announcement")
+    if source_announcement is not None and not isinstance(source_announcement, dict):
+        raise ValueError("docs.yml announcement must be a mapping")
+
+    target_data = read_yaml(target_docs_yml)
+    if source_announcement is None:
+        target_data.pop("announcement", None)
+    else:
+        target_data["announcement"] = source_announcement
+    write_yaml(target_docs_yml, target_data)
+
+
+def source_version_announcement(docs_yml: Path, slug: str) -> YamlMapping | None:
+    entries = parse_versions(read_yaml(docs_yml).get("versions"))
+    for entry in entries:
+        if entry.slug == slug:
+            return entry.announcement
+    if len(entries) == 1:
+        return entries[0].announcement
+    return None
 
 
 def component_dirs(fern_dir: Path) -> list[str]:
@@ -408,6 +439,7 @@ def write_snapshot(
         copy_if_exists(
             source_fern / "fern.config.json", target_fern / "fern.config.json"
         )
+        sync_global_announcement(source_fern / "docs.yml", target_fern / "docs.yml")
 
     versions_dir = target_fern / "versions"
     versions_dir.mkdir(parents=True, exist_ok=True)
@@ -483,6 +515,9 @@ def sync_docs(args: argparse.Namespace) -> None:
                 display_name=slug,
                 path=f"./versions/{slug}.yml",
                 availability=stable_availability,
+                announcement=source_version_announcement(
+                    source_fern / "docs.yml", slug
+                ),
             ),
             refresh_shared=False,
         )
@@ -509,6 +544,9 @@ def sync_docs(args: argparse.Namespace) -> None:
                     display_name=display_override or f"Latest ({slug})",
                     path="./versions/latest.yml",
                     availability=stable_availability,
+                    announcement=source_version_announcement(
+                        source_fern / "docs.yml", "latest"
+                    ),
                 ),
                 refresh_shared=False,
             )
@@ -548,6 +586,7 @@ def sync_docs(args: argparse.Namespace) -> None:
             display_name=display_name,
             path=f"./versions/{slug}.yml",
             availability=availability,
+            announcement=source_version_announcement(source_fern / "docs.yml", slug),
         ),
         refresh_shared=channel == "dev",
     )

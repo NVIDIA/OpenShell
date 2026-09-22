@@ -48,6 +48,8 @@ An interceptor implements the `openshell.gateway_interceptor.v1.GatewayIntercept
 - `Evaluate` handles one selected operation phase.
 - `SnapshotProviderProfiles` optionally returns a provider profile catalog.
 
+`DescribeRequest` carries gateway protocol metadata, and `InterceptorManifest.extension` returns the interceptor's protocol and implementation metadata. The gateway rejects missing metadata, incompatible majors, and unmet required capabilities before it accepts bindings. See [Extension Protocol Negotiation](/extensibility/extension-negotiation).
+
 Each `InterceptorEvaluation` identifies the configured interceptor, manifest binding, public OpenShell service and method, authenticated principal, and active phase. The phase determines whether the payload contains a proposed operation, optional current state, or committed response.
 
 The interceptor returns an `InterceptorResult` with an allow or deny decision, an optional denial status and reason, JSON patches during `modify_operation`, and non-secret log annotations.
@@ -152,7 +154,7 @@ provider_profile_sources = [
 ]
 ```
 
-Include `{ type = "builtin" }` or `{ type = "user" }` entries to compose interceptor profiles with the built-in or user-managed sources. Duplicate normalized profile IDs fail instead of overriding one source with another.
+Include a `{ type = "user" }` entry to compose interceptor profiles with imported profiles. Duplicate normalized profile IDs fail instead of overriding one source with another, so an interceptor-vended profile and an imported profile cannot share an ID.
 
 The gateway validates snapshot structure and provider profile semantics. It treats the configured interceptor as a trusted source and does not verify interceptor-defined signature, hash, or key annotations.
 

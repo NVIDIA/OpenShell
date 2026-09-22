@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use flate2::read::MultiGzDecoder;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::fs::File;
 #[cfg(test)]
@@ -9,9 +10,14 @@ use std::io::BufWriter;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-sandbox.zst"));
+use crate::driver::DEFAULT_SANDBOX_UID;
+
+const SANDBOX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-sandbox.zst"));
+const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-supervisor.zst"));
+const VM_INIT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-vm-init.zst"));
 const UMOCI: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/umoci.zst"));
 const ROOTFS_VARIANT_MARKER: &str = ".openshell-rootfs-variant";
 /// Leading bytes of a gzip stream, used to recognize `.tar.gz`/`.tgz` input
@@ -20,8 +26,7 @@ pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 const SANDBOX_GUEST_INIT_PATH: &str = "/srv/openshell-vm-sandbox-init.sh";
 const SANDBOX_SUPERVISOR_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
 const SANDBOX_UMOCI_PATH: &str = openshell_core::container_paths::VM_UMOCI_PATH;
-const SANDBOX_OWNER_NORMALIZED_MARKER: &str =
-    openshell_core::container_paths::VM_SANDBOX_OWNER_NORMALIZED_MARKER;
+const SANDBOX_VM_INIT_PATH: &str = "/opt/openshell/bin/openshell-vm-init";
 const ROOTFS_IMAGE_MIN_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 const ROOTFS_IMAGE_MIN_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 const EXT4_IMAGE_MIN_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
@@ -31,12 +36,147 @@ pub const fn sandbox_guest_init_path() -> &'static str {
     SANDBOX_GUEST_INIT_PATH
 }
 
+/// Identity of every embedded artifact materialized into a bootstrap rootfs.
+///
+/// Including this in the image-cache key makes local, uncommitted guest-sandbox
+/// changes invalidate the cache even when the `OpenShell` version is unchanged.
+pub fn sandbox_guest_runtime_identity() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(SANDBOX);
+    hasher.update(VM_INIT);
+    hasher.update(UMOCI);
+    hasher.update(include_bytes!("../scripts/openshell-vm-sandbox-init.sh"));
+    format!("{:x}", hasher.finalize())
+}
+
+/// Materialize the supervisor embedded in the VM driver for host-side use.
+pub fn extract_host_supervisor(path: &Path) -> Result<(), String> {
+    if SUPERVISOR.is_empty() {
+        return Err(
+            "host supervisor is not embedded; run `mise run vm:supervisor` and rebuild openshell-driver-vm"
+                .to_string(),
+        );
+    }
+    let supervisor = embedded_host_supervisor()?;
+    install_host_supervisor_atomically(path, &supervisor)?;
+    validate_host_supervisor(path)
+}
+
+pub fn validate_host_supervisor(path: &Path) -> Result<(), String> {
+    validate_host_supervisor_digest(path, embedded_host_supervisor_digest()?)
+}
+
+fn validate_host_supervisor_digest(path: &Path, expected: [u8; 32]) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect cached host supervisor {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "cached host supervisor is not a regular file: {}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(format!(
+                "cached host supervisor is not executable: {}",
+                path.display()
+            ));
+        }
+    }
+    let actual = sha256_reader(
+        File::open(path)
+            .map_err(|error| format!("open cached host supervisor {}: {error}", path.display()))?,
+    )
+    .map_err(|error| format!("hash cached host supervisor {}: {error}", path.display()))?;
+    if actual != expected {
+        return Err(format!(
+            "cached host supervisor content does not match embedded runtime: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn embedded_host_supervisor() -> Result<Vec<u8>, String> {
+    zstd::decode_all(Cursor::new(SUPERVISOR))
+        .map_err(|error| format!("decompress host supervisor: {error}"))
+}
+
+fn embedded_host_supervisor_digest() -> Result<[u8; 32], String> {
+    static DIGEST: OnceLock<Result<[u8; 32], String>> = OnceLock::new();
+    DIGEST
+        .get_or_init(|| embedded_host_supervisor().map(|bytes| sha256_bytes(&bytes)))
+        .clone()
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn sha256_reader(mut reader: impl Read) -> std::io::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn install_host_supervisor_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| format!("host supervisor path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).map_err(|error| format!("create {}: {error}", parent.display()))?;
+    let temporary = parent.join(format!(
+        ".openshell-sandbox.tmp-{}-{}",
+        std::process::id(),
+        INJECTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o755);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| format!("create {}: {error}", temporary.display()))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("write {}: {error}", temporary.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("sync {}: {error}", temporary.display()))?;
+        fs::rename(&temporary, path).map_err(|error| {
+            format!(
+                "commit cached host supervisor {} to {}: {error}",
+                temporary.display(),
+                path.display()
+            )
+        })?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync host supervisor cache {}: {error}", parent.display()))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 #[allow(clippy::similar_names)]
 pub fn prepare_sandbox_rootfs_from_image_root(
     rootfs: &Path,
     image_identity: &str,
-    sandbox_uid: u32,
-    sandbox_gid: u32,
+    sandbox_uid: Option<u32>,
+    sandbox_gid: Option<u32>,
 ) -> Result<(), String> {
     prepare_sandbox_rootfs(rootfs, sandbox_uid, sandbox_gid)?;
     validate_sandbox_rootfs(rootfs)?;
@@ -205,6 +345,13 @@ pub fn write_rootfs_image_file(
     result
 }
 
+pub fn remove_rootfs_image_file(image_path: &Path, guest_path: &str) -> Result<(), String> {
+    let Some(quoted_guest_path) = debugfs_quote_absolute_path(guest_path) else {
+        return Err(format!("invalid debugfs guest path '{guest_path}'"));
+    };
+    run_debugfs(image_path, &format!("rm {quoted_guest_path}"))
+}
+
 pub fn set_rootfs_image_file_mode(
     image_path: &Path,
     guest_path: &str,
@@ -218,6 +365,41 @@ pub fn set_rootfs_image_file_mode(
         image_path,
         &format!("set_inode_field {quoted_guest_path} mode 0{regular_file_mode:o}"),
     )
+}
+
+/// Replay the ext4 journal and repair automatically correctable filesystem
+/// state before the driver mutates a preserved guest disk offline.
+pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
+    let mut failures = Vec::new();
+    let mut unavailable = Vec::new();
+
+    for candidate in e2fs_tool_candidates("e2fsck") {
+        let label = candidate.display().to_string();
+        match Command::new(&candidate)
+            .arg("-p")
+            .arg("-f")
+            .arg(image_path)
+            .output()
+        {
+            Ok(output) if matches!(output.status.code(), Some(0..=2)) => return Ok(()),
+            Ok(output) => failures.push(format!(
+                "{label} failed with status {}\nstdout: {}\nstderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                unavailable.push(format!("{label} not found"));
+            }
+            Err(error) => failures.push(format!("run {label}: {error}")),
+        }
+    }
+
+    Err(if failures.is_empty() {
+        unavailable.join("\n")
+    } else {
+        failures.join("\n")
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -375,7 +557,11 @@ fn append_symlink_to_archive(
 }
 
 #[allow(clippy::similar_names)]
-fn prepare_sandbox_rootfs(rootfs: &Path, sandbox_uid: u32, sandbox_gid: u32) -> Result<(), String> {
+fn prepare_sandbox_rootfs(
+    rootfs: &Path,
+    sandbox_uid: Option<u32>,
+    sandbox_gid: Option<u32>,
+) -> Result<(), String> {
     for relative in ["opt/openshell/.initialized", "opt/openshell/.rootfs-type"] {
         remove_rootfs_path(rootfs, relative)?;
     }
@@ -398,6 +584,7 @@ fn prepare_sandbox_rootfs(rootfs: &Path, sandbox_uid: u32, sandbox_gid: u32) -> 
     }
 
     ensure_supervisor_binary(rootfs)?;
+    ensure_vm_init_binary(rootfs)?;
     ensure_umoci_binary(rootfs)?;
 
     let opt_dir = rootfs.join("opt/openshell");
@@ -417,6 +604,7 @@ fn prepare_sandbox_rootfs(rootfs: &Path, sandbox_uid: u32, sandbox_gid: u32) -> 
 pub fn validate_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
     require_rootfs_path(rootfs, SANDBOX_GUEST_INIT_PATH)?;
     require_rootfs_path(rootfs, SANDBOX_SUPERVISOR_PATH)?;
+    require_rootfs_path(rootfs, SANDBOX_VM_INIT_PATH)?;
     require_rootfs_path(rootfs, SANDBOX_UMOCI_PATH)?;
     require_any_rootfs_path(rootfs, &["/bin/bash"])?;
     require_any_rootfs_path(rootfs, &["/bin/mount", "/usr/bin/mount"])?;
@@ -428,10 +616,6 @@ pub fn validate_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
             "/sbin/chroot",
             "/bin/chroot",
         ],
-    )?;
-    require_any_rootfs_path(
-        rootfs,
-        &["/sbin/ip", "/usr/sbin/ip", "/bin/ip", "/usr/bin/ip"],
     )?;
     require_any_rootfs_path(rootfs, &["/bin/sed", "/usr/bin/sed"])?;
     Ok(())
@@ -589,8 +773,7 @@ fn normalize_sandbox_owner_in_rootfs_image(source: &Path, image_path: &Path) -> 
         return Ok(());
     }
 
-    run_debugfs_batch(image_path, &commands)?;
-    write_rootfs_image_file(image_path, SANDBOX_OWNER_NORMALIZED_MARKER, b"1\n")
+    run_debugfs_batch(image_path, &commands)
 }
 
 fn collect_sandbox_owner_commands(
@@ -677,6 +860,136 @@ fn debugfs_quote_argument(argument: &str) -> Option<String> {
     Some(quoted)
 }
 
+/// Read the sandbox account identity directly from an ext4 rootfs image.
+///
+/// Persisted VM overlays may outlive the prepared-image cache layout that
+/// created them. Reading the matching old lower disk lets the driver preserve
+/// that overlay's real ownership contract during an upgrade.
+pub fn sandbox_guest_user_ids_from_image(image_path: &Path) -> Result<Option<(u32, u32)>, String> {
+    sandbox_guest_user_ids_from_image_path(image_path, "/etc/passwd")
+}
+
+/// Read a sandbox account copied into an overlay upper layer.
+///
+/// An upper-layer passwd file is the most direct evidence of the identity an
+/// existing overlay observed, so migration consults it before any lower image.
+pub fn sandbox_guest_user_ids_from_overlay_image(
+    image_path: &Path,
+) -> Result<Option<(u32, u32)>, String> {
+    sandbox_guest_user_ids_from_image_path(image_path, "/upper/etc/passwd")
+}
+
+/// Check, without mounting, whether an ext4 image has a directory at
+/// `guest_path`. Symlinks are not followed.
+pub fn ext4_image_has_directory(image_path: &Path, guest_path: &str) -> Result<bool, String> {
+    let quoted_path = debugfs_quote_absolute_path(guest_path)
+        .ok_or_else(|| format!("invalid debugfs guest path '{guest_path}'"))?;
+    let command = format!("stat {quoted_path}");
+    let mut last_error = None;
+
+    for candidate in e2fs_tool_candidates("debugfs") {
+        let label = candidate.display().to_string();
+        match Command::new(&candidate)
+            .arg("-R")
+            .arg(&command)
+            .arg(image_path)
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                // debugfs exits 0 whether or not the path exists; the answer
+                // is only in its output.
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stdout.contains("Type: directory") {
+                    return Ok(true);
+                }
+                if stdout.contains("Type: ") || stderr.contains("File not found") {
+                    return Ok(false);
+                }
+                return Err(format!(
+                    "debugfs command '{command}' produced unrecognized output for {}\nstdout: {stdout}\nstderr: {stderr}",
+                    image_path.display()
+                ));
+            }
+            Ok(output) => {
+                last_error = Some(format!(
+                    "{label} failed with status {}\nstdout: {}\nstderr: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                last_error = Some(format!("{label} not found"));
+            }
+            Err(error) => last_error = Some(format!("run {label}: {error}")),
+        }
+    }
+
+    Err(format!(
+        "debugfs command '{command}' failed for {}: {}. Install e2fsprogs (debugfs) and retry",
+        image_path.display(),
+        last_error.unwrap_or_else(|| "debugfs not found".to_string())
+    ))
+}
+
+fn sandbox_guest_user_ids_from_image_path(
+    image_path: &Path,
+    guest_path: &str,
+) -> Result<Option<(u32, u32)>, String> {
+    let metadata = fs::metadata(image_path)
+        .map_err(|error| format!("stat rootfs image {}: {error}", image_path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "rootfs image {} is not a regular file",
+            image_path.display()
+        ));
+    }
+
+    let quoted_path = debugfs_quote_absolute_path(guest_path)
+        .expect("the static passwd path is a valid debugfs path");
+    let command = format!("cat {quoted_path}");
+    let mut last_error = None;
+
+    for candidate in e2fs_tool_candidates("debugfs") {
+        let label = candidate.display().to_string();
+        match Command::new(&candidate)
+            .arg("-R")
+            .arg(&command)
+            .arg(image_path)
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let passwd = String::from_utf8(output.stdout).map_err(|error| {
+                    format!(
+                        "read {guest_path} from {} as UTF-8: {error}",
+                        image_path.display()
+                    )
+                })?;
+                return parse_sandbox_guest_user_ids(&passwd, &image_path.display().to_string());
+            }
+            Ok(output) => {
+                last_error = Some(format!(
+                    "{label} failed with status {}\nstdout: {}\nstderr: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                last_error = Some(format!("{label} not found"));
+            }
+            Err(error) => last_error = Some(format!("run {label}: {error}")),
+        }
+    }
+
+    Err(format!(
+        "debugfs command '{command}' failed for {}: {}. Install e2fsprogs (debugfs) and retry",
+        image_path.display(),
+        last_error.unwrap_or_else(|| "debugfs not found".to_string())
+    ))
+}
+
 fn sandbox_guest_user_ids(rootfs: &Path) -> Result<Option<(u32, u32)>, String> {
     let passwd_path = rootfs.join("etc/passwd");
     if !passwd_path.exists() {
@@ -685,6 +998,10 @@ fn sandbox_guest_user_ids(rootfs: &Path) -> Result<Option<(u32, u32)>, String> {
 
     let passwd = fs::read_to_string(&passwd_path)
         .map_err(|e| format!("read {}: {e}", passwd_path.display()))?;
+    parse_sandbox_guest_user_ids(&passwd, &passwd_path.display().to_string())
+}
+
+fn parse_sandbox_guest_user_ids(passwd: &str, source: &str) -> Result<Option<(u32, u32)>, String> {
     for line in passwd.lines() {
         let mut parts = line.split(':');
         if parts.next() != Some("sandbox") {
@@ -693,14 +1010,14 @@ fn sandbox_guest_user_ids(rootfs: &Path) -> Result<Option<(u32, u32)>, String> {
         let _password = parts.next();
         let uid = parts
             .next()
-            .ok_or_else(|| format!("sandbox entry in {} is missing uid", passwd_path.display()))?
+            .ok_or_else(|| format!("sandbox entry in {source} is missing uid"))?
             .parse::<u32>()
-            .map_err(|e| format!("sandbox uid in {} is invalid: {e}", passwd_path.display()))?;
+            .map_err(|e| format!("sandbox uid in {source} is invalid: {e}"))?;
         let gid = parts
             .next()
-            .ok_or_else(|| format!("sandbox entry in {} is missing gid", passwd_path.display()))?
+            .ok_or_else(|| format!("sandbox entry in {source} is missing gid"))?
             .parse::<u32>()
-            .map_err(|e| format!("sandbox gid in {} is invalid: {e}", passwd_path.display()))?;
+            .map_err(|e| format!("sandbox gid in {source} is invalid: {e}"))?;
         return Ok(Some((uid, gid)));
     }
 
@@ -811,26 +1128,35 @@ fn temporary_injection_path(image_path: &Path) -> PathBuf {
 #[allow(clippy::similar_names)]
 fn ensure_sandbox_guest_user(
     rootfs: &Path,
-    sandbox_uid: u32,
-    sandbox_gid: u32,
+    sandbox_uid: Option<u32>,
+    sandbox_gid: Option<u32>,
 ) -> Result<(), String> {
+    // An image's sandbox account is part of its filesystem contract. Leave it
+    // intact unless an operator explicitly configured either side of the
+    // identity. A missing account still gets the OpenShell default.
+    if sandbox_uid.is_none() && sandbox_gid.is_none() && sandbox_guest_user_ids(rootfs)?.is_some() {
+        return Ok(());
+    }
+
+    let sandbox_uid = sandbox_uid.unwrap_or(DEFAULT_SANDBOX_UID);
+    let sandbox_gid = sandbox_gid.unwrap_or(sandbox_uid);
     let etc_dir = rootfs.join("etc");
     fs::create_dir_all(&etc_dir).map_err(|e| format!("create {}: {e}", etc_dir.display()))?;
 
-    ensure_line_in_file(
+    replace_or_append_line(
         &etc_dir.join("group"),
         &format!("sandbox:x:{sandbox_gid}:"),
         |line| line.starts_with("sandbox:"),
     )?;
-    ensure_line_in_file(&etc_dir.join("gshadow"), "sandbox:!::", |line| {
+    replace_or_append_line(&etc_dir.join("gshadow"), "sandbox:!::", |line| {
         line.starts_with("sandbox:")
     })?;
-    ensure_line_in_file(
+    replace_or_append_line(
         &etc_dir.join("passwd"),
         &format!("sandbox:x:{sandbox_uid}:{sandbox_gid}:OpenShell Sandbox:/sandbox:/bin/bash"),
         |line| line.starts_with("sandbox:"),
     )?;
-    ensure_line_in_file(
+    replace_or_append_line(
         &etc_dir.join("shadow"),
         "sandbox:!:20123:0:99999:7:::",
         |line| line.starts_with("sandbox:"),
@@ -839,28 +1165,36 @@ fn ensure_sandbox_guest_user(
     Ok(())
 }
 
-fn ensure_line_in_file(
+fn replace_or_append_line(
     path: &Path,
     line: &str,
-    exists: impl Fn(&str) -> bool,
+    matches: impl Fn(&str) -> bool,
 ) -> Result<(), String> {
-    let mut contents = if path.exists() {
+    let contents = if path.exists() {
         fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?
     } else {
         String::new()
     };
-
-    if contents.lines().any(exists) {
-        return Ok(());
+    let mut output = String::with_capacity(contents.len().max(line.len() + 1));
+    let mut replaced = false;
+    for existing in contents.lines() {
+        if matches(existing) {
+            if replaced {
+                continue;
+            }
+            output.push_str(line);
+            replaced = true;
+        } else {
+            output.push_str(existing);
+        }
+        output.push('\n');
+    }
+    if !replaced {
+        output.push_str(line);
+        output.push('\n');
     }
 
-    if !contents.is_empty() && !contents.ends_with('\n') {
-        contents.push('\n');
-    }
-    contents.push_str(line);
-    contents.push('\n');
-
-    fs::write(path, contents).map_err(|e| format!("write {}: {e}", path.display()))
+    fs::write(path, output).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 fn ensure_supervisor_binary(rootfs: &Path) -> Result<(), String> {
@@ -877,9 +1211,38 @@ fn ensure_supervisor_binary(rootfs: &Path) -> Result<(), String> {
             fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
         }
 
-        let supervisor = zstd::decode_all(Cursor::new(SUPERVISOR))
-            .map_err(|e| format!("decompress supervisor: {e}"))?;
-        fs::write(&path, supervisor).map_err(|e| format!("write {}: {e}", path.display()))?;
+        let sandbox = zstd::decode_all(Cursor::new(SANDBOX))
+            .map_err(|e| format!("decompress sandbox: {e}"))?;
+        fs::write(&path, sandbox).map_err(|e| format!("write {}: {e}", path.display()))?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn ensure_vm_init_binary(rootfs: &Path) -> Result<(), String> {
+    let path = rootfs.join(SANDBOX_VM_INIT_PATH.trim_start_matches('/'));
+    if VM_INIT.is_empty() {
+        if !path.exists() {
+            return Err(
+                "VM guest init helper not embedded. Build openshell-driver-vm with OPENSHELL_VM_RUNTIME_COMPRESSED_DIR set and run `mise run vm:supervisor` first"
+                    .to_string(),
+            );
+        }
+    } else {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+        let helper = zstd::decode_all(Cursor::new(VM_INIT))
+            .map_err(|e| format!("decompress VM guest init helper: {e}"))?;
+        fs::write(&path, helper).map_err(|e| format!("write {}: {e}", path.display()))?;
     }
 
     #[cfg(unix)]
@@ -966,9 +1329,35 @@ fn remove_rootfs_path(rootfs: &Path, relative: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_supervisor_cache_rejects_wrong_content_and_installs_atomically() {
+        let directory = tempfile::tempdir().expect("cache directory");
+        let destination = directory.path().join("openshell-sandbox");
+        fs::write(&destination, b"stale executable").expect("write stale cache");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
+            .expect("make stale cache executable");
+        let expected = sha256_bytes(b"trusted supervisor");
+
+        assert!(validate_host_supervisor_digest(&destination, expected).is_err());
+        install_host_supervisor_atomically(&destination, b"trusted supervisor")
+            .expect("atomically replace cache");
+        validate_host_supervisor_digest(&destination, expected).expect("validate installed cache");
+        assert_eq!(fs::read(&destination).unwrap(), b"trusted supervisor");
+        assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+    }
 
     #[test]
     fn prepare_sandbox_rootfs_rewrites_guest_layout() {
@@ -981,10 +1370,10 @@ mod tests {
         write_fake_runtime_binaries(&rootfs);
         fs::write(
             rootfs.join("etc/passwd"),
-            "root:x:0:0:root:/root:/bin/bash\n",
+            "root:x:0:0:root:/root:/bin/bash\nsandbox:x:998:997:Sandbox:/sandbox:/bin/sh\n",
         )
         .expect("write passwd");
-        fs::write(rootfs.join("etc/group"), "root:x:0:\n").expect("write group");
+        fs::write(rootfs.join("etc/group"), "root:x:0:\nsandbox:x:997:\n").expect("write group");
         fs::write(rootfs.join("etc/hosts"), "127.0.0.1 localhost\n").expect("write hosts");
         fs::create_dir_all(rootfs.join("bin")).expect("create bin");
         fs::create_dir_all(rootfs.join("sbin")).expect("create sbin");
@@ -996,11 +1385,30 @@ mod tests {
 
         // Use a non-standard UID so the test doesn't collide with the default.
         let uid = 20001;
-        prepare_sandbox_rootfs(&rootfs, uid, uid).expect("prepare sandbox rootfs");
+        prepare_sandbox_rootfs(&rootfs, Some(uid), Some(uid)).expect("prepare sandbox rootfs");
         validate_sandbox_rootfs(&rootfs).expect("validate sandbox rootfs");
 
         assert!(rootfs.join("srv/openshell-vm-sandbox-init.sh").is_file());
         assert!(rootfs.join("opt/openshell/bin/umoci").is_file());
+        assert!(rootfs.join("opt/openshell/bin/openshell-vm-init").is_file());
+        let init_script = fs::read_to_string(rootfs.join("srv/openshell-vm-sandbox-init.sh"))
+            .expect("read guest init");
+        assert!(
+            init_script.contains(
+                "launch-capability-free \"$_sandbox_uid\" \"$_sandbox_gid\" \"$_sandbox_bootstrap_guest\""
+            )
+        );
+        assert!(init_script.contains("OPENSHELL_VM_SANDBOX_BOOTSTRAP"));
+        assert!(init_script.contains("    reconcile_sandbox_account\n    setup_sandbox_workdir"));
+        assert!(
+            init_script
+                .contains("chown \"${_sandbox_uid}:${_sandbox_gid}\" \"$_sandbox_state_dir\"")
+        );
+        assert!(init_script.contains("chmod 0700 \"$_sandbox_state_dir\""));
+        assert!(!init_script.contains("--backend-name=in-pod"));
+        assert!(!init_script.contains("@ISOLATION_INTERFACE_VERSION@"));
+        assert!(!init_script.contains("8.8.8.8"));
+        assert!(!init_script.contains("VM_NET_"));
         assert!(rootfs.join("sandbox").is_dir());
         assert!(rootfs.join("image-cache").is_dir());
         assert!(rootfs.join("lower").is_dir());
@@ -1012,18 +1420,14 @@ mod tests {
                 .next()
                 .is_none()
         );
-        assert!(
-            fs::read_to_string(rootfs.join("etc/passwd"))
-                .expect("read passwd")
-                .contains(&format!(
-                    "sandbox:x:{uid}:{uid}:OpenShell Sandbox:/sandbox:/bin/bash"
-                ))
-        );
-        assert!(
-            fs::read_to_string(rootfs.join("etc/group"))
-                .expect("read group")
-                .contains(&format!("sandbox:x:{uid}:"))
-        );
+        let passwd = fs::read_to_string(rootfs.join("etc/passwd")).expect("read passwd");
+        assert!(passwd.contains(&format!(
+            "sandbox:x:{uid}:{uid}:OpenShell Sandbox:/sandbox:/bin/bash"
+        )));
+        assert!(!passwd.contains("sandbox:x:998:997:"));
+        let group = fs::read_to_string(rootfs.join("etc/group")).expect("read group");
+        assert!(group.contains(&format!("sandbox:x:{uid}:")));
+        assert!(!group.contains("sandbox:x:997:"));
         assert_eq!(
             fs::read_to_string(rootfs.join("etc/hosts")).expect("read hosts"),
             "127.0.0.1 localhost\n"
@@ -1042,7 +1446,7 @@ mod tests {
         fs::create_dir_all(rootfs.join("sandbox")).expect("create sandbox workdir");
         fs::write(rootfs.join("sandbox/app.py"), "print('hello')\n").expect("write app");
 
-        prepare_sandbox_rootfs(&rootfs, 10001, 10001).expect("prepare sandbox rootfs");
+        prepare_sandbox_rootfs(&rootfs, Some(10001), Some(10001)).expect("prepare sandbox rootfs");
 
         assert!(rootfs.join("sandbox").is_dir());
         assert_eq!(
@@ -1148,6 +1552,57 @@ mod tests {
         let mut tail = [0_u8; 4];
         dest_file.read_exact(&mut tail).expect("read tail");
         assert_eq!(&tail, b"tail");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_rootfs_image_accepts_clean_ext4_image() {
+        if !e2fs_tool_candidates("e2fsck")
+            .iter()
+            .any(|candidate| Command::new(candidate).arg("-V").output().is_ok())
+        {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let source = dir.join("source");
+        let image = dir.join("overlay.ext4");
+        fs::create_dir_all(source.join("upper")).expect("create source upperdir");
+        fs::create_dir_all(source.join("work")).expect("create source workdir");
+        create_ext4_image_from_dir_with_size(&source, &image, 64 * 1024 * 1024)
+            .expect("create ext4 image");
+
+        recover_rootfs_image(&image).expect("recover clean ext4 image");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ext4_image_has_directory_distinguishes_directories_files_and_missing_paths() {
+        if !e2fs_tool_candidates("debugfs")
+            .iter()
+            .any(|candidate| Command::new(candidate).arg("-V").output().is_ok())
+        {
+            return;
+        }
+
+        let dir = unique_temp_dir();
+        let source = dir.join("source");
+        let image = dir.join("prepared.ext4");
+        fs::create_dir_all(source.join("image-rootfs/bin")).expect("create image rootfs");
+        fs::write(source.join("regular"), "file\n").expect("write regular file");
+        create_ext4_image_from_dir_with_size(&source, &image, 64 * 1024 * 1024)
+            .expect("create ext4 image");
+
+        assert!(ext4_image_has_directory(&image, "/image-rootfs").expect("stat directory"));
+        assert!(!ext4_image_has_directory(&image, "/regular").expect("stat regular file"));
+        assert!(!ext4_image_has_directory(&image, "/missing").expect("stat missing path"));
+        assert!(ext4_image_has_directory(&image, "relative").is_err());
+
+        let not_ext4 = dir.join("not-ext4.img");
+        fs::write(&not_ext4, vec![0_u8; 64 * 1024]).expect("write non-ext4 image");
+        assert!(ext4_image_has_directory(&not_ext4, "/image-rootfs").is_err());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1287,6 +1742,11 @@ mod tests {
             b"sandbox",
         )
         .expect("write openshell-sandbox");
+        fs::write(
+            rootfs.join("opt/openshell/bin/openshell-vm-init"),
+            b"vm-init",
+        )
+        .expect("write openshell-vm-init");
         fs::write(rootfs.join("opt/openshell/bin/umoci"), b"umoci").expect("write umoci");
     }
 }

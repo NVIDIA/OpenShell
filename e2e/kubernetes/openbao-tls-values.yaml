@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+global:
+  tlsDisable: false
+
+server:
+  extraArgs: -dev-tls -dev-tls-cert-dir=/openbao/tls
+  extraEnvironmentVars:
+    BAO_CACERT: /openbao/tls/vault-ca.pem
+  volumes:
+    - name: dev-tls
+      emptyDir: {}
+  volumeMounts:
+    - name: dev-tls
+      mountPath: /openbao/tls

@@ -27,8 +27,38 @@ type InteractiveSession interface {
 	Read(p []byte) (int, error)
 	Write(p []byte) (int, error)
 	Resize(cols, rows uint32) error
+	// ExitCode waits for final stream completion. An observed exit code is
+	// returned alongside any later transport error. Drain Read concurrently.
 	ExitCode() (int, error)
 	Close() error
+}
+
+// InteractiveSessionControl adds optional input closure and cancellation to
+// InteractiveSession without requiring existing implementations to add methods.
+// Sessions returned by this SDK implement both interfaces.
+type InteractiveSessionControl interface {
+	InteractiveSession
+	// CloseWrite ends stdin and resize input without cancelling output.
+	CloseWrite() error
+	// Cancel aborts the RPC. Close retains the same full-close behavior.
+	Cancel() error
+}
+
+// CloseInteractiveInput ends input while preserving output when supported.
+// Unsupported sessions return ErrorUnimplemented and are left open.
+func CloseInteractiveInput(session InteractiveSession) error {
+	if closer, ok := session.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return &StatusError{Code: ErrorUnimplemented, Message: "interactive session does not support closing input independently"}
+}
+
+// CancelInteractive aborts a session, falling back to the original Close contract.
+func CancelInteractive(session InteractiveSession) error {
+	if canceler, ok := session.(interface{ Cancel() error }); ok {
+		return canceler.Cancel()
+	}
+	return session.Close()
 }
 
 // ExecInterface defines command execution operations on sandboxes.

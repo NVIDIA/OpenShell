@@ -7,6 +7,7 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
 	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
@@ -17,6 +18,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type mockWorkspaceServer struct {
@@ -118,7 +120,7 @@ func testWorkspace() *dm.Workspace {
 		Metadata: &dm.ObjectMeta{
 			Id:              "ws-1",
 			Name:            "test-ws",
-			CreatedAtMs:     1700000000000,
+			CreatedTime:     timestamppb.New(time.UnixMilli(1700000000000)),
 			Labels:          map[string]string{"team": "platform"},
 			ResourceVersion: 1,
 		},
@@ -223,7 +225,7 @@ func TestWorkspaceList_Success(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	workspaces, err := wc.List(context.Background())
+	workspaces, err := wc.ListAll(context.Background())
 
 	require.NoError(t, err)
 	require.Len(t, workspaces, 1)
@@ -238,27 +240,38 @@ func TestWorkspaceList_WithOptions(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	_, err := wc.List(context.Background(), ListOptions{
-		Limit:         10,
-		Offset:        5,
+	_, err := wc.ListAll(context.Background(), ListOptions{
+		PageSize:      10,
 		LabelSelector: "team=platform",
 	})
 
 	require.NoError(t, err)
-	assert.Equal(t, uint32(10), mock.lastListReq.GetLimit())
-	assert.Equal(t, uint32(5), mock.lastListReq.GetOffset())
+	assert.Equal(t, int32(10), mock.lastListReq.GetPageSize())
+	assert.Empty(t, mock.lastListReq.GetPageToken())
 	assert.Equal(t, "team=platform", mock.lastListReq.GetLabelSelector())
+}
+
+func TestWorkspaceList_EmptyReturnsNonNilSlice(t *testing.T) {
+	mock := &mockWorkspaceServer{listResp: &pb.ListWorkspacesResponse{}}
+	conn, cleanup := newMockWorkspaceServer(mock)
+	defer cleanup()
+
+	workspaces, err := newWorkspaceClient(conn).ListAll(context.Background())
+
+	require.NoError(t, err)
+	assert.NotNil(t, workspaces)
+	assert.Empty(t, workspaces)
 }
 
 func TestWorkspaceDelete_Success(t *testing.T) {
 	mock := &mockWorkspaceServer{
-		deleteResp: &pb.DeleteWorkspaceResponse{Deleted: true},
+		deleteResp: &pb.DeleteWorkspaceResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED},
 	}
 	conn, cleanup := newMockWorkspaceServer(mock)
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	err := wc.Delete(context.Background(), "test-ws")
+	_, err := wc.Delete(context.Background(), "test-ws")
 
 	require.NoError(t, err)
 }
@@ -269,7 +282,7 @@ func TestWorkspaceDelete_EmptyName(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	err := wc.Delete(context.Background(), "")
+	_, err := wc.Delete(context.Background(), "")
 
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
@@ -283,7 +296,7 @@ func TestWorkspaceDelete_NotFound(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	err := wc.Delete(context.Background(), "missing-ws")
+	_, err := wc.Delete(context.Background(), "missing-ws")
 
 	require.Error(t, err)
 	assert.True(t, IsNotFound(err))
@@ -296,7 +309,7 @@ func testMember() *pb.WorkspaceMember {
 		Metadata: &dm.ObjectMeta{
 			Id:              "mem-1",
 			Name:            "member-auto",
-			CreatedAtMs:     1700000000000,
+			CreatedTime:     timestamppb.New(time.UnixMilli(1700000000000)),
 			ResourceVersion: 1,
 		},
 		PrincipalSubject: "user@example.com",
@@ -318,7 +331,7 @@ func TestAddMember_Success(t *testing.T) {
 	require.NotNil(t, m)
 	assert.Equal(t, "user@example.com", m.PrincipalSubject)
 	assert.Equal(t, WorkspaceRoleAdmin, m.Role)
-	assert.Equal(t, "test-ws", mock.lastAddMemberReq.GetWorkspace())
+	assert.Equal(t, "test-ws", mock.lastAddMemberReq.GetWorkspaceScope().GetWorkspace())
 	assert.Equal(t, "user@example.com", mock.lastAddMemberReq.GetPrincipalSubject())
 }
 
@@ -374,13 +387,13 @@ func TestAddMember_AlreadyExists(t *testing.T) {
 
 func TestRemoveMember_Success(t *testing.T) {
 	mock := &mockWorkspaceServer{
-		removeMemberResp: &pb.RemoveWorkspaceMemberResponse{Removed: true},
+		removeMemberResp: &pb.RemoveWorkspaceMemberResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED},
 	}
 	conn, cleanup := newMockWorkspaceServer(mock)
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	err := wc.RemoveMember(context.Background(), "test-ws", "user@example.com")
+	_, err := wc.RemoveMember(context.Background(), "test-ws", "user@example.com")
 
 	require.NoError(t, err)
 }
@@ -391,7 +404,7 @@ func TestRemoveMember_EmptyWorkspace(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	err := wc.RemoveMember(context.Background(), "", "user@example.com")
+	_, err := wc.RemoveMember(context.Background(), "", "user@example.com")
 
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
@@ -403,7 +416,7 @@ func TestRemoveMember_EmptySubject(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	err := wc.RemoveMember(context.Background(), "test-ws", "")
+	_, err := wc.RemoveMember(context.Background(), "test-ws", "")
 
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
@@ -417,7 +430,7 @@ func TestRemoveMember_NotFound(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	err := wc.RemoveMember(context.Background(), "test-ws", "missing@example.com")
+	_, err := wc.RemoveMember(context.Background(), "test-ws", "missing@example.com")
 
 	require.Error(t, err)
 	assert.True(t, IsNotFound(err))
@@ -433,7 +446,7 @@ func TestListMembers_Success(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	members, err := wc.ListMembers(context.Background(), "test-ws")
+	members, err := wc.ListAllMembers(context.Background(), "test-ws")
 
 	require.NoError(t, err)
 	require.Len(t, members, 1)
@@ -446,10 +459,24 @@ func TestListMembers_EmptyWorkspace(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	_, err := wc.ListMembers(context.Background(), "")
+	_, err := wc.ListAllMembers(context.Background(), "")
 
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
+}
+
+func TestListMembers_EmptyResultReturnsNonNilSlice(t *testing.T) {
+	mock := &mockWorkspaceServer{
+		listMembersResp: &pb.ListWorkspaceMembersResponse{},
+	}
+	conn, cleanup := newMockWorkspaceServer(mock)
+	defer cleanup()
+
+	members, err := newWorkspaceClient(conn).ListAllMembers(context.Background(), "test-ws")
+
+	require.NoError(t, err)
+	assert.NotNil(t, members)
+	assert.Empty(t, members)
 }
 
 func TestListMembers_WithOptions(t *testing.T) {
@@ -460,9 +487,9 @@ func TestListMembers_WithOptions(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	_, err := wc.ListMembers(context.Background(), "test-ws", ListOptions{Limit: 5, Offset: 2})
+	_, err := wc.ListAllMembers(context.Background(), "test-ws", ListOptions{PageSize: 5})
 
 	require.NoError(t, err)
-	assert.Equal(t, uint32(5), mock.lastListMembersReq.GetLimit())
-	assert.Equal(t, uint32(2), mock.lastListMembersReq.GetOffset())
+	assert.Equal(t, int32(5), mock.lastListMembersReq.GetPageSize())
+	assert.Empty(t, mock.lastListMembersReq.GetPageToken())
 }

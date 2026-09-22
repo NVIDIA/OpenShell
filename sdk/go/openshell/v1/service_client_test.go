@@ -30,6 +30,7 @@ type mockServiceServer struct {
 	getErr    error
 	listErr   error
 	deleteErr error
+	lastList  *pb.ListServicesRequest
 }
 
 func newMockServiceServer() *mockServiceServer {
@@ -52,19 +53,19 @@ func (s *mockServiceServer) ExposeService(_ context.Context, req *pb.ExposeServi
 	resp := &pb.ServiceEndpointResponse{
 		Endpoint: &pb.ServiceEndpoint{
 			Metadata: &dm.ObjectMeta{
-				Id: "ep-" + req.GetService(),
+				Id: "ep-" + req.GetName(),
 			},
-			SandboxName: req.GetSandbox(),
-			ServiceName: req.GetService(),
-			TargetPort:  req.GetTargetPort(),
-			Domain:      req.GetDomain(),
+			Sandbox:    req.GetSandbox(),
+			Name:       req.GetName(),
+			TargetPort: req.GetTargetPort(),
+			Domain:     req.GetDomain(),
 		},
 	}
 	if req.GetDomain() {
-		resp.Url = "https://" + req.GetService() + ".example.com"
+		resp.Url = "https://" + req.GetName() + ".example.com"
 	}
 
-	s.endpoints[serviceKey(req.GetSandbox(), req.GetService())] = resp
+	s.endpoints[serviceKey(req.GetSandbox(), req.GetName())] = resp
 	return resp, nil
 }
 
@@ -75,9 +76,10 @@ func (s *mockServiceServer) GetService(_ context.Context, req *pb.GetServiceRequ
 		return nil, s.getErr
 	}
 
-	ep, ok := s.endpoints[serviceKey(req.GetSandbox(), req.GetService())]
+	sandboxName := req.GetSandbox()
+	ep, ok := s.endpoints[serviceKey(sandboxName, req.GetName())]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "service %q not found in sandbox %q", req.GetService(), req.GetSandbox())
+		return nil, status.Errorf(codes.NotFound, "service %q not found in sandbox %q", req.GetName(), sandboxName)
 	}
 	return ep, nil
 }
@@ -85,14 +87,16 @@ func (s *mockServiceServer) GetService(_ context.Context, req *pb.GetServiceRequ
 func (s *mockServiceServer) ListServices(_ context.Context, req *pb.ListServicesRequest) (*pb.ListServicesResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.lastList = req
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
 
 	var services []*pb.ServiceEndpointResponse
 	for key, ep := range s.endpoints {
-		prefix := req.GetSandbox() + "/"
-		if req.GetSandbox() == "" || (len(key) >= len(prefix) && key[:len(prefix)] == prefix) {
+		sandboxName := req.GetSandbox()
+		prefix := sandboxName + "/"
+		if sandboxName == "" || (len(key) >= len(prefix) && key[:len(prefix)] == prefix) {
 			services = append(services, ep)
 		}
 	}
@@ -106,13 +110,14 @@ func (s *mockServiceServer) DeleteService(_ context.Context, req *pb.DeleteServi
 		return nil, s.deleteErr
 	}
 
-	key := serviceKey(req.GetSandbox(), req.GetService())
+	sandboxName := req.GetSandbox()
+	key := serviceKey(sandboxName, req.GetName())
 	_, ok := s.endpoints[key]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "service %q not found in sandbox %q", req.GetService(), req.GetSandbox())
+		return nil, status.Errorf(codes.NotFound, "service %q not found in sandbox %q", req.GetName(), sandboxName)
 	}
 	delete(s.endpoints, key)
-	return &pb.DeleteServiceResponse{Deleted: true}, nil
+	return &pb.DeleteServiceResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED}, nil
 }
 
 // --- Test setup ---
@@ -150,8 +155,8 @@ func TestServiceExpose(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, ep)
 	assert.Equal(t, "ep-api", ep.ID)
-	assert.Equal(t, "web-app", ep.SandboxName)
-	assert.Equal(t, "api", ep.ServiceName)
+	assert.Equal(t, "web-app", ep.Sandbox)
+	assert.Equal(t, "api", ep.Name)
 	assert.Equal(t, uint32(8080), ep.TargetPort)
 	assert.True(t, ep.Domain)
 	assert.Equal(t, "https://api.example.com", ep.URL)
@@ -196,8 +201,8 @@ func TestServiceGet(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, ep)
-	assert.Equal(t, "api", ep.ServiceName)
-	assert.Equal(t, "web-app", ep.SandboxName)
+	assert.Equal(t, "api", ep.Name)
+	assert.Equal(t, "web-app", ep.Sandbox)
 }
 
 func TestServiceGet_NotFound(t *testing.T) {
@@ -235,7 +240,7 @@ func TestServiceList(t *testing.T) {
 	_, err = client.Expose(context.Background(), "default", "web-app", "web", 3000, false)
 	require.NoError(t, err)
 
-	endpoints, err := client.List(context.Background(), "default", "web-app")
+	endpoints, err := client.ListAll(context.Background(), "default", "web-app")
 
 	require.NoError(t, err)
 	assert.Len(t, endpoints, 2)
@@ -246,9 +251,10 @@ func TestServiceList_Empty(t *testing.T) {
 	client, cleanup := setupServiceTest(t, mock)
 	defer cleanup()
 
-	endpoints, err := client.List(context.Background(), "default", "web-app")
+	endpoints, err := client.ListAll(context.Background(), "default", "web-app")
 
 	require.NoError(t, err)
+	assert.NotNil(t, endpoints)
 	assert.Empty(t, endpoints)
 }
 
@@ -260,10 +266,27 @@ func TestServiceList_WithOptions(t *testing.T) {
 	_, err := client.Expose(context.Background(), "default", "web-app", "api", 8080, true)
 	require.NoError(t, err)
 
-	endpoints, err := client.List(context.Background(), "default", "web-app", ListOptions{Limit: 10, Offset: 0})
+	endpoints, err := client.ListAll(context.Background(), "default", "web-app", ListOptions{PageSize: 10})
 
 	require.NoError(t, err)
 	assert.Len(t, endpoints, 1)
+}
+
+func TestServiceListAll_SelectsAllWorkspaces(t *testing.T) {
+	mock := newMockServiceServer()
+	client, cleanup := setupServiceTest(t, mock)
+	defer cleanup()
+
+	endpoints, err := client.ListAll(context.Background(), "", "", ListOptions{
+		PageSize:      10,
+		AllWorkspaces: true,
+	})
+
+	require.NoError(t, err)
+	assert.Empty(t, endpoints)
+	require.NotNil(t, mock.lastList)
+	assert.Empty(t, mock.lastList.GetSandbox())
+	assert.NotNil(t, mock.lastList.GetWorkspaceScope().GetAllWorkspaces())
 }
 
 func TestServiceList_Error(t *testing.T) {
@@ -272,7 +295,7 @@ func TestServiceList_Error(t *testing.T) {
 	client, cleanup := setupServiceTest(t, mock)
 	defer cleanup()
 
-	endpoints, err := client.List(context.Background(), "default", "web-app")
+	endpoints, err := client.ListAll(context.Background(), "default", "web-app")
 
 	assert.Nil(t, endpoints)
 	require.Error(t, err)
@@ -288,7 +311,7 @@ func TestServiceDelete(t *testing.T) {
 	_, err := client.Expose(context.Background(), "default", "web-app", "api", 8080, true)
 	require.NoError(t, err)
 
-	err = client.Delete(context.Background(), "default", "web-app", "api")
+	_, err = client.Delete(context.Background(), "default", "web-app", "api")
 
 	require.NoError(t, err)
 
@@ -304,7 +327,7 @@ func TestServiceDelete_NotFound(t *testing.T) {
 	client, cleanup := setupServiceTest(t, mock)
 	defer cleanup()
 
-	err := client.Delete(context.Background(), "default", "web-app", "nonexistent")
+	_, err := client.Delete(context.Background(), "default", "web-app", "nonexistent")
 
 	require.Error(t, err)
 	assert.True(t, IsNotFound(err))
@@ -316,7 +339,7 @@ func TestServiceDelete_Error(t *testing.T) {
 	client, cleanup := setupServiceTest(t, mock)
 	defer cleanup()
 
-	err := client.Delete(context.Background(), "default", "web-app", "api")
+	_, err := client.Delete(context.Background(), "default", "web-app", "api")
 
 	require.Error(t, err)
 }

@@ -3,19 +3,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# The static sandbox binary is staged at:
-#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-sandbox
-#
-# Alpine supplies nftables and iptables for pod-namespace egress enforcement.
+# The dynamically linked GNU supervisor binary is staged under
+# deploy/docker/.build/prebuilt-binaries/<arch>/.
 
-FROM alpine:3.22 AS supervisor
+# Keep the GNU runtime and CA roots without a shell or unused native TLS libraries.
+# The default variant preserves UID 0 and /; compute drivers set the runtime UID.
+FROM gcr.io/distroless/base-nossl-debian13@sha256:af5cb8dd589b8520b8c06bebb9efb73d7e16406cab58e85c51761fff49d370a0 AS supervisor
 
 ARG TARGETARCH
 
-RUN apk add --no-cache nftables iptables iptables-legacy
+COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-supervisor /openshell-supervisor
 
-# Keep the binary root-owned for Podman image-volume mounts and executable by
-# the Kubernetes network sidecar's non-root proxy UID.
-COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /openshell-sandbox
-
-ENTRYPOINT ["/openshell-sandbox"]
+ENTRYPOINT ["/openshell-supervisor"]

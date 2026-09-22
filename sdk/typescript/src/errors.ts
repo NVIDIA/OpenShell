@@ -7,6 +7,20 @@
 // an identical contract.
 
 import { Code, ConnectError } from '@connectrpc/connect';
+import { BadRequestSchema, ErrorInfoSchema, RetryInfoSchema } from './gen/google/rpc/error_details_pb.js';
+
+/** A field rejected by the gateway. */
+export interface FieldViolation {
+  field: string;
+  description: string;
+}
+
+/** A stable error reason scoped to its producing service. */
+export interface ErrorInfo {
+  reason: string;
+  domain: string;
+  metadata: Record<string, string>;
+}
 
 export type SdkErrorCode =
   | 'invalid_config'
@@ -32,12 +46,32 @@ export class SdkError extends Error {
   readonly code: SdkErrorCode;
   /** The Connect status code when this error originated from an RPC. */
   readonly connectCode?: Code;
+  /** Decoded field violations; the complete wire details remain in cause. */
+  readonly fieldViolations: FieldViolation[] = [];
+  /** Server-provided reason, domain, and metadata, when present. */
+  readonly errorInfo?: ErrorInfo;
+  /** Suggested minimum delay in milliseconds; does not establish mutation retry safety. */
+  readonly retryDelayMs?: number;
   constructor(code: SdkErrorCode, message: string, options?: SdkErrorOptions) {
     // Format `[code] message` so errorCode() can recover the code from any Error.
     super(`[${code}] ${message}`, options?.cause !== undefined ? { cause: options.cause } : undefined);
     this.name = 'SdkError';
     this.code = code;
     if (options?.connectCode !== undefined) this.connectCode = options.connectCode;
+    if (options?.cause instanceof ConnectError) {
+      const error = options.cause;
+      this.fieldViolations = error
+        .findDetails(BadRequestSchema)
+        .flatMap((detail) => detail.fieldViolations.map(({ field, description }) => ({ field, description })));
+      const info = error.findDetails(ErrorInfoSchema)[0];
+      if (info) {
+        this.errorInfo = { reason: info.reason, domain: info.domain, metadata: { ...info.metadata } };
+      }
+      const delay = error.findDetails(RetryInfoSchema)[0]?.retryDelay;
+      if (delay && delay.seconds >= 0n && delay.seconds <= 315576000000n && delay.nanos >= 0 && delay.nanos < 1e9) {
+        this.retryDelayMs = Number(delay.seconds) * 1000 + delay.nanos / 1e6;
+      }
+    }
   }
 }
 
@@ -72,6 +106,7 @@ export function fromConnect(err: unknown): SdkError {
 
 // Extract the `[code]` prefix from any error message.
 export function errorCode(err: unknown): string | null {
+  if (err instanceof SdkError) return err.code;
   const msg = err instanceof Error ? err.message : String(err);
   const m = /^\[([a-z_]+)\]/.exec(msg);
   return m ? m[1] : null;

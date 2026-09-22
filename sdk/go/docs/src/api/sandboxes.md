@@ -17,8 +17,17 @@ sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSp
     Providers: []string{"openai"},
 }, map[string]string{
     "team": "platform",
-})
+}, v1.CreateOptions{ServiceExposures: []v1.ServiceExposure{
+    {TargetPort: 8080},
+}})
+fmt.Println(sb.ServiceURLs[""])
 ```
+
+Create-time service exposures register loopback HTTP endpoints with the
+sandbox. Leave `Service` empty for the unnamed endpoint or set it to create a
+named endpoint. Routing begins when the sandbox is ready.
+`ServiceURLs` returns the routed URLs keyed by service name; the empty key is
+the unnamed endpoint.
 
 Set `GPU: true` to request the active driver's default GPU assignment. Set
 `GPUCount` when the sandbox needs a specific GPU count; a non-nil `GPUCount`
@@ -55,19 +64,44 @@ sb, err := client.Sandboxes().Get(ctx, "default", "my-sandbox")
 fmt.Println(sb.Status.Phase) // "Ready", "Provisioning", etc.
 ```
 
+### Tool server connections
+
+`sb.Status.EndpointStatuses` shows each configured tool server endpoint and its last accepted network result in one record. A sandbox can be `Ready` while a tool server connection fails; endpoint results do not change lifecycle readiness. OpenShell currently observes endpoints configured for MCP over HTTP.
+
+```go
+for _, endpoint := range sb.Status.EndpointStatuses {
+    fmt.Printf("%s:%v%s: %s, reported %s\n",
+        endpoint.Host, endpoint.Ports, endpoint.Path,
+        endpoint.LastResult, endpoint.LastReportedAt)
+}
+```
+
+`LastResult` is a typed `v1.EndpointResult`. For example, `v1.EndpointTransportFailed` means the transport failed before an HTTP response arrived. `v1.EndpointHTTPResponseReceived` means the server returned an HTTP status below 400; its body can still contain a tool error. Neither result establishes current availability.
+
+OpenShell observes real traffic passively and does not expire idle observations. Keep `LastReportedAt` visible when displaying a result: it records when the gateway accepted the observation, not when the request happened. Retained evidence can be accepted after a reset. `v1.EndpointNoObservedExchange` has an empty timestamp and retains the configured address, so the endpoint remains identifiable before traffic is observed or after evidence is invalidated.
+
 ## List
 
-Lists sandboxes with optional pagination and label filtering.
+`List` constructs a lazy pager; `NextPage` fetches one page at a time.
+`PageSize` controls each request, and `ListAll` explicitly exhausts the pager.
 
 ```go
 // List all sandboxes
-sandboxes, err := client.Sandboxes().List(ctx, "default")
+sandboxes, err := client.Sandboxes().ListAll(ctx, "default")
 
-// With pagination and label filtering
-sandboxes, err := client.Sandboxes().List(ctx, "default", v1.ListOptions{
-    Limit:         10,
-    Offset:        0,
+// Process one page at a time
+pages, err := client.Sandboxes().List("default", v1.ListOptions{PageSize: 10})
+page, err := pages.NextPage(ctx)
+
+// With a page size and label filtering
+sandboxes, err := client.Sandboxes().ListAll(ctx, "default", v1.ListOptions{
+    PageSize:      10,
     LabelSelector: "team=platform",
+})
+
+// Platform Admin only: list across all workspaces
+allSandboxes, err := client.Sandboxes().ListAll(ctx, "", v1.ListOptions{
+    AllWorkspaces: true,
 })
 ```
 
@@ -76,8 +110,15 @@ sandboxes, err := client.Sandboxes().List(ctx, "default", v1.ListOptions{
 Deletes a sandbox by name.
 
 ```go
-err := client.Sandboxes().Delete(ctx, "default", "my-sandbox")
+deletion, err := client.Sandboxes().Delete(ctx, "default", "my-sandbox", v1.DeleteOptions{AllowMissing: true})
 ```
+
+Missing targets return `NotFound` unless `AllowMissing` is true. Inspect
+`deletion.Outcome`: `DeletionAccepted` means cleanup is pending, while
+`DeletionCompleted` and `DeletionAlreadyAbsent` establish logical completion.
+Unknown values do not establish completion. `deletion.SandboxID` identifies the
+original sandbox; do not confuse a same-name replacement with that target.
+Allowing absence does not make a retry safe if names can be reused.
 
 ## AttachProvider
 

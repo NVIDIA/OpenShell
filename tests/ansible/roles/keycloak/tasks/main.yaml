@@ -1,0 +1,126 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Wait for SSH
+  ansible.builtin.wait_for_connection:
+
+- name: Detect tmachine container runtime
+  ansible.builtin.include_role:
+    name: tmachine_container_runtime
+
+- name: Set Keycloak runtime values
+  ansible.builtin.set_fact:
+    keycloak_runtime_user: >-
+      {{ 'tmachine' if tmachine_container_runtime_is_rootless else 'root' }}
+    keycloak_runtime_home: >-
+      {{ '/home/tmachine' if tmachine_container_runtime_is_rootless else '/root' }}
+    keycloak_runtime_state_directory: >-
+      {{ '/home/tmachine/.local/share/openshell-keycloak'
+         if tmachine_container_runtime_is_rootless else keycloak_state_directory }}
+
+- name: Require Keycloak container runtime
+  become: true
+  become_user: "{{ keycloak_runtime_user }}"
+  ansible.builtin.command:
+    argv:
+      - "{{ tmachine_container_runtime_name }}"
+      - --version
+  environment:
+    HOME: "{{ keycloak_runtime_home }}"
+  changed_when: false
+
+- name: Create Keycloak state directory
+  become: true
+  ansible.builtin.file:
+    path: "{{ keycloak_runtime_state_directory }}"
+    state: directory
+    owner: "{{ keycloak_runtime_user }}"
+    group: "{{ keycloak_runtime_user }}"
+    mode: "0755"
+
+- name: Install Keycloak realm fixture
+  become: true
+  ansible.builtin.copy:
+    src: "{{ keycloak_realm_file }}"
+    dest: "{{ keycloak_runtime_state_directory }}/realm.json"
+    owner: "{{ keycloak_runtime_user }}"
+    group: "{{ keycloak_runtime_user }}"
+    mode: "0644"
+
+- name: Remove an existing Keycloak fixture
+  become: true
+  become_user: "{{ keycloak_runtime_user }}"
+  ansible.builtin.command:
+    argv:
+      - "{{ tmachine_container_runtime_name }}"
+      - rm
+      - --force
+      - "{{ keycloak_container_name }}"
+  environment:
+    HOME: "{{ keycloak_runtime_home }}"
+  changed_when: false
+  failed_when: false
+
+- name: Start Keycloak fixture
+  become: true
+  become_user: "{{ keycloak_runtime_user }}"
+  ansible.builtin.command:
+    argv:
+      - "{{ tmachine_container_runtime_name }}"
+      - run
+      - --detach
+      - --name
+      - "{{ keycloak_container_name }}"
+      - --publish
+      - "127.0.0.1:{{ keycloak_port }}:8080"
+      - --env
+      - "KEYCLOAK_ADMIN={{ keycloak_admin_username }}"
+      - --env
+      - "KEYCLOAK_ADMIN_PASSWORD={{ keycloak_admin_password }}"
+      - --volume
+      - "{{ keycloak_runtime_state_directory }}/realm.json:/opt/keycloak/data/import/realm.json:ro,z"
+      - "{{ keycloak_image }}"
+      - start-dev
+      - --import-realm
+  environment:
+    HOME: "{{ keycloak_runtime_home }}"
+  changed_when: true
+
+- name: Wait for Keycloak discovery endpoint
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ keycloak_port }}/realms/{{ keycloak_realm }}/.well-known/openid-configuration"
+    status_code: 200
+    return_content: false
+  register: keycloak_discovery
+  retries: "{{ keycloak_health_retries }}"
+  delay: "{{ keycloak_health_delay }}"
+  until: keycloak_discovery.status | default(0) == 200
+  failed_when: false
+
+- name: Read Keycloak logs after failed health check
+  become: true
+  become_user: "{{ keycloak_runtime_user }}"
+  ansible.builtin.command:
+    argv:
+      - "{{ tmachine_container_runtime_name }}"
+      - logs
+      - --tail
+      - "30"
+      - "{{ keycloak_container_name }}"
+  environment:
+    HOME: "{{ keycloak_runtime_home }}"
+  register: keycloak_logs
+  changed_when: false
+  failed_when: false
+  when: keycloak_discovery.status | default(0) != 200
+
+- name: Show Keycloak logs after failed health check
+  ansible.builtin.debug:
+    var: keycloak_logs.stdout_lines
+  when: keycloak_discovery.status | default(0) != 200
+
+- name: Require Keycloak discovery endpoint
+  ansible.builtin.assert:
+    that: keycloak_discovery.status | default(0) == 200
+    fail_msg: Keycloak did not become healthy within the configured timeout

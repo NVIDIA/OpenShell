@@ -90,7 +90,11 @@ workspace = true
 nix = { workspace = true }
 
 [dev-dependencies]
+# Tests import the example profiles from providers/ the way an operator
+# would; the feature is test-only and never reaches a release binary.
+openshell-providers = { path = "../openshell-providers", features = ["example-profiles"] }
 futures = { workspace = true }
+openshell-server = { path = "../openshell-server", features = ["test-support"] }
 rcgen = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }

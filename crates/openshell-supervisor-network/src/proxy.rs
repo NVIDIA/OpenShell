@@ -11,12 +11,18 @@ use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 #[cfg(target_os = "linux")]
-use crate::policy_dns::{MappingLookupError, PolicyEndpointId, ResolvedEndpointStore};
+use crate::policy_dns::PolicyEndpointId;
+use crate::policy_dns::{MappingLookupError, ResolvedEndpointStore};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::upstream_proxy::{self, UpstreamProxyConfig};
+use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
+use http::StatusCode;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::denial::DenialEvent;
+use openshell_core::endpoint_status::{
+    EndpointObservationContext, EndpointObservationSender, EndpointResult,
+};
 use openshell_core::net::{
     connect_tcp_nodelay_best_effort, is_always_blocked_ip, is_internal_ip, is_link_local_ip,
     set_tcp_nodelay_best_effort,
@@ -24,9 +30,14 @@ use openshell_core::net::{
 use openshell_core::policy::ProxyPolicy;
 use openshell_core::provider_credentials::{ProviderCredentialSnapshot, ProviderCredentialState};
 use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
+use openshell_isolation_interface::contract::{
+    BinaryIdentity as ContractBinaryIdentity, BoundaryDuplexStream, MediationTiming,
+    NetworkMediationSource, PendingTcpOpen, ResolveError, TcpOpenDecision, TcpOpenDenial,
+};
 use openshell_ocsf::{
-    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
-    NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
+    ActionId, ActivityId, BaseEventBuilder, DispositionId, Endpoint, HttpActivityBuilder,
+    HttpRequest, HttpResponse, NetworkActivityBuilder, Process, SeverityId, StatusId,
+    Url as OcsfUrl, ocsf_emit,
 };
 #[cfg(target_os = "linux")]
 use std::mem::size_of;
@@ -35,16 +46,37 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{
-    AsyncRead as TokioAsyncRead, AsyncReadExt, AsyncWrite as TokioAsyncWrite, AsyncWriteExt,
+    AsyncBufReadExt, AsyncRead as TokioAsyncRead, AsyncReadExt, AsyncWrite as TokioAsyncWrite,
+    AsyncWriteExt,
 };
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
+#[cfg(any(target_os = "linux", test))]
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+type ProxyClient = tokio::io::BufReader<BoundaryDuplexStream>;
+type AcceptedProxyConnection = (
+    BoundaryDuplexStream,
+    Option<Result<ContractBinaryIdentity, ResolveError>>,
+    Option<(SocketAddr, SocketAddr)>,
+    Option<TransparentOpen>,
+);
+
+struct TransparentOpen {
+    destination: SocketAddr,
+    authorization: Option<(EgressDecision, destination::UpstreamConnector)>,
+}
+
+enum ProxyAcceptError {
+    Listener(std::io::Error),
+    Source(openshell_isolation_interface::contract::BackendError),
+}
+
 use self::destination::{
-    DestinationDenial, DestinationDenialKind, DestinationRequest, build_validation_plan,
-    validate_destination,
+    DestinationDenial, DestinationDenialKind, DestinationRequest, build_pinned_validation_plan,
+    build_validation_plan, validate_destination,
 };
 use self::egress::{
     EgressDecision, EgressIntent, EndpointDecision, IdentityUnavailableReason, L7ConfigSnapshot,
@@ -52,6 +84,25 @@ use self::egress::{
 };
 
 const MAX_HEADER_BYTES: usize = 8192;
+const MEDIATION_ACCEPT_WINDOW: usize = 32;
+
+struct NetworkOpenTimingGuard {
+    timing: MediationTiming,
+    operation: &'static str,
+}
+
+impl Drop for NetworkOpenTimingGuard {
+    fn drop(&mut self) {
+        tracing::debug!(
+            target: "openshell::network_open_timing",
+            operation = self.operation,
+            notification_to_queue_us = self.timing.sandbox_notification_to_queue.as_micros(),
+            queue_wait_us = self.timing.sandbox_queue_wait.as_micros(),
+            supervisor_processing_us = self.timing.supervisor_received_at.elapsed().as_micros(),
+            "mediated network open timing"
+        );
+    }
+}
 const TUNNEL_PROTOCOL_PEEK_BYTES: usize = crate::l7::rest::HTTP2_PRIOR_KNOWLEDGE_PREFACE.len();
 #[cfg(not(test))]
 const TUNNEL_PROTOCOL_PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
@@ -63,12 +114,68 @@ const TUNNEL_PROTOCOL_PEEK_POLL: std::time::Duration = std::time::Duration::from
 const TUNNEL_PROTOCOL_PEEK_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 const FORWARD_ENCODED_SLASH_REJECTION_DETAIL: &str =
     "request-target contains an encoded '/' (%2F) which is not allowed on this endpoint";
-#[cfg(target_os = "linux")]
-const SIDECAR_SUPERVISOR_TOPOLOGY: &str = "sidecar";
 
-fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
-    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+fn build_connection_error_event(
+    peer_addr: SocketAddr,
+    message: String,
+) -> openshell_ocsf::OcsfEvent {
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Fail)
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+        .message(message)
+        .build()
+}
+
+fn build_proxy_connection_error_event(
+    peer_addr: Option<SocketAddr>,
+    transparent_destination: Option<SocketAddr>,
+    message: String,
+) -> openshell_ocsf::OcsfEvent {
+    if let Some(peer_addr) = peer_addr {
+        return build_connection_error_event(peer_addr, message);
+    }
+    if let Some(destination) = transparent_destination {
+        return NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Fail)
+            .severity(SeverityId::Low)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_ip(destination.ip(), destination.port()))
+            .message(message)
+            .build();
+    }
+
+    BaseEventBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity_name("Proxy connection failure")
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .message(message)
+        .build()
+}
+
+fn build_mediation_lane_failure_event(message: String) -> openshell_ocsf::OcsfEvent {
+    BaseEventBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity_name("Network mediation source failure")
+        .severity(SeverityId::High)
+        .status(StatusId::Failure)
+        .message(message)
+        .build()
+}
+
+fn build_credential_endpoint_mismatch_event(
+    method: &str,
+    host: &str,
+    port: u16,
+    policy_name: &str,
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::for_http_method(method))
+        .http_request(HttpRequest {
+            http_method: method.parse().expect("HTTP method parsing is infallible"),
+            url: None,
+        })
+        .http_response(HttpResponse { code: 403 })
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
         .severity(SeverityId::High)
@@ -79,7 +186,11 @@ fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
             "Credential use denied: credential is not authorized for {host}:{port}"
         ))
         .status_detail("credential_endpoint_mismatch")
-        .build();
+        .build()
+}
+
+fn emit_credential_endpoint_mismatch(method: &str, host: &str, port: u16, policy_name: &str) {
+    let event = build_credential_endpoint_mismatch_event(method, host, port, policy_name);
     ocsf_emit!(event);
     let finding = crate::l7::build_credential_endpoint_mismatch_finding(
         policy_name,
@@ -94,7 +205,7 @@ fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
 /// machine. Traffic to these names is eligible for the trusted-gateway SSRF
 /// exemption when the resolved IP matches the driver-injected value read from
 /// `/etc/hosts` at proxy startup.
-const HOST_GATEWAY_ALIASES: &[&str] = &[
+pub(crate) const HOST_GATEWAY_ALIASES: &[&str] = &[
     "host.openshell.internal",
     "host.containers.internal",
     "host.docker.internal",
@@ -153,8 +264,13 @@ impl ProxyHandle {
         policy_local_ctx: Option<Arc<PolicyLocalContext>>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
         activity_tx: Option<ActivitySender>,
+        endpoint_observation_tx: Option<EndpointObservationSender>,
         engine_ready: tokio::sync::watch::Receiver<bool>,
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
+        backend_host_gateway: Option<IpAddr>,
+        network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
+        policy_dns_store: Option<Arc<ResolvedEndpointStore>>,
+        direct_listener_identity: Option<ContractBinaryIdentity>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -170,15 +286,27 @@ impl ProxyHandle {
             ));
         }
 
-        let listener = TcpListener::bind(http_addr).await.into_diagnostic()?;
-        let local_addr = listener.local_addr().into_diagnostic()?;
+        let source_backed = network_mediation_source.is_some();
+        let listener = if source_backed {
+            None
+        } else {
+            Some(TcpListener::bind(http_addr).await.into_diagnostic()?)
+        };
+        let local_addr = match listener.as_ref() {
+            Some(listener) => listener.local_addr().into_diagnostic()?,
+            None => http_addr,
+        };
         {
             let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Listen)
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
                 .dst_endpoint(Endpoint::from_ip(local_addr.ip(), local_addr.port()))
-                .message(format!("Proxy listening on {local_addr}"))
+                .message(if source_backed {
+                    "Proxy consuming isolation-boundary streams".to_string()
+                } else {
+                    format!("Proxy listening on {local_addr}")
+                })
                 .build();
             ocsf_emit!(event);
         }
@@ -187,6 +315,7 @@ impl ProxyHandle {
         // runs. This is read once at startup so later /etc/hosts modifications
         // by sandbox workloads cannot influence the stored value.
         let trusted_host_gateway: Arc<Option<IpAddr>> = Arc::new(detect_trusted_host_gateway());
+        let backend_host_gateway = Arc::new(backend_host_gateway);
         if let Some(ref ip) = *trusted_host_gateway {
             tracing::info!(
                 %ip,
@@ -268,14 +397,90 @@ impl ProxyHandle {
                 }
             }
 
+            let mut network_accepts = network_mediation_source.as_ref().map(|source| {
+                let accepts = FuturesUnordered::new();
+                for _ in 0..MEDIATION_ACCEPT_WINDOW {
+                    let source = source.clone();
+                    accepts.push(async move { source.accept_tcp().await }.boxed());
+                }
+                accepts
+            });
+            // Transparent opens require policy evaluation and destination
+            // validation before the sandbox may complete connect(2). Keep
+            // those potentially expensive operations out of the accept loop:
+            // serial preauthorization turns bursts of DNS-driven TCP opens
+            // into head-of-line blocking even though the source itself can
+            // accept a window of requests concurrently.
+            let (preauthorized_tx, mut preauthorized_rx) =
+                mpsc::channel(MEDIATION_ACCEPT_WINDOW * 2);
             let mut consecutive_resource_errors: u32 = 0;
             let mut consecutive_unknown_errors: u32 = 0;
             loop {
-                match listener.accept().await {
-                    Ok((stream, _addr)) => {
+                let accepted = if let Some(source) = network_mediation_source.as_ref() {
+                    let accepts = network_accepts
+                        .as_mut()
+                        .expect("mediation source has an accept window");
+                    tokio::select! {
+                        pending = accepts.next() => {
+                            let pending = pending.expect("accept window is never empty");
+                            let source = source.clone();
+                            accepts.push(async move { source.accept_tcp().await }.boxed());
+                            match pending {
+                                Ok(connection) => {
+                                    let tx = preauthorized_tx.clone();
+                                    let dns_store = policy_dns_store.clone();
+                                    let opa = opa_engine.clone();
+                                    let backend_gateway = *backend_host_gateway;
+                                    let trusted_gateway = *trusted_host_gateway;
+                                    tokio::spawn(async move {
+                                        if let Some(connection) = preauthorize_transparent_open(
+                                            connection,
+                                            dns_store.as_ref(),
+                                            &opa,
+                                            backend_gateway,
+                                            trusted_gateway,
+                                        )
+                                        .await
+                                        {
+                                            let _ = tx.send(connection).await;
+                                        }
+                                    });
+                                    continue;
+                                }
+                                Err(error) => Err(ProxyAcceptError::Source(error)),
+                            }
+                        }
+                        Some(connection) = preauthorized_rx.recv() => Ok(connection),
+                    }
+                } else {
+                    let listener = listener
+                        .as_ref()
+                        .expect("listener exists without a mediation source");
+                    listener
+                        .accept()
+                        .await
+                        .map(|(stream, _)| {
+                            set_tcp_nodelay_best_effort(&stream);
+                            let workload_addr = stream.peer_addr().ok();
+                            let proxy_addr = stream.local_addr().ok();
+                            let stream: BoundaryDuplexStream = Box::new(stream);
+                            (
+                                stream,
+                                direct_listener_identity.clone().map(Ok),
+                                workload_addr.zip(proxy_addr),
+                                None,
+                            )
+                        })
+                        .map_err(ProxyAcceptError::Listener)
+                };
+                match accepted {
+                    Ok((stream, supplied_identity, socket_addrs, transparent_destination)) => {
+                        let peer_addr = socket_addrs.map(|(workload_addr, _)| workload_addr);
+                        let transparent_destination_addr = transparent_destination
+                            .as_ref()
+                            .map(|transparent| transparent.destination);
                         consecutive_resource_errors = 0;
                         consecutive_unknown_errors = 0;
-                        set_tcp_nodelay_best_effort(&stream);
                         let opa = opa_engine.clone();
                         let cache = identity_cache.clone();
                         let spid = entrypoint_pid.clone();
@@ -283,8 +488,10 @@ impl ProxyHandle {
                         let policy_local = policy_local_ctx.clone();
                         let proposals = agent_proposals.clone();
                         let gw = trusted_host_gateway.clone();
+                        let backend_gw = backend_host_gateway.clone();
                         let up_proxy = upstream_proxy.clone();
                         let credentials = provider_credentials.clone();
+                        let dns_store = policy_dns_store.clone();
                         let resolver = provider_credentials
                             .as_ref()
                             .and_then(ProviderCredentialState::resolver);
@@ -295,16 +502,22 @@ impl ProxyHandle {
                         });
                         let dtx = denial_tx.clone();
                         let atx = activity_tx.clone();
+                        let endpoint_observations = endpoint_observation_tx.clone();
                         tokio::spawn(async move {
                             #[allow(clippy::large_futures)]
-                            if let Err(err) = handle_tcp_connection(
-                                stream,
+                            if let Err(err) = handle_mediated_connection(
+                                tokio::io::BufReader::new(stream),
+                                supplied_identity,
+                                socket_addrs,
+                                transparent_destination,
+                                dns_store,
                                 opa,
                                 cache,
                                 spid,
                                 tls,
                                 policy_local,
                                 proposals,
+                                backend_gw,
                                 gw,
                                 up_proxy,
                                 credentials,
@@ -312,48 +525,34 @@ impl ProxyHandle {
                                 dynamic_credentials,
                                 dtx,
                                 atx,
+                                endpoint_observations,
                             )
                             .await
                             {
-                                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                    .activity(ActivityId::Fail)
-                                    .severity(SeverityId::Low)
-                                    .status(StatusId::Failure)
-                                    .message(format!("Proxy connection error: {err}"))
-                                    .build();
-                                ocsf_emit!(event);
+                                ocsf_emit!(build_proxy_connection_error_event(
+                                    peer_addr,
+                                    transparent_destination_addr,
+                                    format!("Proxy connection error: {err}"),
+                                ));
                             }
                         });
                     }
-                    Err(err) => {
-                        match classify_accept_error(
+                    Err(ProxyAcceptError::Source(err)) => {
+                        ocsf_emit!(build_mediation_lane_failure_event(format!(
+                            "Network-mediation source failed; proxy accept loop exiting: {err}"
+                        )));
+                        break;
+                    }
+                    Err(ProxyAcceptError::Listener(err)) => {
+                        let action = classify_accept_error(
                             &err,
                             &mut consecutive_resource_errors,
                             &mut consecutive_unknown_errors,
-                        ) {
-                            AcceptAction::Terminal => {
-                                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                    .activity(ActivityId::Fail)
-                                    .severity(SeverityId::High)
-                                    .status(StatusId::Failure)
-                                    .message(format!(
-                                        "Proxy accept loop exiting on terminal error: {err}",
-                                    ))
-                                    .build();
-                                ocsf_emit!(event);
-                                break;
-                            }
-                            AcceptAction::Retry { backoff, severity } => {
-                                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                    .activity(ActivityId::Fail)
-                                    .severity(severity)
-                                    .status(StatusId::Failure)
-                                    .message(format!(
-                                        "Proxy accept error (retrying in {}ms): {err}",
-                                        backoff.as_millis(),
-                                    ))
-                                    .build();
-                                ocsf_emit!(event);
+                        );
+                        ocsf_emit!(build_accept_error_event(local_addr, &err, &action));
+                        match action {
+                            AcceptAction::Terminal => break,
+                            AcceptAction::Retry { backoff, .. } => {
                                 tokio::time::sleep(backoff).await;
                             }
                         }
@@ -363,7 +562,7 @@ impl ProxyHandle {
         });
 
         Ok(Self {
-            http_addr: Some(local_addr),
+            http_addr: (!source_backed).then_some(local_addr),
             join,
             exited_rx: Some(exited_rx),
         })
@@ -376,6 +575,199 @@ impl ProxyHandle {
 
     pub fn take_exit_receiver(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
         self.exited_rx.take()
+    }
+}
+
+async fn preauthorize_transparent_open(
+    connection: PendingTcpOpen,
+    policy_dns_store: Option<&Arc<ResolvedEndpointStore>>,
+    opa_engine: &OpaEngine,
+    backend_host_gateway: Option<IpAddr>,
+    trusted_host_gateway: Option<IpAddr>,
+) -> Option<AcceptedProxyConnection> {
+    let PendingTcpOpen {
+        stream,
+        binary_identity,
+        destination,
+        socket: _,
+        policy_generation: _,
+        timing,
+        decision: completion,
+    } = connection;
+    let _timing = NetworkOpenTimingGuard {
+        timing,
+        operation: "tcp",
+    };
+    let host = match transparent_destination_host(destination, policy_dns_store, opa_engine) {
+        Ok(host) => host,
+        Err(error) => {
+            warn!(%destination, %error, "Denied staged transparent connection");
+            emit_staged_transparent_denial(
+                destination,
+                &binary_identity,
+                &error.to_string(),
+                "transparent_tcp_mapping_denied",
+            );
+            let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
+            return None;
+        }
+    };
+    let mut decision = authorize_supplied_identity(
+        opa_engine,
+        EgressIntent::connect(host.clone(), destination.port()),
+        &binary_identity,
+    );
+    if let NetworkAction::Deny { reason } = &decision.action {
+        warn!(%destination, %reason, "Denied staged transparent connection");
+        emit_staged_transparent_denial(
+            destination,
+            &binary_identity,
+            reason,
+            "transparent_tcp_policy_denied",
+        );
+        let denial = if binary_identity.is_err() {
+            TcpOpenDenial::IdentityUnavailable
+        } else {
+            TcpOpenDenial::PolicyDenied
+        };
+        let _ = completion.send(TcpOpenDecision::Denied(denial));
+        return None;
+    }
+    if let Err(denial) =
+        hydrate_destination_plan(&mut decision, backend_host_gateway, trusted_host_gateway)
+    {
+        warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
+        emit_staged_transparent_denial(
+            destination,
+            &binary_identity,
+            &denial.reason,
+            "transparent_tcp_destination_denied",
+        );
+        let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
+        return None;
+    }
+    if let Some(mapping) = policy_dns_store.and_then(|store| {
+        store
+            .lookup(
+                destination.ip(),
+                destination.port(),
+                opa_engine.current_generation(),
+                std::time::Instant::now(),
+            )
+            .ok()
+    }) {
+        let Ok(plan) = build_pinned_validation_plan(mapping.pinned_addresses()) else {
+            emit_staged_transparent_denial(
+                destination,
+                &binary_identity,
+                "policy DNS produced an invalid pinned destination",
+                "transparent_tcp_destination_denied",
+            );
+            let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
+            return None;
+        };
+        decision.endpoint.destination = Some(plan);
+    }
+    let plan = decision
+        .endpoint
+        .destination
+        .as_ref()
+        .expect("destination plan hydrated");
+    let connector = match validate_destination(DestinationRequest {
+        host: &host,
+        port: destination.port(),
+        sandbox_entrypoint_pid: 0,
+        plan,
+    })
+    .await
+    {
+        Ok(connector) => connector,
+        Err(denial) => {
+            warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
+            emit_staged_transparent_denial(
+                destination,
+                &binary_identity,
+                &denial.reason,
+                "transparent_tcp_destination_denied",
+            );
+            let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
+            return None;
+        }
+    };
+    if completion.send(TcpOpenDecision::RelayReady).is_err() {
+        return None;
+    }
+    Some((
+        stream,
+        Some(binary_identity),
+        None,
+        Some(TransparentOpen {
+            destination,
+            authorization: Some((decision, connector)),
+        }),
+    ))
+}
+
+fn emit_staged_transparent_denial(
+    destination: SocketAddr,
+    identity: &Result<ContractBinaryIdentity, ResolveError>,
+    reason: &str,
+    status_detail: &'static str,
+) {
+    let (binary, ancestors, cmdline) = identity.as_ref().map_or_else(
+        |_| ("-".to_string(), "-".to_string(), "-".to_string()),
+        |identity| {
+            (
+                identity.binary_path.display().to_string(),
+                identity
+                    .ancestors
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" -> "),
+                identity
+                    .cmdline_paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        },
+    );
+    ocsf_emit!(
+        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_ip(destination.ip(), destination.port()))
+            .actor_process(Process::from_bypass(&binary, "-", &ancestors).with_cmd_line(&cmdline))
+            .message(format!("Transparent TCP denied before relay: {reason}"))
+            .status_detail(status_detail)
+            .build()
+    );
+}
+
+fn transparent_destination_host(
+    destination: SocketAddr,
+    policy_dns_store: Option<&Arc<ResolvedEndpointStore>>,
+    opa_engine: &OpaEngine,
+) -> Result<String> {
+    let Some(store) = policy_dns_store else {
+        return Ok(destination.ip().to_string());
+    };
+    match store.lookup(
+        destination.ip(),
+        destination.port(),
+        opa_engine.current_generation(),
+        std::time::Instant::now(),
+    ) {
+        Ok(mapping) => Ok(mapping.record.normalized_name.as_str().to_string()),
+        Err(MappingLookupError::Missing) => Ok(destination.ip().to_string()),
+        Err(error) => Err(miette::miette!(
+            "transparent destination mapping is unavailable: {error}"
+        )),
     }
 }
 
@@ -434,7 +826,7 @@ impl TransparentTcpHandle {
                     );
                 }
                 loop {
-                    let Ok((stream, _)) = listener.accept().await else {
+                    let Ok((stream, peer_addr)) = listener.accept().await else {
                         break;
                     };
                     set_tcp_nodelay_best_effort(&stream);
@@ -460,14 +852,10 @@ impl TransparentTcpHandle {
                         )
                         .await
                         {
-                            ocsf_emit!(
-                                NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                    .activity(ActivityId::Fail)
-                                    .severity(SeverityId::Low)
-                                    .status(StatusId::Failure)
-                                    .message(format!("Transparent TCP connection error: {error}"))
-                                    .build()
-                            );
+                            ocsf_emit!(build_connection_error_event(
+                                peer_addr,
+                                format!("Transparent TCP connection error: {error}")
+                            ));
                         }
                     });
                 }
@@ -607,13 +995,16 @@ async fn handle_transparent_tcp_connection(
         &decision,
         None,
         None,
-        activity_tx.clone(),
         None,
         agent_proposals,
         // The transparent TCP path carries no PolicyLocalContext, so no
         // workspace is available here; matches the CONNECT path default when
         // policy-local context is absent.
         String::new(),
+        relay::RelaySignals {
+            activity: activity_tx.clone(),
+            endpoint_observation: None,
+        },
     );
     let middleware_gate = middleware_uninspectable_gate(&opa_engine, &ctx)?;
     if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::Deny {
@@ -905,11 +1296,41 @@ enum AcceptAction {
     },
 }
 
+fn build_accept_error_event(
+    local_addr: SocketAddr,
+    err: &std::io::Error,
+    action: &AcceptAction,
+) -> openshell_ocsf::OcsfEvent {
+    let (severity, message) = match action {
+        AcceptAction::Terminal => (
+            SeverityId::High,
+            format!("Proxy accept loop exiting on terminal error: {err}"),
+        ),
+        AcceptAction::Retry { backoff, severity } => (
+            *severity,
+            format!(
+                "Proxy accept error (retrying in {}ms): {err}",
+                backoff.as_millis()
+            ),
+        ),
+    };
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Fail)
+        .dst_endpoint(Endpoint::from_ip(local_addr.ip(), local_addr.port()))
+        .severity(severity)
+        .status(StatusId::Failure)
+        .message(message)
+        .build()
+}
+
 fn classify_accept_error(
     err: &std::io::Error,
     consecutive_resource_errors: &mut u32,
     consecutive_unknown_errors: &mut u32,
 ) -> AcceptAction {
+    #[cfg(not(unix))]
+    let _ = (err, &mut *consecutive_resource_errors);
+
     #[cfg(unix)]
     if matches!(
         err.raw_os_error(),
@@ -1090,21 +1511,24 @@ fn middleware_uninspectable_gate(
     Ok(crate::l7::middleware::uninspectable_traffic_gate(&chain))
 }
 
-async fn peek_tunnel_protocol(client: &TcpStream) -> Result<Option<TunnelProtocol>> {
-    let mut peek_buf = [0u8; TUNNEL_PROTOCOL_PEEK_BYTES];
+async fn peek_tunnel_protocol<C>(client: &mut C) -> Result<Option<TunnelProtocol>>
+where
+    C: tokio::io::AsyncBufRead + Unpin,
+{
     let deadline = tokio::time::Instant::now() + TUNNEL_PROTOCOL_PEEK_TIMEOUT;
 
     loop {
-        let n = client.peek(&mut peek_buf).await.into_diagnostic()?;
-        if n == 0 {
+        let available = client.fill_buf().await.into_diagnostic()?;
+        if available.is_empty() {
             return Ok(None);
         }
 
-        let peek = &peek_buf[..n];
+        let n = available.len().min(TUNNEL_PROTOCOL_PEEK_BYTES);
+        let peek = &available[..n];
         let protocol = classify_tunnel_protocol(peek);
         if protocol != TunnelProtocol::Unsupported
             || !could_be_supported_tunnel_protocol_prefix(peek)
-            || n == peek_buf.len()
+            || n == TUNNEL_PROTOCOL_PEEK_BYTES
             || tokio::time::Instant::now() >= deadline
         {
             return Ok(Some(protocol));
@@ -1155,8 +1579,7 @@ struct ForwardL7Reevaluation<'a> {
 struct ForwardMiddlewarePipeline<'a> {
     ctx: &'a crate::l7::relay::L7EvalContext,
     scheme: &'a str,
-    runner: &'a openshell_supervisor_middleware::ChainRunner,
-    generation_guard: &'a PolicyGenerationGuard,
+    exchange: &'a crate::l7::middleware::HttpMiddlewareExchange,
     l7_reevaluation: Option<ForwardL7Reevaluation<'a>>,
 }
 
@@ -1169,7 +1592,6 @@ impl ForwardMiddlewarePipeline<'_> {
         &self,
         request: crate::l7::provider::L7Request,
         client: &mut C,
-        chain: Vec<openshell_supervisor_middleware::ChainEntry>,
     ) -> Result<crate::l7::middleware::MiddlewareApplyResult>
     where
         C: TokioAsyncRead + TokioAsyncWrite + Unpin + Send,
@@ -1188,17 +1610,15 @@ impl ForwardMiddlewarePipeline<'_> {
             None => openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
         };
 
-        crate::l7::middleware::apply_middleware_chain_for_scheme(
-            request,
-            client,
-            self.ctx,
-            self.scheme,
-            chain,
-            self.runner,
-            self.generation_guard,
-            transformed_body_policy,
-        )
-        .await
+        self.exchange
+            .apply_request(
+                request,
+                client,
+                self.ctx,
+                self.scheme,
+                transformed_body_policy,
+            )
+            .await
     }
 }
 
@@ -1305,7 +1725,7 @@ fn build_forward_allow_ocsf_event(
     policy: &str,
 ) -> openshell_ocsf::OcsfEvent {
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Other)
+        .activity(ActivityId::for_http_method(method))
         .action(ActionId::Allowed)
         .disposition(DispositionId::Allowed)
         .severity(SeverityId::Informational)
@@ -1322,12 +1742,58 @@ fn build_forward_allow_ocsf_event(
         .build()
 }
 
-fn build_forward_parse_error_ocsf_event(path: &str) -> openshell_ocsf::OcsfEvent {
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Fail)
+fn build_forward_parse_error_ocsf_event(
+    peer_addr: Option<SocketAddr>,
+    method: &str,
+    path: &str,
+) -> openshell_ocsf::OcsfEvent {
+    let builder = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::for_http_method(method))
+        .http_request(HttpRequest {
+            http_method: method.parse().expect("HTTP method parsing is infallible"),
+            url: None,
+        })
+        .http_response(HttpResponse {
+            code: StatusCode::BAD_REQUEST.as_u16(),
+        })
         .severity(SeverityId::Low)
         .status(StatusId::Failure)
-        .message(format!("FORWARD parse error for {path}"))
+        .message(format!("FORWARD parse error for {path}"));
+    match peer_addr {
+        Some(peer_addr) => builder
+            .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+            .build(),
+        None => builder.build(),
+    }
+}
+
+/// Build the rejection event for an absolute-form request whose scheme is not
+/// supported by the forward proxy. The request URL is omitted because paths may
+/// contain credentials; the method and generated response provide the HTTP
+/// context required by OCSF 1.8.
+fn build_forward_unsupported_scheme_ocsf_event(
+    method: &str,
+    scheme: &str,
+    host: &str,
+    port: u16,
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::for_http_method(method))
+        .http_request(HttpRequest {
+            http_method: method.parse().expect("HTTP method parsing is infallible"),
+            url: None,
+        })
+        .http_response(HttpResponse {
+            code: StatusCode::BAD_REQUEST.as_u16(),
+        })
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Rejected)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .message(format!(
+            "FORWARD rejected: unsupported scheme {scheme} for {host}:{port}"
+        ))
         .build()
 }
 
@@ -1346,7 +1812,7 @@ fn build_forward_l7_parse_rejection_ocsf_event(
     detail: &str,
 ) -> openshell_ocsf::OcsfEvent {
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Other)
+        .activity(ActivityId::for_http_method(method))
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
         .severity(SeverityId::Medium)
@@ -1400,11 +1866,45 @@ fn build_forward_policy_deny_ocsf_event(
 
 fn destination_denial_detail(kind: DestinationDenialKind) -> &'static str {
     match kind {
+        DestinationDenialKind::Resolution => "destination resolution failed",
         DestinationDenialKind::TrustedGateway => "trusted-gateway check failed",
         DestinationDenialKind::InvalidAllowedIps => "invalid allowed_ips in policy",
         DestinationDenialKind::AllowedIps => "allowed_ips check failed",
         DestinationDenialKind::DeclaredEndpoint => "declared endpoint check failed",
         DestinationDenialKind::InternalAddress => "internal address",
+    }
+}
+
+fn endpoint_result_for_destination_failure(kind: DestinationDenialKind) -> EndpointResult {
+    if kind == DestinationDenialKind::Resolution {
+        EndpointResult::TransportFailed
+    } else {
+        EndpointResult::PolicyDenied
+    }
+}
+
+/// Separates resolver failures from address-policy rejections while preserving
+/// the existing diagnostic text used by proxy responses and tests.
+#[derive(Debug)]
+pub(crate) enum DestinationCheckError {
+    /// Name resolution did not produce an address set to authorize.
+    Resolution(String),
+    /// The resolved address set violated destination policy.
+    Denied(String),
+}
+
+impl DestinationCheckError {
+    #[cfg(test)]
+    fn contains(&self, needle: &str) -> bool {
+        self.to_string().contains(needle)
+    }
+}
+
+impl std::fmt::Display for DestinationCheckError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Resolution(reason) | Self::Denied(reason) => formatter.write_str(reason),
+        }
     }
 }
 
@@ -1463,7 +1963,7 @@ fn build_forward_destination_deny_ocsf_event(
     };
 
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Other)
+        .activity(ActivityId::for_http_method(method))
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
         .severity(SeverityId::Medium)
@@ -1482,8 +1982,8 @@ fn build_forward_destination_deny_ocsf_event(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn deny_connect_destination(
-    client: &mut TcpStream,
+async fn deny_connect_destination<C>(
+    client: &mut C,
     denial: &DestinationDenial,
     peer_addr: SocketAddr,
     host: &str,
@@ -1495,7 +1995,10 @@ async fn deny_connect_destination(
     decision: &EgressDecision,
     denial_tx: &Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: &Option<ActivitySender>,
-) -> Result<()> {
+) -> Result<()>
+where
+    C: TokioAsyncWrite + Unpin,
+{
     let detail = destination_denial_detail(denial.kind);
     ocsf_emit!(build_connect_destination_deny_ocsf_event(
         denial, peer_addr, host, port, binary, pid, ancestors, cmdline,
@@ -1528,8 +2031,8 @@ async fn deny_connect_destination(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn deny_forward_destination(
-    client: &mut TcpStream,
+async fn deny_forward_destination<C>(
+    client: &mut C,
     denial: &DestinationDenial,
     peer_addr: SocketAddr,
     method: &str,
@@ -1544,7 +2047,10 @@ async fn deny_forward_destination(
     decision: &EgressDecision,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<&ActivitySender>,
-) -> Result<()> {
+) -> Result<()>
+where
+    C: TokioAsyncWrite + Unpin,
+{
     let detail = destination_denial_detail(denial.kind);
     ocsf_emit!(build_forward_destination_deny_ocsf_event(
         denial, peer_addr, method, host, port, path, binary, pid, ancestors, cmdline, policy,
@@ -1579,15 +2085,17 @@ async fn deny_forward_destination(
 // Many distinct, non-related context parameters are required for a CONNECT
 // dispatch; bundling them into a struct would just shift the noise into call
 // sites.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_tcp_connection(
-    mut client: TcpStream,
+    client: TcpStream,
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
     tls_state: Option<Arc<ProxyTlsState>>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     agent_proposals: openshell_core::proposals::AgentProposals,
+    backend_host_gateway: Arc<Option<IpAddr>>,
     trusted_host_gateway: Arc<Option<IpAddr>>,
     upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
     provider_credentials: Option<ProviderCredentialState>,
@@ -1601,7 +2109,125 @@ async fn handle_tcp_connection(
     >,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
+    endpoint_observation_tx: Option<EndpointObservationSender>,
 ) -> Result<()> {
+    let socket_addrs = client.peer_addr().ok().zip(client.local_addr().ok());
+    let stream: BoundaryDuplexStream = Box::new(client);
+    Box::pin(handle_mediated_connection(
+        tokio::io::BufReader::new(stream),
+        None,
+        socket_addrs,
+        None,
+        None,
+        opa_engine,
+        identity_cache,
+        entrypoint_pid,
+        tls_state,
+        policy_local_ctx,
+        agent_proposals,
+        backend_host_gateway,
+        trusted_host_gateway,
+        upstream_proxy,
+        provider_credentials,
+        secret_resolver,
+        dynamic_credentials,
+        denial_tx,
+        activity_tx,
+        endpoint_observation_tx,
+    ))
+    .await
+}
+
+/// Adapt a transparent application stream to the existing CONNECT pipeline.
+/// The synthetic CONNECT request is supervisor-owned and its successful 200
+/// response is consumed before bytes are returned to the workload.
+fn virtual_connect_stream(
+    workload: BoundaryDuplexStream,
+    authority: String,
+) -> BoundaryDuplexStream {
+    let (handler, bridge) = tokio::io::duplex(64 * 1024);
+    let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge);
+    let (mut workload_read, mut workload_write) = tokio::io::split(workload);
+    tokio::spawn(async move {
+        let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+        if bridge_write.write_all(request.as_bytes()).await.is_ok() {
+            let _ = tokio::io::copy(&mut workload_read, &mut bridge_write).await;
+        }
+        let _ = bridge_write.shutdown().await;
+    });
+    tokio::spawn(async move {
+        let mut header = Vec::with_capacity(256);
+        let mut byte = [0_u8; 1];
+        while header.len() < MAX_HEADER_BYTES {
+            match bridge_read.read(&mut byte).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => header.push(byte[0]),
+            }
+            if header.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        if !header.starts_with(b"HTTP/1.1 200 ") && !header.starts_with(b"HTTP/1.0 200 ") {
+            let _ = workload_write.shutdown().await;
+            return;
+        }
+        let _ = tokio::io::copy(&mut bridge_read, &mut workload_write).await;
+        let _ = workload_write.shutdown().await;
+    });
+    Box::new(handler)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_mediated_connection(
+    mut client: ProxyClient,
+    supplied_identity: Option<Result<ContractBinaryIdentity, ResolveError>>,
+    socket_addrs: Option<(SocketAddr, SocketAddr)>,
+    transparent_open: Option<TransparentOpen>,
+    policy_dns_store: Option<Arc<ResolvedEndpointStore>>,
+    opa_engine: Arc<OpaEngine>,
+    identity_cache: Arc<BinaryIdentityCache>,
+    entrypoint_pid: Arc<AtomicU32>,
+    tls_state: Option<Arc<ProxyTlsState>>,
+    policy_local_ctx: Option<Arc<PolicyLocalContext>>,
+    agent_proposals: openshell_core::proposals::AgentProposals,
+    backend_host_gateway: Arc<Option<IpAddr>>,
+    trusted_host_gateway: Arc<Option<IpAddr>>,
+    upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
+    provider_credentials: Option<ProviderCredentialState>,
+    secret_resolver: Option<Arc<SecretResolver>>,
+    dynamic_credentials: Option<
+        Arc<
+            std::sync::RwLock<
+                std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential>,
+            >,
+        >,
+    >,
+    denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+    activity_tx: Option<ActivitySender>,
+    endpoint_observation_tx: Option<EndpointObservationSender>,
+) -> Result<()> {
+    // Bind observations to the policy/provider inventory active when this
+    // connection was accepted, even if configuration changes while it runs.
+    let endpoint_observation_context = endpoint_observation_tx
+        .as_ref()
+        .and_then(EndpointObservationSender::capture);
+    let (mut preauthorized_decision, prevalidated_connector) = if let Some(transparent) =
+        transparent_open
+    {
+        let destination = transparent.destination;
+        let host =
+            transparent_destination_host(destination, policy_dns_store.as_ref(), &opa_engine)?;
+        let (decision, connector) = transparent
+            .authorization
+            .map_or((None, None), |(decision, connector)| {
+                (Some(decision), Some(connector))
+            });
+        let authority = format!("{host}:{}", destination.port());
+        client = tokio::io::BufReader::new(virtual_connect_stream(client.into_inner(), authority));
+        (decision, connector)
+    } else {
+        (None, None)
+    };
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
 
@@ -1648,47 +2274,63 @@ async fn handle_tcp_connection(
     let target = parts.next().unwrap_or("");
 
     if method != "CONNECT" {
-        return handle_forward_proxy(
+        return Box::pin(handle_forward_proxy(
             method,
             target,
             &buf[..],
             used,
             &mut client,
+            supplied_identity.as_ref(),
+            socket_addrs,
             opa_engine,
             identity_cache,
             entrypoint_pid,
             policy_local_ctx,
             agent_proposals,
+            backend_host_gateway,
             trusted_host_gateway,
             provider_credentials,
             secret_resolver,
             dynamic_credentials,
             denial_tx.as_ref(),
             activity_tx.as_ref(),
-        )
+            endpoint_observation_tx,
+        ))
         .await;
     }
 
     let (raw_host, port) = parse_target(target)?;
     let host = normalize_host(&raw_host);
     let (host_lc, raw_host_lc) = (host.to_ascii_lowercase(), raw_host.to_ascii_lowercase());
-
-    let workload_addr = client.peer_addr().into_diagnostic()?;
-    let proxy_addr = client.local_addr().into_diagnostic()?;
-    let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
+    let workload_addr = socket_addrs.map_or_else(
+        || SocketAddr::from(([0, 0, 0, 0], 0)),
+        |(workload, _)| workload,
+    );
 
     // Evaluate OPA policy with process-identity binding.
     // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
     // /proc scanning + SHA256 hashing of binaries (e.g. node at 124MB).
-    let opa_clone = opa_engine.clone();
-    let cache_clone = identity_cache.clone();
-    let pid_clone = entrypoint_pid.clone();
     let intent = EgressIntent::connect(host_lc.clone(), port);
-    let mut decision = tokio::task::spawn_blocking(move || {
-        authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
-    })
-    .await
-    .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
+    let mut decision = if let Some(decision) = preauthorized_decision.take() {
+        decision
+    } else if let Some(identity) = supplied_identity.as_ref() {
+        authorize_supplied_identity(&opa_engine, intent, identity)
+    } else if !opa_engine.binary_identity_required() {
+        evaluate_endpoint_only_opa(&opa_engine, intent)
+    } else {
+        let (workload_addr, proxy_addr) = socket_addrs.ok_or_else(|| {
+            miette::miette!("legacy proxy connection is missing socket addresses")
+        })?;
+        let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
+        let opa_clone = opa_engine.clone();
+        let cache_clone = identity_cache.clone();
+        let pid_clone = entrypoint_pid.clone();
+        tokio::task::spawn_blocking(move || {
+            authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+        })
+        .await
+        .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?
+    };
 
     debug!(
         transport = ?decision.intent.transport,
@@ -1802,28 +2444,44 @@ async fn handle_tcp_connection(
     hydrate_tls_mode(&mut decision);
     let effective_tls_skip = decision.endpoint.tls_mode == crate::l7::TlsMode::Skip;
     let credential_guard = query_endpoint_credential_guard(&opa_engine, &decision, &host_lc, port)?;
+    // Route materialization is safe before destination dialing and lets an
+    // unambiguous MCP authority report local fail-closed outcomes that occur
+    // before the HTTP request path becomes available.
+    hydrate_l7_route(&mut decision);
+    let connect_endpoint_observer = begin_unambiguous_endpoint_observation(
+        decision.endpoint.l7_route.as_ref(),
+        endpoint_observation_tx.as_ref(),
+        endpoint_observation_context.as_ref(),
+        &connect_generation_guard,
+    );
 
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
-    match hydrate_destination_plan(&mut decision, *trusted_host_gateway) {
-        Ok(()) => {}
-        Err(denial) => {
-            deny_connect_destination(
-                &mut client,
-                &denial,
-                workload_addr,
-                &host_lc,
-                port,
-                &binary_str,
-                &pid_str,
-                &ancestors_str,
-                &cmdline_str,
-                &decision,
-                &denial_tx,
-                &activity_tx,
-            )
-            .await?;
-            return Ok(());
+    if prevalidated_connector.is_none() {
+        match hydrate_destination_plan(&mut decision, *backend_host_gateway, *trusted_host_gateway)
+        {
+            Ok(()) => {}
+            Err(denial) => {
+                if let Some(observer) = connect_endpoint_observer.as_ref() {
+                    observer.observe(endpoint_result_for_destination_failure(denial.kind));
+                }
+                deny_connect_destination(
+                    &mut client,
+                    &denial,
+                    workload_addr,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &pid_str,
+                    &ancestors_str,
+                    &cmdline_str,
+                    &decision,
+                    &denial_tx,
+                    &activity_tx,
+                )
+                .await?;
+                return Ok(());
+            }
         }
     }
     let destination_plan = decision
@@ -1834,32 +2492,39 @@ async fn handle_tcp_connection(
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
     let dns_connect_start = std::time::Instant::now();
-    let connector = match validate_destination(DestinationRequest {
-        host: &raw_host,
-        port,
-        sandbox_entrypoint_pid,
-        plan: destination_plan,
-    })
-    .await
-    {
-        Ok(connector) => connector,
-        Err(denial) => {
-            deny_connect_destination(
-                &mut client,
-                &denial,
-                workload_addr,
-                &host_lc,
-                port,
-                &binary_str,
-                &pid_str,
-                &ancestors_str,
-                &cmdline_str,
-                &decision,
-                &denial_tx,
-                &activity_tx,
-            )
-            .await?;
-            return Ok(());
+    let connector = if let Some(connector) = prevalidated_connector {
+        connector
+    } else {
+        match validate_destination(DestinationRequest {
+            host: &raw_host,
+            port,
+            sandbox_entrypoint_pid,
+            plan: destination_plan,
+        })
+        .await
+        {
+            Ok(connector) => connector,
+            Err(denial) => {
+                if let Some(observer) = connect_endpoint_observer.as_ref() {
+                    observer.observe(endpoint_result_for_destination_failure(denial.kind));
+                }
+                deny_connect_destination(
+                    &mut client,
+                    &denial,
+                    workload_addr,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &pid_str,
+                    &ancestors_str,
+                    &cmdline_str,
+                    &decision,
+                    &denial_tx,
+                    &activity_tx,
+                )
+                .await?;
+                return Ok(());
+            }
         }
     };
 
@@ -1873,6 +2538,9 @@ async fn handle_tcp_connection(
     if refuse_connect_when_tls_unavailable(&mut client, tls_state.is_some(), effective_tls_skip)
         .await?
     {
+        if let Some(observer) = connect_endpoint_observer.as_ref() {
+            observer.observe(EndpointResult::TlsFailed);
+        }
         let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
@@ -1908,6 +2576,9 @@ async fn handle_tcp_connection(
     if credential_guard.blocks_connect() {
         const DETAIL: &str =
             "credentialed endpoint requires L7 inspection; raw tunnel is not explicitly allowed";
+        if let Some(observer) = connect_endpoint_observer.as_ref() {
+            observer.observe(EndpointResult::PolicyDenied);
+        }
         let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
@@ -1952,7 +2623,6 @@ async fn handle_tcp_connection(
 
     // CONNECT must use one policy generation from authorization through route
     // materialization and relay startup.
-    hydrate_l7_route(&mut decision);
     let l7_route = decision.endpoint.l7_route.as_ref();
     if let Err(error) =
         relay::validate_route_generation(l7_route, connect_generation_guard.captured_generation())
@@ -1982,7 +2652,15 @@ async fn handle_tcp_connection(
         .await?;
         return Ok(());
     };
-    let mut upstream = upstream_result.into_diagnostic()?;
+    let mut upstream = match upstream_result {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            if let Some(observer) = connect_endpoint_observer.as_ref() {
+                observer.observe(EndpointResult::TransportFailed);
+            }
+            return Err(error).into_diagnostic();
+        }
+    };
     if let Err(error) = connect_generation_guard.ensure_current() {
         reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
             .await?;
@@ -2025,10 +2703,13 @@ async fn handle_tcp_connection(
         &decision,
         provider_credentials,
         secret_resolver.clone(),
-        activity_tx.clone(),
         dynamic_credentials.clone(),
         agent_proposals,
         workspace,
+        relay::RelaySignals {
+            activity: activity_tx.clone(),
+            endpoint_observation: endpoint_observation_tx,
+        },
     );
 
     if effective_tls_skip {
@@ -2075,7 +2756,7 @@ async fn handle_tcp_connection(
     // Auto-detect the tunnel payload. L7-configured endpoints must only
     // enter relays that can enforce their configured protocol; unsupported
     // bytes fail closed below instead of falling through to raw relay.
-    let Some(tunnel_protocol) = peek_tunnel_protocol(&client).await? else {
+    let Some(tunnel_protocol) = peek_tunnel_protocol(&mut client).await? else {
         return Ok(());
     };
 
@@ -2083,12 +2764,41 @@ async fn handle_tcp_connection(
         // TLS detected — terminate unconditionally.
         if let Some(ref tls) = tls_state {
             ctx.request_default_port = Some(443);
+            // Complete the client handshake before observing the upstream
+            // connection. A malformed client handshake provides no evidence
+            // of an endpoint network failure.
+            let mut tls_client =
+                match crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await {
+                    Ok(client) => client,
+                    Err(error) => {
+                        debug!(host = %host_lc, port, "client TLS handshake failed");
+                        return Err(error);
+                    }
+                };
+            let mut tls_upstream = match crate::l7::tls::tls_connect_upstream(
+                upstream,
+                &host_lc,
+                tls.upstream_config(),
+            )
+            .await
+            {
+                Ok(upstream) => upstream,
+                Err(error) => {
+                    if let Some(observer) = connect_endpoint_observer.as_ref() {
+                        observer.observe(EndpointResult::TlsFailed);
+                    }
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .message("Upstream TLS establishment failed")
+                        .build();
+                    ocsf_emit!(event);
+                    return Err(error);
+                }
+            };
             let tls_result = async {
-                let mut tls_client =
-                    crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
-                let mut tls_upstream =
-                    crate::l7::tls::tls_connect_upstream(upstream, &host_lc, tls.upstream_config())
-                        .await?;
                 let Some(relay_context) =
                     relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx)
                 else {
@@ -2507,18 +3217,6 @@ fn authorize_egress_intent(
         }
     };
 
-    if !crate::opa::network_binary_identity_required() {
-        let result = evaluate_endpoint_only_opa(engine, intent);
-        debug!(
-            "authorize_egress_intent endpoint-only: host={} port={} transport={:?} action={:?}",
-            result.intent.destination.host,
-            result.intent.destination.port,
-            result.intent.transport,
-            result.action
-        );
-        return result;
-    }
-
     let entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
     let Some(proc_net_anchor_pid) = proc_net_anchor_pid(entrypoint_pid) else {
         return deny(
@@ -2596,16 +3294,7 @@ fn authorize_egress_intent(
 
 #[cfg(target_os = "linux")]
 fn proc_net_anchor_pid(entrypoint_pid: u32) -> Option<u32> {
-    if entrypoint_pid != 0 {
-        return Some(entrypoint_pid);
-    }
-    sidecar_topology_enabled().then(std::process::id)
-}
-
-#[cfg(target_os = "linux")]
-fn sidecar_topology_enabled() -> bool {
-    std::env::var(openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY)
-        .is_ok_and(|value| value == SIDECAR_SUPERVISOR_TOPOLOGY)
+    (entrypoint_pid != 0).then_some(entrypoint_pid)
 }
 
 fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> EgressDecision {
@@ -2650,6 +3339,77 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> Egres
     }
 }
 
+/// Evaluate an egress intent using identity already bound to the accepted
+/// connection by an isolation backend. This is the RFC 0012 path; legacy
+/// listeners continue to resolve through procfs in `authorize_egress_intent`.
+fn authorize_supplied_identity(
+    engine: &OpaEngine,
+    intent: EgressIntent,
+    identity: &Result<ContractBinaryIdentity, ResolveError>,
+) -> EgressDecision {
+    let deny = |reason: String,
+                binary: Option<PathBuf>,
+                ancestors: Vec<PathBuf>,
+                cmdline_paths: Vec<PathBuf>| EgressDecision {
+        intent: intent.clone(),
+        action: NetworkAction::Deny { reason },
+        policy_generation: engine.current_generation(),
+        identity: ProcessIdentityEvidence::Unavailable(IdentityUnavailableReason::LookupFailed),
+        endpoint: EndpointDecision::default(),
+        binary,
+        binary_pid: None,
+        ancestors,
+        cmdline_paths,
+    };
+
+    let identity = match identity {
+        Ok(identity) => identity,
+        Err(error) => {
+            return deny(
+                format!("backend identity resolution failed: {error}"),
+                None,
+                vec![],
+                vec![],
+            );
+        }
+    };
+    let Some(digest) = identity.binary_digest else {
+        return deny(
+            "backend identity did not include the required binary digest".to_string(),
+            Some(identity.binary_path.clone()),
+            identity.ancestors.clone(),
+            identity.cmdline_paths.clone(),
+        );
+    };
+    let input = crate::opa::NetworkInput {
+        host: intent.destination.host.clone(),
+        port: intent.destination.port,
+        binary_path: identity.binary_path.clone(),
+        binary_sha256: digest.to_string(),
+        ancestors: identity.ancestors.clone(),
+        cmdline_paths: identity.cmdline_paths.clone(),
+    };
+    match engine.authorize_egress(&input) {
+        Ok(authorization) => EgressDecision {
+            intent,
+            action: authorization.action.clone(),
+            policy_generation: authorization.generation,
+            identity: ProcessIdentityEvidence::Available,
+            endpoint: EndpointDecision::from_authorization(&authorization),
+            binary: Some(identity.binary_path.clone()),
+            binary_pid: None,
+            ancestors: identity.ancestors.clone(),
+            cmdline_paths: identity.cmdline_paths.clone(),
+        },
+        Err(error) => deny(
+            format!("policy evaluation error: {error}"),
+            Some(identity.binary_path.clone()),
+            identity.ancestors.clone(),
+            identity.cmdline_paths.clone(),
+        ),
+    }
+}
+
 /// Non-Linux stub: OPA identity binding requires /proc.
 #[cfg(not(target_os = "linux"))]
 fn authorize_egress_intent(
@@ -2659,10 +3419,6 @@ fn authorize_egress_intent(
     _entrypoint_pid: &AtomicU32,
     intent: EgressIntent,
 ) -> EgressDecision {
-    if !crate::opa::network_binary_identity_required() {
-        return evaluate_endpoint_only_opa(engine, intent);
-    }
-
     EgressDecision {
         intent,
         action: NetworkAction::Deny {
@@ -2695,13 +3451,16 @@ fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette
     ocsf_emit!(event);
 }
 
-async fn reject_stale_connect_policy(
-    client: &mut TcpStream,
+async fn reject_stale_connect_policy<C>(
+    client: &mut C,
     host: &str,
     port: u16,
     activity_tx: Option<&ActivitySender>,
     error: miette::Report,
-) -> Result<()> {
+) -> Result<()>
+where
+    C: TokioAsyncWrite + Unpin,
+{
     warn!(
         host,
         port,
@@ -2740,6 +3499,7 @@ fn hydrate_tls_mode(decision: &mut EgressDecision) {
 
 fn hydrate_destination_plan(
     decision: &mut EgressDecision,
+    backend_host_gateway: Option<IpAddr>,
     trusted_host_gateway: Option<IpAddr>,
 ) -> std::result::Result<(), DestinationDenial> {
     let host = decision.intent.destination.host.clone();
@@ -2748,6 +3508,7 @@ fn hydrate_destination_plan(
     let plan = build_validation_plan(
         &host,
         &host.to_ascii_lowercase(),
+        backend_host_gateway,
         trusted_host_gateway,
         &raw_allowed_ips,
         exact_declared_host,
@@ -2801,6 +3562,24 @@ fn select_l7_config_for_path<'a>(
         .iter()
         .filter(|snapshot| snapshot.config.matches_path(path))
         .max_by_key(|snapshot| snapshot.config.path_specificity())
+}
+
+/// Begin a pre-path observation only when an authority identifies one tool server endpoint.
+fn begin_unambiguous_endpoint_observation(
+    route: Option<&L7RouteSnapshot>,
+    sender: Option<&EndpointObservationSender>,
+    context: Option<&EndpointObservationContext>,
+    guard: &PolicyGenerationGuard,
+) -> Option<crate::l7::EndpointObserver> {
+    let mut mcp_configs = route?.configs.iter().filter(|snapshot| {
+        snapshot.config.protocol == crate::l7::L7Protocol::Mcp
+            && !snapshot.config.endpoint_id.is_empty()
+    });
+    let config = &mcp_configs.next()?.config;
+    if mcp_configs.any(|candidate| candidate.config.endpoint_id != config.endpoint_id) {
+        return None;
+    }
+    crate::l7::EndpointObserver::begin_captured(sender, config, context, None, Some(guard))
 }
 
 /// Query the TLS mode for an endpoint, independent of L7 config.
@@ -3006,43 +3785,45 @@ async fn resolve_and_check_trusted_gateway(
     port: u16,
     trusted_gw: IpAddr,
     entrypoint_pid: u32,
-) -> std::result::Result<Vec<SocketAddr>, String> {
+) -> std::result::Result<Vec<SocketAddr>, DestinationCheckError> {
     if BLOCKED_CONTROL_PLANE_PORTS.contains(&port) {
-        return Err(format!(
+        return Err(DestinationCheckError::Denied(format!(
             "port {port} is a blocked control-plane port, connection rejected"
-        ));
+        )));
     }
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid)
+        .await
+        .map_err(DestinationCheckError::Resolution)?;
     if addrs.is_empty() {
-        return Err(format!(
+        return Err(DestinationCheckError::Resolution(format!(
             "DNS resolution returned no addresses for {}",
             normalize_host_lookup_key(host)
-        ));
+        )));
     }
     for addr in &addrs {
         if is_cloud_metadata_ip(addr.ip()) {
-            return Err(format!(
+            return Err(DestinationCheckError::Denied(format!(
                 "{host} resolves to cloud metadata address {}, connection rejected",
                 addr.ip()
-            ));
+            )));
         }
         if addr.ip() != trusted_gw {
-            return Err(format!(
+            return Err(DestinationCheckError::Denied(format!(
                 "{host} resolves to {} which does not match trusted host gateway \
                  {trusted_gw}, connection rejected",
                 addr.ip()
-            ));
+            )));
         }
         // Defense-in-depth: even if the resolved IP matches trusted_gw, reject
         // any non-link-local address. detect_trusted_host_gateway() already
         // enforces this at startup, but we re-check here to guard against any
         // unanticipated code path that might admit a private or loopback IP.
         if !is_link_local_ip(addr.ip()) {
-            return Err(format!(
+            return Err(DestinationCheckError::Denied(format!(
                 "{host} resolves to non-link-local address {}, \
                  connection rejected",
                 addr.ip()
-            ));
+            )));
         }
     }
     Ok(addrs)
@@ -3357,9 +4138,11 @@ async fn resolve_and_reject_internal(
     host: &str,
     port: u16,
     entrypoint_pid: u32,
-) -> std::result::Result<Vec<SocketAddr>, String> {
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
-    reject_internal_resolved_addrs(host, &addrs)?;
+) -> std::result::Result<Vec<SocketAddr>, DestinationCheckError> {
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid)
+        .await
+        .map_err(DestinationCheckError::Resolution)?;
+    reject_internal_resolved_addrs(host, &addrs).map_err(DestinationCheckError::Denied)?;
     Ok(addrs)
 }
 
@@ -3376,9 +4159,12 @@ async fn resolve_and_check_allowed_ips(
     port: u16,
     allowed_ips: &[ipnet::IpNet],
     entrypoint_pid: u32,
-) -> std::result::Result<Vec<SocketAddr>, String> {
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
-    validate_allowed_ips_for_resolved_addrs(host, port, &addrs, allowed_ips)?;
+) -> std::result::Result<Vec<SocketAddr>, DestinationCheckError> {
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid)
+        .await
+        .map_err(DestinationCheckError::Resolution)?;
+    validate_allowed_ips_for_resolved_addrs(host, port, &addrs, allowed_ips)
+        .map_err(DestinationCheckError::Denied)?;
     Ok(addrs)
 }
 
@@ -3391,9 +4177,12 @@ async fn resolve_and_check_declared_endpoint(
     host: &str,
     port: u16,
     entrypoint_pid: u32,
-) -> std::result::Result<Vec<SocketAddr>, String> {
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
-    validate_declared_endpoint_resolved_addrs(host, port, &addrs)?;
+) -> std::result::Result<Vec<SocketAddr>, DestinationCheckError> {
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid)
+        .await
+        .map_err(DestinationCheckError::Resolution)?;
+    validate_declared_endpoint_resolved_addrs(host, port, &addrs)
+        .map_err(DestinationCheckError::Denied)?;
     Ok(addrs)
 }
 
@@ -3454,9 +4243,12 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
                 }
 
                 if n.prefix_len() < MIN_SAFE_PREFIX_LEN {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Other)
+                    let event = openshell_ocsf::ConfigStateChangeBuilder::new(
+                        openshell_ocsf::ctx::ctx(),
+                    )
                         .severity(SeverityId::Medium)
+                        .status(StatusId::Success)
+                        .state(openshell_ocsf::StateId::Other, "warning")
                         .message(format!(
                             "allowed_ips entry has a very broad CIDR {n} (/{}) < /{MIN_SAFE_PREFIX_LEN}; \
                              this may expose control-plane services on the same network",
@@ -3650,6 +4442,7 @@ fn endpoint_secret_resolver(
 }
 
 struct ForwardEndpointCredentials {
+    body_classifier: Option<Arc<secrets::body::BodyCredentialClassifier>>,
     resolver: Option<Arc<SecretResolver>>,
     revision: Option<u64>,
 }
@@ -3664,12 +4457,14 @@ fn endpoint_credentials_for_request(
     let Some(credentials) = provider_credentials else {
         return ForwardEndpointCredentials {
             resolver: fallback,
+            body_classifier: None,
             revision: None,
         };
     };
-    let (resolver, revision) =
-        credentials.resolver_for_endpoint_with_revision(host, port, canonical_path);
+    let (resolver, body_classifier, revision) =
+        credentials.resolver_and_body_classifier_for_endpoint(host, port, canonical_path);
     ForwardEndpointCredentials {
+        body_classifier,
         resolver,
         revision: Some(revision),
     }
@@ -3779,7 +4574,6 @@ fn rewrite_forward_request(
     path: &str,
     canonical_authority: &str,
     secret_resolver: Option<&SecretResolver>,
-    request_body_credential_rewrite: bool,
 ) -> Result<Vec<u8>, secrets::UnresolvedPlaceholderError> {
     let header_end = raw[..used]
         .windows(4)
@@ -3898,13 +4692,10 @@ fn rewrite_forward_request(
         output.extend_from_slice(&overflow[..body_prefix_len]);
     }
 
-    // Fail-closed: scan for any remaining unresolved placeholders
-    let scan_end = if request_body_credential_rewrite {
-        rewritten_header_end
-    } else {
-        output.len()
-    };
-    let output_str = String::from_utf8_lossy(&output[..scan_end]);
+    // Header resolution only owns headers. Body bytes from the initial read
+    // must reach the same guarded relay as bytes read later, regardless of
+    // whether that relay classifies literal text or explicitly rewrites it.
+    let output_str = String::from_utf8_lossy(&output[..rewritten_header_end]);
     if output_str.contains(secrets::PLACEHOLDER_PREFIX_PUBLIC)
         || output_str.contains(secrets::PROVIDER_ALIAS_MARKER_PUBLIC)
     {
@@ -3975,6 +4766,7 @@ fn complete_chunked_body_prefix_len(bytes: &[u8]) -> Option<usize> {
 }
 
 struct ForwardRelayOptions<'a> {
+    body_classifier: Option<&'a secrets::body::BodyCredentialClassifier>,
     generation_guard: &'a PolicyGenerationGuard,
     credential_generation: Option<crate::l7::rest::CredentialGenerationGuard<'a>>,
     websocket_extensions: crate::l7::rest::WebSocketExtensionMode,
@@ -3986,6 +4778,14 @@ struct ForwardRelayOptions<'a> {
     signing_region: &'a str,
     host: &'a str,
     port: u16,
+    response_middleware: Option<ForwardResponseMiddleware<'a>>,
+    endpoint_observer: Option<&'a crate::l7::EndpointObserver>,
+}
+
+struct ForwardResponseMiddleware<'a> {
+    ctx: &'a crate::l7::relay::L7EvalContext,
+    scheme: &'a str,
+    exchange: &'a crate::l7::middleware::HttpMiddlewareExchange,
 }
 
 async fn relay_rewritten_forward_request<C, U>(
@@ -4006,21 +4806,28 @@ where
         .map_or(rewritten.len(), |p| p + 4);
     let header_str = String::from_utf8_lossy(&rewritten[..header_end]);
     let body_length = crate::l7::rest::parse_body_length(&header_str)?;
-    let (_, query_params) = crate::l7::rest::parse_target_query(path)?;
+    let (request_path, query_params) = crate::l7::rest::parse_target_query(path)?;
     let req = crate::l7::provider::L7Request {
         action: method.to_string(),
-        target: path.to_string(),
+        target: request_path,
         query_params,
         raw_header: rewritten,
         body_length,
     };
 
-    crate::l7::rest::relay_http_request_with_options_guarded(
+    let response_middleware = options.response_middleware.map(|middleware| {
+        middleware
+            .exchange
+            .response_relay(&req, middleware.ctx, middleware.scheme)
+    });
+
+    crate::l7::rest::relay_http_request_with_response_middleware_guarded_observed(
         &req,
         client,
         upstream,
         crate::l7::rest::RelayRequestOptions {
             resolver: options.secret_resolver,
+            body_classifier: options.body_classifier,
             credential_generation: options.credential_generation,
             generation_guard: Some(options.generation_guard),
             websocket_extensions: options.websocket_extensions,
@@ -4032,6 +4839,8 @@ where
             host: options.host,
             port: options.port,
         },
+        response_middleware,
+        options.endpoint_observer,
     )
     .await
 }
@@ -4077,12 +4886,15 @@ async fn handle_forward_proxy(
     target_uri: &str,
     buf: &[u8],
     used: usize,
-    client: &mut TcpStream,
+    client: &mut ProxyClient,
+    supplied_identity: Option<&Result<ContractBinaryIdentity, ResolveError>>,
+    socket_addrs: Option<(SocketAddr, SocketAddr)>,
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     agent_proposals: openshell_core::proposals::AgentProposals,
+    backend_host_gateway: Arc<Option<IpAddr>>,
     trusted_host_gateway: Arc<Option<IpAddr>>,
     provider_credentials: Option<ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
@@ -4095,13 +4907,27 @@ async fn handle_forward_proxy(
     >,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<&ActivitySender>,
+    endpoint_observation_tx: Option<EndpointObservationSender>,
 ) -> Result<()> {
+    let endpoint_observation_context = endpoint_observation_tx
+        .as_ref()
+        .and_then(EndpointObservationSender::capture);
+    let mut endpoint_observer = None;
+    let workload_peer_addr = socket_addrs.map(|(workload, _)| workload);
+    // The connection handlers below require a workload address for policy and
+    // accounting. OCSF events must instead use `workload_peer_addr`, because
+    // the unspecified fallback is not an observed network endpoint.
+    let workload_addr = workload_peer_addr.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
     let mut telemetry_path = forward_telemetry_path(target_uri);
     // 1. Parse the absolute-form URI. Every external forward target is
     // canonicalized below before credential binding, policy-path evaluation,
     // upstream bytes, or telemetry consume it.
     let Ok((scheme, host, port, mut path)) = parse_proxy_uri(target_uri) else {
-        ocsf_emit!(build_forward_parse_error_ocsf_event(&telemetry_path));
+        ocsf_emit!(build_forward_parse_error_ocsf_event(
+            workload_peer_addr,
+            method,
+            &telemetry_path
+        ));
         respond(client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
         return Ok(());
     };
@@ -4143,17 +4969,7 @@ async fn handle_forward_proxy(
     }
 
     if scheme != "http" {
-        let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Refuse)
-            .action(ActionId::Denied)
-            .disposition(DispositionId::Rejected)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Failure)
-            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .message(format!(
-                "FORWARD rejected: unsupported scheme {scheme} for {host_lc}:{port}"
-            ))
-            .build();
+        let event = build_forward_unsupported_scheme_ocsf_event(method, &scheme, &host_lc, port);
         ocsf_emit!(event);
         if scheme == "https" {
             respond(
@@ -4181,19 +4997,25 @@ async fn handle_forward_proxy(
         canonicalize_forward_host_header(&buf[..used], &canonical_authority)?;
 
     // 2. Evaluate OPA policy (same identity binding as CONNECT)
-    let workload_addr = client.peer_addr().into_diagnostic()?;
-    let proxy_addr = client.local_addr().into_diagnostic()?;
-    let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
-
-    let opa_clone = opa_engine.clone();
-    let cache_clone = identity_cache.clone();
-    let pid_clone = entrypoint_pid.clone();
     let intent = EgressIntent::forward_http(host_lc.clone(), port);
-    let mut decision = tokio::task::spawn_blocking(move || {
-        authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
-    })
-    .await
-    .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
+    let mut decision = if let Some(identity) = supplied_identity {
+        authorize_supplied_identity(&opa_engine, intent, identity)
+    } else if !opa_engine.binary_identity_required() {
+        evaluate_endpoint_only_opa(&opa_engine, intent)
+    } else {
+        let (workload_addr, proxy_addr) = socket_addrs.ok_or_else(|| {
+            miette::miette!("legacy proxy connection is missing socket addresses")
+        })?;
+        let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
+        let opa_clone = opa_engine.clone();
+        let cache_clone = identity_cache.clone();
+        let pid_clone = entrypoint_pid.clone();
+        tokio::task::spawn_blocking(move || {
+            authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+        })
+        .await
+        .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?
+    };
 
     debug!(
         transport = ?decision.intent.transport,
@@ -4386,10 +5208,13 @@ async fn handle_forward_proxy(
         &decision,
         provider_credentials,
         secret_resolver.clone(),
-        activity_tx.cloned(),
         dynamic_credentials.clone(),
         agent_proposals,
         workspace,
+        relay::RelaySignals {
+            activity: activity_tx.cloned(),
+            endpoint_observation: endpoint_observation_tx,
+        },
     );
     l7_ctx.request_default_port = match scheme.as_str() {
         "http" => Some(80),
@@ -4492,6 +5317,13 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         };
+        endpoint_observer = crate::l7::EndpointObserver::begin_captured(
+            l7_ctx.endpoint_observation_tx.as_ref(),
+            &l7_config.config,
+            endpoint_observation_context.as_ref(),
+            None,
+            Some(&forward_generation_guard),
+        );
         // `canonicalize_options` was built before the matching config was
         // known, so `allow_encoded_slash` was taken permissively across every
         // config on this route. Re-check it against the config that actually
@@ -4700,6 +5532,7 @@ async fn handle_forward_proxy(
                 client,
                 &l7_ctx,
                 &telemetry_path,
+                endpoint_observer.as_ref(),
             )
             .await?
             {
@@ -4854,7 +5687,7 @@ async fn handle_forward_proxy(
     //    - Otherwise: reject internal IPs, allow public IPs through.
     //    When the policy host is already a literal IP address, treat it as
     //    implicitly allowed — the user explicitly declared the destination.
-    match hydrate_destination_plan(&mut decision, *trusted_host_gateway) {
+    match hydrate_destination_plan(&mut decision, *backend_host_gateway, *trusted_host_gateway) {
         Ok(()) => {}
         Err(denial) => {
             deny_forward_destination(
@@ -4973,8 +5806,11 @@ async fn handle_forward_proxy(
         .await?;
         return Ok(());
     }
+    let request_id = uuid::Uuid::new_v4().to_string();
     let websocket_chain = forward_websocket_request.then(|| chain.clone());
-    if !chain.is_empty() {
+    let response_selection = if chain.is_empty() {
+        None
+    } else {
         let middleware_runner = opa_engine.middleware_runner()?;
         let request = crate::l7::rest::request_from_buffered_http(
             method,
@@ -4990,14 +5826,19 @@ async fn handle_forward_proxy(
             }),
             _ => None,
         };
+        let middleware_exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+            request_id.clone(),
+            chain,
+            middleware_runner,
+            forward_generation_guard.clone(),
+        );
         let pipeline = ForwardMiddlewarePipeline {
             ctx: &l7_ctx,
             scheme: &scheme,
-            runner: &middleware_runner,
-            generation_guard: &forward_generation_guard,
+            exchange: &middleware_exchange,
             l7_reevaluation,
         };
-        forward_request_bytes = match pipeline.apply(request, client, chain).await? {
+        forward_request_bytes = match pipeline.apply(request, client).await? {
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request.raw_header,
             crate::l7::middleware::MiddlewareApplyResult::Denied { denial, .. } => {
                 emit_activity_simple(activity_tx, true, "middleware");
@@ -5015,7 +5856,8 @@ async fn handle_forward_proxy(
                 return Ok(());
             }
         };
-    }
+        Some(middleware_exchange)
+    };
     let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
         let request = crate::l7::rest::request_from_buffered_http(
             method,
@@ -5131,7 +5973,6 @@ async fn handle_forward_proxy(
         &upstream_target,
         &canonical_authority,
         secret_resolver.as_deref(),
-        request_body_credential_rewrite,
     ) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -5147,7 +5988,10 @@ async fn handle_forward_proxy(
                     .await;
             }
             if e.is_endpoint_mismatch() {
-                emit_credential_endpoint_mismatch(&host_lc, port, policy_str);
+                if let Some(observer) = endpoint_observer.as_ref() {
+                    observer.observe_credential_failure(true);
+                }
+                emit_credential_endpoint_mismatch(method, &host_lc, port, policy_str);
                 respond(
                     client,
                     &build_json_error_response(
@@ -5158,6 +6002,17 @@ async fn handle_forward_proxy(
                     ),
                 )
                 .await?;
+                client.shutdown().await.into_diagnostic()?;
+                let mut discard = [0_u8; 1024];
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    loop {
+                        match client.read(&mut discard).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                })
+                .await;
             } else {
                 respond(
                     client,
@@ -5191,6 +6046,7 @@ async fn handle_forward_proxy(
                 client,
                 &l7_ctx,
                 &telemetry_path,
+                endpoint_observer.as_ref(),
             )
             .await?
             {
@@ -5330,6 +6186,7 @@ async fn handle_forward_proxy(
             credential_generation,
             websocket_extensions,
             secret_resolver: secret_resolver.as_deref(),
+            body_classifier: endpoint_credentials.body_classifier.as_deref(),
             request_body_credential_rewrite,
             deny_uninspected_credentials,
             credential_signing,
@@ -5337,18 +6194,37 @@ async fn handle_forward_proxy(
             signing_region,
             host: &host_lc,
             port,
+            response_middleware: response_selection.as_ref().map(|exchange| {
+                ForwardResponseMiddleware {
+                    ctx: &l7_ctx,
+                    scheme: &scheme,
+                    exchange,
+                }
+            }),
+            endpoint_observer: endpoint_observer.as_ref(),
         },
     )
     .await;
     let outcome_result = match outcome_result {
         Err(report) => {
+            if let Some(error) = report.downcast_ref::<secrets::body::BodyCredentialError>() {
+                if let Some(session) = middleware_session.take() {
+                    session
+                        .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
+                        .await;
+                }
+                let _ = upstream.shutdown().await;
+                crate::l7::relay::reject_body_credential(client, *error).await?;
+                return Ok(());
+            }
             if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>() {
                 if let Some(session) = middleware_session.take() {
                     session
                         .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                         .await;
                 }
-                crate::l7::relay::reject_credential_resolution(client, &l7_ctx, error).await?;
+                crate::l7::relay::reject_credential_resolution(client, &l7_ctx, method, error)
+                    .await?;
                 return Ok(());
             }
             Err(report)
@@ -5466,8 +6342,9 @@ fn normalize_host(raw_host: &str) -> &str {
     raw_host.strip_suffix('.').unwrap_or(raw_host)
 }
 
-async fn respond(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
+async fn respond(client: &mut (impl TokioAsyncWrite + Unpin), bytes: &[u8]) -> Result<()> {
     client.write_all(bytes).await.into_diagnostic()?;
+    client.flush().await.into_diagnostic()?;
     Ok(())
 }
 
@@ -5606,11 +6483,14 @@ const TLS_TERMINATION_UNAVAILABLE_DETAIL: &str = "TLS termination unavailable (C
 /// HTTP status (the flaw this replaces). Returns `true` when the connection was
 /// refused (the caller must stop) and `false` when the caller should proceed to
 /// establish the tunnel.
-async fn refuse_connect_when_tls_unavailable(
-    client: &mut TcpStream,
+async fn refuse_connect_when_tls_unavailable<C>(
+    client: &mut C,
     tls_state_present: bool,
     effective_tls_skip: bool,
-) -> Result<bool> {
+) -> Result<bool>
+where
+    C: TokioAsyncWrite + Unpin,
+{
     if tls_state_present || effective_tls_skip {
         return Ok(false);
     }
@@ -5660,13 +6540,205 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
+    #[test]
+    fn supplied_identity_preserves_authorized_endpoint_metadata() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            r#"
+network_policies:
+  inspected:
+    name: inspected
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        request_body_credential_rewrite: true
+        allowed_ips: ["192.0.2.0/24"]
+        rules:
+          - allow: { method: GET, path: /allowed }
+    binaries:
+      - path: /usr/bin/python3
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#,
+        )
+        .expect("load policy");
+        let identity = Ok(ContractBinaryIdentity {
+            binary_path: PathBuf::from("/usr/bin/python3"),
+            binary_digest: Some("00".repeat(32).parse().expect("digest")),
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+        });
+
+        let mut decision = authorize_supplied_identity(
+            &engine,
+            EgressIntent::connect("api.example.com".to_string(), 443),
+            &identity,
+        );
+
+        assert_eq!(query_allowed_ips(&decision), ["192.0.2.0/24"]);
+        hydrate_l7_route(&mut decision);
+        let route = decision
+            .endpoint
+            .l7_route
+            .expect("supplied identity must retain L7 metadata");
+        assert_eq!(route.configs.len(), 1);
+        assert!(route.configs[0].config.request_body_credential_rewrite);
+    }
+
+    #[tokio::test]
+    async fn staged_transparent_open_waits_for_l4_policy() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            r#"
+network_policies:
+  allowed:
+    name: allowed
+    endpoints:
+      - host: 203.0.113.7
+        port: 443
+      - host: 169.254.169.254
+        port: 80
+    binaries:
+      - path: /usr/bin/curl
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#,
+        )
+        .unwrap();
+        let identity = || {
+            Ok(ContractBinaryIdentity {
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_digest: Some("00".repeat(32).parse().unwrap()),
+                ancestors: Vec::new(),
+                cmdline_paths: Vec::new(),
+            })
+        };
+        let pending = |destination: &str| {
+            let (stream, _peer) = tokio::io::duplex(64);
+            let (decision, completion) = tokio::sync::oneshot::channel();
+            (
+                PendingTcpOpen {
+                    stream: Box::new(stream),
+                    binary_identity: identity(),
+                    destination: destination.parse().unwrap(),
+                    socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
+                        socket_cookie: 7,
+                        nonblocking: false,
+                        process_generation: 1,
+                    },
+                    policy_generation: engine.current_generation(),
+                    timing: MediationTiming::default(),
+                    decision,
+                },
+                completion,
+            )
+        };
+
+        let (allowed, allowed_result) = pending("203.0.113.7:443");
+        assert!(
+            preauthorize_transparent_open(allowed, None, &engine, None, None)
+                .await
+                .is_some()
+        );
+        assert_eq!(allowed_result.await.unwrap(), TcpOpenDecision::RelayReady);
+
+        let (unsafe_destination, unsafe_result) = pending("169.254.169.254:80");
+        assert!(
+            preauthorize_transparent_open(unsafe_destination, None, &engine, None, None)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            unsafe_result.await.unwrap(),
+            TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination)
+        );
+
+        let (denied, denied_result) = pending("203.0.113.8:443");
+        assert!(
+            preauthorize_transparent_open(denied, None, &engine, None, None)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            denied_result.await.unwrap(),
+            TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)
+        );
+    }
+
+    struct FailedMediationSource;
+
+    #[tokio::test]
+    async fn virtual_connect_is_portless_and_hides_the_synthetic_handshake() {
+        let (workload, mut workload_peer) = tokio::io::duplex(1024);
+        let mut handler = virtual_connect_stream(Box::new(workload), "api.example.com:443".into());
+
+        workload_peer.write_all(b"client-tls").await.unwrap();
+        let mut request = vec![0_u8; 128];
+        let length = handler.read(&mut request).await.unwrap();
+        let request = &request[..length];
+        assert!(request.starts_with(b"CONNECT api.example.com:443 HTTP/1.1\r\n"));
+
+        handler
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nserver-tls")
+            .await
+            .unwrap();
+        let mut response = [0_u8; 10];
+        workload_peer.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"server-tls");
+    }
+
+    #[async_trait::async_trait]
+    impl NetworkMediationSource for FailedMediationSource {
+        async fn accept_tcp(
+            &self,
+        ) -> std::result::Result<
+            PendingTcpOpen,
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            Err(
+                openshell_isolation_interface::contract::BackendError::Unavailable(
+                    "test source unavailable".to_string(),
+                ),
+            )
+        }
+
+        async fn accept_dns(
+            &self,
+        ) -> std::result::Result<
+            openshell_isolation_interface::contract::PendingDnsQuery,
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            Err(
+                openshell_isolation_interface::contract::BackendError::Unavailable(
+                    "test source unavailable".to_string(),
+                ),
+            )
+        }
+    }
+
     struct DenyWebSocketPreflight;
 
     #[tonic::async_trait]
     impl openshell_core::middleware::SupervisorMiddlewareEndpoint for DenyWebSocketPreflight {
         async fn describe(
             &self,
-            _request: tonic::Request<()>,
+            _request: tonic::Request<openshell_core::proto::MiddlewareDescribeRequest>,
         ) -> std::result::Result<
             tonic::Response<openshell_core::proto::MiddlewareManifest>,
             tonic::Status,
@@ -5682,9 +6754,18 @@ mod tests {
                         phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
                             as i32,
                         max_payload_bytes: 1024,
-                        timeout: "1s".into(),
+                        request_timeout: Some(prost_types::Duration {
+                            seconds: 1,
+                            nanos: 0,
+                        }),
                     }],
                     expected_audience: String::new(),
+                    extension: Some(openshell_core::extension_protocol::extension_metadata(
+                        openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                        "openshell/test-middleware",
+                        "test",
+                        [],
+                    )),
                 },
             ))
         }
@@ -5755,6 +6836,124 @@ mod tests {
         release: Arc<tokio::sync::Notify>,
     }
 
+    struct ForwardResponseHeadersMiddleware {
+        expected_path: String,
+        forbidden_path_fragment: String,
+        block: bool,
+    }
+
+    #[tonic::async_trait]
+    impl openshell_core::middleware::InProcessMiddleware for ForwardResponseHeadersMiddleware {
+        async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+            openshell_core::proto::MiddlewareManifest {
+                name: "test/forward-response".into(),
+                service_version: "test".into(),
+                bindings: vec![openshell_core::proto::MiddlewareBinding {
+                    operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpResponse
+                        as i32,
+                    phase: openshell_core::proto::SupervisorMiddlewarePhase::PreReturn as i32,
+                    max_payload_bytes: 8192,
+                    request_timeout: None,
+                }],
+                expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-forward-response",
+                    "test",
+                    [],
+                )),
+            }
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: openshell_core::middleware::HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            Ok(openshell_core::proto::HttpRequestResult {
+                decision: openshell_core::proto::Decision::Allow as i32,
+                ..Default::default()
+            })
+        }
+
+        async fn open_http_response_pre_return(
+            &self,
+            mut requests: mpsc::Receiver<openshell_core::proto::HttpResponseEvent>,
+        ) -> std::result::Result<openshell_core::middleware::HttpResponseResultStream, tonic::Status>
+        {
+            let (sender, receiver) = mpsc::channel(2);
+            let expected_path = self.expected_path.clone();
+            let forbidden_path_fragment = self.forbidden_path_fragment.clone();
+            let block = self.block;
+            tokio::spawn(async move {
+                while let Some(event) = requests.recv().await {
+                    match event.event {
+                        Some(openshell_core::proto::http_response_event::Event::Preflight(
+                            preflight,
+                        )) => {
+                            let target = preflight.target.expect("response target");
+                            assert_eq!(target.path, expected_path);
+                            assert!(!target.path.contains(&forbidden_path_fragment));
+                            let action = if block {
+                                openshell_core::proto::http_response_preflight_result::Action::BlockDelivery(
+                                    openshell_core::proto::HttpResponseBlockDelivery {},
+                                )
+                            } else {
+                                openshell_core::proto::http_response_preflight_result::Action::Inspect(
+                                    openshell_core::proto::HttpResponsePreflightInspect {
+                                        body_mode: openshell_core::proto::HttpResponseBodyMode::HeadersOnly as i32,
+                                        header_mutations: vec![openshell_core::proto::HeaderMutation {
+                                            operation: Some(
+                                                openshell_core::proto::header_mutation::Operation::Write(
+                                                    openshell_core::proto::WriteHeader {
+                                                        name: "x-forward-response-test".into(),
+                                                        value: "selected".into(),
+                                                        on_existing: openshell_core::proto::ExistingHeaderAction::Overwrite as i32,
+                                                    },
+                                                ),
+                                            ),
+                                        }],
+                                    },
+                                )
+                            };
+                            let result = openshell_core::proto::HttpResponseEventResult {
+                                result: Some(
+                                    openshell_core::proto::http_response_event_result::Result::PreflightResult(
+                                        openshell_core::proto::HttpResponsePreflightResult {
+                                            action: Some(action),
+                                            reason_code: if block {
+                                                "query_guard".into()
+                                            } else {
+                                                String::new()
+                                            },
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ),
+                            };
+                            if sender.send(Ok(result)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(openshell_core::proto::http_response_event::Event::SessionEnd(_))
+                        | None => break,
+                        Some(_) => panic!("headers-only response received an unexpected event"),
+                    }
+                }
+            });
+            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+        }
+    }
+
     #[tonic::async_trait]
     impl openshell_core::middleware::InProcessMiddleware for BlockingForwardMiddleware {
         async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
@@ -5766,9 +6965,15 @@ mod tests {
                         as i32,
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }
         }
 
@@ -5834,6 +7039,8 @@ network_policies: {}
             AgentProposals::default(),
             Arc::new(None),
             Arc::new(None),
+            Arc::new(None),
+            None,
             None,
             None,
             None,
@@ -5843,6 +7050,50 @@ network_policies: {}
         .await
         .expect("malformed request should be handled");
         client.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn terminal_mediation_source_failure_stops_proxy() {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let engine = Arc::new(
+            OpaEngine::from_strings_with_binary_identity_required(
+                policy,
+                "network_policies: {}",
+                true,
+            )
+            .expect("engine"),
+        );
+        let (_ready_tx, ready_rx) = tokio::sync::watch::channel(true);
+        let mut handle = ProxyHandle::start_with_bind_addr(
+            &ProxyPolicy { http_addr: None },
+            Some(([127, 0, 0, 1], 3128).into()),
+            engine,
+            Arc::new(BinaryIdentityCache::new()),
+            Arc::new(AtomicU32::new(1)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ready_rx,
+            &upstream_proxy::UpstreamProxyArgs::default(),
+            None,
+            Some(Arc::new(FailedMediationSource)),
+            None,
+            None,
+        )
+        .await
+        .expect("proxy starts before source accept");
+        let exited = handle
+            .take_exit_receiver()
+            .expect("proxy exposes its exit receiver");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), exited)
+            .await
+            .expect("source failure must stop the proxy")
+            .expect_err("proxy task drops the exit sender");
+        assert!(handle.join.is_finished());
     }
 
     #[tokio::test]
@@ -5968,29 +7219,39 @@ network_policies:
                 socket.read_to_end(&mut response).await.unwrap();
                 response
             });
-            let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
+            let (proxy_connection, _) = proxy_listener.accept().await.unwrap();
+            let socket_addrs = proxy_connection
+                .peer_addr()
+                .ok()
+                .zip(proxy_connection.local_addr().ok());
+            let mut proxy_connection: ProxyClient =
+                tokio::io::BufReader::new(Box::new(proxy_connection));
 
-            tokio::time::timeout(
+            Box::pin(tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                handle_forward_proxy(
+                Box::pin(handle_forward_proxy(
                     "POST",
                     &target,
                     request.as_bytes(),
                     request.len(),
                     &mut proxy_connection,
+                    None,
+                    socket_addrs,
                     engine,
                     Arc::new(BinaryIdentityCache::new()),
                     Arc::new(AtomicU32::new(std::process::id())),
                     None,
                     AgentProposals::default(),
                     Arc::new(None),
+                    Arc::new(None),
                     None,
                     None,
                     None,
                     None,
                     None,
-                ),
-            )
+                    None,
+                )),
+            ))
             .await
             .expect("MCP forwarding should complete")
             .expect("handle valid MCP request");
@@ -6082,28 +7343,38 @@ network_policies:
                 .expect("read proxy response");
             response
         });
-        let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
+        let (proxy_connection, _) = proxy_listener.accept().await.unwrap();
+        let socket_addrs = proxy_connection
+            .peer_addr()
+            .ok()
+            .zip(proxy_connection.local_addr().ok());
+        let stream: BoundaryDuplexStream = Box::new(proxy_connection);
+        let mut proxy_connection = tokio::io::BufReader::new(stream);
 
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            handle_forward_proxy(
+            Box::pin(handle_forward_proxy(
                 "GET",
                 &target,
                 request.as_bytes(),
                 request.len(),
                 &mut proxy_connection,
+                None,
+                socket_addrs,
                 engine,
                 Arc::new(BinaryIdentityCache::new()),
                 Arc::new(AtomicU32::new(std::process::id())),
                 None,
                 AgentProposals::default(),
                 Arc::new(None),
+                Arc::new(None),
                 None,
                 None,
                 None,
                 None,
                 None,
-            ),
+                None,
+            )),
         )
         .await
         .expect("denied preflight must complete without an upstream response")
@@ -6216,27 +7487,37 @@ network_policies:
                 .await
                 .unwrap();
         });
-        let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
+        let (proxy_connection, _) = proxy_listener.accept().await.unwrap();
+        let socket_addrs = proxy_connection
+            .peer_addr()
+            .ok()
+            .zip(proxy_connection.local_addr().ok());
+        let stream: BoundaryDuplexStream = Box::new(proxy_connection);
+        let mut proxy_connection = tokio::io::BufReader::new(stream);
 
         let handler = tokio::spawn(async move {
-            handle_forward_proxy(
+            Box::pin(handle_forward_proxy(
                 "GET",
                 &target,
                 request.as_bytes(),
                 request.len(),
                 &mut proxy_connection,
+                None,
+                socket_addrs,
                 engine,
                 Arc::new(BinaryIdentityCache::new()),
                 Arc::new(AtomicU32::new(std::process::id())),
                 None,
                 AgentProposals::default(),
                 Arc::new(None),
+                Arc::new(None),
                 None,
                 None,
                 None,
                 None,
                 None,
-            )
+                None,
+            ))
             .await
         });
         let scenario = tokio::time::timeout(std::time::Duration::from_mins(1), async {
@@ -6348,6 +7629,87 @@ network_policies:
             request.starts_with("CONNECT api.example.com.:443 HTTP/1.1\r\n"),
             "proxy must receive the absolute FQDN: {request}"
         );
+    }
+
+    #[test]
+    fn accept_errors_include_the_listening_endpoint() {
+        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
+
+        let addr = "127.0.0.1:3128".parse().unwrap();
+        let error = std::io::Error::other("accept failed");
+        for action in [
+            AcceptAction::Terminal,
+            AcceptAction::Retry {
+                backoff: std::time::Duration::from_millis(250),
+                severity: SeverityId::Low,
+            },
+        ] {
+            let event = build_accept_error_event(addr, &error, &action);
+            let json = event.to_json().unwrap();
+            validate_required_fields(&json, &load_class_schema("network_activity"));
+            assert_eq!(json["dst_endpoint"]["ip"], "127.0.0.1");
+            assert_eq!(json["dst_endpoint"]["port"], 3128);
+            assert!(json["message"].as_str().unwrap().contains("accept failed"));
+        }
+    }
+
+    #[test]
+    fn connection_errors_include_the_known_peer() {
+        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
+
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let schema = load_class_schema("network_activity");
+        let json = build_connection_error_event(peer, "Proxy connection error".to_string())
+            .to_json()
+            .unwrap();
+        assert_eq!(json["class_uid"], 4001);
+        assert_eq!(json["src_endpoint"]["ip"], "127.0.0.1");
+        assert_eq!(json["src_endpoint"]["port"], 54321);
+        validate_required_fields(&json, &schema);
+    }
+
+    #[test]
+    fn forward_parse_errors_include_http_context_and_peer() {
+        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
+
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let json =
+            build_forward_parse_error_ocsf_event(Some(peer), "GET", "/[INVALID_REQUEST_TARGET]")
+                .to_json()
+                .unwrap();
+
+        assert_eq!(json["class_uid"], 4002);
+        assert_eq!(json["activity_name"], "Get");
+        assert_eq!(json["http_request"]["http_method"], "GET");
+        assert!(json["http_request"].get("url").is_none());
+        assert_eq!(json["http_response"]["code"], 400);
+        assert_eq!(json["src_endpoint"]["ip"], "127.0.0.1");
+        assert_eq!(json["src_endpoint"]["port"], 54321);
+        validate_required_fields(&json, &load_class_schema("http_activity"));
+    }
+
+    #[test]
+    fn forward_parse_errors_without_a_peer_do_not_fabricate_an_endpoint() {
+        let json = build_forward_parse_error_ocsf_event(None, "GET", "/[INVALID_REQUEST_TARGET]")
+            .to_json()
+            .unwrap();
+
+        assert_eq!(json["class_uid"], 4002);
+        assert!(json.get("src_endpoint").is_none());
+        assert!(json.get("dst_endpoint").is_none());
+    }
+
+    #[test]
+    fn endpointless_proxy_failures_are_base_events() {
+        for event in [
+            build_proxy_connection_error_event(None, None, "connection failed".to_string()),
+            build_mediation_lane_failure_event("source failed".to_string()),
+        ] {
+            let json = event.to_json().unwrap();
+            assert_eq!(json["class_uid"], 0);
+            assert_ne!(json["activity_name"], "Stop");
+            assert_eq!(json["status"], "Failure");
+        }
     }
 
     #[test]
@@ -6472,7 +7834,7 @@ network_policies:
         let json = event.to_json().unwrap();
 
         assert_eq!(json["class_name"], "HTTP Activity");
-        assert_eq!(json["activity_name"], "Other");
+        assert_eq!(json["activity_name"], "Get");
         assert_eq!(json["action"], "Denied");
         assert_eq!(json["disposition"], "Blocked");
         assert_eq!(json["severity"], "Medium");
@@ -6690,9 +8052,13 @@ network_policies:
         assert!(!serialized.contains("real-secret"), "{serialized}");
         assert!(!serialized.contains("?token="), "{serialized}");
 
-        let malformed = build_forward_parse_error_ocsf_event(&forward_telemetry_path(
-            "not-a-uri?token=real-secret&key=openshell:resolve:env:API_TOKEN",
-        ))
+        let malformed = build_forward_parse_error_ocsf_event(
+            Some("127.0.0.1:12345".parse().unwrap()),
+            "GET",
+            &forward_telemetry_path(
+                "not-a-uri?token=real-secret&key=openshell:resolve:env:API_TOKEN",
+            ),
+        )
         .to_json()
         .unwrap();
         assert_eq!(
@@ -6755,6 +8121,8 @@ network_policies:
         websocket_credential_rewrite: bool,
     ) -> crate::l7::L7EndpointConfig {
         crate::l7::L7EndpointConfig {
+            endpoint_id: String::new(),
+            policy_hash: String::new(),
             protocol,
             path: "/**".to_string(),
             tls: crate::l7::TlsMode::Auto,
@@ -6810,14 +8178,14 @@ network_policies:
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let (server, _) = listener.accept().await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
 
         client
             .write_all(crate::l7::rest::HTTP2_PRIOR_KNOWLEDGE_PREFACE)
             .await
             .unwrap();
 
-        let protocol = peek_tunnel_protocol(&server)
+        let protocol = peek_tunnel_protocol(&mut tokio::io::BufReader::new(&mut server))
             .await
             .expect("peek should succeed")
             .expect("client sent bytes");
@@ -6939,6 +8307,7 @@ network_policies:
             },
         );
         let snapshot = ProviderCredentialSnapshot {
+            installation_id: String::new(),
             revision: 42,
             child_env: std::collections::HashMap::new(),
             dynamic_credentials,
@@ -7120,17 +8489,6 @@ network_policies:
                 .next()
                 .expect("built-in middleware service"),
         );
-        let pipeline = ForwardMiddlewarePipeline {
-            ctx: &ctx,
-            scheme: "http",
-            runner: &runner,
-            generation_guard: tunnel_engine.generation_guard(),
-            l7_reevaluation: Some(ForwardL7Reevaluation {
-                config: &config,
-                engine: &tunnel_engine,
-                request_info: &request_info,
-            }),
-        };
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
             name: "redactor".into(),
             implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
@@ -7138,10 +8496,26 @@ network_policies:
             config: prost_types::Struct::default(),
             on_error: openshell_supervisor_middleware::OnError::FailClosed,
         }];
+        let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+            "test-request-id".into(),
+            chain,
+            runner,
+            tunnel_engine.generation_guard().clone(),
+        );
+        let pipeline = ForwardMiddlewarePipeline {
+            ctx: &ctx,
+            scheme: "http",
+            exchange: &exchange,
+            l7_reevaluation: Some(ForwardL7Reevaluation {
+                config: &config,
+                engine: &tunnel_engine,
+                request_info: &request_info,
+            }),
+        };
         let (_app, mut client) = tokio::io::duplex(8192);
 
         let outcome = pipeline
-            .apply(request, &mut client, chain)
+            .apply(request, &mut client)
             .await
             .expect("forward middleware pipeline");
 
@@ -7218,13 +8592,6 @@ network_policies:
             canonicalize_forward_host_header(raw, "api.example.test").unwrap(),
         )
         .unwrap();
-        let pipeline = ForwardMiddlewarePipeline {
-            ctx: &ctx,
-            scheme: "http",
-            runner: &runner,
-            generation_guard: &guard,
-            l7_reevaluation: None,
-        };
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
             name: "blocker".into(),
             implementation: "test/blocking-forward".into(),
@@ -7232,13 +8599,25 @@ network_policies:
             config: prost_types::Struct::default(),
             on_error: openshell_supervisor_middleware::OnError::FailClosed,
         }];
+        let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+            "test-request-id".into(),
+            chain,
+            runner,
+            guard.clone(),
+        );
+        let pipeline = ForwardMiddlewarePipeline {
+            ctx: &ctx,
+            scheme: "http",
+            exchange: &exchange,
+            l7_reevaluation: None,
+        };
         let (_app, mut client) = tokio::io::duplex(8192);
         let revoke = async {
             entered.notified().await;
             state.revoke_static_provider_environment(2);
             release.notify_one();
         };
-        let (outcome, ()) = tokio::join!(pipeline.apply(request, &mut client, chain), revoke);
+        let (outcome, ()) = tokio::join!(pipeline.apply(request, &mut client), revoke);
         let request = match outcome.expect("middleware pipeline") {
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request,
             crate::l7::middleware::MiddlewareApplyResult::Denied { .. } => {
@@ -7266,7 +8645,6 @@ network_policies:
             &prepared.upstream_target,
             "api.example.test",
             credentials.resolver.as_deref(),
-            false,
         );
         assert!(
             rewrite.is_err(),
@@ -7352,12 +8730,208 @@ network_policies:
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn plaintext_forward_relay_applies_response_middleware() {
+        let guard = forward_test_guard();
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 80,
+            request_default_port: Some(80),
+            policy_name: "forward".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ..Default::default()
+        };
+        let runner = openshell_supervisor_middleware::ChainRunner::new(Arc::new(
+            ForwardResponseHeadersMiddleware {
+                expected_path: "/demo".into(),
+                forbidden_path_fragment: "not-present".into(),
+                block: false,
+            },
+        ));
+        let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            name: "response".into(),
+            implementation: "test/forward-response".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        }];
+        let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+            "correlated-request-id".into(),
+            chain,
+            runner,
+            guard.clone(),
+        );
+        let request = b"GET /demo HTTP/1.1\r\nHost: api.example.test\r\n\r\n".to_vec();
+        let (mut proxy_to_upstream, mut upstream) = tokio::io::duplex(8192);
+        let (mut app, mut proxy_to_client) = tokio::io::duplex(8192);
+        let upstream_task = tokio::spawn(async move {
+            let mut request = vec![0; 1024];
+            let size = upstream.read(&mut request).await.unwrap();
+            assert!(request[..size].ends_with(b"\r\n\r\n"));
+            upstream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let outcome = relay_rewritten_forward_request(
+            "GET",
+            "/demo",
+            request,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            ForwardRelayOptions {
+                body_classifier: None,
+                generation_guard: &guard,
+                credential_generation: None,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: None,
+                request_body_credential_rewrite: false,
+                deny_uninspected_credentials: false,
+                credential_signing: crate::l7::CredentialSigning::None,
+                signing_service: "",
+                signing_region: "",
+                host: "api.example.test",
+                port: 80,
+                response_middleware: Some(ForwardResponseMiddleware {
+                    ctx: &ctx,
+                    scheme: "http",
+                    exchange: &exchange,
+                }),
+                endpoint_observer: None,
+            },
+        )
+        .await
+        .expect("plaintext forward relay");
+        assert!(matches!(
+            outcome,
+            crate::l7::provider::RelayOutcome::Reusable
+        ));
+        upstream_task.await.unwrap();
+        drop(proxy_to_client);
+        let mut response = Vec::new();
+        app.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.contains("x-forward-response-test: selected\r\n"));
+        assert!(response.ends_with("\r\n\r\nok"));
+    }
+
+    #[tokio::test]
+    async fn plaintext_forward_response_denial_never_echoes_query_secret() {
+        const SECRET: &str = "sk-forward-query-secret";
+        let guard = forward_test_guard();
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 80,
+            request_default_port: Some(80),
+            policy_name: "forward".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ..Default::default()
+        };
+        let runner = openshell_supervisor_middleware::ChainRunner::new(Arc::new(
+            ForwardResponseHeadersMiddleware {
+                expected_path: "/demo".into(),
+                forbidden_path_fragment: SECRET.into(),
+                block: true,
+            },
+        ));
+        let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            name: "response".into(),
+            implementation: "test/forward-response".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        }];
+        let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+            "correlated-request-id".into(),
+            chain,
+            runner,
+            guard.clone(),
+        );
+        let target = format!("/demo?access_token={SECRET}");
+        let request =
+            format!("GET {target} HTTP/1.1\r\nHost: api.example.test\r\n\r\n").into_bytes();
+        let (mut proxy_to_upstream, mut upstream) = tokio::io::duplex(8192);
+        let (mut app, mut proxy_to_client) = tokio::io::duplex(8192);
+        let upstream_task = tokio::spawn(async move {
+            let mut request = vec![0; 1024];
+            let size = upstream.read(&mut request).await.unwrap();
+            assert!(request[..size].ends_with(b"\r\n\r\n"));
+            upstream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let outcome = relay_rewritten_forward_request(
+            "GET",
+            &target,
+            request,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            ForwardRelayOptions {
+                body_classifier: None,
+                generation_guard: &guard,
+                credential_generation: None,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: None,
+                request_body_credential_rewrite: false,
+                deny_uninspected_credentials: false,
+                credential_signing: crate::l7::CredentialSigning::None,
+                signing_service: "",
+                signing_region: "",
+                host: "api.example.test",
+                port: 80,
+                response_middleware: Some(ForwardResponseMiddleware {
+                    ctx: &ctx,
+                    scheme: "http",
+                    exchange: &exchange,
+                }),
+                endpoint_observer: None,
+            },
+        )
+        .await
+        .expect("plaintext forward response denial");
+        assert!(matches!(
+            outcome,
+            crate::l7::provider::RelayOutcome::Consumed
+        ));
+        upstream_task.await.unwrap();
+        drop(proxy_to_client);
+        let mut response = Vec::new();
+        app.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+        assert!(response.contains("\"path\":\"/demo\""));
+        assert!(!response.contains(SECRET));
+        assert!(!response.contains("access_token"));
+    }
+
     async fn relay_forward_request_and_capture(
         method: &str,
         path: &str,
         raw: &[u8],
         resolver: Option<&SecretResolver>,
         request_body_credential_rewrite: bool,
+    ) -> Result<String> {
+        relay_forward_request_and_capture_classified(
+            method,
+            path,
+            raw,
+            resolver,
+            request_body_credential_rewrite,
+            None,
+        )
+        .await
+    }
+
+    async fn relay_forward_request_and_capture_classified(
+        method: &str,
+        path: &str,
+        raw: &[u8],
+        resolver: Option<&SecretResolver>,
+        request_body_credential_rewrite: bool,
+        body_classifier: Option<&secrets::body::BodyCredentialClassifier>,
     ) -> Result<String> {
         let guard = forward_test_guard();
         let target_uri = std::str::from_utf8(raw)
@@ -7368,15 +8942,8 @@ network_policies:
             .expect("forward test request has an absolute target");
         let (_, host, port, _) = parse_proxy_uri(target_uri)?;
         let authority = canonical_forward_authority(&host, port);
-        let rewritten = rewrite_forward_request(
-            raw,
-            raw.len(),
-            path,
-            &authority,
-            resolver,
-            request_body_credential_rewrite,
-        )
-        .map_err(|e| miette::miette!("{e}"))?;
+        let rewritten = rewrite_forward_request(raw, raw.len(), path, &authority, resolver)
+            .map_err(|e| miette::miette!("{e}"))?;
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
         let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
 
@@ -7427,15 +8994,18 @@ network_policies:
             ForwardRelayOptions {
                 generation_guard: &guard,
                 credential_generation: None,
+                body_classifier,
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: resolver,
                 request_body_credential_rewrite,
-                deny_uninspected_credentials: false,
+                deny_uninspected_credentials: body_classifier.is_some(),
                 credential_signing: crate::l7::CredentialSigning::None,
                 signing_service: "",
                 signing_region: "",
                 host: "",
                 port: 0,
+                response_middleware: None,
+                endpoint_observer: None,
             },
         )
         .await?;
@@ -7672,7 +9242,6 @@ network_policies:
             path,
             &canonical_forward_authority(&host, port),
             None,
-            false,
         )
         .expect("forward websocket request should rewrite to origin form");
         let websocket_extensions = crate::l7::relay::websocket_extension_mode(&config, false);
@@ -7692,6 +9261,7 @@ network_policies:
                 ForwardRelayOptions {
                     generation_guard: guard,
                     credential_generation: None,
+                    body_classifier: None,
                     websocket_extensions,
                     secret_resolver: None,
                     request_body_credential_rewrite: false,
@@ -7701,6 +9271,8 @@ network_policies:
                     signing_region: "",
                     host: "",
                     port: 0,
+                    response_middleware: None,
+                    endpoint_observer: None,
                 },
             )
             .await?;
@@ -7995,6 +9567,8 @@ network_policies:
         let configs = vec![
             L7ConfigSnapshot {
                 config: crate::l7::L7EndpointConfig {
+                    endpoint_id: String::new(),
+                    policy_hash: String::new(),
                     protocol: crate::l7::L7Protocol::Rest,
                     path: "/**".to_string(),
                     tls: crate::l7::TlsMode::Auto,
@@ -8016,6 +9590,8 @@ network_policies:
             },
             L7ConfigSnapshot {
                 config: crate::l7::L7EndpointConfig {
+                    endpoint_id: String::new(),
+                    policy_hash: String::new(),
                     protocol: crate::l7::L7Protocol::Graphql,
                     path: "/graphql".to_string(),
                     tls: crate::l7::TlsMode::Auto,
@@ -9235,6 +10811,36 @@ network_policies:
     }
 
     #[test]
+    fn unsupported_forward_scheme_event_omits_request_url() {
+        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
+
+        let event =
+            build_forward_unsupported_scheme_ocsf_event("GET", "https", "api.example.com", 443);
+        let json = event.to_json().unwrap();
+
+        assert_eq!(json["http_request"]["http_method"], "GET");
+        assert!(json["http_request"].get("url").is_none());
+        assert_eq!(json["http_response"]["code"], 400);
+        validate_required_fields(&json, &load_class_schema("http_activity"));
+    }
+
+    #[test]
+    fn credential_endpoint_mismatch_event_includes_method_and_response() {
+        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
+
+        let event =
+            build_credential_endpoint_mismatch_event("POST", "api.example.com", 443, "bound");
+        let json = event.to_json().unwrap();
+
+        assert_eq!(json["class_uid"], 4002);
+        assert_eq!(json["activity_name"], "Post");
+        assert_eq!(json["http_request"]["http_method"], "POST");
+        assert!(json["http_request"].get("url").is_none());
+        assert_eq!(json["http_response"]["code"], 403);
+        validate_required_fields(&json, &load_class_schema("http_activity"));
+    }
+
+    #[test]
     fn forward_credentials_capture_endpoint_resolver_and_revision_together() {
         use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
 
@@ -9646,7 +11252,6 @@ network_policies:
             "/v1/projects",
             "api.example.test:8080",
             None,
-            false,
         )
         .expect("forward request should rewrite");
         let rewritten = String::from_utf8_lossy(&rewritten);
@@ -9672,7 +11277,6 @@ network_policies:
             "/v1/projects",
             "api.example.test:8080",
             None,
-            false,
         )
         .expect("forward request should rewrite");
         let rewritten = String::from_utf8_lossy(&rewritten);
@@ -9720,7 +11324,7 @@ network_policies:
     fn test_rewrite_get_request() {
         let raw =
             b"GET http://10.0.0.1:8000/api HTTP/1.1\r\nHost: 10.0.0.1:8000\r\nAccept: */*\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/api", "10.0.0.1:8000", None, false)
+        let result = rewrite_forward_request(raw, raw.len(), "/api", "10.0.0.1:8000", None)
             .expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.starts_with("GET /api HTTP/1.1\r\n"));
@@ -9767,7 +11371,7 @@ network_policies:
         assert!(!canonical.contains("second.example.test"));
         assert!(canonical.ends_with("\r\n\r\nbody"));
 
-        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", authority, None, false)
+        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", authority, None)
             .expect("final rewrite enforces canonical Host");
         let rewritten = String::from_utf8(rewritten).expect("rewritten request is UTF-8");
         assert_eq!(
@@ -9823,13 +11427,6 @@ network_policies:
                 .expect("built-in middleware service"),
         );
         let guard = forward_test_guard();
-        let pipeline = ForwardMiddlewarePipeline {
-            ctx: &ctx,
-            scheme: "http",
-            runner: &runner,
-            generation_guard: &guard,
-            l7_reevaluation: None,
-        };
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
             name: "redactor".into(),
             implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
@@ -9837,10 +11434,22 @@ network_policies:
             config: prost_types::Struct::default(),
             on_error: openshell_supervisor_middleware::OnError::FailClosed,
         }];
+        let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+            "test-request-id".into(),
+            chain,
+            runner,
+            guard,
+        );
+        let pipeline = ForwardMiddlewarePipeline {
+            ctx: &ctx,
+            scheme: "http",
+            exchange: &exchange,
+            l7_reevaluation: None,
+        };
         let (_app, mut client) = tokio::io::duplex(8192);
 
         let allowed = pipeline
-            .apply(request, &mut client, chain)
+            .apply(request, &mut client)
             .await
             .expect("middleware pipeline");
         let crate::l7::middleware::MiddlewareApplyResult::Allowed(request) = allowed else {
@@ -9852,7 +11461,6 @@ network_policies:
             "/api",
             authority,
             None,
-            false,
         )
         .expect("rewrite middleware-selected request");
         let rewritten = String::from_utf8(rewritten).expect("rewritten request is UTF-8");
@@ -9873,8 +11481,8 @@ network_policies:
     #[test]
     fn test_rewrite_strips_proxy_headers() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nProxy-Authorization: Basic abc\r\nProxy-Connection: keep-alive\r\nAccept: */*\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", "host", None, false)
-            .expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/p", "host", None).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(
             !result_str
@@ -9888,8 +11496,8 @@ network_policies:
     #[test]
     fn test_rewrite_replaces_connection_header() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nConnection: keep-alive\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", "host", None, false)
-            .expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/p", "host", None).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Connection: close"));
         assert!(!result_str.contains("keep-alive"));
@@ -9898,8 +11506,8 @@ network_policies:
     #[test]
     fn test_rewrite_strips_connection_nominated_headers() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nX-Guard: hidden\r\nConnection: keep-alive, x-guard\r\nKeep-Alive: timeout=5\r\nX-Visible: yes\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", "host", None, false)
-            .expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/p", "host", None).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         let lower = result_str.to_ascii_lowercase();
 
@@ -9912,8 +11520,8 @@ network_policies:
     #[test]
     fn test_rewrite_preserves_body_overflow() {
         let raw = b"POST http://host/api HTTP/1.1\r\nHost: host\r\nContent-Length: 13\r\n\r\n{\"key\":\"val\"}";
-        let result = rewrite_forward_request(raw, raw.len(), "/api", "host", None, false)
-            .expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/api", "host", None).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("{\"key\":\"val\"}"));
         assert!(result_str.contains("POST /api HTTP/1.1"));
@@ -9922,8 +11530,8 @@ network_policies:
     #[test]
     fn test_rewrite_preserves_existing_via() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nVia: 1.0 upstream\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", "host", None, false)
-            .expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/p", "host", None).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Via: 1.0 upstream"));
         // Should not add a second Via header
@@ -9946,7 +11554,7 @@ network_policies:
         .expect("canonicalization should succeed for the attack payload");
         assert_eq!(canon.path, "/secret");
 
-        let rewritten = rewrite_forward_request(raw, raw.len(), &canon.path, "host", None, false)
+        let rewritten = rewrite_forward_request(raw, raw.len(), &canon.path, "host", None)
             .expect("rewrite_forward_request should succeed");
         let rewritten_str = String::from_utf8_lossy(&rewritten);
         assert!(
@@ -9972,9 +11580,8 @@ network_policies:
             _ => canon.path,
         };
 
-        let rewritten =
-            rewrite_forward_request(raw, raw.len(), &upstream_target, "host", None, false)
-                .expect("rewrite_forward_request should succeed");
+        let rewritten = rewrite_forward_request(raw, raw.len(), &upstream_target, "host", None)
+            .expect("rewrite_forward_request should succeed");
         let rewritten_str = String::from_utf8_lossy(&rewritten);
         assert!(
             rewritten_str.starts_with(
@@ -9992,12 +11599,82 @@ network_policies:
                 .collect(),
         );
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nAuthorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY\r\n\r\n";
-        let result =
-            rewrite_forward_request(raw, raw.len(), "/p", "host", resolver.as_ref(), false)
-                .expect("should succeed");
+        let result = rewrite_forward_request(raw, raw.len(), "/p", "host", resolver.as_ref())
+            .expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Authorization: Bearer sk-test"));
         assert!(!result_str.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn forward_initial_body_is_classified_separately_from_auth_headers() {
+        use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+        let state = ProviderCredentialState::from_bound_environment(
+            42,
+            TestHashMap::from([("API_KEY".into(), "private-test-secret".into())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "API_KEY".into(),
+                StaticCredentialBinding {
+                    credential_identity: "provider".into(),
+                    workload_credential_handle: String::new(),
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.example.com".into(),
+                        port: 80,
+                        path: "/**".into(),
+                    }],
+                },
+            )]),
+            vec![],
+        )
+        .unwrap();
+        let issued = state.snapshot().child_env["API_KEY"].clone();
+        let (resolver, classifier, _) =
+            state.resolver_and_body_classifier_for_endpoint("api.example.com", 80, "/chat");
+        for token in [
+            "openshell:resolve:env:KEY".to_owned(),
+            issued.clone(),
+            issued.replace(':', "%3A"),
+            format!(
+                "sk-OPENSHELL-RESOLVE-ENV-{}",
+                issued.strip_prefix("openshell:resolve:env:").unwrap()
+            ),
+        ] {
+            let body = format!(r#"{{"messages":[{{"role":"tool","content":"{token}"}}]}}"#);
+            let raw = format!(
+                "POST http://api.example.com/chat HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer {issued}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            for _ in 0..2 {
+                let forwarded = relay_forward_request_and_capture_classified(
+                    "POST",
+                    "/chat",
+                    raw.as_bytes(),
+                    resolver.as_deref(),
+                    false,
+                    classifier.as_deref(),
+                )
+                .await
+                .unwrap();
+                let (headers, actual_body) = forwarded.split_once("\r\n\r\n").unwrap();
+                assert!(headers.contains("Authorization: Bearer private-test-secret"));
+                assert_eq!(actual_body, body);
+                assert!(!actual_body.contains("private-test-secret"));
+            }
+        }
+        // Header placeholders remain fail-closed even when the body can be literal.
+        let raw = b"POST http://api.example.com/chat HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer openshell:resolve:env:MISSING\r\nContent-Length: 0\r\n\r\n";
+        assert!(
+            rewrite_forward_request(
+                raw,
+                raw.len(),
+                "/chat",
+                "api.example.com",
+                resolver.as_deref()
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -10118,7 +11795,6 @@ network_policies:
             "/api/messages",
             "api.example.com",
             Some(&resolver),
-            true,
         )
         .expect("header rewrite should defer body overflow to body rewriter");
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
@@ -10133,6 +11809,7 @@ network_policies:
             ForwardRelayOptions {
                 generation_guard: &guard,
                 credential_generation: None,
+                body_classifier: None,
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: Some(&resolver),
                 request_body_credential_rewrite: true,
@@ -10142,6 +11819,8 @@ network_policies:
                 signing_region: "",
                 host: "",
                 port: 0,
+                response_middleware: None,
+                endpoint_observer: None,
             },
         )
         .await
@@ -10214,6 +11893,7 @@ network_policies:
             ForwardRelayOptions {
                 generation_guard: &guard,
                 credential_generation: None,
+                body_classifier: None,
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: Some(&resolver),
                 request_body_credential_rewrite: false,
@@ -10223,6 +11903,8 @@ network_policies:
                 signing_region: "us-west-2",
                 host: "api.example.com",
                 port: 80,
+                response_middleware: None,
+                endpoint_observer: None,
             },
         )
         .await
@@ -10261,7 +11943,6 @@ network_policies:
             "/ws",
             "gateway.example.test",
             None,
-            false,
         )
         .expect("websocket forward rewrite should succeed");
         let result_str = String::from_utf8_lossy(&result);
@@ -10289,7 +11970,7 @@ network_policies:
         engine.reload(policy, policy_data).unwrap();
 
         let raw = b"GET http://host/api HTTP/1.1\r\nHost: host\r\n\r\n";
-        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", "host", None, false)
+        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", "host", None)
             .expect("rewrite should succeed");
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
         let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
@@ -10303,6 +11984,7 @@ network_policies:
             ForwardRelayOptions {
                 generation_guard: &guard,
                 credential_generation: None,
+                body_classifier: None,
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: None,
                 request_body_credential_rewrite: false,
@@ -10312,6 +11994,8 @@ network_policies:
                 signing_region: "",
                 host: "",
                 port: 0,
+                response_middleware: None,
+                endpoint_observer: None,
             },
         )
         .await;
@@ -10339,7 +12023,7 @@ network_policies:
             .unwrap();
 
         let raw = b"POST http://host/api HTTP/1.1\r\nHost: host\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
-        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", "host", None, false)
+        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", "host", None)
             .expect("rewrite should succeed");
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
         let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
@@ -10353,6 +12037,7 @@ network_policies:
             ForwardRelayOptions {
                 generation_guard: &guard,
                 credential_generation: None,
+                body_classifier: None,
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: None,
                 request_body_credential_rewrite: false,
@@ -10362,6 +12047,8 @@ network_policies:
                 signing_region: "",
                 host: "",
                 port: 0,
+                response_middleware: None,
+                endpoint_observer: None,
             },
         )
         .await;
@@ -10758,6 +12445,7 @@ network_policies:
                 None,                      // tls_state — ephemeral CA unavailable
                 None,                      // policy_local_ctx
                 AgentProposals::default(), // agent_proposals
+                Arc::new(None),            // backend_host_gateway
                 Arc::new(None),            // trusted_host_gateway
                 Arc::new(None),            // upstream_proxy
                 None,                      // provider_credentials
@@ -10765,6 +12453,7 @@ network_policies:
                 None,                      // dynamic_credentials
                 Some(denial_tx),           // denial_tx — positive allow/deny signal
                 None,                      // activity_tx
+                None,                      // endpoint_observation_tx
             )),
         )
         .await
@@ -10790,15 +12479,17 @@ network_policies:
         const POLICY_REGO: &str = include_str!("../data/sandbox-policy.rego");
 
         let exe = std::env::current_exe().expect("current_exe");
+        // JSON strings are valid YAML scalars and correctly escape Windows
+        // path separators such as `D:\\...`.
+        let exe_yaml = serde_json::to_string(&exe.to_string_lossy()).expect("encode executable");
         let data = format!(
             r#"network_policies:
   test_allow:
     name: test_allow
     endpoints:
 {endpoint_yaml}    binaries:
-      - {{ path: "{exe}" }}
+      - {{ path: {exe_yaml} }}
 "#,
-            exe = exe.display(),
         );
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, &data).expect("load policy"));
 
@@ -10826,10 +12517,12 @@ network_policies:
             AgentProposals::default(),
             Arc::new(None),
             Arc::new(None),
+            Arc::new(None),
             None,
             None,
             None,
             Some(denial_tx),
+            None,
             None,
         ))
         .await
@@ -10932,7 +12625,10 @@ network_policies:
             response.starts_with("HTTP/1.1 403 Forbidden"),
             "internal forward destination must get the SSRF 403; got: {response:?}"
         );
-        assert!(response.contains("ssrf_denied"));
+        assert!(
+            response.contains("ssrf_denied"),
+            "expected the SSRF-specific denial body; got: {response:?}"
+        );
         assert!(
             response.contains("GET 127.0.0.1:80 blocked: declared endpoint check failed"),
             "an explicit loopback endpoint must fail declared-endpoint validation; got: {response:?}"

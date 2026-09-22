@@ -17,6 +17,52 @@ use openshell_core::proto;
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// Missing targets are errors unless explicitly allowed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeleteOptions {
+    pub allow_missing: bool,
+}
+
+/// A deletion acknowledgement is not necessarily completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DeletionOutcome {
+    Unspecified,
+    Completed,
+    Accepted,
+    AlreadyAbsent,
+    Unknown(i32),
+}
+
+impl From<i32> for DeletionOutcome {
+    fn from(value: i32) -> Self {
+        match proto::DeletionOutcome::try_from(value) {
+            Ok(proto::DeletionOutcome::Unspecified) => Self::Unspecified,
+            Ok(proto::DeletionOutcome::Completed) => Self::Completed,
+            Ok(proto::DeletionOutcome::Accepted) => Self::Accepted,
+            Ok(proto::DeletionOutcome::AlreadyAbsent) => Self::AlreadyAbsent,
+            Err(_) => Self::Unknown(value),
+        }
+    }
+}
+
+#[test]
+fn deletion_outcomes_preserve_unknown_values() {
+    assert_eq!(DeletionOutcome::from(0), DeletionOutcome::Unspecified);
+    assert_eq!(DeletionOutcome::from(1), DeletionOutcome::Completed);
+    assert_eq!(DeletionOutcome::from(2), DeletionOutcome::Accepted);
+    assert_eq!(DeletionOutcome::from(3), DeletionOutcome::AlreadyAbsent);
+    assert_eq!(DeletionOutcome::from(99), DeletionOutcome::Unknown(99));
+}
+
+/// Result for the original target, never a same-name replacement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeletionResult {
+    pub outcome: DeletionOutcome,
+    /// Present for sandbox deletions that found a target.
+    pub sandbox_id: Option<String>,
+}
+
 /// Gateway health snapshot.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -100,7 +146,7 @@ impl From<i32> for SandboxPhase {
 pub struct SandboxSpec {
     /// Optional user-supplied sandbox name. When empty the server generates one.
     pub name: Option<String>,
-    /// Container image reference (e.g. `ghcr.io/nvidia/openshell-community/sandboxes/python:latest`).
+    /// Container image reference (e.g. `registry.example.com/agents/python:latest`).
     pub image: Option<String>,
     /// Labels attached to the sandbox.
     pub labels: HashMap<String, String>,
@@ -115,6 +161,17 @@ pub struct SandboxSpec {
     pub command: Vec<String>,
     /// Allocate a retained pseudo-terminal for the canonical command.
     pub tty: bool,
+    /// Loopback HTTP services to expose when the sandbox is created.
+    pub service_exposures: Vec<ServiceExposure>,
+}
+
+/// A loopback HTTP service to expose during sandbox creation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceExposure {
+    /// Service name. Empty selects the sandbox's unnamed endpoint.
+    pub service: String,
+    /// Loopback TCP port inside the sandbox.
+    pub target_port: u16,
 }
 
 /// Caller intent for creating a sandbox from a named workload template.
@@ -132,6 +189,8 @@ pub struct SandboxTemplateCreateSpec {
     pub command: Vec<String>,
     /// Allocate a retained pseudo-terminal for the canonical command.
     pub tty: bool,
+    /// Loopback HTTP services to expose when the sandbox is created.
+    pub service_exposures: Vec<ServiceExposure>,
     /// Create-time sandbox policy. The named workload template supplies runtime
     /// workload fields; policy remains part of the sandbox's governance spec.
     pub policy: Option<proto::SandboxPolicy>,
@@ -161,14 +220,12 @@ pub type SandboxStartup = proto::SandboxStartup;
 /// Options for listing reusable sandbox templates.
 #[derive(Clone, Debug, Default)]
 pub struct SandboxTemplateListOptions {
-    /// Maximum templates to return. `0` defers to the server default.
-    pub limit: u32,
-    /// Offset into the result list.
-    pub offset: u32,
+    /// Maximum templates requested per page. `0` uses the server default.
+    pub page_size: i32,
+    /// Opaque token from a previous page. Empty starts at the beginning.
+    pub page_token: String,
     /// Optional label selector in `key=value,key2=value2` form.
     pub label_selector: String,
-    /// List templates across all workspaces.
-    pub all_workspaces: bool,
 }
 
 /// Reference to a sandbox owned by the gateway.
@@ -183,6 +240,9 @@ pub struct SandboxRef {
     pub resource_version: u64,
     pub exit_code: Option<i32>,
     pub created_from_workload_template: Option<SandboxWorkloadTemplateProvenance>,
+    /// Service URLs returned by sandbox creation, keyed by service name. The
+    /// empty key identifies the unnamed service. Non-create reads leave this empty.
+    pub service_urls: HashMap<String, String>,
 }
 
 /// Reusable workload template revision used to create a sandbox.
@@ -214,6 +274,7 @@ impl SandboxRef {
             resource_version: meta.resource_version,
             exit_code,
             created_from_workload_template,
+            service_urls: HashMap::new(),
         }
     }
 }
@@ -249,10 +310,10 @@ impl WorkspaceRef {
 /// Options for listing sandboxes.
 #[derive(Clone, Debug, Default)]
 pub struct ListOptions {
-    /// Maximum sandboxes to return. `0` defers to the server default.
-    pub limit: u32,
-    /// Offset into the result list.
-    pub offset: u32,
+    /// Maximum resources requested per page. `0` uses the server default.
+    pub page_size: i32,
+    /// Opaque token from a previous page. Empty starts at the beginning.
+    pub page_token: String,
     /// Optional Kubernetes-style label selector (e.g. `env=prod,team=core`).
     pub label_selector: Option<String>,
 }

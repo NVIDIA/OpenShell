@@ -17,7 +17,7 @@ inputs:
   cargo-version:
     description: Cargo package version embedded in the binary
     required: true
-  image-tag:
+  supervisor-image-tag:
     description: Default supervisor image tag embedded in the binary
     required: false
     default: ""
@@ -29,25 +29,13 @@ inputs:
     description: Additional flags passed to cargo build
     required: false
     default: ""
-
 runs:
   using: composite
   steps:
-    - name: Hash development shell
-      id: dev-shell
-      shell: bash
-      run: |
-        shell_drv=$(nix eval --raw --impure .#devShells --apply 'shells: shells.${builtins.currentSystem}.default.drvPath')
-        echo "hash=$(nix hash file --type sha256 --base16 "$shell_drv")" >> "$GITHUB_OUTPUT"
-
-    - name: Cache Rust artifacts
-      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+    - uses: ./.github/actions/setup-rust
       with:
-        shared-key: binaries-${{ inputs.binary }}-${{ inputs.triple }}-${{ steps.dev-shell.outputs.hash }}
-        cache-on-failure: "true"
-        cache-workspace-crates: "true"
-        cache-bin: "false"
-        cmd-format: nix develop -c {0}
+        cache-key: binaries-v2-${{ inputs.binary }}-${{ inputs.triple }}
+        save-cache: "true"
 
     - name: Set version
       shell: nix develop -c bash -euo pipefail {0}
@@ -59,7 +47,7 @@ runs:
       shell: nix develop -c bash -euo pipefail {0}
       env:
         GIT_DIR: /nonexistent
-        OPENSHELL_IMAGE_TAG: ${{ inputs.image-tag }}
+        OPENSHELL_IMAGE_TAG: ${{ inputs.supervisor-image-tag }}
         INPUTS_PACKAGE: ${{ inputs.package }}
         INPUTS_BINARY: ${{ inputs.binary }}
         INPUTS_TRIPLE: ${{ inputs.triple }}
@@ -72,10 +60,11 @@ runs:
         INPUTS_BINARY: ${{ inputs.binary }}
         INPUTS_TRIPLE: ${{ inputs.triple }}
       run: |
+        binary="target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY}"
         # Confirm the binary runs and reports the expected name.
-        target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY} --version | grep -q "^${INPUTS_BINARY} "
+        "$binary" --version | grep -q "^${INPUTS_BINARY} "
         # Confirm Syft can decode the embedded cargo-auditable metadata.
-        SYFT_CHECK_FOR_APP_UPDATE=false syft file:target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY} -o cyclonedx-json | grep 'pkg:cargo/' > /dev/null
+        SYFT_CHECK_FOR_APP_UPDATE=false syft "file:${binary}" -o cyclonedx-json | grep 'pkg:cargo/' > /dev/null
 
     - name: Upload ${{ inputs.binary }}
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

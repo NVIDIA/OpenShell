@@ -36,66 +36,65 @@ After installing the CLI, run `openshell --help` in your terminal to view the fu
 Install the public OpenShell agent skills with `npx skills add NVIDIA/OpenShell`. The `openshell-cli` skill guides your agent through common workflows and uses the installed CLI help as the command reference; no OpenShell source checkout is required.
 </Tip>
 
-## Create Your First OpenShell Sandbox
+## Import a Provider Profile
 
-Create a sandbox and launch an agent inside it.
-Choose the tab that matches your agent:
+A provider profile describes the credentials, endpoints, and client binaries a
+provider needs. A gateway serves only the profiles you imported, so import one
+before creating a sandbox that uses a provider.
 
-<Tabs>
-<Tab title="Claude Code">
-
-Run the following command to create a sandbox with Claude Code:
-
-```shell
-openshell sandbox create -- claude
-```
-
-The CLI prompts you to create a provider from local credentials.
-Type `yes` to continue.
-If `ANTHROPIC_API_KEY` is set in your environment, the CLI picks it up automatically.
-If not, you can configure it from inside the sandbox after it launches.
-
-<Note>
-`ANTHROPIC_API_KEY` is an API key from [console.anthropic.com](https://console.anthropic.com), not a subscription token. Subscription users must generate a separate API key.
-</Note>
-</Tab>
-
-<Tab title="OpenCode">
-
-Run the following command to create a sandbox with OpenCode:
+The OpenShell repository ships example profiles in
+[`providers/`](https://github.com/NVIDIA/OpenShell/tree/main/providers). Download
+the one matching your agent and import it at platform scope:
 
 ```shell
-openshell sandbox create -- opencode
+curl -LsSfO https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/claude-code.yaml
+openshell provider profile import -f claude-code.yaml --global
 ```
 
-The CLI prompts you to create a provider from local credentials.
-Type `yes` to continue.
-If `OPENAI_API_KEY` or `OPENROUTER_API_KEY` is set in your environment, the CLI picks it up automatically.
-If not, you can configure it from inside the sandbox after it launches.
-</Tab>
-
-<Tab title="Codex">
-
-Run the following command to create a sandbox with Codex:
+Use `codex.yaml` for Codex, or `openai.yaml` for OpenCode. Confirm the catalog:
 
 ```shell
-openshell sandbox create -- codex
+openshell provider list-profiles
 ```
 
-The CLI prompts you to create a provider from local credentials.
-Type `yes` to continue.
-If `OPENAI_API_KEY` is set in your environment, the CLI picks it up automatically.
-If not, you can configure it from inside the sandbox after it launches.
-</Tab>
+<Tip>
+Read the comment header at the top of each file before importing it. It names
+the client binaries the profile expects and the image layout those paths assume.
+If your sandbox image installs the agent somewhere else, edit `binaries` first —
+otherwise the profile matches nothing and the credential is never injected.
+</Tip>
 
-<Tab title="Base Sandbox">
+## Create Your First Sandbox
 
-Use the `--from` flag to create a sandbox from the base container:
+Create a sandbox with the gateway's default workload image:
 
 ```shell
-openshell sandbox create --from base
+openshell sandbox create --name quickstart
 ```
 
-</Tab>
+The default is `nvcr.io/nvidia/base/ubuntu:24.04`. It provides a minimal Ubuntu Noble environment; install workload-specific tools in your own image.
 
-</Tabs>
+Connect to the sandbox:
+
+```shell
+openshell sandbox connect quickstart
+```
+
+Run a command without opening an interactive session:
+
+```shell
+openshell sandbox exec -n quickstart -- cat /etc/os-release
+```
+
+## Run an Agent Image
+
+Build an OCI image containing your agent and its dependencies, then pass its full image reference:
+
+```shell
+docker build -t my-agent:latest ./my-agent
+openshell sandbox create --from my-agent:latest -- my-agent
+```
+
+For a Podman gateway, build and use a Podman-visible name such as `localhost/my-agent:latest`. For a remote gateway, push the image to a registry that the gateway can pull from.
+
+Attach a provider and a policy that authorize the agent's credentials, endpoints, and executable paths. Refer to [Bring Your Own Container](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container), [Providers](/providers), and [Customize Sandbox Policies](/sandboxes/policies).

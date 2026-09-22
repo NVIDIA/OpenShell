@@ -27,7 +27,9 @@ func TestSandboxLifecycle(t *testing.T) {
     require.NoError(t, err)
     assert.Equal(t, types.SandboxReady, sb.Status.Phase)
 
-    require.NoError(t, client.Sandboxes().Delete(ctx, "default", "my-sandbox"))
+    deletion, err := client.Sandboxes().Delete(ctx, "default", "my-sandbox")
+    require.NoError(t, err)
+    assert.Equal(t, v1.DeletionCompleted, deletion.Outcome)
 }
 ```
 

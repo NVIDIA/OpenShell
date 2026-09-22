@@ -18,6 +18,21 @@ type GatewayInfo = types.GatewayInfo
 // ComputeDriverInfo describes a compute backend available on the gateway.
 type ComputeDriverInfo = types.ComputeDriverInfo
 
+// ExtensionInfo describes one successful gateway/extension negotiation.
+type ExtensionInfo = types.ExtensionInfo
+
+// ExtensionKind identifies one supported extension family.
+type ExtensionKind = types.ExtensionKind
+
+// ExtensionKind constants re-exported from the types package.
+const (
+	ExtensionKindComputeDriver        = types.ExtensionKindComputeDriver
+	ExtensionKindCredentialDriver     = types.ExtensionKindCredentialDriver
+	ExtensionKindGatewayInterceptor   = types.ExtensionKindGatewayInterceptor
+	ExtensionKindSupervisorMiddleware = types.ExtensionKindSupervisorMiddleware
+	ExtensionKindUnknown              = types.ExtensionKindUnknown
+)
+
 // ServiceStatus describes the health state of the gateway.
 type ServiceStatus = types.ServiceStatus
 

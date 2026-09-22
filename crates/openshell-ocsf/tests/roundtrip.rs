@@ -12,17 +12,17 @@ use std::net::{IpAddr, Ipv4Addr};
 use openshell_ocsf::{
     ActionId, ActivityId, AiModel, ApiActivityBuilder, AppLifecycleBuilder, Attack, AuthTypeId,
     BaseEventBuilder, ConfidenceId, ConfigStateChangeBuilder, ConnectionInfo,
-    DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo, HttpActivityBuilder, HttpMethod,
-    HttpRequest, HttpResponse, LaunchTypeId, NetworkActivityBuilder, OcsfEvent, Process,
-    ProcessActivityBuilder, RiskLevelId, SandboxContext, SecurityLevelId, SeverityId,
-    SshActivityBuilder, StateId, StatusId, Url,
+    DetectionFindingBuilder, DispositionId, Endpoint, EventContext, FindingInfo,
+    HttpActivityBuilder, HttpMethod, HttpRequest, HttpResponse, LaunchTypeId,
+    NetworkActivityBuilder, OcsfEvent, Process, ProcessActivityBuilder, RiskLevelId,
+    SecurityLevelId, SeverityId, SshActivityBuilder, StateId, StatusId, Url,
 };
 
-fn ctx() -> SandboxContext {
-    SandboxContext {
+fn ctx() -> EventContext {
+    EventContext {
         sandbox_id: "sb-7f3a9c2e14b8".to_string(),
         sandbox_name: "agent-workspace-01".to_string(),
-        container_image: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
+        container_image: "nvcr.io/nvidia/base/ubuntu:24.04".to_string(),
         hostname: "openshell-sb-7f3a9c2e14b8".to_string(),
         product_version: "0.42.1".to_string(),
         proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),

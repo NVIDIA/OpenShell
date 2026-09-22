@@ -1,0 +1,265 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "API Errors"
+sidebar-title: "API Errors"
+description: "Inspect structured gateway failures and choose an appropriate recovery action."
+keywords: "OpenShell, SDK, gRPC, API errors, retries"
+---
+
+Gateway errors include a gRPC status code and a message. Shared request validation
+and concurrency checks also return standard protobuf details in
+`grpc-status-details-bin`. Use the status code and structured fields for decisions.
+Treat messages as explanations whose text can change.
+
+## Structured details
+
+The SDKs decode these standard detail types while retaining the original failure.
+Older gateways and checks that have not adopted structured details can return only
+a code and message. Missing details do not change the meaning of the status code.
+
+| Detail | Meaning |
+|---|---|
+| `google.rpc.BadRequest` | `field_violations` identifies rejected fields and explains each violation. Shared sandbox, exec, provider size, and workspace selector checks supply these details. |
+| `google.rpc.ErrorInfo` | `reason`, `domain`, and `metadata` identify a failure without parsing its message. Gateway reasons use the `openshell.nvidia.com` domain. |
+| `google.rpc.RetryInfo` | `retry_delay` gives a minimum delay before an otherwise safe retry. Its presence does not guarantee that a mutation has not already committed. |
+
+Recognized gateway reasons include the following.
+
+| Reason | Code | Recovery |
+|---|---|---|
+| `INVALID_ARGUMENT` | `INVALID_ARGUMENT` | Correct the fields listed in `BadRequest`. |
+| `RESOURCE_VERSION_CONFLICT` | `ABORTED` | Read the resource again and construct a new conditional write. `metadata.recovery` is `REFRESH_STATE`; `current_resource_version` is included when known. |
+| `PROFILE_SOURCE_UNAVAILABLE` | `UNAVAILABLE` | Retry a profile snapshot read after at least the supplied delay. |
+| `REQUEST_ID_PAYLOAD_MISMATCH` | `FAILED_PRECONDITION` | Keep the original payload for that request ID. Inspect the original operation before submitting a different one. |
+| `REQUEST_OUTCOME_UNCERTAIN` | `FAILED_PRECONDITION` | An attempt is admitted but has no confirmed replayable success. Observe resource state and reconcile effects. Do not switch to a new ID to bypass the admission. |
+| `REQUEST_REPLAY_UNAVAILABLE` | `FAILED_PRECONDITION` | The original scope, resource, interceptor transformation, or fingerprint key is no longer replayable. Reconcile effects; the gateway does not execute the request again. Missing private-key material can also reject admission before work starts. |
+
+## Status and retry guidance
+
+A timeout or disconnected transport can occur after a mutation commits. Do not
+automatically repeat creates, credential rotation, or command execution based
+only on a transient status. Retry a mutation only when its documented operation
+contract makes the repeated request safe. A correlation ID does not provide that
+guarantee.
+
+| Status | Recovery |
+|---|---|
+| `INVALID_ARGUMENT`, `OUT_OF_RANGE` | Correct the request. |
+| `UNAUTHENTICATED` | Refresh or replace credentials before a new attempt. |
+| `PERMISSION_DENIED` | Obtain the required authorization. |
+| `NOT_FOUND` | Check the resource and workspace. Follow the operation's missing-resource contract. |
+| `ALREADY_EXISTS` | Inspect the existing resource before deciding whether it satisfies the request. |
+| `FAILED_PRECONDITION` | Resolve the reported state or configuration requirement. |
+| `ABORTED` | Read fresh state before retrying a conditional operation. |
+| `UNAVAILABLE`, `RESOURCE_EXHAUSTED` | A transient condition may recover. Apply backoff and any minimum retry delay only to a retry-safe operation. |
+| `DEADLINE_EXCEEDED`, `CANCELLED` | A mutation's outcome can be unknown. Cancellation does not imply rollback. |
+| `UNIMPLEMENTED` | Check gateway and SDK version compatibility. |
+| `INTERNAL`, `UNKNOWN`, `DATA_LOSS` | Preserve the status and correlation metadata for diagnosis. Do not blindly retry mutations. |
+
+## SDK access
+
+Each SDK exposes decoded fields and an escape hatch for complete transport data.
+Unknown details remain available through the original error even when the SDK
+does not recognize their message type.
+
+| SDK | Decoded details | Original failure |
+|---|---|---|
+| Rust | `SdkError::error_details()`, `retry_delay()` | `SdkError::grpc_status()` returns the original `tonic::Status`, including details bytes and metadata. |
+| Go | `StatusError.FieldViolations`, `ErrorInfo`, `RetryDelay`, `GRPCCode` | `StatusError.Cause` retains the gRPC error. `status.FromError` can recover its details through error wrapping. |
+| TypeScript | `SdkError.fieldViolations`, `errorInfo`, `retryDelayMs`, `connectCode` | `SdkError.cause` retains the `ConnectError`, including all details and metadata. Use `fromConnect` for raw calls. |
+| Python | `GatewayError.field_violations`, `error_info`, `retry_delay` | `raw_error` retains the gRPC exception and metadata; `raw_status` retains the parsed envelope. Use `from_grpc_error` for raw calls. |
+
+Retry delays are Rust and Go durations, TypeScript milliseconds, and Python
+seconds. Absent or invalid delay details do not produce a suggested delay.
+
+## Migration
+
+Existing error codes and human-readable messages remain available. Python curated
+clients now raise `GatewayError`, which remains a `grpc.RpcError`; existing
+`except grpc.RpcError` handlers continue to work. `GatewayError` is not a
+`grpc.Call`. If your handler checks that interface, inspect `raw_error` before
+checking the status, or call `GatewayError.code()` directly. Python deletion waits
+recognize `NOT_FOUND` through the wrapper; managed-sandbox cleanup requests
+`allow_missing=True` and handles the typed deletion outcome. Other failures still
+propagate. Rust error variants now retain
+status fields; use `..` when destructuring variants that do not need those fields.
+Go and TypeScript add typed detail fields to their existing error types.
+
+No SDK automatically retries a mutation as a result of decoding these details.
+
+## Durable request admission
+
+Thirty user-callable unary RPCs accept an optional `request_id` in their protobuf requests.
+
+| Resource | RPCs |
+|---|---|
+| Workspace | `CreateWorkspace`, `DeleteWorkspace` |
+| Workspace member | `AddWorkspaceMember`, `RemoveWorkspaceMember` |
+| Sandbox template | `CreateSandboxTemplate`, `DeleteSandboxTemplate` |
+| Sandbox | `CreateSandbox`, `DeleteSandbox`, `StartSandbox`, `StopSandbox`, `AttachSandboxProvider`, `DetachSandboxProvider` |
+| Service | `ExposeService`, `DeleteService` |
+| Provider | `CreateProvider`, `UpdateProvider`, `DeleteProvider`, `ConfigureProviderRefresh`, `DeleteProviderRefresh`, `RotateProviderCredential` |
+| Provider profile | `ImportProviderProfiles`, `UpdateProviderProfiles`, `DeleteProviderProfile` |
+| Policy and config | `UpdateConfig`, `ApproveDraftChunk`, `RejectDraftChunk`, `EditDraftChunk`, `UndoDraftChunk`, `ApproveAllDraftChunks`, `ClearDraftChunks` |
+
+Use a nonzero, hyphenated UUID of exactly 36 characters. Uppercase and lowercase
+forms identify the same request. An empty ID preserves the existing behavior
+without deduplication. This ID is separate from transport correlation metadata.
+The gateway scopes it to the authenticated identity provider, OIDC issuer,
+subject, RPC method, and requested workspace. Use the same identity, scope, ID,
+and payload when checking an admitted attempt. Map ordering does not affect the
+payload fingerprint; changed values or protobuf message presence do.
+
+For `CreateWorkspace` and `DeleteWorkspace`, the requested workspace is the
+request's `name`. The same caller can reuse an ID for the same method on different
+workspace names. Within one workspace name, a changed payload still returns
+`REQUEST_ID_PAYLOAD_MISMATCH`. Workspace deletion replay does not require the
+deleted workspace to exist and does not delete a same-name replacement.
+
+Pre-release gateways that used unscoped workspace admission require reconciliation
+before upgrading. Their workspace create/delete receipts do not replay under the
+corrected name-scoped namespace. Do not retry those IDs after upgrading without
+reconciling the original operations' effects.
+
+The gateway durably admits one owner before executing the mutation. Concurrent
+duplicates either replay its confirmed success or return
+`REQUEST_OUTCOME_UNCERTAIN`. Disconnecting or cancelling the client does not stop
+admitted work. An error, interrupted process, or failed success-record write
+leaves the admission unresolved. No gateway replica takes over that admission,
+even after restart or after 24 hours. Status codes alone do not prove that the
+attempt had no effects.
+
+Successful results have a 24-hour replay window, measured from durable completion.
+A successful replay includes `openshell-replayed: true` response metadata and
+does not extend the window. After it expires, the same ID can admit a new
+execution. Do not retry an old operation after that window without reconciling
+its effects. Unresolved admissions never expire.
+
+Every replay checks current authorization, including membership and permission
+to assign workspace administrators. A replacement workspace makes workspace-scoped
+replay unavailable. Target readiness, conditional-write versions, and draft review
+tokens are first-execution preconditions, not conditions to execute again.
+
+| Result family | Replay behavior |
+|---|---|
+| Workspace, membership, template, provider, and profile resources | Load the original UUID at its recorded version. Missing or changed resources make replay unavailable. Provider credentials remain redacted. |
+| Sandbox resources | Load the original UUID with its current state, including newer status or configuration. Attach/detach flags describe the original operation. A missing original sandbox makes replay unavailable. |
+| Provider readiness receipts | Return the original attach, detach, or update receipts and mutation ID, including the original update target set. Later attachment changes do not replace these receipts. Missing operation evidence makes replay unavailable without executing the mutation again. |
+| Service endpoint | Require the original endpoint version and sandbox identity. Return the recorded URL. |
+| Refresh status | Return current status for the original provider, refresh record, and authorization epoch. Reconfiguration or removal makes replay unavailable. Rotation is not repeated. |
+| Policy and config | Return the original versions, counts, and nonsecret annotations while the original sandbox exists. Global config has no sandbox guard. |
+| Deletion | Return the original outcome without requiring the deleted target or parent to exist and without deleting a replacement. `ACCEPTED` remains an acknowledgment of the original cleanup, not proof of completion. |
+
+Profile imports and updates also preserve their original public diagnostics and
+success flags. Profile declarations, diagnostic source labels, and annotations
+must not contain secrets.
+
+For sandbox, service, provider, profile, and policy/config methods, fingerprints
+use HMAC with domain-separated material derived from the configured gateway JWT
+private key, or the primary TLS private key when JWT signing is not configured.
+These methods require readable, stable private-key material when you supply an
+ID. Replicas sharing a database must share that material. Changing it makes
+existing protected receipts unavailable until their successful replay window
+expires; unresolved admissions remain protected indefinitely. Workspace,
+membership, and template methods retain their original fingerprint format.
+
+Gateway interceptors run their current modification and validation phases on
+every attempt, including replay. They cannot add, remove, or change `request_id`.
+The gateway fingerprints the original client payload and separately guards the
+effective transformed payload and workspace. A changed transformation makes
+replay unavailable. A current denial remains authoritative. Successful replay
+does not invoke post-commit observers again. Post-commit observation remains
+best-effort; this is not a durable delivery queue.
+
+Replay rows contain fingerprints, resource references, and explicitly selected
+public diagnostic or scalar outcomes, not credential-bearing response snapshots.
+Completed receipts are limited to 64 KiB. A failure to capture a bounded receipt
+after execution leaves the admission unresolved. Each caller can
+hold at most 1,000 durable admissions. At capacity, the gateway removes expired
+successes; if no space remains, it rejects new admissions with
+`RESOURCE_EXHAUSTED`. Existing records remain protected. Unresolved records
+require operator investigation; there is no automatic reset or takeover API.
+The gateway also limits detached admission workers to 64 per process and these
+request messages to 4 MiB.
+
+Supply IDs through generated/raw RPC clients. Curated SDK request-ID helpers and
+automatic retry policies are not part of this contract yet. Exec, SSH sessions,
+rootfs staging, and supervisor-authenticated mutations do not gain deduplication
+from this feature. Sandbox principals cannot opt into `UpdateConfig` admission.
+Check gateway compatibility
+before relying on IDs; older protobuf servers can silently ignore unknown fields.
+
+## Deletion outcomes
+
+Delete, membership-removal, and SSH-revocation RPCs return a typed outcome.
+Transport success alone does not establish completion.
+
+| Outcome | Meaning |
+|---|---|
+| `COMPLETED` | The gateway resource was removed, or the existing SSH session is revoked. Downstream platform garbage collection may still be finishing. |
+| `ACCEPTED` | Sandbox deletion started, but the gateway sandbox record still exists. Observe its removal before assuming completion. |
+| `ALREADY_ABSENT` | The target was missing when resolved, and the request set `allow_missing=true`. |
+| `UNSPECIFIED` or an unknown value | Completion is not established. Check gateway and SDK compatibility. |
+
+Requests default to `allow_missing=false`: an initially missing target returns
+`NOT_FOUND`. Set it to `true` for cleanup that allows an absent target. This flag
+does not suppress missing parents, authorization failures, invalid requests,
+failed preconditions, or backend errors. Re-revoking an existing revoked session
+returns `COMPLETED` after authorization without changing its resource version.
+
+`DeleteSandbox` also returns the original `sandbox_id` when it found a target.
+For an accepted deletion, poll or watch that identity. A same-name sandbox with a
+different ID is not the sandbox being deleted. Cancellation or a disconnected
+client does not stop the gateway's already-started deletion worker.
+
+Pass the deletion result's ID to the SDK wait helper to avoid following a
+same-name replacement.
+
+| SDK | Identity-aware deletion wait |
+|---|---|
+| Rust | `client.wait_deleted(name, timeout, result.sandbox_id.as_deref()).await?` on either the default or workspace-scoped client. |
+| Python | `client.wait_deleted(name, workspace=workspace, expected_sandbox_id=result.sandbox_id)`. Managed-sandbox cleanup supplies this automatically. |
+| TypeScript | `client.sandbox.waitDeleted(name, timeoutSecs, { workspace, expectedSandboxId: result.sandboxId })`. |
+
+These waits complete on `NOT_FOUND` or a different observed ID. Without an
+expected ID, they wait for the name to be absent. Existing Rust callers must add
+the third argument; use `None` to retain name-only behavior.
+
+`allow_missing` is not request deduplication. A later request by name can delete
+a newly created resource with that name. Do not blindly repeat a timed-out
+deletion when names might be reused.
+
+### SDK migration for deletion
+
+Upgrade gateways and clients together. This pre-1.0 change removes the boolean
+response fields, reserving their names and wire numbers. New clients reading an
+old response see `UNSPECIFIED`; they must not interpret it as completion.
+
+| RPC | Removed field | Replacement |
+|---|---|---|
+| `DeleteSandboxTemplate` | `deleted` | `outcome` |
+| `DeleteSandbox` | `deleted` | `outcome`, `sandbox_id` |
+| `DeleteService` | `deleted` | `outcome` |
+| `DeleteProvider` | `deleted` | `outcome` |
+| `DeleteProviderRefresh` | `deleted` | `outcome` |
+| `DeleteProviderProfile` | `deleted` | `outcome` |
+| `DeleteWorkspace` | `deleted` | `outcome` |
+| `RemoveWorkspaceMember` | `removed` | `outcome` |
+| `RevokeSshSession` | `revoked` | `outcome` |
+
+These RPCs use a typed result rather than `Empty` because callers must
+distinguish absence, asynchronous acceptance, and completion.
+
+Curated SDK methods return `DeletionResult` instead of a boolean or no result.
+Rust accepts `DeleteOptions { allow_missing: true }`; Python accepts the keyword
+`allow_missing=True`; TypeScript accepts `{ allowMissing: true }`; Go accepts an
+optional `DeleteOptions{AllowMissing: true}` and returns `(result, error)`.
+Go and Python preserve unknown numeric outcomes, Rust uses `Unknown(i32)`, and
+TypeScript returns `outcome: 'unknown'` with `rawOutcome`.
+
+Other mutation responses remain unchanged: provider attach/detach also return
+the resulting sandbox, profile import/update return resources and diagnostics,
+and config updates return version/application information. Their supplementary
+booleans are not the sole result. Internal compute-driver and supervisor
+contracts are separate from this public API migration.

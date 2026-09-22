@@ -6,6 +6,9 @@
 /target/
 e2e/rust/target/
 target/
+
+# Test result artifacts (JUnit XML, etc.)
+/results/
 debug/
 release/
 
@@ -185,6 +188,9 @@ tmp/
 temp/
 *.tmp
 e2e/gpu/images/.build/
+
+# Ansible Galaxy roles
+/tests/ansible/.roles/
 
 # Secrets/credentials (should never be committed)
 *.pem

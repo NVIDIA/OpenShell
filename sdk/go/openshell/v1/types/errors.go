@@ -6,6 +6,7 @@ package types
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // ErrorCode classifies SDK errors by their gRPC origin.
@@ -61,6 +62,27 @@ type StatusError struct {
 	Code    ErrorCode
 	Message string
 	Cause   error
+	// GRPCCode retains the exact transport code before SDK classification.
+	GRPCCode int32
+	// FieldViolations identifies invalid request fields without parsing Message.
+	FieldViolations []FieldViolation
+	// ErrorInfo is the server's machine-readable reason, domain, and metadata.
+	ErrorInfo *ErrorInfo
+	// RetryDelay is a suggested minimum delay, not proof a mutation is safe to repeat.
+	RetryDelay *time.Duration
+}
+
+// FieldViolation identifies an invalid request field.
+type FieldViolation struct {
+	Field       string
+	Description string
+}
+
+// ErrorInfo describes a server failure using a stable reason within a domain.
+type ErrorInfo struct {
+	Reason   string
+	Domain   string
+	Metadata map[string]string
 }
 
 func (e *StatusError) Error() string {

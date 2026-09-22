@@ -17,7 +17,6 @@ use openshell_core::proto::{
     PlatformEvent, SandboxPhase, SandboxPolicy, SettingValue, setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
-use openshell_providers::builtin_profiles;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::process::Command;
@@ -758,7 +757,10 @@ pub struct ProfileSuggestion {
     pub credential: String,
 }
 
-fn credential_env_matches(env: &HashMap<String, String>) -> Vec<(String, Vec<ProfileSuggestion>)> {
+fn credential_env_matches(
+    env: &HashMap<String, String>,
+    profiles: &[openshell_providers::ProviderTypeProfile],
+) -> Vec<(String, Vec<ProfileSuggestion>)> {
     const KEYWORDS: [&str; 7_usize] = [
         "TOKEN",
         "SECRET",
@@ -777,10 +779,11 @@ fn credential_env_matches(env: &HashMap<String, String>) -> Vec<(String, Vec<Pro
         })
     };
 
-    // scan builtin_profiles()
+    // Suggestions come from the connected gateway's catalog, so they only ever
+    // name a profile the user can actually create a provider from.
     let profile_suggestions = |key: &str| -> Vec<ProfileSuggestion> {
         let mut suggestions = Vec::new();
-        for profile in builtin_profiles() {
+        for profile in profiles {
             for cred in &profile.credentials {
                 if cred.env_vars.iter().any(|v| v.eq_ignore_ascii_case(key)) {
                     suggestions.push(ProfileSuggestion {
@@ -806,13 +809,22 @@ fn credential_env_matches(env: &HashMap<String, String>) -> Vec<(String, Vec<Pro
     matches
 }
 
+/// Warn about credentials passed as plain `--env` values.
+///
+/// `profiles` is the connected gateway's catalog. Pass an empty slice when it
+/// could not be fetched: the warning still fires, it just cannot name a profile
+/// to use instead.
 #[allow(clippy::implicit_hasher)]
-pub fn warn_credential_env_vars(env: &HashMap<String, String>, suppress: bool) {
+pub fn warn_credential_env_vars(
+    env: &HashMap<String, String>,
+    profiles: &[openshell_providers::ProviderTypeProfile],
+    suppress: bool,
+) {
     if suppress {
         return;
     }
 
-    let matches = credential_env_matches(env);
+    let matches = credential_env_matches(env, profiles);
     if matches.is_empty() {
         return;
     }
@@ -1141,10 +1153,19 @@ mod tests {
             .collect()
     }
 
+    /// Stands in for the catalog a connected gateway would publish.
+    fn catalog() -> &'static [openshell_providers::ProviderTypeProfile] {
+        static CATALOG: std::sync::OnceLock<Vec<openshell_providers::ProviderTypeProfile>> =
+            std::sync::OnceLock::new();
+        CATALOG
+            .get_or_init(openshell_providers::example_profiles::load_all)
+            .as_slice()
+    }
+
     #[test]
     fn suffix_match_no_profile() {
         let env = env(&[("FOO_TOKEN", "x")]);
-        let prof = credential_env_matches(&env);
+        let prof = credential_env_matches(&env, catalog());
         assert_eq!(prof.len(), 1_usize);
         assert_eq!(&prof[0].0, "FOO_TOKEN");
         assert!(prof[0].1.is_empty());
@@ -1154,7 +1175,7 @@ mod tests {
     fn exact_profile_match() {
         let env = env(&[("GITHUB_TOKEN", "x")]);
 
-        let prof = credential_env_matches(&env);
+        let prof = credential_env_matches(&env, catalog());
         assert_eq!(prof.len(), 1_usize);
         assert_eq!(prof[0].0, "GITHUB_TOKEN");
 
@@ -1172,7 +1193,7 @@ mod tests {
     fn case_insensitive() {
         let env = env(&[("gh_token", "x")]);
 
-        let prof = credential_env_matches(&env);
+        let prof = credential_env_matches(&env, catalog());
         assert_eq!(prof.len(), 1_usize);
         assert_eq!(prof[0].0, "gh_token");
 
@@ -1190,7 +1211,7 @@ mod tests {
     fn non_credential_skipped() {
         let env = env(&[("PATH", "x"), ("HOME", "y")]);
 
-        let prof = credential_env_matches(&env);
+        let prof = credential_env_matches(&env, catalog());
         assert!(prof.is_empty());
     }
 
@@ -1198,7 +1219,7 @@ mod tests {
     fn no_value_leak() {
         let env = env(&[("APP_SECRET", "secretVALUE42")]);
 
-        let prof = credential_env_matches(&env);
+        let prof = credential_env_matches(&env, catalog());
         assert_eq!(prof.len(), 1_usize);
 
         let dumped = format!("{prof:?}");
@@ -1213,7 +1234,7 @@ mod tests {
             ("MID_PASSWORD", "c"),
         ]);
 
-        let prof = credential_env_matches(&env);
+        let prof = credential_env_matches(&env, catalog());
         let keys: Vec<&str> = prof.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["ABC_SECRET", "MID_PASSWORD", "ZED_TOKEN"]);
     }
@@ -1226,7 +1247,7 @@ mod tests {
             ("SECRETARY_EMAIL", "z"),
         ]);
 
-        let prof = credential_env_matches(&env);
+        let prof = credential_env_matches(&env, catalog());
         assert!(prof.is_empty());
     }
 
@@ -1238,7 +1259,7 @@ mod tests {
             ("PRIMARY_KEY", "c"),
         ]);
 
-        let prof = credential_env_matches(&env);
+        let prof = credential_env_matches(&env, catalog());
         assert_eq!(prof.len(), 2_usize);
 
         let keys = prof.iter().map(|(k, _)| k.as_str()).collect::<Vec<&str>>();

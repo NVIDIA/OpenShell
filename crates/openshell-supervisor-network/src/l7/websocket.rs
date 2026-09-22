@@ -3550,7 +3550,7 @@ network_policies:
 
         async fn describe(
             &self,
-            _request: Request<()>,
+            _request: Request<openshell_core::proto::MiddlewareDescribeRequest>,
         ) -> std::result::Result<Response<openshell_core::proto::MiddlewareManifest>, Status>
         {
             use openshell_core::proto::{
@@ -3565,9 +3565,18 @@ network_policies:
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                         as u64,
-                    timeout: "1s".into(),
+                    request_timeout: Some(prost_types::Duration {
+                        seconds: 1,
+                        nanos: 0,
+                    }),
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }))
         }
 
@@ -3759,7 +3768,10 @@ network_policies:
                 grpc_endpoint: format!("http://{address}"),
                 max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
-                timeout: "2s".into(),
+                request_timeout: Some(prost_types::Duration {
+                    seconds: 2,
+                    nanos: 0,
+                }),
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
@@ -3831,7 +3843,10 @@ network_policies:
                 grpc_endpoint: format!("http://{address}"),
                 max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
-                timeout: "2s".into(),
+                request_timeout: Some(prost_types::Duration {
+                    seconds: 2,
+                    nanos: 0,
+                }),
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
@@ -4788,7 +4803,10 @@ network_policies:
                 grpc_endpoint: format!("http://{address}"),
                 max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
-                timeout: "2s".into(),
+                request_timeout: Some(prost_types::Duration {
+                    seconds: 2,
+                    nanos: 0,
+                }),
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
@@ -4938,7 +4956,10 @@ network_policies:
                 grpc_endpoint: format!("http://{address}"),
                 max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
-                timeout: "2s".into(),
+                request_timeout: Some(prost_types::Duration {
+                    seconds: 2,
+                    nanos: 0,
+                }),
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,

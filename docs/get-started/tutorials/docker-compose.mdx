@@ -34,7 +34,12 @@ The Compose configuration lives at [`deploy/docker/`](https://github.com/NVIDIA/
 
 ## Port note
 
-The Docker compute driver injects `host.openshell.internal:<gateway-port>` into every sandbox container as its callback address. The gateway listens on port 8080 inside the container, so **port 8080 must be published at the same number on the Docker host**. Publishing it as a different host port (for example `18080:8080`) causes sandbox containers to call back to the wrong port and remain stuck in the `Provisioning` phase.
+The Docker supervisor uses host networking and connects to the gateway through
+the host's loopback port. The gateway listens on port 8080 inside the container,
+so **port 8080 must be published at the same number on the Docker host**.
+Publishing it as a different host port (for example `18080:8080`) leaves the
+supervisor unable to establish its gateway session and the sandbox remains in
+the `Provisioning` phase.
 
 If port 8080 is taken, change `OPENSHELL_SERVER_PORT` and update the port mapping to `<your-port>:8080`, then set `OPENSHELL_PORT=<your-port>` in an `.env` file.
 
@@ -96,7 +101,16 @@ The output should show `Status: Connected`.
 
 ## Configure an AI provider
 
-Set your API key as an environment variable and create a provider:
+Import the provider profile for the service you use, then set your API key as an
+environment variable and create a provider. A gateway serves only the profiles
+you imported:
+
+```shell
+curl -LsSfO https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/anthropic.yaml
+openshell provider profile import -f anthropic.yaml --global
+```
+
+Use `openai.yaml` for the OpenAI tab below.
 
 <Tabs>
 <Tab title="Anthropic (Claude)">
@@ -123,40 +137,38 @@ Confirm the provider was stored:
 openshell provider list
 ```
 
-## Pre-pull sandbox images (optional)
+## Pre-pull workload images (optional)
 
-Sandbox images are pulled automatically on first use, but the initial pull can take several minutes for large images. Pre-pull to avoid long waits at sandbox creation time:
-
-```shell
-# Base image — includes Claude Code, OpenCode, Codex, and Copilot
-docker pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
-```
-
-## Create a sandbox
-
-<Tabs>
-<Tab title="OpenClaw">
-
-OpenClaw runs inside OpenShell through [NemoClaw](https://github.com/NVIDIA/NemoClaw), which manages the sandbox image, model-provider setup, and security policies.
-
-Follow the [NemoClaw Quickstart](https://docs.nvidia.com/nemoclaw/latest/get-started/quickstart/) to set up an OpenClaw sandbox.
-
-</Tab>
-<Tab title="Claude Code">
+Workload images are pulled automatically on first use. Pre-pull the default
+Ubuntu workload or your own agent image to avoid waiting during sandbox
+creation:
 
 ```shell
-openshell sandbox create -- claude
+docker pull nvcr.io/nvidia/base/ubuntu:24.04
+docker pull registry.example.com/your-org/agent:latest
 ```
 
-</Tab>
-<Tab title="OpenCode">
+## Create a Sandbox
+
+Create a minimal Ubuntu sandbox:
 
 ```shell
-openshell sandbox create -- opencode
+openshell sandbox create --name compose-demo
 ```
 
-</Tab>
-</Tabs>
+To run an agent, use an explicit OCI image that contains it:
+
+```shell
+openshell sandbox create \
+  --from registry.example.com/your-org/agent:latest \
+  --provider <provider-name> \
+  -- my-agent
+```
+
+OpenClaw runs through [NemoClaw](https://github.com/NVIDIA/NemoClaw), which
+manages its sandbox image, model provider, and security policies. Follow the
+[NemoClaw Quickstart](https://docs.nvidia.com/nemoclaw/latest/get-started/quickstart/)
+for that workflow.
 
 Wait for the phase to change from `Provisioning` to `Ready`:
 

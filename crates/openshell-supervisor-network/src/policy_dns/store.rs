@@ -73,6 +73,17 @@ pub(crate) struct MappingLookup {
 }
 
 impl MappingLookup {
+    pub(crate) fn pinned_addresses(&self) -> Vec<IpAddr> {
+        let mut seen = HashSet::new();
+        self.record
+            .contracts
+            .iter()
+            .filter(|contract| contract.port == self.port)
+            .flat_map(|contract| contract.pinned_addresses.iter().copied())
+            .filter(|address| seen.insert(*address))
+            .collect()
+    }
+
     pub(crate) fn endpoint_ids(&self) -> impl Iterator<Item = &PolicyEndpointId> {
         self.record
             .contracts

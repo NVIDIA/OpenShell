@@ -32,11 +32,11 @@ func (c *fakeSSHClient) CreateSession(_ context.Context, _, _ string) (*types.SS
 }
 
 // RevokeSession returns Unimplemented.
-func (c *fakeSSHClient) RevokeSession(_ context.Context, _, _ string) (bool, error) {
+func (c *fakeSSHClient) RevokeSession(_ context.Context, _, _ string, _ ...v1.DeleteOptions) (*types.DeletionResult, error) {
 	if c.closedFunc() {
-		return false, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-	return false, &types.StatusError{Code: types.ErrorUnimplemented, Message: "RevokeSession is not supported by the fake client"}
+	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "RevokeSession is not supported by the fake client"}
 }
 
 // Tunnel returns Unimplemented. Ports outside 1-65535 and empty sandbox names

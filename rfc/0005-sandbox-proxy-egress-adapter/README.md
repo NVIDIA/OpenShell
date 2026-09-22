@@ -25,7 +25,7 @@ See rfc/README.md for the full RFC process and state definitions.
 
 Refactor sandbox egress around shared authorization, destination-validation,
 and relay boundaries. CONNECT, forward HTTP, native TCP capture, policy DNS,
-`inference.local`, `policy.local`, and metadata loopback become narrow adapters
+`policy.local`, and metadata loopback become narrow adapters
 that translate userland entry points into common runtime intents. Policy
 evaluation, destination validation, supervisor middleware, credential
 injection, request-body rewrite, WebSocket handling, protocol processing, and
@@ -101,7 +101,7 @@ authorization or relay logic.
 ### Migration Big Rocks
 
 1. **Transport and local-service adapters.** CONNECT, forward HTTP,
-   transparent TCP, policy DNS, `inference.local`, `policy.local`, and metadata
+   transparent TCP, policy DNS, `policy.local`, and metadata
    loopback become small adapters. They parse their surface and produce either
    an egress intent, a local response, or a DNS answer. They do not duplicate
    policy evaluation.
@@ -160,13 +160,10 @@ flowchart TD
     end
 
     subgraph LocalApis["Sandbox-local services"]
-        InferenceReq["Request to inference.local"]
         PolicyReq["Request to policy.local"]
         MetadataReq["Request to metadata loopback"]
-        InferenceAdapter["Inference local adapter"]
         PolicyAdapter["Policy local adapter"]
         MetadataAdapter["Metadata loopback adapter"]
-        InferenceReq --> InferenceAdapter
         PolicyReq --> PolicyAdapter
         MetadataReq --> MetadataAdapter
     end
@@ -189,14 +186,12 @@ flowchart TD
     User --> ProxyBytes
     User --> NameLookup
     User --> NativeConnect
-    User --> InferenceReq
     User --> PolicyReq
     User --> MetadataReq
 
     Connect --> Intent
     Forward --> Intent
     TcpAdapter --> Intent
-    InferenceAdapter --> InferenceResp["Local inference response"]
     PolicyAdapter --> PolicyResp["Local policy response"]
     MetadataAdapter --> MetadataResp["Local metadata credential response"]
 ```
@@ -362,8 +357,6 @@ authorization evidence evaluated at connect time, not the mechanism that joins
 the DNS request to the TCP connection.
 
 Local service adapters stay outside the normal external egress relay:
-`inference.local` routes chat, completion, model discovery, embeddings, and
-provider-specific inference traffic through the router with local limits;
 `policy.local` exposes current policy, denial summaries, proposal submission,
 and proposal wait routes; metadata loopback serves provider metadata
 credentials to SDKs that bypass HTTP proxy variables.

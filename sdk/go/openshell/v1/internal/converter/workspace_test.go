@@ -17,14 +17,14 @@ import (
 func TestWorkspaceFromProto(t *testing.T) {
 	proto := &dm.Workspace{
 		Metadata: &dm.ObjectMeta{
-			Id:                  "ws-1",
-			Name:                "my-workspace",
-			CreatedAtMs:         1700000000000,
-			Labels:              map[string]string{"team": "platform"},
-			Annotations:         map[string]string{"managed-by": "sdk"},
-			ResourceVersion:     3,
-			Workspace:           "",
-			DeletionTimestampMs: 1700000060000,
+			Id:              "ws-1",
+			Name:            "my-workspace",
+			CreatedTime:     TimestampFromMillis(1700000000000),
+			Labels:          map[string]string{"team": "platform"},
+			Annotations:     map[string]string{"managed-by": "sdk"},
+			ResourceVersion: 3,
+			Workspace:       "",
+			DeletionTime:    TimestampFromMillis(1700000060000),
 		},
 		Status: &dm.WorkspaceStatus{
 			Phase: dm.WorkspacePhase_WORKSPACE_PHASE_ACTIVE,
@@ -115,7 +115,7 @@ func TestWorkspaceMemberFromProto(t *testing.T) {
 		Metadata: &dm.ObjectMeta{
 			Id:              "mem-1",
 			Name:            "member-auto-name",
-			CreatedAtMs:     1700000000000,
+			CreatedTime:     TimestampFromMillis(1700000000000),
 			Annotations:     map[string]string{"source": "cli"},
 			ResourceVersion: 2,
 		},

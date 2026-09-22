@@ -7,6 +7,7 @@
 description = "Build all Docker images"
 depends = [
   "build:docker:gateway",
+  "build:docker:sandbox",
   "build:docker:supervisor",
 ]
 hide = true
@@ -26,6 +27,11 @@ description = "Build the gateway Docker image"
 run = "tasks/scripts/docker-build-image.sh gateway"
 hide = true
 
+["build:docker:sandbox"]
+description = "Build the sandbox runtime image"
+run = "tasks/scripts/docker-build-image.sh sandbox"
+hide = true
+
 ["build:docker:supervisor"]
 description = "Build the supervisor image"
 run = "tasks/scripts/docker-build-image.sh supervisor"
@@ -36,13 +42,18 @@ description = "Alias for build:docker:gateway"
 depends = ["build:docker:gateway"]
 hide = true
 
+["docker:build:sandbox"]
+description = "Alias for build:docker:sandbox"
+depends = ["build:docker:sandbox"]
+hide = true
+
 ["docker:build:supervisor"]
 description = "Alias for build:docker:supervisor"
 depends = ["build:docker:supervisor"]
 hide = true
 
 ["build:docker:multiarch"]
-description = "Build multi-arch gateway and supervisor images and push to a registry"
+description = "Build multi-arch gateway, sandbox, and supervisor images and push to a registry"
 run = "tasks/scripts/docker-publish-multiarch.sh"
 hide = true
 

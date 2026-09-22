@@ -6,6 +6,7 @@ package fake
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -232,6 +233,11 @@ func copySandboxStatus(s types.SandboxStatus) types.SandboxStatus {
 		copy(conds, s.Conditions)
 		s.Conditions = conds
 	}
+	// Callers may mutate endpoint snapshots without changing the fake's storage.
+	s.EndpointStatuses = slices.Clone(s.EndpointStatuses)
+	for i := range s.EndpointStatuses {
+		s.EndpointStatuses[i].Ports = slices.Clone(s.EndpointStatuses[i].Ports)
+	}
 	return s
 }
 
@@ -308,8 +314,7 @@ func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, sp
 		ResourceVersion: 1,
 		Spec:            copySandboxSpec(*spec),
 		Status: types.SandboxStatus{
-			SandboxName: name,
-			Phase:       types.SandboxProvisioning,
+			Phase: types.SandboxProvisioning,
 		},
 	}
 
@@ -369,8 +374,7 @@ func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, nam
 			ResourceVersion: fmt.Sprint(template.ResourceVersion),
 		},
 		Status: types.SandboxStatus{
-			SandboxName: name,
-			Phase:       types.SandboxProvisioning,
+			Phase: types.SandboxProvisioning,
 		},
 	}
 
@@ -445,16 +449,28 @@ func (c *fakeSandboxClient) Get(_ context.Context, workspace, name string) (*typ
 	return c.store.Get(workspace, name)
 }
 
-// List returns all sandboxes. ListOptions are accepted for interface
-// compatibility but filtering is not implemented.
-func (c *fakeSandboxClient) List(_ context.Context, workspace string, opts ...v1.ListOptions) ([]*types.Sandbox, error) {
+// List returns a lazy pager over sandboxes. Filtering is not implemented.
+func (c *fakeSandboxClient) List(workspace string, opts ...v1.ListOptions) (*v1.Pager[*types.Sandbox], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-	if len(opts) > 0 && opts[0].AllWorkspaces {
-		return c.store.ListAll(), nil
+	var options v1.ListOptions
+	if len(opts) > 0 {
+		options = opts[0]
 	}
-	return c.store.List(workspace), nil
+	items := c.store.List(workspace)
+	if len(opts) > 0 && opts[0].AllWorkspaces {
+		items = c.store.ListAll()
+	}
+	return newSlicePager(items, options.PageSize, options.PageToken)
+}
+
+func (c *fakeSandboxClient) ListAll(ctx context.Context, workspace string, opts ...v1.ListOptions) ([]*types.Sandbox, error) {
+	pager, err := c.List(workspace, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return pager.All(ctx)
 }
 
 // Stop transitions a sandbox to the Stopped phase.
@@ -557,15 +573,14 @@ func (c *fakeSandboxClient) WaitStopped(ctx context.Context, workspace, name str
 }
 
 // Delete removes a sandbox by name. The operation is idempotent.
-func (c *fakeSandboxClient) Delete(_ context.Context, workspace, name string) error {
+func (c *fakeSandboxClient) Delete(_ context.Context, workspace, name string, opts ...v1.DeleteOptions) (*types.DeletionResult, error) {
 	if c.closedFunc() {
-		return &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
 
 	deleted, existed := c.store.DeleteAndGet(workspace, name)
 	if !existed {
-		// Not found — idempotent delete
-		return nil
+		return deletionResult(false, "", opts)
 	}
 
 	c.broadcaster.Broadcast(types.Event[*types.Sandbox]{
@@ -573,7 +588,7 @@ func (c *fakeSandboxClient) Delete(_ context.Context, workspace, name string) er
 		Object: deleted,
 	}, name)
 
-	return nil
+	return deletionResult(true, deleted.ID, opts)
 }
 
 // WaitReady transitions a sandbox to the Ready phase. In the fake

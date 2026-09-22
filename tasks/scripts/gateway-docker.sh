@@ -16,6 +16,8 @@
 #   OPENSHELL_DOCKER_GATEWAY_NAME=my-docker-gateway mise run gateway:docker
 #   OPENSHELL_SANDBOX_NAMESPACE=my-ns mise run gateway:docker
 #   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:docker
+#   OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/... mise run gateway:docker
+#   OPENSHELL_SANDBOX_RUNTIME_IMAGE=ghcr.io/... mise run gateway:docker
 #
 # After the gateway is running, point the CLI at it with either:
 #   openshell --gateway docker-dev <command>
@@ -24,33 +26,20 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=tasks/scripts/gateway-toml.sh
+source "${ROOT}/tasks/scripts/gateway-toml.sh"
+# shellcheck source=tasks/scripts/gateway-pull-policy.sh
+source "${ROOT}/tasks/scripts/gateway-pull-policy.sh"
 PORT="${OPENSHELL_SERVER_PORT:-18080}"
 GATEWAY_NAME="${OPENSHELL_DOCKER_GATEWAY_NAME:-docker-dev}"
 STATE_DIR="${OPENSHELL_DOCKER_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-docker}"
 SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-docker-dev}"
-SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
-SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
+SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
+SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE:-openshell/supervisor:dev}"
+SANDBOX_RUNTIME_IMAGE="${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-openshell/sandbox:dev}"
+SANDBOX_IMAGE_PULL_POLICY="$(normalize_image_pull_policy "${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}")"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
-
-normalize_arch() {
-  case "$1" in
-    x86_64|amd64) echo "amd64" ;;
-    aarch64|arm64) echo "arm64" ;;
-    *) echo "$1" ;;
-  esac
-}
-
-linux_target_triple() {
-  case "$1" in
-    amd64) echo "x86_64-unknown-linux-gnu" ;;
-    arm64) echo "aarch64-unknown-linux-gnu" ;;
-    *)
-      echo "ERROR: unsupported Docker daemon architecture '$1'" >&2
-      exit 2
-      ;;
-  esac
-}
 
 port_is_in_use() {
   local port=$1
@@ -63,6 +52,32 @@ port_is_in_use() {
     return $?
   fi
   (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
+}
+
+ensure_docker_runtime_image() {
+  local image=$1
+  local configured_image=$2
+  local build_target=$3
+  local role=$4
+
+  if [[ -n "${configured_image}" ]]; then
+    if docker image inspect "${image}" >/dev/null 2>&1; then
+      return
+    fi
+    echo "ERROR: ${role} image '${image}' not found locally." >&2
+    echo "       Build it with Docker or unset its image override to build the local :dev image." >&2
+    exit 1
+  fi
+
+  # Always run the build pipeline for default development images so source
+  # changes cannot leave a fixed :dev tag pointing at stale runtime code.
+  echo "Refreshing Docker ${role} image (${image})..."
+  CONTAINER_ENGINE=docker IMAGE_TAG=dev mise run "build:docker:${build_target}"
+
+  if ! docker image inspect "${image}" >/dev/null 2>&1; then
+    echo "ERROR: expected ${role} image '${image}' after build" >&2
+    exit 1
+  fi
 }
 
 append_local_otlp_config_if_available() {
@@ -120,39 +135,18 @@ if port_is_in_use "${PORT}"; then
   exit 2
 fi
 
-GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-http://host.openshell.internal:${PORT}}"
+ensure_docker_runtime_image \
+  "${SUPERVISOR_IMAGE}" \
+  "${OPENSHELL_SUPERVISOR_IMAGE:-}" \
+  supervisor \
+  supervisor
+ensure_docker_runtime_image \
+  "${SANDBOX_RUNTIME_IMAGE}" \
+  "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" \
+  sandbox \
+  "sandbox runtime"
 
-DAEMON_ARCH="$(normalize_arch "$(docker info --format '{{.Architecture}}' 2>/dev/null || true)")"
-HOST_OS="$(uname -s)"
-HOST_ARCH="$(normalize_arch "$(uname -m)")"
-SUPERVISOR_TARGET="$(linux_target_triple "${DAEMON_ARCH}")"
-# Cache the supervisor binary alongside the gateway state. Reuses the same
-# Docker pipeline used for the supervisor image. The Dockerfiles do not compile
-# Rust; the cross-compile runs on the host via cargo zigbuild and the binary is
-# staged into the build context. On macOS the host staging path raises the
-# per-process file-descriptor limit automatically (see build-env.sh), so the
-# static musl link no longer hits ProcessFdQuotaExceeded on this many rlibs.
-SUPERVISOR_OUT_DIR="${STATE_DIR}/supervisor/${DAEMON_ARCH}"
-SUPERVISOR_BIN="${SUPERVISOR_OUT_DIR}/openshell-sandbox"
-
-install_supervisor_binary() {
-  local source=$1
-  local staged
-
-  # A running sandbox may execute a bind-mounted copy of SUPERVISOR_BIN.
-  # Replacing its directory entry keeps that old inode alive for the running
-  # container without truncating it, while new containers see this build.
-  mkdir -p "${SUPERVISOR_OUT_DIR}"
-  staged="$(mktemp "${SUPERVISOR_OUT_DIR}/.openshell-sandbox.XXXXXX")"
-  if ! cp "${source}" "${staged}" || ! chmod 0755 "${staged}"; then
-    rm -f -- "${staged}"
-    return 1
-  fi
-  if ! mv -f -- "${staged}" "${SUPERVISOR_BIN}"; then
-    rm -f -- "${staged}"
-    return 1
-  fi
-}
+GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-http://127.0.0.1:${PORT}}"
 
 CARGO_BUILD_JOBS_ARG=()
 if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
@@ -171,51 +165,15 @@ echo "Generating local gateway credentials..."
   --server-san "localhost" \
   --server-san "host.openshell.internal"
 
-echo "Building openshell-sandbox for ${SUPERVISOR_TARGET}..."
-if [[ "${HOST_OS}" == "Linux" && "${HOST_ARCH}" == "${DAEMON_ARCH}" ]]; then
-  # Native Linux build — no cross-toolchain required.
-  rustup target add "${SUPERVISOR_TARGET}" >/dev/null 2>&1 || true
-  cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-    -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
-  install_supervisor_binary \
-    "${ROOT}/target/${SUPERVISOR_TARGET}/debug/openshell-sandbox"
-else
-  # Cross-compile through the prebuilt-binary staging helper, then use the
-  # supervisor stage to extract just the openshell-sandbox binary.
-  #
-  # This task is gated on a working Docker daemon above, so pin the
-  # container-engine helper to docker — otherwise it auto-detects podman
-  # whenever the binary happens to be on PATH.
-  mkdir -p "${SUPERVISOR_OUT_DIR}"
-  SUPERVISOR_BUILD_DIR="$(mktemp -d "${SUPERVISOR_OUT_DIR}/.build.XXXXXX")"
-  if ! CONTAINER_ENGINE=docker \
-    DOCKER_PLATFORM="linux/${DAEMON_ARCH}" \
-    DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_BUILD_DIR}" \
-      bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor-output; then
-    rm -rf -- "${SUPERVISOR_BUILD_DIR}"
-    exit 1
-  fi
-  if ! install_supervisor_binary "${SUPERVISOR_BUILD_DIR}/openshell-sandbox"; then
-    rm -rf -- "${SUPERVISOR_BUILD_DIR}"
-    exit 1
-  fi
-  rm -rf -- "${SUPERVISOR_BUILD_DIR}"
-fi
-
-if [[ ! -f "${SUPERVISOR_BIN}" ]]; then
-  echo "ERROR: expected supervisor binary at ${SUPERVISOR_BIN}" >&2
-  exit 1
-fi
-
 mkdir -p "${STATE_DIR}"
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
 cat >"${CONFIG_PATH}" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 name = "${GATEWAY_NAME}"
-compute_drivers = ["docker"]
+compute_driver = "docker"
 disable_tls = true
 
 [openshell.gateway.auth]
@@ -229,11 +187,36 @@ gateway_id = "${GATEWAY_NAME}"
 
 [openshell.drivers.docker]
 default_image = "${SANDBOX_IMAGE}"
+supervisor_image = "${SUPERVISOR_IMAGE}"
+sandbox_runtime_image = "${SANDBOX_RUNTIME_IMAGE}"
 image_pull_policy = "${SANDBOX_IMAGE_PULL_POLICY}"
-sandbox_namespace = "${SANDBOX_NAMESPACE}"
+sandbox_label = "${SANDBOX_NAMESPACE}"
 grpc_endpoint = "${GRPC_ENDPOINT}"
-supervisor_bin = "${SUPERVISOR_BIN}"
+# Explicit supervisor-compatible default. Set RuntimeDefault or
+# Localhost/<profile> only on a Docker host with AppArmor enabled.
+app_armor_profile = "Unconfined"
 EOF
+
+# Keep the local task's proxy inputs aligned with [openshell.drivers.docker].
+# Credentials stay in the referenced root-owned file; do not echo their value.
+if [[ -n "${OPENSHELL_SANDBOX_HTTPS_PROXY+x}" ]]; then
+  printf 'https_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_HTTPS_PROXY}")" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_SANDBOX_NO_PROXY+x}" ]]; then
+  printf 'no_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_NO_PROXY}")" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_SANDBOX_PROXY_AUTH_FILE+x}" ]]; then
+  printf 'proxy_auth_file = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_AUTH_FILE}")" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE+x}" ]]; then
+  printf 'proxy_auth_allow_insecure = %s\n' "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME+x}" ]]; then
+  printf 'proxy_connect_by_hostname = %s\n' "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}" >>"${CONFIG_PATH}"
+fi
+if [[ -n "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET+x}" ]]; then
+  printf 'provider_spiffe_workload_api_socket = "%s"\n' "$(toml_escape "${OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET}")" >>"${CONFIG_PATH}"
+fi
 
 append_local_otlp_config_if_available "${CONFIG_PATH}"
 
@@ -255,6 +238,6 @@ exec "${GATEWAY_BIN}" \
   --config "${CONFIG_PATH}" \
   --port "${PORT}" \
   --log-level "${LOG_LEVEL}" \
-  --drivers docker \
+  --compute-driver docker \
   --disable-tls \
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
