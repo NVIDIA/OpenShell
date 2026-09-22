@@ -371,6 +371,7 @@ fn build_credential_resolution_event(
 
 fn build_credential_endpoint_mismatch_finding(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
     crate::l7::build_credential_endpoint_mismatch_finding(
+        openshell_ocsf::ctx::ctx(),
         &ctx.policy_name,
         &ctx.host,
         None,

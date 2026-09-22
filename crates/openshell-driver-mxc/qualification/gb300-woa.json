@@ -1,0 +1,597 @@
+{
+  "schema_version": 1,
+  "contract_id": "nvbug-6643699-gb300-woa-mxc",
+  "nvbug": 6643699,
+  "title": "GB300 native Windows ARM64 OpenShell MXC qualification",
+  "target": {
+    "hardware": "GB300",
+    "operating_system": "windows",
+    "architecture": "arm64",
+    "rust_target": "aarch64-pc-windows-msvc",
+    "execution": "native",
+    "wsl": false,
+    "base_ref": "origin/windows"
+  },
+  "decisions": {
+    "required_agent_apps": [
+      "OpenClaw"
+    ],
+    "target_models": [],
+    "model_scope": "agent_application_owned",
+    "model_release_gate": false,
+    "model_rationale": "OpenShell provides the MXC sandbox and governed transport; it does not select or ship local-inference models. Product Management and the agent-app owner may attach optional model evidence without replacing an OpenShell/MXC gate.",
+    "required_skip_policy": "fail",
+    "nemoclaw_credit": "Native-x64 NemoClaw qualification is a separate gate and cannot satisfy native Windows ARM64 OpenShell/MXC coverage."
+  },
+  "owners": {
+    "openshell_dev": {
+      "name": "Shailendra Singh",
+      "responsibility": "OpenShell MXC implementation, build, and repository-owned tests"
+    },
+    "gb300_qa": {
+      "name": "Rohit Varma Kalidindi",
+      "responsibility": "GB300 host execution, evidence custody, and release verdict"
+    },
+    "sw_program": {
+      "name": "Eric Tam",
+      "responsibility": "Cross-team schedule and unresolved dependency coordination"
+    },
+    "product": {
+      "name": "Abhishek Gore",
+      "responsibility": "Agent-app and model product-scope changes"
+    },
+    "agent_app": {
+      "name": "Agent application owner",
+      "responsibility": "Versioned ARM64 application/runtime inputs and application-level acceptance"
+    },
+    "mxc_platform": {
+      "name": "MXC platform owner",
+      "responsibility": "GB300 wxc-exec build, enabled backend, and platform prerequisites"
+    }
+  },
+  "matrix": [
+    {
+      "id": "contract-integrity",
+      "title": "Qualification contract integrity",
+      "disposition": "required",
+      "owner": "openshell_dev",
+      "architecture": "any",
+      "hardware_dependent": false,
+      "credits_gb300_arm64": true,
+      "allow_skip": false,
+      "prerequisites": [
+        "Python 3.11 or newer",
+        "Repository checkout containing this manifest and validator"
+      ],
+      "commands": [
+        "uv run python crates/openshell-driver-mxc/qualification/validate.py contract"
+      ],
+      "pass_criteria": [
+        "Validator exits 0",
+        "Every matrix row has a valid disposition, owner, prerequisites, pass criteria, and artifact contract",
+        "Required ARM64 rows are non-skippable and x64-only rows cannot receive ARM64 credit"
+      ],
+      "artifact_roles": [
+        "contract_validation_log"
+      ]
+    },
+    {
+      "id": "source-provenance",
+      "title": "Exact windows-tip source provenance",
+      "disposition": "required",
+      "owner": "gb300_qa",
+      "architecture": "any",
+      "hardware_dependent": false,
+      "credits_gb300_arm64": true,
+      "allow_skip": false,
+      "prerequisites": [
+        "Fresh fetch of the NVIDIA/OpenShell origin remote",
+        "Expected base SHA recorded before qualification",
+        "Clean worktree based directly on that origin/windows SHA"
+      ],
+      "commands": [
+        "git fetch --prune origin windows",
+        "git rev-parse refs/remotes/origin/windows",
+        "git merge-base HEAD refs/remotes/origin/windows",
+        "git status --porcelain=v1"
+      ],
+      "pass_criteria": [
+        "Fetched origin/windows equals the expected 40-character base SHA",
+        "HEAD descends directly from that base SHA",
+        "The worktree is clean before evidence collection"
+      ],
+      "artifact_roles": [
+        "environment_and_source_provenance"
+      ]
+    },
+    {
+      "id": "gb300-arm64-host",
+      "title": "Native GB300 Windows ARM64 host and MXC preflight",
+      "disposition": "required",
+      "owner": "gb300_qa",
+      "architecture": "native_arm64",
+      "hardware_dependent": true,
+      "credits_gb300_arm64": true,
+      "allow_skip": false,
+      "prerequisites": [
+        "GB300 Windows host",
+        "Native ARM64 process architecture",
+        "wxc-exec.exe built for ARM64",
+        "ProcessContainer backend enabled",
+        "Elevated PowerShell for MXC loopback and AppContainer setup"
+      ],
+      "commands": [
+        "powershell -NoProfile -ExecutionPolicy Bypass -File crates/openshell-driver-mxc/examples/probe-mxc-host.ps1 -WxcExecPath <path> -OutFile <evidence>/mxc-host-capabilities.json -Full"
+      ],
+      "pass_criteria": [
+        "Host OS is Windows and RuntimeInformation.OSArchitecture is Arm64",
+        "Execution is not WSL or emulation",
+        "Operator hardware attestation identifies GB300",
+        "wxc-exec PE machine is ARM64",
+        "Probe verdicts processcontainer=live and dryRun=ok"
+      ],
+      "artifact_roles": [
+        "environment_and_source_provenance",
+        "mxc_host_capabilities",
+        "mxc_host_probe_log"
+      ]
+    },
+    {
+      "id": "arm64-msvc-check",
+      "title": "ARM64 MSVC workspace check",
+      "disposition": "required",
+      "owner": "openshell_dev",
+      "architecture": "native_arm64",
+      "hardware_dependent": false,
+      "credits_gb300_arm64": true,
+      "allow_skip": false,
+      "prerequisites": [
+        "Visual Studio ARM64 compiler, Spectre libraries, Clang, CMake, and Windows SDK",
+        "Rust target aarch64-pc-windows-msvc"
+      ],
+      "commands": [
+        "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 check aarch64-pc-windows-msvc -LogDir <evidence>"
+      ],
+      "pass_criteria": [
+        "Command exits 0",
+        "Windows-supported workspace and gateway dependency-boundary check both pass"
+      ],
+      "artifact_roles": [
+        "arm64_check_log"
+      ]
+    },
+    {
+      "id": "arm64-release-build",
+      "title": "ARM64 release artifacts",
+      "disposition": "required",
+      "owner": "openshell_dev",
+      "architecture": "native_arm64",
+      "hardware_dependent": false,
+      "credits_gb300_arm64": true,
+      "allow_skip": false,
+      "prerequisites": [
+        "ARM64 MSVC check prerequisites",
+        "Pinned prebuilt Z3 runtime or a complete approved override"
+      ],
+      "commands": [
+        "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 build aarch64-pc-windows-msvc -LogDir <evidence>",
+        "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 artifacts aarch64-pc-windows-msvc"
+      ],
+      "pass_criteria": [
+        "Release build exits 0",
+        "openshell-gateway.exe, openshell.exe, openshell-supervisor-relay.exe, and libz3.dll exist for aarch64-pc-windows-msvc",
+        "Size and SHA256 are recorded for every artifact"
+      ],
+      "artifact_roles": [
+        "arm64_build_log",
+        "arm64_binary_manifest"
+      ]
+    },
+    {
+      "id": "arm64-native-tests",
+      "title": "Native ARM64 Windows workspace tests",
+      "disposition": "required",
+      "owner": "openshell_dev",
+      "architecture": "native_arm64",
+      "hardware_dependent": false,
+      "credits_gb300_arm64": true,
+      "allow_skip": false,
+      "prerequisites": [
+        "ARM64 release-build prerequisites",
+        "Native ARM64 test runner"
+      ],
+      "commands": [
+        "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-precommit aarch64-pc-windows-msvc -LogDir <evidence>"
+      ],
+      "pass_criteria": [
+        "Command exits 0",
+        "The CI nextest profile and server test-support suite pass natively"
+      ],
+      "artifact_roles": [
+        "arm64_test_log"
+      ]
+    },
+    {
+      "id": "arm64-unsupported-driver-contracts",
+      "title": "Unsupported Windows compute-driver boundaries",
+      "disposition": "required",
+      "owner": "openshell_dev",
+      "architecture": "native_arm64",
+      "hardware_dependent": false,
+      "credits_gb300_arm64": true,
+      "allow_skip": false,
+      "prerequisites": [
+        "Native ARM64 test runner"
+      ],
+      "commands": [
+        "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-unsupported aarch64-pc-windows-msvc -LogDir <evidence>"
+      ],
+      "pass_criteria": [
+        "Focused unsupported-driver tests exit 0",
+        "Protocol-only, MXC-only, Docker-stub-only, and MXC-plus-Docker-stub compositions pass"
+      ],
+      "artifact_roles": [
+        "unsupported_driver_contract_log"
+      ]
+    },
+    {
+      "id": "processcontainer-real-mxc",
+      "title": "Strict live ProcessContainer integration",
+      "disposition": "required",
+      "owner": "openshell_dev",
+      "architecture": "native_arm64",
+      "hardware_dependent": true,
+      "credits_gb300_arm64": true,
+      "allow_skip": false,
+      "prerequisites": [
+        "Live ARM64 wxc-exec ProcessContainer backend",
+        "Windows curl.exe",
+        "Network path to the allowlisted HTTPS fixture"
+      ],
+      "commands": [
+        "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-mxc-gb300 aarch64-pc-windows-msvc -LogDir <evidence>"
+      ],
+      "pass_criteria": [
+        "Every required dry-run and ProcessContainer test passes",
+        "No required test emits SKIP",
+        "In-policy write succeeds, out-of-policy write is denied, and governed HTTPS reads the injected CA bundle"
+      ],
+      "artifact_roles": [
+        "strict_real_mxc_log"
+      ]
+    },
+    {
+      "id": "processcontainer-policy-e2e",
+      "title": "Tier-3 ProcessContainer policy scenarios",
+      "disposition": "required",
+      "owner": "gb300_qa",
+      "architecture": "native_arm64",
+      "hardware_dependent": true,
+      "credits_gb300_arm64": true,
+      "allow_skip": false,
+      "prerequisites": [
+        "Live ProcessContainer backend",
+        "Fresh ARM64 gateway, CLI, relay, and Z3 artifacts staged with tracked fixtures"
+      ],
+      "commands": [
+        "powershell -NoProfile -ExecutionPolicy Bypass -File run-mxc-e2e.ps1 -WxcExecPath <path> -Backend process_container"
+      ],
+      "pass_criteria": [
+        "fs-rw, fs-readonly, fs-default-deny, and network-reject all PASS",
+        "Summary is PASS=4 FAIL=0 SKIP=0",
+        "The exact rendered TOML, policies, gateway logs, transcript, and summary are retained"
+      ],
+      "artifact_roles": [
+        "mxc_policy_e2e_log",
+        "mxc_policy_e2e_bundle"
+      ]
+    },
+    {
+      "id": "openclaw-arm64-forward",
+      "title": "OpenClaw ARM64 MXC launch and dynamic forwarding",
+      "disposition": "required",
+      "owner": "agent_app",
+      "architecture": "native_arm64",
+      "hardware_dependent": true,
+      "credits_gb300_arm64": true,
+      "allow_skip": false,
+      "prerequisites": [
+        "Caller-supplied ARM64 node.exe",
+        "Versioned OpenClaw package containing openclaw.mjs",
+        "Live ProcessContainer backend",
+        "Elevated PowerShell",
+        "Allowed HTTPS endpoint available to the governed-egress proof"
+      ],
+      "commands": [
+        "powershell -NoProfile -ExecutionPolicy Bypass -File run-openclaw-forward-test.ps1 -Backend process_container -WxcExecPath <path> -NodeExePath <arm64-node> -OpenClawInstallDir <openclaw>"
+      ],
+      "pass_criteria": [
+        "node.exe PE machine is ARM64",
+        "OpenClaw package version is captured",
+        "Sandbox reaches ready and the authenticated host-side OpenClaw client returns ok=true through openshell forward service",
+        "Allowed HTTPS succeeds while denied host and direct Internet bypass remain blocked"
+      ],
+      "artifact_roles": [
+        "openclaw_forward_log",
+        "openclaw_forward_bundle"
+      ]
+    },
+    {
+      "id": "isolation-session",
+      "title": "MXC isolation_session backend",
+      "disposition": "optional",
+      "owner": "mxc_platform",
+      "architecture": "native_arm64",
+      "hardware_dependent": true,
+      "credits_gb300_arm64": false,
+      "allow_skip": true,
+      "prerequisites": [
+        "Windows build 26300.8553 or newer",
+        "IsoSessionApp.dll and isolation_session support in wxc-exec"
+      ],
+      "commands": [
+        "mise run --skip-tools windows:test:mxc-real:arm64",
+        "powershell -NoProfile -ExecutionPolicy Bypass -File run-openclaw-forward-test.ps1 -Backend isolation_session <runtime inputs>"
+      ],
+      "pass_criteria": [
+        "If executed, provision-start-exec-stop-deprovision completes and cleanup leaves no orphan",
+        "Absence is recorded with the probe reason and does not fail the GB300 ProcessContainer gate"
+      ],
+      "artifact_roles": [
+        "optional_isolation_session_log"
+      ]
+    },
+    {
+      "id": "provider-credential-injection",
+      "title": "MXC provider credential substitution",
+      "disposition": "optional",
+      "owner": "openshell_dev",
+      "architecture": "native_arm64",
+      "hardware_dependent": true,
+      "credits_gb300_arm64": false,
+      "allow_skip": true,
+      "prerequisites": [
+        "Non-production scoped provider credential",
+        "Live ProcessContainer governed-egress backend"
+      ],
+      "commands": [
+        "powershell -NoProfile -ExecutionPolicy Bypass -File run-provider-credential-test.ps1"
+      ],
+      "pass_criteria": [
+        "If executed, placeholder substitution succeeds only at the bound endpoint",
+        "No credential or bearer value appears in retained artifacts"
+      ],
+      "artifact_roles": [
+        "optional_provider_credential_bundle"
+      ]
+    },
+    {
+      "id": "etw-ocsf-audit",
+      "title": "MXC ETW to OCSF audit",
+      "disposition": "optional",
+      "owner": "openshell_dev",
+      "architecture": "native_arm64",
+      "hardware_dependent": true,
+      "credits_gb300_arm64": false,
+      "allow_skip": true,
+      "prerequisites": [
+        "Elevated ETW session access",
+        "Windows Sandboxing event providers enabled"
+      ],
+      "commands": [
+        "powershell -NoProfile -ExecutionPolicy Bypass -File run-ocsf-audit.ps1"
+      ],
+      "pass_criteria": [
+        "If executed, events are attributed to the owned sandbox and secret-free OCSF JSONL is retained"
+      ],
+      "artifact_roles": [
+        "optional_ocsf_bundle"
+      ]
+    },
+    {
+      "id": "local-inference-models",
+      "title": "Agent-app local inference models",
+      "disposition": "optional",
+      "owner": "product",
+      "architecture": "native_arm64",
+      "hardware_dependent": true,
+      "credits_gb300_arm64": false,
+      "allow_skip": true,
+      "prerequisites": [
+        "Product-selected model and runtime build",
+        "Agent-app-owned inference acceptance criteria"
+      ],
+      "commands": [],
+      "pass_criteria": [
+        "No model is implicitly claimed by the OpenShell contract",
+        "If supplied, optional evidence records exact model ID, model hash or version, inference runtime, prompt outcome, and latency"
+      ],
+      "artifact_roles": [
+        "optional_model_evidence"
+      ]
+    },
+    {
+      "id": "additional-agent-apps",
+      "title": "Agent applications other than OpenClaw",
+      "disposition": "optional",
+      "owner": "sw_program",
+      "architecture": "native_arm64",
+      "hardware_dependent": true,
+      "credits_gb300_arm64": false,
+      "allow_skip": true,
+      "prerequisites": [
+        "Named application owner",
+        "Versioned native ARM64 build",
+        "Application-specific pass/fail oracle"
+      ],
+      "commands": [],
+      "pass_criteria": [
+        "Applications are added explicitly rather than inferred from generic OpenShell coverage",
+        "Optional app evidence cannot replace the required OpenClaw or MXC rows"
+      ],
+      "artifact_roles": [
+        "optional_agent_app_evidence"
+      ]
+    },
+    {
+      "id": "wsl",
+      "title": "WSL execution",
+      "disposition": "unsupported",
+      "owner": "product",
+      "architecture": "none",
+      "hardware_dependent": false,
+      "credits_gb300_arm64": false,
+      "allow_skip": true,
+      "prerequisites": [
+        "None"
+      ],
+      "commands": [],
+      "pass_criteria": [
+        "No WSL result is accepted as native WoA evidence"
+      ],
+      "artifact_roles": [],
+      "reason": "NVBug 6643699 explicitly scopes GB300 coverage to native Windows-on-Arm and states WSL: No."
+    },
+    {
+      "id": "windows-non-mxc-drivers",
+      "title": "Docker, Kubernetes, Podman, and VM compute drivers on Windows",
+      "disposition": "unsupported",
+      "owner": "openshell_dev",
+      "architecture": "none",
+      "hardware_dependent": false,
+      "credits_gb300_arm64": false,
+      "allow_skip": true,
+      "prerequisites": [
+        "None"
+      ],
+      "commands": [],
+      "pass_criteria": [
+        "Focused rejection contracts pass; no unsupported driver is presented as GB300 runtime coverage"
+      ],
+      "artifact_roles": [],
+      "reason": "The Windows gateway retains explicit unsupported stubs; only the in-process MXC compute driver is a native Windows runtime."
+    },
+    {
+      "id": "mxc-process-policy",
+      "title": "Portable process policy enforcement in MXC",
+      "disposition": "unsupported",
+      "owner": "openshell_dev",
+      "architecture": "none",
+      "hardware_dependent": false,
+      "credits_gb300_arm64": false,
+      "allow_skip": true,
+      "prerequisites": [
+        "None"
+      ],
+      "commands": [],
+      "pass_criteria": [
+        "Explicit process policy is rejected rather than silently weakened"
+      ],
+      "artifact_roles": [],
+      "reason": "MXC supplies OS isolation but has no supported mapping for OpenShell portable process policy."
+    },
+    {
+      "id": "mxc-gpu-passthrough",
+      "title": "GPU passthrough through the MXC driver",
+      "disposition": "unsupported",
+      "owner": "product",
+      "architecture": "none",
+      "hardware_dependent": true,
+      "credits_gb300_arm64": false,
+      "allow_skip": true,
+      "prerequisites": [
+        "None"
+      ],
+      "commands": [],
+      "pass_criteria": [
+        "No GPU passthrough claim is made from host GPU presence"
+      ],
+      "artifact_roles": [],
+      "reason": "GPU passthrough is not pursued by the host-side-governance MXC design."
+    },
+    {
+      "id": "mxc-interactive-exec",
+      "title": "Interactive exec and connect",
+      "disposition": "unsupported",
+      "owner": "openshell_dev",
+      "architecture": "none",
+      "hardware_dependent": false,
+      "credits_gb300_arm64": false,
+      "allow_skip": true,
+      "prerequisites": [
+        "None"
+      ],
+      "commands": [],
+      "pass_criteria": [
+        "Dynamic service forwarding is tested without claiming interactive exec/connect support"
+      ],
+      "artifact_roles": [],
+      "reason": "The supervisor relay supports launch, shutdown, and dynamic forwarding but not the Linux ConnectSupervisor protocol."
+    },
+    {
+      "id": "nemoclaw-native-x64",
+      "title": "NemoClaw native-x64 qualification",
+      "disposition": "architecture_constrained",
+      "owner": "agent_app",
+      "architecture": "native_x64",
+      "hardware_dependent": false,
+      "credits_gb300_arm64": false,
+      "allow_skip": true,
+      "prerequisites": [
+        "Native x64 host required by the NemoClaw qualification guard"
+      ],
+      "commands": [],
+      "pass_criteria": [
+        "Run only in the separately owned native-x64 lane",
+        "Never use its result to satisfy a GB300 Windows ARM64 row"
+      ],
+      "artifact_roles": [],
+      "reason": "The current NemoClaw qualification guard requires native x64; this contract qualifies OpenShell/MXC on native ARM64 independently."
+    },
+    {
+      "id": "node-openclaw-x64-installer",
+      "title": "Bundled win-x64 Node.js installer helper",
+      "disposition": "architecture_constrained",
+      "owner": "agent_app",
+      "architecture": "native_x64",
+      "hardware_dependent": false,
+      "credits_gb300_arm64": false,
+      "allow_skip": true,
+      "prerequisites": [
+        "x64-compatible Windows execution"
+      ],
+      "commands": [
+        "powershell -NoProfile -ExecutionPolicy Bypass -File install-nodejs-openclaw.ps1"
+      ],
+      "pass_criteria": [
+        "The helper remains usable for x64 development",
+        "GB300 qualification instead supplies an independently versioned ARM64 node.exe and verifies its PE machine"
+      ],
+      "artifact_roles": [],
+      "reason": "The helper downloads node-v<version>-win-x64.zip and therefore cannot establish native ARM64 application coverage."
+    },
+    {
+      "id": "windows-x64-lanes",
+      "title": "Windows x64 build and test lanes",
+      "disposition": "architecture_constrained",
+      "owner": "openshell_dev",
+      "architecture": "native_x64",
+      "hardware_dependent": false,
+      "credits_gb300_arm64": false,
+      "allow_skip": true,
+      "prerequisites": [
+        "Native x64 Windows host"
+      ],
+      "commands": [
+        "mise run --skip-tools windows:ci",
+        "mise run --skip-tools windows:test:mxc-real:x64"
+      ],
+      "pass_criteria": [
+        "Results remain x64 regression evidence only",
+        "Cross-builds and emulated execution cannot satisfy native ARM64 rows"
+      ],
+      "artifact_roles": [],
+      "reason": "GB300 WoA qualification requires native ARM64 execution."
+    }
+  ]
+}

@@ -194,16 +194,24 @@ This example uses `process_container`. The `IsoSessionApp.dll` and
 
 ## Real-MXC test lane
 
-Three tasks drive real `wxc-exec.exe` hardware; all are **skip-safe** — any test
-or scenario that requires an absent binary or backend prints a SKIP reason and
-exits 0 rather than failing.
+The generic real-`wxc-exec.exe` tasks are **skip-safe**: a test or scenario that
+requires an absent binary or backend prints a SKIP reason and exits 0. They are
+useful developer diagnostics, but a skipped run is not qualification evidence.
+The GB300 task is deliberately strict and fails on every required skip.
 
 | Task | What it runs | When to use |
 |---|---|---|
 | `windows:test:mxc-real:x64` | `tests/wxc_exec_real.rs` — Tier-2 invoker tests with `--ignored --test-threads=1`, including an HTTPS request through the host proxy | Pre-merge on any Windows host that has `wxc-exec`; dry-run tests always pass; enforcement tests probe-gate themselves |
 | `windows:test:mxc-real:arm64` | Native ARM64 `tests/wxc_exec_real.rs` with the same contract | Pre-merge on an ARM64 Windows host with `wxc-exec` |
+| `windows:test:mxc-gb300:arm64` | Required ARM64 ProcessContainer cases from `tests/wxc_exec_real.rs`; rejects x64 and every required `SKIP` | GB300 qualification only; requires a live backend and all prerequisites |
 | `windows:e2e:mxc` | `examples/run-mxc-e2e.ps1` — Tier-3 scenario runner, real binary, probe-gated | Demo box / nightly; needs the gateway + CLI binaries in the script directory |
 | `windows:e2e:mxc:mock` | Same runner with `-Mock` — wiring-only, no real `wxc-exec` needed | Any Windows host (CI, dev machine); validates wiring and the network-reject scenario |
+| `windows:qualify:mxc:gb300` | Complete source, host, ARM64 build/test, strict MXC, policy E2E, OpenClaw, and hash-bound evidence contract | Review/release evidence on a native GB300 Windows ARM64 host |
+
+The exact required, optional, unsupported, and architecture-constrained GB300
+matrix is documented and machine-validated in
+[`qualification/`](qualification/README.md). Native-x64 NemoClaw and Windows x64
+lanes are explicitly separate and cannot receive GB300 ARM64 credit.
 
 **Probe script:** `examples/probe-mxc-host.ps1` is an operator/CI preflight that emits a JSON capability report
 (OS build, wxc-exec path/version, dry-run exit code, per-backend trial result,
