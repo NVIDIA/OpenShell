@@ -1918,14 +1918,25 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) = Box::pin(run_refresh_worker_tick(
+            match Box::pin(run_refresh_worker_tick(
                 state.store.as_ref(),
                 Some(&state.credentials),
                 Some(&state.compute),
             ))
             .await
             {
-                warn!(error = %err, "provider credential refresh worker tick failed");
+                Ok(workspaces) => {
+                    for workspace in workspaces {
+                        crate::config_delivery::publish_workspace_components(
+                            &state,
+                            &workspace,
+                            crate::config_delivery::ConfigComponents::ALL,
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "provider credential refresh worker tick failed");
+                }
             }
         }
     });
@@ -1944,7 +1955,8 @@ async fn run_refresh_worker_tick(
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
     compute: Option<&crate::compute::ComputeRuntime>,
-) -> Result<(), Status> {
+) -> Result<std::collections::HashSet<String>, Status> {
+    let mut changed_workspaces = std::collections::HashSet::new();
     let now_ms = current_time_ms();
     let states = list_all_refresh_states(store).await.inspect_err(|_| {
         crate::otel_tracing::mark_error(&tracing::Span::current());
@@ -1994,6 +2006,8 @@ async fn run_refresh_worker_tick(
                     error = %err,
                     "failed to finalize tombstoned provider refresh; retrying on the next sweep"
                 );
+            } else {
+                changed_workspaces.insert(state.object_workspace().to_string());
             }
             continue;
         }
@@ -2077,9 +2091,11 @@ async fn run_refresh_worker_tick(
                 error = %err,
                 "provider credential refresh failed"
             );
+        } else {
+            changed_workspaces.insert(state.object_workspace().to_string());
         }
     }
-    Ok(())
+    Ok(changed_workspaces)
 }
 
 #[cfg(test)]

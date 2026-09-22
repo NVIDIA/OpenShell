@@ -133,6 +133,7 @@ protoc-bin-vendored = { workspace = true }
 # would; the feature is test-only and never reaches a release binary.
 openshell-providers = { path = "../openshell-providers", features = ["example-profiles"] }
 base64 = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "aws-lc-rs"] }
 rcgen = { workspace = true }
 rsa = { version = "0.9", features = ["pem"] }

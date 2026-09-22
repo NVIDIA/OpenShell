@@ -546,9 +546,10 @@ service OpenShell {
   //
   // The supervisor opens this stream at startup and keeps it alive for the
   // sandbox lifetime. The gateway uses it to coordinate relay channels for
-  // SSH connect, ExecSandbox, and targetable sandbox services. Raw service
-  // bytes flow over RelayStream calls (separate HTTP/2 streams on the same
-  // connection), not over this stream.
+  // SSH connect, ExecSandbox, targetable sandbox services, and configuration
+  // delivery. Peers must report the same exact protocol_revision during the
+  // handshake. Raw service bytes flow over RelayStream calls (separate HTTP/2
+  // streams on the same connection), not over this stream.
   rpc ConnectSupervisor(stream SupervisorMessage) returns (stream GatewayMessage) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "sandbox"
@@ -2573,6 +2574,36 @@ message GetSandboxProviderEnvironmentResponse {
   ProviderReadinessReason readiness_reason = 9;
 }
 
+enum ProviderEnvironmentValueClassification {
+  PROVIDER_ENVIRONMENT_VALUE_CLASSIFICATION_UNSPECIFIED = 0;
+  PROVIDER_ENVIRONMENT_VALUE_CLASSIFICATION_NON_SECRET = 1;
+  PROVIDER_ENVIRONMENT_VALUE_CLASSIFICATION_STATIC_CREDENTIAL = 2;
+}
+
+// One environment value and all metadata that shares its key.
+message ProviderEnvironmentValue {
+  reserved 3;
+  reserved "expires_at_ms";
+  string name = 1;
+  string value = 2 [(openshell.options.v1.secret) = true];
+  ProviderEnvironmentValueClassification classification = 4;
+  StaticCredentialBinding static_credential_binding = 5;
+  // Absolute expiration time. Absence means no expiry.
+  google.protobuf.Timestamp expiration_time = 103;
+}
+
+// Complete provider environment state delivered to a supervisor. Dynamic
+// credentials are endpoint selectors rather than environment values and stay
+// in their own collection.
+message ProviderEnvironmentSnapshot {
+  uint64 provider_env_revision = 1;
+  repeated ProviderEnvironmentValue values = 2;
+  map<string, ProviderProfileCredential> dynamic_credentials = 3;
+  string provider_attachment_epoch = 4;
+  string policy_hash = 5;
+  ProviderReadinessReason readiness_reason = 6;
+}
+
 message ExchangeProviderSubjectTokenRequest {
   // The sandbox ID. Must match the authenticated sandbox principal.
   string sandbox_id = 1;
@@ -2888,6 +2919,9 @@ message GetSandboxLogsResponse {
 // Supervisor session messages
 // ---------------------------------------------------------------------------
 
+// These messages form an internal, version-locked deployment protocol between
+// the gateway and the supervisor. They are not a public sandbox client API.
+
 // Envelope for supervisor-to-gateway messages on the ConnectSupervisor stream.
 message SupervisorMessage {
   oneof payload {
@@ -2895,6 +2929,8 @@ message SupervisorMessage {
     SupervisorHeartbeat heartbeat = 2;
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
+    ConfigUpdateResult config_update_result = 5;
+    ConfigBootstrapResult config_bootstrap_result = 6;
   }
 }
 
@@ -2906,6 +2942,7 @@ message GatewayMessage {
     GatewayHeartbeat heartbeat = 3;
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
+    ConfigUpdate config_update = 6;
   }
 }
 
@@ -2920,6 +2957,9 @@ message SupervisorHello {
   uint64 connection_epoch = 3;
   // The supervisor can report credential, policy, and launch-environment installation.
   bool supports_provider_readiness = 4;
+  // Exact internal stream protocol revision implemented by this supervisor.
+  // Zero identifies a supervisor built before the handshake existed.
+  uint32 protocol_revision = 5;
 }
 
 // Gateway accepts the supervisor session.
@@ -2928,8 +2968,65 @@ message SessionAccepted {
   reserved "heartbeat_interval_secs";
   // Gateway-assigned session ID for this connection.
   string session_id = 1;
+  // Complete gateway-owned configuration. During the staged rollout this may
+  // be omitted only when the gateway cannot build the projection.
+  ConfigBootstrap bootstrap = 3;
+  // Exact internal stream protocol revision implemented by this gateway.
+  uint32 protocol_revision = 4;
   // Recommended heartbeat interval.
   google.protobuf.Duration heartbeat_interval = 102;
+}
+
+// Complete gateway-owned configuration for a supervisor session.
+message ConfigBootstrap {
+  openshell.sandbox.v1.SandboxConfigSnapshot sandbox_config = 1;
+  ProviderEnvironmentSnapshot provider_environment = 2;
+}
+
+// A complete replacement snapshot for exactly one configuration component.
+message ConfigUpdate {
+  // Opaque non-empty identifier scoped to the active supervisor session.
+  string update_id = 1;
+  // Monotonic within one session and component. Snapshot revisions are
+  // content identities and must only be compared for equality.
+  uint64 component_sequence = 2;
+  oneof component {
+    openshell.sandbox.v1.SandboxConfigSnapshot sandbox_config = 3;
+    ProviderEnvironmentSnapshot provider_environment = 4;
+  }
+}
+
+// Sanitized application failure. Messages must not contain configuration
+// payloads, credentials, or provider values.
+message ConfigApplyFailure {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+}
+
+message ConfigComponentApplyResult {
+  ConfigComponent component = 1;
+  // Revision extracted from the received snapshot.
+  ConfigSnapshotRevision requested_revision = 2;
+  // Revision active after this attempt. Omitted when the received snapshot
+  // was not installed or a local override has no gateway revision.
+  ConfigSnapshotRevision applied_revision = 3;
+  ConfigApplyOutcome outcome = 4;
+  ConfigApplyFailure failure = 5;
+}
+
+// Application result for one ConfigUpdate.
+message ConfigUpdateResult {
+  // Echoes ConfigUpdate.update_id for session-local correlation.
+  string update_id = 1;
+  // Echoes ConfigUpdate.component_sequence.
+  uint64 component_sequence = 2;
+  ConfigComponentApplyResult result = 3;
+}
+
+// Aggregate application result for the SessionAccepted bootstrap.
+message ConfigBootstrapResult {
+  repeated ConfigComponentApplyResult results = 1;
 }
 
 // Gateway rejects the supervisor session.

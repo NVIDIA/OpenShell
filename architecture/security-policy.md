@@ -55,6 +55,11 @@ file-compatible rights. This avoids rejecting valid mixed-path policies without
 weakening `hard_requirement`: genuine unsupported ABI capabilities and
 preparation failures still fail sandbox startup.
 
+During startup policy preparation, an authenticated supervisor may propose any
+complete policy for its own sandbox. The gateway does not constrain that proposal
+relative to the candidate it sent. It applies the normal sandbox policy
+authorization, validation, safety, and composition checks before persistence.
+
 ## Network Decisions
 
 Ordinary network traffic follows this order:
