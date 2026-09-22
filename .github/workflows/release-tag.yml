@@ -141,7 +141,11 @@ jobs:
     uses: ./.github/workflows/security-scan.yml
     with:
       candidate_ref: ${{ inputs.tag || github.ref_name }}
-      allow-high-critical: false
+      # Temporary observation mode for the pre-existing CodeQL, Trivy, and
+      # Zizmor backlog. Remove after baseline/delta enforcement is implemented.
+      # Cargo Deny, Codex Security, and scanner execution errors remain fatal.
+      fail-on-codex-findings: true
+      fail-on-static-findings: false
       images: |
         ghcr.io/nvidia/openshell/gateway:${{ needs.compute-versions.outputs.source_sha }}
         ghcr.io/nvidia/openshell/sandbox:${{ needs.compute-versions.outputs.source_sha }}

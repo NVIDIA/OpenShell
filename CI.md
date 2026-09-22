@@ -97,10 +97,18 @@ Actions or call it from another workflow. All applicable children analyze the
 candidate snapshot. Cargo Deny uses its existing NVIDIA self-hosted runner and
 CI container.
 
+Tagged releases temporarily run CodeQL, Trivy, and Zizmor findings in
+observation mode while the existing backlog is triaged. Cargo Deny advisories,
+Codex Security findings, and scanner execution errors still block publication.
+The temporary `fail-on-static-findings: false` override must be removed when
+baseline/delta enforcement is implemented; it does not waive Cargo Deny, Codex
+Security, or scanner execution failures.
+
 ```shell
 gh workflow run security-scan.yml --ref main \
   -f candidate_ref=v0.1.1-pre.1 \
-  -F allow-high-critical=true
+  -F fail-on-codex-findings=false \
+  -F fail-on-static-findings=false
 ```
 
 To integrate it into a larger workflow, run it after the job that pushes the
@@ -125,7 +133,8 @@ jobs:
         ${{ needs.build.outputs.gateway_image }}
         ${{ needs.build.outputs.sandbox_image }}
       charts: ${{ needs.build.outputs.chart_ref }}
-      allow-high-critical: false
+      fail-on-codex-findings: true
+      fail-on-static-findings: true
     secrets:
       CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -140,10 +149,12 @@ publishes SARIF, including Codex results for manual parent runs. Codex keeps its
 release-train category on `main`; CodeQL, Trivy, and workflow reports publish
 against the candidate tag and commit. Existing standalone triggers stay active.
 
-The parent fails on HIGH/CRITICAL findings from Codex, CodeQL, Trivy, and Zizmor.
-Set `allow-high-critical: true` to report those findings without failing; it
-defaults to `false`. Scanner setup, execution, and report publication errors
-still fail. Reports are published before the finding threshold is enforced.
+The parent fails on Codex findings when `fail-on-codex-findings` is `true` and
+on HIGH/CRITICAL findings from CodeQL, Trivy, and Zizmor when
+`fail-on-static-findings` is `true`. Both inputs default to `true`. Set either
+input to `false` to make only that finding class informational. Scanner setup,
+execution, and report publication errors still fail. Reports are published
+before the finding threshold is enforced.
 
 Codex uses each finding's severity; CodeQL uses the rule's security score
 (at least 7.0); Trivy uses `HIGH,CRITICAL`, including vulnerabilities without an
@@ -151,9 +162,9 @@ upstream fix; Zizmor uses its High severity. Actionlint remains informational.
 Existing scanner exceptions still apply.
 
 Cargo Deny runs only `cargo deny check advisories` in the parent. It keeps its
-native failure behavior and configured exceptions, regardless of
-`allow-high-critical`; it has no HIGH/CRITICAL filter. Its standalone runs still
-check all dependency policies.
+native failure behavior and configured exceptions regardless of either finding
+threshold input; it has no HIGH/CRITICAL filter. Its standalone runs still check
+all dependency policies.
 
 Codex scans the cumulative diff from `stable_ref` to `candidate_ref`. Both inputs
 are tag names, not arbitrary commit SHAs. Omit `stable_ref` to resolve the previous
@@ -377,7 +388,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Security Scan gates release publication. |
+| `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Security Scan gates release publication on Cargo Deny advisories, Codex Security findings, and scanner execution errors while the static-analysis backlog remains in temporary observation mode. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts on `macos`, `ubuntu`, `fedora`, and `kubernetes` (kind + Helm) runners. Each job reaches its gateway and creates, exercises, and deletes a sandbox. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts

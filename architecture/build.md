@@ -506,8 +506,12 @@ The tagged release workflow calls the aggregate Security Scan after publishing
 the candidate's commit-addressed gateway, sandbox, and supervisor images. CodeQL,
 Trivy, Cargo Deny, and Actionlint/Zizmor run for every release tag; Codex Security
 also runs for pre-release tags. The release job depends on the aggregate result,
-which fails on scanner errors, Cargo Deny advisories, and unexcepted High or
-Critical findings.
+which fails on scanner errors, Cargo Deny advisories, and Codex Security
+findings. CodeQL, Trivy, and Zizmor findings temporarily remain informational
+while their existing backlog is triaged. Remove the release workflow's
+`fail-on-static-findings: false` override when baseline/delta enforcement is
+implemented so new High or Critical findings become blocking without requiring
+the historical backlog to reach zero first.
 
 `release-auto-tag.yml` runs at 14:00 Europe/Zurich on weekdays (including daylight
 saving time changes) and supports manual dispatch. Maintainers start weekday
