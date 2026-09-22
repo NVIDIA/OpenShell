@@ -58,6 +58,10 @@ use tonic::transport::Channel;
 #[cfg(unix)]
 use tonic::transport::Endpoint;
 use tonic::{Code, Request, Status};
+
+pub const COMPUTE_DRIVER_ANNOTATION: &str = "internal.openshell.ai/compute-driver";
+pub const COMPUTE_RUNTIME_IDENTITY_ANNOTATION: &str =
+    "internal.openshell.ai/compute-runtime-identity";
 #[cfg(unix)]
 use tower::service_fn;
 use tracing::{Instrument as _, debug, info, warn};
@@ -227,7 +231,7 @@ impl LifecycleGateRegistry {
 /// Passing it to `lock_global_for_lifecycle` makes that ordering visible at
 /// every global-lock acquisition in a lifecycle path.
 #[derive(Debug)]
-struct SandboxLifecycleGuard {
+pub struct SandboxLifecycleGuard {
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -716,6 +720,15 @@ impl ComputeRuntime {
         })
     }
 
+    pub(crate) async fn sandbox_create_guards(
+        &self,
+        sandbox_id: &str,
+    ) -> crate::persistence::PersistenceResult<(SandboxLifecycleGuard, SandboxSyncGuard)> {
+        let lifecycle_guard = self.lifecycle_gates.lock_for(sandbox_id).await;
+        let global_guard = self.sandbox_sync_guard().await?;
+        Ok((lifecycle_guard, global_guard))
+    }
+
     /// Acquires the process-wide lock for code that already holds the
     /// sandbox-ID lifecycle gate. The guard parameter documents and enforces
     /// that callers acquire locks in lifecycle-gate -> global-lock order.
@@ -782,7 +795,10 @@ impl ComputeRuntime {
         self.driver_info.supports_sandbox_authentication
     }
 
-    pub(crate) async fn authenticate_sandbox(&self, credential: &str) -> Result<String, Status> {
+    pub(crate) async fn authenticate_sandbox(
+        &self,
+        credential: &str,
+    ) -> Result<openshell_core::proto::compute::v1::AuthenticateSandboxResponse, Status> {
         if !self.supports_sandbox_authentication() {
             return Err(Status::unimplemented(
                 "selected compute driver does not authenticate sandbox credentials",
@@ -798,7 +814,7 @@ impl ComputeRuntime {
                 |driver| async move { driver.authenticate_sandbox(Request::new(request)).await },
             )
             .await
-            .map(|response| response.into_inner().sandbox_id)
+            .map(tonic::Response::into_inner)
     }
 
     #[must_use]
@@ -888,12 +904,12 @@ impl ComputeRuntime {
         sandbox_token: Option<String>,
         await_main_process_attachment: bool,
     ) -> Result<Sandbox, Status> {
-        self.create_sandbox_authenticated(
+        Box::pin(self.create_sandbox_authenticated(
             sandbox,
             sandbox_token,
             None,
             await_main_process_attachment,
-        )
+        ))
         .await
     }
 
@@ -903,6 +919,33 @@ impl ComputeRuntime {
         sandbox_token: Option<String>,
         launch_authentication: Option<Vec<u8>>,
         await_main_process_attachment: bool,
+    ) -> Result<Sandbox, Status> {
+        let (lifecycle_guard, global_guard) = self
+            .sandbox_create_guards(sandbox.object_id())
+            .await
+            .map_err(|error| {
+                crate::grpc::persistence_error_to_status(error, "acquire sandbox mutation lock")
+            })?;
+        Box::pin(self.create_sandbox_authenticated_with_guards(
+            sandbox,
+            sandbox_token,
+            launch_authentication,
+            await_main_process_attachment,
+            lifecycle_guard,
+            global_guard,
+        ))
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_sandbox_authenticated_with_guards(
+        &self,
+        sandbox: Sandbox,
+        sandbox_token: Option<String>,
+        launch_authentication: Option<Vec<u8>>,
+        await_main_process_attachment: bool,
+        lifecycle_guard: SandboxLifecycleGuard,
+        global_guard: SandboxSyncGuard,
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
         let mut sandbox = sandbox;
@@ -958,6 +1001,10 @@ impl ComputeRuntime {
                     Status::internal(format!("persist sandbox failed: {e}"))
                 }
             })?;
+        if let Some(metadata) = sandbox.metadata.as_mut() {
+            metadata.resource_version = result.resource_version;
+        }
+        drop(global_guard);
 
         if let Some(token) = sandbox_token
             && let Some(spec) = driver_sandbox.spec.as_mut()
@@ -983,17 +1030,64 @@ impl ComputeRuntime {
             )
             .await
         {
-            Ok(_) => {
+            Ok(response) => {
+                let runtime_identity = response.into_inner().runtime_identity;
                 // The driver now owns the staged archive and removes the
-                // request directory once it has built the disk. Every other
-                // arm lets the guard drop and clean up.
+                // request directory once it has built the disk.
                 if let Some(staged) = staged.as_mut() {
                     staged.disarm();
                 }
-                self.sandbox_watch_bus.notify(sandbox.object_id());
-                if let Some(metadata) = sandbox.metadata.as_mut() {
-                    metadata.resource_version = result.resource_version;
+                let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+                if self.supports_sandbox_authentication() && runtime_identity.is_empty() {
+                    let status =
+                        Status::internal("compute driver did not return a runtime identity");
+                    return Err(self
+                        .compensate_failed_create(
+                            &sandbox_id,
+                            sandbox.object_name(),
+                            lifecycle_guard,
+                            global_guard,
+                            status,
+                        )
+                        .await);
                 }
+                if self.supports_sandbox_authentication() {
+                    let driver_name = self.configured_driver_name().to_string();
+                    let persisted = self
+                        .store
+                        .update_message_cas::<Sandbox, _>(&sandbox_id, 0, move |sandbox| {
+                            if let Some(metadata) = sandbox.metadata.as_mut() {
+                                metadata.annotations.insert(
+                                    COMPUTE_DRIVER_ANNOTATION.to_string(),
+                                    driver_name.clone(),
+                                );
+                                metadata.annotations.insert(
+                                    COMPUTE_RUNTIME_IDENTITY_ANNOTATION.to_string(),
+                                    runtime_identity.clone(),
+                                );
+                            }
+                        })
+                        .await;
+                    sandbox = match persisted {
+                        Ok(sandbox) => sandbox,
+                        Err(error) => {
+                            let status = Status::internal(format!(
+                                "persist compute runtime identity failed: {error}"
+                            ));
+                            return Err(self
+                                .compensate_failed_create(
+                                    &sandbox_id,
+                                    sandbox.object_name(),
+                                    lifecycle_guard,
+                                    global_guard,
+                                    status,
+                                )
+                                .await);
+                        }
+                    };
+                }
+                self.sandbox_index.update_from_sandbox(&sandbox);
+                self.sandbox_watch_bus.notify(sandbox.object_id());
                 Ok(sandbox)
             }
             Err(status) if status.code() == Code::AlreadyExists => {
@@ -1024,6 +1118,122 @@ impl ComputeRuntime {
                 )))
             }
         }
+    }
+
+    async fn compensate_failed_create(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        lifecycle_guard: SandboxLifecycleGuard,
+        global_guard: tokio::sync::OwnedMutexGuard<()>,
+        original: Status,
+    ) -> Status {
+        let transition = match self
+            .begin_sandbox_delete_with_initial_snapshot(sandbox_id, None)
+            .await
+        {
+            Ok(BeginDelete::Started(transition)) => *transition,
+            Ok(BeginDelete::AlreadyDeleting) => {
+                return Status::new(
+                    original.code(),
+                    format!(
+                        "{}; cleanup after successful create was already claimed",
+                        original.message()
+                    ),
+                );
+            }
+            Err(error) => {
+                drop(global_guard);
+                let delete_result = self
+                    .delete_backend_after_failed_create(sandbox_id, sandbox_name)
+                    .await;
+                let cleanup_detail = match delete_result {
+                    Ok(_) => String::new(),
+                    Err(delete_error) => format!(
+                        "; best-effort backend cleanup also failed: {}",
+                        delete_error.message()
+                    ),
+                };
+                return Status::new(
+                    original.code(),
+                    format!(
+                        "{}; cleanup after successful create could not claim the sandbox record: {}{}",
+                        original.message(),
+                        error.message(),
+                        cleanup_detail
+                    ),
+                );
+            }
+        };
+        self.sandbox_index.update_from_sandbox(&transition.deleting);
+        self.sandbox_watch_bus.notify(sandbox_id);
+        drop(global_guard);
+
+        let delete_result = self
+            .delete_backend_after_failed_create(sandbox_id, sandbox_name)
+            .await;
+        match delete_result {
+            Ok(deleted) => {
+                if deleted {
+                    // The driver accepted an asynchronous deletion. Keep the
+                    // durable Deleting record until the watch path confirms
+                    // that the backend is absent, matching ordinary delete
+                    // semantics.
+                    original
+                } else if self
+                    .remove_deleting_sandbox_record(&lifecycle_guard, sandbox_id)
+                    .await
+                {
+                    original
+                } else {
+                    Status::new(
+                        original.code(),
+                        format!(
+                            "{}; cleanup after successful create lost ownership of the sandbox record",
+                            original.message()
+                        ),
+                    )
+                }
+            }
+            Err(error) => {
+                self.recover_failed_delete(&lifecycle_guard, &transition)
+                    .await;
+                Status::new(
+                    original.code(),
+                    format!(
+                        "{}; cleanup after successful create failed: {}",
+                        original.message(),
+                        error.message()
+                    ),
+                )
+            }
+        }
+    }
+
+    async fn delete_backend_after_failed_create(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+    ) -> Result<bool, Status> {
+        self.driver
+            .call(
+                openshell_otel::rpc::DELETE_SANDBOX,
+                Some(sandbox_id),
+                |driver| {
+                    let sandbox_id = sandbox_id.to_string();
+                    let sandbox_name = sandbox_name.to_string();
+                    async move {
+                        driver
+                            .delete_sandbox(Request::new(DeleteSandboxRequest {
+                                sandbox_id,
+                                name: sandbox_name,
+                            }))
+                            .await
+                    }
+                },
+            )
+            .await
+            .map(|response| response.into_inner().deleted)
     }
 
     pub(crate) async fn stop_sandbox(
@@ -1414,6 +1624,7 @@ impl ComputeRuntime {
         let generation_id = sandbox_runtime_generation(&starting)
             .map_err(Status::failed_precondition)?
             .into_string();
+        let expected_runtime_identity = sandbox_compute_runtime_identity(&previous);
         let authentication_for_recreate = launch_authentication.clone();
         let mut result = self
             .await_provisioning_operation(
@@ -1431,6 +1642,7 @@ impl ComputeRuntime {
                                     name: sandbox_name,
                                     launch_authentication,
                                     generation_id,
+                                    expected_runtime_identity,
                                 }))
                                 .await
                         }
@@ -1461,9 +1673,13 @@ impl ComputeRuntime {
                                     sandbox: Some(driver_sandbox),
                                 }))
                                 .await
-                                .map(|_| {
+                                .map(|response| {
                                     tonic::Response::new(
-                                        openshell_core::proto::compute::v1::StartSandboxResponse {},
+                                        openshell_core::proto::compute::v1::StartSandboxResponse {
+                                            runtime_identity: response
+                                                .into_inner()
+                                                .runtime_identity,
+                                        },
                                     )
                                 })
                         },
@@ -1473,14 +1689,57 @@ impl ComputeRuntime {
         }
 
         match result {
-            Ok(_) => {
-                let _global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
-                let latest = self
-                    .store
-                    .get_message::<Sandbox>(&sandbox_id)
-                    .await
-                    .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-                    .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            Ok(response) => {
+                let runtime_identity = response.into_inner().runtime_identity;
+                if self.supports_sandbox_authentication() && runtime_identity.is_empty() {
+                    let status =
+                        Status::internal("compute driver did not return a runtime identity");
+                    return Err(self
+                        .compensate_successful_start(&lifecycle_guard, &starting, &previous, status)
+                        .await);
+                }
+                let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+                let latest = if self.supports_sandbox_authentication() {
+                    let driver_name = self.configured_driver_name().to_string();
+                    let persisted = self
+                        .persist_start_runtime_binding(
+                            &sandbox_id,
+                            &starting,
+                            &driver_name,
+                            &runtime_identity,
+                            &[
+                                SandboxPhase::Starting,
+                                SandboxPhase::Provisioning,
+                                SandboxPhase::Ready,
+                            ],
+                        )
+                        .await;
+                    match persisted {
+                        Ok(sandbox) => sandbox,
+                        Err(error) => {
+                            drop(global_guard);
+                            let status = Status::internal(format!(
+                                "persist compute runtime identity failed: {error}"
+                            ));
+                            return Err(self
+                                .compensate_successful_start(
+                                    &lifecycle_guard,
+                                    &starting,
+                                    &previous,
+                                    status,
+                                )
+                                .await);
+                        }
+                    }
+                } else {
+                    self.store
+                        .get_message::<Sandbox>(&sandbox_id)
+                        .await
+                        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                        .ok_or_else(|| Status::not_found("sandbox not found"))?
+                };
+                self.sandbox_index.update_from_sandbox(&latest);
+                self.sandbox_watch_bus.notify(&sandbox_id);
                 Ok(latest)
             }
             Err(err) => {
@@ -1491,6 +1750,128 @@ impl ComputeRuntime {
                     format!("start sandbox failed: {}", err.message()),
                 ))
             }
+        }
+    }
+
+    async fn persist_start_runtime_binding(
+        &self,
+        sandbox_id: &str,
+        starting: &Sandbox,
+        driver_name: &str,
+        runtime_identity: &str,
+        allowed_phases: &[SandboxPhase],
+    ) -> Result<Sandbox, String> {
+        let expected_generation = sandbox_runtime_generation(starting)?;
+        let mut expected_resource_version = sandbox_resource_version(starting);
+
+        for attempt in 1..=START_PHASE_CAS_RETRY_LIMIT {
+            let driver_name = driver_name.to_string();
+            let runtime_identity = runtime_identity.to_string();
+            match self
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    sandbox_id,
+                    expected_resource_version,
+                    move |sandbox| {
+                        if let Some(metadata) = sandbox.metadata.as_mut() {
+                            metadata
+                                .annotations
+                                .insert(COMPUTE_DRIVER_ANNOTATION.to_string(), driver_name.clone());
+                            metadata.annotations.insert(
+                                COMPUTE_RUNTIME_IDENTITY_ANNOTATION.to_string(),
+                                runtime_identity.clone(),
+                            );
+                        }
+                    },
+                )
+                .await
+            {
+                Ok(sandbox) => return Ok(sandbox),
+                Err(crate::persistence::PersistenceError::Conflict { .. })
+                    if attempt < START_PHASE_CAS_RETRY_LIMIT =>
+                {
+                    let current = self
+                        .store
+                        .get_message::<Sandbox>(sandbox_id)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| {
+                            "sandbox was removed while persisting runtime identity".to_string()
+                        })?;
+                    let current_generation = sandbox_runtime_generation(&current)?;
+                    let phase =
+                        SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
+                    if current_generation != expected_generation || !allowed_phases.contains(&phase)
+                    {
+                        return Err(format!(
+                            "sandbox changed lifecycle ownership while persisting runtime identity (phase: {phase:?})"
+                        ));
+                    }
+                    expected_resource_version = sandbox_resource_version(&current);
+                    debug!(
+                        sandbox_id,
+                        attempt,
+                        expected_resource_version,
+                        "Retrying runtime identity persistence after concurrent start progress"
+                    );
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+
+        unreachable!("runtime identity persistence retry loop always returns")
+    }
+
+    async fn compensate_successful_start(
+        &self,
+        lifecycle_guard: &SandboxLifecycleGuard,
+        starting: &Sandbox,
+        previous: &Sandbox,
+        original: Status,
+    ) -> Status {
+        let sandbox_id = starting.object_id();
+        let sandbox_name = starting.object_name();
+        let stop_result = self
+            .driver
+            .call(
+                openshell_otel::rpc::STOP_SANDBOX,
+                Some(sandbox_id),
+                |driver| {
+                    let sandbox_id = sandbox_id.to_string();
+                    let sandbox_name = sandbox_name.to_string();
+                    async move {
+                        driver
+                            .stop_sandbox(Request::new(StopSandboxRequest {
+                                sandbox_id,
+                                name: sandbox_name,
+                            }))
+                            .await
+                    }
+                },
+            )
+            .await;
+        if let Err(error) = stop_result {
+            return Status::new(
+                original.code(),
+                format!(
+                    "{}; rollback after successful start failed: {}",
+                    original.message(),
+                    error.message()
+                ),
+            );
+        }
+
+        let _global_guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
+        if self.restore_lifecycle_snapshot(starting, previous).await {
+            original
+        } else {
+            Status::new(
+                original.code(),
+                format!(
+                    "{}; rollback after successful start lost ownership of the sandbox record",
+                    original.message()
+                ),
+            )
         }
     }
 
@@ -1549,7 +1930,7 @@ impl ComputeRuntime {
                         );
                     }
                 } else {
-                    self.restore_lifecycle_snapshot(transition, previous).await;
+                    let _ = self.restore_lifecycle_snapshot(transition, previous).await;
                 }
             }
             Ok(Some(_) | None) | Err(_) => {
@@ -1630,7 +2011,7 @@ impl ComputeRuntime {
             .map_err(|e| crate::grpc::persistence_error_to_status(e, "update sandbox lifecycle"))
     }
 
-    async fn restore_lifecycle_snapshot(&self, owned: &Sandbox, previous: &Sandbox) {
+    async fn restore_lifecycle_snapshot(&self, owned: &Sandbox, previous: &Sandbox) -> bool {
         let sandbox_id = owned.object_id().to_string();
         let previous = previous.clone();
         match self
@@ -1645,9 +2026,11 @@ impl ComputeRuntime {
             Ok(restored) => {
                 self.sandbox_index.update_from_sandbox(&restored);
                 self.sandbox_watch_bus.notify(&sandbox_id);
+                true
             }
             Err(err) => {
                 debug!(sandbox_id, error = %err, "Skipped lifecycle rollback after concurrent change");
+                false
             }
         }
     }
@@ -2546,6 +2929,7 @@ impl ComputeRuntime {
                     continue;
                 }
             };
+            let expected_runtime_identity = sandbox_compute_runtime_identity(&sandbox);
             match self
                 .await_provisioning_operation(
                     &sandbox,
@@ -2556,6 +2940,7 @@ impl ComputeRuntime {
                             let sandbox_id = sandbox_id.clone();
                             let sandbox_name = sandbox_name.clone();
                             let launch_authentication = launch_authentication.clone();
+                            let expected_runtime_identity = expected_runtime_identity.clone();
                             async move {
                                 driver
                                     .start_sandbox(Request::new(StartSandboxRequest {
@@ -2563,6 +2948,7 @@ impl ComputeRuntime {
                                         name: sandbox_name,
                                         launch_authentication,
                                         generation_id,
+                                        expected_runtime_identity,
                                     }))
                                     .await
                             }
@@ -2571,7 +2957,49 @@ impl ComputeRuntime {
                 )
                 .await
             {
-                Ok(_) => {
+                Ok(response) => {
+                    let mut recovered_sandbox = sandbox.clone();
+                    if self.supports_sandbox_authentication() {
+                        let runtime_identity = response.into_inner().runtime_identity;
+                        if runtime_identity.is_empty() {
+                            warn!(
+                                sandbox_id = %sandbox.object_id(),
+                                "Compute driver returned an empty runtime identity during startup recovery"
+                            );
+                            authentication_failed(sandbox.object_id());
+                            failed += 1;
+                            continue;
+                        }
+                        match self
+                            .persist_start_runtime_binding(
+                                &sandbox_id,
+                                &sandbox,
+                                self.configured_driver_name(),
+                                &runtime_identity,
+                                &[
+                                    SandboxPhase::Starting,
+                                    SandboxPhase::Provisioning,
+                                    SandboxPhase::Ready,
+                                    SandboxPhase::Error,
+                                    SandboxPhase::Unspecified,
+                                    SandboxPhase::Unknown,
+                                ],
+                            )
+                            .await
+                        {
+                            Ok(updated) => recovered_sandbox = updated,
+                            Err(error) => {
+                                warn!(
+                                    sandbox_id = %sandbox.object_id(),
+                                    %error,
+                                    "Failed to persist runtime identity during startup recovery"
+                                );
+                                authentication_failed(sandbox.object_id());
+                                failed += 1;
+                                continue;
+                            }
+                        }
+                    }
                     if let Err(err) = authentication_committed(sandbox.object_id()).await {
                         warn!(
                             sandbox_id = %sandbox.object_id(),
@@ -2580,7 +3008,7 @@ impl ComputeRuntime {
                         );
                     }
                     let did_recover = if recoverable_error {
-                        self.clear_recoverable_error(&sandbox).await
+                        self.clear_recoverable_error(&recovered_sandbox).await
                     } else {
                         false
                     };
@@ -2742,6 +3170,7 @@ impl ComputeRuntime {
                             continue;
                         }
                     };
+                    let expected_runtime_identity = sandbox_compute_runtime_identity(&sandbox);
                     if let Err(err) = self
                         .driver
                         .call(
@@ -2754,6 +3183,7 @@ impl ComputeRuntime {
                                         name: sandbox_name,
                                         launch_authentication: Vec::new(),
                                         generation_id,
+                                        expected_runtime_identity,
                                     }))
                                     .await
                             },
@@ -4711,6 +5141,19 @@ fn sandbox_resource_version(sandbox: &Sandbox) -> u64 {
         .map_or(0, |metadata| metadata.resource_version)
 }
 
+fn sandbox_compute_runtime_identity(sandbox: &Sandbox) -> String {
+    sandbox
+        .metadata
+        .as_ref()
+        .and_then(|metadata| {
+            metadata
+                .annotations
+                .get(COMPUTE_RUNTIME_IDENTITY_ANNOTATION)
+        })
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn sandbox_runtime_generation(
     sandbox: &Sandbox,
 ) -> Result<openshell_core::sandbox_generation::SandboxGenerationId, String> {
@@ -5355,7 +5798,7 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
 #[derive(Debug)]
 pub struct NoopTestDriver {
     workspace_delete_failures: std::sync::atomic::AtomicUsize,
-    sandbox_authentication: Option<Result<String, (Code, String)>>,
+    sandbox_authentication: Option<Result<(String, String), (Code, String)>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -5372,7 +5815,18 @@ impl NoopTestDriver {
     pub fn authenticating_sandbox(sandbox_id: impl Into<String>) -> Self {
         Self {
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
-            sandbox_authentication: Some(Ok(sandbox_id.into())),
+            sandbox_authentication: Some(Ok((sandbox_id.into(), "test-runtime".to_string()))),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn authenticating_sandbox_with_runtime(
+        sandbox_id: impl Into<String>,
+        runtime_identity: impl Into<String>,
+    ) -> Self {
+        Self {
+            workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
+            sandbox_authentication: Some(Ok((sandbox_id.into(), runtime_identity.into()))),
         }
     }
 
@@ -5406,9 +5860,10 @@ impl ComputeDriver for NoopTestDriver {
         Status,
     > {
         match &self.sandbox_authentication {
-            Some(Ok(sandbox_id)) => Ok(tonic::Response::new(
+            Some(Ok((sandbox_id, runtime_identity))) => Ok(tonic::Response::new(
                 openshell_core::proto::compute::v1::AuthenticateSandboxResponse {
                     sandbox_id: sandbox_id.clone(),
+                    runtime_identity: runtime_identity.clone(),
                 },
             )),
             Some(Err((code, message))) => Err(Status::new(*code, message.clone())),
@@ -5484,7 +5939,15 @@ impl ComputeDriver for NoopTestDriver {
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::CreateSandboxResponse>, Status>
     {
         Ok(tonic::Response::new(
-            openshell_core::proto::compute::v1::CreateSandboxResponse {},
+            openshell_core::proto::compute::v1::CreateSandboxResponse {
+                runtime_identity: self
+                    .sandbox_authentication
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .map_or_else(String::new, |(_, runtime_identity)| {
+                        runtime_identity.clone()
+                    }),
+            },
         ))
     }
 
@@ -5504,7 +5967,15 @@ impl ComputeDriver for NoopTestDriver {
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::StartSandboxResponse>, Status>
     {
         Ok(tonic::Response::new(
-            openshell_core::proto::compute::v1::StartSandboxResponse {},
+            openshell_core::proto::compute::v1::StartSandboxResponse {
+                runtime_identity: self
+                    .sandbox_authentication
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .map_or_else(String::new, |(_, runtime_identity)| {
+                        runtime_identity.clone()
+                    }),
+            },
         ))
     }
 
@@ -6077,7 +6548,7 @@ mod tests {
             &self,
             _request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
-            Ok(tonic::Response::new(CreateSandboxResponse {}))
+            Ok(tonic::Response::new(CreateSandboxResponse::default()))
         }
 
         async fn stop_sandbox(
@@ -6091,7 +6562,7 @@ mod tests {
             &self,
             _request: Request<StartSandboxRequest>,
         ) -> Result<tonic::Response<StartSandboxResponse>, Status> {
-            Ok(tonic::Response::new(StartSandboxResponse {}))
+            Ok(tonic::Response::new(StartSandboxResponse::default()))
         }
 
         async fn delete_sandbox(
@@ -6173,6 +6644,9 @@ mod tests {
         delete_calls: AtomicUsize,
         delete_requests: TestMutex<Vec<(String, String)>>,
         delete_outcome: TestMutex<ControlledDeleteOutcome>,
+        create_started: Notify,
+        create_release: Semaphore,
+        create_blocked: AtomicBool,
         stop_started: Notify,
         stop_finished: Notify,
         stop_release: Semaphore,
@@ -6187,7 +6661,9 @@ mod tests {
         start_calls: AtomicUsize,
         start_requests: TestMutex<Vec<(String, String)>>,
         start_authentications: TestMutex<Vec<Vec<u8>>>,
+        start_expected_runtime_identities: TestMutex<Vec<String>>,
         start_outcome: TestMutex<ControlledLifecycleOutcome>,
+        runtime_identity: TestMutex<String>,
         get_started: Notify,
         get_release: Semaphore,
         get_blocked: AtomicBool,
@@ -6207,6 +6683,9 @@ mod tests {
                 delete_calls: AtomicUsize::new(0),
                 delete_requests: TestMutex::new(Vec::new()),
                 delete_outcome: TestMutex::new(ControlledDeleteOutcome::Ok(true)),
+                create_started: Notify::new(),
+                create_release: Semaphore::new(0),
+                create_blocked: AtomicBool::new(false),
                 stop_started: Notify::new(),
                 stop_finished: Notify::new(),
                 stop_release: Semaphore::new(0),
@@ -6221,7 +6700,9 @@ mod tests {
                 start_calls: AtomicUsize::new(0),
                 start_requests: TestMutex::new(Vec::new()),
                 start_authentications: TestMutex::new(Vec::new()),
+                start_expected_runtime_identities: TestMutex::new(Vec::new()),
                 start_outcome: TestMutex::new(ControlledLifecycleOutcome::Ok),
+                runtime_identity: TestMutex::new(String::new()),
                 get_started: Notify::new(),
                 get_release: Semaphore::new(0),
                 get_blocked: AtomicBool::new(false),
@@ -6231,6 +6712,14 @@ mod tests {
 
         fn block_delete(&self) {
             self.delete_blocked.store(true, Ordering::SeqCst);
+        }
+
+        fn block_create(&self) {
+            self.create_blocked.store(true, Ordering::SeqCst);
+        }
+
+        fn release_create(&self) {
+            self.create_release.add_permits(1);
         }
 
         fn release_delete(&self) {
@@ -6282,6 +6771,13 @@ mod tests {
                 .expect("start outcome lock poisoned") = outcome;
         }
 
+        fn set_runtime_identity(&self, runtime_identity: impl Into<String>) {
+            *self
+                .runtime_identity
+                .lock()
+                .expect("runtime identity lock poisoned") = runtime_identity.into();
+        }
+
         fn set_get_outcome(&self, outcome: ControlledGetOutcome) {
             *self.get_outcome.lock().expect("get outcome lock poisoned") = outcome;
         }
@@ -6323,6 +6819,13 @@ mod tests {
             self.start_authentications
                 .lock()
                 .expect("start authentications lock poisoned")
+                .clone()
+        }
+
+        fn start_expected_runtime_identities(&self) -> Vec<String> {
+            self.start_expected_runtime_identities
+                .lock()
+                .expect("start expected runtime identities lock poisoned")
                 .clone()
         }
 
@@ -6425,7 +6928,21 @@ mod tests {
             &self,
             _request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
-            Ok(tonic::Response::new(CreateSandboxResponse {}))
+            self.create_started.notify_one();
+            if self.create_blocked.load(Ordering::SeqCst) {
+                self.create_release
+                    .acquire()
+                    .await
+                    .expect("create release semaphore closed")
+                    .forget();
+            }
+            Ok(tonic::Response::new(CreateSandboxResponse {
+                runtime_identity: self
+                    .runtime_identity
+                    .lock()
+                    .expect("runtime identity lock poisoned")
+                    .clone(),
+            }))
         }
 
         async fn stop_sandbox(
@@ -6472,6 +6989,10 @@ mod tests {
                 .lock()
                 .expect("start authentications lock poisoned")
                 .push(request.launch_authentication);
+            self.start_expected_runtime_identities
+                .lock()
+                .expect("start expected runtime identities lock poisoned")
+                .push(request.expected_runtime_identity);
             self.start_calls.fetch_add(1, Ordering::SeqCst);
             self.start_started.notify_one();
             if self.start_blocked.load(Ordering::SeqCst) {
@@ -6488,7 +7009,13 @@ mod tests {
                 .expect("start outcome lock poisoned")
                 .clone();
             match outcome {
-                ControlledLifecycleOutcome::Ok => Ok(tonic::Response::new(StartSandboxResponse {})),
+                ControlledLifecycleOutcome::Ok => Ok(tonic::Response::new(StartSandboxResponse {
+                    runtime_identity: self
+                        .runtime_identity
+                        .lock()
+                        .expect("runtime identity lock poisoned")
+                        .clone(),
+                })),
                 ControlledLifecycleOutcome::NotFound => Err(Status::not_found("sandbox not found")),
                 ControlledLifecycleOutcome::Error(message) => Err(Status::internal(message)),
             }
@@ -6601,6 +7128,467 @@ mod tests {
         let mut runtime = test_runtime_for_driver(driver, driver_name).await;
         runtime.driver_info.gateway_manages_lifecycle = true;
         runtime
+    }
+
+    fn enable_runtime_identity_binding(runtime: &mut ComputeRuntime) {
+        runtime.driver_info.supports_sandbox_authentication = true;
+    }
+
+    fn set_compute_runtime_binding(sandbox: &mut Sandbox, identity: &str) {
+        let annotations = &mut sandbox
+            .metadata
+            .as_mut()
+            .expect("sandbox metadata")
+            .annotations;
+        annotations.insert(
+            COMPUTE_DRIVER_ANNOTATION.to_string(),
+            "test-driver".to_string(),
+        );
+        annotations.insert(
+            COMPUTE_RUNTIME_IDENTITY_ANNOTATION.to_string(),
+            identity.to_string(),
+        );
+    }
+
+    async fn runtime_with_binding_store_failure(
+        driver: Arc<ControlledDriver>,
+    ) -> (tempfile::TempDir, ComputeRuntime) {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database_url = format!("sqlite://{}", directory.path().join("gateway.db").display());
+        let store = Arc::new(Store::connect(&database_url).await.expect("connect store"));
+        let pool = sqlx::SqlitePool::connect(&database_url)
+            .await
+            .expect("connect failure injector");
+        sqlx::query(
+            "CREATE TRIGGER reject_test_runtime_identity \
+             BEFORE UPDATE OF payload ON objects \
+             WHEN instr(NEW.payload, CAST('new-runtime-identity' AS BLOB)) > 0 \
+             BEGIN SELECT RAISE(ABORT, 'injected runtime identity persistence failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("install persistence failure trigger");
+        pool.close().await;
+
+        let mut runtime = test_runtime(driver).await;
+        runtime.store = store;
+        enable_runtime_identity_binding(&mut runtime);
+        (directory, runtime)
+    }
+
+    #[tokio::test]
+    async fn empty_create_runtime_identity_deletes_backend_and_record() {
+        let driver = ControlledDriver::new();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Ok(false));
+        let mut runtime = test_runtime(driver.clone()).await;
+        enable_runtime_identity_binding(&mut runtime);
+        let sandbox = sandbox_record(
+            "sb-create-empty-identity",
+            "create-empty-identity",
+            SandboxPhase::Provisioning,
+        );
+
+        let error = runtime
+            .create_sandbox(sandbox.clone(), None, false)
+            .await
+            .expect_err("empty identity must fail create");
+
+        assert!(
+            error
+                .message()
+                .contains("did not return a runtime identity")
+        );
+        assert_eq!(driver.delete_calls(), 1);
+        assert_eq!(
+            driver.delete_requests(),
+            vec![(
+                sandbox.object_id().to_string(),
+                sandbox.object_name().to_string()
+            )]
+        );
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_compensation_retains_deleting_record_while_backend_delete_is_pending() {
+        let driver = ControlledDriver::new();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Ok(true));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+            ready_driver_sandbox("sb-create-delete-pending", "create-delete-pending"),
+        )));
+        let mut runtime = test_runtime(driver.clone()).await;
+        enable_runtime_identity_binding(&mut runtime);
+        let sandbox = sandbox_record(
+            "sb-create-delete-pending",
+            "create-delete-pending",
+            SandboxPhase::Provisioning,
+        );
+
+        runtime
+            .create_sandbox(sandbox.clone(), None, false)
+            .await
+            .expect_err("empty identity must fail create");
+
+        assert_eq!(driver.delete_calls(), 1);
+        let retained = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .expect("pending backend deletion must retain the durable record");
+        assert_eq!(retained.phase(), SandboxPhase::Deleting as i32);
+    }
+
+    #[tokio::test]
+    async fn create_binding_store_failure_deletes_backend_and_record() {
+        let driver = ControlledDriver::new();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Ok(false));
+        driver.set_runtime_identity("new-runtime-identity");
+        let (_directory, runtime) = runtime_with_binding_store_failure(driver.clone()).await;
+        let sandbox = sandbox_record(
+            "sb-create-store-failure",
+            "create-store-failure",
+            SandboxPhase::Provisioning,
+        );
+
+        let error = runtime
+            .create_sandbox(sandbox.clone(), None, false)
+            .await
+            .expect_err("binding persistence failure must fail create");
+
+        assert!(
+            error
+                .message()
+                .contains("persist compute runtime identity failed")
+        );
+        assert_eq!(driver.delete_calls(), 1);
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_compensation_deletes_backend_when_delete_transition_cannot_be_stored() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database_url = format!("sqlite://{}", directory.path().join("gateway.db").display());
+        let store = Arc::new(Store::connect(&database_url).await.expect("connect store"));
+        let pool = sqlx::SqlitePool::connect(&database_url)
+            .await
+            .expect("connect failure injector");
+        sqlx::query(
+            "CREATE TRIGGER reject_test_payload_updates \
+             BEFORE UPDATE OF payload ON objects \
+             BEGIN SELECT RAISE(ABORT, 'injected payload persistence failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("install persistence failure trigger");
+        pool.close().await;
+
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity("new-runtime-identity");
+        let mut runtime = test_runtime(driver.clone()).await;
+        runtime.store = store;
+        enable_runtime_identity_binding(&mut runtime);
+        let sandbox = sandbox_record(
+            "sb-create-transition-failure",
+            "create-transition-failure",
+            SandboxPhase::Provisioning,
+        );
+
+        let error = runtime
+            .create_sandbox(sandbox.clone(), None, false)
+            .await
+            .expect_err("binding and delete-transition persistence failures must fail create");
+
+        assert!(
+            error
+                .message()
+                .contains("persist compute runtime identity failed")
+        );
+        assert!(
+            error
+                .message()
+                .contains("could not claim the sandbox record")
+        );
+        assert_eq!(driver.delete_calls(), 1);
+        assert_eq!(
+            driver.delete_requests(),
+            vec![(
+                sandbox.object_id().to_string(),
+                sandbox.object_name().to_string()
+            )]
+        );
+        let retained = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .expect("failed durable transition must retain the original record");
+        assert_eq!(retained.phase(), SandboxPhase::Provisioning as i32);
+    }
+
+    #[tokio::test]
+    async fn create_merges_runtime_binding_after_watch_update() {
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity("new-runtime-identity");
+        driver.block_create();
+        let mut runtime = test_runtime(driver.clone()).await;
+        enable_runtime_identity_binding(&mut runtime);
+        let sandbox = sandbox_record(
+            "sb-create-watch-race",
+            "create-watch-race",
+            SandboxPhase::Provisioning,
+        );
+
+        let create_runtime = runtime.clone();
+        let create_sandbox = sandbox.clone();
+        let create = tokio::spawn(async move {
+            create_runtime
+                .create_sandbox(create_sandbox, None, false)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), driver.create_started.notified())
+            .await
+            .expect("create did not reach the driver");
+
+        let update_runtime = runtime.clone();
+        let update = tokio::spawn(async move {
+            update_runtime
+                .apply_sandbox_update(ready_driver_sandbox(
+                    "sb-create-watch-race",
+                    "create-watch-race",
+                ))
+                .await
+        });
+        update.await.unwrap().unwrap();
+
+        driver.release_create();
+        create.await.unwrap().unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.metadata.unwrap().annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+            "new-runtime-identity"
+        );
+        assert_eq!(driver.delete_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_start_runtime_identity_stops_backend_and_restores_record() {
+        let driver = ControlledDriver::new();
+        let mut runtime = test_runtime(driver.clone()).await;
+        enable_runtime_identity_binding(&mut runtime);
+        let mut sandbox = sandbox_record(
+            "sb-start-empty-identity",
+            "start-empty-identity",
+            SandboxPhase::Stopped,
+        );
+        set_compute_runtime_binding(&mut sandbox, "previous-runtime-identity");
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let error = runtime
+            .start_sandbox("default", sandbox.object_name())
+            .await
+            .expect_err("empty identity must fail start");
+
+        assert!(
+            error
+                .message()
+                .contains("did not return a runtime identity")
+        );
+        assert_eq!(driver.start_calls(), 1);
+        assert_eq!(driver.stop_calls(), 1);
+        let restored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.phase(), SandboxPhase::Stopped as i32);
+        assert_eq!(
+            restored.metadata.unwrap().annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+            "previous-runtime-identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_binding_store_failure_stops_backend_and_restores_record() {
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity("new-runtime-identity");
+        let (_directory, runtime) = runtime_with_binding_store_failure(driver.clone()).await;
+        let mut sandbox = sandbox_record(
+            "sb-start-store-failure",
+            "start-store-failure",
+            SandboxPhase::Stopped,
+        );
+        set_compute_runtime_binding(&mut sandbox, "previous-runtime-identity");
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let error = runtime
+            .start_sandbox("default", sandbox.object_name())
+            .await
+            .expect_err("binding persistence failure must fail start");
+
+        assert!(
+            error
+                .message()
+                .contains("persist compute runtime identity failed")
+        );
+        assert_eq!(driver.start_calls(), 1);
+        assert_eq!(driver.stop_calls(), 1);
+        let restored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.phase(), SandboxPhase::Stopped as i32);
+        assert_eq!(
+            restored.metadata.unwrap().annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+            "previous-runtime-identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_merges_runtime_binding_after_supervisor_connects() {
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity("new-runtime-identity");
+        driver.block_start();
+        let mut runtime = test_runtime(driver.clone()).await;
+        enable_runtime_identity_binding(&mut runtime);
+        let mut sandbox = sandbox_record(
+            "sb-start-supervisor-race",
+            "start-supervisor-race",
+            SandboxPhase::Stopped,
+        );
+        set_compute_runtime_binding(&mut sandbox, "previous-runtime-identity");
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let start_runtime = runtime.clone();
+        let sandbox_name = sandbox.object_name().to_string();
+        let start =
+            tokio::spawn(
+                async move { start_runtime.start_sandbox("default", &sandbox_name).await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
+            .await
+            .expect("start did not reach the driver");
+
+        runtime
+            .supervisor_session_connected(sandbox.object_id(), "replacement-instance")
+            .await
+            .expect("replacement supervisor must connect while start is in flight");
+        driver.release_start();
+
+        let started = start
+            .await
+            .expect("start task must finish")
+            .expect("start must merge its binding with supervisor readiness");
+        assert_eq!(
+            started.metadata.as_ref().unwrap().annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+            "new-runtime-identity"
+        );
+        assert_eq!(
+            started.status.as_ref().unwrap().main_process_instance_id,
+            "replacement-instance"
+        );
+        assert_eq!(driver.stop_calls(), 0);
+        assert_eq!(
+            driver.start_expected_runtime_identities(),
+            vec!["previous-runtime-identity".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn start_does_not_bind_runtime_identity_after_generation_changes() {
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity("new-runtime-identity");
+        driver.block_start();
+        let mut runtime = test_runtime(driver.clone()).await;
+        enable_runtime_identity_binding(&mut runtime);
+        let mut sandbox = sandbox_record(
+            "sb-start-generation-race",
+            "start-generation-race",
+            SandboxPhase::Stopped,
+        );
+        set_compute_runtime_binding(&mut sandbox, "previous-runtime-identity");
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let start_runtime = runtime.clone();
+        let sandbox_name = sandbox.object_name().to_string();
+        let start =
+            tokio::spawn(
+                async move { start_runtime.start_sandbox("default", &sandbox_name).await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
+            .await
+            .expect("start did not reach the driver");
+
+        let starting = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .expect("starting record must exist");
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>(
+                sandbox.object_id(),
+                sandbox_resource_version(&starting),
+                |sandbox| {
+                    sandbox.metadata.as_mut().unwrap().annotations.insert(
+                        crate::auth::sandbox_session::RUNTIME_GENERATION_ANNOTATION.to_string(),
+                        "replacement-generation".to_string(),
+                    );
+                },
+            )
+            .await
+            .expect("replace runtime generation while start is in flight");
+        driver.release_start();
+
+        let error = start
+            .await
+            .expect("start task must finish")
+            .expect_err("a replaced generation must reject the prior runtime binding");
+        assert!(
+            error
+                .message()
+                .contains("changed lifecycle ownership while persisting runtime identity")
+        );
+        assert_eq!(driver.stop_calls(), 1);
+        let retained = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .expect("replacement record must be retained");
+        assert_eq!(
+            retained.metadata.as_ref().unwrap().annotations
+                [crate::auth::sandbox_session::RUNTIME_GENERATION_ANNOTATION],
+            "replacement-generation"
+        );
+        assert_eq!(
+            retained.metadata.as_ref().unwrap().annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+            "previous-runtime-identity"
+        );
     }
 
     fn register_test_supervisor_session(runtime: &ComputeRuntime, sandbox_id: &str) {
@@ -11791,6 +12779,42 @@ mod tests {
         assert_eq!(
             driver.start_authentications(),
             vec![b"authentication:sb-1".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn start_persisted_sandboxes_preserves_and_updates_runtime_binding() {
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity("new-runtime-identity");
+        let mut runtime =
+            test_runtime_with_gateway_managed_lifecycle(driver.clone(), "arbitrary").await;
+        enable_runtime_identity_binding(&mut runtime);
+        let mut sandbox = sandbox_record("sb-1", "sandbox", SandboxPhase::Ready);
+        set_compute_runtime_binding(&mut sandbox, "previous-runtime-identity");
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .start_persisted_sandboxes_with_authentication(
+                |_| async { Ok(b"authentication".to_vec()) },
+                |_| async { Ok(()) },
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            driver.start_expected_runtime_identities(),
+            vec!["previous-runtime-identity".to_string()]
+        );
+        let restored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .expect("sandbox must remain persisted");
+        assert_eq!(
+            restored.metadata.unwrap().annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+            "new-runtime-identity"
         );
     }
 

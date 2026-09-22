@@ -150,7 +150,7 @@ impl ComputeDriver for ComputeDriverService {
                 Box::pin(self.driver.create_sandbox(&sandbox))
                     .await
                     .map_err(Status::from)?;
-                Ok(Response::new(CreateSandboxResponse {}))
+                Ok(Response::new(CreateSandboxResponse::default()))
             })
             .await
     }
@@ -192,7 +192,7 @@ impl ComputeDriver for ComputeDriverService {
                     )
                     .await
                     .map_err(Status::from)?;
-                Ok(Response::new(StartSandboxResponse {}))
+                Ok(Response::new(StartSandboxResponse::default()))
             })
             .await
     }
