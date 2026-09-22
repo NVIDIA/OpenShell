@@ -293,6 +293,34 @@ Common findings:
 - The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. A runtime may return `ENOSYS` for `process_vm_readv` and `process_vm_writev` while satisfying the production parent-to-workload-child task-memory probe through `/proc/<pid>/mem`; only failure of both backends is fatal. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
 - A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
 
+#### Corporate upstream proxy
+
+Docker corporate proxy settings are operator-owned fields under
+`[openshell.drivers.docker]`. Confirm the complete proxy table and inspect the
+companion supervisor command and logs:
+
+```bash
+grep -A20 '^\[openshell.drivers.docker\]' <gateway.toml> | grep -E 'https_proxy|no_proxy|proxy_auth_file|proxy_auth_allow_insecure|proxy_connect_by_hostname|proxy_ca_bundle'
+docker ps --filter label=openshell.ai/isolation-role=supervisor
+docker inspect --format '{{json .Config.Cmd}} {{json .Mounts}}' <supervisor-container>
+docker logs <supervisor-container> --tail=200 | grep -Ei 'upstream|connect|proxy|certificate'
+```
+
+`proxy_ca_bundle` names a gateway-host PEM file and requires `https_proxy`.
+The proxy URL may use `http://` or `https://`; a plain HTTP proxy may still
+re-sign destination TLS. Missing, unreadable, empty, oversized, malformed, or
+certificate-free bundles fail closed. The Docker driver copies a validated
+bundle into its supervisor-only named volume and passes the fixed path
+`/.openshell/supervisor/upstream-proxy-ca-bundle.pem`. The gateway-host path
+must not appear in container arguments, mounts, workload environment, or
+`template.driver_config.docker`.
+
+An HTTPS proxy certificate error usually means the bundle lacks the proxy
+listener issuer or its certificate does not match the proxy hostname. A
+TLS-intercepted destination error means the re-signing issuer is missing or the
+supervisor did not receive the bundle. Keep verification enabled and correct
+the operator bundle.
+
 During a graceful gateway restart, Docker, Podman, and VM sandboxes with
 running intent should stop before the gateway exits and restart after it
 returns. Check for `Stopped sandbox during gateway shutdown` and `Started

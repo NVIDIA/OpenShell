@@ -20,6 +20,7 @@ use openshell_core::proto::compute::v1::{
     ResourceRequirements, WorkloadIdentityRequest,
 };
 use std::fs;
+use std::io::Read as _;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -197,9 +198,152 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
         enable_bind_mounts: false,
         upstream_proxy: UpstreamProxyConfig::default(),
+        proxy_ca_bundle: None,
         provider_spiffe_workload_api_socket: None,
         app_armor_profile: Some(AppArmorProfile::Unconfined),
     }
+}
+
+fn write_test_proxy_ca_bundle(directory: &TempDir) -> PathBuf {
+    let tls = generate_sandbox_tls_material(openshell_core::SandboxSessionId::new())
+        .expect("generate test proxy CA");
+    let path = directory.path().join("proxy-ca.pem");
+    fs::write(&path, tls.trust_anchor_pem).expect("write test proxy CA");
+    path
+}
+
+#[test]
+fn docker_config_parses_operator_proxy_ca_bundle() {
+    let config: DockerComputeConfig = toml::from_str(
+        r#"
+https_proxy = "https://proxy.corp.example:8443"
+proxy_ca_bundle = "/etc/openshell/tls/proxy-ca.pem"
+"#,
+    )
+    .expect("parse Docker proxy CA configuration");
+
+    assert_eq!(
+        config.proxy_ca_bundle,
+        Some(PathBuf::from("/etc/openshell/tls/proxy-ca.pem"))
+    );
+}
+
+#[test]
+fn docker_proxy_ca_bundle_validation_is_fail_closed() {
+    let directory = TempDir::new().expect("create CA directory");
+    let ca_bundle = write_test_proxy_ca_bundle(&directory);
+    let gateway_bind_address = "127.0.0.1:17670".parse().unwrap();
+
+    let mut valid = DockerComputeConfig::default();
+    valid.upstream_proxy.https_proxy = Some("http://proxy.corp.example:8080".to_string());
+    valid.proxy_ca_bundle = Some(ca_bundle);
+    valid
+        .validate_configuration(gateway_bind_address)
+        .expect("a valid CA bundle is accepted with an HTTP interception proxy");
+
+    let mut without_proxy = valid.clone();
+    without_proxy.upstream_proxy.https_proxy = None;
+    let error = without_proxy
+        .validate_configuration(gateway_bind_address)
+        .expect_err("a CA bundle without a proxy must fail");
+    assert!(error.to_string().contains("proxy_ca_bundle"), "{error}");
+    assert!(error.to_string().contains("https_proxy"), "{error}");
+
+    let mut empty_path = valid.clone();
+    empty_path.proxy_ca_bundle = Some(PathBuf::new());
+    let error = empty_path
+        .validate_configuration(gateway_bind_address)
+        .expect_err("an empty CA bundle path must fail");
+    assert!(error.to_string().contains("must not be empty"), "{error}");
+
+    let mut missing = valid.clone();
+    missing.proxy_ca_bundle = Some(directory.path().join("missing.pem"));
+    let error = missing
+        .validate_configuration(gateway_bind_address)
+        .expect_err("a missing CA bundle must fail");
+    assert!(error.to_string().contains("could not be read"), "{error}");
+
+    let malformed_path = directory.path().join("malformed.pem");
+    fs::write(&malformed_path, "not a certificate\n").unwrap();
+    let mut malformed = valid;
+    malformed.proxy_ca_bundle = Some(malformed_path);
+    let error = malformed
+        .validate_configuration(gateway_bind_address)
+        .expect_err("a certificate-free CA bundle must fail");
+    assert!(error.to_string().contains("no PEM certificate"), "{error}");
+}
+
+#[test]
+fn docker_proxy_ca_bundle_uses_fixed_supervisor_path() {
+    let proxy = UpstreamProxyConfig {
+        https_proxy: Some("https://proxy.corp.example:8443".to_string()),
+        ..UpstreamProxyConfig::default()
+    };
+
+    let args = docker_upstream_proxy_cli_args(&proxy, true);
+    let option = args
+        .iter()
+        .position(|arg| arg == "--upstream-proxy-ca-bundle")
+        .expect("proxy CA option");
+    assert_eq!(
+        args.get(option + 1).map(String::as_str),
+        Some(SUPERVISOR_PROXY_CA_BUNDLE_MOUNT_PATH)
+    );
+    assert!(
+        !args.iter().any(|arg| arg.contains("/etc/openshell/tls")),
+        "gateway-host paths must not appear in supervisor argv: {args:?}"
+    );
+
+    let args = docker_upstream_proxy_cli_args(&proxy, false);
+    assert!(!args.iter().any(|arg| arg == "--upstream-proxy-ca-bundle"));
+}
+
+#[test]
+fn docker_proxy_ca_bundle_is_staged_in_supervisor_archive() {
+    let directory = TempDir::new().expect("create CA directory");
+    let ca_bundle = write_test_proxy_ca_bundle(&directory);
+    let expected = fs::read_to_string(&ca_bundle).unwrap();
+    let mut builder = tar::Builder::new(Vec::new());
+
+    append_docker_proxy_ca_bundle(&mut builder, Some(&ca_bundle)).expect("append proxy CA bundle");
+    let archive = builder.into_inner().expect("finish proxy CA archive");
+    let mut archive = tar::Archive::new(archive.as_slice());
+    let mut entries = archive.entries().unwrap();
+    let mut entry = entries.next().expect("proxy CA entry").unwrap();
+
+    assert_eq!(
+        entry.path().unwrap().as_ref(),
+        Path::new("upstream-proxy-ca-bundle.pem")
+    );
+    assert_eq!(entry.header().uid().unwrap(), u64::from(SUPERVISOR_UID));
+    assert_eq!(entry.header().gid().unwrap(), u64::from(SUPERVISOR_GID));
+    assert_eq!(entry.header().mode().unwrap(), 0o644);
+    let mut actual = String::new();
+    entry.read_to_string(&mut actual).unwrap();
+    assert_eq!(actual, expected);
+    assert!(entries.next().is_none());
+}
+
+#[test]
+fn sandbox_driver_config_cannot_override_proxy_ca_bundle() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "proxy_ca_bundle": "/workload/controlled-ca.pem"
+    })));
+
+    let error = DockerComputeDriver::validate_sandbox(&sandbox, &config)
+        .expect_err("sandbox driver config must not accept proxy_ca_bundle");
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("unknown field"), "{error}");
+    assert!(error.message().contains("proxy_ca_bundle"), "{error}");
 }
 
 fn test_workload_identity() -> ResolvedWorkloadIdentity {

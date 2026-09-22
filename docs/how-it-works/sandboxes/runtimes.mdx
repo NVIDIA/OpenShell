@@ -91,6 +91,26 @@ Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint
 
 Docker Desktop must have host networking enabled, and it cannot use Enhanced Container Isolation. Set `grpc_endpoint` when sandboxes cannot reach the gateway on host loopback. For GPU sandboxes, configure Docker CDI before starting the gateway.
 
+### Docker Corporate Proxy Egress
+
+For proxy-required networks, the Docker driver accepts `https_proxy`,
+`no_proxy`, `proxy_auth_file`, `proxy_auth_allow_insecure`,
+`proxy_connect_by_hostname`, and `proxy_ca_bundle`. The companion supervisor
+chains policy-approved TLS tunnels through the proxy with HTTP CONNECT.
+
+`proxy_ca_bundle` is an operator-owned gateway-host PEM path. Docker validates
+and copies the bundle into its supervisor-only named volume, so this also works
+with remote Docker daemons and does not expose the host path to the workload.
+The supervisor uses the bundle for an HTTPS proxy connection and for upstream
+certificates re-signed by a TLS-intercepting proxy. Workload processes receive
+the same corporate roots through their generated combined trust bundle.
+
+Sandbox environment, image contents, and `template.driver_config.docker`
+cannot alter these settings. Invalid proxy relationships or CA files prevent
+the gateway or sandbox from starting and never degrade to direct egress. See
+the [Gateway Configuration File](/how-it-works/gateways/configuration) for URL,
+authentication, `NO_PROXY`, hostname CONNECT, and CA validation details.
+
 ### Docker Mounts
 
 Mount existing named volumes or `tmpfs` through driver config. Label volumes so resource admission accepts them:

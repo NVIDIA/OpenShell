@@ -574,8 +574,13 @@ cross the authenticated vsock channel. A gateway-host proxy is addressed as
 
 The Docker driver runs `openshell-supervisor` in a separate companion container.
 Its private named volume contains supervisor bootstrap and channel material.
-The workload container receives only `openshell-sandbox`, public interception
-CA material, and the other sandbox half of the authenticated channel.
+The driver bounded-reads operator proxy credentials and CA bundles into that
+supervisor-only volume and passes fixed container paths to the supervisor; it
+never exposes gateway-host paths to sandbox-controlled configuration. The
+corporate CA extends supervisor upstream trust and is folded into the public
+combined trust bundle generated for workload processes. The workload container
+receives only `openshell-sandbox`, public interception and combined CA
+material, and the other sandbox half of the authenticated channel.
 
 For Kubernetes, the operator configures a Secret name and key rather than a
 gateway-host file path. Kubernetes projects that Secret only into the separate
