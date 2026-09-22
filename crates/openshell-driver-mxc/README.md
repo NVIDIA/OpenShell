@@ -75,6 +75,14 @@ debug = false
 etw_audit = false
 ```
 
+`wxc_exec_path` is required and must be an absolute path to `wxc-exec.exe`.
+The gateway rejects an omitted or relative value (including the bare filename
+`wxc-exec.exe`) at startup, before any sandbox is created: `wxc-exec.exe` is
+the binary that builds every sandbox, so a relative value would let
+PATH-lookup or working-directory-relative resolution execute an unapproved
+binary with the gateway's identity instead of the approved `wxc-exec`. There
+is no usable default.
+
 When `egress_proxy` is enabled, `egress_proxy_addr` must be a loopback
 `IP:PORT` seed. For policies with explicit network rules, the driver preserves
 the configured IP and allocates a unique ephemeral port for that sandbox's
