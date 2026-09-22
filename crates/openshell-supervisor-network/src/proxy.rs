@@ -74,12 +74,13 @@ const FORWARD_ENCODED_SLASH_REJECTION_DETAIL: &str =
 const SIDECAR_SUPERVISOR_TOPOLOGY: &str = "sidecar";
 
 fn build_credential_endpoint_mismatch_event(
+    event_context: &EventContext,
     method: &str,
     host: &str,
     port: u16,
     policy_name: &str,
 ) -> openshell_ocsf::OcsfEvent {
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    HttpActivityBuilder::new(event_context)
         .activity(ActivityId::for_http_method(method))
         .http_request(HttpRequest {
             http_method: method.parse().expect("HTTP method parsing is infallible"),
@@ -99,10 +100,18 @@ fn build_credential_endpoint_mismatch_event(
         .build()
 }
 
-fn emit_credential_endpoint_mismatch(method: &str, host: &str, port: u16, policy_name: &str) {
-    let event = build_credential_endpoint_mismatch_event(method, host, port, policy_name);
+fn emit_credential_endpoint_mismatch(
+    event_context: &EventContext,
+    method: &str,
+    host: &str,
+    port: u16,
+    policy_name: &str,
+) {
+    let event =
+        build_credential_endpoint_mismatch_event(event_context, method, host, port, policy_name);
     ocsf_emit!(event);
     let finding = crate::l7::build_credential_endpoint_mismatch_finding(
+        event_context,
         policy_name,
         host,
         None,
@@ -818,7 +827,14 @@ async fn handle_transparent_tcp_connection(
         }
     ));
     emit_activity(&activity_tx, false, "transparent_tcp");
-    relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await
+    relay::relay_tcp(
+        &mut client,
+        &mut upstream,
+        &generation_guard,
+        &ctx,
+        openshell_ocsf::ctx::ctx(),
+    )
+    .await
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -2041,6 +2057,7 @@ async fn handle_tcp_connection(
             Ok(guard) => guard,
             Err(error) => {
                 reject_stale_connect_policy(
+                    &event_context,
                     &mut client,
                     &host_lc,
                     port,
@@ -2213,6 +2230,7 @@ async fn handle_tcp_connection(
             .build();
         ocsf_emit!(event);
         crate::l7::emit_uninspected_credential_finding(
+            &event_context,
             &host_lc,
             policy_str,
             if effective_tls_skip { "tls-skip" } else { "l4" },
@@ -2241,8 +2259,15 @@ async fn handle_tcp_connection(
     if let Err(error) =
         relay::validate_route_generation(l7_route, connect_generation_guard.captured_generation())
     {
-        reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
-            .await?;
+        reject_stale_connect_policy(
+            &event_context,
+            &mut client,
+            &host_lc,
+            port,
+            activity_tx.as_ref(),
+            error,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -2252,6 +2277,7 @@ async fn handle_tcp_connection(
     };
     let Some(upstream_result) = upstream_result else {
         reject_stale_connect_policy(
+            &event_context,
             &mut client,
             &host_lc,
             port,
@@ -2276,8 +2302,15 @@ async fn handle_tcp_connection(
         }
     };
     if let Err(error) = connect_generation_guard.ensure_current() {
-        reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
-            .await?;
+        reject_stale_connect_policy(
+            &event_context,
+            &mut client,
+            &host_lc,
+            port,
+            activity_tx.as_ref(),
+            error,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -2360,11 +2393,19 @@ async fn handle_tcp_connection(
             port = port,
             "tls: skip — bypassing TLS auto-detection, raw tunnel"
         );
-        let Some(generation_guard) = relay::prepare_raw_relay(l7_route, &opa_engine, &decision)
+        let Some(generation_guard) =
+            relay::prepare_raw_relay(l7_route, &opa_engine, &decision, &event_context)
         else {
             return Ok(());
         };
-        relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await?;
+        relay::relay_tcp(
+            &mut client,
+            &mut upstream,
+            &generation_guard,
+            &ctx,
+            &event_context,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -2414,9 +2455,13 @@ async fn handle_tcp_connection(
                 }
             };
             let tls_result = async {
-                let Some(relay_context) =
-                    relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx)
-                else {
+                let Some(relay_context) = relay::prepare_http_relay(
+                    l7_route,
+                    &opa_engine,
+                    &decision,
+                    &ctx,
+                    &event_context,
+                ) else {
                     return Ok(());
                 };
 
@@ -2489,7 +2534,8 @@ async fn handle_tcp_connection(
         // Plaintext HTTP detected.
         ctx.request_default_port = Some(80);
         let is_l7_relay = l7_route.is_some_and(|route| !route.configs.is_empty());
-        let Some(relay_context) = relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx)
+        let Some(relay_context) =
+            relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx, &event_context)
         else {
             return Ok(());
         };
@@ -2576,11 +2622,19 @@ async fn handle_tcp_connection(
             port = port,
             "Non-TLS non-HTTP traffic detected, raw tunnel"
         );
-        let Some(generation_guard) = relay::prepare_raw_relay(l7_route, &opa_engine, &decision)
+        let Some(generation_guard) =
+            relay::prepare_raw_relay(l7_route, &opa_engine, &decision, &event_context)
         else {
             return Ok(());
         };
-        relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await?;
+        relay::relay_tcp(
+            &mut client,
+            &mut upstream,
+            &generation_guard,
+            &ctx,
+            &event_context,
+        )
+        .await?;
     }
 
     Ok(())
@@ -3044,8 +3098,13 @@ fn authorize_egress_intent(
     }
 }
 
-fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette::Report) {
-    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+fn build_l7_tunnel_close_after_policy_change_event(
+    event_context: &EventContext,
+    host: &str,
+    port: u16,
+    error: &miette::Report,
+) -> openshell_ocsf::OcsfEvent {
+    NetworkActivityBuilder::new(event_context)
         .activity(ActivityId::Open)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -3055,11 +3114,21 @@ fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette
         .message(format!(
             "L7 tunnel closed before inspection because policy changed: {error}"
         ))
-        .build();
+        .build()
+}
+
+fn emit_l7_tunnel_close_after_policy_change(
+    event_context: &EventContext,
+    host: &str,
+    port: u16,
+    error: miette::Report,
+) {
+    let event = build_l7_tunnel_close_after_policy_change_event(event_context, host, port, &error);
     ocsf_emit!(event);
 }
 
 async fn reject_stale_connect_policy(
+    event_context: &EventContext,
     client: &mut TcpStream,
     host: &str,
     port: u16,
@@ -3072,7 +3141,7 @@ async fn reject_stale_connect_policy(
         error = %error,
         "CONNECT rejected because policy changed after L4 authorization"
     );
-    emit_l7_tunnel_close_after_policy_change(host, port, error);
+    emit_l7_tunnel_close_after_policy_change(event_context, host, port, error);
     emit_activity_simple(activity_tx, true, "policy_stale");
     respond(
         client,
@@ -4759,7 +4828,7 @@ async fn handle_forward_proxy(
                 error = %e,
                 "Forward proxy rejected request because policy generation changed after L4 decision"
             );
-            emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+            emit_l7_tunnel_close_after_policy_change(&event_context, &host_lc, port, e);
             emit_activity_simple(activity_tx, true, "policy_stale");
             respond(
                 client,
@@ -4880,6 +4949,7 @@ async fn handle_forward_proxy(
                 "Forward proxy rejected request because L7 route lookup used a different policy generation"
             );
             emit_l7_tunnel_close_after_policy_change(
+                &event_context,
                 &host_lc,
                 port,
                 miette::miette!(
@@ -4912,7 +4982,7 @@ async fn handle_forward_proxy(
                     error = %e,
                     "Forward proxy rejected request because L7 tunnel engine could not be cloned"
                 );
-                emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+                emit_l7_tunnel_close_after_policy_change(&event_context, &host_lc, port, e);
                 emit_activity_simple(activity_tx, true, "policy_stale");
                 respond(
                     client,
@@ -5421,7 +5491,7 @@ async fn handle_forward_proxy(
             error = %e,
             "Forward proxy rejected request because policy changed before upstream connect"
         );
-        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        emit_l7_tunnel_close_after_policy_change(&event_context, &host_lc, port, e);
         emit_activity_simple(activity_tx, true, "policy_stale");
         respond(
             client,
@@ -5452,6 +5522,7 @@ async fn handle_forward_proxy(
             observer.observe(EndpointResult::PolicyDenied);
         }
         emit_l7_tunnel_close_after_policy_change(
+            &event_context,
             &host_lc,
             port,
             miette::miette!(
@@ -5674,7 +5745,13 @@ async fn handle_forward_proxy(
                 if let Some(observer) = endpoint_observer.as_ref() {
                     observer.observe_credential_failure(true);
                 }
-                emit_credential_endpoint_mismatch(method, &host_lc, port, policy_str);
+                emit_credential_endpoint_mismatch(
+                    &event_context,
+                    method,
+                    &host_lc,
+                    port,
+                    policy_str,
+                );
                 respond(
                     client,
                     &build_json_error_response(
@@ -5749,7 +5826,7 @@ async fn handle_forward_proxy(
             error = %e,
             "Forward proxy rejected request because policy changed before relay"
         );
-        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        emit_l7_tunnel_close_after_policy_change(&event_context, &host_lc, port, e);
         if let Some(session) = middleware_session.take() {
             session
                 .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
@@ -5829,7 +5906,7 @@ async fn handle_forward_proxy(
             error = %e,
             "Forward proxy rejected request because policy changed during upstream connect"
         );
-        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        emit_l7_tunnel_close_after_policy_change(&event_context, &host_lc, port, e);
         if let Some(session) = middleware_session.take() {
             session
                 .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
@@ -10542,16 +10619,91 @@ network_policies:
     fn credential_endpoint_mismatch_event_includes_method_and_response() {
         use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
 
-        let event =
-            build_credential_endpoint_mismatch_event("POST", "api.example.com", 443, "bound");
+        let event_context = proxy_event_context("sandbox-incident-id", "sandbox-incident");
+        let event = build_credential_endpoint_mismatch_event(
+            &event_context,
+            "POST",
+            "api.example.com",
+            443,
+            "bound",
+        );
         let json = event.to_json().unwrap();
+        let finding = crate::l7::build_credential_endpoint_mismatch_finding(
+            &event_context,
+            "bound",
+            "api.example.com",
+            None,
+            "Provider credential endpoint binding mismatch; request denied",
+        )
+        .to_json()
+        .unwrap();
 
         assert_eq!(json["class_uid"], 4002);
         assert_eq!(json["activity_name"], "Post");
         assert_eq!(json["http_request"]["http_method"], "POST");
         assert!(json["http_request"].get("url").is_none());
         assert_eq!(json["http_response"]["code"], 403);
+        for incident_event in [&json, &finding] {
+            assert_eq!(incident_event["container"]["uid"], "sandbox-incident-id");
+            assert_eq!(incident_event["container"]["name"], "sandbox-incident");
+        }
         validate_required_fields(&json, &load_class_schema("http_activity"));
+    }
+
+    #[test]
+    fn uninspected_credential_finding_keeps_per_proxy_sandbox_attribution() {
+        let event_context = proxy_event_context("sandbox-uninspected-id", "sandbox-uninspected");
+        let finding = crate::l7::build_uninspected_credential_finding(
+            &event_context,
+            "api.example.com",
+            "bound",
+            "tls-skip",
+        )
+        .to_json()
+        .unwrap();
+
+        assert_eq!(finding["container"]["uid"], "sandbox-uninspected-id");
+        assert_eq!(finding["container"]["name"], "sandbox-uninspected");
+    }
+
+    #[tokio::test]
+    async fn stale_connect_rejection_keeps_context_and_returns_policy_denial() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address);
+        let accepted = listener.accept();
+        let (client, accepted) = tokio::join!(client, accepted);
+        let mut client = client.unwrap();
+        let (mut proxy, _) = accepted.unwrap();
+        let event_context = proxy_event_context("sandbox-stale-id", "sandbox-stale");
+
+        reject_stale_connect_policy(
+            &event_context,
+            &mut proxy,
+            "api.example.com",
+            443,
+            None,
+            miette::miette!("policy generation is stale"),
+        )
+        .await
+        .unwrap();
+
+        let mut response = vec![0; 512];
+        let bytes_read = client.read(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response[..bytes_read]);
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+        assert!(response.contains("policy_denied"), "{response}");
+
+        let event = build_l7_tunnel_close_after_policy_change_event(
+            &event_context,
+            "api.example.com",
+            443,
+            &miette::miette!("policy generation is stale"),
+        )
+        .to_json()
+        .unwrap();
+        assert_eq!(event["container"]["uid"], "sandbox-stale-id");
+        assert_eq!(event["container"]["name"], "sandbox-stale");
     }
 
     #[test]

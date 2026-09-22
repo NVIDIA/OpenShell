@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex};
 use crate::opa::PolicyGenerationGuard;
 
 pub(crate) fn build_credential_endpoint_mismatch_finding(
+    event_context: &openshell_ocsf::EventContext,
     policy_name: &str,
     host: &str,
     protocol: Option<&str>,
@@ -50,7 +51,7 @@ pub(crate) fn build_credential_endpoint_mismatch_finding(
     }
     evidence.push(("disposition", "denied"));
 
-    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+    DetectionFindingBuilder::new(event_context)
         .activity(ActivityId::Open)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -413,8 +414,13 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     })
 }
 
-pub(crate) fn emit_uninspected_credential_finding(host: &str, policy_name: &str, surface: &str) {
-    let event = openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+pub(crate) fn build_uninspected_credential_finding(
+    event_context: &openshell_ocsf::EventContext,
+    host: &str,
+    policy_name: &str,
+    surface: &str,
+) -> openshell_ocsf::OcsfEvent {
+    openshell_ocsf::DetectionFindingBuilder::new(event_context)
         .severity(openshell_ocsf::SeverityId::High)
         .finding_info(openshell_ocsf::FindingInfo::new(
             "openshell.credentials.traffic_uninspectable",
@@ -427,8 +433,21 @@ pub(crate) fn emit_uninspected_credential_finding(host: &str, policy_name: &str,
             ("disposition", "denied"),
         ])
         .message("Uninspected credential-bearing traffic denied")
-        .build();
-    openshell_ocsf::ocsf_emit!(event);
+        .build()
+}
+
+pub(crate) fn emit_uninspected_credential_finding(
+    event_context: &openshell_ocsf::EventContext,
+    host: &str,
+    policy_name: &str,
+    surface: &str,
+) {
+    openshell_ocsf::ocsf_emit!(build_uninspected_credential_finding(
+        event_context,
+        host,
+        policy_name,
+        surface,
+    ));
 }
 
 impl L7EndpointConfig {

@@ -36,6 +36,7 @@ pub(super) struct RelayContext<'a> {
     request: &'a L7EvalContext,
     policy: PreparedHttpPolicy,
     middleware_engine: &'a OpaEngine,
+    event_context: &'a openshell_ocsf::EventContext,
 }
 
 /// Non-blocking observation channels attached to an authorized HTTP relay.
@@ -146,9 +147,11 @@ pub(super) fn prepare_http_relay<'a>(
     opa_engine: &'a OpaEngine,
     decision: &EgressDecision,
     request: &'a L7EvalContext,
+    event_context: &'a openshell_ocsf::EventContext,
 ) -> Option<RelayContext<'a>> {
     if let Err(error) = validate_route_generation(route, decision.policy_generation) {
         emit_l7_tunnel_close_after_policy_change(
+            event_context,
             &decision.intent.destination.host,
             decision.intent.destination.port,
             error,
@@ -161,6 +164,7 @@ pub(super) fn prepare_http_relay<'a>(
             Ok(evaluator) => evaluator,
             Err(error) => {
                 emit_l7_tunnel_close_after_policy_change(
+                    event_context,
                     &decision.intent.destination.host,
                     decision.intent.destination.port,
                     error,
@@ -182,6 +186,7 @@ pub(super) fn prepare_http_relay<'a>(
             Ok(guard) => guard,
             Err(error) => {
                 emit_l7_tunnel_close_after_policy_change(
+                    event_context,
                     &decision.intent.destination.host,
                     decision.intent.destination.port,
                     error,
@@ -196,6 +201,7 @@ pub(super) fn prepare_http_relay<'a>(
         request,
         policy,
         middleware_engine: opa_engine,
+        event_context,
     })
 }
 
@@ -206,9 +212,11 @@ pub(super) fn prepare_raw_relay(
     route: Option<&L7RouteSnapshot>,
     opa_engine: &OpaEngine,
     decision: &EgressDecision,
+    event_context: &openshell_ocsf::EventContext,
 ) -> Option<PolicyGenerationGuard> {
     if let Err(error) = validate_route_generation(route, decision.policy_generation) {
         emit_l7_tunnel_close_after_policy_change(
+            event_context,
             &decision.intent.destination.host,
             decision.intent.destination.port,
             error,
@@ -220,6 +228,7 @@ pub(super) fn prepare_raw_relay(
         Ok(guard) => Some(guard),
         Err(error) => {
             emit_l7_tunnel_close_after_policy_change(
+                event_context,
                 &decision.intent.destination.host,
                 decision.intent.destination.port,
                 error,
@@ -255,7 +264,11 @@ where
                     context.request,
                 ) => result,
                 () = generation_guard.wait_until_stale() => {
-                    emit_stale_relay_close(context.request, &generation_guard);
+                    emit_stale_relay_close(
+                        context.request,
+                        &generation_guard,
+                        context.event_context,
+                    );
                     Ok(())
                 }
             }
@@ -271,7 +284,11 @@ where
                     context.request,
                 ) => result,
                 () = generation_guard.wait_until_stale() => {
-                    emit_stale_relay_close(context.request, &generation_guard);
+                    emit_stale_relay_close(
+                        context.request,
+                        &generation_guard,
+                        context.event_context,
+                    );
                     Ok(())
                 }
             }
@@ -286,7 +303,11 @@ where
                     Some(context.middleware_engine),
                 ) => result,
                 () = generation_guard.wait_until_stale() => {
-                    emit_stale_relay_close(context.request, &generation_guard);
+                    emit_stale_relay_close(
+                        context.request,
+                        &generation_guard,
+                        context.event_context,
+                    );
                     Ok(())
                 }
             }
@@ -300,6 +321,7 @@ pub(super) async fn relay_tcp<C, U>(
     upstream: &mut U,
     generation_guard: &PolicyGenerationGuard,
     request: &L7EvalContext,
+    event_context: &openshell_ocsf::EventContext,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -310,14 +332,19 @@ where
             result.into_diagnostic()?;
         }
         () = generation_guard.wait_until_stale() => {
-            emit_stale_relay_close(request, generation_guard);
+            emit_stale_relay_close(request, generation_guard, event_context);
         }
     }
     Ok(())
 }
 
-fn emit_stale_relay_close(request: &L7EvalContext, guard: &PolicyGenerationGuard) {
+fn emit_stale_relay_close(
+    request: &L7EvalContext,
+    guard: &PolicyGenerationGuard,
+    event_context: &openshell_ocsf::EventContext,
+) {
     emit_l7_tunnel_close_after_policy_change(
+        event_context,
         &request.host,
         request.port,
         miette::miette!(
@@ -380,8 +407,14 @@ mod tests {
         let decision = decision(engine.current_generation());
         let request = request_context();
 
-        let context = prepare_http_relay(None, &engine, &decision, &request)
-            .expect("current L4 generation should prepare a relay");
+        let context = prepare_http_relay(
+            None,
+            &engine,
+            &decision,
+            &request,
+            openshell_ocsf::ctx::ctx(),
+        )
+        .expect("current L4 generation should prepare a relay");
         let PreparedHttpPolicy::Passthrough { generation_guard } = context.policy else {
             panic!("route-less relay should use a generation guard");
         };
@@ -403,7 +436,14 @@ mod tests {
         let request = request_context();
 
         assert!(
-            prepare_http_relay(Some(&route), &engine, &decision, &request).is_none(),
+            prepare_http_relay(
+                Some(&route),
+                &engine,
+                &decision,
+                &request,
+                openshell_ocsf::ctx::ctx(),
+            )
+            .is_none(),
             "a current L7 lookup must not freshen a stale L4 allow"
         );
     }
@@ -441,7 +481,14 @@ mod tests {
         let request = request_context();
 
         assert!(
-            prepare_http_relay(Some(&route), &engine, &decision, &request).is_none(),
+            prepare_http_relay(
+                Some(&route),
+                &engine,
+                &decision,
+                &request,
+                openshell_ocsf::ctx::ctx(),
+            )
+            .is_none(),
             "an inspected route must use the generation that authorized CONNECT"
         );
     }
@@ -456,7 +503,8 @@ mod tests {
         };
 
         assert!(
-            prepare_raw_relay(Some(&route), &engine, &decision).is_none(),
+            prepare_raw_relay(Some(&route), &engine, &decision, openshell_ocsf::ctx::ctx(),)
+                .is_none(),
             "a raw relay must not freshen a stale L4 allow"
         );
     }
@@ -469,7 +517,14 @@ mod tests {
         engine.reload(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
 
         assert!(
-            prepare_http_relay(None, &engine, &decision, &request).is_none(),
+            prepare_http_relay(
+                None,
+                &engine,
+                &decision,
+                &request,
+                openshell_ocsf::ctx::ctx(),
+            )
+            .is_none(),
             "policy reload must prevent a stale relay from starting"
         );
     }
@@ -485,7 +540,14 @@ mod tests {
         let (_upstream_peer, mut proxy_upstream) = tokio::io::duplex(64);
 
         let relay = tokio::spawn(async move {
-            relay_tcp(&mut proxy_client, &mut proxy_upstream, &guard, &request).await
+            relay_tcp(
+                &mut proxy_client,
+                &mut proxy_upstream,
+                &guard,
+                &request,
+                openshell_ocsf::ctx::ctx(),
+            )
+            .await
         });
         tokio::task::yield_now().await;
 
