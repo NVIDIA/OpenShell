@@ -59,6 +59,8 @@ If you run OpenShell for a team, start here.
 
 - **Recreate Kubernetes Secrets provider credentials.** The Kubernetes Secrets credential driver stores every provider credential in its configured `namespace` in every workspace mode. Remove the `workspace_mode`, `gateway_id`, and `allow_reference_namespace` driver settings; a `gateway.toml` that sets them is rejected at startup. Credentials stored by the driver are not migrated. Deploy a fresh gateway, then create providers and refresh grants again ([PR #3616](https://github.com/NVIDIA/OpenShell/pull/3616)).
 
+- **Install the workspace chart in operator-managed namespaces.** In operator workspace mode, the gateway receives Secret permissions only from the `openshell-workspace` chart. Install the matching chart release in every operator-managed namespace; without it, sandbox bootstrap fails ([PR #3616](https://github.com/NVIDIA/OpenShell/pull/3616)).
+
 - **Implement extension protocol negotiation.** Custom compute drivers, credential drivers, gateway interceptors, and middleware must exchange `PeerMetadata`, use protocol `1.0`, and advertise their family base capability. Upgrade both peers together. See [Extension Protocol Negotiation](/extensibility/extension-negotiation) and [PR #3352](https://github.com/NVIDIA/OpenShell/pull/3352).
 
 - **Remove compute-driver callback-listener negotiation.** Regenerate custom compute-driver bindings and connect supervisors to the operator-configured primary gateway endpoint ([PR #3365](https://github.com/NVIDIA/OpenShell/pull/3365)).

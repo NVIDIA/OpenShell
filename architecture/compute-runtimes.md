@@ -522,6 +522,9 @@ the gateway ServiceAccount must not be shared with unrelated workloads.
 Operator mode does not create NetworkPolicies or copy image-pull Secrets.
 Platform teams must apply the gateway ingress boundary and provision configured
 image-pull Secrets in every operator-managed namespace.
+The gateway ClusterRole grants no Secret permissions in operator mode. The
+`openshell-workspace` chart Role installed in each operator-managed namespace
+grants bootstrap Secret `create` and `delete`.
 
 **Operator** uses pre-provisioned namespaces discovered through two optional
 sources: a K8s label selector (`operator_namespace_label`) and a drop-in
