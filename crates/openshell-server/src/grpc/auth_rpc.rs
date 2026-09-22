@@ -9,7 +9,7 @@
 //! - `RefreshSandboxToken` — renew a still-valid gateway JWT
 //!
 //! Both end in a fresh gateway-signed JWT minted by
-//! [`crate::auth::sandbox_jwt::SandboxJwtIssuer`]. Refresh atomically advances
+//! [`crate::auth::sandbox_jwt::SandboxSessionJwtAuthority`]. Refresh atomically advances
 //! the sandbox's credential lineage. The immediately consumed bearer may only
 //! replay the same refresh for a short recovery window; it cannot authorize
 //! ordinary RPCs or select another successor.
@@ -177,7 +177,7 @@ pub async fn handle_refresh_sandbox_token(
         ));
     };
 
-    let issuer = state.sandbox_jwt_issuer.as_ref().ok_or_else(|| {
+    let issuer = state.extension_jwt_issuer.as_ref().ok_or_else(|| {
         warn!(
             sandbox_id = %sandbox.sandbox_id,
             "RefreshSandboxToken called but sandbox JWT issuer is not configured"
@@ -319,7 +319,6 @@ pub async fn handle_refresh_sandbox_token(
 }
 
 const MAX_EXTENSION_CREDENTIALS_PER_REFRESH: usize = 64;
-const DEFAULT_EXTENSION_TOKEN_TTL: Duration = Duration::from_mins(15);
 const REFRESH_REPLAY_GRACE: Duration = Duration::from_secs(30);
 
 fn current_unix_seconds() -> i64 {
@@ -332,7 +331,7 @@ fn current_unix_seconds() -> i64 {
 
 #[allow(clippy::result_large_err)]
 fn mint_extension_credentials(
-    issuer: &crate::auth::sandbox_jwt::SandboxJwtIssuer,
+    issuer: &crate::auth::sandbox_jwt::ExtensionJwtIssuer,
     sandbox_id: &str,
     requested_names: &[String],
     available_services: &[openshell_core::proto::SupervisorMiddlewareService],
@@ -362,11 +361,7 @@ fn mint_extension_credentials(
             .iter()
             .map(|service| (service.name.as_str(), service))
             .collect();
-    let ttl = issuer
-        .sandbox_token_ttl()
-        .map_or(DEFAULT_EXTENSION_TOKEN_TTL, |ttl| {
-            ttl.min(MAX_EXTENSION_TOKEN_TTL)
-        });
+    let ttl = issuer.token_ttl().min(MAX_EXTENSION_TOKEN_TTL);
 
     requested_names
         .iter()
@@ -438,7 +433,7 @@ mod tests {
     use crate::ServerState;
     use crate::auth::identity::Identity;
     use crate::auth::principal::{Principal, SandboxPrincipal, UserPrincipal};
-    use crate::auth::sandbox_jwt::{SandboxJwtIssuer, SandboxSessionJwtAuthority};
+    use crate::auth::sandbox_jwt::{ExtensionJwtIssuer, SandboxSessionJwtAuthority};
     use crate::compute::new_test_runtime;
     use crate::persistence::Store;
     use crate::sandbox_index::SandboxIndex;
@@ -473,14 +468,15 @@ mod tests {
             None,
         );
         // We don't need the authenticator for these tests; only the issuer.
-        let issuer = SandboxJwtIssuer::from_pem(
+        let issuer = ExtensionJwtIssuer::from_pem(
             mat.signing_key_pem.as_bytes(),
+            mat.public_key_pem.as_bytes(),
             mat.kid.clone(),
             "test-gateway",
-            Some(Duration::from_hours(1)),
+            Duration::from_hours(1),
         )
         .unwrap();
-        state.sandbox_jwt_issuer = Some(Arc::new(issuer));
+        state.extension_jwt_issuer = Some(Arc::new(issuer));
         let authority = Arc::new(
             SandboxSessionJwtAuthority::from_pem(
                 mat.signing_key_pem.as_bytes(),
@@ -710,7 +706,7 @@ mod tests {
     #[tokio::test]
     async fn extension_credentials_are_minted_only_for_selected_registration_names() {
         let state = state_with_issuer().await;
-        let issuer = state.sandbox_jwt_issuer.as_deref().expect("issuer");
+        let issuer = state.extension_jwt_issuer.as_deref().expect("issuer");
         let available = vec![openshell_core::proto::SupervisorMiddlewareService {
             name: "content-guard".to_string(),
             audience: "urn:example:content-guard".to_string(),
@@ -756,7 +752,7 @@ mod tests {
     #[tokio::test]
     async fn opted_out_registrations_never_receive_a_minted_credential() {
         let state = state_with_issuer().await;
-        let issuer = state.sandbox_jwt_issuer.as_deref().expect("issuer");
+        let issuer = state.extension_jwt_issuer.as_deref().expect("issuer");
         let available = vec![openshell_core::proto::SupervisorMiddlewareService {
             name: "legacy-guard".to_string(),
             audience: "urn:example:legacy-guard".to_string(),
@@ -781,7 +777,7 @@ mod tests {
     #[tokio::test]
     async fn extension_credential_request_rejects_duplicate_names_atomically() {
         let state = state_with_issuer().await;
-        let issuer = state.sandbox_jwt_issuer.as_deref().expect("issuer");
+        let issuer = state.extension_jwt_issuer.as_deref().expect("issuer");
         let available = vec![openshell_core::proto::SupervisorMiddlewareService {
             name: "content-guard".to_string(),
             audience: "urn:example:content-guard".to_string(),

@@ -2813,7 +2813,7 @@ pub(super) async fn load_sandbox_config(
         policy_source,
         &supervisor_middleware_services,
         state.config.policy_validation_failure_mode,
-        state.sandbox_jwt_issuer.is_some(),
+        state.extension_jwt_issuer.is_some(),
     );
     if let Some(policy) = policy.as_ref() {
         validate_policy_credential_binding_context(
@@ -2852,7 +2852,7 @@ pub(super) async fn load_sandbox_config(
             .policy_validation_failure_mode
             .as_str()
             .to_string(),
-        extension_authentication_enabled: state.sandbox_jwt_issuer.is_some(),
+        extension_authentication_enabled: state.extension_jwt_issuer.is_some(),
         provider_attachment_epoch: sandbox
             .spec
             .as_ref()

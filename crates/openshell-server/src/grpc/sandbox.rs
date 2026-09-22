@@ -629,19 +629,13 @@ async fn handle_create_sandbox_inner(
     } else {
         None
     };
-    let sandbox_token = if let Some(authentication) = &launch_authentication {
-        Some(
-            authentication
-                .supervisor
-                .gateway_token
-                .expose_secret()
-                .to_string(),
-        )
-    } else if let Some(issuer) = &state.sandbox_jwt_issuer {
-        Some(issuer.mint(&id)?.token)
-    } else {
-        None
-    };
+    let sandbox_token = launch_authentication.as_ref().map(|authentication| {
+        authentication
+            .supervisor
+            .gateway_token
+            .expose_secret()
+            .to_string()
+    });
     let launch_authentication = launch_authentication
         .map(|authentication| {
             serde_json::to_vec(&authentication)

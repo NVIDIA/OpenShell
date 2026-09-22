@@ -13,7 +13,8 @@
 //! the chain — fail-closed.
 //!
 //! Live authenticators slotting into the chain:
-//! - [`super::sandbox_jwt::SandboxJwtAuthenticator`] — gateway-minted JWTs
+//! - [`super::sandbox_jwt::SandboxSessionJwtAuthenticator`] — generation-bound
+//!   gateway session JWTs
 //! - [`super::compute_driver::ComputeDriverAuthenticator`] — driver-native
 //!   sandbox bootstrap credentials (path-scoped to `IssueSandboxToken`)
 //! - [`super::oidc::OidcAuthenticator`] — user OIDC Bearer tokens

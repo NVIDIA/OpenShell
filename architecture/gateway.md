@@ -342,6 +342,8 @@ driver/runtime identity recorded at provisioning before returning the current
 generation-bound session JWT. Session authentication checks the durable runtime
 generation and token lineage for every sandbox RPC, so a replaced runtime and
 legacy unbound tokens cannot retain provider or control-plane access. The
+gateway admits only explicitly typed, generation-bound session JWTs for sandbox
+RPCs. It does not accept the pre-session untyped JWT format. The
 Kubernetes driver uses its own named configuration to run TokenReview and
 verify the live pod and controlling Sandbox CR. Its runtime identity binds the
 namespace, immutable Sandbox CR UID, and supervisor Pod UID. Restart preserves
@@ -356,11 +358,8 @@ can recover that same successor for 30 seconds when the request matches, but it
 cannot authorize ordinary RPCs or choose another successor. Advancing the
 successor removes that retry path across every gateway replica. Short
 `gateway_jwt.ttl_secs` lifetimes still bound the exposure of a current bearer
-that has not yet been refreshed.
-Omitting `gateway_jwt.ttl_secs` selects non-expiring tokens for local
-single-player Docker, Podman, and VM gateways; those tokens carry `exp = 0`.
-Kubernetes and other shared deployments should set a positive TTL. Explicit
-zero is rejected.
+that has not yet been refreshed. Omitting `gateway_jwt.ttl_secs` uses a
+900-second lifetime. Explicit zero is rejected.
 
 Gateway JWT signing-key rotation is currently an offline operator action. The
 runtime loads one active signing key and one matching public verification key

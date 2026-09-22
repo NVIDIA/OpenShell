@@ -867,12 +867,9 @@ where
 ///    — delegates a driver-native credential and receives a sandbox identity
 ///    so the handler can mint a gateway JWT. No-op on every other path.
 /// 3. `SandboxSessionJwtAuthenticator` — validates generation-bound gateway
-///    JWTs against the durable sandbox identity. When configured, legacy
-///    unbound sandbox JWTs are deliberately not admitted.
-/// 4. `SandboxJwtAuthenticator` — legacy fallback used only when session JWT
-///    authentication is unavailable. Recognized via a distinctive `kid` so
-///    non-matching Bearer tokens fall through.
-/// 5. `OidcAuthenticator` — validates user Bearer tokens against the
+///    JWTs against the durable sandbox identity. Untyped legacy sandbox JWTs
+///    are not admitted.
+/// 4. `OidcAuthenticator` — validates user Bearer tokens against the
 ///    configured OIDC issuer. Returns `Unauthenticated` for missing
 ///    Bearer headers so non-OIDC clients can't sneak through.
 ///
@@ -893,7 +890,6 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
     if let Some(driver) = state.compute_driver_authenticator.clone() {
         authenticators.push(driver);
     }
-    let session_authentication_enabled = state.sandbox_session_jwt_authority.is_some();
     if let Some(authority) = state.sandbox_session_jwt_authority.clone() {
         authenticators.push(Arc::new(
             crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator::new(
@@ -901,9 +897,6 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
                 state.store.clone(),
             ),
         ));
-    }
-    if !session_authentication_enabled && let Some(jwt) = state.sandbox_jwt_authenticator.clone() {
-        authenticators.push(jwt);
     }
     if let Some(cache) = state.oidc_cache.clone() {
         authenticators.push(Arc::new(OidcAuthenticator::new(cache)));
@@ -2546,6 +2539,8 @@ mod tests {
             Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
         };
         use http_body_util::Full;
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        use serde::Serialize;
         use std::sync::Arc;
         use std::sync::Mutex;
         use tower::Service;
@@ -2643,6 +2638,36 @@ mod tests {
                 },
                 trust_domain: Some("openshell".to_string()),
             })
+        }
+
+        #[derive(Serialize)]
+        struct LegacySandboxClaims {
+            sub: String,
+            iss: String,
+            aud: String,
+            iat: i64,
+            exp: i64,
+            sandbox_id: String,
+        }
+
+        fn legacy_sandbox_token(material: &openshell_bootstrap::jwt::JwtKeyMaterial) -> String {
+            let claims = LegacySandboxClaims {
+                sub: "spiffe://openshell/sandbox/sandbox-a".to_string(),
+                iss: "openshell-gateway:test".to_string(),
+                aud: "openshell-gateway:test".to_string(),
+                iat: 1,
+                exp: 0,
+                sandbox_id: "sandbox-a".to_string(),
+            };
+            let mut header = Header::new(Algorithm::EdDSA);
+            header.kid = Some(material.kid.clone());
+            encode(
+                &header,
+                &claims,
+                &EncodingKey::from_ed_pem(material.signing_key_pem.as_bytes())
+                    .expect("signing key"),
+            )
+            .expect("legacy token")
         }
 
         #[tokio::test]
@@ -2927,6 +2952,52 @@ mod tests {
             assert!(seen.lock().unwrap().is_none());
             // tonic sets grpc-status=16 (UNAUTHENTICATED) in trailers.
             assert_eq!(grpc_status(&res).as_deref(), Some("16"));
+        }
+
+        #[tokio::test]
+        async fn legacy_sandbox_jwt_cannot_reach_sensitive_sandbox_methods() {
+            let material = openshell_bootstrap::jwt::generate_jwt_key().expect("JWT key");
+            let authority = Arc::new(
+                crate::auth::sandbox_jwt::SandboxSessionJwtAuthority::from_pem(
+                    material.signing_key_pem.as_bytes(),
+                    material.public_key_pem.as_bytes(),
+                    material.kid.clone(),
+                    "test",
+                    Duration::from_mins(15),
+                )
+                .expect("session authority"),
+            );
+            let store = Arc::new(
+                crate::persistence::Store::connect("sqlite::memory:")
+                    .await
+                    .expect("store"),
+            );
+            let token = legacy_sandbox_token(&material);
+
+            for path in [
+                "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
+                "/openshell.v1.OpenShell/ConnectSupervisor",
+            ] {
+                let authenticator = Arc::new(
+                    crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator::new(
+                        authority.clone(),
+                        store.clone(),
+                    ),
+                );
+                let chain = AuthenticatorChain::new(vec![authenticator]);
+                let (recorder, seen) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+                let request = Request::builder()
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Full::new(Bytes::new()))
+                    .expect("request");
+
+                let response = router.call(request).await.expect("router response");
+
+                assert!(seen.lock().unwrap().is_none(), "{path} reached handler");
+                assert_eq!(grpc_status(&response).as_deref(), Some("16"), "{path}");
+            }
         }
 
         #[tokio::test]

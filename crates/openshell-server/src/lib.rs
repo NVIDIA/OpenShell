@@ -100,12 +100,8 @@ struct GatewayExtensionCredential {
     ttl: Duration,
 }
 
-fn extension_token_ttl(issuer: &auth::sandbox_jwt::SandboxJwtIssuer) -> Duration {
-    issuer
-        .sandbox_token_ttl()
-        .map_or(Duration::from_mins(15), |ttl| {
-            ttl.min(MAX_EXTENSION_TOKEN_TTL)
-        })
+fn extension_token_ttl(issuer: &auth::sandbox_jwt::ExtensionJwtIssuer) -> Duration {
+    issuer.token_ttl().min(MAX_EXTENSION_TOKEN_TTL)
 }
 
 /// Mint the gateway-caller credential for one extension registration.
@@ -115,7 +111,7 @@ fn extension_token_ttl(issuer: &auth::sandbox_jwt::SandboxJwtIssuer) -> Duration
 /// downgrades a security boundary, so it is reported once per registration at
 /// startup rather than being silently tolerated.
 fn mint_gateway_extension_credential(
-    issuer: &Arc<auth::sandbox_jwt::SandboxJwtIssuer>,
+    issuer: &Arc<auth::sandbox_jwt::ExtensionJwtIssuer>,
     kind: ExtensionKind,
     name: &str,
     audience: &str,
@@ -182,7 +178,7 @@ fn mint_gateway_extension_credential(
 }
 
 fn spawn_gateway_extension_token_refresh(
-    issuer: Arc<auth::sandbox_jwt::SandboxJwtIssuer>,
+    issuer: Arc<auth::sandbox_jwt::ExtensionJwtIssuer>,
     credentials: Vec<GatewayExtensionCredential>,
 ) {
     if credentials.is_empty() {
@@ -326,19 +322,11 @@ pub struct ServerState {
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
-    /// Gateway-minted sandbox JWT issuer. `None` when `config.gateway_jwt`
-    /// is not configured; in that mode `IssueSandboxToken` returns
-    /// `Status::unavailable`. Populated at startup from the on-disk key
-    /// material that `certgen` writes.
-    pub sandbox_jwt_issuer: Option<Arc<auth::sandbox_jwt::SandboxJwtIssuer>>,
+    /// Typed extension JWT issuer and public verification metadata.
+    pub extension_jwt_issuer: Option<Arc<auth::sandbox_jwt::ExtensionJwtIssuer>>,
 
     /// Launch-scoped gateway and Sandbox Protocol token authority.
     pub sandbox_session_jwt_authority: Option<Arc<auth::sandbox_jwt::SandboxSessionJwtAuthority>>,
-
-    /// Authenticator that validates gateway-minted sandbox JWTs on every
-    /// inbound request. Always set when `sandbox_jwt_issuer` is, so callers
-    /// presenting a freshly minted token are recognized.
-    pub sandbox_jwt_authenticator: Option<Arc<auth::sandbox_jwt::SandboxJwtAuthenticator>>,
 
     /// Optional selected-driver authenticator for the `IssueSandboxToken`
     /// bootstrap path.
@@ -451,9 +439,8 @@ impl ServerState {
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
-            sandbox_jwt_issuer: None,
+            extension_jwt_issuer: None,
             sandbox_session_jwt_authority: None,
-            sandbox_jwt_authenticator: None,
             compute_driver_authenticator: None,
             peer_authenticator: None,
             grpc_rate_limiter,
@@ -545,7 +532,7 @@ pub(crate) async fn run_server(
 
     // Load signing material before connecting remote extensions so their
     // startup Describe calls can authenticate with gateway-caller tokens.
-    let (sandbox_jwt_issuer, sandbox_jwt_authenticator, sandbox_session_jwt_authority) =
+    let (extension_jwt_issuer, sandbox_session_jwt_authority) =
         if let Some(ref jwt) = config.gateway_jwt {
             let signing_pem = std::fs::read(&jwt.signing_key_path).map_err(|e| {
                 Error::config(format!(
@@ -575,19 +562,12 @@ pub(crate) async fn run_server(
                 )));
             }
             let issuer = Arc::new(
-                auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+                auth::sandbox_jwt::ExtensionJwtIssuer::from_pem(
                     &signing_pem,
-                    kid.clone(),
-                    &jwt.gateway_id,
-                    jwt.sandbox_token_ttl(),
-                )
-                .map_err(Error::config)?,
-            );
-            let authenticator = Arc::new(
-                auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(
                     &public_pem,
                     kid.clone(),
                     &jwt.gateway_id,
+                    jwt.token_ttl(),
                 )
                 .map_err(Error::config)?,
             );
@@ -597,7 +577,7 @@ pub(crate) async fn run_server(
                     &public_pem,
                     kid,
                     &jwt.gateway_id,
-                    jwt.sandbox_token_ttl().unwrap_or(Duration::from_mins(15)),
+                    jwt.token_ttl(),
                 )
                 .map_err(Error::config)?,
             );
@@ -606,9 +586,9 @@ pub(crate) async fn run_server(
                 ttl_secs = jwt.ttl_secs.map(std::num::NonZeroU64::get),
                 "gateway-minted sandbox JWT enabled"
             );
-            (Some(issuer), Some(authenticator), Some(session_authority))
+            (Some(issuer), Some(session_authority))
         } else {
-            (None, None, None)
+            (None, None)
         };
 
     let middleware_registrations = config_file
@@ -626,7 +606,7 @@ pub(crate) async fn run_server(
         .unwrap_or_default();
     let mut gateway_extension_credentials = Vec::new();
     let middleware_registry = Arc::new(
-        if let Some(issuer) = sandbox_jwt_issuer.as_ref() {
+        if let Some(issuer) = extension_jwt_issuer.as_ref() {
             let mut slots = HashMap::new();
             for registration in &middleware_registrations {
                 if let Some(credential) = mint_gateway_extension_credential(
@@ -706,7 +686,7 @@ pub(crate) async fn run_server(
         shutdown_rx.clone(),
     )
     .await?;
-    let gateway_interceptors = if let Some(issuer) = sandbox_jwt_issuer.as_ref() {
+    let gateway_interceptors = if let Some(issuer) = extension_jwt_issuer.as_ref() {
         let mut slots = BTreeMap::new();
         for interceptor in &config.gateway_interceptors {
             let audience = interceptor.resolved_audience();
@@ -758,14 +738,15 @@ pub(crate) async fn run_server(
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
-    state.sandbox_jwt_issuer = sandbox_jwt_issuer.clone();
-    state.sandbox_jwt_authenticator = sandbox_jwt_authenticator;
+    state.extension_jwt_issuer = extension_jwt_issuer.clone();
     state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;
-    if let Some(issuer) = sandbox_jwt_issuer {
+    if let Some(issuer) = extension_jwt_issuer {
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
     }
 
-    if state.sandbox_jwt_issuer.is_some() && state.compute.supports_sandbox_authentication() {
+    if state.sandbox_session_jwt_authority.is_some()
+        && state.compute.supports_sandbox_authentication()
+    {
         state.compute_driver_authenticator = Some(Arc::new(
             auth::compute_driver::ComputeDriverAuthenticator::new(state.compute.clone()),
         ));
@@ -1676,17 +1657,6 @@ async fn build_compute_runtime(
     let admission =
         compute::driver_config::admission_config_from_context(driver_startup, driver.name())?;
     info!(driver = %driver.name(), "Using compute driver");
-    if config
-        .gateway_jwt
-        .as_ref()
-        .is_some_and(|jwt| jwt.sandbox_token_ttl().is_none())
-        && !driver.is_local_singleplayer(registry)
-    {
-        warn!(
-            "Gateway configured with non-expiring sandbox JWTs (gateway_jwt.ttl_secs is omitted); set gateway_jwt.ttl_secs > 0 for shared deployments"
-        );
-    }
-
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
             let build_context = ComputeDriverBuildContext {
@@ -1773,15 +1743,6 @@ impl ConfiguredComputeDriver {
         match self {
             Self::Registered(registration) => &registration.name,
             Self::Remote { name } => name,
-        }
-    }
-
-    fn is_local_singleplayer(&self, registry: &ComputeDriverRegistry) -> bool {
-        match self {
-            Self::Registered(registration) => registration.is_local_singleplayer(),
-            Self::Remote { name } => registry
-                .get(name)
-                .is_some_and(ComputeDriverRegistration::is_local_singleplayer),
         }
     }
 
@@ -2007,17 +1968,18 @@ mod tests {
         record_detection_probe("third", true)
     }
 
-    fn extension_test_issuer() -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
-        extension_test_issuer_with_ttl(Some(Duration::from_mins(15)))
+    fn extension_test_issuer() -> Arc<crate::auth::sandbox_jwt::ExtensionJwtIssuer> {
+        extension_test_issuer_with_ttl(Duration::from_mins(15))
     }
 
     fn extension_test_issuer_with_ttl(
-        ttl: Option<Duration>,
-    ) -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
+        ttl: Duration,
+    ) -> Arc<crate::auth::sandbox_jwt::ExtensionJwtIssuer> {
         let material = openshell_bootstrap::jwt::generate_jwt_key().expect("jwt key");
         Arc::new(
-            crate::auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+            crate::auth::sandbox_jwt::ExtensionJwtIssuer::from_pem(
                 material.signing_key_pem.as_bytes(),
+                material.public_key_pem.as_bytes(),
                 material.kid,
                 "gateway-a",
                 ttl,
@@ -2027,17 +1989,17 @@ mod tests {
     }
 
     #[test]
-    fn non_expiring_sandbox_tokens_use_finite_extension_ttl() {
-        let issuer = extension_test_issuer_with_ttl(None);
+    fn gateway_ttl_bounds_extension_ttl() {
+        let issuer = extension_test_issuer_with_ttl(Duration::from_mins(15));
         assert_eq!(extension_token_ttl(&issuer), Duration::from_mins(15));
     }
 
     #[test]
     fn extension_token_ttl_is_capped_at_one_hour() {
-        let issuer = extension_test_issuer_with_ttl(Some(Duration::from_hours(24)));
+        let issuer = extension_test_issuer_with_ttl(Duration::from_hours(24));
         assert_eq!(extension_token_ttl(&issuer), Duration::from_hours(1));
 
-        let short = extension_test_issuer_with_ttl(Some(Duration::from_mins(5)));
+        let short = extension_test_issuer_with_ttl(Duration::from_mins(5));
         assert_eq!(extension_token_ttl(&short), Duration::from_mins(5));
     }
 
