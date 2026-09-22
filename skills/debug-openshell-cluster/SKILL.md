@@ -134,6 +134,19 @@ bundle is available; Kubernetes projects its bundle through a Secret.
 
 Custom names use `[openshell.drivers.<name>].socket_path`. A launch-time `--compute-driver-socket` override may also use `docker`, `podman`, `kubernetes`, or `vm`; the endpoint then takes precedence over built-in construction. First-party standalone drivers require the socket parent directory to be owned by the driver's effective UID, force its mode to `0700`, create the socket with mode `0600`, and accept only peers with that same UID. Check the parent and socket separately with `stat`; a gateway running under a different UID cannot connect even when filesystem permissions or group membership would otherwise allow it. Operator-supplied drivers must provide equivalent access control appropriate to their implementation. Check gateway logs for connection errors, `GetCapabilities` failures, missing peer metadata, protocol-major mismatch, unmet required capabilities, or an unexpected advertised driver name. `openshell gateway info` reports successful startup negotiations. The advertised name is diagnostic metadata; negotiated features control optional behavior. The gateway does not create or supervise operator-supplied driver processes or sockets.
 
+For the Kubernetes Secrets credential driver, every provider credential lives in
+the configured `namespace`, in every workspace mode. A `PermissionDenied` error
+naming another namespace means the provider's credential handle points outside
+the configured namespace; recreate the provider. An `unknown field` startup
+error for `[openshell.credential_drivers.kubernetes-secrets]` means the table
+sets a key the driver does not accept. Confirm the gateway can reach the
+credential namespace:
+
+```bash
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -A3 '^\[openshell\.credential_drivers\.kubernetes-secrets\]'
+kubectl auth can-i get secrets -n <credential-namespace> --as system:serviceaccount:openshell:openshell
+```
+
 For a configured Vault credential driver, inspect its endpoint and trust bundle
 before debugging provider resolution. Non-loopback addresses must use HTTPS,
 and the driver never follows redirects. A private CA bundle augments platform

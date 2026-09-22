@@ -247,9 +247,6 @@ data:
 
     [openshell.credential_drivers.kubernetes-secrets]
     namespace = {{ include "openshell.credentialKubernetesSecretsNamespace" . | quote }}
-    allow_reference_namespace = {{ .Values.server.credentialDrivers.kubernetesSecrets.allowReferenceNamespace }}
-    workspace_mode               = {{ .Values.server.drivers.kubernetes.workspaceMode | default "shared" | quote }}
-    gateway_id                   = {{ .Values.server.sandboxJwt.gatewayId | default (include "openshell.fullname" .) | quote }}
     {{- end }}
 
     {{- if .Values.server.credentialDrivers.vault.enabled }}

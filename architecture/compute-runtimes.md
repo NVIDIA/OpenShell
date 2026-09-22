@@ -555,9 +555,10 @@ isolation boundary.
 ### Credential Driver Integration
 
 The Kubernetes Secrets credential driver (`openshell-driver-kubernetes-secrets`)
-stores secrets in workspace-specific namespaces when `workspace_mode` is managed
-or operator. In shared mode, all secrets render into the single configured
-namespace.
+stores every provider credential in its single configured namespace, in every
+workspace mode, and rejects handles that reference another namespace. The
+gateway reaches those Secrets through a namespaced Role; the gateway
+ClusterRole grants no credential Secret permissions.
 
 When runtime infrastructure changes, validate the relevant sandbox e2e path and
 update the matching driver README if a maintainer-facing constraint changes.

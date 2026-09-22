@@ -79,12 +79,24 @@ tests:
             resources: ["networkpolicies"]
             verbs: ["get", "create", "patch", "update"]
 
-  - it: grants broad secret access when credential driver is enabled (operator)
+  - it: omits credential Secret access in managed mode
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      server.credentialDrivers.kubernetesSecrets.enabled: true
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get", "create", "patch", "delete"]
+
+  - it: omits credential Secret access in operator mode
     set:
       server.drivers.kubernetes.workspaceMode: operator
       server.credentialDrivers.kubernetesSecrets.enabled: true
     asserts:
-      - contains:
+      - notContains:
           path: rules
           content:
             apiGroups: [""]

@@ -12,6 +12,18 @@ NVIDIA OpenShell follows a frequent release cadence. Use the following GitHub re
 
 ## 0.1.0 migration notes
 
+### Kubernetes Secrets credential storage
+
+The Kubernetes Secrets credential driver stores every provider credential in
+its configured `namespace`, in every workspace mode. The gateway receives
+Secret permissions in that namespace through a namespaced Role.
+
+The driver settings `workspace_mode`, `gateway_id`, and
+`allow_reference_namespace` are removed, and a `gateway.toml` that still sets
+them is rejected at startup. Existing credential state from the Kubernetes
+Secrets driver is not migrated. Deploy a fresh gateway, then create providers
+and refresh grants again.
+
 ### Workload images
 
 The default workload image is now `nvcr.io/nvidia/base/ubuntu:24.04`. It is a
