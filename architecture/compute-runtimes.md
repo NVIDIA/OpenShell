@@ -226,11 +226,13 @@ conservative operator-managed behavior.
 Drivers that can verify a platform-native sandbox credential advertise
 `GetCapabilities.supports_sandbox_authentication`. On the path-scoped
 `IssueSandboxToken` exchange, the gateway forwards the opaque bearer credential
-to that selected driver through `AuthenticateSandbox`. The driver returns only
-the authenticated sandbox ID. The gateway then verifies that its durable
-sandbox record exists and mints the gateway JWT. The driver socket is therefore
-a sandbox-identity trust boundary, but it does not grant user or administrator
-authority.
+to that selected driver through `AuthenticateSandbox`. The driver returns the
+authenticated sandbox ID and opaque runtime identity. The gateway verifies
+that both match its durable sandbox record and returns a generation-bound
+session JWT whose lineage is checked on every subsequent sandbox RPC. Legacy
+unbound sandbox JWTs are not admitted when session authentication is enabled.
+The driver socket is therefore a sandbox-identity trust boundary, but it does
+not grant user or administrator authority.
 
 ## Deletion Lifecycle
 
@@ -516,6 +518,11 @@ an exact match before issuing a sandbox JWT. If binding validation or storage
 fails after a lifecycle call succeeds, the gateway compensates that call before
 returning the error. This correlates credential authentication with the durable
 runtime record rather than authorizing from the sandbox ID alone.
+
+`StartSandbox` carries the previously recorded opaque identity. Kubernetes
+requires exactly one label-selected Sandbox CR and verifies that its namespace
+and immutable UID match that identity before replacing the supervisor Pod. The
+new Pod UID becomes the updated binding only after the continuity check passes.
 
 Shared and managed modes still reserve the sandbox namespace, Sandbox CRs,
 sandbox pods, and configured sandbox ServiceAccount for the Kubernetes driver

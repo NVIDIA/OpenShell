@@ -416,6 +416,11 @@ message StartSandboxRequest {
   // Stable identity of this gateway start transition. Retries of the same
   // transition carry the same generation ID; a later start uses a new ID.
   string generation_id = 4;
+  // Opaque runtime identity persisted from the prior successful create or
+  // start. Drivers that advertise runtime identity binding must preserve the
+  // stable resource represented by this identity while replacing only the
+  // generation-specific runtime component.
+  string expected_runtime_identity = 5;
 }
 
 message StartSandboxResponse {

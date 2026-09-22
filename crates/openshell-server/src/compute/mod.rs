@@ -1631,6 +1631,7 @@ impl ComputeRuntime {
         let generation_id = sandbox_runtime_generation(&starting)
             .map_err(Status::failed_precondition)?
             .into_string();
+        let expected_runtime_identity = sandbox_compute_runtime_identity(&previous);
         let authentication_for_recreate = launch_authentication.clone();
         let mut result = self
             .await_provisioning_operation(
@@ -1648,6 +1649,7 @@ impl ComputeRuntime {
                                     name: sandbox_name,
                                     launch_authentication,
                                     generation_id,
+                                    expected_runtime_identity,
                                 }))
                                 .await
                         }
@@ -1712,6 +1714,11 @@ impl ComputeRuntime {
                             &starting,
                             &driver_name,
                             &runtime_identity,
+                            &[
+                                SandboxPhase::Starting,
+                                SandboxPhase::Provisioning,
+                                SandboxPhase::Ready,
+                            ],
                         )
                         .await;
                     match persisted {
@@ -1759,6 +1766,7 @@ impl ComputeRuntime {
         starting: &Sandbox,
         driver_name: &str,
         runtime_identity: &str,
+        allowed_phases: &[SandboxPhase],
     ) -> Result<Sandbox, String> {
         let expected_generation = sandbox_runtime_generation(starting)?;
         let mut expected_resource_version = sandbox_resource_version(starting);
@@ -1800,13 +1808,7 @@ impl ComputeRuntime {
                     let current_generation = sandbox_runtime_generation(&current)?;
                     let phase =
                         SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
-                    if current_generation != expected_generation
-                        || !matches!(
-                            phase,
-                            SandboxPhase::Starting
-                                | SandboxPhase::Provisioning
-                                | SandboxPhase::Ready
-                        )
+                    if current_generation != expected_generation || !allowed_phases.contains(&phase)
                     {
                         return Err(format!(
                             "sandbox changed lifecycle ownership while persisting runtime identity (phase: {phase:?})"
@@ -2934,6 +2936,7 @@ impl ComputeRuntime {
                     continue;
                 }
             };
+            let expected_runtime_identity = sandbox_compute_runtime_identity(&sandbox);
             match self
                 .await_provisioning_operation(
                     &sandbox,
@@ -2944,6 +2947,7 @@ impl ComputeRuntime {
                             let sandbox_id = sandbox_id.clone();
                             let sandbox_name = sandbox_name.clone();
                             let launch_authentication = launch_authentication.clone();
+                            let expected_runtime_identity = expected_runtime_identity.clone();
                             async move {
                                 driver
                                     .start_sandbox(Request::new(StartSandboxRequest {
@@ -2951,6 +2955,7 @@ impl ComputeRuntime {
                                         name: sandbox_name,
                                         launch_authentication,
                                         generation_id,
+                                        expected_runtime_identity,
                                     }))
                                     .await
                             }
@@ -2959,7 +2964,49 @@ impl ComputeRuntime {
                 )
                 .await
             {
-                Ok(_) => {
+                Ok(response) => {
+                    let mut recovered_sandbox = sandbox.clone();
+                    if self.supports_sandbox_authentication() {
+                        let runtime_identity = response.into_inner().runtime_identity;
+                        if runtime_identity.is_empty() {
+                            warn!(
+                                sandbox_id = %sandbox.object_id(),
+                                "Compute driver returned an empty runtime identity during startup recovery"
+                            );
+                            authentication_failed(sandbox.object_id());
+                            failed += 1;
+                            continue;
+                        }
+                        match self
+                            .persist_start_runtime_binding(
+                                &sandbox_id,
+                                &sandbox,
+                                self.configured_driver_name(),
+                                &runtime_identity,
+                                &[
+                                    SandboxPhase::Starting,
+                                    SandboxPhase::Provisioning,
+                                    SandboxPhase::Ready,
+                                    SandboxPhase::Error,
+                                    SandboxPhase::Unspecified,
+                                    SandboxPhase::Unknown,
+                                ],
+                            )
+                            .await
+                        {
+                            Ok(updated) => recovered_sandbox = updated,
+                            Err(error) => {
+                                warn!(
+                                    sandbox_id = %sandbox.object_id(),
+                                    %error,
+                                    "Failed to persist runtime identity during startup recovery"
+                                );
+                                authentication_failed(sandbox.object_id());
+                                failed += 1;
+                                continue;
+                            }
+                        }
+                    }
                     if let Err(err) = authentication_committed(sandbox.object_id()).await {
                         warn!(
                             sandbox_id = %sandbox.object_id(),
@@ -2968,7 +3015,7 @@ impl ComputeRuntime {
                         );
                     }
                     let did_recover = if recoverable_error {
-                        self.clear_recoverable_error(&sandbox).await
+                        self.clear_recoverable_error(&recovered_sandbox).await
                     } else {
                         false
                     };
@@ -3130,6 +3177,7 @@ impl ComputeRuntime {
                             continue;
                         }
                     };
+                    let expected_runtime_identity = sandbox_compute_runtime_identity(&sandbox);
                     if let Err(err) = self
                         .driver
                         .call(
@@ -3142,6 +3190,7 @@ impl ComputeRuntime {
                                         name: sandbox_name,
                                         launch_authentication: Vec::new(),
                                         generation_id,
+                                        expected_runtime_identity,
                                     }))
                                     .await
                             },
@@ -5099,6 +5148,19 @@ fn sandbox_resource_version(sandbox: &Sandbox) -> u64 {
         .map_or(0, |metadata| metadata.resource_version)
 }
 
+fn sandbox_compute_runtime_identity(sandbox: &Sandbox) -> String {
+    sandbox
+        .metadata
+        .as_ref()
+        .and_then(|metadata| {
+            metadata
+                .annotations
+                .get(COMPUTE_RUNTIME_IDENTITY_ANNOTATION)
+        })
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn sandbox_runtime_generation(
     sandbox: &Sandbox,
 ) -> Result<openshell_core::sandbox_generation::SandboxGenerationId, String> {
@@ -6608,6 +6670,7 @@ mod tests {
         start_calls: AtomicUsize,
         start_requests: TestMutex<Vec<(String, String)>>,
         start_authentications: TestMutex<Vec<Vec<u8>>>,
+        start_expected_runtime_identities: TestMutex<Vec<String>>,
         start_outcome: TestMutex<ControlledLifecycleOutcome>,
         runtime_identity: TestMutex<String>,
         advertises_sandbox_authentication: AtomicBool,
@@ -6648,6 +6711,7 @@ mod tests {
                 start_calls: AtomicUsize::new(0),
                 start_requests: TestMutex::new(Vec::new()),
                 start_authentications: TestMutex::new(Vec::new()),
+                start_expected_runtime_identities: TestMutex::new(Vec::new()),
                 start_outcome: TestMutex::new(ControlledLifecycleOutcome::Ok),
                 runtime_identity: TestMutex::new(String::new()),
                 advertises_sandbox_authentication: AtomicBool::new(false),
@@ -6775,6 +6839,13 @@ mod tests {
             self.start_authentications
                 .lock()
                 .expect("start authentications lock poisoned")
+                .clone()
+        }
+
+        fn start_expected_runtime_identities(&self) -> Vec<String> {
+            self.start_expected_runtime_identities
+                .lock()
+                .expect("start expected runtime identities lock poisoned")
                 .clone()
         }
 
@@ -6943,6 +7014,10 @@ mod tests {
                 .lock()
                 .expect("start authentications lock poisoned")
                 .push(request.launch_authentication);
+            self.start_expected_runtime_identities
+                .lock()
+                .expect("start expected runtime identities lock poisoned")
+                .push(request.expected_runtime_identity);
             self.start_calls.fetch_add(1, Ordering::SeqCst);
             self.start_started.notify_one();
             if self.start_blocked.load(Ordering::SeqCst) {
@@ -7483,6 +7558,10 @@ mod tests {
             "replacement-instance"
         );
         assert_eq!(driver.stop_calls(), 0);
+        assert_eq!(
+            driver.start_expected_runtime_identities(),
+            vec!["previous-runtime-identity".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -12747,6 +12826,42 @@ mod tests {
         assert_eq!(
             driver.start_authentications(),
             vec![b"authentication:sb-1".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn start_persisted_sandboxes_preserves_and_updates_runtime_binding() {
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity("new-runtime-identity");
+        let mut runtime =
+            test_runtime_with_gateway_managed_lifecycle(driver.clone(), "arbitrary").await;
+        enable_runtime_identity_binding(&mut runtime);
+        let mut sandbox = sandbox_record("sb-1", "sandbox", SandboxPhase::Ready);
+        set_compute_runtime_binding(&mut sandbox, "previous-runtime-identity");
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .start_persisted_sandboxes_with_authentication(
+                |_| async { Ok(b"authentication".to_vec()) },
+                |_| async { Ok(()) },
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            driver.start_expected_runtime_identities(),
+            vec!["previous-runtime-identity".to_string()]
+        );
+        let restored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .expect("sandbox must remain persisted");
+        assert_eq!(
+            restored.metadata.unwrap().annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+            "new-runtime-identity"
         );
     }
 

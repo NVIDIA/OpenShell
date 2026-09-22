@@ -203,6 +203,7 @@ impl ComputeDriver for ComputeDriverService {
                         &request.sandbox_id,
                         &request.generation_id,
                         &request.launch_authentication,
+                        &request.expected_runtime_identity,
                     ))
                     .await
                     .map_err(|error| {

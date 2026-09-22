@@ -142,10 +142,11 @@ Both Pods set `automountServiceAccountToken: false`. The supervisor receives an
 explicit audience-bound projected token for the one-shot `IssueSandboxToken`
 exchange. The driver verifies that token and returns an opaque runtime identity
 derived from the namespace, immutable Sandbox resource UID, and supervisor Pod
-UID. The gateway
-requires that identity to match the value recorded during provisioning before
-returning the sandbox-scoped JWT used by the supervisor session. The sandbox
-Pod receives neither token.
+UID. Restart requires exactly one matching Sandbox resource and preserves its
+namespace and UID while rotating the supervisor Pod UID. The gateway requires
+the authenticated identity to match the durable binding before returning the
+generation-bound session JWT used by the supervisor. The sandbox Pod receives
+neither token.
 
 The gateway uses the supervisor relay for connect, exec, logs, and file sync.
 Sandbox Pods do not need direct external ingress for SSH.

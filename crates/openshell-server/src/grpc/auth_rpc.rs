@@ -89,13 +89,16 @@ pub async fn handle_issue_sandbox_token(
         ));
     };
 
-    let issuer = state.sandbox_jwt_issuer.as_ref().ok_or_else(|| {
-        warn!(
-            sandbox_id = %sandbox.sandbox_id,
-            "IssueSandboxToken called but sandbox JWT issuer is not configured"
-        );
-        Status::unavailable("sandbox JWT minting is not configured on this gateway")
-    })?;
+    let session_authority = state
+        .sandbox_session_jwt_authority
+        .as_ref()
+        .ok_or_else(|| {
+            warn!(
+                sandbox_id = %sandbox.sandbox_id,
+                "IssueSandboxToken called but sandbox session minting is not configured"
+            );
+            Status::unavailable("sandbox session minting is not configured on this gateway")
+        })?;
 
     let sandbox_record = ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
     let metadata = sandbox_record
@@ -119,15 +122,26 @@ pub async fn handle_issue_sandbox_token(
         ));
     }
 
-    let minted = issuer.mint(&sandbox.sandbox_id)?;
+    let identity =
+        crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
+            .map_err(|_| Status::permission_denied("sandbox runtime identity is invalid"))?;
+    let authentication = session_authority.mint_persisted_launch(&sandbox.sandbox_id, &identity)?;
+    let token = authentication
+        .supervisor
+        .gateway_token
+        .expose_secret()
+        .to_string();
     info!(
         sandbox_id = %sandbox.sandbox_id,
-        "issued gateway sandbox JWT"
+        "issued generation-bound gateway sandbox JWT"
     );
     Ok(Response::new(IssueSandboxTokenResponse {
-        token: minted.token,
+        token,
         expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(
-            minted.expires_at_ms,
+            authentication
+                .supervisor
+                .gateway_expires_at
+                .saturating_mul(1000),
         )
         .map_err(|error| Status::internal(error.to_string()))?,
     }))
@@ -799,8 +813,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn issue_returns_token_for_existing_sandbox() {
+    async fn issue_returns_generation_bound_token_and_rejects_it_after_runtime_replacement() {
+        use crate::auth::authenticator::Authenticator;
         use crate::auth::principal::SandboxIdentitySource;
+        use crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator;
 
         let state = state_with_issuer().await;
         let mut req = Request::new(IssueSandboxTokenRequest {});
@@ -819,6 +835,43 @@ mod tests {
             .into_inner();
         assert!(!resp.token.is_empty());
         assert!(resp.expiration_time.is_some());
+
+        let authenticator = SandboxSessionJwtAuthenticator::new(
+            state
+                .sandbox_session_jwt_authority
+                .clone()
+                .expect("session authority"),
+            state.store.clone(),
+        );
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", resp.token)
+                .parse()
+                .expect("bearer header"),
+        );
+        let provider_path = "/openshell.v1.OpenShell/GetSandboxProviderEnvironment";
+        let principal = authenticator
+            .authenticate(&headers, provider_path)
+            .await
+            .expect("active runtime token must authenticate")
+            .expect("session authenticator must recognize its token");
+        assert!(matches!(principal, Principal::Sandbox(_)));
+
+        let replacement = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+            .expect("replacement identity");
+        state
+            .store
+            .update_message_cas::<Sandbox, _>("sandbox-a", 0, move |sandbox| {
+                replacement.write(&mut sandbox.metadata.as_mut().expect("metadata").annotations);
+            })
+            .await
+            .expect("replace runtime identity");
+        let error = authenticator
+            .authenticate(&headers, provider_path)
+            .await
+            .expect_err("obsolete runtime token must not reach provider access");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
     }
 
     #[tokio::test]
