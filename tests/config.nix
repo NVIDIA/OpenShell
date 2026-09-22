@@ -144,8 +144,8 @@ let
         inputs = {
           openshell_deb = "../artifacts/upgrade/deb/source/openshell.deb";
           openshell_upgrade_source_version = "../artifacts/upgrade/deb/source/version";
-          openshell_supervisor_image = "../artifacts/upgrade/deb/source/openshell-supervisor-tmachine.tar";
-          openshell_sandbox_image = "../artifacts/upgrade/deb/source/openshell-sandbox-tmachine.tar";
+          openshell_supervisor_image = "../artifacts/upgrade/source-images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../artifacts/upgrade/source-images/openshell-sandbox-tmachine.tar";
         };
       }
       {
@@ -155,8 +155,8 @@ let
         inputs = {
           openshell_rpm = "../artifacts/upgrade/rpm/source/openshell.rpm";
           openshell_gateway_rpm = "../artifacts/upgrade/rpm/source/openshell-gateway.rpm";
-          openshell_supervisor_image = "../artifacts/upgrade/rpm/source/openshell-supervisor-tmachine.tar";
-          openshell_sandbox_image = "../artifacts/upgrade/rpm/source/openshell-sandbox-tmachine.tar";
+          openshell_supervisor_image = "../artifacts/upgrade/source-images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../artifacts/upgrade/source-images/openshell-sandbox-tmachine.tar";
         };
       }
     ];
