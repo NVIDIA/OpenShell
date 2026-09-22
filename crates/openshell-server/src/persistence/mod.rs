@@ -29,6 +29,62 @@ pub const CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE: &str = "config_component_obs
 
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 
+/// Optional sandbox projection committed with a settings mutation and its
+/// durable operation.
+pub struct AtomicSandboxProjection<'a> {
+    pub sandbox_id: &'a str,
+    pub annotations: &'a HashMap<String, String>,
+    pub expected_resource_version: u64,
+}
+
+impl AtomicSandboxProjection<'_> {
+    fn apply_and_sync_operation_response(
+        &self,
+        payload: &[u8],
+        current_resource_version: u64,
+        operation_record: &mut crate::storage_proto::StoredConfigUpdateOperation,
+    ) -> PersistenceResult<(openshell_core::proto::Sandbox, bool)> {
+        use openshell_core::SetResourceVersion as _;
+        use prost::Message as _;
+
+        if self.expected_resource_version != 0
+            && self.expected_resource_version != current_resource_version
+        {
+            return Err(PersistenceError::Conflict {
+                current_resource_version: Some(current_resource_version),
+            });
+        }
+
+        let payload = migrate_legacy_time_fields("sandbox", payload)?;
+        let mut sandbox =
+            openshell_core::proto::Sandbox::decode(payload.as_slice()).map_err(|error| {
+                PersistenceError::Decode(format!("decode sandbox payload failed: {error}"))
+            })?;
+        sandbox.set_resource_version(current_resource_version);
+        let metadata = sandbox.metadata.as_mut().ok_or_else(|| {
+            PersistenceError::Decode("sandbox payload missing metadata".to_string())
+        })?;
+        let mut changed = false;
+        for (key, value) in self.annotations {
+            if metadata.annotations.get(key) != Some(value) {
+                metadata.annotations.insert(key.clone(), value.clone());
+                changed = true;
+            }
+        }
+        operation_record
+            .response_annotations
+            .clone_from(&metadata.annotations);
+        Ok((sandbox, changed))
+    }
+}
+
+/// Result of a compare-and-swap update that already has the current payload.
+#[derive(Debug)]
+pub enum KnownVersionUpdate<T> {
+    Changed(T),
+    Conflict,
+}
+
 /// Maximum number of object ids sent in one set-based delete statement.
 ///
 /// Keep this well below `SQLite`'s bind-variable limit. Backends split larger
@@ -392,6 +448,101 @@ impl Store {
             labels,
             condition
         ))
+    }
+
+    /// Write desired state and its durable update operation in one database
+    /// transaction. Used by sandbox-scoped settings mutations.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_if_with_operation(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        condition: WriteCondition,
+        operation: &crate::storage_proto::StoredConfigUpdateOperation,
+        sandbox_projection: Option<&AtomicSandboxProjection<'_>>,
+    ) -> PersistenceResult<WriteResult> {
+        store_dispatch_traced!(self.put_if_with_operation(
+            object_type,
+            id,
+            name,
+            workspace,
+            payload,
+            condition,
+            operation,
+            sandbox_projection
+        ))
+    }
+
+    /// Persist completion tracking for a request whose desired value is unchanged.
+    pub async fn insert_existing_config_operation(
+        &self,
+        operation: &crate::storage_proto::StoredConfigUpdateOperation,
+        workspace: &str,
+        sandbox_name: &str,
+    ) -> PersistenceResult<()> {
+        store_dispatch!(self.insert_existing_config_operation(operation, workspace, sandbox_name))
+    }
+
+    /// Update an operation payload and its query columns with one CAS write.
+    pub async fn update_config_operation_cas(
+        &self,
+        operation: &crate::storage_proto::StoredConfigUpdateOperation,
+        expected_resource_version: u64,
+    ) -> PersistenceResult<KnownVersionUpdate<crate::storage_proto::StoredConfigUpdateOperation>>
+    {
+        let resource_version = store_dispatch!(
+            self.update_config_operation_cas(operation, expected_resource_version)
+        )?;
+        let Some(resource_version) = resource_version else {
+            return Ok(KnownVersionUpdate::Conflict);
+        };
+        let mut updated = operation.clone();
+        updated.set_resource_version(resource_version);
+        Ok(KnownVersionUpdate::Changed(updated))
+    }
+
+    /// Repair operation query columns from the authoritative protobuf payload
+    /// without changing the payload or resource version.
+    pub async fn repair_config_operation_projection(
+        &self,
+        operation: &crate::storage_proto::StoredConfigUpdateOperation,
+        expected_resource_version: u64,
+    ) -> PersistenceResult<bool> {
+        store_dispatch!(
+            self.repair_config_operation_projection(operation, expected_resource_version)
+        )
+    }
+
+    /// Return pending operations for one sandbox. Terminal history is excluded
+    /// by SQL before protobuf payloads are decoded.
+    pub async fn list_pending_config_operations_for_scope(
+        &self,
+        scope: &str,
+    ) -> PersistenceResult<Vec<crate::storage_proto::StoredConfigUpdateOperation>> {
+        store_dispatch!(self.list_pending_config_operations_for_scope(scope))?
+            .into_iter()
+            .map(decode_record)
+            .collect()
+    }
+
+    /// Return a bounded, stable batch of pending operations whose retry time
+    /// has arrived.
+    pub async fn list_due_config_update_operations(
+        &self,
+        now_ms: i64,
+        limit: u32,
+    ) -> PersistenceResult<Vec<crate::storage_proto::StoredConfigUpdateOperation>> {
+        store_dispatch!(self.list_due_config_update_operations(now_ms, limit))?
+            .into_iter()
+            .map(decode_record)
+            .collect()
+    }
+
+    pub async fn count_pending_config_update_operations(&self) -> PersistenceResult<u64> {
+        store_dispatch!(self.count_pending_config_update_operations())
     }
 
     /// Delete an object by id with compare-and-swap support.

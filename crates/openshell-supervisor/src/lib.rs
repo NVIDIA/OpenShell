@@ -4053,10 +4053,37 @@ struct PendingStreamProvider {
 }
 
 #[derive(Debug)]
+struct RejectedStreamSandbox {
+    configuration_instance_id: String,
+    requested_revision: openshell_core::proto::ConfigSnapshotRevision,
+    environment: EnvironmentIdentity,
+    error: String,
+    failure_mode: PolicyValidationFailureMode,
+    result: openshell_core::proto::ConfigComponentApplyResult,
+}
+
+impl RejectedStreamSandbox {
+    fn matches(
+        &self,
+        snapshot: &openshell_core::grpc_client::SettingsPollResult,
+        requested_revision: &openshell_core::proto::ConfigSnapshotRevision,
+        environment: &EnvironmentIdentity,
+        error: &str,
+    ) -> bool {
+        self.configuration_instance_id == snapshot.configuration_instance_id
+            && self.requested_revision == *requested_revision
+            && self.environment == *environment
+            && self.error == error
+            && self.failure_mode == snapshot.policy_validation_failure_mode
+    }
+}
+
+#[derive(Debug)]
 struct StreamConfigurationState {
     active_environment: EnvironmentIdentity,
     pending_provider: Option<PendingStreamProvider>,
     pending_sandbox: Option<Box<openshell_core::grpc_client::SettingsPollResult>>,
+    rejected_sandbox: Option<Box<RejectedStreamSandbox>>,
 }
 
 impl StreamConfigurationState {
@@ -4068,6 +4095,7 @@ impl StreamConfigurationState {
                 .unwrap_or_default(),
             pending_provider: None,
             pending_sandbox: None,
+            rejected_sandbox: None,
         }
     }
 }
@@ -4369,6 +4397,7 @@ async fn apply_stream_sandbox_snapshot<C: PolicyGatewayClient>(
         && current_stream_revision.as_ref() == Some(&requested_revision)
         && desired_environment == stream_state.active_environment
     {
+        stream_state.rejected_sandbox = None;
         return config_apply_result(
             ConfigComponent::SandboxConfig,
             requested_revision.clone(),
@@ -4394,7 +4423,12 @@ async fn apply_stream_sandbox_snapshot<C: PolicyGatewayClient>(
         } else {
             &snapshot.configuration_error
         };
-        return match apply_policy_validation_failure(
+        if let Some(rejected) = stream_state.rejected_sandbox.as_ref()
+            && rejected.matches(&snapshot, &requested_revision, &desired_environment, error)
+        {
+            return rejected.result.clone();
+        }
+        let (result, cacheable) = match apply_policy_validation_failure(
             &ctx.opa_engine,
             snapshot.policy_validation_failure_mode,
             *has_last_valid_policy,
@@ -4417,22 +4451,39 @@ async fn apply_stream_sandbox_snapshot<C: PolicyGatewayClient>(
                 } else {
                     ConfigApplyOutcome::FailedClosed
                 };
-                config_apply_result(
-                    ConfigComponent::SandboxConfig,
-                    requested_revision,
-                    applied_revision,
-                    outcome,
-                    Some(("configuration_rejected", error.to_string(), true)),
+                (
+                    config_apply_result(
+                        ConfigComponent::SandboxConfig,
+                        requested_revision.clone(),
+                        applied_revision,
+                        outcome,
+                        Some(("configuration_rejected", error.to_string(), true)),
+                    ),
+                    true,
                 )
             }
-            Err(failure) => config_apply_result(
-                ConfigComponent::SandboxConfig,
-                requested_revision,
-                None,
-                ConfigApplyOutcome::FailedClosed,
-                Some(("configuration_rejected", failure.to_string(), true)),
+            Err(failure) => (
+                config_apply_result(
+                    ConfigComponent::SandboxConfig,
+                    requested_revision.clone(),
+                    None,
+                    ConfigApplyOutcome::FailedClosed,
+                    Some(("configuration_rejected", failure.to_string(), true)),
+                ),
+                false,
             ),
         };
+        if cacheable {
+            stream_state.rejected_sandbox = Some(Box::new(RejectedStreamSandbox {
+                configuration_instance_id: snapshot.configuration_instance_id,
+                requested_revision,
+                environment: desired_environment,
+                error: error.to_string(),
+                failure_mode: snapshot.policy_validation_failure_mode,
+                result: result.clone(),
+            }));
+        }
+        return result;
     }
 
     if desired_environment != stream_state.active_environment
@@ -4638,6 +4689,7 @@ async fn apply_stream_sandbox_snapshot<C: PolicyGatewayClient>(
 
     match outcome {
         Ok(outcome) => {
+            stream_state.rejected_sandbox = None;
             if let Ok(generation) = ctx
                 .opa_engine
                 .generation_guard(ctx.opa_engine.current_generation())
@@ -7980,6 +8032,94 @@ network_policies:
         assert!(ctx.ocsf_enabled.load(Ordering::Relaxed));
         assert!(ctx.agent_proposals.enabled());
         assert_eq!(current_settings, initial.settings);
+    }
+
+    #[tokio::test]
+    async fn duplicate_rejected_stream_snapshot_does_not_advance_fail_closed_generation() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let mut rejected =
+            settings_poll_result(Some(proto_policy_fixture()), 2, PolicySource::Sandbox);
+        rejected.config_revision = 200;
+        rejected.settings_revision = 2;
+        rejected.configuration_admitted = false;
+        rejected.configuration_error = "invalid policy".to_string();
+        rejected.policy_validation_failure_mode = PolicyValidationFailureMode::FailClosed;
+
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let initial_generation = engine.current_generation();
+        let ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: None,
+                has_last_valid_policy: false,
+            },
+            default_middleware_connector(),
+        );
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut config_revision = 0;
+        let mut stream_revision = None;
+        let mut policy_version = 0;
+        let mut policy_hash = String::new();
+        let mut endpoint_policy = None;
+        let mut middleware_services = Vec::new();
+        let mut extension_authentication_enabled = false;
+        let mut middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
+        let mut current_settings = std::collections::HashMap::new();
+        let mut stream_state = StreamConfigurationState::new(None);
+        let mut provider_revision = 0;
+        let mut has_last_valid_policy = false;
+
+        let result = apply_stream_sandbox_snapshot(
+            &ctx,
+            &client,
+            rejected.clone(),
+            &mut config_revision,
+            &mut stream_revision,
+            &mut policy_version,
+            &mut policy_hash,
+            &mut endpoint_policy,
+            &mut middleware_services,
+            &mut extension_authentication_enabled,
+            &mut middleware_registry_status,
+            &mut current_settings,
+            &mut stream_state,
+            &mut provider_revision,
+            true,
+            &mut has_last_valid_policy,
+        )
+        .await;
+
+        assert_eq!(
+            ConfigApplyOutcome::try_from(result.outcome).unwrap(),
+            ConfigApplyOutcome::FailedClosed
+        );
+        let rejected_generation = ctx.opa_engine.current_generation();
+        assert!(rejected_generation > initial_generation);
+
+        let duplicate = apply_stream_sandbox_snapshot(
+            &ctx,
+            &client,
+            rejected,
+            &mut config_revision,
+            &mut stream_revision,
+            &mut policy_version,
+            &mut policy_hash,
+            &mut endpoint_policy,
+            &mut middleware_services,
+            &mut extension_authentication_enabled,
+            &mut middleware_registry_status,
+            &mut current_settings,
+            &mut stream_state,
+            &mut provider_revision,
+            true,
+            &mut has_last_valid_policy,
+        )
+        .await;
+
+        assert_eq!(duplicate, result);
+        assert_eq!(ctx.opa_engine.current_generation(), rejected_generation);
     }
 
     #[tokio::test]

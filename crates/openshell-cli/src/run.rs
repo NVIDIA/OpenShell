@@ -46,7 +46,8 @@ use openshell_bootstrap::{
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, BeginRootfsTarStagingRequest,
-    ClearDraftChunksRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
+    ClearDraftChunksRequest, ConfigUpdateConsistency, ConfigUpdateOperation,
+    ConfigUpdateOperationState, CreateSandboxRequest, CreateSandboxTemplateRequest,
     CreateSshSessionRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
     DeleteServiceRequest, DeletionOutcome, EndpointResult, EndpointStatus, ExecSandboxRequest,
     ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
@@ -73,6 +74,82 @@ use std::time::{Duration, Instant};
 use tonic::{Code, Status};
 
 const PROVISIONAL_CONTAINER_EXIT_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(5);
+const POLICY_WAIT_TIMEOUT_EXIT_CODE: i32 = 124;
+
+fn report_policy_wait_timeout(status: &Status) -> Option<i32> {
+    if status.code() != Code::DeadlineExceeded {
+        return None;
+    }
+    let operation_id = status
+        .metadata()
+        .get("operation-id")
+        .and_then(|value| value.to_str().ok());
+    if let Some(operation_id) = operation_id {
+        eprintln!(
+            "{} Timeout waiting for policy update operation {}; update remains committed",
+            "✗".red().bold(),
+            operation_id
+        );
+    } else {
+        eprintln!(
+            "{} Timeout waiting for policy update; update remains committed",
+            "✗".red().bold()
+        );
+    }
+    Some(POLICY_WAIT_TIMEOUT_EXIT_CODE)
+}
+
+fn report_config_update_operation(
+    operation: Option<&ConfigUpdateOperation>,
+    version: u32,
+) -> Result<()> {
+    let operation =
+        operation.ok_or_else(|| miette!("gateway omitted the requested completion operation"))?;
+    match ConfigUpdateOperationState::try_from(operation.state).unwrap_or_default() {
+        ConfigUpdateOperationState::Applied => {
+            if operation.outcome == openshell_core::proto::ConfigApplyOutcome::Degraded as i32 {
+                eprintln!(
+                    "{} Policy version {} applied with degraded outcome (operation {}): {}",
+                    "!".yellow().bold(),
+                    version,
+                    operation.operation_id,
+                    operation.sanitized_error
+                );
+                return Ok(());
+            }
+            eprintln!(
+                "{} Policy version {} applied (operation {})",
+                "✓".green().bold(),
+                version,
+                operation.operation_id
+            );
+            Ok(())
+        }
+        ConfigUpdateOperationState::Inactive => {
+            eprintln!(
+                "{} Policy version {} committed; sandbox is inactive (operation {})",
+                "✓".green().bold(),
+                version,
+                operation.operation_id
+            );
+            Ok(())
+        }
+        ConfigUpdateOperationState::Failed
+        | ConfigUpdateOperationState::Superseded
+        | ConfigUpdateOperationState::Cancelled => Err(miette!(
+            "policy version {} did not apply: {} (operation {})",
+            version,
+            operation.sanitized_error,
+            operation.operation_id
+        )),
+        ConfigUpdateOperationState::Pending | ConfigUpdateOperationState::Unspecified => {
+            Err(miette!(
+                "gateway returned a non-terminal completion operation {}",
+                operation.operation_id
+            ))
+        }
+    }
+}
 
 fn proto_timestamp_ms(timestamp: Option<&prost_types::Timestamp>) -> i64 {
     timestamp
@@ -4969,7 +5046,7 @@ pub async fn sandbox_policy_set(
     timeout_secs: u64,
     workspace: &str,
     tls: &TlsOptions,
-) -> Result<()> {
+) -> Result<i32> {
     let policy = load_sandbox_policy(Some(policy_path))?
         .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
 
@@ -4990,17 +5067,35 @@ pub async fn sandbox_policy_set(
         .and_then(|r| r.into_inner().revision)
         .map_or(0, |r| r.version);
 
-    let response = client
+    let response = match client
         .update_config(UpdateConfigRequest {
             sandbox: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
             policy: Some(policy),
+            consistency: if wait {
+                ConfigUpdateConsistency::WaitForCompletion.into()
+            } else {
+                ConfigUpdateConsistency::CommitOnly.into()
+            },
+            wait_timeout: Some(
+                openshell_core::time::duration_from_std(Duration::from_secs(timeout_secs))
+                    .into_diagnostic()?,
+            ),
             ..Default::default()
         })
         .await
-        .into_diagnostic()?;
+    {
+        Ok(response) => response,
+        Err(status) if wait => {
+            if let Some(exit_code) = report_policy_wait_timeout(&status) {
+                return Ok(exit_code);
+            }
+            return Err(status).into_diagnostic();
+        }
+        Err(status) => return Err(status).into_diagnostic(),
+    };
 
     let resp = response.into_inner();
 
@@ -5011,7 +5106,7 @@ pub async fn sandbox_policy_set(
             resp.version,
             &resp.policy_hash[..12]
         );
-        return Ok(());
+        return Ok(0);
     }
 
     eprintln!(
@@ -5022,70 +5117,11 @@ pub async fn sandbox_policy_set(
     );
 
     if !wait {
-        return Ok(());
+        return Ok(0);
     }
 
-    // Poll for status until loaded, failed, or timeout.
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        if Instant::now() > deadline {
-            eprintln!(
-                "{} Timeout waiting for policy version {} to load",
-                "✗".red().bold(),
-                resp.version
-            );
-            std::process::exit(124);
-        }
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        let status_resp = client
-            .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
-                sandbox: name.to_string(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(
-                    workspace.to_string(),
-                )),
-                version: resp.version,
-                global: false,
-            })
-            .await
-            .into_diagnostic()?;
-
-        let inner = status_resp.into_inner();
-        if let Some(rev) = &inner.revision {
-            let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
-            match status {
-                PolicyStatus::Loaded => {
-                    eprintln!(
-                        "{} Policy version {} loaded (active version: {})",
-                        "✓".green().bold(),
-                        rev.version,
-                        inner.active_version
-                    );
-                    return Ok(());
-                }
-                PolicyStatus::Failed => {
-                    eprintln!(
-                        "{} Policy version {} failed to load: {}",
-                        "✗".red().bold(),
-                        rev.version,
-                        rev.load_error
-                    );
-                    std::process::exit(1);
-                }
-                PolicyStatus::Superseded => {
-                    eprintln!(
-                        "{} Policy version {} was superseded (active version: {})",
-                        "⚠".yellow().bold(),
-                        rev.version,
-                        inner.active_version
-                    );
-                    return Ok(());
-                }
-                _ => {} // still pending, keep polling
-            }
-        }
-    }
+    report_config_update_operation(resp.operation.as_ref(), resp.version)?;
+    Ok(0)
 }
 
 /// Preview or atomically submit explicitly scoped incremental policy operations.
@@ -5107,7 +5143,7 @@ pub async fn sandbox_policy_update(
     timeout_secs: u64,
     workspace: &str,
     tls: &TlsOptions,
-) -> Result<()> {
+) -> Result<i32> {
     if dry_run && wait {
         return Err(miette!("--wait cannot be combined with --dry-run"));
     }
@@ -5156,23 +5192,40 @@ pub async fn sandbox_policy_update(
         );
         print_policy_merge_warnings(&merged.warnings);
         print_sandbox_policy(&merged.policy);
-        return Ok(());
+        return Ok(0);
     }
 
     let current_version = current.version;
     let current_hash = current.policy_hash.clone();
-    let response = client
+    let response = match client
         .update_config(UpdateConfigRequest {
             sandbox: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
             merge_operations: plan.merge_operations,
+            consistency: if wait {
+                ConfigUpdateConsistency::WaitForCompletion.into()
+            } else {
+                ConfigUpdateConsistency::CommitOnly.into()
+            },
+            wait_timeout: Some(
+                openshell_core::time::duration_from_std(Duration::from_secs(timeout_secs))
+                    .into_diagnostic()?,
+            ),
             ..Default::default()
         })
         .await
-        .into_diagnostic()?
-        .into_inner();
+    {
+        Ok(response) => response.into_inner(),
+        Err(status) if wait => {
+            if let Some(exit_code) = report_policy_wait_timeout(&status) {
+                return Ok(exit_code);
+            }
+            return Err(status).into_diagnostic();
+        }
+        Err(status) => return Err(status).into_diagnostic(),
+    };
 
     print_policy_merge_warnings(&merged.warnings);
 
@@ -5183,7 +5236,7 @@ pub async fn sandbox_policy_update(
             response.version,
             short_hash(&response.policy_hash)
         );
-        return Ok(());
+        return Ok(0);
     }
 
     eprintln!(
@@ -5194,69 +5247,11 @@ pub async fn sandbox_policy_update(
     );
 
     if !wait {
-        return Ok(());
+        return Ok(0);
     }
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        if Instant::now() > deadline {
-            eprintln!(
-                "{} Timeout waiting for policy version {} to load",
-                "✗".red().bold(),
-                response.version
-            );
-            std::process::exit(124);
-        }
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        let status_resp = client
-            .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
-                sandbox: name.to_string(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(
-                    workspace.to_string(),
-                )),
-                version: response.version,
-                global: false,
-            })
-            .await
-            .into_diagnostic()?;
-
-        let inner = status_resp.into_inner();
-        if let Some(rev) = &inner.revision {
-            let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
-            match status {
-                PolicyStatus::Loaded => {
-                    eprintln!(
-                        "{} Policy version {} loaded (active version: {})",
-                        "✓".green().bold(),
-                        rev.version,
-                        inner.active_version
-                    );
-                    return Ok(());
-                }
-                PolicyStatus::Failed => {
-                    eprintln!(
-                        "{} Policy version {} failed to load: {}",
-                        "✗".red().bold(),
-                        rev.version,
-                        rev.load_error
-                    );
-                    std::process::exit(1);
-                }
-                PolicyStatus::Superseded => {
-                    eprintln!(
-                        "{} Policy version {} was superseded (active version: {})",
-                        "⚠".yellow().bold(),
-                        rev.version,
-                        inner.active_version
-                    );
-                    return Ok(());
-                }
-                _ => {}
-            }
-        }
-    }
+    report_config_update_operation(response.operation.as_ref(), response.version)?;
+    Ok(0)
 }
 
 pub async fn sandbox_policy_get(

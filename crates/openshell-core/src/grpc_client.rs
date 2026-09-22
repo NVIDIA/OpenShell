@@ -1253,14 +1253,14 @@ fn provider_subject_token_exchange_status(status: Status) -> miette::Report {
 
 /// A reusable gRPC client for the `OpenShell` service.
 ///
-/// Wraps a tonic channel connected once and reused for policy polling
-/// and status reporting, avoiding per-request TLS handshake overhead.
+/// Wraps a tonic channel connected once and reused for status reporting and
+/// extension-credential rotation, avoiding per-request TLS handshake overhead.
 #[derive(Clone)]
 pub struct CachedOpenShellClient {
     client: OpenShellClient<AuthedChannel>,
     workspace: Arc<tokio::sync::OnceCell<String>>,
     /// Extension credentials for this supervisor. Cloning the client shares
-    /// the store, so the middleware registry and the polling loop that rotates
+    /// the store, so the middleware registry and the stream loop that rotates
     /// it observe the same slots.
     extension_credentials: ExtensionCredentialStore,
 }
@@ -1541,7 +1541,7 @@ impl CachedOpenShellClient {
         endpoint: &str,
         extension_credentials: ExtensionCredentialStore,
     ) -> Result<Self> {
-        debug!(endpoint = %endpoint, "Connecting openshell gRPC client for policy polling");
+        debug!(endpoint = %endpoint, "Connecting reusable openshell gRPC client");
         let client = connect(endpoint).await?;
         Ok(Self {
             client,
@@ -1619,7 +1619,7 @@ impl CachedOpenShellClient {
     }
 
     /// Rotate every credential currently retained by the installed registry.
-    /// This remains available when configuration polling fails independently.
+    /// This remains available independently of streamed configuration updates.
     pub async fn refresh_installed_extension_credentials(&self) -> Result<()> {
         let names = self.extension_credentials.names();
         if names.is_empty() || !self.extension_credentials.needs_refresh(&names, now_ms()) {

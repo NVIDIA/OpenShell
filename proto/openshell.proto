@@ -459,6 +459,16 @@ service OpenShell {
     };
   }
 
+  // Get a durable sandbox configuration update operation by id.
+  rpc GetConfigUpdateOperation(GetConfigUpdateOperationRequest)
+      returns (GetConfigUpdateOperationResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
   // Get the load status of a specific policy version.
   rpc GetSandboxPolicyStatus(GetSandboxPolicyStatusRequest)
       returns (GetSandboxPolicyStatusResponse) {
@@ -2669,11 +2679,39 @@ message UpdateConfigRequest {
   // sandbox metadata as a convenience projection. For setting-only updates, it
   // only merges them into sandbox metadata.
   map<string, string> annotations = 9;
+  // Controls whether the RPC returns after commit or after the runtime reaches
+  // a terminal outcome, including failure, supersession, cancellation or inactivity.
+  // This is a completion mode, not a database consistency level.
+  // Unspecified preserves commit-only compatibility.
+  ConfigUpdateConsistency consistency = 12;
+  // Optional retry key scoped to the sandbox. Reusing a key returns the
+  // original operation and never creates another desired-state revision.
+  string idempotency_key = 13;
+  // Server-side wait bound for WAIT_FOR_COMPLETION. Zero uses 60 seconds. The
+  // operation remains durable and may complete after this RPC times out.
+  reserved 14;
+  reserved "wait_timeout_secs";
+  google.protobuf.Duration wait_timeout = 114;
   // Required for sandbox-scoped updates and empty for global updates.
   string sandbox = 1;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 11;
+}
+
+enum ConfigUpdateConsistency {
+  CONFIG_UPDATE_CONSISTENCY_UNSPECIFIED = 0;
+  CONFIG_UPDATE_CONSISTENCY_COMMIT_ONLY = 1;
+  CONFIG_UPDATE_CONSISTENCY_WAIT_FOR_COMPLETION = 2;
+}
+
+message GetConfigUpdateOperationRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+  string operation_id = 1;
+}
+
+message GetConfigUpdateOperationResponse {
+  ConfigUpdateOperation operation = 1;
 }
 
 message PolicyMergeOperation {
@@ -2747,6 +2785,9 @@ message UpdateConfigResponse {
   bool deleted = 4;
   // Sandbox metadata annotations after the update. Empty for global updates.
   map<string, string> annotations = 5;
+  // Durable completion operation for a sandbox-scoped request, including an
+  // unchanged desired value. Omitted for global changes.
+  ConfigUpdateOperation operation = 6;
 }
 
 // Get sandbox policy status request.

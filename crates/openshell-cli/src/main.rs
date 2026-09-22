@@ -2980,7 +2980,7 @@ async fn run_async() -> Result<()> {
                         .await?;
                     } else {
                         let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
-                        run::sandbox_policy_set(
+                        let exit_code = run::sandbox_policy_set(
                             &ctx.endpoint,
                             &name,
                             &policy,
@@ -2990,6 +2990,9 @@ async fn run_async() -> Result<()> {
                             &tls,
                         )
                         .await?;
+                        if exit_code != 0 {
+                            std::process::exit(exit_code);
+                        }
                     }
                 }
                 PolicyCommands::Update {
@@ -3008,7 +3011,7 @@ async fn run_async() -> Result<()> {
                     timeout,
                 } => {
                     let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
-                    run::sandbox_policy_update(
+                    let exit_code = run::sandbox_policy_update(
                         &ctx.endpoint,
                         &name,
                         &add_endpoints,
@@ -3027,6 +3030,9 @@ async fn run_async() -> Result<()> {
                         &tls,
                     )
                     .await?;
+                    if exit_code != 0 {
+                        std::process::exit(exit_code);
+                    }
                 }
                 PolicyCommands::Get {
                     name,

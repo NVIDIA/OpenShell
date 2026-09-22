@@ -33,11 +33,12 @@ use openshell_core::proto::{
     ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, ExtensionKind,
     FinalizeMainProcessExitRequest, FinalizeMainProcessExitResponse, GatewayMessage,
-    GetCurrentUserRequest, GetCurrentUserResponse, GetDraftHistoryRequest, GetDraftHistoryResponse,
-    GetDraftPolicyRequest, GetDraftPolicyResponse, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetGatewayInfoRequest, GetGatewayInfoResponse,
-    GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
-    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetConfigUpdateOperationRequest, GetConfigUpdateOperationResponse, GetCurrentUserRequest,
+    GetCurrentUserResponse, GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest,
+    GetDraftPolicyResponse, GetGatewayConfigRequest, GetGatewayConfigResponse,
+    GetGatewayInfoRequest, GetGatewayInfoResponse, GetProviderProfileRequest,
+    GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse, GetProviderRequest,
+    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
     GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
     GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse, GetSandboxRequest,
@@ -619,13 +620,6 @@ impl OpenShell for OpenShellService {
         policy::handle_get_gateway_config(&self.state, request).await
     }
 
-    async fn get_sandbox_provider_environment(
-        &self,
-        request: Request<GetSandboxProviderEnvironmentRequest>,
-    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
-        policy::handle_get_sandbox_provider_environment(&self.state, request).await
-    }
-
     async fn exchange_provider_subject_token(
         &self,
         request: Request<ExchangeProviderSubjectTokenRequest>,
@@ -637,7 +631,45 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<UpdateConfigRequest>,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        let consistency =
+            openshell_core::proto::ConfigUpdateConsistency::try_from(request.get_ref().consistency)
+                .map_err(|_| Status::invalid_argument("unknown update consistency"))?;
+        let wait = consistency == openshell_core::proto::ConfigUpdateConsistency::WaitForCompletion;
+        if wait && request.get_ref().global {
+            return Err(Status::invalid_argument(
+                "WAIT_FOR_COMPLETION is only supported for sandbox-scoped updates",
+            ));
+        }
+        let timeout = policy::config_wait_timeout(request.get_ref().wait_timeout.as_ref())?;
+        let mut response = mutation_replay::run(&self.state, request).await?;
+        if wait {
+            let id = response
+                .get_ref()
+                .operation
+                .as_ref()
+                .ok_or_else(|| Status::internal("gateway omitted completion operation"))?
+                .operation_id
+                .clone();
+            response.get_mut().operation = Some(
+                crate::config_update_operation::wait_for_terminal(&self.state, &id, timeout)
+                    .await?,
+            );
+        }
+        Ok(response)
+    }
+
+    async fn get_config_update_operation(
+        &self,
+        request: Request<GetConfigUpdateOperationRequest>,
+    ) -> Result<Response<GetConfigUpdateOperationResponse>, Status> {
+        policy::handle_get_config_update_operation(&self.state, request).await
+    }
+
+    async fn get_sandbox_provider_environment(
+        &self,
+        request: Request<GetSandboxProviderEnvironmentRequest>,
+    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
+        policy::handle_get_sandbox_provider_environment(&self.state, request).await
     }
 
     async fn get_sandbox_policy_status(

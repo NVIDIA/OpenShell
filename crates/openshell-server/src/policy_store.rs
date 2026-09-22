@@ -4,7 +4,7 @@
 use crate::persistence::{
     DraftChunkRecord, PersistenceError, PersistenceResult, PolicyRecord, SetResourceVersion, Store,
 };
-use crate::storage_proto::{DraftChunkPayload, PolicyRevisionPayload};
+use crate::storage_proto::{DraftChunkPayload, PolicyRevisionPayload, StoredConfigUpdateOperation};
 use openshell_core::proto::{NetworkPolicyRule, Sandbox, SandboxPolicy as ProtoSandboxPolicy};
 use prost::Message;
 use std::collections::HashMap;
@@ -37,6 +37,7 @@ pub struct AtomicPolicyRevisionWrite {
     /// Populate the create-time baseline, or replace it while startup admission
     /// is blocked and no workload has consumed the static restrictions.
     pub backfill_policy: Option<ProtoSandboxPolicy>,
+    pub operation: Option<StoredConfigUpdateOperation>,
 }
 
 pub fn policy_record_for_atomic_write(
@@ -663,6 +664,7 @@ mod tests {
             .read_write
             .push("/new-static-path".to_string());
         let write = AtomicPolicyRevisionWrite {
+            operation: None,
             id: "revision".to_string(),
             sandbox_id: "sandbox".to_string(),
             workspace: "default".to_string(),

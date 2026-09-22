@@ -64,7 +64,13 @@ def test_mutation_replay_preserves_sandbox_lifecycle_and_replacement(
             request_id=str(uuid.uuid4()),
         )
         updated = stub.UpdateConfig(update, timeout=30)
-        assert replay(stub.UpdateConfig, update) == updated
+        replayed_update = replay(stub.UpdateConfig, update)
+        assert replayed_update.version == updated.version
+        assert replayed_update.policy_hash == updated.policy_hash
+        assert replayed_update.settings_revision == updated.settings_revision
+        assert replayed_update.deleted == updated.deleted
+        assert replayed_update.annotations == updated.annotations
+        assert replayed_update.operation.operation_id == updated.operation.operation_id
         delete = openshell_pb2.DeleteSandboxRequest(
             name=name,
             workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=scope),

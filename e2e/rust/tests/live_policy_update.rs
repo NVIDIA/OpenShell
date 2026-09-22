@@ -12,7 +12,7 @@
 //!
 //! These tests replace the Python e2e tests `test_live_policy_update_and_logs`
 //! and `test_live_policy_update_from_empty_network_policies`, which were flaky
-//! due to hard-coded 90s poll timeouts. The Rust tests use the CLI's built-in
+//! due to hard-coded 90s wait timeouts. The Rust tests use the CLI's built-in
 //! `--wait` flag for reliable synchronization.
 //!
 //! Note: the removed Python tests also covered `GetSandboxLogs` RPC and

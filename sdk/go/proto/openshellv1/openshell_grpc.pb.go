@@ -68,6 +68,7 @@ const (
 	OpenShell_GetSandboxConfig_FullMethodName              = "/openshell.v1.OpenShell/GetSandboxConfig"
 	OpenShell_GetGatewayConfig_FullMethodName              = "/openshell.v1.OpenShell/GetGatewayConfig"
 	OpenShell_UpdateConfig_FullMethodName                  = "/openshell.v1.OpenShell/UpdateConfig"
+	OpenShell_GetConfigUpdateOperation_FullMethodName      = "/openshell.v1.OpenShell/GetConfigUpdateOperation"
 	OpenShell_GetSandboxPolicyStatus_FullMethodName        = "/openshell.v1.OpenShell/GetSandboxPolicyStatus"
 	OpenShell_ListSandboxPolicies_FullMethodName           = "/openshell.v1.OpenShell/ListSandboxPolicies"
 	OpenShell_ReportPolicyStatus_FullMethodName            = "/openshell.v1.OpenShell/ReportPolicyStatus"
@@ -225,6 +226,8 @@ type OpenShellClient interface {
 	GetGatewayConfig(ctx context.Context, in *sandboxv1.GetGatewayConfigRequest, opts ...grpc.CallOption) (*sandboxv1.GetGatewayConfigResponse, error)
 	// Update settings or policy at sandbox or global scope.
 	UpdateConfig(ctx context.Context, in *UpdateConfigRequest, opts ...grpc.CallOption) (*UpdateConfigResponse, error)
+	// Get a durable sandbox configuration update operation by id.
+	GetConfigUpdateOperation(ctx context.Context, in *GetConfigUpdateOperationRequest, opts ...grpc.CallOption) (*GetConfigUpdateOperationResponse, error)
 	// Get the load status of a specific policy version.
 	GetSandboxPolicyStatus(ctx context.Context, in *GetSandboxPolicyStatusRequest, opts ...grpc.CallOption) (*GetSandboxPolicyStatusResponse, error)
 	// List policy history for a sandbox.
@@ -811,6 +814,16 @@ func (c *openShellClient) UpdateConfig(ctx context.Context, in *UpdateConfigRequ
 	return out, nil
 }
 
+func (c *openShellClient) GetConfigUpdateOperation(ctx context.Context, in *GetConfigUpdateOperationRequest, opts ...grpc.CallOption) (*GetConfigUpdateOperationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetConfigUpdateOperationResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetConfigUpdateOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *openShellClient) GetSandboxPolicyStatus(ctx context.Context, in *GetSandboxPolicyStatusRequest, opts ...grpc.CallOption) (*GetSandboxPolicyStatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetSandboxPolicyStatusResponse)
@@ -1320,6 +1333,8 @@ type OpenShellServer interface {
 	GetGatewayConfig(context.Context, *sandboxv1.GetGatewayConfigRequest) (*sandboxv1.GetGatewayConfigResponse, error)
 	// Update settings or policy at sandbox or global scope.
 	UpdateConfig(context.Context, *UpdateConfigRequest) (*UpdateConfigResponse, error)
+	// Get a durable sandbox configuration update operation by id.
+	GetConfigUpdateOperation(context.Context, *GetConfigUpdateOperationRequest) (*GetConfigUpdateOperationResponse, error)
 	// Get the load status of a specific policy version.
 	GetSandboxPolicyStatus(context.Context, *GetSandboxPolicyStatusRequest) (*GetSandboxPolicyStatusResponse, error)
 	// List policy history for a sandbox.
@@ -1575,6 +1590,9 @@ func (UnimplementedOpenShellServer) GetGatewayConfig(context.Context, *sandboxv1
 }
 func (UnimplementedOpenShellServer) UpdateConfig(context.Context, *UpdateConfigRequest) (*UpdateConfigResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdateConfig not implemented")
+}
+func (UnimplementedOpenShellServer) GetConfigUpdateOperation(context.Context, *GetConfigUpdateOperationRequest) (*GetConfigUpdateOperationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetConfigUpdateOperation not implemented")
 }
 func (UnimplementedOpenShellServer) GetSandboxPolicyStatus(context.Context, *GetSandboxPolicyStatusRequest) (*GetSandboxPolicyStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSandboxPolicyStatus not implemented")
@@ -2489,6 +2507,24 @@ func _OpenShell_UpdateConfig_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_GetConfigUpdateOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetConfigUpdateOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetConfigUpdateOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetConfigUpdateOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetConfigUpdateOperation(ctx, req.(*GetConfigUpdateOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OpenShell_GetSandboxPolicyStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetSandboxPolicyStatusRequest)
 	if err := dec(in); err != nil {
@@ -3278,6 +3314,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UpdateConfig",
 			Handler:    _OpenShell_UpdateConfig_Handler,
+		},
+		{
+			MethodName: "GetConfigUpdateOperation",
+			Handler:    _OpenShell_GetConfigUpdateOperation_Handler,
 		},
 		{
 			MethodName: "GetSandboxPolicyStatus",

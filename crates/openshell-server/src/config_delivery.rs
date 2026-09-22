@@ -26,11 +26,6 @@ use crate::supervisor_session::SupervisorSessionRegistry;
 /// future envelope fields.
 pub const MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES: usize = 3 * 1024 * 1024;
 const CONFIG_SNAPSHOT_BUILD_TIMEOUT: Duration = Duration::from_secs(45);
-// Stage 1 bootstrap is optional. Keep credential backend stalls well below
-// the 15-second relay session-wait budget while polling remains authoritative.
-pub const OPTIONAL_CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = Duration::from_secs(1);
-// Stage 2 supervisors apply the bootstrap directly, so allow the same bounded
-// build window as an ordinary complete snapshot before rejecting the session.
 pub const REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = CONFIG_SNAPSHOT_BUILD_TIMEOUT;
 const MAX_ACTIVE_FANOUT_WORKERS: usize = 64;
 /// Concurrent snapshot builds allowed per pooled database connection. Builds
@@ -88,6 +83,7 @@ pub trait SupervisorConfigRouter: fmt::Debug + Send + Sync {
         &self,
         sandbox_id: &str,
         message: SupervisorConfigMessage,
+        require_acknowledgement: bool,
     ) -> DeliveryDisposition;
 
     async fn routable_sandbox_ids(&self) -> Vec<String>;
@@ -111,8 +107,10 @@ impl SupervisorConfigRouter for LocalSupervisorConfigRouter {
         &self,
         sandbox_id: &str,
         message: SupervisorConfigMessage,
+        require_acknowledgement: bool,
     ) -> DeliveryDisposition {
-        self.sessions.deliver_config(sandbox_id, message)
+        self.sessions
+            .deliver_config(sandbox_id, message, require_acknowledgement)
     }
 
     async fn routable_sandbox_ids(&self) -> Vec<String> {
@@ -569,7 +567,7 @@ async fn enqueue_sandbox_from_fanout(
 
 async fn publish_sandbox_component_now(state: &Arc<ServerState>, key: &DeliveryKey) {
     let component = key.component.name();
-    let build = async {
+    let build = Box::pin(async {
         let sandbox = state
             .store
             .get_message::<Sandbox>(&key.sandbox_id)
@@ -579,23 +577,39 @@ async fn publish_sandbox_component_now(state: &Arc<ServerState>, key: &DeliveryK
             return Ok(None);
         };
         match key.component {
-            ConfigComponentKind::SandboxConfig => build_sandbox_config_snapshot(state, &sandbox)
-                .await
-                .map(|snapshot| SupervisorConfigMessage::SandboxConfig(Box::new(snapshot))),
+            ConfigComponentKind::SandboxConfig => {
+                let snapshot = build_sandbox_config_snapshot(state, &sandbox).await?;
+                let requires_acknowledgement =
+                    crate::config_update_operation::associate_pending_with_snapshot(
+                        state,
+                        &key.sandbox_id,
+                        &snapshot,
+                    )
+                    .await?;
+                Ok((
+                    SupervisorConfigMessage::SandboxConfig(Box::new(snapshot)),
+                    requires_acknowledgement,
+                ))
+            }
             ConfigComponentKind::ProviderEnvironment => {
                 build_provider_environment_snapshot(state, &sandbox, true)
                     .await
-                    .map(SupervisorConfigMessage::ProviderEnvironment)
+                    .map(|snapshot| {
+                        (
+                            SupervisorConfigMessage::ProviderEnvironment(snapshot),
+                            false,
+                        )
+                    })
             }
         }
         .map(Some)
-    };
+    });
     match state.config_delivery_queue.run_bounded_build(build).await {
         Ok(Ok(None)) => {}
-        Ok(Ok(Some(message))) => {
+        Ok(Ok(Some((message, requires_acknowledgement)))) => {
             let disposition = state
                 .supervisor_config_router()
-                .deliver(&key.sandbox_id, message)
+                .deliver(&key.sandbox_id, message, requires_acknowledgement)
                 .await;
             record_delivery(component, disposition);
         }
@@ -879,6 +893,7 @@ mod tests {
             &self,
             sandbox_id: &str,
             _message: SupervisorConfigMessage,
+            _require_acknowledgement: bool,
         ) -> DeliveryDisposition {
             self.visits.send(sandbox_id.to_string()).unwrap();
             assert!(
@@ -1325,86 +1340,5 @@ mod tests {
             .unwrap()
             .provider_env_revision = 7;
         assert!(bootstrap_revisions_match(&bootstrap));
-    }
-
-    #[tokio::test]
-    async fn stalled_credentials_do_not_block_session_acceptance() {
-        use openshell_core::proto::{CredentialHandle, Provider};
-
-        let state = test_server_state().await;
-        state
-            .store
-            .put_message(&Provider {
-                metadata: Some(ObjectMeta {
-                    id: "provider".into(),
-                    name: "provider".into(),
-                    workspace: "default".into(),
-                    ..Default::default()
-                }),
-                r#type: "github".into(),
-                credential_handles: HashMap::from([(
-                    "GITHUB_TOKEN".into(),
-                    CredentialHandle {
-                        driver: "test-static".into(),
-                        handle: "blocked".into(),
-                        ..Default::default()
-                    },
-                )]),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        state
-            .store
-            .put_message(&Sandbox {
-                metadata: Some(ObjectMeta {
-                    id: "sandbox".into(),
-                    name: "sandbox".into(),
-                    workspace: "default".into(),
-                    ..Default::default()
-                }),
-                spec: Some(SandboxSpec {
-                    providers: vec!["provider".into()],
-                    ..Default::default()
-                }),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let (resolve_hit, _release_resolve) = state.credentials.gate_next_resolve();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let connect = connect_supervisor_stream(
-                &state,
-                "sandbox",
-                openshell_core::proto::PREVIOUS_SUPERVISOR_PROTOCOL_REVISION,
-            );
-            let (response, hit) = tokio::join!(connect, resolve_hit);
-            hit.expect("bootstrap must reach the stalled credential driver");
-            let mut harness = response.unwrap();
-            let first = harness.inbound.message().await.unwrap().unwrap();
-            let Some(gateway_message::Payload::SessionAccepted(accepted)) = first.payload else {
-                panic!("expected session acceptance");
-            };
-            assert!(accepted.bootstrap.is_none());
-            assert!(
-                state
-                    .supervisor_sessions
-                    .is_current_session("sandbox", &accepted.session_id)
-            );
-            // Relay control remains usable while credential resolution is stalled.
-            let (_, relay) = state
-                .supervisor_sessions
-                .open_relay("sandbox", Duration::from_secs(1))
-                .await
-                .unwrap();
-            let message = harness.inbound.message().await.unwrap().unwrap();
-            assert!(matches!(
-                message.payload,
-                Some(gateway_message::Payload::RelayOpen(_))
-            ));
-            drop(relay);
-        })
-        .await
-        .expect("optional bootstrap must not consume the relay reconnect budget");
     }
 }
