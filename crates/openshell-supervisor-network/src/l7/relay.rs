@@ -2936,6 +2936,7 @@ fn evaluate_l7_request_once(
             "path": ctx.binary_path,
             "ancestors": ctx.ancestors,
             "cmdline_paths": ctx.cmdline_paths,
+            "match_paths": engine.binary_match_paths(),
         },
         "request": {
             "method": request.action,

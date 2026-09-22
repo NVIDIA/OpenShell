@@ -659,58 +659,6 @@ fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-/// Probe the released binary's live `network.proxy` support separately from
-/// ordinary `ProcessContainer` support. Some builds accept the proxy JSON during
-/// `--dry-run` but return `ERROR_INVALID_PARAMETER` from the live launcher.
-fn probe_processcontainer_proxy(wxc: &PathBuf) -> Result<(), String> {
-    let (_tempdir, temp_path) = temp_fixture();
-    let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|error| format!("failed to reserve proxy probe port: {error}"))?;
-    let proxy_port = proxy_listener
-        .local_addr()
-        .map_err(|error| format!("failed to read proxy probe port: {error}"))?
-        .port();
-    let config = serde_json::json!({
-        "version": "0.6.0-alpha",
-        "containerId": "probe-pc-proxy",
-        "containment": "processcontainer",
-        "process": {
-            "commandLine": "C:\\Windows\\System32\\cmd.exe /c exit 0",
-            "cwd": temp_path,
-            "timeout": 30_000,
-        },
-        "filesystem": {
-            "readwritePaths": [temp_path],
-        },
-        "processContainer": {
-            "leastPrivilege": false,
-        },
-        "network": {
-            "defaultPolicy": "block",
-            "proxy": { "localhost": proxy_port },
-        },
-    });
-
-    let json = serde_json::to_string(&config).unwrap();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
-    let output = Command::new(wxc)
-        .arg("--config-base64")
-        .arg(&b64)
-        .output()
-        .map_err(|error| format!("wxc-exec proxy probe failed to spawn: {error}"))?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    Err(format!(
-        "live network.proxy probe returned exit {}: stdout={} stderr={}",
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    ))
-}
-
 /// Probe the `isolation_session` backend.
 ///
 /// Attempts a `provision` phase. Returns `Ok(sandbox_id)` when live, or
@@ -1013,11 +961,6 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
         eprintln!("SKIP: processcontainer not live: {reason}");
         return;
     }
-    if let Err(reason) = probe_processcontainer_proxy(&wxc) {
-        eprintln!("SKIP: processcontainer network.proxy not live: {reason}");
-        return;
-    }
-
     let system_root = std::env::var("SYSTEMROOT").expect("SYSTEMROOT must be set on Windows");
     let cmd = PathBuf::from(&system_root).join("System32").join("cmd.exe");
     let curl = PathBuf::from(system_root).join("System32").join("curl.exe");
@@ -1029,10 +972,14 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
     let output_dir = tempfile::tempdir().expect("HTTPS output directory");
     let output_path = output_dir.path().join("example.html");
     let certificate_path = output_dir.path().join("peer-certificate.txt");
+    let post_response_path = output_dir.path().join("post-response.json");
+    let post_status_path = output_dir.path().join("post-status.txt");
     let diagnostic_path = output_dir.path().join("https-diagnostic.txt");
     let output_dir_string = output_dir.path().to_string_lossy().into_owned();
     let output_path_string = output_path.to_string_lossy().into_owned();
     let certificate_path_string = certificate_path.to_string_lossy().into_owned();
+    let post_response_path_string = post_response_path.to_string_lossy().into_owned();
+    let post_status_path_string = post_status_path.to_string_lossy().into_owned();
     let diagnostic_path_string = diagnostic_path.to_string_lossy().into_owned();
     let cmd_string = cmd.to_string_lossy().into_owned();
     // Schannel's revocation lookup targets are intentionally outside this
@@ -1046,8 +993,15 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
          --cacert \"%CURL_CA_BUNDLE%\" \
          https://example.com/ --output \"{output_path_string}\" \
          --write-out \"%{{certs}}\" 1>\"{certificate_path_string}\" \
+         2>>\"{diagnostic_path_string}\" && \
+         \"{}\" --silent --show-error --ssl-no-revoke \
+         --cacert \"%CURL_CA_BUNDLE%\" --request POST \
+         --header \"Content-Type: application/json\" --data \"{{}}\" \
+         https://example.com/ --output \"{post_response_path_string}\" \
+         --write-out \"%{{http_code}}\" 1>\"{post_status_path_string}\" \
          2>>\"{diagnostic_path_string}\"",
-        curl.display()
+        curl.display(),
+        curl.display(),
     );
     let command = vec![
         cmd_string.clone(),
@@ -1155,6 +1109,19 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
     assert!(
         peer_certificate.contains("OpenShell Sandbox CA"),
         "HTTPS response must use a certificate issued by the host proxy CA"
+    );
+    let post_status = std::fs::read_to_string(post_status_path).expect("POST status output");
+    assert_eq!(
+        post_status.trim(),
+        "403",
+        "read-only policy must deny HTTPS POST"
+    );
+    let post_response =
+        std::fs::read_to_string(post_response_path).expect("POST denial response body");
+    assert!(
+        post_response.contains("policy_denied")
+            || post_response.contains("no matching L7 allow rule"),
+        "POST denial must come from the OpenShell L7 policy: {post_response}"
     );
 }
 

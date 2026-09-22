@@ -163,9 +163,12 @@ exclusive on a single host (each rejects the other architecture -- see the
 table below): run `windows:test:mxc-real:x64` on an x64 host, or
 `windows:test:mxc-real:arm64` on an ARM64 host, as part of validating this
 subsystem -- run the one matching your host architecture, not both, and not
-neither. Both are skip-safe (they print a SKIP reason and exit 0 when
-`wxc-exec` or the matching backend isn't available), so running the
-arch-appropriate task is always safe even without real MXC hardware. Neither
+neither. Both print a SKIP reason and exit 0 when `wxc-exec` or the matching
+backend is unavailable. Once the host proves that ProcessContainer is live,
+however, required capabilities are authoritative: rejection of
+`network.proxy` or another enforcement failure fails the task. Running the
+architecture-appropriate task is therefore safe without real MXC hardware but
+must not be described as wholly skip-safe on supported hardware. Neither task
 is part of `windows:ci`'s ordered contract, so invoke it explicitly.
 
 For GB300 Windows ARM64 qualification, do not use the skip-safe developer task

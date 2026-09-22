@@ -179,7 +179,12 @@ impl MxcBackend {
 #[serde(default, deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)] // Independent, existing gateway TOML options.
 pub struct MxcComputeConfig {
-    /// Path to `wxc-exec.exe`. Required for live runs.
+    /// Path to `wxc-exec.exe`. Required for live runs, and must be an
+    /// absolute path: `wxc-exec` is the binary that builds every sandbox, so
+    /// a relative path (including the unset default) would let PATH-lookup
+    /// or working-directory-relative resolution execute a decoy binary with
+    /// the gateway's identity instead of the approved `wxc-exec`. Enforced
+    /// at gateway startup by the compute-driver config preflight.
     pub wxc_exec_path: String,
     /// Backend to target. Default: `process_container`.
     pub backend: MxcBackend,
@@ -256,7 +261,12 @@ pub struct MxcComputeConfig {
 impl Default for MxcComputeConfig {
     fn default() -> Self {
         Self {
-            wxc_exec_path: "wxc-exec.exe".into(),
+            // No usable default: `wxc_exec_path` must be explicitly set to an
+            // absolute path (see `validate_configuration` and the field doc
+            // comment above). Shipping a bare relative filename here would
+            // silently reintroduce the exact PATH/CWD-hijack risk the
+            // validation exists to reject.
+            wxc_exec_path: String::new(),
             backend: MxcBackend::default(),
             pc_least_privilege: false,
             pc_capabilities: Vec::new(),
@@ -272,6 +282,32 @@ impl Default for MxcComputeConfig {
             debug: false,
             etw_audit: false,
         }
+    }
+}
+
+impl MxcComputeConfig {
+    /// Validate startup configuration without touching `wxc-exec` or the
+    /// filesystem beyond `Path::is_absolute`.
+    ///
+    /// `wxc_exec_path` must be set to an absolute path: it is the binary
+    /// that builds every sandbox, so a relative path (including an unset,
+    /// empty value) would let PATH-lookup or working-directory-relative
+    /// resolution execute a decoy binary with the gateway's identity instead
+    /// of the approved `wxc-exec`, turning the containment mechanism itself
+    /// into an arbitrary-code-execution primitive.
+    pub fn validate_configuration(&self) -> openshell_core::Result<()> {
+        if self.wxc_exec_path.trim().is_empty() {
+            return Err(openshell_core::Error::config(
+                "[openshell.drivers.mxc] wxc_exec_path must be set to an absolute path to wxc-exec.exe",
+            ));
+        }
+        if !Path::new(&self.wxc_exec_path).is_absolute() {
+            return Err(openshell_core::Error::config(format!(
+                "[openshell.drivers.mxc] wxc_exec_path must be an absolute path, got '{}'",
+                self.wxc_exec_path
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -433,23 +469,39 @@ impl std::fmt::Debug for MxcComputeBackend {
 }
 
 fn sandbox_config(sandbox: &DriverSandbox) -> Result<MxcSandboxConfig, tonic::Status> {
-    let config = sandbox
+    let driver_config = sandbox
         .spec
         .as_ref()
         .and_then(|spec| spec.template.as_ref())
-        .and_then(|template| template.driver_config.as_ref())
-        .ok_or_else(|| {
-            tonic::Status::invalid_argument(
-                "mxc requires template.driver_config.mxc with a non-empty command array",
-            )
-        })?;
-    let config: MxcSandboxConfig =
-        serde_json::from_value(struct_to_json_value(config)).map_err(|error| {
-            tonic::Status::invalid_argument(format!("invalid mxc driver_config: {error}"))
-        })?;
+        .and_then(|template| template.driver_config.as_ref());
+    let config = match driver_config {
+        // Explicit, MXC-specific override (`--driver-config-json`). Takes
+        // priority over the generic CLI command below since it's the most
+        // deliberately-targeted input a caller can supply for this driver.
+        Some(driver_config) => serde_json::from_value(struct_to_json_value(driver_config))
+            .map_err(|error| {
+                tonic::Status::invalid_argument(format!("invalid mxc driver_config: {error}"))
+            })?,
+        // Generic, driver-agnostic `sandbox create -- <COMMAND>` syntax
+        // (`DriverSandboxSpec.command`, the same field every other compute
+        // driver honors). Previously silently ignored here: the caller's
+        // typed command was accepted by the CLI and discarded before ever
+        // reaching this function, surfacing only as a "must contain a
+        // non-empty executable" error that gave no hint a command had been
+        // supplied at all.
+        None => MxcSandboxConfig {
+            command: sandbox
+                .spec
+                .as_ref()
+                .map(|spec| spec.command.clone())
+                .unwrap_or_default(),
+            cwd: String::new(),
+        },
+    };
     if config.command.is_empty() || config.command[0].is_empty() {
         return Err(tonic::Status::invalid_argument(
-            "mxc driver_config.command must contain a non-empty executable",
+            "mxc sandbox command must contain a non-empty executable: set it via \
+             `sandbox create -- <COMMAND>` or `--driver-config-json`",
         ));
     }
     Ok(config)
@@ -2604,6 +2656,67 @@ mod lifecycle_tests {
             status: None,
         }
     }
+
+    /// A `DriverSandbox` carrying only the generic `sandbox create -- <COMMAND>`
+    /// field (`DriverSandboxSpec.command`), with no MXC-specific
+    /// `driver_config` at all -- the shape the CLI's documented,
+    /// driver-agnostic syntax actually produces.
+    fn driver_sandbox_with_cli_command(id: &str, command: Vec<String>) -> DriverSandbox {
+        DriverSandbox {
+            id: id.to_string(),
+            name: id.to_string(),
+            namespace: String::new(),
+            workspace: String::new(),
+            spec: Some(DriverSandboxSpec {
+                sandbox_token: "test-token".into(),
+                command,
+                ..Default::default()
+            }),
+            status: None,
+        }
+    }
+
+    #[test]
+    fn sandbox_config_honors_generic_cli_command() {
+        // Regression test: `sandbox create -- <COMMAND>` (the CLI's own
+        // documented, driver-agnostic syntax) must actually reach the MXC
+        // driver instead of being silently discarded.
+        let sandbox = driver_sandbox_with_cli_command(
+            "sb-cli-cmd",
+            vec!["cmd.exe".into(), "/c".into(), "exit".into()],
+        );
+        let config = sandbox_config(&sandbox).unwrap();
+        assert_eq!(
+            config.command,
+            vec!["cmd.exe".to_string(), "/c".to_string(), "exit".to_string()]
+        );
+    }
+
+    #[test]
+    fn sandbox_config_driver_config_takes_priority_over_cli_command() {
+        // `--driver-config-json` is the more deliberately-targeted input for
+        // this driver; if both are somehow supplied, it must win.
+        let mut sandbox =
+            driver_sandbox_with_command("sb-both", "", vec!["driver-config-cmd.exe".into()]);
+        sandbox.spec.as_mut().unwrap().command = vec!["cli-cmd.exe".into()];
+        let config = sandbox_config(&sandbox).unwrap();
+        assert_eq!(config.command, vec!["driver-config-cmd.exe".to_string()]);
+    }
+
+    #[test]
+    fn sandbox_config_rejects_empty_command_from_every_source() {
+        let sandbox = driver_sandbox_with_cli_command("sb-empty", Vec::new());
+        let error = sandbox_config(&sandbox).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        let message = error.message();
+        // Actionable: names both ways to supply a command, unlike the old
+        // "driver_config.command must contain a non-empty executable"
+        // message, which read as if the CLI's own command syntax weren't
+        // one of them.
+        assert!(message.contains("sandbox create -- <COMMAND>"));
+        assert!(message.contains("--driver-config-json"));
+    }
+
     fn fs_policy(read_write: &[&str]) -> SandboxPolicy {
         SandboxPolicy {
             filesystem: Some(FilesystemPolicy {
@@ -2779,6 +2892,50 @@ mod lifecycle_tests {
                 .expect_err("workload fields must not be accepted in gateway config");
             assert!(error.to_string().contains(field));
         }
+    }
+
+    #[test]
+    fn validate_configuration_rejects_unset_wxc_exec_path() {
+        // Regression test: the shipped default used to be the bare relative
+        // filename "wxc-exec.exe", which is exactly the PATH/CWD-hijack
+        // primitive this validation exists to reject. The default must stay
+        // rejected, not silently become a usable-but-insecure fallback.
+        let config = MxcComputeConfig::default();
+        assert!(config.wxc_exec_path.is_empty());
+        let error = config.validate_configuration().unwrap_err();
+        assert!(error.to_string().contains("wxc_exec_path"));
+    }
+
+    #[test]
+    fn validate_configuration_rejects_relative_wxc_exec_path() {
+        let config = MxcComputeConfig {
+            wxc_exec_path: "wxc-exec.exe".into(),
+            ..Default::default()
+        };
+        let error = config.validate_configuration().unwrap_err();
+        assert!(error.to_string().contains("wxc_exec_path"));
+
+        let config = MxcComputeConfig {
+            wxc_exec_path: r"..\wxc-exec.exe".into(),
+            ..Default::default()
+        };
+        assert!(config.validate_configuration().is_err());
+    }
+
+    #[test]
+    fn validate_configuration_accepts_absolute_wxc_exec_path() {
+        let config = MxcComputeConfig {
+            wxc_exec_path: r"C:\mxc-kit\bin\wxc-exec.exe".into(),
+            ..Default::default()
+        };
+        config.validate_configuration().unwrap();
+    }
+
+    #[test]
+    fn governed_egress_defaults_off_and_allocates_unique_loopback_ports() {
+        let config = MxcComputeConfig::default();
+        assert!(!config.egress_proxy);
+        assert!(config.egress_proxy_addr.is_empty());
     }
 
     #[test]

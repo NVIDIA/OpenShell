@@ -90,6 +90,14 @@ The proxy SHA256-hashes each binary on first use (trust-on-first-use). If someon
 | Risk if relaxed | Broad glob patterns (like `/**`) allow any binary to reach the endpoint, defeating the purpose of binary-scoped enforcement. |
 | Recommendation | Scope binaries to the specific executables that need each endpoint. Use narrow globs when the exact path varies (for example, across Python virtual environments). |
 
+On Windows, OpenShell normalizes `/` and `\` for ordinary binary paths and folds
+ASCII case only when trusted runtime evidence confirms that every parent
+directory uses case-insensitive lookup. A sensitive or indeterminate component
+keeps the whole match case-exact, so a case-distinct executable cannot inherit
+another executable's grant. Policy loading never opens policy-authored paths.
+UNC, device, and verbatim namespace paths are matched exactly without separator
+or case rewriting; prefer ordinary absolute paths.
+
 ### L4-Only vs L7 Inspection
 
 The `protocol` field on an endpoint controls whether the proxy inspects individual HTTP requests inside the tunnel.
@@ -124,6 +132,8 @@ This enables credential injection and L7 inspection without explicit configurati
 | What you can change | Set `tls: skip` on an endpoint to disable TLS detection and termination for that endpoint. Use this for client-certificate mTLS to upstream or non-standard binary protocols. |
 | Risk if relaxed | `tls: skip` disables placeholder credential rewriting, dynamic token grant injection, and L7 inspection for that endpoint. The proxy relays encrypted traffic without seeing the contents. |
 | Recommendation | Use auto-detect (the default) for most endpoints. Use `tls: skip` only when the upstream requires the client's own TLS certificate (mTLS) or uses a non-HTTP protocol. A provider-credentialed endpoint also requires the explicit `allow_uninspected_credentials: true` exception. |
+
+On Windows, inbox `curl.exe` uses Schannel and does not automatically honor the injected `CURL_CA_BUNDLE` value. Pass `--cacert %CURL_CA_BUNDLE%` explicitly when that client sends HTTPS traffic through an MXC governed-egress proxy. Other clients continue to use the trust variable they support.
 
 ### SSRF Protection
 

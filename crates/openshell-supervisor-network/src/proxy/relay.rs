@@ -77,12 +77,12 @@ pub(super) fn http_context(
         binary_path: decision
             .binary
             .as_ref()
-            .map(|path| path.to_string_lossy().into_owned())
+            .map(|path| crate::opa::network_binary_match_path(path))
             .unwrap_or_default(),
         ancestors: decision
             .ancestors
             .iter()
-            .map(|path| path.to_string_lossy().into_owned())
+            .map(|path| crate::opa::network_binary_match_path(path))
             .collect(),
         cmdline_paths: decision
             .cmdline_paths
@@ -115,9 +115,12 @@ pub(super) fn pin_policy_generation(
 /// Clone an L7 evaluator for a relay or the forward HTTP single-request path.
 pub(super) fn pin_l7_evaluator(
     opa_engine: &OpaEngine,
-    expected_generation: u64,
+    decision: &EgressDecision,
 ) -> Result<TunnelPolicyEngine> {
-    opa_engine.clone_engine_for_tunnel(expected_generation)
+    opa_engine.clone_engine_for_tunnel_with_match_paths(
+        decision.policy_generation,
+        decision.binary_match_paths.clone(),
+    )
 }
 
 pub(super) fn validate_route_generation(
@@ -160,7 +163,7 @@ pub(super) fn prepare_http_relay<'a>(
     }
 
     let policy = if let Some(route) = route.filter(|route| !route.configs.is_empty()) {
-        let evaluator = match pin_l7_evaluator(opa_engine, decision.policy_generation) {
+        let evaluator = match pin_l7_evaluator(opa_engine, decision) {
             Ok(evaluator) => evaluator,
             Err(error) => {
                 emit_l7_tunnel_close_after_policy_change(
@@ -357,8 +360,16 @@ fn emit_stale_relay_close(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    use super::super::query_l7_route_snapshot;
     use super::super::{EgressIntent, EndpointDecision, ProcessIdentityEvidence};
     use super::*;
+    #[cfg(target_os = "windows")]
+    use crate::opa::NetworkInput;
+    #[cfg(target_os = "windows")]
+    use std::path::PathBuf;
+    #[cfg(target_os = "windows")]
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const POLICY_REGO: &str = include_str!("../../data/sandbox-policy.rego");
     const EMPTY_POLICY_DATA: &str = "network_policies: {}\n";
@@ -376,6 +387,7 @@ mod tests {
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
+            binary_match_paths: Vec::new(),
         }
     }
 
@@ -399,6 +411,115 @@ mod tests {
             workspace: String::new(),
             endpoint_observation_tx: None,
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn inspected_http_relay_matches_mixed_case_windows_binary_path() {
+        let (mut caller, mut relay_client) = tokio::io::duplex(4096);
+        let (mut relay_upstream, mut server) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move {
+            let engine = OpaEngine::from_strings(
+                POLICY_REGO,
+                r"
+network_policies:
+  windows_binary:
+    endpoints:
+      - host: example.com
+        port: 80
+        protocol: rest
+        access: full
+    binaries:
+      - path: 'C:\WINDOWS\SYSTEM32\CURL.EXE'
+",
+            )
+            .expect("load Windows L7 policy");
+            let input = NetworkInput {
+                host: "example.com".to_string(),
+                port: 80,
+                binary_path: PathBuf::from("c:/windows/system32/curl.exe"),
+                binary_sha256: "unused".to_string(),
+                ancestors: Vec::new(),
+                cmdline_paths: Vec::new(),
+            };
+            let authorization = engine.authorize_egress(&input).expect("authorize egress");
+            assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
+            let decision = EgressDecision {
+                intent: EgressIntent::connect("example.com".to_string(), 80),
+                action: authorization.action.clone(),
+                policy_generation: authorization.generation,
+                identity: ProcessIdentityEvidence::Available,
+                endpoint: EndpointDecision::from_authorization(&authorization),
+                binary: Some(input.binary_path),
+                binary_pid: None,
+                ancestors: Vec::new(),
+                cmdline_paths: Vec::new(),
+                binary_match_paths: authorization.binary_match_paths.clone(),
+            };
+            let route = query_l7_route_snapshot(&decision, "example.com", 80)
+                .expect("REST endpoint should produce an inspected route");
+            let mut request = http_context(
+                &decision,
+                None,
+                None,
+                None,
+                openshell_core::proposals::AgentProposals::default(),
+                String::new(),
+                RelaySignals {
+                    activity: None,
+                    endpoint_observation: None,
+                },
+            );
+            request.request_default_port = Some(80);
+            let context = prepare_http_relay(
+                Some(&route),
+                &engine,
+                &decision,
+                &request,
+                openshell_ocsf::ctx::ctx(),
+            )
+            .expect("current policy generation should prepare the relay");
+            relay_http_stream(&mut relay_client, &mut relay_upstream, context).await
+        });
+
+        caller
+            .write_all(b"GET /v1 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write client request");
+        let mut forwarded = [0_u8; 512];
+        let forwarded_len = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.read(&mut forwarded),
+        )
+        .await
+        .expect("request should reach upstream")
+        .expect("read relayed request");
+        assert!(
+            forwarded[..forwarded_len].starts_with(b"GET /v1 HTTP/1.1\r\n"),
+            "unexpected upstream request: {:?}",
+            String::from_utf8_lossy(&forwarded[..forwarded_len])
+        );
+        server
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write upstream response");
+
+        let mut response = [0_u8; 512];
+        let response_len = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            caller.read(&mut response),
+        )
+        .await
+        .expect("response should reach client")
+        .expect("read relay response");
+        assert!(response[..response_len].starts_with(b"HTTP/1.1 204 No Content"));
+        drop(caller);
+        drop(server);
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .expect("HTTP relay should complete")
+            .expect("relay task should not panic")
+            .expect("HTTP relay should allow the normalized binary path");
     }
 
     #[test]

@@ -75,6 +75,14 @@ debug = false
 etw_audit = false
 ```
 
+`wxc_exec_path` is required and must be an absolute path to `wxc-exec.exe`.
+The gateway rejects an omitted or relative value (including the bare filename
+`wxc-exec.exe`) at startup, before any sandbox is created: `wxc-exec.exe` is
+the binary that builds every sandbox, so a relative value would let
+PATH-lookup or working-directory-relative resolution execute an unapproved
+binary with the gateway's identity instead of the approved `wxc-exec`. There
+is no usable default.
+
 When `egress_proxy` is enabled, `egress_proxy_addr` must be a loopback
 `IP:PORT` seed. For policies with explicit network rules, the driver preserves
 the configured IP and allocates a unique ephemeral port for that sandbox's
@@ -93,7 +101,7 @@ openshell sandbox create --name mxc-demo --policy demo.yaml `
   --driver-config-json $config --env MODE=demo --no-tty
 ```
 
-The `command` array is required and preserves Windows argument boundaries. `cwd` is optional. Supply per-sandbox environment variables with `--env` or `--env-from`; gateway configuration does not carry workload commands or environment. Provider-owned keys override matching entries case-insensitively, but raw static values remain in the host proxy; MXC receives their revision-scoped placeholders. When governed egress is enabled, the driver replaces common TLS trust environment variables with paths to public proxy CA files staged under `<cwd>/.openshell-proxy/<sandbox-id>/`, and injects `HTTP_PROXY`/`HTTPS_PROXY` while clearing `NO_PROXY` so inherited bypass rules cannot skip policy enforcement.
+The `command` array is required and preserves Windows argument boundaries. `cwd` is optional. The generic, driver-agnostic `sandbox create -- <COMMAND>` CLI syntax also works and is honored when no `--driver-config-json` is supplied; `--driver-config-json`'s `command` wins if both are somehow present. Supply per-sandbox environment variables with `--env` or `--env-from`; gateway configuration does not carry workload commands or environment. Provider-owned keys override matching entries case-insensitively, but raw static values remain in the host proxy; MXC receives their revision-scoped placeholders. When governed egress is enabled, the driver replaces common TLS trust environment variables with paths to public proxy CA files staged under `<cwd>/.openshell-proxy/<sandbox-id>/`, and injects `HTTP_PROXY`/`HTTPS_PROXY` while clearing `NO_PROXY` so inherited bypass rules cannot skip policy enforcement.
 
 UI capability (Win32k syscalls, clipboard, input injection) is a `SandboxPolicy` concern, not gateway TOML -- see the Capability Matrix above and `docs/reference/policy-schema.mdx`'s `ui` section. Defaults to disabled (Win32k syscall lockdown) when a policy has no explicit `ui:` section; set `allow_graphical_ui: true` for agents that touch user32/gdi32 at startup even without opening a real window (e.g. Node.js-based targets like OpenClaw's gateway -- see `examples/e2e-policies/openclaw-gateway.yaml`).
 
@@ -124,7 +132,26 @@ PID from inheriting the previous process's attribution regardless of delivery
 delay. The process monitor retires the live PID at exit. Established identity,
 activity, and correlation-vector links remain available for five seconds so
 already in-flight ETW records can arrive, but retired PID evidence cannot resolve
-them. Records without matching generation evidence remain unattributed.
+them. Records without matching generation evidence remain unattributed --
+deliberately: misattributing an ETW record to the wrong `sandbox_id` would
+corrupt the audit trail, which is worse than a coverage gap. Unrelated,
+non-OpenShell AppContainer or UAC activity shares this same OS Sandboxing
+provider and cannot be told apart from OpenShell's own records without this
+generation evidence, so guessing (for example, by assuming a lone pending
+launch owns an unmatched record) is not a safe substitute for it.
+
+An unattributed record is dropped after five seconds, and the driver warns
+once immediately, then coalesces further drops to at most one aggregated
+warning every 30 seconds while they continue -- unattributed drops are
+expected, ordinary activity, not a rare condition, so warning once per record
+would let a burst of that activity flood operator logs.
+
+If the real-time ETW session itself never matches a single record from the
+Sandboxing provider despite observed sandbox activity -- for example a
+provider-identity mismatch, or the provider not firing at all on a given
+host/build -- the driver warns once per session and emits a `mxc-etw-zero-events`
+OCSF Detection Finding [2004] naming the gap, distinct from the per-record
+unattributed-drop warning above.
 
 Each sandbox receives a distinct proxy listener and a random per-sandbox credential through its proxy environment. Missing, incorrect, duplicate, or another sandbox's proxy credentials receive HTTP 407 before policy evaluation or forwarding. This authenticates requests to the OpenShell proxy; it does not restrict access to unrelated host-loopback services or authenticate individual processes inside a sandbox. Proxy credentials and command/environment payloads must not be logged.
 
@@ -167,11 +194,18 @@ process env. In every environment mode, the driver stages the public CA files
 under the authorized `<cwd>/.openshell-proxy/<sandbox-id>` directory. The host
 proxy's private temporary directory is never added to the sandbox's read-write
 shares. The staged directory contains only public CA certificates; the ephemeral
-CA private key remains in the host proxy's memory. The driver
-seeds only `SYSTEMROOT`, `WINDIR`, `PATH`, `COMSPEC`, and `LOCALAPPDATA` from the
-gateway host before applying sandbox and TLS overrides, so required Windows
-bootstrap values remain available without exposing the gateway's full
-environment unless the gateway explicitly opts into another environment mode.
+CA private key remains in the host proxy's memory.
+
+Windows inbox `curl.exe` uses Schannel and ignores `CURL_CA_BUNDLE` as an
+environment variable, so workloads using it must pass
+`--cacert %CURL_CA_BUNDLE%` explicitly. Clients that honor the injected trust
+variables consume the same per-sandbox bundle directly.
+
+The driver seeds only `SYSTEMROOT`, `WINDIR`, `PATH`, `COMSPEC`, and
+`LOCALAPPDATA` from the gateway host before applying sandbox and TLS overrides,
+so required Windows bootstrap values remain available without exposing the
+gateway's full environment unless the gateway explicitly opts into another
+environment mode.
 
 When governed egress is disabled, any network rule fails closed during sandbox creation.
 
@@ -194,10 +228,12 @@ This example uses `process_container`. The `IsoSessionApp.dll` and
 
 ## Real-MXC test lane
 
-The generic real-`wxc-exec.exe` tasks are **skip-safe**: a test or scenario that
-requires an absent binary or backend prints a SKIP reason and exits 0. They are
-useful developer diagnostics, but a skipped run is not qualification evidence.
-The GB300 task is deliberately strict and fails on every required skip.
+The generic real-`wxc-exec.exe` tasks print a SKIP reason and exit 0 when the
+binary or requested backend is unavailable. Once ProcessContainer is live,
+required capabilities are authoritative: rejection of `network.proxy` or
+another enforcement failure fails the task. These tasks are useful developer
+diagnostics, but a skipped run is not qualification evidence. The GB300 task
+is deliberately strict and fails on every required skip.
 
 | Task | What it runs | When to use |
 |---|---|---|
