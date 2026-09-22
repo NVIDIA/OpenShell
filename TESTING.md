@@ -106,6 +106,21 @@ requires mTLS.
 
 ### Python E2E (`e2e/python/`)
 
+`mise run e2e:python` builds `openshell/e2e-python:dev` from
+`e2e/python/Dockerfile.workload` and selects it only for the test gateway.
+This Noble-based fixture supplies the `sandbox` user, Python tooling, Git,
+and a writable `/sandbox/.venv`. Its Python version comes from `.python-version`
+so cloudpickle code objects match the test runner. The production workload
+default remains the unmodified NVIDIA Ubuntu image.
+
+The Rust Docker harness also selects this fixture for tests that need tools
+or the named user. Explicit `--from` or `--template` arguments and the default-image
+tests retain their own image selection. Docker sandbox and support-container
+fixtures use the fixed image name; no workload-image override is needed.
+Podman, VM, and Kubernetes retain their existing pinned, pullable fixture and
+image setup. Conformance-only runs do not need the Docker fixture.
+Build the Docker fixture separately with `mise run e2e:workload:build`.
+
 Tests use the `sandbox` fixture from `conftest.py` to create real sandboxes:
 
 ```python

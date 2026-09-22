@@ -1334,7 +1334,7 @@ async fn acknowledged_provider_changes_apply_to_fresh_clients_and_revoke_retaine
         std::fs::write(
             &dockerfile,
             format!(
-                "FROM {E2E_WORKLOAD_IMAGE}\nUSER root\nRUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*\nCOPY client.py /opt/provider-readiness-client.py\nUSER 1000:1000\n"
+                "FROM {E2E_WORKLOAD_IMAGE}\nCOPY client.py /opt/provider-readiness-client.py\nUSER 1000:1000\n",
             ),
         )
         .map_err(|_| "could not write fixture Dockerfile")?;

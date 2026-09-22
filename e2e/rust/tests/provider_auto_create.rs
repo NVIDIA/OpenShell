@@ -22,6 +22,8 @@ use std::sync::Mutex;
 
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::output::{extract_field, strip_ansi};
+#[cfg(feature = "e2e-docker")]
+use openshell_e2e::harness::sandbox::E2E_WORKLOAD_IMAGE;
 
 const TEST_API_KEY: &str = "sk-e2e-auto-provider-test-key";
 static CLAUDE_PROVIDER_LOCK: Mutex<()> = Mutex::new(());
@@ -108,9 +110,10 @@ network_policies: {}
     // Create a sandbox that prints the ANTHROPIC_API_KEY env var.
     // --auto-providers skips the interactive prompt.
     let mut cmd = openshell_cmd();
-    cmd.arg("sandbox")
-        .arg("create")
-        .arg("--detach")
+    cmd.arg("sandbox").arg("create");
+    #[cfg(feature = "e2e-docker")]
+    cmd.arg("--from").arg(E2E_WORKLOAD_IMAGE);
+    cmd.arg("--detach")
         .arg("--policy")
         .arg(policy.path())
         .arg("--provider")

@@ -15,8 +15,7 @@ use std::time::Duration;
 use tokio::time::{interval, timeout};
 
 use super::port::find_free_port;
-
-const DEFAULT_TEST_SERVER_IMAGE: &str = super::sandbox::E2E_WORKLOAD_IMAGE;
+use super::sandbox::E2E_WORKLOAD_IMAGE;
 
 #[must_use]
 pub fn e2e_driver() -> Option<String> {
@@ -197,7 +196,7 @@ impl ContainerHttpServer {
             ]);
         }
         args.extend([
-            DEFAULT_TEST_SERVER_IMAGE.to_string(),
+            E2E_WORKLOAD_IMAGE.to_string(),
             "-c".to_string(),
             script.to_string(),
         ]);
@@ -325,7 +324,7 @@ impl HostSupportContainer {
                 "python3",
                 "-p",
                 &format!("{port}:{container_port}"),
-                DEFAULT_TEST_SERVER_IMAGE,
+                E2E_WORKLOAD_IMAGE,
                 "-c",
                 script,
             ])
@@ -380,7 +379,7 @@ impl HostSupportContainer {
                 .map(|capability| format!("--cap-add={capability}")),
         );
         args.extend([
-            DEFAULT_TEST_SERVER_IMAGE.to_string(),
+            E2E_WORKLOAD_IMAGE.to_string(),
             "-c".to_string(),
             script.to_string(),
         ]);
@@ -493,7 +492,7 @@ impl SupportContainer {
                 .map(|capability| format!("--cap-add={capability}")),
         );
         args.extend([
-            DEFAULT_TEST_SERVER_IMAGE.to_string(),
+            E2E_WORKLOAD_IMAGE.to_string(),
             "-c".to_string(),
             script.to_string(),
         ]);

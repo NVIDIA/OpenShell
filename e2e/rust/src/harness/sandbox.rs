@@ -20,7 +20,13 @@ use super::output::{extract_field, strip_ansi};
 /// Tool-capable workload image used by the E2E harness.
 ///
 /// Product defaults remain on the minimal NVIDIA Ubuntu image. Tests that
-/// explicitly pass `--from` continue to exercise their requested image.
+/// explicitly pass `--from` or `--template` retain their requested workload.
+/// Docker setup builds this Noble-based fixture before running the tests.
+#[cfg(feature = "e2e-docker")]
+pub const E2E_WORKLOAD_IMAGE: &str = "openshell/e2e-python:dev";
+
+/// Preserve the existing pullable fixture for non-Docker E2E lanes.
+#[cfg(not(feature = "e2e-docker"))]
 pub const E2E_WORKLOAD_IMAGE: &str = "ghcr.io/astral-sh/uv:0.12.17-python3.12-trixie-slim@sha256:9a59bb7206905ccaae4f7dab222fbac47c125a21e5fc16f43f427cd6c940ade3";
 
 /// Extract the sandbox name from CLI create output.
@@ -44,13 +50,17 @@ fn has_explicit_sandbox_name(args: &[&str]) -> bool {
         .any(|arg| *arg == "--name" || arg.starts_with("--name="))
 }
 
-fn has_explicit_sandbox_image(args: &[&str]) -> bool {
-    args.iter()
-        .any(|arg| *arg == "--from" || arg.starts_with("--from="))
+fn has_explicit_sandbox_workload(args: &[&str]) -> bool {
+    args.iter().take_while(|arg| **arg != "--").any(|arg| {
+        *arg == "--from"
+            || arg.starts_with("--from=")
+            || *arg == "--template"
+            || arg.starts_with("--template=")
+    })
 }
 
 fn add_test_image_if_missing(command: &mut tokio::process::Command, args: &[&str]) {
-    if !has_explicit_sandbox_image(args) {
+    if !has_explicit_sandbox_workload(args) {
         command.arg("--from").arg(E2E_WORKLOAD_IMAGE);
     }
 }
@@ -737,7 +747,7 @@ impl Drop for SandboxGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_explicit_sandbox_image, has_explicit_sandbox_name};
+    use super::{has_explicit_sandbox_name, has_explicit_sandbox_workload};
 
     #[test]
     fn detects_explicit_sandbox_names() {
@@ -747,9 +757,17 @@ mod tests {
     }
 
     #[test]
-    fn detects_explicit_sandbox_images() {
-        assert!(has_explicit_sandbox_image(&["--from", "example:latest"]));
-        assert!(has_explicit_sandbox_image(&["--from=example:latest"]));
-        assert!(!has_explicit_sandbox_image(&["--policy", "policy.yaml"]));
+    fn detects_explicit_sandbox_workloads() {
+        assert!(has_explicit_sandbox_workload(&["--from", "example:latest"]));
+        assert!(has_explicit_sandbox_workload(&["--from=example:latest"]));
+        assert!(has_explicit_sandbox_workload(&["--template", "example"]));
+        assert!(has_explicit_sandbox_workload(&["--template=example"]));
+        assert!(!has_explicit_sandbox_workload(&["--policy", "policy.yaml"]));
+        assert!(!has_explicit_sandbox_workload(&["--", "echo", "--from=x"]));
+        assert!(!has_explicit_sandbox_workload(&[
+            "--",
+            "echo",
+            "--template=x"
+        ]));
     }
 }

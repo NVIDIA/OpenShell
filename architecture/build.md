@@ -102,6 +102,12 @@ with GNU libc and uses the same glibc 2.28 compatibility floor as the gateway.
 
 ## Container Builds
 
+Docker E2E tool-dependent workloads use a dedicated Noble-based fixture,
+separate from the product's minimal default image. The fixture supplies the
+test identity and tools, with Python aligned to the host test runner for
+serialized callable compatibility. Default-image coverage retains the product
+image. Other compute-driver test lanes retain their existing workload fixtures.
+
 The Docker image pipeline is a two-step flow: build the Rust binary natively
 for the target architecture, then assemble the container image from the
 prebuilt binary. The gateway, sandbox, and supervisor images use distinct
