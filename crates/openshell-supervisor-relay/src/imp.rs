@@ -36,10 +36,9 @@
 //! ```
 //!
 //! Usage: `openshell-supervisor-relay.exe <target-port>` -- `<target-port>`
-//! is the TCP port the launched command is expected to bind (an early
-//! liveness check, `wait_for_port_ready`: if the target never binds it
-//! within the bounded five-minute cold-start budget, this process exits with
-//! an error instead of sitting around with a target that will never work).
+//! is the TCP port the launched command is expected to bind. The host MXC
+//! driver observes that listener and confirms it over the control channel;
+//! the relay races that confirmation against target exit and shutdown.
 //! This binary uses no `share_dir` files
 //! at all -- command/env and shutdown both travel over the control channel.
 //!
@@ -63,7 +62,9 @@
 //!   Request:  `{"id": <N>, "op": "<op>", "data": <any>}`
 //!   Response: `{"id": <N>, "ok": true,  "data": <any>}`
 //!          or `{"id": <N>, "ok": false, "error": "<msg>"}`
-//!   Event (unsolicited, no id): `{"event": "<name>"}`
+//!   Event (unsolicited, no id): `{"event": "<name>"}` (startup also emits
+//!          either `target_ready` or `target_failed`; the latter includes an
+//!          `error` string with the target's exit and bounded stderr detail)
 //!
 //! Startup handshake: before spawning anything, this process emits
 //! `{"event":"ready","protocol_version":N}` on stdout (`N` = `PROTOCOL_VERSION`
@@ -82,7 +83,8 @@
 //!
 //! Ops: `launch` (see above), `shutdown` (no data; acked, then wakes
 //! `run_lifecycle` to kill the target and exit -- see Shutdown above),
-//! `ping`, `echo`, and `forward` -- `forward` opens a new, independent relay
+//! `target_ready` (host listener confirmation), `ping`, `echo`, and `forward`
+//! -- `forward` opens a new, independent relay
 //! bridge for the target port and relay address given in the request (see
 //! `handle_control_request`'s doc comment for the full shape).
 //!
@@ -93,8 +95,8 @@
 
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
@@ -108,7 +110,22 @@ use tokio_tungstenite::tungstenite::Message;
 /// out-of-sync peer can't safely ignore, so an independently staged, stale
 /// binary on either side fails fast with a clear version-mismatch error
 /// instead of hanging or misbehaving against a field/event it predates.
-const PROTOCOL_VERSION: u64 = 2;
+const PROTOCOL_VERSION: u64 = 4;
+
+const TARGET_STDERR_TAIL_LINES: usize = 20;
+const TARGET_STDERR_LINE_CHARS: usize = 1024;
+
+struct SpawnedTarget {
+    child: tokio::process::Child,
+    stderr_tail: Arc<StdMutex<VecDeque<String>>>,
+    stderr_forwarder: Option<tokio::task::JoinHandle<()>>,
+}
+
+enum StartupOutcome {
+    Ready,
+    Exited(std::io::Result<std::process::ExitStatus>),
+    Shutdown,
+}
 
 struct ForwardSession {
     reader: tokio::sync::Mutex<tokio::net::tcp::OwnedReadHalf>,
@@ -131,19 +148,24 @@ pub async fn run() -> anyhow::Result<()> {
     // files are used by this process at all.
     let (launch_tx, launch_rx) = oneshot::channel::<(Vec<String>, Vec<String>)>();
     let launch_slot = Arc::new(tokio::sync::Mutex::new(Some(launch_tx)));
+    let (target_ready_tx, target_ready_rx) = oneshot::channel::<()>();
+    let target_ready_slot = Arc::new(tokio::sync::Mutex::new(Some(target_ready_tx)));
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let shutdown_slot = Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx)));
     let forward_sessions = Arc::new(ForwardSessions::new(HashMap::new()));
-    // Lets main() ask run_control_channel's task to announce "target_ready"
-    // on stdout once the target is actually up (see below) -- routed
-    // through that task rather than a second independent stdout handle
-    // here, since concurrent writers to tokio's stdout can interleave.
-    let (target_ready_tx, target_ready_rx) = oneshot::channel::<()>();
+    // Lets main() ask run_control_channel's task to announce either
+    // "target_ready" or "target_failed" on stdout. The acknowledgement makes
+    // failure delivery deterministic: do not let this process exit until the
+    // real target diagnostic has been flushed into the pipe to the driver.
+    let (target_status_tx, target_status_rx) = oneshot::channel::<Result<(), String>>();
+    let (target_status_ack_tx, target_status_ack_rx) = oneshot::channel::<()>();
     tokio::spawn(run_control_channel(
         launch_slot,
+        target_ready_slot,
         shutdown_slot,
         forward_sessions,
-        target_ready_rx,
+        target_status_rx,
+        target_status_ack_tx,
     ));
 
     eprintln!("[openshell-supervisor-relay] waiting for launch request from driver...");
@@ -151,29 +173,56 @@ pub async fn run() -> anyhow::Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("control channel closed before a launch request arrived"))?;
 
-    let mut child = spawn_target(command, env)?;
-
-    eprintln!("[openshell-supervisor-relay] waiting for target on 127.0.0.1:{port} ...");
-    // Race the (up to ~300s worst case) port-readiness wait against a
-    // "shutdown" control-channel request, rather than only observing
-    // shutdown once run_lifecycle's select starts below. Without this, a
-    // shutdown arriving while the target is still coming up (or never
-    // binds) gets acknowledged immediately by run_control_channel -- which
-    // just fires this oneshot, nothing more -- but nothing actually acts on
-    // it until wait_for_port_ready returns on its own, leaving this process
-    // (and the target it spawned) alive for up to the full port-readiness
-    // budget after a caller was told shutdown succeeded.
-    let mut shutdown_rx = shutdown_rx;
-    tokio::select! {
-        result = wait_for_port_ready(&mut child, port, PORT_READY_PER_TRY_TIMEOUT) => {
-            result?;
+    let mut target = match spawn_target(command, env) {
+        Ok(target) => target,
+        Err(error) => {
+            let message = format!("target process failed to start: {error:#}");
+            announce_target_status(target_status_tx, target_status_ack_rx, Err(message.clone()))
+                .await;
+            eprintln!("[openshell-supervisor-relay] {message}");
+            std::process::exit(1);
         }
-        _ = &mut shutdown_rx => {
+    };
+
+    eprintln!(
+        "[openshell-supervisor-relay] waiting for host-confirmed target readiness on port {port} ..."
+    );
+    // The AppContainer cannot reliably connect to a not-yet-listening
+    // loopback port or inspect the Windows TCP table. The host driver can
+    // observe that table, so it sends `target_ready` after the listener
+    // appears. Race that confirmation against target exit and shutdown so a
+    // failed target still reports its real status/stderr immediately.
+    let mut shutdown_rx = shutdown_rx;
+    let startup = tokio::select! {
+        biased;
+        // If the target exits at the same instant the host confirms its
+        // listener, preserve the real exit/stderr diagnostic instead of
+        // briefly publishing a stale Ready state.
+        status = target.child.wait() => StartupOutcome::Exited(status),
+        _ = &mut shutdown_rx => StartupOutcome::Shutdown,
+        result = target_ready_rx => match result {
+            Ok(()) => StartupOutcome::Ready,
+            Err(_) => StartupOutcome::Exited(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "control channel closed before target readiness was confirmed",
+            ))),
+        },
+    };
+    match startup {
+        StartupOutcome::Ready => {}
+        StartupOutcome::Exited(status) => {
+            let message = target_failure_message(&mut target, port, status).await;
+            announce_target_status(target_status_tx, target_status_ack_rx, Err(message.clone()))
+                .await;
+            eprintln!("[openshell-supervisor-relay] {message}");
+            std::process::exit(1);
+        }
+        StartupOutcome::Shutdown => {
             eprintln!(
                 "[openshell-supervisor-relay] shutdown request -- stopping before target became ready"
             );
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = target.child.kill().await;
+            let _ = target.child.wait().await;
             eprintln!("[openshell-supervisor-relay] done");
             // Not `return Ok(())`: run_control_channel loops on
             // stdin.next_line() for this process's entire lifetime and
@@ -187,18 +236,18 @@ pub async fn run() -> anyhow::Result<()> {
             std::process::exit(0);
         }
     }
-    eprintln!("[openshell-supervisor-relay] target is up on port {port}");
+    eprintln!("[openshell-supervisor-relay] host confirmed target listener on port {port}");
     // Unsolicited event, distinct from the "launch" control-channel
     // response (which only confirmed the command/env arrived, not that the
     // target is actually reachable) -- driver.rs awaits this before
     // publishing the sandbox Ready=True. A send failure just means the
     // control-channel task already exited; nothing to do about that here.
-    let _ = target_ready_tx.send(());
+    announce_target_status(target_status_tx, target_status_ack_rx, Ok(())).await;
 
     // No bridge at startup -- relay bridging is entirely on-demand via the
     // control channel's "forward" op (see module docs). Just run the target
     // process's lifecycle from here.
-    run_lifecycle(child, shutdown_rx).await;
+    run_lifecycle(target, shutdown_rx).await;
 
     Ok(())
 }
@@ -244,7 +293,7 @@ fn byte_preview(data: &[u8]) -> String {
 /// because our stdout is reserved exclusively for the control-channel
 /// protocol with the driver. The child's stdin is closed; it isn't part of
 /// this channel.
-fn spawn_target(command: Vec<String>, env: Vec<String>) -> anyhow::Result<tokio::process::Child> {
+fn spawn_target(command: Vec<String>, env: Vec<String>) -> anyhow::Result<SpawnedTarget> {
     if command.is_empty() {
         anyhow::bail!("launch command must not be empty");
     }
@@ -284,24 +333,91 @@ fn spawn_target(command: Vec<String>, env: Vec<String>) -> anyhow::Result<tokio:
     let mut child = cmd.spawn()?;
 
     if let Some(stdout) = child.stdout.take() {
-        tokio::spawn(forward_tagged_lines(stdout, "target stdout"));
+        tokio::spawn(forward_tagged_lines(stdout, "target stdout", None));
     }
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(forward_tagged_lines(stderr, "target stderr"));
-    }
+    let stderr_tail = Arc::new(StdMutex::new(VecDeque::new()));
+    let stderr_forwarder = child.stderr.take().map(|stderr| {
+        tokio::spawn(forward_tagged_lines(
+            stderr,
+            "target stderr",
+            Some(stderr_tail.clone()),
+        ))
+    });
 
-    Ok(child)
+    Ok(SpawnedTarget {
+        child,
+        stderr_tail,
+        stderr_forwarder,
+    })
 }
 
 /// Read lines from `reader` and re-emit them on our own stderr, tagged, so
 /// the target's output stays visible in the gateway log without touching our
 /// stdout (reserved for the control channel).
-async fn forward_tagged_lines(reader: impl tokio::io::AsyncRead + Unpin, label: &'static str) {
+async fn forward_tagged_lines(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    label: &'static str,
+    capture_tail: Option<Arc<StdMutex<VecDeque<String>>>>,
+) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(tail) = &capture_tail {
+            let mut chars = line.chars();
+            let mut captured: String = chars.by_ref().take(TARGET_STDERR_LINE_CHARS).collect();
+            if chars.next().is_some() {
+                captured.push_str("...");
+            }
+            if let Ok(mut tail) = tail.lock() {
+                if tail.len() == TARGET_STDERR_TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(captured);
+            }
+        }
         eprintln!("[{label}] {line}");
     }
+}
+
+async fn announce_target_status(
+    sender: oneshot::Sender<Result<(), String>>,
+    announced: oneshot::Receiver<()>,
+    status: Result<(), String>,
+) {
+    if sender.send(status).is_err() {
+        return;
+    }
+    if tokio::time::timeout(Duration::from_secs(5), announced)
+        .await
+        .is_err()
+    {
+        eprintln!("[openshell-supervisor-relay] control channel did not flush target status");
+    }
+}
+
+async fn target_failure_message(
+    target: &mut SpawnedTarget,
+    port: u16,
+    status: std::io::Result<std::process::ExitStatus>,
+) -> String {
+    if let Some(forwarder) = target.stderr_forwarder.take() {
+        let _ = tokio::time::timeout(Duration::from_secs(2), forwarder).await;
+    }
+    let status = status.map_or_else(
+        |error| format!("status unavailable: {error}"),
+        |status| status.to_string(),
+    );
+    let stderr = target
+        .stderr_tail
+        .lock()
+        .map(|tail| tail.iter().cloned().collect::<Vec<_>>().join(" | "))
+        .unwrap_or_default();
+    let stderr = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!("; stderr: {stderr}")
+    };
+    format!("target process exited before port {port} came up: {status}{stderr}")
 }
 
 // ── Control channel ───────────────────────────────────────────────────────────
@@ -314,6 +430,9 @@ async fn forward_tagged_lines(reader: impl tokio::io::AsyncRead + Unpin, label: 
 /// env)` to `main()`. `None` after the first successful launch (or if
 /// `main()` already gave up on it) -- a second `"launch"` is rejected.
 type LaunchSlot = tokio::sync::Mutex<Option<oneshot::Sender<(Vec<String>, Vec<String>)>>>;
+/// Holds the one-shot sender the driver's host-side listener observation
+/// fires. Startup does not become ready until this confirmation arrives.
+type TargetReadySlot = tokio::sync::Mutex<Option<oneshot::Sender<()>>>;
 /// Holds the one-shot sender the `"shutdown"` op fires, waking
 /// `run_lifecycle`'s select so it can kill the target and exit. `None`
 /// after the first shutdown request -- a second one is a no-op ack.
@@ -321,9 +440,11 @@ type ShutdownSlot = tokio::sync::Mutex<Option<oneshot::Sender<()>>>;
 
 async fn run_control_channel(
     launch: Arc<LaunchSlot>,
+    target_ready: Arc<TargetReadySlot>,
     shutdown: Arc<ShutdownSlot>,
     forward_sessions: Arc<ForwardSessions>,
-    target_ready_rx: oneshot::Receiver<()>,
+    target_status_rx: oneshot::Receiver<Result<(), String>>,
+    target_status_ack: oneshot::Sender<()>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -344,11 +465,11 @@ async fn run_control_channel(
     }
     eprintln!("[openshell-supervisor-relay] control channel ready (stdin/stdout)");
 
-    // `None` once fired (or once main()'s sender is dropped without firing,
-    // e.g. wait_for_port_ready failed) -- the `if` guard below then disables
-    // that select arm instead of it firing repeatedly on every subsequent
-    // poll of an already-resolved oneshot.
-    let mut target_ready_rx = Some(target_ready_rx);
+    // `None` once fired (or once main()'s sender is dropped without firing) --
+    // the `if` guard below then disables that select arm instead of it firing
+    // repeatedly on every subsequent poll of an already-resolved oneshot.
+    let mut target_status_rx = Some(target_status_rx);
+    let mut target_status_ack = Some(target_status_ack);
 
     loop {
         tokio::select! {
@@ -381,6 +502,7 @@ async fn run_control_channel(
                 let response = handle_control_request(
                     trimmed,
                     &launch,
+                    &target_ready,
                     &shutdown,
                     &forward_sessions,
                 )
@@ -395,19 +517,25 @@ async fn run_control_channel(
             // See module docs' startup handshake -- distinct from the
             // "launch" response, which only confirms the command/env
             // arrived. Unsolicited, like "ready" above.
-            result = async { target_ready_rx.as_mut().unwrap().await }, if target_ready_rx.is_some() => {
-                target_ready_rx = None;
-                if result.is_ok() {
-                    let event = serde_json::json!({"event": "target_ready"}).to_string() + "\n";
-                    if stdout.write_all(event.as_bytes()).await.is_err() || stdout.flush().await.is_err() {
-                        eprintln!("[openshell-supervisor-relay] control channel: failed to announce target_ready");
+            result = async { target_status_rx.as_mut().unwrap().await }, if target_status_rx.is_some() => {
+                target_status_rx = None;
+                let event = match result {
+                    Ok(Ok(())) => Some(serde_json::json!({"event": "target_ready"})),
+                    Ok(Err(error)) => Some(serde_json::json!({"event": "target_failed", "error": error})),
+                    Err(_) => None,
+                };
+                if let Some(event) = event {
+                    let out = event.to_string() + "\n";
+                    if stdout.write_all(out.as_bytes()).await.is_err() || stdout.flush().await.is_err() {
+                        eprintln!("[openshell-supervisor-relay] control channel: failed to announce target status");
+                    }
+                    if let Some(ack) = target_status_ack.take() {
+                        let _ = ack.send(());
                     }
                 }
-                // A dropped sender (main() bailed before the target ever
-                // came up, e.g. wait_for_port_ready's own error) means
-                // there's nothing to announce -- driver.rs's timeout on the
-                // corresponding event will surface that as a launch failure
-                // on its own.
+                // A dropped sender means main() exited before announcing
+                // target status. There is nothing to write in that case;
+                // driver.rs will observe control-channel EOF.
             }
         }
     }
@@ -446,6 +574,7 @@ fn describe_control_request(line: &str) -> String {
 async fn handle_control_request(
     line: &str,
     launch: &LaunchSlot,
+    target_ready: &TargetReadySlot,
     shutdown: &ShutdownSlot,
     forward_sessions: &ForwardSessions,
 ) -> serde_json::Value {
@@ -461,6 +590,33 @@ async fn handle_control_request(
     let op = req.get("op").and_then(|v| v.as_str()).unwrap_or("");
 
     match op {
+        // The host MXC driver can observe the AppContainer listener without
+        // the AppContainer's own network/table restrictions. It sends this
+        // only after the configured target port appears in the host TCP
+        // table; main races this signal against target exit and shutdown.
+        "target_ready" => {
+            let slot = target_ready.lock().await.take();
+            slot.map_or_else(
+                || {
+                    serde_json::json!({
+                        "id": id,
+                        "ok": false,
+                        "error": "target readiness already confirmed"
+                    })
+                },
+                |tx| {
+                    if tx.send(()).is_ok() {
+                        serde_json::json!({"id": id, "ok": true})
+                    } else {
+                        serde_json::json!({
+                            "id": id,
+                            "ok": false,
+                            "error": "target readiness receiver is unavailable"
+                        })
+                    }
+                },
+            )
+        }
         // Driver sends this on sandbox delete instead of writing a
         // openshell-shutdown.signal file -- wakes run_lifecycle's select so
         // it can kill the target and exit. Acked even on a repeat (the
@@ -714,74 +870,6 @@ where
     Err(last_error)
 }
 
-/// Number of full-budget tries `wait_for_port_ready` makes -- each try gets
-/// its own complete `per_try_timeout` window, not a slice of it. Worst case
-/// total wait is `max_tries * per_try_timeout` (5 * 60s = 300s today). Keep
-/// this aligned with the MXC driver's 310-second target-ready timeout so a
-/// cold process remains actively probed for the full advertised budget.
-const PORT_READY_MAX_TRIES: u32 = 5;
-const PORT_READY_PER_TRY_TIMEOUT: Duration = Duration::from_mins(1);
-
-/// Poll for the target port accepting TCP connections, bailing out early
-/// (rather than waiting out all tries) if the child process exits first — a
-/// dead child will never open the port, so there's no reason to wait. Makes
-/// up to `PORT_READY_MAX_TRIES` tries, each given the full `per_try_timeout`
-/// budget, logging the start of every try so a long cold-start wait (Node.js
-/// first-run JIT/module resolution, first-touch AV scan of freshly staged
-/// binaries, etc.) is visible rather than silent until success or final
-/// timeout.
-async fn wait_for_port_ready(
-    child: &mut tokio::process::Child,
-    port: u16,
-    per_try_timeout: Duration,
-) -> anyhow::Result<()> {
-    // Bound each individual connect attempt: on at least one observed
-    // wxc-exec build, a connect() against a not-yet-listening loopback port
-    // inside the AppContainer never resolved at all (no fast ECONNREFUSED,
-    // no error) instead of failing quickly like an ordinary closed-port
-    // connect. Without this, a single early attempt can hang forever and
-    // this function -- and the whole readiness wait -- never returns even
-    // after the target's port genuinely opens, since nothing ever retries.
-    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
-
-    let overall_start = tokio::time::Instant::now();
-    for try_num in 1..=PORT_READY_MAX_TRIES {
-        eprintln!(
-            "[openshell-supervisor-relay] port readiness try {try_num}/{PORT_READY_MAX_TRIES} (up to {per_try_timeout:?}) for port {port}"
-        );
-        let try_deadline = tokio::time::Instant::now() + per_try_timeout;
-        loop {
-            let attempt = tokio::time::timeout(
-                ATTEMPT_TIMEOUT,
-                tokio::net::TcpStream::connect(("127.0.0.1", port)),
-            )
-            .await;
-            if let Ok(Ok(_)) = attempt {
-                eprintln!(
-                    "[openshell-supervisor-relay] port {port} ready after {:?} (try {try_num}/{PORT_READY_MAX_TRIES})",
-                    overall_start.elapsed()
-                );
-                return Ok(());
-            }
-            if let Ok(Some(status)) = child.try_wait() {
-                anyhow::bail!("target process exited before port {port} came up: {status}");
-            }
-            if tokio::time::Instant::now() >= try_deadline {
-                eprintln!(
-                    "[openshell-supervisor-relay] port readiness try {try_num}/{PORT_READY_MAX_TRIES} timed out after {per_try_timeout:?} (elapsed {:?} total)",
-                    overall_start.elapsed()
-                );
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-    }
-    anyhow::bail!(
-        "timed out after {PORT_READY_MAX_TRIES} tries ({:?} total) waiting for port {port}",
-        overall_start.elapsed()
-    );
-}
-
 // ── Relay bridge ──────────────────────────────────────────────────────────────
 //
 // Implements the sandbox side of relay.rs's Phase A protocol exactly:
@@ -893,14 +981,14 @@ async fn run_relay_bridge(
             msg = relay_read.next() => match msg {
                 Some(Ok(Message::Text(t))) => {
                     if t == "SESSION_START" {
-                        // Retry briefly: even though wait_for_port_ready() already
-                        // confirmed a raw TCP accept succeeds once, that doesn't
-                        // guarantee the target's listener stays continuously
-                        // accept-ready under a freshly-started process (observed as
-                        // a genuine, reproducible ~500ms startup race elsewhere in
-                        // this codebase -- see mxc-ws-agent.rs's local-connect
-                        // retry). A session-open failure here would otherwise
-                        // silently drop the host's connection attempt.
+                        // Retry briefly: the host driver's TCP-table observation
+                        // confirms a listener exists, but does not guarantee it
+                        // stays continuously accept-ready under a freshly-started
+                        // process (observed as a genuine, reproducible ~500ms
+                        // startup race elsewhere in this codebase -- see
+                        // mxc-ws-agent.rs's local-connect retry). A session-open
+                        // failure here would otherwise silently drop the host's
+                        // connection attempt.
                         match connect_forward_target(|| tokio::net::TcpStream::connect(("127.0.0.1", port))).await {
                           Ok(s) => {
                             // Latency-sensitive request/response tunnel --
@@ -998,17 +1086,17 @@ async fn run_relay_bridge(
 /// Any active dynamic relay bridges are tokio tasks in this same process, so
 /// `std::process::exit` below tears them down too -- no separate stop signal
 /// needed.
-async fn run_lifecycle(mut child: tokio::process::Child, shutdown_rx: oneshot::Receiver<()>) {
+async fn run_lifecycle(mut target: SpawnedTarget, shutdown_rx: oneshot::Receiver<()>) {
     tokio::select! {
-        status = child.wait() => {
+        status = target.child.wait() => {
             let code = status.map_or(1, |s| s.code().unwrap_or(1));
             eprintln!("[openshell-supervisor-relay] target exited with code {code}");
             std::process::exit(code);
         }
         _ = shutdown_rx => {
             eprintln!("[openshell-supervisor-relay] shutdown request -- stopping");
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = target.child.kill().await;
+            let _ = target.child.wait().await;
             eprintln!("[openshell-supervisor-relay] done");
             std::process::exit(0);
         }
@@ -1017,19 +1105,11 @@ async fn run_lifecycle(mut child: tokio::process::Child, shutdown_rx: oneshot::R
 
 #[cfg(test)]
 mod forward_connect_tests {
-    use super::{PORT_READY_MAX_TRIES, PORT_READY_PER_TRY_TIMEOUT, connect_forward_target};
+    use super::connect_forward_target;
     use std::io::{Error, ErrorKind};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-
-    #[test]
-    fn port_ready_budget_covers_five_minute_cold_start_contract() {
-        assert_eq!(
-            PORT_READY_PER_TRY_TIMEOUT * PORT_READY_MAX_TRIES,
-            Duration::from_mins(5),
-        );
-    }
 
     #[tokio::test(start_paused = true)]
     async fn forward_connect_returns_success_without_retry_delay() {

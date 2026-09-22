@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Gateway template for the cloud-inference (T1) demo. The runner resolves
+# wxc-exec and writes a disposable copy. NV_API_KEY is supplied at sandbox
+# creation with --env-from and is never stored in this file.
+
+[openshell]
+version = 2
+
+[openshell.drivers.mxc]
+wxc_exec_path = "wxc-exec.exe"
+backend = "process_container"
+default_configuration_id = "composable"
+pc_least_privilege = false
+pc_capabilities = []
+egress_proxy = true
+egress_proxy_addr = "127.0.0.1:0"
+debug = false
