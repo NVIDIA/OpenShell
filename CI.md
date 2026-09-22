@@ -85,6 +85,10 @@ to the package installers and downloads the packages selected by its matrix.
 
 Four opt-in labels enable the long-running E2E suites:
 
+Every approved `Branch E2E Checks` run builds the DEB and RPM packages, even
+when no optional E2E label is present. The `test:upgrade` label controls only
+the tmachine upgrade execution and its runtime-image preparation.
+
 - `test:e2e` runs the Docker, rootless Podman, Kubernetes, and VM E2E suites
   with both managed and standalone compute drivers in `Branch E2E Checks`
 - `test:e2e-gpu` runs GPU E2E in `Branch E2E Checks`
