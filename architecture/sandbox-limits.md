@@ -95,6 +95,7 @@ streaming HTTP middleware to use the same process-wide budget.
 |---|---:|---|
 | Initial CONNECT request headers | 8 KiB | Reject the proxy request. |
 | Inspected HTTP/1 request headers | 16 KiB | Reject the request. |
+| Streamed HTTP/1 chunk framing | 16 KiB per chunk-size line; 16 KiB and 128 fields for the complete trailer block | End the relay. Chunk payloads pass through a fixed 8 KiB buffer and do not accumulate to the declared chunk size. |
 | Credential-rewritten HTTP body | 256 KiB | Reject when rewriting requires a larger buffered body. |
 | SigV4 body signing | 10 MiB | Reject when signing requires a larger buffered body. |
 | GraphQL request body | 64 KiB default | Policy can set a positive `graphql_max_body_bytes`; there is no shared platform ceiling yet. |

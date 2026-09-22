@@ -67,6 +67,8 @@ async fn max_middleware_body_bytes() -> usize {
     chain[0].max_payload_bytes()
 }
 const RELAY_BUF_SIZE: usize = 8192;
+const MAX_CHUNK_LINE_BYTES: usize = MAX_HEADER_BYTES;
+const MAX_CHUNK_TRAILER_FIELDS: usize = 128;
 const RESPONSE_UNIT_COALESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2);
 const HTTP_METHOD_PREFIXES: &[&[u8]] = &[
     b"GET ",
@@ -3113,8 +3115,8 @@ where
 /// Handles chunk extensions and trailers per RFC 7230.
 ///
 /// `already_forwarded` are overflow bytes that were already written to the
-/// writer during header parsing. They are seeded into the parser buffer so
-/// termination can still be detected when boundaries span reads.
+/// writer during header parsing. The parser consumes them before reading more
+/// bytes so it can detect boundaries without forwarding them twice.
 async fn relay_chunked<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -3126,43 +3128,19 @@ where
     W: AsyncWrite + Unpin,
 {
     let started_at = std::time::Instant::now();
-    let mut read_buf = [0u8; RELAY_BUF_SIZE];
-    let mut parse_buf = Vec::from(already_forwarded);
-    let mut forwarded_len = already_forwarded.len();
-    let mut pos = 0usize;
+    let mut input = ChunkedRelayInput::new(already_forwarded);
     let mut chunk_count = 0usize;
     let mut chunk_payload_bytes = 0usize;
 
-    // Parse chunk-size lines + chunk payloads until final 0-size chunk, then
-    // parse trailers until the terminating empty trailer line.
     loop {
-        // Parse one chunk size line: "<hex>[;extensions]\r\n"
-        let size_line_end = loop {
-            if let Some(end) = find_crlf(&parse_buf, pos) {
-                break end;
-            }
-            if parse_buf.len().saturating_sub(pos) >= MAX_HEADER_BYTES {
-                return Err(miette!("Chunk-size line exceeds limit"));
-            }
-            let target_len = parse_buf
-                .len()
-                .checked_add(1)
-                .ok_or_else(|| miette!("Chunked body size overflow"))?;
-            relay_chunked_until_len(
+        let size_line = input
+            .read_line(
                 reader,
-                &mut read_buf,
-                &mut parse_buf,
-                target_len,
-                generation_guard,
                 "Chunked body ended before chunk-size line",
+                "Chunk-size line exceeds limit",
             )
             .await?;
-        };
-        if size_line_end.saturating_add(2).saturating_sub(pos) > MAX_HEADER_BYTES {
-            return Err(miette!("Chunk-size line exceeds limit"));
-        }
-
-        let size_line = std::str::from_utf8(&parse_buf[pos..size_line_end])
+        let size_line = std::str::from_utf8(&size_line)
             .into_diagnostic()
             .map_err(|_| miette!("Invalid UTF-8 in chunk-size line"))?;
         let size_token = size_line
@@ -3173,59 +3151,26 @@ where
         let chunk_size = usize::from_str_radix(size_token, 16)
             .into_diagnostic()
             .map_err(|_| miette!("Invalid chunk size token: {size_token:?}"))?;
-        pos = size_line_end + 2;
-        flush_validated_chunked_bytes(
-            writer,
-            &parse_buf,
-            &mut forwarded_len,
-            pos,
-            false,
-            generation_guard,
-        )
-        .await?;
 
         if chunk_size == 0 {
-            // Parse trailers (if any). Terminates on empty trailer line.
             let mut trailer_count = 0usize;
+            let mut trailer_bytes = 0usize;
             loop {
-                let trailer_end = loop {
-                    if let Some(end) = find_crlf(&parse_buf, pos) {
-                        break end;
-                    }
-                    if parse_buf.len().saturating_sub(pos) >= MAX_HEADER_BYTES {
-                        return Err(miette!("Chunk trailer line exceeds limit"));
-                    }
-                    let target_len = parse_buf
-                        .len()
-                        .checked_add(1)
-                        .ok_or_else(|| miette!("Chunked trailer size overflow"))?;
-                    relay_chunked_until_len(
+                let trailer_line = input
+                    .read_line(
                         reader,
-                        &mut read_buf,
-                        &mut parse_buf,
-                        target_len,
-                        generation_guard,
                         "Chunked body ended before trailer terminator",
+                        "Chunk trailer line exceeds limit",
                     )
                     .await?;
-                };
-                if trailer_end.saturating_add(2).saturating_sub(pos) > MAX_HEADER_BYTES {
-                    return Err(miette!("Chunk trailer line exceeds limit"));
+                trailer_bytes = trailer_bytes
+                    .checked_add(trailer_line.len() + 2)
+                    .ok_or_else(|| miette!("Chunk trailer size overflow"))?;
+                if trailer_bytes > MAX_HEADER_BYTES {
+                    return Err(miette!("Chunk trailers exceed {MAX_HEADER_BYTES} bytes"));
                 }
-
-                let trailer_line = &parse_buf[pos..trailer_end];
-                let trailer_is_empty = trailer_line.is_empty();
-                pos = trailer_end + 2;
-                flush_validated_chunked_bytes(
-                    writer,
-                    &parse_buf,
-                    &mut forwarded_len,
-                    pos,
-                    trailer_is_empty,
-                    generation_guard,
-                )
-                .await?;
-                if trailer_is_empty {
+                if trailer_line.is_empty() {
+                    input.flush_pending(writer, generation_guard).await?;
                     debug!(
                         chunk_count,
                         chunk_payload_bytes,
@@ -3235,128 +3180,167 @@ where
                     );
                     return Ok(());
                 }
+                if trailer_count == MAX_CHUNK_TRAILER_FIELDS {
+                    return Err(miette!(
+                        "Chunk trailers exceed {MAX_CHUNK_TRAILER_FIELDS} fields"
+                    ));
+                }
                 trailer_count += 1;
-                if pos > RELAY_BUF_SIZE * 4 && forwarded_len >= pos {
-                    parse_buf.drain(..pos);
-                    forwarded_len -= pos;
-                    pos = 0;
+                if input.pending_len() >= RELAY_BUF_SIZE {
+                    input.flush_pending(writer, generation_guard).await?;
                 }
             }
         }
 
-        // Ensure the full chunk payload + trailing CRLF is available.
-        let chunk_end = pos
-            .checked_add(chunk_size)
-            .ok_or_else(|| miette!("Chunk size overflow"))?;
-        let chunk_with_crlf_end = chunk_end
-            .checked_add(2)
-            .ok_or_else(|| miette!("Chunk size overflow"))?;
-
-        relay_chunked_until_len(
-            reader,
-            &mut read_buf,
-            &mut parse_buf,
-            chunk_with_crlf_end,
-            generation_guard,
-            "Chunked body ended mid-chunk",
-        )
-        .await?;
-        if &parse_buf[chunk_end..chunk_with_crlf_end] != b"\r\n" {
+        input
+            .consume_exact(
+                reader,
+                writer,
+                chunk_size,
+                generation_guard,
+                "Chunked body ended mid-chunk",
+            )
+            .await?;
+        let terminator = [
+            input
+                .read_byte(reader, "Chunked body ended before chunk terminator")
+                .await?,
+            input
+                .read_byte(reader, "Chunked body ended before chunk terminator")
+                .await?,
+        ];
+        if terminator != *b"\r\n" {
             return Err(miette!("Chunk missing terminating CRLF"));
         }
-        pos = chunk_with_crlf_end;
-        flush_validated_chunked_bytes(
-            writer,
-            &parse_buf,
-            &mut forwarded_len,
-            pos,
-            true,
-            generation_guard,
-        )
-        .await?;
+        input.flush_pending(writer, generation_guard).await?;
         chunk_count += 1;
         chunk_payload_bytes = chunk_payload_bytes.saturating_add(chunk_size);
-
-        // Keep parser memory bounded for long streams.
-        if pos > RELAY_BUF_SIZE * 4 && forwarded_len >= pos {
-            parse_buf.drain(..pos);
-            forwarded_len -= pos;
-            pos = 0;
-        }
     }
 }
 
-/// Read only the bytes needed to reach `target_len`.
-///
-/// The connection-scoped buffered reader may fetch more data from the socket,
-/// but this parser consumes only the current body. Any read-ahead remains in
-/// that reader for the next request's policy decision.
-async fn relay_chunked_until_len<R>(
-    reader: &mut R,
-    read_buf: &mut [u8; RELAY_BUF_SIZE],
-    parse_buf: &mut Vec<u8>,
-    target_len: usize,
-    generation_guard: Option<&PolicyGenerationGuard>,
-    eof_message: &'static str,
-) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-{
-    while parse_buf.len() < target_len {
-        let remaining = target_len - parse_buf.len();
-        let to_read = remaining.min(read_buf.len());
-        let n = reader
-            .read(&mut read_buf[..to_read])
-            .await
-            .into_diagnostic()?;
-        if n == 0 {
-            return Err(miette!(eof_message));
+struct ChunkedRelayInput<'a> {
+    already_forwarded: &'a [u8],
+    already_forwarded_pos: usize,
+    pending: Vec<u8>,
+}
+
+impl<'a> ChunkedRelayInput<'a> {
+    fn new(already_forwarded: &'a [u8]) -> Self {
+        Self {
+            already_forwarded,
+            already_forwarded_pos: 0,
+            pending: Vec::with_capacity(RELAY_BUF_SIZE),
+        }
+    }
+
+    fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    async fn read_line<R>(
+        &mut self,
+        reader: &mut R,
+        eof_message: &'static str,
+        limit_message: &'static str,
+    ) -> Result<Vec<u8>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut line = Vec::new();
+        loop {
+            if line.len() == MAX_CHUNK_LINE_BYTES {
+                return Err(miette!(limit_message));
+            }
+            line.push(self.read_byte(reader, eof_message).await?);
+            if line.ends_with(b"\r\n") {
+                line.truncate(line.len() - 2);
+                return Ok(line);
+            }
+        }
+    }
+
+    async fn consume_exact<R, W>(
+        &mut self,
+        reader: &mut R,
+        writer: &mut W,
+        mut remaining: usize,
+        generation_guard: Option<&PolicyGenerationGuard>,
+        eof_message: &'static str,
+    ) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        if self.already_forwarded_pos < self.already_forwarded.len() {
+            let available = self.already_forwarded.len() - self.already_forwarded_pos;
+            let consumed = available.min(remaining);
+            self.already_forwarded_pos += consumed;
+            remaining -= consumed;
+        }
+
+        while remaining > 0 {
+            if self.pending.len() >= RELAY_BUF_SIZE {
+                self.flush_pending(writer, generation_guard).await?;
+            }
+            let available = RELAY_BUF_SIZE - self.pending.len();
+            let to_read = remaining.min(available);
+            let start = self.pending.len();
+            self.pending.resize(start + to_read, 0);
+            let read = reader
+                .read(&mut self.pending[start..])
+                .await
+                .into_diagnostic()?;
+            if read == 0 {
+                self.pending.truncate(start);
+                return Err(miette!(eof_message));
+            }
+            self.pending.truncate(start + read);
+            if let Some(guard) = generation_guard {
+                guard.ensure_current()?;
+            }
+            remaining -= read;
+        }
+        Ok(())
+    }
+
+    async fn read_byte<R>(&mut self, reader: &mut R, eof_message: &'static str) -> Result<u8>
+    where
+        R: AsyncRead + Unpin,
+    {
+        if self.already_forwarded_pos < self.already_forwarded.len() {
+            let byte = self.already_forwarded[self.already_forwarded_pos];
+            self.already_forwarded_pos += 1;
+            return Ok(byte);
+        }
+        let byte = match reader.read_u8().await {
+            Ok(byte) => byte,
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(miette!(eof_message));
+            }
+            Err(error) => return Err(error).into_diagnostic(),
+        };
+        self.pending.push(byte);
+        Ok(byte)
+    }
+
+    async fn flush_pending<W>(
+        &mut self,
+        writer: &mut W,
+        generation_guard: Option<&PolicyGenerationGuard>,
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        if self.pending.is_empty() {
+            return Ok(());
         }
         if let Some(guard) = generation_guard {
             guard.ensure_current()?;
         }
-        parse_buf.extend_from_slice(&read_buf[..n]);
+        writer.write_all(&self.pending).await.into_diagnostic()?;
+        self.pending.clear();
+        Ok(())
     }
-    Ok(())
-}
-
-/// Forward complete, validated chunk framing.
-///
-/// Size lines may be coalesced with their payload, but every completed chunk is
-/// forwarded immediately so streaming request and response bodies make
-/// progress without waiting for the terminal chunk. This writes by validated
-/// framing units rather than once per framing byte.
-async fn flush_validated_chunked_bytes<W>(
-    writer: &mut W,
-    parse_buf: &[u8],
-    forwarded_len: &mut usize,
-    validated_len: usize,
-    force: bool,
-    generation_guard: Option<&PolicyGenerationGuard>,
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let pending = validated_len.saturating_sub(*forwarded_len);
-    if pending == 0 || (!force && pending < RELAY_BUF_SIZE) {
-        return Ok(());
-    }
-    if let Some(guard) = generation_guard {
-        guard.ensure_current()?;
-    }
-    writer
-        .write_all(&parse_buf[*forwarded_len..validated_len])
-        .await
-        .into_diagnostic()?;
-    *forwarded_len = validated_len;
-    Ok(())
-}
-
-fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
-    buf.get(start..)?
-        .windows(2)
-        .position(|w| w == b"\r\n")
-        .map(|offset| start + offset)
 }
 
 fn validate_websocket_response(
@@ -4006,6 +3990,81 @@ mod tests {
         ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_streams_max_sized_incomplete_chunk_without_retaining_payload() {
+        let payload_len = RELAY_BUF_SIZE * 32;
+        let mut wire = format!("{:x}\r\n", usize::MAX).into_bytes();
+        wire.resize(wire.len() + payload_len, b'a');
+        let wire_len = wire.len();
+        let mut reader = CountingReader::new(wire);
+        let mut writer = tokio::io::sink();
+
+        let error = relay_chunked(&mut reader, &mut writer, &[], None)
+            .await
+            .expect_err("an incomplete chunk must fail");
+
+        assert!(error.to_string().contains("ended mid-chunk"));
+        assert_eq!(
+            reader.position, wire_len,
+            "the relay must stream the payload instead of rejecting or accumulating the declared chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_rejects_oversized_chunk_size_line() {
+        let mut wire = b"1;".to_vec();
+        wire.resize(MAX_CHUNK_LINE_BYTES + 1, b'x');
+        wire.extend_from_slice(b"\r\na\r\n0\r\n\r\n");
+        let mut reader = CountingReader::new(wire);
+        let mut writer = tokio::io::sink();
+
+        let error = relay_chunked(&mut reader, &mut writer, &[], None)
+            .await
+            .expect_err("an oversized chunk-size line must fail");
+
+        assert!(error.to_string().contains("Chunk-size line exceeds"));
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_rejects_oversized_trailer_block() {
+        let mut wire = b"0\r\n".to_vec();
+        for name in [b'a', b'b'] {
+            wire.extend_from_slice(&[name, b':']);
+            wire.resize(wire.len() + MAX_HEADER_BYTES / 2, b'x');
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"\r\n");
+        let mut reader = CountingReader::new(wire);
+        let mut writer = tokio::io::sink();
+
+        let error = relay_chunked(&mut reader, &mut writer, &[], None)
+            .await
+            .expect_err("an oversized trailer block must fail");
+
+        assert!(error.to_string().contains("Chunk trailers exceed"));
+    }
+
+    #[tokio::test]
+    async fn relay_chunked_rejects_excessive_trailer_fields() {
+        let mut wire = b"0\r\n".to_vec();
+        for _ in 0..=MAX_CHUNK_TRAILER_FIELDS {
+            wire.extend_from_slice(b"x: y\r\n");
+        }
+        wire.extend_from_slice(b"\r\n");
+        let mut reader = CountingReader::new(wire);
+        let mut writer = tokio::io::sink();
+
+        let error = relay_chunked(&mut reader, &mut writer, &[], None)
+            .await
+            .expect_err("too many trailer fields must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Chunk trailers exceed 128 fields")
+        );
     }
 
     fn write_header(name: &str, value: &str, on_existing: ExistingHeaderAction) -> HeaderMutation {
