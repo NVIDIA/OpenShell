@@ -318,7 +318,10 @@ async fn live_docker_resource_admission_checks_native_volume_labels() {
         let labels = workspace.map(|workspace| {
             HashMap::from([
                 ("openshell.ai/sandbox-attachable".into(), "true".into()),
-                ("openshell.ai/workspace".into(), workspace.into()),
+                (
+                    "openshell.ai/sandbox-attachable-workspace".into(),
+                    workspace.into(),
+                ),
             ])
         });
         driver

@@ -29,7 +29,7 @@ impl Default for ResourceAdmissionConfig {
             required_labels: BTreeMap::from([
                 ("openshell.ai/sandbox-attachable".into(), "true".into()),
                 (
-                    "openshell.ai/workspace".into(),
+                    "openshell.ai/sandbox-attachable-workspace".into(),
                     WORKSPACE_PLACEHOLDER.into(),
                 ),
             ]),
@@ -280,7 +280,10 @@ mod tests {
     fn labels(workspace: &str) -> BTreeMap<String, String> {
         BTreeMap::from([
             ("openshell.ai/sandbox-attachable".into(), "true".into()),
-            ("openshell.ai/workspace".into(), workspace.into()),
+            (
+                "openshell.ai/sandbox-attachable-workspace".into(),
+                workspace.into(),
+            ),
         ])
     }
 
@@ -312,7 +315,7 @@ mod tests {
             serde_json::from_str(r#"{"required_labels":{}}"#).unwrap();
         assert!(empty.validate().is_err());
         let workspace_only: ResourceAdmissionConfig = serde_json::from_str(
-            r#"{"required_labels":{"openshell.ai/workspace":"${workspace}"}}"#,
+            r#"{"required_labels":{"openshell.ai/sandbox-attachable-workspace":"${workspace}"}}"#,
         )
         .unwrap();
         assert!(workspace_only.validate().is_err());

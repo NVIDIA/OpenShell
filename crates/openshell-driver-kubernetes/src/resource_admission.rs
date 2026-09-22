@@ -258,11 +258,11 @@ mod tests {
         for (labels, allowed) in [
             (serde_json::json!({}), false),
             (
-                serde_json::json!({"openshell.ai/sandbox-attachable":"true","openshell.ai/workspace":"other"}),
+                serde_json::json!({"openshell.ai/sandbox-attachable":"true","openshell.ai/sandbox-attachable-workspace":"other"}),
                 false,
             ),
             (
-                serde_json::json!({"openshell.ai/sandbox-attachable":"true","openshell.ai/workspace":"team-a"}),
+                serde_json::json!({"openshell.ai/sandbox-attachable":"true","openshell.ai/sandbox-attachable-workspace":"team-a"}),
                 true,
             ),
         ] {

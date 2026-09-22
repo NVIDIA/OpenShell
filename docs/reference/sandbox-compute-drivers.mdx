@@ -217,7 +217,7 @@ Use a `volume` mount for existing Docker named volumes:
 
 ```shell
 docker volume create --label openshell.ai/sandbox-attachable=true \
-  --label openshell.ai/workspace=default openshell-work
+  --label openshell.ai/sandbox-attachable-workspace=default openshell-work
 
 openshell sandbox create \
   --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
@@ -310,7 +310,7 @@ Use a `volume` mount for existing Podman named volumes:
 
 ```shell
 podman volume create --label openshell.ai/sandbox-attachable=true \
-  --label openshell.ai/workspace=default openshell-work
+  --label openshell.ai/sandbox-attachable-workspace=default openshell-work
 
 openshell sandbox create \
   --driver-config-json '{"podman":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \

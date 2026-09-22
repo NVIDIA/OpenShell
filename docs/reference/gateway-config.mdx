@@ -545,7 +545,7 @@ enabled = true
 
 [openshell.drivers.kubernetes.resource_admission.required_labels]
 "openshell.ai/sandbox-attachable" = "true"
-"openshell.ai/workspace" = "${workspace}"
+"openshell.ai/sandbox-attachable-workspace" = "${workspace}"
 ```
 
 Use the same fields under the selected Docker, Podman, VM, MXC, or external
@@ -559,9 +559,9 @@ need explicit operator approval.
 
 The following label keys are reserved for driver-owned metadata and cannot be
 used in `required_labels`: `openshell.ai/managed-by`, `openshell.ai/gateway-id`,
-and `openshell.ai/sandbox-workspace`. The default workspace admission key is
-`openshell.ai/workspace`, which is distinct from the reserved sandbox metadata
-key.
+and `openshell.ai/sandbox-workspace`. The default admission key
+`openshell.ai/sandbox-attachable-workspace` is distinct from the reserved
+sandbox metadata key.
 
 The operator must label the referenced resource before use. Labels on a sandbox
 do not approve its attachments. For example, a PVC used by workspace `team-a`
@@ -571,7 +571,7 @@ needs this metadata:
 metadata:
   labels:
     openshell.ai/sandbox-attachable: "true"
-    openshell.ai/workspace: "team-a"
+    openshell.ai/sandbox-attachable-workspace: "team-a"
 ```
 
 Kubernetes checks PVCs, RuntimeClasses, PriorityClasses, and credential/config
