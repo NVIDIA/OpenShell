@@ -118,6 +118,16 @@ be supplied by a gateway-global policy because it is applied at startup. When a
 global dynamic policy is active, effective-policy reads retain the UI block from
 the sandbox's creation policy.
 
+Live policy updates are also capability-negotiated. A driver that reports
+`supports_live_policy_updates = true` must apply every gateway mutation that can
+change an existing sandbox's effective dynamic policy. A driver that reports
+`false` causes the gateway to reject those mutations before persistence and to
+serialize sandbox creation with global policy and provider changes. Rejected
+mutations include direct replacement or merge, global policy changes while a
+sandbox exists, policy-advisor approval or undo, provider attach or detach, and
+updates to a provider profile used by a running sandbox. An omitted capability
+retains the legacy `true` behavior for compatibility with existing drivers.
+
 The gateway records driver identity and version from the startup capability
 response. Elevated gateway info reports that initialized driver snapshot instead
 of re-querying drivers on each request.

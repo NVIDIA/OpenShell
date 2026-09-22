@@ -394,10 +394,15 @@ async fn handle_create_sandbox_inner(
             .authorize(&token, &workspace, &subject)?;
     }
 
-    // Serialize every create with global policy and provider mutations. A
-    // provider-free create still resolves global policy, so allowing it to
-    // overlap a global update could persist a sandbox against the old policy.
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    // Drivers without live policy updates need an atomic boundary between
+    // create-time policy resolution and mutations that affect existing sandboxes.
+    // Capable drivers retain the existing concurrent-create behavior and do not
+    // need the MXC-specific serialization around their potentially slow RPCs.
+    let _sandbox_sync_guard = if state.compute.supports_live_policy_updates() {
+        None
+    } else {
+        Some(state.compute.sandbox_sync_guard().await)
+    };
 
     // Validate provider names exist (fail fast).
     for name in &spec.providers {
@@ -4980,8 +4985,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_free_create_waits_for_sandbox_sync_guard() {
-        let state = test_server_state().await;
+    async fn mxc_provider_free_create_waits_for_sandbox_sync_guard() {
+        let state = test_server_state_with_driver("mxc").await;
 
         let guard = state.compute.sandbox_sync_guard().await;
         let task_state = state.clone();
@@ -5017,6 +5022,42 @@ mod tests {
         assert!(
             response.sandbox.unwrap().spec.unwrap().providers.is_empty(),
             "the synchronization test must exercise a provider-free create"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_update_driver_create_does_not_wait_for_sandbox_sync_guard() {
+        let state = test_server_state().await;
+
+        let guard = state.compute.sandbox_sync_guard().await;
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            handle_create_sandbox(
+                &task_state,
+                authed_request(CreateSandboxRequest {
+                    name: "concurrent-create".to_string(),
+                    spec: Some(SandboxSpec::default()),
+                    labels: HashMap::new(),
+                    annotations: HashMap::new(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    await_main_process_attachment: false,
+                    workload_template_name: String::new(),
+                }),
+            )
+            .await
+        });
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("live-update-capable create must not wait for the sync guard")
+            .expect("join create task")
+            .expect("create should succeed")
+            .into_inner();
+        drop(guard);
+
+        assert!(
+            response.sandbox.unwrap().spec.unwrap().providers.is_empty(),
+            "the concurrency test must exercise a provider-free create"
         );
     }
 
