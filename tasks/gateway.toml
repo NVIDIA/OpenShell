@@ -16,6 +16,10 @@ run = "bash tasks/scripts/gateway.sh"
 description = "Run a standalone gateway with the bundled Docker compute driver"
 run = "bash tasks/scripts/gateway-docker.sh"
 
+["gateway:kubernetes"]
+description = "Run a standalone gateway with the bundled Kubernetes compute driver"
+run = "bash tasks/scripts/gateway-kubernetes.sh"
+
 ["gateway:podman"]
 description = "Run a standalone gateway with the bundled Podman compute driver"
 run = "bash tasks/scripts/gateway-podman.sh"
