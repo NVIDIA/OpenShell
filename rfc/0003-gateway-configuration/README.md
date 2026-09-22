@@ -98,6 +98,11 @@ guest_tls_ca          = "/etc/openshell/certs/ca.pem"
 guest_tls_cert        = "/etc/openshell/certs/client.pem"
 guest_tls_key         = "/etc/openshell/certs/client-key.pem"
 
+# Shared sandbox destination trust. These gateway-local paths are read and
+# normalized at startup; the resulting material is delivered by in-tree drivers.
+[openshell.supervisor.network]
+additional_ca_cert_paths = ["/etc/openshell/certs/private-destination-ca.pem"]
+
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
 key_path              = "/etc/openshell/certs/gateway-key.pem"
@@ -174,8 +179,9 @@ Driver authors define and own their config schema. Adding a new driver does not 
 Field-level merge rules:
 
 1. **`[openshell.gateway]`** populates `openshell_core::Config` (including the nested `[openshell.gateway.tls]` and `[openshell.gateway.oidc]` tables, which map to `TlsConfig` and `OidcConfig` respectively).
-2. **`[openshell.drivers.<name>]`** is propagated to the driver crate, which deserializes it into its own struct. Driver schemas evolve independently of the gateway's core `Config`.
-3. **CLI / env** override any value set by steps 1–2, field by field. The override check uses clap's `ValueSource` — a value is applied from the file only when the corresponding flag was not supplied via the command line or environment.
+2. **`[openshell.supervisor.network]`** holds shared network-supervisor settings. `additional_ca_cert_paths` accepts an ordered list of gateway-local certificate-only PEM files. Gateway startup strictly normalizes them before an in-tree compute driver receives the material. The setting augments sandbox destination trust and does not configure proxy, listener, OIDC, or gateway callback trust.
+3. **`[openshell.drivers.<name>]`** is propagated to the driver crate, which deserializes it into its own struct. Driver schemas evolve independently of the gateway's core `Config`.
+4. **CLI / env** override any value set by steps 1–3, field by field. The override check uses clap's `ValueSource` — a value is applied from the file only when the corresponding flag was not supplied via the command line or environment.
 
 `bind_address`, `health_bind_address`, and `metrics_bind_address` are stored as `SocketAddr` (IP + port). The CLI exposes them as a single `--bind-address` IP plus `--port`, `--health-port`, and `--metrics-port`; CLI overrides apply to the matching part of the parsed `SocketAddr`.
 
@@ -205,6 +211,7 @@ The following cross-field validations are applied after merging file + env + CLI
 - Gateway listener TLS requires `cert_path` and `key_path`; `client_ca_path` is required only for listener client-certificate verification. TLS-enabled Docker, Podman, and VM drivers also require a complete gateway-owned guest CA, certificate, and key bundle. Kubernetes projects guest TLS through a Secret instead.
 - `database_url` must be non-empty after merging env + CLI — every supported driver requires it. The field is not accepted from the file (see Secrets above).
 - `compute_driver` selects exactly one driver. When omitted, the gateway falls back to auto-detection. A custom driver requires a named table with `socket_path`, unless startup supplies an explicit socket override. The legacy `compute_drivers` list is rejected.
+- Every `additional_ca_cert_paths` entry must name a readable, non-empty certificate-only PEM file with at least one usable certificate. Private keys, unrelated PEM items, DER-only input, inline PEM, and URLs are rejected. Configured material is unsupported with remote or custom compute drivers.
 
 ### Schema compatibility
 

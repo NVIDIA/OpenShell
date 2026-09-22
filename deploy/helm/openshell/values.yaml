@@ -47,6 +47,9 @@ supervisor:
     pullPolicy: null
     # -- Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed.
     tag: ""
+  network:
+    # -- Name of an operator-owned ConfigMap with a `ca.crt` key containing additional destination CA certificates for sandbox supervisors. Empty disables additional destination trust.
+    additionalCaConfigMapName: ""
   sandboxRuntime:
     # -- Required operator acknowledgement that the cluster CNI enforces NetworkPolicy.
     networkPolicyEnforced: false

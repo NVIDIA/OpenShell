@@ -106,6 +106,16 @@ struct Args {
     #[arg(long)]
     upstream_proxy_ca_bundle: Option<String>,
 
+    /// Driver-staged roots that augment destination TLS trust. This protected
+    /// argv input deliberately has no environment alias.
+    #[arg(long)]
+    network_additional_ca_bundle: Option<PathBuf>,
+
+    /// Gateway-issued SHA-256 generation for the staged destination roots.
+    /// This protected argv input deliberately has no environment alias.
+    #[arg(long)]
+    network_additional_ca_digest: Option<String>,
+
     #[arg(long)]
     backend_descriptor_file: Option<PathBuf>,
 
@@ -203,6 +213,11 @@ fn auth_bundle(args: &Args) -> Result<openshell_core::jwt::SupervisorAuthBundle>
 }
 
 fn validate_role_arguments(args: &Args) -> Result<()> {
+    openshell_supervisor_network::l7::tls::validate_network_additional_ca_args(
+        args.network_additional_ca_bundle.as_deref(),
+        args.network_additional_ca_digest.as_deref(),
+    )?;
+
     match args.role {
         SupervisorRole::IsolationBackend => {
             if args.backend_descriptor_file.is_none() {
@@ -442,6 +457,8 @@ fn main() -> Result<()> {
                     auth_bundle,
                     admitted_isolation_backend,
                     args.main_exit_marker,
+                    args.network_additional_ca_bundle,
+                    args.network_additional_ca_digest,
                 ))
                 .await
             }
@@ -459,6 +476,8 @@ fn main() -> Result<()> {
                     policy_data,
                     args.tls_dir,
                     upstream_proxy_args,
+                    args.network_additional_ca_bundle,
+                    args.network_additional_ca_digest,
                 )
                 .await
             }
@@ -470,6 +489,8 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory as _;
+
     use super::*;
 
     #[test]
@@ -555,5 +576,90 @@ mod tests {
     fn completion_marker_must_be_absolute() {
         assert!(validate_main_exit_marker(Some(Path::new("relative"))).is_err());
         assert!(validate_main_exit_marker(Some(Path::new("/run/openshell/main-exit"))).is_ok());
+    }
+
+    #[test]
+    fn destination_ca_pair_is_protected_and_accepted_by_network_proxy() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--role",
+            "network-proxy",
+            "--policy-rules",
+            "/tmp/policy.rego",
+            "--policy-data",
+            "/tmp/policy.yaml",
+            "--network-additional-ca-bundle",
+            "/etc/openshell-tls/network-additional-ca.crt",
+            "--network-additional-ca-digest",
+            &digest,
+        ])
+        .expect("destination trust arguments should parse");
+        validate_role_arguments(&args).expect("coherent destination trust arguments");
+        assert_eq!(
+            args.network_additional_ca_bundle.as_deref(),
+            Some(Path::new("/etc/openshell-tls/network-additional-ca.crt"))
+        );
+        assert_eq!(
+            args.network_additional_ca_digest.as_deref(),
+            Some(digest.as_str())
+        );
+
+        let command = Args::command();
+        for id in [
+            "network_additional_ca_bundle",
+            "network_additional_ca_digest",
+        ] {
+            let argument = command
+                .get_arguments()
+                .find(|argument| argument.get_id() == id)
+                .expect("destination trust argument metadata");
+            assert!(
+                argument.get_env().is_none(),
+                "environment must not select destination trust material"
+            );
+        }
+    }
+
+    #[test]
+    fn both_roles_reject_incoherent_or_malformed_destination_ca_arguments_early() {
+        let valid_digest = format!("sha256:{}", "a".repeat(64));
+        for role in ["isolation-backend", "network-proxy"] {
+            let path_only = Args::try_parse_from([
+                "openshell-supervisor",
+                "--role",
+                role,
+                "--network-additional-ca-bundle",
+                "/etc/openshell-tls/network-additional-ca.crt",
+            ])
+            .expect("path-only argument should parse before validation");
+            let digest_only = Args::try_parse_from([
+                "openshell-supervisor",
+                "--role",
+                role,
+                "--network-additional-ca-digest",
+                &valid_digest,
+            ])
+            .expect("digest-only argument should parse before validation");
+            let malformed = Args::try_parse_from([
+                "openshell-supervisor",
+                "--role",
+                role,
+                "--network-additional-ca-bundle",
+                "/etc/openshell-tls/network-additional-ca.crt",
+                "--network-additional-ca-digest",
+                "sha256:not-a-digest",
+            ])
+            .expect("malformed digest should parse before validation");
+
+            for (args, expected) in [
+                (path_only, "must be set together"),
+                (digest_only, "must be set together"),
+                (malformed, "lowercase hexadecimal"),
+            ] {
+                let error = validate_role_arguments(&args).unwrap_err();
+                assert!(error.to_string().contains(expected), "{role}: {error}");
+            }
+        }
     }
 }
