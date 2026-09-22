@@ -90,6 +90,10 @@ Windows validation is exposed through `tasks/windows.toml`:
 | `windows:test:arm64` | Run the same suite natively on ARM64. |
 | `windows:test:unsupported:x64` | Run focused gateway-composition tests for unsupported driver contracts. |
 | `windows:test:unsupported:arm64` | Run the same focused contracts natively on ARM64. |
+| `windows:test:mxc-real:arm64` | Run the native real-MXC developer suite; missing hardware remains skip-safe. |
+| `windows:test:mxc-gb300:arm64` | Run the required real-MXC subset on native ARM64 and fail on any required skip. |
+| `windows:qualify:mxc:gb300:contract` | Validate the static NVBug 6643699 scope matrix on any development host. |
+| `windows:qualify:mxc:gb300` | Execute the complete native GB300 ARM64 gate and produce hash-bound evidence. |
 | `windows:ci` | Run check, build, test, unsupported-contract tests, and artifact reporting. |
 
 The Windows tasks call `tasks/scripts/windows-msvc.ps1`. The wrapper discovers
@@ -184,6 +188,13 @@ host. Hosted tests use architecture-matched runners, so ARM64 test results are
 native rather than emulated coverage.
 
 ## Validation Contract
+
+The generic real-MXC lanes are diagnostics and deliberately remain skip-safe.
+They cannot establish hardware qualification when a prerequisite or backend is
+absent. GB300 release evidence uses the separate fail-closed contract in
+[`crates/openshell-driver-mxc/qualification/`](../crates/openshell-driver-mxc/qualification/README.md).
+That matrix separates native Windows ARM64 evidence from x64-only NemoClaw and
+Windows lanes, and records all hardware-dependent exclusions explicitly.
 
 A successful Windows build report should include:
 

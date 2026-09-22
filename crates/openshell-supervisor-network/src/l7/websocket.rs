@@ -636,6 +636,7 @@ fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
             .build()
     );
     ocsf_emit!(crate::l7::build_credential_endpoint_mismatch_finding(
+        openshell_ocsf::ctx::ctx(),
         policy_name,
         host,
         Some("websocket"),
@@ -1387,7 +1388,12 @@ fn emit_uninspected_credential_denial(host: &str, port: u16, policy_name: &str, 
         ))
         .build();
     ocsf_emit!(event);
-    crate::l7::emit_uninspected_credential_finding(host, policy_name, surface);
+    crate::l7::emit_uninspected_credential_finding(
+        openshell_ocsf::ctx::ctx(),
+        host,
+        policy_name,
+        surface,
+    );
 }
 
 fn inspect_websocket_text_message(

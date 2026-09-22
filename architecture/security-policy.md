@@ -418,6 +418,13 @@ middleware, token grants, credential rewriting, policy-generation checks, and
 the HTTP relay have succeeded so a later denial cannot coexist with an allowed
 record for the same request.
 
+Each Windows MXC sandbox owns a separate host proxy. That proxy carries an
+immutable per-sandbox OCSF context so proxy lifecycle events and top-level
+CONNECT/forward decisions use the correct `container.uid` and `container.name`
+even when one gateway serves multiple sandboxes concurrently. The process-wide
+sandbox context is only suitable for the one-supervisor-per-sandbox runtime
+model.
+
 Never log secrets, credentials, bearer tokens, or query parameters in OCSF
 messages. OCSF JSONL output may be shipped to external systems.
 The gateway-local OCSF JSONL file sink is restricted to the Windows/MXC path
