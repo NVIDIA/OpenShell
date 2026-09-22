@@ -8656,9 +8656,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_free_create_waits_for_global_policy_transition() {
-        use openshell_core::proto::{CreateSandboxRequest, SandboxSpec};
-
+    async fn global_policy_transition_waits_for_sandbox_sync_guard() {
         let state = test_server_state().await;
         let guard = state.compute.sandbox_sync_guard().await;
 
@@ -8680,39 +8678,12 @@ mod tests {
             "global update should wait for the guard"
         );
 
-        let create_state = state.clone();
-        let create = tokio::spawn(async move {
-            super::super::sandbox::handle_create_sandbox(
-                &create_state,
-                authed_request(CreateSandboxRequest {
-                    name: "provider-free-create".to_string(),
-                    spec: Some(SandboxSpec::default()),
-                    labels: HashMap::new(),
-                    annotations: HashMap::new(),
-                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                    await_main_process_attachment: false,
-                    workload_template_name: String::new(),
-                }),
-            )
-            .await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(
-            !create.is_finished(),
-            "provider-free create must not overlap a global policy transition"
-        );
-
         drop(guard);
         tokio::time::timeout(std::time::Duration::from_secs(5), update)
             .await
             .expect("global update should finish after guard release")
             .expect("join global update")
             .expect("global update should succeed");
-        tokio::time::timeout(std::time::Duration::from_secs(5), create)
-            .await
-            .expect("create should finish after global update")
-            .expect("join create")
-            .expect("provider-free create should succeed");
     }
 
     #[tokio::test]

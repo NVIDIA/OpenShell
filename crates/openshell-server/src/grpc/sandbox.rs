@@ -4980,13 +4980,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_sandbox_with_providers_waits_for_sandbox_sync_guard() {
+    async fn provider_free_create_waits_for_sandbox_sync_guard() {
         let state = test_server_state().await;
-        state
-            .store
-            .put_message(&test_provider("work-github", "github"))
-            .await
-            .unwrap();
 
         let guard = state.compute.sandbox_sync_guard().await;
         let task_state = state.clone();
@@ -4995,10 +4990,7 @@ mod tests {
                 &task_state,
                 authed_request(CreateSandboxRequest {
                     name: "guarded-create".to_string(),
-                    spec: Some(SandboxSpec {
-                        providers: vec!["work-github".to_string()],
-                        ..Default::default()
-                    }),
+                    spec: Some(SandboxSpec::default()),
                     labels: HashMap::new(),
                     annotations: HashMap::new(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
@@ -5012,7 +5004,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(
             !task.is_finished(),
-            "sandbox create with initial providers should wait for sandbox sync guard"
+            "provider-free sandbox create should wait for sandbox sync guard"
         );
         drop(guard);
 
@@ -5022,9 +5014,9 @@ mod tests {
             .expect("join create task")
             .expect("create should succeed")
             .into_inner();
-        assert_eq!(
-            response.sandbox.unwrap().spec.unwrap().providers,
-            vec!["work-github".to_string()]
+        assert!(
+            response.sandbox.unwrap().spec.unwrap().providers.is_empty(),
+            "the synchronization test must exercise a provider-free create"
         );
     }
 
