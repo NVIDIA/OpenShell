@@ -5077,7 +5077,7 @@ mod tests {
             handle_create_sandbox(
                 &task_state,
                 authed_request(CreateSandboxRequest {
-                    name: "provider-backed-create".to_string(),
+                    name: "provider-create".to_string(),
                     spec: Some(SandboxSpec {
                         providers: vec!["work-github".to_string()],
                         ..Default::default()
