@@ -7377,6 +7377,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         driver.config.state_dir = temp.path().to_path_buf();
+        driver.config.bootstrap_image = "invalid bootstrap image reference".to_string();
         let sandbox = Sandbox {
             id: "sb-spawned-trace".to_string(),
             name: "spawned-trace".to_string(),
