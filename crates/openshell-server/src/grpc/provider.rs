@@ -2729,16 +2729,15 @@ pub(super) async fn handle_import_provider_profiles(
     );
     diagnostics.extend(validate_profile_set(&profiles));
     if !has_errors(&diagnostics) {
-        diagnostics.extend(
-            profile_attached_sandbox_diagnostics(
-                state.store.as_ref(),
-                &catalog,
-                &workspace,
-                &profiles,
-                "import",
-            )
-            .await?,
-        );
+        let (attached_diagnostics, _) = profile_attached_sandbox_diagnostics(
+            state.store.as_ref(),
+            &catalog,
+            &workspace,
+            &profiles,
+            "import",
+        )
+        .await?;
+        diagnostics.extend(attached_diagnostics);
     }
 
     if has_errors(&diagnostics) {
@@ -2843,17 +2842,18 @@ pub(super) async fn handle_update_provider_profiles(
             severity: "error".to_string(),
         });
     }
+    let mut affects_attached_sandbox = false;
     if !has_errors(&diagnostics) {
-        diagnostics.extend(
-            profile_attached_sandbox_diagnostics(
-                state.store.as_ref(),
-                &catalog,
-                &workspace,
-                &profiles,
-                "update",
-            )
-            .await?,
-        );
+        let (attached_diagnostics, affects_attached) = profile_attached_sandbox_diagnostics(
+            state.store.as_ref(),
+            &catalog,
+            &workspace,
+            &profiles,
+            "update",
+        )
+        .await?;
+        diagnostics.extend(attached_diagnostics);
+        affects_attached_sandbox = affects_attached;
     }
 
     if has_errors(&diagnostics) {
@@ -2862,6 +2862,10 @@ pub(super) async fn handle_update_provider_profiles(
             profile: None,
             updated: false,
         }));
+    }
+
+    if affects_attached_sandbox {
+        super::policy::require_live_policy_update_support(state)?;
     }
 
     let expected_resource_version = expected_resource_version.unwrap_or_default();
@@ -3489,7 +3493,7 @@ async fn profile_attached_sandbox_diagnostics(
     workspace: &str,
     profiles: &[(String, ProviderTypeProfile)],
     operation: &str,
-) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
+) -> Result<(Vec<ProfileValidationDiagnostic>, bool), Status> {
     let mut candidate_profiles = HashMap::<String, (String, ProviderTypeProfile)>::new();
     for (source, profile) in profiles {
         let Some(id) = normalize_profile_id(&profile.id) else {
@@ -3498,7 +3502,7 @@ async fn profile_attached_sandbox_diagnostics(
         candidate_profiles.insert(id, (source.clone(), profile.clone()));
     }
     if candidate_profiles.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
 
     let is_platform_scope = workspace.is_empty();
@@ -3523,6 +3527,7 @@ async fn profile_attached_sandbox_diagnostics(
         .await?
     };
     let mut diagnostics = Vec::new();
+    let mut affects_attached_sandbox = false;
     let validate_policy_composition =
         super::policy::provider_policy_composition_enabled(store).await?;
     for sandbox in sandboxes {
@@ -3650,6 +3655,7 @@ async fn profile_attached_sandbox_diagnostics(
         if imported_profiles_used.is_empty() {
             continue;
         }
+        affects_attached_sandbox = true;
         if let Err(err) = validate_dynamic_token_grant_bindings_unambiguous(&bindings) {
             for (source, profile_id) in &imported_profiles_used {
                 diagnostics.push(ProfileValidationDiagnostic {
@@ -3684,7 +3690,7 @@ async fn profile_attached_sandbox_diagnostics(
         }
     }
 
-    Ok(diagnostics)
+    Ok((diagnostics, affects_attached_sandbox))
 }
 
 fn stored_provider_profile_for_workspace(
@@ -4966,7 +4972,9 @@ mod tests {
     use super::*;
     use crate::auth::identity::{Identity, IdentityProvider};
     use crate::auth::principal::{Principal, UserPrincipal};
-    use crate::grpc::test_support::{authed_request, test_server_state};
+    use crate::grpc::test_support::{
+        authed_request, test_server_state, test_server_state_with_driver,
+    };
     use crate::grpc::{MAX_MAP_KEY_LEN, MAX_PROVIDER_TYPE_LEN};
     use crate::persistence::test_store;
     use openshell_core::proto::{
@@ -5432,6 +5440,86 @@ mod tests {
         assert_eq!(
             after.profile.unwrap().endpoints[0].host,
             "api.updated.example"
+        );
+    }
+
+    #[tokio::test]
+    async fn mxc_rejects_attached_provider_profile_update_before_persistence() {
+        let state = test_server_state_with_driver("mxc").await;
+        let mut original = custom_profile("custom-api");
+        original.endpoints = vec![NetworkEndpoint {
+            host: "api.before.example".to_string(),
+            port: 443,
+            ..Default::default()
+        }];
+        state
+            .store
+            .put_message(&stored_provider_profile(original))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&provider_with_values("work-custom", "custom-api"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "mxc-profile-sandbox-id".to_string(),
+                    name: "mxc-profile-sandbox".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["work-custom".to_string()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let stored_before = state
+            .store
+            .get_message_by_name::<StoredProviderProfile>("default", "custom-api")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut updated = custom_profile("custom-api");
+        updated.resource_version = stored_before.metadata.as_ref().unwrap().resource_version;
+        updated.endpoints = vec![NetworkEndpoint {
+            host: "api.after.example".to_string(),
+            port: 443,
+            ..Default::default()
+        }];
+
+        let error = handle_update_provider_profiles(
+            &state,
+            authed_request(UpdateProviderProfilesRequest {
+                profile: Some(ProviderProfileImportItem {
+                    profile: Some(updated),
+                    source: "custom-api.yaml".to_string(),
+                }),
+                expected_resource_version: 0,
+                id: "custom-api".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("MXC cannot apply an attached provider profile update");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("delete and recreate"));
+
+        let stored_after = state
+            .store
+            .get_message_by_name::<StoredProviderProfile>("default", "custom-api")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_after.profile.unwrap().endpoints[0].host,
+            "api.before.example"
         );
     }
 

@@ -394,11 +394,10 @@ async fn handle_create_sandbox_inner(
             .authorize(&token, &workspace, &subject)?;
     }
 
-    let _sandbox_sync_guard = if spec.providers.is_empty() {
-        None
-    } else {
-        Some(state.compute.sandbox_sync_guard().await)
-    };
+    // Serialize every create with global policy and provider mutations. A
+    // provider-free create still resolves global policy, so allowing it to
+    // overlap a global update could persist a sandbox against the old policy.
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
 
     // Validate provider names exist (fail fast).
     for name in &spec.providers {
@@ -1119,6 +1118,14 @@ pub(super) async fn handle_attach_sandbox_provider(
         .as_ref()
         .ok_or_else(|| Status::internal("sandbox spec is missing"))?;
 
+    if !spec
+        .providers
+        .iter()
+        .any(|name| name == &request.provider_name)
+    {
+        super::policy::require_live_policy_update_support(state)?;
+    }
+
     // Pre-check: fail fast if already at MAX_PROVIDERS limit (avoid spurious CAS conflicts)
     // Note: This is an optimization; the CAS closure rechecks after dedupe in case of races
     if spec.providers.len() >= MAX_PROVIDERS
@@ -1256,6 +1263,14 @@ pub(super) async fn handle_detach_sandbox_provider(
         .spec
         .as_ref()
         .ok_or_else(|| Status::internal("sandbox spec is missing"))?;
+
+    if spec
+        .providers
+        .iter()
+        .any(|name| name == &request.provider_name)
+    {
+        super::policy::require_live_policy_update_support(state)?;
+    }
     let mut candidate_spec = spec.clone();
     candidate_spec
         .providers
@@ -3874,6 +3889,74 @@ mod tests {
         let spec = sandbox.spec.unwrap();
         assert_eq!(spec.providers, vec!["work-github"]);
         assert_eq!(spec.log_level, "debug");
+    }
+
+    #[tokio::test]
+    async fn mxc_rejects_provider_attachment_and_detachment_before_persistence() {
+        let state = test_server_state_with_driver("mxc").await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("attach-target", Vec::new()))
+            .await
+            .unwrap();
+
+        let attach_error = handle_attach_sandbox_provider(
+            &state,
+            authed_request(AttachSandboxProviderRequest {
+                sandbox_name: "attach-target".to_string(),
+                provider_name: "work-github".to_string(),
+                expected_resource_version: 0,
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        )
+        .await
+        .expect_err("MXC cannot apply provider attachment to an existing sandbox");
+        assert_eq!(attach_error.code(), tonic::Code::FailedPrecondition);
+        assert!(attach_error.message().contains("delete and recreate"));
+        let attach_target = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "attach-target")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(attach_target.spec.unwrap().providers.is_empty());
+
+        state
+            .store
+            .put_message(&test_sandbox(
+                "detach-target",
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+        let detach_error = handle_detach_sandbox_provider(
+            &state,
+            authed_request(DetachSandboxProviderRequest {
+                sandbox_name: "detach-target".to_string(),
+                provider_name: "work-github".to_string(),
+                expected_resource_version: 0,
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        )
+        .await
+        .expect_err("MXC cannot apply provider detachment to an existing sandbox");
+        assert_eq!(detach_error.code(), tonic::Code::FailedPrecondition);
+        assert!(detach_error.message().contains("delete and recreate"));
+        let detach_target = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "detach-target")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            detach_target.spec.unwrap().providers,
+            vec!["work-github".to_string()]
+        );
     }
 
     #[tokio::test]

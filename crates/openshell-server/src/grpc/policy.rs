@@ -2323,13 +2323,13 @@ async fn validate_provider_composition_for_existing_sandboxes(
     }
 }
 
-fn require_live_policy_update_support(state: &ServerState) -> Result<(), Status> {
+pub(super) fn require_live_policy_update_support(state: &ServerState) -> Result<(), Status> {
     if state.compute.supports_live_policy_updates() {
         return Ok(());
     }
 
     Err(Status::failed_precondition(format!(
-        "compute driver '{}' cannot apply policy updates to an existing sandbox; delete and recreate the sandbox with the requested policy",
+        "compute driver '{}' cannot apply effective policy changes to an existing sandbox; delete and recreate the sandbox with the requested policy",
         state.compute.configured_driver_name()
     )))
 }
@@ -8653,6 +8653,66 @@ mod tests {
                 .expect("global policy remains configured"),
             initial
         );
+    }
+
+    #[tokio::test]
+    async fn provider_free_create_waits_for_global_policy_transition() {
+        use openshell_core::proto::{CreateSandboxRequest, SandboxSpec};
+
+        let state = test_server_state().await;
+        let guard = state.compute.sandbox_sync_guard().await;
+
+        let update_state = state.clone();
+        let update = tokio::spawn(async move {
+            handle_update_config(
+                &update_state,
+                with_user(Request::new(UpdateConfigRequest {
+                    global: true,
+                    policy: Some(test_policy_with_rule("global", "global.example.com")),
+                    ..Default::default()
+                })),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !update.is_finished(),
+            "global update should wait for the guard"
+        );
+
+        let create_state = state.clone();
+        let create = tokio::spawn(async move {
+            super::super::sandbox::handle_create_sandbox(
+                &create_state,
+                authed_request(CreateSandboxRequest {
+                    name: "provider-free-create".to_string(),
+                    spec: Some(SandboxSpec::default()),
+                    labels: HashMap::new(),
+                    annotations: HashMap::new(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    await_main_process_attachment: false,
+                    workload_template_name: String::new(),
+                }),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !create.is_finished(),
+            "provider-free create must not overlap a global policy transition"
+        );
+
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), update)
+            .await
+            .expect("global update should finish after guard release")
+            .expect("join global update")
+            .expect("global update should succeed");
+        tokio::time::timeout(std::time::Duration::from_secs(5), create)
+            .await
+            .expect("create should finish after global update")
+            .expect("join create")
+            .expect("provider-free create should succeed");
     }
 
     #[tokio::test]
