@@ -22,6 +22,8 @@ pub mod gpu;
 #[cfg(feature = "compute-driver")]
 mod isolation;
 #[cfg(feature = "compute-driver")]
+mod layer_applier;
+#[cfg(feature = "compute-driver")]
 pub mod lifecycle;
 #[cfg(feature = "compute-driver")]
 pub mod otel_tracing;
