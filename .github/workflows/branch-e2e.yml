@@ -247,21 +247,21 @@ jobs:
         ]
 
   # Run driver-specific integration tests:
-  # TODO: This should be added as soon as we have driver-specific tests enabled in tmachine.
-  # driver-specific:
-  #   needs: prepare-integration
-  #   permissions:
-  #     actions: read
-  #     contents: read
-  #     packages: read
-  #   uses: ./.github/workflows/integration-runner.yml
-  #   with:
-  #     category: driver-specific
-  #     source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
-  #     integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
-  #     test-matrix: >-
-  #       [
-  #       ]
+  driver-specific-integration:
+    needs: prepare-integration
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/integration-runner.yml
+    with:
+      category: driver-specific
+      source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+      test-matrix: >-
+        [
+          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"driver-podman"}
+        ]
 
   docker-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -451,6 +451,7 @@ jobs:
       - pr_metadata
       - conformance-integration
       - feature-specific-integration
+      - driver-specific-integration
       - docker-e2e
       - vm-e2e
       - docker-external-driver-e2e
