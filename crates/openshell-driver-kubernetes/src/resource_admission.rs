@@ -32,6 +32,48 @@ struct Reference {
     scope: Scope,
 }
 
+fn resource_description(reference: &Reference, namespace: &str, cluster: bool) -> String {
+    if cluster {
+        format!("{} '{}'", reference.kind, reference.name)
+    } else {
+        format!("{} '{}/{}'", reference.kind, namespace, reference.name)
+    }
+}
+
+fn contextualize(status: Status, resource: &str) -> Status {
+    Status::new(status.code(), format!("{resource}: {}", status.message()))
+}
+
+fn metadata_lookup_error(error: kube::Error, resource: &str) -> Status {
+    match error {
+        kube::Error::Api(response) if response.code == 404 => {
+            Status::failed_precondition(format!("{resource} does not exist"))
+        }
+        kube::Error::Api(response) if response.code == 403 => Status::failed_precondition(format!(
+            "gateway is forbidden from reading metadata for {resource} (Kubernetes 403); check gateway RBAC"
+        )),
+        kube::Error::Api(response) if response.code == 401 => Status::unavailable(format!(
+            "gateway authentication was rejected while reading metadata for {resource} (Kubernetes 401)"
+        )),
+        kube::Error::Api(response) => Status::unavailable(format!(
+            "Kubernetes API returned {} ({}) while reading metadata for {resource}",
+            response.code, response.reason
+        )),
+        kube::Error::RustlsTls(_) | kube::Error::TlsRequired => Status::unavailable(format!(
+            "Kubernetes API TLS failed while reading metadata for {resource}"
+        )),
+        kube::Error::Auth(_) => Status::unavailable(format!(
+            "Kubernetes client authentication failed while reading metadata for {resource}"
+        )),
+        kube::Error::HyperError(_) | kube::Error::Service(_) => Status::unavailable(format!(
+            "Kubernetes API connection failed while reading metadata for {resource}"
+        )),
+        _ => Status::unavailable(format!(
+            "Kubernetes client failed while reading metadata for {resource}"
+        )),
+    }
+}
+
 fn reference(refs: &mut BTreeSet<Reference>, kind: &'static str, name: Option<&str>, scope: Scope) {
     if let Some(name) = name.filter(|name| !name.is_empty()) {
         refs.insert(Reference {
@@ -180,34 +222,39 @@ pub async fn admit(
         } else {
             Api::namespaced_with(client.clone(), namespace, &resource)
         };
+        let description = resource_description(&reference, namespace, cluster);
         let object = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             api.get_metadata(&reference.name),
         )
         .await
-        .map_err(|_| Status::unavailable("resource admission lookup timed out"))?
-        .map_err(|error| match error {
-            kube::Error::Api(response) if response.code == 404 => {
-                Status::failed_precondition("external resource not admitted")
-            }
-            _ => Status::unavailable("resource admission metadata lookup failed"),
-        })?;
+        .map_err(|_| {
+            Status::unavailable(format!(
+                "Kubernetes API timed out while reading metadata for {description}"
+            ))
+        })?
+        .map_err(|error| metadata_lookup_error(error, &description))?;
         let metadata = object.metadata;
         if metadata.deletion_timestamp.is_some() {
-            return Err(Status::failed_precondition("resource is being deleted"));
+            return Err(Status::failed_precondition(format!(
+                "{description} is being deleted"
+            )));
         }
-        let uid = metadata
-            .uid
-            .filter(|uid| !uid.is_empty())
-            .ok_or_else(|| Status::failed_precondition("resource has no identity"))?;
+        let uid = metadata.uid.filter(|uid| !uid.is_empty()).ok_or_else(|| {
+            Status::failed_precondition(format!("{description} has no Kubernetes UID"))
+        })?;
         let labels = metadata
             .labels
             .as_ref()
             .into_iter()
             .flat_map(|labels| labels.iter());
         match reference.scope {
-            Scope::Workspace => policy.admit(workspace, labels)?,
-            Scope::Shared => policy.admit_shared(labels)?,
+            Scope::Workspace => policy
+                .admit(workspace, labels)
+                .map_err(|status| contextualize(status, &description))?,
+            Scope::Shared => policy
+                .admit_shared(labels)
+                .map_err(|status| contextualize(status, &description))?,
         }
         identities.insert(
             format!(
@@ -312,6 +359,125 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn metadata_lookup_errors_identify_the_resource_and_failure_class() {
+        for (http_status, reason, expected_code, expected_message) in [
+            (
+                404,
+                "NotFound",
+                tonic::Code::FailedPrecondition,
+                "does not exist",
+            ),
+            (
+                403,
+                "Forbidden",
+                tonic::Code::FailedPrecondition,
+                "check gateway RBAC",
+            ),
+            (
+                503,
+                "ServiceUnavailable",
+                tonic::Code::Unavailable,
+                "Kubernetes API returned 503 (ServiceUnavailable)",
+            ),
+        ] {
+            let service = tower::service_fn(
+                move |_request: http::Request<kube::client::Body>| async move {
+                    let body = serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Status",
+                        "status": "Failure",
+                        "message": "fixture failure",
+                        "reason": reason,
+                        "code": http_status,
+                    });
+                    Ok::<_, std::convert::Infallible>(
+                        http::Response::builder()
+                            .status(http_status)
+                            .header("content-type", "application/json")
+                            .body(kube::client::Body::from(body.to_string().into_bytes()))
+                            .unwrap(),
+                    )
+                },
+            );
+            let client = Client::new(service, "shared");
+            let spec = serde_json::json!({
+                "automountServiceAccountToken": false,
+                "volumes": [{
+                    "name": "data",
+                    "persistentVolumeClaim": {"claimName": "team-data"}
+                }]
+            });
+
+            let error = admit(
+                &client,
+                &ResourceAdmissionConfig::default(),
+                "team-a",
+                "shared",
+                &spec,
+                "private",
+            )
+            .await
+            .expect_err("lookup must fail");
+
+            assert_eq!(error.code(), expected_code);
+            assert!(
+                error
+                    .message()
+                    .contains("PersistentVolumeClaim 'shared/team-data'"),
+                "unexpected error: {error}"
+            );
+            assert!(
+                error.message().contains(expected_message),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn label_denial_identifies_the_resource() {
+        let service = tower::service_fn(|_request: http::Request<kube::client::Body>| async move {
+            let body = serde_json::json!({
+                "apiVersion": "meta.k8s.io/v1",
+                "kind": "PartialObjectMetadata",
+                "metadata": {
+                    "name": "kata",
+                    "uid": "runtime-class-uid",
+                    "labels": {}
+                }
+            });
+            Ok::<_, std::convert::Infallible>(
+                http::Response::builder()
+                    .header("content-type", "application/json")
+                    .body(kube::client::Body::from(body.to_string().into_bytes()))
+                    .unwrap(),
+            )
+        });
+        let client = Client::new(service, "shared");
+        let spec = serde_json::json!({
+            "automountServiceAccountToken": false,
+            "runtimeClassName": "kata"
+        });
+
+        let error = admit(
+            &client,
+            &ResourceAdmissionConfig::default(),
+            "team-a",
+            "shared",
+            &spec,
+            "private",
+        )
+        .await
+        .expect_err("unlabelled RuntimeClass must be denied");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            "RuntimeClass 'kata': external resource not admitted by required labels"
+        );
+    }
+
     #[test]
     fn inventories_all_containers_and_reference_aliases() {
         let pod = serde_json::json!({"automountServiceAccountToken":false,"runtimeClassName":"r","priorityClassName":"p",

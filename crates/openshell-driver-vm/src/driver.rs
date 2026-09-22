@@ -1852,12 +1852,6 @@ impl VmDriver {
                 record.process.is_some() || record.provisioning_task.is_some(),
             )
         };
-        let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
-            .await
-            .map_err(|error| {
-                Status::failed_precondition(format!("read VM admission provenance: {error}"))
-            })?;
-        self.validate_sandbox(&sandbox)?;
         if already_running {
             let active_generation =
                 tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE))
@@ -1876,6 +1870,14 @@ impl VmDriver {
             if launch_authentication.is_empty() {
                 return Ok(());
             }
+        }
+        let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+            .await
+            .map_err(|error| {
+                Status::failed_precondition(format!("read VM admission provenance: {error}"))
+            })?;
+        self.validate_sandbox(&sandbox)?;
+        if already_running {
             // The gateway keeps launch sessions in memory. A non-empty bundle
             // during startup recovery represents a new gateway session, so
             // restart the VM before installing it rather than leaving the old
@@ -8677,6 +8679,53 @@ mod tests {
             )
             .expect("persisted launch authentication");
         assert_eq!(persisted_authentication.supervisor.session_id, old_session);
+    }
+
+    #[tokio::test]
+    async fn already_running_start_noop_does_not_require_admission_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let sandbox = Sandbox {
+            id: "sandbox-running".to_string(),
+            name: "running".to_string(),
+            ..Default::default()
+        };
+        let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
+        create_private_dir_all(&state_dir).await.unwrap();
+        tokio::fs::write(
+            state_dir.join(HOST_BOUNDARY_GENERATION_FILE),
+            b"g0000000000000001\n",
+        )
+        .await
+        .unwrap();
+        let provisioning_task = tokio::spawn(std::future::pending());
+        let snapshot = sandbox_snapshot(&sandbox, provisioning_condition(), false);
+        driver.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxRecord {
+                snapshot,
+                state_dir,
+                process: None,
+                provisioning_task: Some(provisioning_task),
+                gpu_bdf: None,
+                deleting: false,
+            },
+        );
+
+        driver
+            .start_sandbox(&sandbox.id, &sandbox.name, "g0000000000000001", Vec::new())
+            .await
+            .expect("matching already-running start must remain an idempotent no-op");
+
+        let task = driver
+            .registry
+            .lock()
+            .await
+            .remove(&sandbox.id)
+            .and_then(|record| record.provisioning_task)
+            .unwrap();
+        task.abort();
     }
 
     fn test_launch_authentication(label: &str) -> (Vec<u8>, openshell_core::SandboxSessionId) {

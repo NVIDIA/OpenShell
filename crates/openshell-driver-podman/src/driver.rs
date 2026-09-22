@@ -685,7 +685,10 @@ impl PodmanComputeDriver {
                                 .flat_map(|labels| labels.iter()),
                         )
                         .map_err(|error| {
-                            ComputeDriverError::Precondition(error.message().into())
+                            ComputeDriverError::Precondition(format!(
+                                "podman volume '{volume}': {}",
+                                error.message()
+                            ))
                         })?;
                     if !self.config.enable_bind_mounts && podman_volume_is_bind_backed(&volume_info)
                     {
@@ -775,7 +778,12 @@ impl PodmanComputeDriver {
                                     .into_iter()
                                     .flat_map(|labels| labels.iter()),
                             )
-                            .map_err(precondition)?;
+                            .map_err(|error| {
+                                ComputeDriverError::Precondition(format!(
+                                    "podman volume '{name}': {}",
+                                    error.message()
+                                ))
+                            })?;
                         if !self.config.enable_bind_mounts && podman_volume_is_bind_backed(&volume)
                         {
                             return Err(ComputeDriverError::Precondition(
@@ -2997,10 +3005,17 @@ mod tests {
             });
             let mut sandbox = sandbox_with_volume_mount("existing");
             sandbox.workspace = "team-a".into();
-            assert_eq!(
-                driver.validate_sandbox_create(&sandbox).await.is_ok(),
-                allowed
-            );
+            let result = driver.validate_sandbox_create(&sandbox).await;
+            if !allowed {
+                assert!(
+                    result
+                        .as_ref()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("podman volume 'existing'")
+                );
+            }
+            assert_eq!(result.is_ok(), allowed);
             handle.await.unwrap();
             assert!(
                 requests

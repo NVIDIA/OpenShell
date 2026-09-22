@@ -339,12 +339,19 @@ async fn live_docker_resource_admission_checks_native_volume_labels() {
                 "type":"volume", "source":name, "target":"/external", "read_only":read_only
             }]}))
             .unwrap();
-            results.push(
-                driver
-                    .validate_user_volume_mounts_available(&mounts, "team-a")
-                    .await
-                    .is_ok(),
-            );
+            let result = driver
+                .validate_user_volume_mounts_available(&mounts, "team-a")
+                .await;
+            if !approved {
+                assert!(
+                    result
+                        .as_ref()
+                        .unwrap_err()
+                        .message()
+                        .contains(&format!("docker volume '{name}'"))
+                );
+            }
+            results.push(result.is_ok());
         }
         driver
             .docker

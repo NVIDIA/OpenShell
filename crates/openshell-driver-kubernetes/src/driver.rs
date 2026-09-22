@@ -1270,7 +1270,17 @@ impl KubernetesComputeDriver {
                         .into_iter()
                         .flat_map(|labels| labels.iter()),
                 )
-                .map_err(admission_error)?;
+                .map_err(|error| {
+                    admission_error(tonic::Status::new(
+                        error.code(),
+                        format!(
+                            "Secret '{}/{}': {}",
+                            self.config.namespace,
+                            secret_name,
+                            error.message()
+                        ),
+                    ))
+                })?;
 
             let existing = tokio::time::timeout(KUBE_API_TIMEOUT, target_api.get_opt(secret_name))
                 .await
@@ -10889,6 +10899,10 @@ mod tests {
             .await
             .expect_err("unapproved source must not be copied");
         assert!(matches!(error, KubernetesDriverError::Precondition(_)));
+        assert!(
+            error.to_string().contains("Secret 'openshell/regcred'"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

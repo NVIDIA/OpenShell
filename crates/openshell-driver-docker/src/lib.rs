@@ -1141,7 +1141,13 @@ impl DockerComputeDriver {
                         identities.insert(source.clone(), docker_volume_identity(&volume));
                         self.config
                             .resource_admission
-                            .admit(workspace, &volume.labels)?;
+                            .admit(workspace, &volume.labels)
+                            .map_err(|error| {
+                                Status::new(
+                                    error.code(),
+                                    format!("docker volume '{source}': {}", error.message()),
+                                )
+                            })?;
                         if !self.config.enable_bind_mounts && docker_volume_is_bind_backed(&volume)
                         {
                             return Err(Status::failed_precondition(format!(
@@ -1254,7 +1260,13 @@ impl DockerComputeDriver {
                         actual.insert(name.to_string(), docker_volume_identity(&volume));
                         self.config
                             .resource_admission
-                            .admit(workspace, &volume.labels)?;
+                            .admit(workspace, &volume.labels)
+                            .map_err(|error| {
+                                Status::new(
+                                    error.code(),
+                                    format!("docker volume '{name}': {}", error.message()),
+                                )
+                            })?;
                         if !self.config.enable_bind_mounts && docker_volume_is_bind_backed(&volume)
                         {
                             return Err(Status::failed_precondition(
