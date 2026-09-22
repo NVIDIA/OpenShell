@@ -282,6 +282,19 @@ owned task prevents cancellation from stranding a mutation. A gateway restart
 does not start a persisted `Deleting` operation. If the backend completed the
 delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 
+The prune sweep retains a `Completed` sandbox and a settled `Error` sandbox
+(a crashed main process, or any other terminal failure not specifically about
+the compute resource itself) even when the driver reports it missing: both
+are audit records with no live resource to reclaim, and deleting one out from
+under a concurrent `GetSandbox`/`ListSandboxes`/`DeleteSandbox` caller would
+be a silent race, not a cleanup. An `Error` sandbox whose condition reports
+the compute resource itself as missing -- set either by startup recovery
+finding a previously-known sandbox already gone, or by this same sweep
+transitioning a `Stopping`/`Stopped`/`Starting` sandbox to `Error` on an
+earlier pass -- is not retained this way: it is exactly the orphaned resource
+this sweep exists to reclaim, so it keeps flowing through the normal
+delete-and-cleanup path above.
+
 ## Runtime Summary
 
 | Runtime | Best fit | Sandbox boundary | Notes |
