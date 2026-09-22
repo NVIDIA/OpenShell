@@ -2842,8 +2842,7 @@ pub(super) async fn handle_update_provider_profiles(
             severity: "error".to_string(),
         });
     }
-    let mut affects_attached_sandbox = false;
-    if !has_errors(&diagnostics) {
+    let affects_attached_sandbox = if !has_errors(&diagnostics) {
         let (attached_diagnostics, affects_attached) = profile_attached_sandbox_diagnostics(
             state.store.as_ref(),
             &catalog,
@@ -2853,8 +2852,10 @@ pub(super) async fn handle_update_provider_profiles(
         )
         .await?;
         diagnostics.extend(attached_diagnostics);
-        affects_attached_sandbox = affects_attached;
-    }
+        affects_attached
+    } else {
+        false
+    };
 
     if has_errors(&diagnostics) {
         return Ok(Response::new(UpdateProviderProfilesResponse {
