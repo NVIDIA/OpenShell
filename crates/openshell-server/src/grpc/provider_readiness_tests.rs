@@ -74,6 +74,8 @@ fn hello() -> SupervisorHello {
         protocol_revision: SUPERVISOR_PROTOCOL_REVISION,
         connection_epoch: 0,
         supports_provider_readiness: true,
+        image_policy: None,
+        image_policy_discovery: None,
     }
 }
 

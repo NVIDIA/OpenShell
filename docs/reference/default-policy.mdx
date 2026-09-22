@@ -10,6 +10,25 @@ position: 2
 
 When you create a sandbox without `--policy`, OpenShell applies a restrictive built-in fallback. The policy comes from the OpenShell runtime and does not depend on the selected workload image.
 
+## How an Image Policy Becomes Active
+
+If the selected workload image contains a policy, the supervisor offers it to
+the gateway on the first connection. If the gateway already has a policy for
+the sandbox, the gateway policy takes precedence. Otherwise, the gateway uses
+the image policy as the initial candidate. If the image has no policy, the
+gateway uses the built-in fallback.
+
+The gateway sends the selected policy back to the supervisor on the same
+connection. The supervisor adds filesystem paths that exist in that image, then
+returns either the unchanged policy or the complete prepared policy. The
+gateway validates and persists the result before it accepts the supervisor
+session. An invalid image or prepared policy prevents sandbox startup.
+
+The accepted session contains a fresh gateway-owned configuration bootstrap.
+The supervisor initializes from that bootstrap. It does not initialize from
+the image policy or the preparation response. Reconnects skip image-policy
+preparation and use the current gateway configuration.
+
 ## Filesystem Access
 
 The fallback includes the sandbox working directory and grants read-only access to standard runtime paths:

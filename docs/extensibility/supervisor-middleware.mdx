@@ -209,6 +209,14 @@ Plan startup and updates around these boundaries:
 - Keep required services available before creating or updating policies. The gateway validates implementation-owned config before persisting a policy.
 - Treat `fail_open` as an explicit availability-over-enforcement decision.
 
+The supervisor must connect to every remote middleware service required by its
+initial effective policy before it starts the sandbox workload. A connection
+failure blocks sandbox startup even when a matching config uses `fail_open`.
+The supervisor cannot acknowledge a bootstrap that omitted a required runtime.
+After startup, a failed registry reload keeps the last-known-good registry and
+reports the new configuration as rejected. Existing workload processes keep
+running under that retained configuration.
+
 When the effective sandbox configuration changes, a running supervisor validates the new service registry before installing it. If the reload fails, the supervisor keeps its last-known-good registry and emits a configuration failure event.
 
 ## Observe Middleware

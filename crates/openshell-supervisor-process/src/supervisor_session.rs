@@ -11,17 +11,24 @@
 //! selection — it has no protocol awareness of the bytes flowing through.
 
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    FinalizeMainProcessExitRequest, GatewayMessage, RelayFrame, RelayInit, RelayOpen,
-    RelayOpenResult, ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello,
-    SupervisorMessage, TcpRelayTarget, gateway_message, relay_open, supervisor_message,
+    ConfigApplyFailure, ConfigApplyOutcome, ConfigBootstrap, ConfigBootstrapResult,
+    ConfigComponent, ConfigComponentApplyResult, ConfigSnapshotRevision, ConfigUpdate,
+    ConfigUpdateResult, FinalizeMainProcessExitRequest, GatewayMessage, ImagePolicyDiscovery,
+    RelayFrame, RelayInit, RelayOpen, RelayOpenResult, ReportMainProcessExitRequest, SandboxPolicy,
+    StartupConfigPrepared, SupervisorHeartbeat, SupervisorHello, SupervisorMessage, TcpRelayTarget,
+    config_snapshot_revision, config_update, gateway_message, relay_open, startup_config_prepared,
+    supervisor_message,
 };
-use openshell_core::proto::{LEGACY_SUPERVISOR_PROTOCOL_REVISION, SUPERVISOR_PROTOCOL_REVISION};
+use openshell_core::proto::{
+    LEGACY_SUPERVISOR_PROTOCOL_REVISION, PREVIOUS_SUPERVISOR_PROTOCOL_REVISION,
+    SUPERVISOR_PROTOCOL_REVISION,
+};
 use openshell_isolation_interface::contract::{BoundaryLoopbackConnector, LoopbackTarget};
 use openshell_ocsf::{
     ActivityId, BaseEventBuilder, ConnectionInfo, Endpoint, EventContext, NetworkActivityBuilder,
@@ -37,6 +44,110 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const CONFIG_APPLY_TIMEOUT: Duration = Duration::from_mins(1);
+// The gateway may hold the initial stream open while an operator repairs an
+// invalid image policy. Keep this above the five-minute provisioning window.
+pub const SESSION_PREPARE_TIMEOUT: Duration = Duration::from_mins(6);
+
+type StartupPolicyPreparer =
+    Box<dyn FnOnce(SandboxPolicy) -> Result<Option<SandboxPolicy>, String> + Send>;
+
+/// A stream-delivered desired-state payload awaiting application by the
+/// supervisor runtime. The response travels back over `ConnectSupervisor`.
+pub enum ConfigApplyRequest {
+    Bootstrap {
+        bootstrap: ConfigBootstrap,
+        response: tokio::sync::oneshot::Sender<ConfigBootstrapResult>,
+    },
+    Update {
+        update: ConfigUpdate,
+        response: tokio::sync::oneshot::Sender<ConfigUpdateResult>,
+    },
+}
+
+/// A revision-2 supervisor session that has received its required bootstrap.
+///
+/// It has not yet reported runtime initialization. Holding the stream open
+/// across supervisor construction makes the bootstrap the source of initial
+/// gateway-owned state rather than a later reconciliation input.
+pub struct PreparedSupervisorSession {
+    endpoint: String,
+    sandbox_id: String,
+    instance_id: String,
+    channel: grpc_client::AuthedChannel,
+    tx: mpsc::Sender<SupervisorMessage>,
+    inbound: tonic::Streaming<GatewayMessage>,
+    heartbeat_secs: u32,
+    session_id: String,
+    protocol_revision: u32,
+    bootstrap: Option<ConfigBootstrap>,
+}
+
+impl PreparedSupervisorSession {
+    pub fn take_bootstrap(&mut self) -> Option<ConfigBootstrap> {
+        self.bootstrap.take()
+    }
+
+    pub fn uses_stream_configuration(&self) -> bool {
+        self.protocol_revision == SUPERVISOR_PROTOCOL_REVISION
+    }
+}
+
+#[derive(Default)]
+struct ConfigSequenceWatermarks {
+    sandbox_config: u64,
+    provider_environment: u64,
+}
+
+fn failed_component_result(
+    component: ConfigComponent,
+    requested_revision: Option<ConfigSnapshotRevision>,
+    outcome: ConfigApplyOutcome,
+    code: &str,
+    message: &str,
+) -> ConfigComponentApplyResult {
+    ConfigComponentApplyResult {
+        component: component.into(),
+        requested_revision,
+        applied_revision: None,
+        outcome: outcome.into(),
+        failure: Some(ConfigApplyFailure {
+            code: code.to_string(),
+            message: message.chars().take(1024).collect(),
+            retryable: false,
+        }),
+    }
+}
+
+fn update_component_and_revision(
+    update: &ConfigUpdate,
+) -> (ConfigComponent, Option<ConfigSnapshotRevision>) {
+    match update.component.as_ref() {
+        Some(config_update::Component::SandboxConfig(snapshot)) => (
+            ConfigComponent::SandboxConfig,
+            Some(ConfigSnapshotRevision {
+                component: Some(config_snapshot_revision::Component::SandboxConfig(
+                    openshell_core::proto::SandboxConfigRevision {
+                        config_revision: snapshot.config_revision,
+                        policy_version: snapshot.version,
+                        policy_source: snapshot.policy_source,
+                        global_policy_version: snapshot.global_policy_version,
+                        settings_revision: snapshot.settings_revision,
+                    },
+                )),
+            }),
+        ),
+        Some(config_update::Component::ProviderEnvironment(snapshot)) => (
+            ConfigComponent::ProviderEnvironment,
+            Some(ConfigSnapshotRevision {
+                component: Some(config_snapshot_revision::Component::ProviderEnvironment(
+                    snapshot.provider_env_revision,
+                )),
+            }),
+        ),
+        None => (ConfigComponent::Unspecified, None),
+    }
+}
 
 /// Runtime identity and status channel shared with a supervisor session task.
 pub struct SessionRuntimeContext {
@@ -44,6 +155,8 @@ pub struct SessionRuntimeContext {
     pub instance_id: String,
     /// Publishes the currently accepted gateway session to sibling reporters.
     pub session_id_updates: Option<watch::Sender<Option<String>>>,
+    /// Applies streamed configuration updates to the running supervisor.
+    pub config_apply_tx: Option<mpsc::Sender<ConfigApplyRequest>>,
 }
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
@@ -295,6 +408,7 @@ fn map_session_stream_message<T>(
 ///
 /// The task runs for the lifetime of the sandbox process, reconnecting with
 /// exponential backoff on failures.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     endpoint: String,
     sandbox_id: String,
@@ -336,9 +450,77 @@ pub fn spawn_with_readiness(
         terminating,
         instance_id: runtime.instance_id,
         session_id_updates: runtime.session_id_updates,
+        config_apply_tx: runtime.config_apply_tx,
         ready_tx,
+        runtime_ready: Arc::new(AtomicBool::new(true)),
     };
-    (tokio::spawn(run_session_loop(config)), ready_rx)
+    (tokio::spawn(run_session_loop(config, None)), ready_rx)
+}
+
+/// Establish the control stream and receive the required revision-2 bootstrap
+/// before gateway-owned runtime initialization begins.
+pub async fn prepare(
+    endpoint: String,
+    sandbox_id: String,
+    instance_id: String,
+    image_policy_discovery: ImagePolicyDiscovery,
+    prepare_policy: impl FnOnce(SandboxPolicy) -> Result<Option<SandboxPolicy>, String> + Send + 'static,
+) -> Result<PreparedSupervisorSession, Box<dyn std::error::Error + Send + Sync>> {
+    let prepared = tokio::time::timeout(
+        SESSION_PREPARE_TIMEOUT,
+        open_session(
+            endpoint,
+            sandbox_id,
+            instance_id,
+            1,
+            Some(image_policy_discovery),
+            Some(Box::new(prepare_policy)),
+        ),
+    )
+    .await
+    .map_err(|_| "timed out waiting for supervisor session bootstrap")??;
+    if prepared.protocol_revision == SUPERVISOR_PROTOCOL_REVISION && prepared.bootstrap.is_none() {
+        return Err("revision-2 gateway omitted required configuration bootstrap".into());
+    }
+    Ok(prepared)
+}
+
+/// Resume a prepared startup session after the supervisor runtime and relay
+/// endpoints are ready.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_prepared(
+    prepared: PreparedSupervisorSession,
+    bootstrap_result: Option<ConfigBootstrapResult>,
+    ssh_socket_path: std::path::PathBuf,
+    port_forward: Arc<dyn BoundaryLoopbackConnector>,
+    expected_ssh_peer_pid: Option<u32>,
+    terminating: Arc<AtomicBool>,
+    config_apply_tx: mpsc::Sender<ConfigApplyRequest>,
+    session_id_updates: Option<watch::Sender<Option<String>>>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    watch::Receiver<bool>,
+    mpsc::Sender<SupervisorMessage>,
+    Arc<AtomicBool>,
+) {
+    let (ready_tx, ready_rx) = watch::channel(false);
+    let outbound = prepared.tx.clone();
+    let runtime_ready = Arc::new(AtomicBool::new(false));
+    let config = SessionConfig {
+        endpoint: prepared.endpoint.clone(),
+        sandbox_id: prepared.sandbox_id.clone(),
+        ssh_socket_path,
+        port_forward,
+        expected_ssh_peer_pid,
+        terminating,
+        instance_id: prepared.instance_id.clone(),
+        config_apply_tx: Some(config_apply_tx),
+        session_id_updates,
+        ready_tx,
+        runtime_ready: runtime_ready.clone(),
+    };
+    let task = tokio::spawn(run_session_loop(config, Some((prepared, bootstrap_result))));
+    (task, ready_rx, outbound, runtime_ready)
 }
 
 struct SessionConfig {
@@ -349,19 +531,28 @@ struct SessionConfig {
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
+    config_apply_tx: Option<mpsc::Sender<ConfigApplyRequest>>,
     /// Publishes the currently accepted session to sibling control-plane reporters.
     session_id_updates: Option<watch::Sender<Option<String>>>,
     ready_tx: watch::Sender<bool>,
+    runtime_ready: Arc<AtomicBool>,
 }
 
-async fn run_session_loop(config: SessionConfig) {
+async fn run_session_loop(
+    config: SessionConfig,
+    mut prepared: Option<(PreparedSupervisorSession, Option<ConfigBootstrapResult>)>,
+) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
 
     loop {
         attempt += 1;
 
-        let result = run_single_session(&config, attempt).await;
+        let result = if let Some((session, bootstrap_result)) = prepared.take() {
+            run_prepared_session(&config, session, bootstrap_result).await
+        } else {
+            run_single_session(&config, attempt).await
+        };
         if let Some(updates) = &config.session_id_updates {
             updates.send_replace(None);
         }
@@ -396,11 +587,29 @@ async fn run_single_session(
     config: &SessionConfig,
     connection_epoch: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Connect to the gateway. The same `Channel` is used for both the
-    // long-lived control stream and all data-plane `RelayStream` calls, so
-    // every relay rides the same TCP+TLS+HTTP/2 connection — no new TLS
-    // handshake per relay.
-    let channel = grpc_client::connect_channel_pub(&config.endpoint)
+    let prepared = open_session(
+        config.endpoint.clone(),
+        config.sandbox_id.clone(),
+        config.instance_id.clone(),
+        connection_epoch,
+        None,
+        None,
+    )
+    .await?;
+    run_prepared_session(config, prepared, None).await
+}
+
+async fn open_session(
+    endpoint: String,
+    sandbox_id: String,
+    instance_id: String,
+    connection_epoch: u64,
+    image_policy_discovery: Option<ImagePolicyDiscovery>,
+    mut prepare_policy: Option<StartupPolicyPreparer>,
+) -> Result<PreparedSupervisorSession, Box<dyn std::error::Error + Send + Sync>> {
+    // The same authenticated channel carries the long-lived control stream
+    // and all data-plane RelayStream calls.
+    let channel = grpc_client::connect_channel_pub(&endpoint)
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
     let mut client = OpenShellClient::new(channel.clone());
@@ -410,12 +619,22 @@ async fn run_single_session(
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
 
     // Send hello as the first message.
+    let image_policy = image_policy_discovery.as_ref().and_then(|discovery| {
+        let openshell_core::proto::image_policy_discovery::Result::Policy(policy) =
+            discovery.result.as_ref()?
+        else {
+            return None;
+        };
+        Some(policy.clone())
+    });
     tx.send(SupervisorMessage {
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
-            sandbox_id: config.sandbox_id.clone(),
-            instance_id: config.instance_id.clone(),
+            sandbox_id: sandbox_id.clone(),
+            instance_id: instance_id.clone(),
             protocol_revision: SUPERVISOR_PROTOCOL_REVISION,
             connection_epoch,
+            image_policy,
+            image_policy_discovery,
             supports_provider_readiness: true,
         })),
     })
@@ -429,18 +648,61 @@ async fn run_single_session(
         .map_err(|e| format!("connect_supervisor RPC failed: {e}"))?;
     let mut inbound = response.into_inner();
 
-    // Wait for SessionAccepted.
-    let accepted = match map_stream_message(
-        inbound.message().await,
-        "stream closed before session accepted",
-    )?
-    .payload
-    {
-        Some(gateway_message::Payload::SessionAccepted(a)) => a,
-        Some(gateway_message::Payload::SessionRejected(r)) => {
-            return Err(format!("session rejected: {}", r.reason).into());
+    // The gateway may ask the initial supervisor to prepare its selected
+    // policy against the local image before it sends the authoritative
+    // bootstrap. Reconnects do not repeat this startup-only exchange.
+    let accepted = loop {
+        match map_stream_message(
+            inbound.message().await,
+            "stream closed before session accepted",
+        )?
+        .payload
+        {
+            Some(gateway_message::Payload::StartupConfigCandidate(candidate)) => {
+                let preparer = prepare_policy
+                    .take()
+                    .ok_or("gateway requested startup preparation on a reconnect")?;
+                let result = candidate.policy.map_or_else(
+                    || {
+                        startup_config_prepared::Result::Failure(ConfigApplyFailure {
+                            code: "startup_policy_candidate_missing".to_string(),
+                            message: "gateway startup candidate omitted its policy".to_string(),
+                            retryable: false,
+                        })
+                    },
+                    |policy| match preparer(policy) {
+                        Ok(Some(policy)) => startup_config_prepared::Result::PreparedPolicy(policy),
+                        Ok(None) => startup_config_prepared::Result::Unchanged(()),
+                        Err(message) => {
+                            startup_config_prepared::Result::Failure(ConfigApplyFailure {
+                                code: "startup_policy_preparation_failed".to_string(),
+                                message: message.chars().take(1024).collect(),
+                                retryable: false,
+                            })
+                        }
+                    },
+                );
+                tx.send(SupervisorMessage {
+                    payload: Some(supervisor_message::Payload::StartupConfigPrepared(
+                        StartupConfigPrepared {
+                            candidate_id: candidate.candidate_id,
+                            result: Some(result),
+                        },
+                    )),
+                })
+                .await
+                .map_err(|_| "failed to send startup configuration result")?;
+            }
+            Some(gateway_message::Payload::SessionAccepted(accepted)) => break accepted,
+            Some(gateway_message::Payload::SessionRejected(rejected)) => {
+                return Err(format!("session rejected: {}", rejected.reason).into());
+            }
+            _ => {
+                return Err(
+                    "expected StartupConfigCandidate, SessionAccepted, or SessionRejected".into(),
+                );
+            }
         }
-        _ => return Err("expected SessionAccepted or SessionRejected".into()),
     };
 
     let heartbeat_secs = accepted
@@ -448,28 +710,68 @@ async fn run_single_session(
         .as_ref()
         .and_then(|value| openshell_core::time::duration_to_std(value).ok())
         .map_or(5, |value| value.as_secs().max(5));
+    let heartbeat_secs = u32::try_from(heartbeat_secs).unwrap_or(u32::MAX);
     validate_gateway_protocol_revision(accepted.protocol_revision)?;
-    if let Some(updates) = &config.session_id_updates {
-        updates.send_replace(Some(accepted.session_id.clone()));
-    }
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
-        &config.endpoint,
+        &endpoint,
         &accepted.session_id,
-        u32::try_from(heartbeat_secs).unwrap_or(u32::MAX),
+        heartbeat_secs,
     );
     ocsf_emit!(event);
-    if accepted.bootstrap.is_some() {
-        debug!(
-            sandbox_id = %config.sandbox_id,
-            session_id = %accepted.session_id,
-            "supervisor session: ignoring configuration bootstrap while polling remains active"
-        );
+
+    let protocol_revision = accepted.protocol_revision;
+    Ok(PreparedSupervisorSession {
+        endpoint,
+        sandbox_id,
+        instance_id,
+        channel,
+        tx,
+        inbound,
+        heartbeat_secs,
+        session_id: accepted.session_id,
+        protocol_revision,
+        bootstrap: (protocol_revision == SUPERVISOR_PROTOCOL_REVISION)
+            .then_some(accepted.bootstrap)
+            .flatten(),
+    })
+}
+
+async fn run_prepared_session(
+    config: &SessionConfig,
+    mut prepared: PreparedSupervisorSession,
+    startup_result: Option<ConfigBootstrapResult>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(updates) = &config.session_id_updates {
+        updates.send_replace(Some(prepared.session_id.clone()));
     }
-    config.ready_tx.send_replace(true);
+    let heartbeat_secs = prepared.heartbeat_secs;
+    let channel = prepared.channel;
+    let tx = prepared.tx;
+    let mut inbound = prepared.inbound;
+
+    if let Some(result) = startup_result {
+        tx.send(SupervisorMessage {
+            payload: Some(supervisor_message::Payload::ConfigBootstrapResult(result)),
+        })
+        .await
+        .map_err(|_| "failed to queue configuration bootstrap result")?;
+    } else if let Some(bootstrap) = prepared.bootstrap.take() {
+        let result = apply_bootstrap(config, bootstrap).await;
+        tx.send(SupervisorMessage {
+            payload: Some(supervisor_message::Payload::ConfigBootstrapResult(result)),
+        })
+        .await
+        .map_err(|_| "failed to queue configuration bootstrap result")?;
+    }
+    let config_sequences = Arc::new(Mutex::new(ConfigSequenceWatermarks::default()));
+    if prepared.protocol_revision != SUPERVISOR_PROTOCOL_REVISION {
+        config.ready_tx.send_replace(true);
+    }
 
     // Main loop: receive gateway messages + send heartbeats.
-    let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
+    let mut heartbeat_interval =
+        tokio::time::interval(Duration::from_secs(u64::from(heartbeat_secs)));
     heartbeat_interval.tick().await; // skip immediate tick
 
     loop {
@@ -491,6 +793,10 @@ async fn run_single_session(
                     channel: &channel,
                     tx: &tx,
                     terminating: &config.terminating,
+                    config_apply_tx: config.config_apply_tx.as_ref(),
+                    config_sequences: &config_sequences,
+                    ready_tx: &config.ready_tx,
+                    runtime_ready: &config.runtime_ready,
                 };
                 handle_gateway_message(
                     &msg,
@@ -516,6 +822,12 @@ fn validate_gateway_protocol_revision(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match gateway_revision {
         SUPERVISOR_PROTOCOL_REVISION => Ok(()),
+        PREVIOUS_SUPERVISOR_PROTOCOL_REVISION => {
+            warn!(
+                "supervisor session: gateway uses Stage 1 stream semantics; polling remains active"
+            );
+            Ok(())
+        }
         LEGACY_SUPERVISOR_PROTOCOL_REVISION => {
             warn!(
                 "supervisor session: gateway predates the protocol handshake; upgrade the gateway before pinning newer supervisor images"
@@ -527,6 +839,83 @@ fn validate_gateway_protocol_revision(
         )
         .into()),
     }
+}
+
+async fn apply_bootstrap(
+    config: &SessionConfig,
+    bootstrap: ConfigBootstrap,
+) -> ConfigBootstrapResult {
+    let Some(apply_tx) = config.config_apply_tx.as_ref() else {
+        return ConfigBootstrapResult {
+            results: bootstrap_components(&bootstrap)
+                .into_iter()
+                .map(|(component, revision)| {
+                    failed_component_result(
+                        component,
+                        revision,
+                        ConfigApplyOutcome::Unsupported,
+                        "apply_unavailable",
+                        "configuration apply service is unavailable",
+                    )
+                })
+                .collect(),
+            admission: None,
+        };
+    };
+    let (response, receiver) = tokio::sync::oneshot::channel();
+    if apply_tx
+        .send(ConfigApplyRequest::Bootstrap {
+            bootstrap,
+            response,
+        })
+        .await
+        .is_err()
+    {
+        return ConfigBootstrapResult {
+            results: Vec::new(),
+            admission: None,
+        };
+    }
+    match tokio::time::timeout(CONFIG_APPLY_TIMEOUT, receiver).await {
+        Ok(Ok(result)) => result,
+        _ => ConfigBootstrapResult {
+            results: Vec::new(),
+            admission: None,
+        },
+    }
+}
+
+fn bootstrap_components(
+    bootstrap: &ConfigBootstrap,
+) -> Vec<(ConfigComponent, Option<ConfigSnapshotRevision>)> {
+    let mut components = Vec::with_capacity(2);
+    if let Some(snapshot) = bootstrap.sandbox_config.as_ref() {
+        components.push((
+            ConfigComponent::SandboxConfig,
+            Some(ConfigSnapshotRevision {
+                component: Some(config_snapshot_revision::Component::SandboxConfig(
+                    openshell_core::proto::SandboxConfigRevision {
+                        config_revision: snapshot.config_revision,
+                        policy_version: snapshot.version,
+                        policy_source: snapshot.policy_source,
+                        global_policy_version: snapshot.global_policy_version,
+                        settings_revision: snapshot.settings_revision,
+                    },
+                )),
+            }),
+        ));
+    }
+    if let Some(snapshot) = bootstrap.provider_environment.as_ref() {
+        components.push((
+            ConfigComponent::ProviderEnvironment,
+            Some(ConfigSnapshotRevision {
+                component: Some(config_snapshot_revision::Component::ProviderEnvironment(
+                    snapshot.provider_env_revision,
+                )),
+            }),
+        ));
+    }
+    components
 }
 
 /// Report the canonical process result and wait for durable handling.
@@ -577,6 +966,16 @@ struct GatewayMessageContext<'a> {
     channel: &'a grpc_client::AuthedChannel,
     tx: &'a mpsc::Sender<SupervisorMessage>,
     terminating: &'a Arc<AtomicBool>,
+    config_apply_tx: Option<&'a mpsc::Sender<ConfigApplyRequest>>,
+    config_sequences: &'a Arc<Mutex<ConfigSequenceWatermarks>>,
+    ready_tx: &'a watch::Sender<bool>,
+    runtime_ready: &'a Arc<AtomicBool>,
+}
+
+fn update_session_readiness(accepted: bool, ready_tx: &watch::Sender<bool>) {
+    if accepted {
+        ready_tx.send_replace(true);
+    }
 }
 
 fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<'_>) {
@@ -584,14 +983,116 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
         Some(gateway_message::Payload::Heartbeat(_)) => {
             // Gateway heartbeat — nothing to do.
         }
+        Some(gateway_message::Payload::ConfigurationAdmission(admission)) => {
+            let accepted = admission.state
+                == i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted);
+            update_session_readiness(accepted, context.ready_tx);
+            if accepted && context.runtime_ready.load(Ordering::Acquire) {
+                let tx = context.tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(SupervisorMessage {
+                            payload: Some(supervisor_message::Payload::RuntimeReady(
+                                openshell_core::proto::SupervisorRuntimeReady {},
+                            )),
+                        })
+                        .await;
+                });
+            }
+        }
         Some(gateway_message::Payload::ConfigUpdate(update)) => {
-            // Stage 1 accepts pushed configuration but leaves polling as the
-            // only path that changes runtime state.
-            debug!(
-                sandbox_id = %context.sandbox_id,
-                component_sequence = update.component_sequence,
-                "supervisor session: ignoring configuration update while polling remains active"
-            );
+            let update = update.clone();
+            let tx = context.tx.clone();
+            let apply_tx = context.config_apply_tx.cloned();
+            let sandbox_id = context.sandbox_id.to_string();
+            let (component, _) = update_component_and_revision(&update);
+            let invalid_update = update.update_id.is_empty()
+                || update.component_sequence == 0
+                || update.component.is_none();
+            let stale_sequence = if invalid_update {
+                false
+            } else {
+                let mut watermarks = context.config_sequences.lock().unwrap();
+                let watermark = match component {
+                    ConfigComponent::ProviderEnvironment => &mut watermarks.provider_environment,
+                    ConfigComponent::SandboxConfig | ConfigComponent::Unspecified => {
+                        &mut watermarks.sandbox_config
+                    }
+                };
+                if update.component_sequence <= *watermark {
+                    true
+                } else {
+                    *watermark = update.component_sequence;
+                    false
+                }
+            };
+            tokio::spawn(async move {
+                let (component, revision) = update_component_and_revision(&update);
+                let fallback = |outcome, code: &str, message: &str| ConfigUpdateResult {
+                    update_id: update.update_id.clone(),
+                    component_sequence: update.component_sequence,
+                    result: Some(failed_component_result(
+                        component, revision, outcome, code, message,
+                    )),
+                    admission: None,
+                };
+                let result = if invalid_update {
+                    fallback(
+                        ConfigApplyOutcome::Unsupported,
+                        "invalid_update",
+                        "configuration update identity, sequence, and component are required",
+                    )
+                } else if stale_sequence {
+                    fallback(
+                        ConfigApplyOutcome::IgnoredStale,
+                        "stale_sequence",
+                        "configuration update sequence is stale",
+                    )
+                } else if let Some(apply_tx) = apply_tx {
+                    let (response, receiver) = tokio::sync::oneshot::channel();
+                    if apply_tx
+                        .send(ConfigApplyRequest::Update {
+                            update: update.clone(),
+                            response,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        fallback(
+                            ConfigApplyOutcome::Unsupported,
+                            "apply_unavailable",
+                            "configuration apply service is unavailable",
+                        )
+                    } else {
+                        match tokio::time::timeout(CONFIG_APPLY_TIMEOUT, receiver).await {
+                            Ok(Ok(result)) => result,
+                            _ => fallback(
+                                ConfigApplyOutcome::Unsupported,
+                                "apply_timeout",
+                                "configuration application timed out",
+                            ),
+                        }
+                    }
+                } else {
+                    fallback(
+                        ConfigApplyOutcome::Unsupported,
+                        "apply_unavailable",
+                        "configuration apply service is unavailable",
+                    )
+                };
+                if tx
+                    .send(SupervisorMessage {
+                        payload: Some(supervisor_message::Payload::ConfigUpdateResult(result)),
+                    })
+                    .await
+                    .is_err()
+                {
+                    debug!(
+                        sandbox_id,
+                        "configuration result dropped after session close"
+                    );
+                }
+            });
         }
         Some(gateway_message::Payload::RelayOpen(open)) => {
             let channel_id = open.channel_id.clone();
@@ -904,6 +1405,7 @@ mod target_tests {
     #[test]
     fn gateway_protocol_revision_accepts_current_and_legacy_peers() {
         assert!(validate_gateway_protocol_revision(SUPERVISOR_PROTOCOL_REVISION).is_ok());
+        assert!(validate_gateway_protocol_revision(PREVIOUS_SUPERVISOR_PROTOCOL_REVISION).is_ok());
         assert!(validate_gateway_protocol_revision(LEGACY_SUPERVISOR_PROTOCOL_REVISION).is_ok());
     }
 
@@ -912,6 +1414,16 @@ mod target_tests {
         let error = validate_gateway_protocol_revision(SUPERVISOR_PROTOCOL_REVISION + 1)
             .expect_err("version skew must be rejected");
         assert!(error.to_string().contains("revision mismatch"));
+    }
+
+    #[test]
+    fn rejected_live_update_does_not_revoke_session_readiness() {
+        let (ready_tx, ready_rx) = watch::channel(false);
+        update_session_readiness(true, &ready_tx);
+        assert!(*ready_rx.borrow());
+
+        update_session_readiness(false, &ready_tx);
+        assert!(*ready_rx.borrow());
     }
 
     fn tcp(host: &str, port: u32) -> TcpRelayTarget {
