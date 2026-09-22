@@ -127,11 +127,11 @@ while preserving the workspace PVC. The namespace-wide workload fence remains
 in place across sandbox generations.
 
 If provisioning is interrupted, recovery first confirms that the old workload
-Pod is gone. It then lists generation Secrets by sandbox and component labels,
-deletes each stale Secret with a UID precondition, and clears the rollback state
-so the next generation can be created. The Helm chart grants the gateway
-`create`, `list`, and `delete` access to Secrets for this lifecycle. Listing is
-required even when no generation Secrets remain.
+Pod is gone. It then deletes the recorded generation's Secrets by name and
+clears the rollback state so the next generation can be created. Each
+generation Secret is owned by its Pod, so Kubernetes garbage collection removes
+any other generation. The Helm chart grants the gateway `create` and `delete`
+access to Secrets for this lifecycle.
 
 ## Check Cluster Requirements
 

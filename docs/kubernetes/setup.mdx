@@ -329,6 +329,12 @@ namespace. That Role grants `get`, `create`, `patch`, and `delete` on all Secret
 in the credential namespace, and is the gateway's only permission grant for provider
 credential Secrets.
 
+In managed and operator workspace modes, the chart creates an
+`openshell-workspace-secret-source` Role and RoleBinding in the sandbox
+namespace. That Role grants `get` on only the gateway client TLS Secret and, in
+managed mode, the configured image-pull Secrets, which the gateway copies into
+workspace namespaces.
+
 The namespaced Role covers sandbox lifecycle and identity:
 
 | API Group | Resource | Verbs |

@@ -484,11 +484,12 @@ limit. RBAC promotes sandbox CRD permissions to a ClusterRole and adds namespace
 Secret copies use server-side apply. Kubernetes authorizes an apply to an
 existing Secret as `patch`, but also requires `create` authorization when the
 target does not exist. RBAC cannot constrain `create` by `resourceNames`, so
-managed mode grants cluster-wide Secret `create`, `list`, and `delete` for
-generation-scoped bootstrap Secret creation and rollback recovery while keeping
-source reads and subsequent patches restricted to the explicitly configured TLS
-and image-pull Secret names. Recovery lists bootstrap Secrets by sandbox and
-component labels, then deletes stale generations with UID preconditions. The
+managed mode grants cluster-wide Secret `create` and `delete` for
+generation-scoped bootstrap Secret creation and rollback recovery. Patches are
+restricted to the explicitly configured TLS and image-pull Secret names, and
+source reads use a Role in the driver's source namespace. Recovery deletes the
+bootstrap Secrets of the recorded and target runtime generations by exact name;
+Pod owner references let garbage collection remove any other generation. The
 driver exercises these broad permissions only in gateway-owned managed
 namespaces. This depends on the managed-mode ownership invariant described below;
 the gateway ServiceAccount must not be shared with unrelated workloads.

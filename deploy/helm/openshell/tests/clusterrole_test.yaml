@@ -114,7 +114,7 @@ tests:
             apiGroups: [""]
             resources: ["secrets"]
             resourceNames: ["custom-client-tls"]
-            verbs: ["get", "patch"]
+            verbs: ["patch"]
 
   - it: grants operator bootstrap secret lifecycle permissions when TLS and credential storage are disabled
     set:
@@ -126,7 +126,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
+            verbs: ["create", "delete"]
       - notContains:
           path: rules
           content:
@@ -148,13 +148,13 @@ tests:
             apiGroups: [""]
             resources: ["secrets"]
             resourceNames: ["custom-client-tls", "registry-one", "registry-two"]
-            verbs: ["get", "patch"]
+            verbs: ["patch"]
       - contains:
           path: rules
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
+            verbs: ["create", "delete"]
 
   - it: restricts managed copies to image-pull secrets when TLS is disabled
     set:
@@ -169,13 +169,13 @@ tests:
             apiGroups: [""]
             resources: ["secrets"]
             resourceNames: ["registry-one"]
-            verbs: ["get", "patch"]
+            verbs: ["patch"]
       - contains:
           path: rules
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
+            verbs: ["create", "delete"]
 
   - it: omits secrets rule entirely in shared mode
     set:
@@ -209,7 +209,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
+            verbs: ["create", "delete"]
 
   - it: grants operator sandbox-runtime companion permissions
     set:
@@ -232,4 +232,4 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
+            verbs: ["create", "delete"]

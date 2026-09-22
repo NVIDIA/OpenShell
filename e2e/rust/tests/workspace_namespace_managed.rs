@@ -587,6 +587,16 @@ async fn managed_gateway_cannot_read_or_modify_workspace_secrets() {
         );
     }
     assert!(
+        !gateway_can("list", "secrets", &ns).await,
+        "gateway must not list Secrets in workspace namespace {ns}"
+    );
+    for copied in ["secrets/openshell-client-tls", "secrets/e2e-regcred"] {
+        assert!(
+            !gateway_can("get", copied, &ns).await,
+            "gateway must not read {copied} outside its sandbox namespace"
+        );
+    }
+    assert!(
         gateway_can("get", "secrets", "openshell").await,
         "gateway must still reach provider credential Secrets in its configured namespace"
     );

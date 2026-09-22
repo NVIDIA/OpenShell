@@ -765,13 +765,12 @@ Do not suspend or delete the workload Pod manually. The driver advances to
 workload.
 
 If a Sandbox remains in the `suspending` bootstrap phase, verify that the
-gateway ServiceAccount can create, list, and delete Secrets in the sandbox
-namespace. Recovery lists generation Secrets by sandbox and component labels
-even when none remain, then deletes stale entries with UID preconditions before
-clearing the suspension annotations:
+gateway ServiceAccount can create and delete Secrets in the sandbox
+namespace. Recovery deletes the recorded generation's bootstrap Secrets by name
+before clearing the suspension annotations:
 
 ```bash
-for verb in create list delete; do
+for verb in create delete; do
   kubectl auth can-i "$verb" secrets \
     --namespace <sandbox-namespace> \
     --as system:serviceaccount:openshell:openshell
