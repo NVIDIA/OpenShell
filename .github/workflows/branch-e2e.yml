@@ -198,6 +198,8 @@ jobs:
           cargo-version: ${{ needs.version.outputs.cargo }}
 
   build-vm-driver:
+    # The Debian package embeds this binary, so unconditional package builds
+    # require the VM driver artifact even when no E2E suite is selected.
     needs: [pr_metadata, version, build-binaries]
     if: needs.pr_metadata.outputs.should_run == 'true'
     permissions:

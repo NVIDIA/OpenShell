@@ -125,11 +125,13 @@ jobs:
           mv "$gateway_rpm" artifacts/packages/rpm/openshell-gateway.rpm
           rm -rf "$download_dir"
 
-      - name: Resolve prerelease Debian upgrade source
-        if: inputs['include-deb-upgrade-source']
+      - name: Resolve prerelease upgrade source
+        if: inputs['include-deb-upgrade-source'] || inputs['include-rpm-upgrade-source']
         id: upgrade-source
         env:
           GH_TOKEN: ${{ github.token }}
+          INCLUDE_DEB: ${{ inputs['include-deb-upgrade-source'] }}
+          INCLUDE_RPM: ${{ inputs['include-rpm-upgrade-source'] }}
         run: |
           set -euo pipefail
           successful_run_ids=$(gh api --paginate \
@@ -138,7 +140,8 @@ jobs:
           artifact_records=$(gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
             --jq '.artifacts[] | select(.expired == false) | [.workflow_run.id, .name] | @tsv')
-          source_tag=$(printf '%s\n--ARTIFACTS--\n%s\n' "$successful_run_ids" "$artifact_records" | awk -F '\t' '
+          source_record=$(printf '%s\n--ARTIFACTS--\n%s\n' "$successful_run_ids" "$artifact_records" | awk -F '\t' \
+            -v require_deb="$INCLUDE_DEB" -v require_rpm="$INCLUDE_RPM" '
             $0 == "--ARTIFACTS--" {
               reading_artifacts = 1
               next
@@ -147,53 +150,75 @@ jobs:
               if ($1 ~ /^[0-9]+$/) successful_runs[$1] = 1
               next
             }
-            $1 in successful_runs && $2 ~ /^openshell-v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*-linux-amd64-deb$/ {
-              tag = $2
-              sub(/^openshell-/, "", tag)
-              sub(/-linux-amd64-deb$/, "", tag)
-              version = tag
-              sub(/^v/, "", version)
-              split(version, parts, "-pre\\.")
-              split(parts[1], core, "\\.")
-              sequence = parts[2] + 0
-              if (!found || core[1] + 0 > major ||
-                  (core[1] + 0 == major && core[2] + 0 > minor) ||
-                  (core[1] + 0 == major && core[2] + 0 == minor && core[3] + 0 > patch) ||
-                  (core[1] + 0 == major && core[2] + 0 == minor && core[3] + 0 == patch && sequence > prerelease)) {
-                selected = tag
-                major = core[1] + 0
-                minor = core[2] + 0
-                patch = core[3] + 0
-                prerelease = sequence
-                found = 1
+            $1 in successful_runs {
+              run_id = $1
+              artifact = $2
+              tag = ""
+              if (artifact ~ /^openshell-v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*-linux-amd64-deb$/) {
+                tag = artifact
+                sub(/^openshell-/, "", tag)
+                sub(/-linux-amd64-deb$/, "", tag)
+                deb[run_id SUBSEP tag] = artifact
+              } else if (artifact ~ /^openshell-v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*-linux-x86_64-rpm$/) {
+                tag = artifact
+                sub(/^openshell-/, "", tag)
+                sub(/-linux-x86_64-rpm$/, "", tag)
+                rpm[run_id SUBSEP tag] = artifact
+              }
+              if (tag != "") {
+                candidates[run_id SUBSEP tag] = tag
+                runs[run_id SUBSEP tag] = run_id
               }
             }
             END {
-              if (found) print selected
+              for (key in candidates) {
+                if (require_deb == "true" && !(key in deb)) continue
+                if (require_rpm == "true" && !(key in rpm)) continue
+                tag = candidates[key]
+                run_id = runs[key]
+                deb_artifact = (key in deb) ? deb[key] : "-"
+                rpm_artifact = (key in rpm) ? rpm[key] : "-"
+                version = tag
+                sub(/^v/, "", version)
+                split(version, parts, "-pre\\.")
+                split(parts[1], core, "\\.")
+                sequence = parts[2] + 0
+                if (!found || core[1] + 0 > major ||
+                    (core[1] + 0 == major && core[2] + 0 > minor) ||
+                    (core[1] + 0 == major && core[2] + 0 == minor && core[3] + 0 > patch) ||
+                    (core[1] + 0 == major && core[2] + 0 == minor && core[3] + 0 == patch && sequence > prerelease)) {
+                  selected = tag
+                  selected_run = run_id
+                  selected_deb = deb_artifact
+                  selected_rpm = rpm_artifact
+                  major = core[1] + 0
+                  minor = core[2] + 0
+                  patch = core[3] + 0
+                  prerelease = sequence
+                  found = 1
+                }
+              }
+              if (found) {
+                printf "%s\t%s\t%s\t%s\n", selected, selected_run, selected_deb, selected_rpm
+              }
             }')
-          if [[ -z "$source_tag" ]]; then
-            echo "no retained prerelease Debian artifact is available" >&2
+          if [[ -z "$source_record" ]]; then
+            echo "no successful retained prerelease contains all requested package artifacts" >&2
             exit 1
           fi
-          source_artifact="openshell-${source_tag}-linux-amd64-deb"
-          source_run_id=$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${source_artifact}&per_page=100" \
-            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .workflow_run.id')
-          if [[ -z "$source_run_id" || "$source_run_id" == "null" ]]; then
-            echo "no retained artifact run is available for ${source_artifact}" >&2
-            exit 1
-          fi
+          IFS=$'\t' read -r source_tag source_run_id deb_artifact rpm_artifact <<< "$source_record"
           {
             echo "tag=${source_tag}"
-            echo "artifact=${source_artifact}"
             echo "run-id=${source_run_id}"
+            if [[ "$deb_artifact" != "-" ]]; then echo "deb-artifact=${deb_artifact}"; fi
+            if [[ "$rpm_artifact" != "-" ]]; then echo "rpm-artifact=${rpm_artifact}"; fi
           } >> "$GITHUB_OUTPUT"
 
       - name: Download prerelease Debian upgrade source
         if: inputs['include-deb-upgrade-source']
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: ${{ steps.upgrade-source.outputs.artifact }}
+          name: ${{ steps.upgrade-source.outputs['deb-artifact'] }}
           path: artifacts/upgrade/deb/source/download
           github-token: ${{ github.token }}
           run-id: ${{ steps.upgrade-source.outputs['run-id'] }}
@@ -218,95 +243,34 @@ jobs:
           rmdir "$download_dir"
           dpkg-deb --field "${source_dir}/openshell.deb" Version > "${source_dir}/version"
 
-      - name: Export prerelease runtime images for upgrade source
-        if: inputs['include-deb-upgrade-source']
+      # Packages do not embed OCI image payloads. Their gateway binaries pin
+      # this release tag, while tmachine consumes tarballs to keep guest setup
+      # independent of registry access.
+      - name: Export prerelease runtime images for upgrade sources
+        if: inputs['include-deb-upgrade-source'] || inputs['include-rpm-upgrade-source']
         env:
           IMAGE_TAG: ${{ steps.upgrade-source.outputs.tag }}
         run: |
           set -euo pipefail
           image_tag="${IMAGE_TAG#v}"
-          mkdir -p artifacts/upgrade/deb/source
+          mkdir -p artifacts/upgrade/source-images
 
           docker pull "ghcr.io/nvidia/openshell/sandbox:${image_tag}"
           docker tag "ghcr.io/nvidia/openshell/sandbox:${image_tag}" openshell/sandbox:tmachine
-          docker save --output artifacts/upgrade/deb/source/openshell-sandbox-tmachine.tar openshell/sandbox:tmachine
+          docker save --output artifacts/upgrade/source-images/openshell-sandbox-tmachine.tar openshell/sandbox:tmachine
 
           docker pull "ghcr.io/nvidia/openshell/supervisor:${image_tag}"
           docker tag "ghcr.io/nvidia/openshell/supervisor:${image_tag}" openshell/supervisor:tmachine
-          docker save --output artifacts/upgrade/deb/source/openshell-supervisor-tmachine.tar openshell/supervisor:tmachine
-
-      - name: Resolve prerelease RPM upgrade source
-        if: inputs['include-rpm-upgrade-source']
-        id: rpm-upgrade-source
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          successful_run_ids=$(gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/release-tag.yml/runs?status=success&per_page=100" \
-            --jq '.workflow_runs[] | select(.status == "completed" and .conclusion == "success") | .id')
-          artifact_records=$(gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
-            --jq '.artifacts[] | select(.expired == false) | [.workflow_run.id, .name] | @tsv')
-          source_tag=$(printf '%s\n--ARTIFACTS--\n%s\n' "$successful_run_ids" "$artifact_records" | awk -F '\t' '
-            $0 == "--ARTIFACTS--" {
-              reading_artifacts = 1
-              next
-            }
-            !reading_artifacts {
-              if ($1 ~ /^[0-9]+$/) successful_runs[$1] = 1
-              next
-            }
-            $1 in successful_runs && $2 ~ /^openshell-v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*-linux-x86_64-rpm$/ {
-              tag = $2
-              sub(/^openshell-/, "", tag)
-              sub(/-linux-x86_64-rpm$/, "", tag)
-              version = tag
-              sub(/^v/, "", version)
-              split(version, parts, "-pre\\.")
-              split(parts[1], core, "\\.")
-              sequence = parts[2] + 0
-              if (!found || core[1] + 0 > major ||
-                  (core[1] + 0 == major && core[2] + 0 > minor) ||
-                  (core[1] + 0 == major && core[2] + 0 == minor && core[3] + 0 > patch) ||
-                  (core[1] + 0 == major && core[2] + 0 == minor && core[3] + 0 == patch && sequence > prerelease)) {
-                selected = tag
-                major = core[1] + 0
-                minor = core[2] + 0
-                patch = core[3] + 0
-                prerelease = sequence
-                found = 1
-              }
-            }
-            END {
-              if (found) print selected
-            }')
-          if [[ -z "$source_tag" ]]; then
-            echo "no retained prerelease RPM artifact is available" >&2
-            exit 1
-          fi
-          source_artifact="openshell-${source_tag}-linux-x86_64-rpm"
-          source_run_id=$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${source_artifact}&per_page=100" \
-            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .workflow_run.id')
-          if [[ -z "$source_run_id" || "$source_run_id" == "null" ]]; then
-            echo "no retained artifact run is available for ${source_artifact}" >&2
-            exit 1
-          fi
-          {
-            echo "tag=${source_tag}"
-            echo "artifact=${source_artifact}"
-            echo "run-id=${source_run_id}"
-          } >> "$GITHUB_OUTPUT"
+          docker save --output artifacts/upgrade/source-images/openshell-supervisor-tmachine.tar openshell/supervisor:tmachine
 
       - name: Download prerelease RPM upgrade source
         if: inputs['include-rpm-upgrade-source']
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: ${{ steps.rpm-upgrade-source.outputs.artifact }}
+          name: ${{ steps.upgrade-source.outputs['rpm-artifact'] }}
           path: artifacts/upgrade/rpm/source/download
           github-token: ${{ github.token }}
-          run-id: ${{ steps.rpm-upgrade-source.outputs['run-id'] }}
+          run-id: ${{ steps.upgrade-source.outputs['run-id'] }}
 
       - name: Stage prerelease RPM upgrade source
         if: inputs['include-rpm-upgrade-source']
@@ -329,23 +293,6 @@ jobs:
           mv "$gateway_rpm" "${source_dir}/openshell-gateway.rpm"
           mv "${download_dir}/openshell-checksums-sha256.txt" "${source_dir}/openshell-checksums-sha256.txt"
           rm -rf "$download_dir"
-
-      - name: Export prerelease runtime images for RPM upgrade source
-        if: inputs['include-rpm-upgrade-source']
-        env:
-          IMAGE_TAG: ${{ steps.rpm-upgrade-source.outputs.tag }}
-        run: |
-          set -euo pipefail
-          image_tag="${IMAGE_TAG#v}"
-          mkdir -p artifacts/upgrade/rpm/source
-
-          docker pull "ghcr.io/nvidia/openshell/sandbox:${image_tag}"
-          docker tag "ghcr.io/nvidia/openshell/sandbox:${image_tag}" openshell/sandbox:tmachine
-          docker save --output artifacts/upgrade/rpm/source/openshell-sandbox-tmachine.tar openshell/sandbox:tmachine
-
-          docker pull "ghcr.io/nvidia/openshell/supervisor:${image_tag}"
-          docker tag "ghcr.io/nvidia/openshell/supervisor:${image_tag}" openshell/supervisor:tmachine
-          docker save --output artifacts/upgrade/rpm/source/openshell-supervisor-tmachine.tar openshell/supervisor:tmachine
 
       - name: Log in to GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
