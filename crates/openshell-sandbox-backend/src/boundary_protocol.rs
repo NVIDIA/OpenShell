@@ -82,6 +82,7 @@ pub struct SeccompEvidence {
     pub task_memory_read: bool,
     pub task_memory_write: bool,
     pub cancellation: bool,
+    pub task_memory_writes_disabled: bool,
 }
 
 /// Mechanism-specific audit evidence for the native Linux sandbox adapter.
@@ -129,7 +130,7 @@ impl NativeLinuxSandboxAuditEvidence {
             && self.seccomp.proc_fd_identity
             && self.seccomp.task_memory_read
             && self.seccomp.task_memory_write
-            && self.seccomp.cancellation
+            && (self.seccomp.cancellation || self.seccomp.task_memory_writes_disabled)
             && self.landlock_abi >= 3
             && self.landlock_allow_deny
             && self.udp_dns_round_trip
@@ -1408,6 +1409,7 @@ mod tests {
                 task_memory_read: true,
                 task_memory_write: true,
                 cancellation: true,
+                task_memory_writes_disabled: false,
             },
             landlock_abi: 6,
             landlock_allow_deny: true,
@@ -1436,6 +1438,22 @@ mod tests {
         audit.seccomp.addfd_send = false;
         assert!(audit.validate().is_err());
         assert!(!audit.properties().egress_interception.enforced);
+    }
+
+    #[test]
+    fn audit_evidence_accepts_legacy_read_only_listener() {
+        let mut audit = complete_audit_evidence();
+        audit.seccomp.cancellation = false;
+        audit.seccomp.task_memory_writes_disabled = true;
+        assert!(audit.validate().is_ok());
+    }
+
+    #[test]
+    fn audit_evidence_rejects_plain_listener_with_writes_enabled() {
+        let mut audit = complete_audit_evidence();
+        audit.seccomp.cancellation = false;
+        audit.seccomp.task_memory_writes_disabled = false;
+        assert!(audit.validate().is_err());
     }
 
     #[test]
