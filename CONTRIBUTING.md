@@ -343,7 +343,7 @@ cargo build -p openshell-prover-cli --features bundled-z3
 For x86-64 and ARM64 Windows MSVC builds, use one of these Z3 paths:
 
 - Prebuilt Z3 (the default for `windows:*` tasks): `z3-sys` downloads the
-  pinned Z3 4.16.0 GitHub release for the target architecture on the first
+  pinned Z3 5.1.0 GitHub release for the target architecture on the first
   build. Cargo reuses the extracted archive from its target directory. Windows
   CI authenticates the GitHub API request with `READ_ONLY_GITHUB_TOKEN` and
   preserves the archive in the architecture-specific Cargo target cache. For
@@ -381,8 +381,8 @@ To use a local x64 Z3 release instead of the prebuilt download, set
 `Z3_LIBRARY_PATH_OVERRIDE` and `Z3_SYS_Z3_HEADER` before running the task:
 
 ```powershell
-$env:Z3_LIBRARY_PATH_OVERRIDE='C:\path\to\z3-4.16.0-x64-win\bin'
-$env:Z3_SYS_Z3_HEADER='C:\path\to\z3-4.16.0-x64-win\include\z3.h'
+$env:Z3_LIBRARY_PATH_OVERRIDE='C:\path\to\z3-5.1.0-x64-win\bin'
+$env:Z3_SYS_Z3_HEADER='C:\path\to\z3-5.1.0-x64-win\include\z3.h'
 mise run --skip-tools windows:build:x64
 ```
 

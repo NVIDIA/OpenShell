@@ -135,7 +135,7 @@ from this skill.
 | `CARGO_TARGET_DIR` | `target` under repo root | Override Cargo output location. Use a short absolute path when x64-to-ARM64 builds approach Windows path-length limits. |
 | `Z3_LIBRARY_PATH_OVERRIDE` | unset | Directory containing an x64 system `libz3.lib`; not valid for ARM64. |
 | `Z3_SYS_Z3_HEADER` | unset | Full `z3.h` path required with a system Z3 library. |
-| `Z3_SYS_Z3_VERSION` | `4.16.0` | Pinned official prebuilt Z3 release selected by the wrapper. |
+| `Z3_SYS_Z3_VERSION` | `5.1.0` | Pinned official prebuilt Z3 release selected by the wrapper. |
 | `READ_ONLY_GITHUB_TOKEN` | unset | Optional token for the Z3 release lookup; GitHub Actions supplies `github.token`. |
 | `RUSTC_WRAPPER` | inherited | The wrapper resolves an available command to an absolute path. If it is unavailable, the wrapper warns and continues without compiler caching. |
 

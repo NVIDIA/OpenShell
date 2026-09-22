@@ -120,7 +120,7 @@ and the locked Rolldown version. Go tests retain race coverage wherever the
 toolchain supports it; POSIX permission-bit checks are not Windows ACL tests.
 Test tasks require the Rust target architecture to match the Windows host, so
 an ARM64 test result is native coverage rather than x64 emulation coverage.
-By default it enables the `z3-sys` prebuilt-release feature and pins Z3 4.16.0.
+By default it enables the `z3-sys` prebuilt-release feature and pins Z3 5.1.0.
 On a clean target directory, `z3-sys` downloads the official static library for
 the selected Windows architecture instead of compiling Z3 through
 CMake/MSBuild. GitHub Actions supplies its read-only workflow token for the
