@@ -125,6 +125,8 @@ This enables credential injection and L7 inspection without explicit configurati
 | Risk if relaxed | `tls: skip` disables placeholder credential rewriting, dynamic token grant injection, and L7 inspection for that endpoint. The proxy relays encrypted traffic without seeing the contents. |
 | Recommendation | Use auto-detect (the default) for most endpoints. Use `tls: skip` only when the upstream requires the client's own TLS certificate (mTLS) or uses a non-HTTP protocol. A provider-credentialed endpoint also requires the explicit `allow_uninspected_credentials: true` exception. |
 
+On Windows, inbox `curl.exe` uses Schannel and does not automatically honor the injected `CURL_CA_BUNDLE` value. Pass `--cacert %CURL_CA_BUNDLE%` explicitly when that client sends HTTPS traffic through an MXC governed-egress proxy. Other clients continue to use the trust variable they support.
+
 ### SSRF Protection
 
 After OPA policy allows a connection, the proxy resolves DNS and rejects undeclared internal destinations.
