@@ -8,7 +8,11 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::driver_utils::{LABEL_GATEWAY_ID, LABEL_MANAGED_BY, LABEL_SANDBOX_WORKSPACE};
+
 const WORKSPACE_PLACEHOLDER: &str = "${workspace}";
+const RESERVED_LABEL_KEYS: [&str; 3] =
+    [LABEL_MANAGED_BY, LABEL_GATEWAY_ID, LABEL_SANDBOX_WORKSPACE];
 
 /// Label policy shared by every compute driver. A supplied map replaces defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +139,11 @@ impl ResourceAdmissionConfig {
             );
         }
         for (key, value) in &self.required_labels {
+            if RESERVED_LABEL_KEYS.contains(&key.as_str()) {
+                return Err(format!(
+                    "resource admission label key is reserved for driver-owned metadata: {key}"
+                ));
+            }
             if !valid_label_key(key) {
                 return Err(format!("invalid resource admission label key: {key}"));
             }
@@ -315,6 +324,26 @@ mod tests {
             .validate()
             .is_ok()
         );
+    }
+
+    #[test]
+    fn rejects_driver_owned_label_keys() {
+        assert!(ResourceAdmissionConfig::default().validate().is_ok());
+        for key in RESERVED_LABEL_KEYS {
+            let policy = ResourceAdmissionConfig {
+                required_labels: BTreeMap::from([
+                    ("example.com/approved".into(), "true".into()),
+                    (key.into(), "operator-value".into()),
+                ]),
+                ..Default::default()
+            };
+            assert_eq!(
+                policy.validate(),
+                Err(format!(
+                    "resource admission label key is reserved for driver-owned metadata: {key}"
+                ))
+            );
+        }
     }
 
     #[test]

@@ -557,6 +557,12 @@ namespace or caller label. Other substitutions and expressions are unsupported.
 At least one fixed label is required so intentionally shared resources still
 need explicit operator approval.
 
+The following label keys are reserved for driver-owned metadata and cannot be
+used in `required_labels`: `openshell.ai/managed-by`, `openshell.ai/gateway-id`,
+and `openshell.ai/sandbox-workspace`. The default workspace admission key is
+`openshell.ai/workspace`, which is distinct from the reserved sandbox metadata
+key.
+
 The operator must label the referenced resource before use. Labels on a sandbox
 do not approve its attachments. For example, a PVC used by workspace `team-a`
 needs this metadata:
