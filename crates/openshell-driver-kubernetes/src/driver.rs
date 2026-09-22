@@ -1671,20 +1671,20 @@ impl KubernetesComputeDriver {
             .namespace
             .as_deref()
             .ok_or_else(|| tonic::Status::failed_precondition("sandbox lacks namespace"))?;
-        let sandbox_id =
-            sandbox_id_from_object(object).map_err(tonic::Status::failed_precondition)?;
-        let generation = sandbox_runtime_generation(object).ok_or_else(|| {
-            tonic::Status::failed_precondition("sandbox lacks runtime generation")
+        sandbox_id_from_object(object).map_err(tonic::Status::failed_precondition)?;
+        let spec = &object.data["spec"]["podTemplate"]["spec"];
+        let private_secret = sandbox_bootstrap_secret_name(spec).ok_or_else(|| {
+            tonic::Status::failed_precondition(
+                "sandbox pod template is missing its bootstrap Secret volume",
+            )
         })?;
-        let names = SandboxRuntimeNames::for_generation(&sandbox_id, generation);
-        let spec = object.data["spec"]["podTemplate"]["spec"].clone();
         let actual = crate::resource_admission::admit(
             &self.client,
             &self.config.resource_admission,
             workspace,
             namespace,
-            &spec,
-            &names.sandbox_secret,
+            spec,
+            private_secret,
         )
         .await?;
         if actual != expected {
@@ -5654,6 +5654,15 @@ const SANDBOX_PROXY_CA_VOLUME_NAME: &str = "openshell-run";
 const SANDBOX_PROXY_CA_MOUNT_PATH: &str = "/run";
 const SANDBOX_BOOTSTRAP_SCHEDULING_GATE: &str = "openshell.ai/bootstrap";
 
+fn sandbox_bootstrap_secret_name(spec: &serde_json::Value) -> Option<&str> {
+    spec["volumes"]
+        .as_array()?
+        .iter()
+        .find(|volume| volume["name"] == SANDBOX_BOOTSTRAP_VOLUME_NAME)?["secret"]["secretName"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+}
+
 /// Render the workload Pod that runs the `OpenShell` sandbox runtime.
 ///
 /// The pod receives no gateway credential or endpoint. Its non-root sandbox
@@ -7354,6 +7363,51 @@ mod tests {
                 .is_empty()
         );
     }
+
+    #[tokio::test]
+    async fn admission_revalidates_stopped_sandbox_without_runtime_generation() {
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("stopped-sandbox", &resource);
+        sandbox.metadata.namespace = Some("openshell".to_string());
+        sandbox.metadata.labels = Some(BTreeMap::from([
+            (LABEL_SANDBOX_ID.to_string(), "sandbox-id".to_string()),
+            (LABEL_SANDBOX_WORKSPACE.to_string(), "team-a".to_string()),
+        ]));
+        sandbox.metadata.annotations = Some(BTreeMap::from([
+            (
+                crate::resource_admission::CONFIG_USED.to_string(),
+                "false".to_string(),
+            ),
+            (
+                crate::resource_admission::IDENTITIES.to_string(),
+                "{}".to_string(),
+            ),
+        ]));
+        sandbox.data = serde_json::json!({
+            "spec": {
+                "podTemplate": {
+                    "spec": {
+                        "automountServiceAccountToken": false,
+                        "volumes": [{
+                            "name": SANDBOX_BOOTSTRAP_VOLUME_NAME,
+                            "secret": {"secretName": "os-sandbox-sandbox-id-oldgeneration"}
+                        }]
+                    }
+                }
+            }
+        });
+
+        driver
+            .admit_stored_resources(&sandbox)
+            .await
+            .expect("stopped sandbox should use its stored private Secret reference");
+    }
+
     use openshell_core::progress::{
         PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
         PROGRESS_COMPLETE_STEP_KEY,

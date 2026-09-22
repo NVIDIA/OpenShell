@@ -1316,6 +1316,9 @@ else
       --docker-server=registry.example.test \
       --docker-username=e2e-user \
       --docker-password=e2e-password
+    kctl -n "${NAMESPACE}" label secret \
+      "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET}" \
+      openshell.ai/sandbox-attachable=true
   fi
 
   if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
