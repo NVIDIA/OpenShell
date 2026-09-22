@@ -51,8 +51,8 @@ jobs:
               status_summary="The matching required CI gate status on this PR will flip green automatically once the run finishes."
               ;;
             test:upgrade)
-              suite_summary="the Debian upgrade qualification"
-              build_summary="the Debian package, VM driver, sandbox image, and supervisor image"
+              suite_summary="the Debian and RPM upgrade qualification"
+              build_summary="DEB and RPM packages, VM driver, sandbox image, and supervisor image"
               status_summary="This is an optional proof-of-life suite; failures are visible in the workflow run but do not publish a required CI gate status."
               ;;
             test:e2e-kubernetes)
