@@ -30,13 +30,13 @@ pub enum ControlChannelError {
 
 type PendingMap = Mutex<HashMap<u64, oneshot::Sender<Value>>>;
 /// Slot for one of the spawner's one-time, unsolicited events -- startup-
-/// ready (see `try_route_ready`) and target-ready (see
-/// `try_route_target_ready`) each get their own instance of this type.
+/// ready (see `try_route_ready`) and target status (see
+/// `try_route_target_status`) each get their own instance of this type.
 /// Not part of `PendingMap`: neither has a correlation id or is a reply to
 /// anything the driver sent. The payload is `Ok(())` for a normal fire, or
 /// `Err(reason)` when the event fired but something about it was rejected
-/// (currently only the "ready" event's protocol version check uses this;
-/// `"target_ready"` always sends `Ok(())`).
+/// `"target_ready"` sends `Ok(())`; `"target_failed"` sends its diagnostic
+/// as `Err(reason)`.
 pub type ReadySlot = Mutex<Option<oneshot::Sender<Result<(), String>>>>;
 
 /// Wire protocol version this driver requires from
@@ -50,7 +50,7 @@ pub type ReadySlot = Mutex<Option<oneshot::Sender<Result<(), String>>>>;
 /// "forward", or the `"target_ready"` event itself) -- an independently
 /// staged, stale relay binary then fails fast with a clear error instead of
 /// hanging or misbehaving against fields/events it doesn't understand.
-const REQUIRED_SUPERVISOR_RELAY_PROTOCOL_VERSION: u64 = 2;
+const REQUIRED_SUPERVISOR_RELAY_PROTOCOL_VERSION: u64 = 4;
 
 /// One control channel per sandboxed process. `request()` is safe to call
 /// concurrently — each call gets its own correlation id and awaits only its
@@ -129,20 +129,25 @@ impl ControlChannel {
         .await
     }
 
-    /// Try to recognize `line` as the spawner's unsolicited target-ready
-    /// event (`{"event":"target_ready"}`) -- sent once the spawner has
-    /// actually spawned the target and confirmed its configured port is
-    /// accepting connections (see `wait_for_port_ready` in
-    /// `openshell-supervisor-relay`). Distinct from the `"launch"`
-    /// control-channel *response*, which only confirms the command/env
-    /// arrived, not that the target is running: driver.rs awaits this event
-    /// too before publishing the sandbox `Ready=True`, so a caller acting on
-    /// `Ready` can't race a target that hasn't bound its port yet. Returns
-    /// `true` if `line` was consumed this way. No version gate here -- the
-    /// startup "ready" handshake above already rejected an incompatible
-    /// peer long before this could fire.
-    pub async fn try_route_target_ready(target_ready: &ReadySlot, line: &str) -> bool {
-        Self::try_route_named_event(target_ready, line, "target_ready", |_| Ok(())).await
+    /// Route the spawner's one-time target status event. `target_ready`
+    /// confirms the configured port is accepting connections;
+    /// `target_failed` carries the target's actual exit/error diagnostic.
+    /// Both are distinct from the `launch` response, which only confirms the
+    /// command and environment arrived. No version gate is needed here: the
+    /// startup handshake already rejected an incompatible peer.
+    pub async fn try_route_target_status(target_status: &ReadySlot, line: &str) -> bool {
+        if Self::try_route_named_event(target_status, line, "target_ready", |_| Ok(())).await {
+            return true;
+        }
+        Self::try_route_named_event(target_status, line, "target_failed", |value| {
+            let error = value
+                .get("error")
+                .and_then(Value::as_str)
+                .filter(|error| !error.trim().is_empty())
+                .unwrap_or("target failed without a diagnostic");
+            Err(error.to_string())
+        })
+        .await
     }
 
     async fn try_route_named_event(
@@ -279,7 +284,7 @@ mod tests {
         let (slot, rx) = armed_ready_slot();
 
         let consumed =
-            ControlChannel::try_route_ready(&slot, r#"{"event":"ready","protocol_version":2}"#)
+            ControlChannel::try_route_ready(&slot, r#"{"event":"ready","protocol_version":4}"#)
                 .await;
 
         assert!(consumed);
@@ -298,13 +303,13 @@ mod tests {
             consumed,
             "a recognized ready event is consumed even when rejected"
         );
-        let err = rx.await.unwrap().expect_err("version 2 must be rejected");
+        let err = rx.await.unwrap().expect_err("version 1 must be rejected");
         assert!(
-            err.contains('2'),
+            err.contains('1'),
             "error should name the offending version: {err}"
         );
         assert!(
-            err.contains('1'),
+            err.contains('4'),
             "error should name the required version: {err}"
         );
     }
@@ -334,7 +339,7 @@ mod tests {
         assert!(!ControlChannel::try_route_ready(&slot, "garbage").await);
     }
 
-    // ── try_route_target_ready ───────────────────────────────────────────
+    // ── try_route_target_status ──────────────────────────────────────────
 
     #[tokio::test]
     async fn try_route_target_ready_fires_ok_with_no_version_gate() {
@@ -342,9 +347,9 @@ mod tests {
 
         // No protocol_version field at all -- unlike "ready", "target_ready"
         // must not be gated on one (see the doc comment on
-        // try_route_target_ready).
+        // try_route_target_status).
         let consumed =
-            ControlChannel::try_route_target_ready(&slot, r#"{"event":"target_ready"}"#).await;
+            ControlChannel::try_route_target_status(&slot, r#"{"event":"target_ready"}"#).await;
 
         assert!(consumed);
         assert_eq!(rx.await.unwrap(), Ok(()));
@@ -356,9 +361,9 @@ mod tests {
 
         // "ready" and "target_ready" must not be cross-routed into each
         // other's slot.
-        let consumed = ControlChannel::try_route_target_ready(
+        let consumed = ControlChannel::try_route_target_status(
             &slot,
-            r#"{"event":"ready","protocol_version":2}"#,
+            r#"{"event":"ready","protocol_version":4}"#,
         )
         .await;
 
@@ -369,13 +374,15 @@ mod tests {
     async fn try_route_named_event_is_a_safe_no_op_once_the_slot_is_already_empty() {
         let (slot, rx) = armed_ready_slot();
 
-        assert!(ControlChannel::try_route_target_ready(&slot, r#"{"event":"target_ready"}"#).await);
+        assert!(
+            ControlChannel::try_route_target_status(&slot, r#"{"event":"target_ready"}"#).await
+        );
         // The slot's sender was taken (and used) on the first fire. A
         // repeat of the same event on the wire is still recognized as a
         // "target_ready" line (so the caller doesn't mistake it for plain
         // log text) but must not panic just because the slot is now empty.
         let consumed_again =
-            ControlChannel::try_route_target_ready(&slot, r#"{"event":"target_ready"}"#).await;
+            ControlChannel::try_route_target_status(&slot, r#"{"event":"target_ready"}"#).await;
 
         assert!(
             consumed_again,
@@ -385,6 +392,23 @@ mod tests {
             rx.await.unwrap(),
             Ok(()),
             "only the first fire's Ok(()) was ever sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_route_target_failed_preserves_the_diagnostic() {
+        let (slot, rx) = armed_ready_slot();
+
+        let consumed = ControlChannel::try_route_target_status(
+            &slot,
+            r#"{"event":"target_failed","error":"exit 23; stderr: early crash"}"#,
+        )
+        .await;
+
+        assert!(consumed);
+        assert_eq!(
+            rx.await.unwrap(),
+            Err("exit 23; stderr: early crash".to_string())
         );
     }
 

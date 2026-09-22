@@ -163,11 +163,11 @@ command as the static sandbox process identity because MXC does not expose
 Linux-style procfs socket ownership. For HTTPS L7 inspection, the host proxy generates a
 per-sandbox CA and injects `NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `SSL_CERT_FILE`,
 `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and `GIT_SSL_CAINFO` into the agent
-process env. In curated-environment mode, the driver stages the public CA files
-under the authorized `<cwd>/.openshell-proxy/<sandbox-id>` directory. Other
-environment modes grant the sandbox's unique public-CA directory as an internal
-read-write share. The directory contains only public CA certificates;
-the ephemeral CA private key remains in the host proxy's memory.
+process env. In every environment mode, the driver stages the public CA files
+under the authorized `<cwd>/.openshell-proxy/<sandbox-id>` directory. The host
+proxy's private temporary directory is never added to the sandbox's read-write
+shares. The staged directory contains only public CA certificates; the ephemeral
+CA private key remains in the host proxy's memory.
 
 Windows inbox `curl.exe` uses Schannel and ignores `CURL_CA_BUNDLE` as an
 environment variable, so workloads using it must pass
