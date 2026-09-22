@@ -433,23 +433,39 @@ impl std::fmt::Debug for MxcComputeBackend {
 }
 
 fn sandbox_config(sandbox: &DriverSandbox) -> Result<MxcSandboxConfig, tonic::Status> {
-    let config = sandbox
+    let driver_config = sandbox
         .spec
         .as_ref()
         .and_then(|spec| spec.template.as_ref())
-        .and_then(|template| template.driver_config.as_ref())
-        .ok_or_else(|| {
-            tonic::Status::invalid_argument(
-                "mxc requires template.driver_config.mxc with a non-empty command array",
-            )
-        })?;
-    let config: MxcSandboxConfig =
-        serde_json::from_value(struct_to_json_value(config)).map_err(|error| {
-            tonic::Status::invalid_argument(format!("invalid mxc driver_config: {error}"))
-        })?;
+        .and_then(|template| template.driver_config.as_ref());
+    let config = match driver_config {
+        // Explicit, MXC-specific override (`--driver-config-json`). Takes
+        // priority over the generic CLI command below since it's the most
+        // deliberately-targeted input a caller can supply for this driver.
+        Some(driver_config) => serde_json::from_value(struct_to_json_value(driver_config))
+            .map_err(|error| {
+                tonic::Status::invalid_argument(format!("invalid mxc driver_config: {error}"))
+            })?,
+        // Generic, driver-agnostic `sandbox create -- <COMMAND>` syntax
+        // (`DriverSandboxSpec.command`, the same field every other compute
+        // driver honors). Previously silently ignored here: the caller's
+        // typed command was accepted by the CLI and discarded before ever
+        // reaching this function, surfacing only as a "must contain a
+        // non-empty executable" error that gave no hint a command had been
+        // supplied at all.
+        None => MxcSandboxConfig {
+            command: sandbox
+                .spec
+                .as_ref()
+                .map(|spec| spec.command.clone())
+                .unwrap_or_default(),
+            cwd: String::new(),
+        },
+    };
     if config.command.is_empty() || config.command[0].is_empty() {
         return Err(tonic::Status::invalid_argument(
-            "mxc driver_config.command must contain a non-empty executable",
+            "mxc sandbox command must contain a non-empty executable: set it via \
+             `sandbox create -- <COMMAND>` or `--driver-config-json`",
         ));
     }
     Ok(config)
@@ -2613,6 +2629,67 @@ mod lifecycle_tests {
             status: None,
         }
     }
+
+    /// A `DriverSandbox` carrying only the generic `sandbox create -- <COMMAND>`
+    /// field (`DriverSandboxSpec.command`), with no MXC-specific
+    /// `driver_config` at all -- the shape the CLI's documented,
+    /// driver-agnostic syntax actually produces.
+    fn driver_sandbox_with_cli_command(id: &str, command: Vec<String>) -> DriverSandbox {
+        DriverSandbox {
+            id: id.to_string(),
+            name: id.to_string(),
+            namespace: String::new(),
+            workspace: String::new(),
+            spec: Some(DriverSandboxSpec {
+                sandbox_token: "test-token".into(),
+                command,
+                ..Default::default()
+            }),
+            status: None,
+        }
+    }
+
+    #[test]
+    fn sandbox_config_honors_generic_cli_command() {
+        // Regression test: `sandbox create -- <COMMAND>` (the CLI's own
+        // documented, driver-agnostic syntax) must actually reach the MXC
+        // driver instead of being silently discarded.
+        let sandbox = driver_sandbox_with_cli_command(
+            "sb-cli-cmd",
+            vec!["cmd.exe".into(), "/c".into(), "exit".into()],
+        );
+        let config = sandbox_config(&sandbox).unwrap();
+        assert_eq!(
+            config.command,
+            vec!["cmd.exe".to_string(), "/c".to_string(), "exit".to_string()]
+        );
+    }
+
+    #[test]
+    fn sandbox_config_driver_config_takes_priority_over_cli_command() {
+        // `--driver-config-json` is the more deliberately-targeted input for
+        // this driver; if both are somehow supplied, it must win.
+        let mut sandbox =
+            driver_sandbox_with_command("sb-both", "", vec!["driver-config-cmd.exe".into()]);
+        sandbox.spec.as_mut().unwrap().command = vec!["cli-cmd.exe".into()];
+        let config = sandbox_config(&sandbox).unwrap();
+        assert_eq!(config.command, vec!["driver-config-cmd.exe".to_string()]);
+    }
+
+    #[test]
+    fn sandbox_config_rejects_empty_command_from_every_source() {
+        let sandbox = driver_sandbox_with_cli_command("sb-empty", Vec::new());
+        let error = sandbox_config(&sandbox).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        let message = error.message();
+        // Actionable: names both ways to supply a command, unlike the old
+        // "driver_config.command must contain a non-empty executable"
+        // message, which read as if the CLI's own command syntax weren't
+        // one of them.
+        assert!(message.contains("sandbox create -- <COMMAND>"));
+        assert!(message.contains("--driver-config-json"));
+    }
+
     fn fs_policy(read_write: &[&str]) -> SandboxPolicy {
         SandboxPolicy {
             filesystem: Some(FilesystemPolicy {
