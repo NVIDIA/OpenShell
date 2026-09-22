@@ -2161,6 +2161,23 @@ fn validate_sandbox_rejects_unknown_driver_config_fields() {
 }
 
 #[test]
+fn sandbox_driver_config_rejects_trusted_runtime_image_overrides() {
+    for field in ["sandbox_runtime_image", "supervisor_image"] {
+        let template = DriverSandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                (field): "registry.example.com/openshell/runtime:untrusted"
+            }))),
+            ..Default::default()
+        };
+
+        let error = DockerSandboxDriverConfig::from_template(&template)
+            .expect_err("sandbox requests must not select trusted runtime images");
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains(field), "{error}");
+    }
+}
+
+#[test]
 fn validate_sandbox_accepts_gpu_count_request_shape() {
     let mut config = runtime_config();
     config.gpu.cdi_supported = true;

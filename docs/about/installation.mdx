@@ -77,6 +77,21 @@ Linux packages require glibc 2.28 or newer. The installer checks libc before dow
 
 The Linux user service listens on `https://127.0.0.1:17670` and generates a local mTLS bundle before the gateway starts. Debian uses built-in gateway defaults unless you create a config. RPM seeds `~/.config/openshell/gateway.toml` from its packaged Podman template on first start. RPM upgrades migrate only an unchanged package-generated schema-v1 file; they preserve edited files. Follow the [schema version 2 migration steps](/reference/gateway-config#migrate-to-schema-version-2) when upgrading an edited v1 configuration.
 
+Both Debian and RPM load `~/.config/openshell/gateway.env` for configuration
+preflight and gateway startup. Use it to select exact trusted runtime artifacts
+without creating driver-specific TOML:
+
+```shell
+OPENSHELL_SANDBOX_RUNTIME_IMAGE=registry.example.com/openshell/sandbox@sha256:<digest>
+OPENSHELL_SUPERVISOR_IMAGE=registry.example.com/openshell/supervisor@sha256:<digest>
+```
+
+Explicit image fields in the selected Docker, Podman, or Kubernetes TOML table
+take precedence. Restart the user service after editing the file. Treat these
+variables as trusted operator configuration; sandbox requests cannot set them,
+and registry credentials must remain in the container runtime's credential
+store or Kubernetes image-pull secrets.
+
 The CLI reads the client bundle from `~/.config/openshell/gateways/openshell/mtls/`.
 
 The installer starts the service for you. Use systemd user commands when you need to inspect, restart, or stop the gateway service:

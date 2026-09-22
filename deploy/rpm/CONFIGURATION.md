@@ -51,6 +51,21 @@ editing the TOML file, add them to `~/.config/openshell/gateway.env`:
 OPENSHELL_BIND_ADDRESS=192.168.1.10
 ```
 
+To select exact trusted runtime artifacts across the built-in Docker, Podman,
+or Kubernetes driver, set complete tagged or digest-pinned references:
+
+```shell
+OPENSHELL_SANDBOX_RUNTIME_IMAGE=registry.example.com/openshell/sandbox@sha256:<digest>
+OPENSHELL_SUPERVISOR_IMAGE=registry.example.com/openshell/supervisor@sha256:<digest>
+```
+
+An explicit `sandbox_runtime_image` or `supervisor_image` in the selected
+driver's TOML table takes precedence over the environment; the environment
+takes precedence over the compiled release default. Preflight and startup use
+the same resolution. These values are trusted operator inputs, not sandbox
+request fields. Keep registry credentials in Podman's credential store rather
+than embedding them in image references.
+
 To override the path to the TOML config file entirely:
 
 ```shell
@@ -221,8 +236,8 @@ overrides that persist across package upgrades.
 | `bind_address` | `127.0.0.1:17670` (gateway default) | Address for the primary gRPC/HTTP API listener. |
 | `compute_driver` | `"podman"` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman; legacy `compute_drivers` lists are rejected. |
 | `[openshell.drivers.podman].default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
-| `[openshell.drivers.podman].sandbox_runtime_image` | `ghcr.io/nvidia/openshell/sandbox:latest` | Static musl sandbox runtime image mounted into Podman workloads. |
-| `[openshell.drivers.podman].supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Dynamic glibc supervisor image used outside the workload. |
+| `[openshell.drivers.podman].sandbox_runtime_image` | `ghcr.io/nvidia/openshell/sandbox:<gateway-version>` | Trusted sandbox runtime image. `OPENSHELL_SANDBOX_RUNTIME_IMAGE` supplies a process default when this field is omitted. |
+| `[openshell.drivers.podman].supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:<gateway-version>` | Trusted supervisor image. `OPENSHELL_SUPERVISOR_IMAGE` supplies a process default when this field is omitted. |
 | `[openshell.gateway].guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Gateway-owned client TLS material injected into the selected local driver and mounted into sandbox containers. |
 | `[openshell.gateway.tls]` paths | auto-generated paths | Server TLS certificate, key, and client CA. |
 | `disable_tls` | unset | Set to `true` to disable TLS. |

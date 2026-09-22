@@ -64,6 +64,17 @@ Common gateway options:
 
 Set driver-specific values such as sandbox images, gateway endpoints, network names, TLS material, and VM sizing in the gateway TOML file. See the [Gateway Configuration File](./gateway-config) reference for the full `[openshell.drivers.<name>]` schema.
 
+Docker, Podman, and Kubernetes also accept gateway-process defaults for the
+trusted sandbox-runtime and supervisor images through
+`OPENSHELL_SANDBOX_RUNTIME_IMAGE` and `OPENSHELL_SUPERVISOR_IMAGE`. Complete
+tags and digest-pinned OCI references are supported. An explicit
+`sandbox_runtime_image` or `supervisor_image` in the selected driver's TOML
+table overrides the corresponding environment value; the environment value
+overrides the release default. Helm normally renders explicit Kubernetes
+driver fields, so those chart-selected values remain authoritative. VM and
+extension drivers do not use these variables. Sandbox requests cannot override
+either trusted image.
+
 Extension drivers use the same `compute_driver.proto` gRPC surface as the
 managed VM driver. For an out-of-tree driver, choose a driver name and point
 the gateway at the Unix socket the operator has already provisioned:

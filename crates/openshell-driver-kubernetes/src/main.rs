@@ -109,13 +109,13 @@ struct Args {
     #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
-    #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE")]
+    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
     sandbox_runtime_image: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE_PULL_POLICY")]
     sandbox_runtime_image_pull_policy: Option<KubernetesImagePullPolicy>,
 
-    #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
+    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
     supervisor_image: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY")]

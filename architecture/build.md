@@ -292,11 +292,12 @@ for direct executable installation on every environment. Release Dev and
 Release Tag run Ubuntu conformance through the Debian package, while Fedora
 continues using direct executable installation until RPM coverage is available.
 The Debian qualification profile keeps candidate-image overrides outside the
-operator-owned gateway configuration: it writes a harness-owned file under
-`/var/lib/openshell-qualification` and selects it through the packaged systemd
-unit's `gateway.env` hook. Ordinary package installations continue to use the
-gateway's built-in runtime-image defaults unless the operator configures an
-override.
+operator-owned gateway configuration. It supplies the Docker selector and exact
+sandbox-runtime and supervisor references through the packaged systemd unit's
+`gateway.env` hook, so config preflight and actual startup resolve the same
+artifacts without generating `gateway.toml`. Ordinary package installations
+continue to use the gateway's compiled runtime-image defaults unless the
+operator supplies process defaults or explicit driver TOML values.
 
 ## Python Wheel Packaging
 

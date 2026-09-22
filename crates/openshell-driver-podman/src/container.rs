@@ -2184,6 +2184,25 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_driver_config_rejects_trusted_runtime_image_overrides() {
+        use openshell_core::proto::compute::v1::DriverSandboxTemplate;
+
+        for field in ["sandbox_runtime_image", "supervisor_image"] {
+            let template = DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    (field): "registry.example.com/openshell/runtime:untrusted"
+                }))),
+                ..Default::default()
+            };
+
+            let error = PodmanSandboxDriverConfig::from_template(&template)
+                .expect_err("sandbox requests must not select trusted runtime images");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+
+    #[test]
     fn container_spec_defaults_drop_capabilities_and_keep_runtime_seccomp() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();

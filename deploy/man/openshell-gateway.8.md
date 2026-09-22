@@ -171,6 +171,16 @@ need a custom bundle location.
 The gateway then starts from built-in defaults and reads
 *~/.config/openshell/gateway.toml* when that file exists.
 
+The user service also reads *~/.config/openshell/gateway.env* for both config
+preflight and startup. **OPENSHELL_SANDBOX_RUNTIME_IMAGE** and
+**OPENSHELL_SUPERVISOR_IMAGE** accept complete tagged or digest-pinned OCI
+references for the built-in Docker, Podman, and Kubernetes drivers. Explicit
+image fields in the selected driver's TOML table take precedence over these
+variables; the variables take precedence over compiled release defaults.
+Startup diagnostics report the effective references and their configuration
+source. These are trusted gateway inputs and cannot be supplied by sandbox
+requests. Do not embed registry credentials in image references.
+
 To persist the service across logouts:
 
     sudo loginctl enable-linger $USER

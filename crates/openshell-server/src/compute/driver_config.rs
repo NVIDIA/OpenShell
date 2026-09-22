@@ -151,6 +151,24 @@ where
     driver_config_from_file(context.file, driver_name)
 }
 
+/// Return whether the selected driver's TOML table explicitly contains `field`.
+///
+/// Driver config defaults cannot answer this reliably because an authored value
+/// may be identical to an environment or compiled default. Callers use this
+/// metadata only to apply gateway-owned precedence around the deserialized
+/// driver configuration.
+pub fn driver_config_field_is_explicit(
+    context: DriverStartupContext<'_>,
+    driver_name: &str,
+    field: &str,
+) -> bool {
+    context
+        .file
+        .and_then(|file| file.openshell.drivers.get(driver_name))
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| table.contains_key(field))
+}
+
 fn driver_config_from_file<T>(
     file: Option<&config_file::ConfigFile>,
     driver_name: &str,
@@ -518,5 +536,41 @@ socket_path = "/run/openshell/kyma.sock"
             err.to_string()
                 .contains("remote compute driver 'kyma' requires socket_path")
         );
+    }
+
+    #[test]
+    fn explicit_driver_field_detection_uses_only_the_selected_toml_table() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell]
+version = 2
+
+[openshell.drivers.docker]
+sandbox_runtime_image = "registry.example.com/openshell/sandbox:toml"
+"#,
+        )
+        .expect("valid config");
+        let context = test_context(Some(&file));
+
+        assert!(driver_config_field_is_explicit(
+            context,
+            "docker",
+            "sandbox_runtime_image"
+        ));
+        assert!(!driver_config_field_is_explicit(
+            context,
+            "docker",
+            "supervisor_image"
+        ));
+        assert!(!driver_config_field_is_explicit(
+            context,
+            "podman",
+            "sandbox_runtime_image"
+        ));
+        assert!(!driver_config_field_is_explicit(
+            test_context(None),
+            "docker",
+            "sandbox_runtime_image"
+        ));
     }
 }

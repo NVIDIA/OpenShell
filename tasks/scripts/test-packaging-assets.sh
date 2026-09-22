@@ -40,10 +40,12 @@ assert_file_exists() {
 service="${ROOT}/deploy/deb/openshell-gateway.service"
 control="${ROOT}/deploy/deb/control.in"
 spec="${ROOT}/openshell.spec"
+deb_qualification="${ROOT}/tests/ansible/playbooks/openshell-deb.yaml"
 
 assert_file_exists "$service"
 assert_file_exists "$control"
 assert_file_exists "$spec"
+assert_file_exists "$deb_qualification"
 
 # Debian control files are RFC822-style metadata. Older dpkg-deb releases
 # reject comment lines as malformed fields, so keep SPDX metadata in the
@@ -60,6 +62,8 @@ fi
 assert_contains \
   "$service" \
   'Environment=OPENSHELL_LOCAL_TLS_DIR=%h/.local/state/openshell/tls'
+assert_contains "$service" 'EnvironmentFile=-%E/openshell/gateway.env'
+assert_contains "$service" 'ExecStart=/usr/bin/openshell-gateway'
 assert_contains \
   "$service" \
   'ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR} --server-san host.openshell.internal'
@@ -68,6 +72,8 @@ assert_not_contains "$service" '%S/openshell/tls'
 assert_contains \
   "$spec" \
   'Environment=OPENSHELL_LOCAL_TLS_DIR=%%h/.local/state/openshell/tls'
+assert_contains "$spec" 'EnvironmentFile=-%%E/openshell/gateway.env'
+assert_contains "$spec" 'ExecStart=/usr/bin/openshell-gateway'
 assert_contains \
   "$spec" \
   'ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR} --server-san host.openshell.internal'
@@ -76,6 +82,16 @@ assert_contains "$spec" '%package prover'
 assert_contains "$spec" '%files prover'
 assert_contains "$spec" '%{_bindir}/%{name}-prover'
 assert_not_contains "$spec" '%%S/openshell/tls'
+
+# Installed-package qualification must select the candidate trusted runtime
+# images through the same environment file consumed by preflight and startup,
+# without generating operator-owned gateway TOML.
+assert_contains "$deb_qualification" 'dest: /home/tmachine/.config/openshell/gateway.env'
+assert_contains "$deb_qualification" 'OPENSHELL_COMPUTE_DRIVER=docker'
+assert_contains "$deb_qualification" 'OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine'
+assert_contains "$deb_qualification" 'OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine'
+assert_not_contains "$deb_qualification" 'OPENSHELL_GATEWAY_CONFIG='
+assert_not_contains "$deb_qualification" '/var/lib/openshell-qualification/gateway.toml'
 
 # Schema-v2 package startup wiring.
 snap_wrapper="${ROOT}/tasks/scripts/snap-gateway-wrapper.sh"

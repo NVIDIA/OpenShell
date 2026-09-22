@@ -45,45 +45,23 @@
         - openshell-sandbox
         - openshell-supervisor
 
-    # The package normally starts from its built-in runtime-image defaults.
-    # Qualification instead pins the candidate images staged by tmachine, so
-    # keep that override separate from the operator-owned gateway.toml.
-    - name: Create OpenShell qualification configuration directory
-      become: true
-      ansible.builtin.file:
-        path: /var/lib/openshell-qualification
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
-
-    - name: Configure candidate OpenShell runtime images for qualification
-      become: true
-      ansible.builtin.copy:
-        dest: /var/lib/openshell-qualification/gateway.toml
-        owner: root
-        group: root
-        mode: "0644"
-        content: |
-          [openshell]
-          version = 2
-
-          [openshell.drivers.docker]
-          sandbox_runtime_image = "docker.io/openshell/sandbox:tmachine"
-          supervisor_image = "docker.io/openshell/supervisor:tmachine"
-
     - name: Create OpenShell environment directory
       ansible.builtin.file:
         path: /home/tmachine/.config/openshell
         state: directory
         mode: "0700"
 
-    - name: Select qualification gateway configuration
+    # Exercise the package-owned service and its existing environment-file
+    # mechanism without generating operator-owned gateway TOML. Both preflight
+    # and daemon startup must resolve these exact candidate runtime images.
+    - name: Configure candidate OpenShell runtime images for qualification
       ansible.builtin.copy:
         dest: /home/tmachine/.config/openshell/gateway.env
         mode: "0600"
         content: |
-          OPENSHELL_GATEWAY_CONFIG=/var/lib/openshell-qualification/gateway.toml
+          OPENSHELL_COMPUTE_DRIVER=docker
+          OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine
+          OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine
 
     - name: Start tmachine user manager
       ansible.builtin.include_role:

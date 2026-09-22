@@ -8028,6 +8028,23 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_driver_config_rejects_trusted_runtime_image_overrides() {
+        for field in ["sandbox_runtime_image", "supervisor_image"] {
+            let template = SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    (field): "registry.example.com/openshell/runtime:untrusted"
+                }))),
+                ..Default::default()
+            };
+
+            let error = KubernetesSandboxDriverConfig::from_template(&template)
+                .expect_err("sandbox requests must not select trusted runtime images");
+            assert!(error.contains("unknown field"), "{error}");
+            assert!(error.contains(field), "{error}");
+        }
+    }
+
+    #[test]
     fn driver_config_for_spec_rejects_unknown_fields() {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),

@@ -18,6 +18,38 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 `database_url` is env-only. The loader rejects it when it appears in the file. When `OPENSHELL_DB_URL` is unset, the gateway stores its SQLite database under `$XDG_STATE_HOME/openshell/gateway/openshell.db`.
 
+### Trusted runtime image overrides
+
+Docker, Podman, and Kubernetes consume two gateway-owned trusted runtime
+images. Set complete tagged or digest-pinned OCI references for the gateway
+process when you need to qualify exact artifacts or use a registry mirror:
+
+```shell
+OPENSHELL_SANDBOX_RUNTIME_IMAGE=registry.example.com/openshell/sandbox@sha256:<digest>
+OPENSHELL_SUPERVISOR_IMAGE=registry.example.com/openshell/supervisor:1.2.3
+```
+
+These two settings use driver-specific precedence because explicit operator
+configuration must remain authoritative:
+
+```text
+[openshell.drivers.<selected>] TOML > process environment > compiled release default
+```
+
+`openshell-gateway config preflight` and gateway startup use the same effective
+references. Startup logs report each reference and whether it came from
+`driver_toml`, `process_environment`, or `compiled_default`. Environment values
+are handled exactly like the corresponding TOML fields and passed to the
+selected container runtime. Configure registry credentials in Docker, Podman,
+or Kubernetes image-pull secrets instead of embedding them in a reference.
+
+The variables affect only the built-in Docker, Podman, and Kubernetes drivers.
+They do not affect VM, MXC, or extension drivers. They are trusted gateway
+operator inputs and are never accepted from sandbox create requests. For
+Debian and RPM user services, place them in
+`~/.config/openshell/gateway.env`; the service supplies that file to both
+preflight and gateway startup.
+
 `name` assigns an operator-facing identity to the gateway installation. Set it with `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`. It defaults to `openshell`; the Helm chart defaults it to the chart fullname so all replicas in one installation share a name. Chart fullnames are only unique within their Kubernetes namespace, so set `server.name` explicitly when one collector receives telemetry from multiple namespaces or clusters. This identity is independent of client-side gateway aliases, TLS names, and `gateway_jwt.gateway_id`.
 
 ## Package-Managed Locations

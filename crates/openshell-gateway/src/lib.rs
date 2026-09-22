@@ -42,6 +42,66 @@ use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_server::ComputeDriverRegistration;
 use openshell_server::ComputeDriverRegistry;
 
+#[cfg(all(
+    not(target_os = "windows"),
+    any(
+        feature = "compute-driver-docker",
+        feature = "compute-driver-kubernetes",
+        feature = "compute-driver-podman"
+    )
+))]
+fn runtime_image_source(
+    context: openshell_server::ComputeDriverConfigContext<'_>,
+    field: &str,
+    environment_variable: &str,
+) -> &'static str {
+    if context.driver_config_field_is_explicit(field) {
+        "driver_toml"
+    } else if std::env::var(environment_variable).is_ok() {
+        "process_environment"
+    } else {
+        "compiled_default"
+    }
+}
+
+#[cfg(all(
+    not(target_os = "windows"),
+    any(
+        feature = "compute-driver-docker",
+        feature = "compute-driver-kubernetes",
+        feature = "compute-driver-podman"
+    )
+))]
+fn log_trusted_runtime_images(
+    context: openshell_server::ComputeDriverConfigContext<'_>,
+    driver_name: &str,
+    sandbox_runtime_image: &str,
+    supervisor_image: &str,
+    sandbox_runtime_active: bool,
+) {
+    tracing::info!(
+        compute_driver = driver_name,
+        image = sandbox_runtime_image,
+        configuration_source = runtime_image_source(
+            context,
+            "sandbox_runtime_image",
+            openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV,
+        ),
+        active = sandbox_runtime_active,
+        "resolved trusted sandbox runtime image"
+    );
+    tracing::info!(
+        compute_driver = driver_name,
+        image = supervisor_image,
+        configuration_source = runtime_image_source(
+            context,
+            "supervisor_image",
+            openshell_core::config::SUPERVISOR_IMAGE_ENV,
+        ),
+        "resolved trusted supervisor image"
+    );
+}
+
 /// Install every first-party compute driver linked into the standard gateway.
 #[must_use]
 pub fn install_default_compute_drivers() -> ComputeDriverRegistry {
@@ -253,7 +313,15 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let config = kubernetes_config(context.config_context())?;
+        let config_context = context.config_context();
+        let config = kubernetes_config(config_context)?;
+        log_trusted_runtime_images(
+            config_context,
+            "kubernetes",
+            &config.sandbox_runtime_image,
+            &config.supervisor_image,
+            true,
+        );
         let driver = openshell_driver_kubernetes::KubernetesComputeDriver::new(
             config,
             context.shutdown_receiver(),
@@ -305,7 +373,24 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let mut config: openshell_driver_docker::DockerComputeConfig = context.driver_config()?;
+        let config_context = context.config_context();
+        let mut config: openshell_driver_docker::DockerComputeConfig =
+            config_context.driver_config()?;
+        let sandbox_runtime_image = config
+            .sandbox_runtime_image
+            .clone()
+            .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image);
+        let supervisor_image = config
+            .supervisor_image
+            .clone()
+            .unwrap_or_else(openshell_core::config::default_supervisor_image);
+        log_trusted_runtime_images(
+            config_context,
+            "docker",
+            &sandbox_runtime_image,
+            &supervisor_image,
+            config.supervisor_bin.is_none(),
+        );
         require_guest_tls_for_local_driver(&context, "docker")?;
         apply_guest_tls(
             &mut config.guest_tls_ca,
@@ -351,7 +436,15 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let mut config = podman_config(context.config_context())?;
+        let config_context = context.config_context();
+        let mut config = podman_config(config_context)?;
+        log_trusted_runtime_images(
+            config_context,
+            "podman",
+            &config.sandbox_runtime_image,
+            &config.supervisor_image,
+            true,
+        );
         require_guest_tls_for_local_driver(&context, "podman")?;
         apply_guest_tls(
             &mut config.guest_tls_ca,
