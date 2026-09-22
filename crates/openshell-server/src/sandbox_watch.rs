@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{broadcast, watch};
 use openshell_core::proto::SandboxStreamWarning;
+use tokio::sync::{broadcast, watch};
 
 use crate::persistence::Store;
 use openshell_core::proto::Sandbox;
@@ -201,44 +201,6 @@ mod tests {
         bus.remove("nonexistent");
     }
 
-    #[tokio::test]
-    async fn shared_store_poller_notifies_remote_resource_version_change() {
-        let store = Arc::new(crate::persistence::test_store().await);
-        let bus = SandboxWatchBus::new();
-        let sandbox = Sandbox {
-            metadata: Some(ObjectMeta {
-                id: "sb-1".to_string(),
-                name: "sandbox-a".to_string(),
-                workspace: "default".to_string(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        store.put_message(&sandbox).await.unwrap();
-
-        let mut rx = bus.subscribe("sb-1");
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        spawn_store_poller(store.clone(), bus, Duration::from_millis(10), shutdown_rx);
-
-        tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("poller should publish its initial observation")
-            .unwrap();
-
-        store
-            .update_message_cas::<Sandbox, _>("sb-1", 0, |stored| {
-                stored.set_phase(1);
-            })
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("poller should observe a remote store update")
-            .unwrap();
-
-        shutdown_tx.send(true).unwrap();
-    }
-
     #[test]
     fn lag_warning_reports_dropped_count() {
         let warning = lag_warning(7);
@@ -280,5 +242,43 @@ mod tests {
         // The receiver is still usable: after lag it resumes at the oldest
         // surviving message instead of closing.
         assert!(rx.recv().await.is_ok(), "receiver should recover after lag");
+    }
+
+    #[tokio::test]
+    async fn shared_store_poller_notifies_remote_resource_version_change() {
+        let store = Arc::new(crate::persistence::test_store().await);
+        let bus = SandboxWatchBus::new();
+        let sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        store.put_message(&sandbox).await.unwrap();
+
+        let mut rx = bus.subscribe("sb-1");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        spawn_store_poller(store.clone(), bus, Duration::from_millis(10), shutdown_rx);
+
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("poller should publish its initial observation")
+            .unwrap();
+
+        store
+            .update_message_cas::<Sandbox, _>("sb-1", 0, |stored| {
+                stored.set_phase(1);
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("poller should observe a remote store update")
+            .unwrap();
+
+        shutdown_tx.send(true).unwrap();
     }
 }

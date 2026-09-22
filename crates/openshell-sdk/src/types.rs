@@ -159,7 +159,16 @@ impl From<proto::SandboxLogLine> for LogLine {
         };
         Self {
             sandbox_id: value.sandbox_id,
-            timestamp_ms: value.timestamp_ms,
+            // The wire contract carries `google.protobuf.Timestamp`; these
+            // curated types stay dependency-light and expose milliseconds, the
+            // same reduction the CLI applies at its own presentation edge. An
+            // absent or unrepresentable timestamp reads as 0, which is what
+            // this field meant before the wire types gained presence.
+            timestamp_ms: value
+                .event_time
+                .as_ref()
+                .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok())
+                .unwrap_or(0),
             level: value.level,
             target: value.target,
             message: value.message,
@@ -172,7 +181,11 @@ impl From<proto::SandboxLogLine> for LogLine {
 impl From<proto::PlatformEvent> for PlatformEvent {
     fn from(value: proto::PlatformEvent) -> Self {
         Self {
-            timestamp_ms: value.timestamp_ms,
+            timestamp_ms: value
+                .event_time
+                .as_ref()
+                .and_then(|time| openshell_core::time::timestamp_to_millis(time).ok())
+                .unwrap_or(0),
             source: value.source,
             r#type: value.r#type,
             reason: value.reason,

@@ -13,8 +13,8 @@ use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_sdk::{
     AuthConfig, ClientConfig, ExecOptions, ListOptions, OpenShellClient, Refresh, RefreshError,
     RefreshedToken, SandboxPhase, SandboxSpec, SandboxTemplateCreateSpec,
-    SandboxTemplateListOptions, ServiceExposure, ServiceStatus as SdkServiceStatus,
-    WatchEvent, WatchOptions,
+    SandboxTemplateListOptions, ServiceExposure, ServiceStatus as SdkServiceStatus, WatchEvent,
+    WatchOptions,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -151,7 +151,7 @@ fn log_event(seq: u64, msg: &str) -> proto::SandboxStreamEvent {
         payload: Some(proto::sandbox_stream_event::Payload::Log(
             proto::SandboxLogLine {
                 sandbox_id: "id-my-box".into(),
-                timestamp_ms: 0,
+                event_time: None,
                 level: "INFO".into(),
                 target: "t".into(),
                 message: msg.into(),

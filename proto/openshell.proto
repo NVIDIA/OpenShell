@@ -2028,7 +2028,7 @@ message WatchSandboxRequest {
   // empty resume_after_cursor, because retrying the same token fails
   // identically. A cursor this server could not have issued is rejected with
   // INVALID_ARGUMENT.
-  string resume_after_cursor = 11;
+  string resume_after_cursor = 12;
 }
 
 // One event in a sandbox watch stream.

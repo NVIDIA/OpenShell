@@ -1991,7 +1991,7 @@ pub(super) async fn handle_watch_sandbox(
                 // water. Marking every event the phase examined, not only the
                 // ones that survived the filters, keeps a filtered event's live
                 // duplicate suppressed: the live loop does not re-apply
-                // `log_since_ms` and would otherwise let it through.
+                // `log_since_time` and would otherwise let it through.
                 let mut merged: Vec<CursoredEvent> = Vec::new();
                 if let Some(Ok(v)) = log_replay {
                     if let Some(last) = v.last() {
@@ -3220,7 +3220,7 @@ async fn stream_exec_over_relay(
                     )),
                 }))
                 .await;
-            let _ = proxy_task.await;
+            finish_interactive_exec_proxy(proxy_task).await;
             return Ok(());
         }
     } else {
@@ -3230,12 +3230,12 @@ async fn stream_exec_over_relay(
     let exit_code = match exec_result {
         Ok(code) => code,
         Err(status) => {
-            let _ = proxy_task.await;
+            finish_interactive_exec_proxy(proxy_task).await;
             return Err(status);
         }
     };
 
-    let _ = proxy_task.await;
+    finish_interactive_exec_proxy(proxy_task).await;
 
     let _ = tx
         .send(Ok(ExecSandboxEvent {
@@ -3301,7 +3301,7 @@ async fn stream_interactive_exec_over_relay(
                     )),
                 }))
                 .await;
-            finish_interactive_exec_proxy(proxy_task).await;
+            let _ = proxy_task.await;
             return Ok(());
         }
     } else {
@@ -3311,12 +3311,12 @@ async fn stream_interactive_exec_over_relay(
     let exit_code = match exec_result {
         Ok(code) => code,
         Err(status) => {
-            finish_interactive_exec_proxy(proxy_task).await;
+            let _ = proxy_task.await;
             return Err(status);
         }
     };
 
-    finish_interactive_exec_proxy(proxy_task).await;
+    let _ = proxy_task.await;
 
     let _ = tx
         .send(Ok(ExecSandboxEvent {
@@ -4305,7 +4305,7 @@ mod tests {
                 .tracing_log_bus
                 .publish_external(openshell_core::proto::SandboxLogLine {
                     sandbox_id: sandbox_id.to_string(),
-                    timestamp_ms: i as i64,
+                    event_time: openshell_core::time::timestamp_from_millis(i as i64).ok(),
                     level: "INFO".to_string(),
                     target: "test".to_string(),
                     message: format!("line {i}"),
@@ -4321,7 +4321,7 @@ mod tests {
             SandboxStreamEvent {
                 payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Event(
                     openshell_core::proto::PlatformEvent {
-                        timestamp_ms: 0,
+                        event_time: openshell_core::time::timestamp_from_millis(0).ok(),
                         source: "test".to_string(),
                         r#type: "Normal".to_string(),
                         reason: reason.to_string(),
@@ -4373,7 +4373,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: id.clone(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 resume_after_cursor: cursor_token(&state, &id, 1),
                 ..Default::default()
@@ -4413,7 +4414,7 @@ mod tests {
             .tracing_log_bus
             .publish_external(openshell_core::proto::SandboxLogLine {
                 sandbox_id: id.clone(),
-                timestamp_ms: 3,
+                event_time: openshell_core::time::timestamp_from_millis(3).ok(),
                 level: "INFO".to_string(),
                 target: "test".to_string(),
                 message: "line 3".to_string(),
@@ -4425,7 +4426,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: id.clone(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 follow_events: true,
                 resume_after_cursor: cursor_token(&state, &id, 1),
@@ -4470,7 +4472,7 @@ mod tests {
             .tracing_log_bus
             .publish_external(openshell_core::proto::SandboxLogLine {
                 sandbox_id: id.clone(),
-                timestamp_ms: 3,
+                event_time: openshell_core::time::timestamp_from_millis(3).ok(),
                 level: "INFO".to_string(),
                 target: "test".to_string(),
                 message: "line 3".to_string(),
@@ -4482,7 +4484,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: id.clone(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 follow_events: true,
                 // event_tail has no default; 0 would replay no platform events.
@@ -4516,7 +4519,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: id.clone(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 follow_events: true,
                 ..Default::default()
@@ -4591,7 +4595,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: id.clone(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 follow_events: true,
                 ..Default::default()
@@ -4690,7 +4695,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: id.clone(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 follow_events: true,
                 resume_after_cursor: last_cursor,
@@ -4739,7 +4745,8 @@ mod tests {
             let response = handle_watch_sandbox(
                 &state,
                 authed_request(WatchSandboxRequest {
-                    id: id.clone(),
+                    sandbox: sandbox.object_name().to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                     follow_logs: true,
                     follow_events: true,
                     ..Default::default()
@@ -4781,7 +4788,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: id.clone(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 resume_after_cursor: cursor_token(&state, &id, 3),
                 ..Default::default()
@@ -4817,7 +4825,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: id.clone(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 // Seq 2 was trimmed; this is an unrecoverable gap.
                 resume_after_cursor: cursor_token(&state, &id, 2),
@@ -4911,7 +4920,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: id.clone(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 resume_after_cursor: retired_cursor,
                 ..Default::default()
@@ -4960,7 +4970,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: id.clone(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 resume_after_cursor: retired_cursor,
                 ..Default::default()
@@ -4996,7 +5007,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: id.clone(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 resume_after_cursor: retired_cursor,
                 ..Default::default()
@@ -5031,7 +5043,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: id.clone(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 resume_after_cursor: retired_cursor,
                 ..Default::default()
@@ -5068,7 +5081,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: b_id.clone(),
+                sandbox: b.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 resume_after_cursor: a_cursor,
                 ..Default::default()
@@ -5102,7 +5116,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: id.clone(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 resume_after_cursor: ahead,
                 ..Default::default()
@@ -5133,7 +5148,8 @@ mod tests {
             let err = handle_watch_sandbox(
                 &state,
                 authed_request(WatchSandboxRequest {
-                    id: id.clone(),
+                    sandbox: sandbox.object_name().to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                     follow_logs: true,
                     resume_after_cursor: raw.to_string(),
                     ..Default::default()
@@ -5167,7 +5183,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: id.clone(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 resume_after_cursor: foreign_cursor(1),
                 ..Default::default()
@@ -5198,7 +5215,8 @@ mod tests {
         let response = handle_watch_sandbox(
             &state,
             authed_request(WatchSandboxRequest {
-                id: id.clone(),
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 follow_logs: true,
                 ..Default::default()
             }),
@@ -5214,7 +5232,7 @@ mod tests {
                 .tracing_log_bus
                 .publish_external(openshell_core::proto::SandboxLogLine {
                     sandbox_id: id.clone(),
-                    timestamp_ms: i64::from(i),
+                    event_time: openshell_core::time::timestamp_from_millis(i64::from(i)).ok(),
                     level: "INFO".to_string(),
                     target: "test".to_string(),
                     message: format!("line {i}"),

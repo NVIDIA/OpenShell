@@ -111,7 +111,12 @@ pub enum SdkError {
     /// the sandbox log files.
     #[error("out of range: {message}")]
     #[diagnostic(code(openshell::sdk::out_of_range))]
-    OutOfRange { message: String },
+    OutOfRange {
+        /// Error message.
+        message: String,
+        /// Original gateway status, including details and metadata.
+        status: Box<tonic::Status>,
+    },
 }
 
 impl SdkError {
@@ -163,7 +168,7 @@ impl SdkError {
         match code {
             tonic::Code::NotFound => Self::NotFound { message, status },
             tonic::Code::AlreadyExists => Self::AlreadyExists { message, status },
-            tonic::Code::OutOfRange => Self::OutOfRange { message },
+            tonic::Code::OutOfRange => Self::OutOfRange { message, status },
             tonic::Code::InvalidArgument => Self::InvalidConfig {
                 message,
                 status: Some(status),
@@ -187,6 +192,7 @@ impl SdkError {
             Self::InvalidConfig { status, .. } | Self::Auth { status, .. } => status.as_deref(),
             Self::NotFound { status, .. }
             | Self::AlreadyExists { status, .. }
+            | Self::OutOfRange { status, .. }
             | Self::Rpc { status, .. } => Some(status),
             _ => None,
         }
@@ -203,13 +209,6 @@ impl SdkError {
     /// This does not establish that repeating a mutation is safe.
     pub fn retry_delay(&self) -> Option<std::time::Duration> {
         self.error_details()?.retry_info()?.retry_delay
-    }
-
-    /// Create an `OutOfRange` error.
-    pub fn out_of_range(message: impl Into<String>) -> Self {
-        Self::OutOfRange {
-            message: message.into(),
-        }
     }
 
     /// Stable string code for cross-language binding consumers.
