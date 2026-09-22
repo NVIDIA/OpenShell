@@ -124,7 +124,7 @@ mod tests {
     // the old type. Message and enum counts are unchanged, and the durable and
     // overlap fingerprints are untouched: neither field is part of a stored type.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "4c9eba0a0b3316fc4ef289a1982537cf3964995210489e5db7fc33072848d468";
+        "fd8a5cad432441be1fe8891332b56f52335c208cc7283dcd93e385e7ae66c6da";
     const DURABLE_SCHEMA_SHA256: &str =
         "9eeaa29dfba187bff69fb7bc4f9a13a0f1d7be3f7049a38c8f0e20ce77ec7d8b";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
