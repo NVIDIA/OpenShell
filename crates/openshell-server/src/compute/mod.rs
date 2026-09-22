@@ -1707,22 +1707,11 @@ impl ComputeRuntime {
                 let latest = if self.supports_sandbox_authentication() {
                     let driver_name = self.configured_driver_name().to_string();
                     let persisted = self
-                        .store
-                        .update_message_cas::<Sandbox, _>(
+                        .persist_start_runtime_binding(
                             &sandbox_id,
-                            sandbox_resource_version(&starting),
-                            move |sandbox| {
-                                if let Some(metadata) = sandbox.metadata.as_mut() {
-                                    metadata.annotations.insert(
-                                        COMPUTE_DRIVER_ANNOTATION.to_string(),
-                                        driver_name.clone(),
-                                    );
-                                    metadata.annotations.insert(
-                                        COMPUTE_RUNTIME_IDENTITY_ANNOTATION.to_string(),
-                                        runtime_identity.clone(),
-                                    );
-                                }
-                            },
+                            &starting,
+                            &driver_name,
+                            &runtime_identity,
                         )
                         .await;
                     match persisted {
@@ -1762,6 +1751,80 @@ impl ComputeRuntime {
                 ))
             }
         }
+    }
+
+    async fn persist_start_runtime_binding(
+        &self,
+        sandbox_id: &str,
+        starting: &Sandbox,
+        driver_name: &str,
+        runtime_identity: &str,
+    ) -> Result<Sandbox, String> {
+        let expected_generation = sandbox_runtime_generation(starting)?;
+        let mut expected_resource_version = sandbox_resource_version(starting);
+
+        for attempt in 1..=START_PHASE_CAS_RETRY_LIMIT {
+            let driver_name = driver_name.to_string();
+            let runtime_identity = runtime_identity.to_string();
+            match self
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    sandbox_id,
+                    expected_resource_version,
+                    move |sandbox| {
+                        if let Some(metadata) = sandbox.metadata.as_mut() {
+                            metadata
+                                .annotations
+                                .insert(COMPUTE_DRIVER_ANNOTATION.to_string(), driver_name.clone());
+                            metadata.annotations.insert(
+                                COMPUTE_RUNTIME_IDENTITY_ANNOTATION.to_string(),
+                                runtime_identity.clone(),
+                            );
+                        }
+                    },
+                )
+                .await
+            {
+                Ok(sandbox) => return Ok(sandbox),
+                Err(crate::persistence::PersistenceError::Conflict { .. })
+                    if attempt < START_PHASE_CAS_RETRY_LIMIT =>
+                {
+                    let current = self
+                        .store
+                        .get_message::<Sandbox>(sandbox_id)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| {
+                            "sandbox was removed while persisting runtime identity".to_string()
+                        })?;
+                    let current_generation = sandbox_runtime_generation(&current)?;
+                    let phase =
+                        SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
+                    if current_generation != expected_generation
+                        || !matches!(
+                            phase,
+                            SandboxPhase::Starting
+                                | SandboxPhase::Provisioning
+                                | SandboxPhase::Ready
+                        )
+                    {
+                        return Err(format!(
+                            "sandbox changed lifecycle ownership while persisting runtime identity (phase: {phase:?})"
+                        ));
+                    }
+                    expected_resource_version = sandbox_resource_version(&current);
+                    debug!(
+                        sandbox_id,
+                        attempt,
+                        expected_resource_version,
+                        "Retrying runtime identity persistence after concurrent start progress"
+                    );
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+
+        unreachable!("runtime identity persistence retry loop always returns")
     }
 
     async fn compensate_successful_start(
@@ -7372,6 +7435,126 @@ mod tests {
         assert_eq!(restored.phase(), SandboxPhase::Stopped as i32);
         assert_eq!(
             restored.metadata.unwrap().annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+            "previous-runtime-identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_merges_runtime_binding_after_supervisor_connects() {
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity("new-runtime-identity");
+        driver.block_start();
+        let mut runtime = test_runtime(driver.clone()).await;
+        enable_runtime_identity_binding(&mut runtime);
+        let mut sandbox = sandbox_record(
+            "sb-start-supervisor-race",
+            "start-supervisor-race",
+            SandboxPhase::Stopped,
+        );
+        set_compute_runtime_binding(&mut sandbox, "previous-runtime-identity");
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let start_runtime = runtime.clone();
+        let sandbox_name = sandbox.object_name().to_string();
+        let start =
+            tokio::spawn(
+                async move { start_runtime.start_sandbox("default", &sandbox_name).await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
+            .await
+            .expect("start did not reach the driver");
+
+        runtime
+            .supervisor_session_connected(sandbox.object_id(), "replacement-instance")
+            .await
+            .expect("replacement supervisor must connect while start is in flight");
+        driver.release_start();
+
+        let started = start
+            .await
+            .expect("start task must finish")
+            .expect("start must merge its binding with supervisor readiness");
+        assert_eq!(
+            started.metadata.as_ref().unwrap().annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+            "new-runtime-identity"
+        );
+        assert_eq!(
+            started.status.as_ref().unwrap().main_process_instance_id,
+            "replacement-instance"
+        );
+        assert_eq!(driver.stop_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn start_does_not_bind_runtime_identity_after_generation_changes() {
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity("new-runtime-identity");
+        driver.block_start();
+        let mut runtime = test_runtime(driver.clone()).await;
+        enable_runtime_identity_binding(&mut runtime);
+        let mut sandbox = sandbox_record(
+            "sb-start-generation-race",
+            "start-generation-race",
+            SandboxPhase::Stopped,
+        );
+        set_compute_runtime_binding(&mut sandbox, "previous-runtime-identity");
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let start_runtime = runtime.clone();
+        let sandbox_name = sandbox.object_name().to_string();
+        let start =
+            tokio::spawn(
+                async move { start_runtime.start_sandbox("default", &sandbox_name).await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
+            .await
+            .expect("start did not reach the driver");
+
+        let starting = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .expect("starting record must exist");
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>(
+                sandbox.object_id(),
+                sandbox_resource_version(&starting),
+                |sandbox| {
+                    sandbox.metadata.as_mut().unwrap().annotations.insert(
+                        crate::auth::sandbox_session::RUNTIME_GENERATION_ANNOTATION.to_string(),
+                        "replacement-generation".to_string(),
+                    );
+                },
+            )
+            .await
+            .expect("replace runtime generation while start is in flight");
+        driver.release_start();
+
+        let error = start
+            .await
+            .expect("start task must finish")
+            .expect_err("a replaced generation must reject the prior runtime binding");
+        assert!(
+            error
+                .message()
+                .contains("changed lifecycle ownership while persisting runtime identity")
+        );
+        assert_eq!(driver.stop_calls(), 1);
+        let retained = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .expect("replacement record must be retained");
+        assert_eq!(
+            retained.metadata.as_ref().unwrap().annotations
+                [crate::auth::sandbox_session::RUNTIME_GENERATION_ANNOTATION],
+            "replacement-generation"
+        );
+        assert_eq!(
+            retained.metadata.as_ref().unwrap().annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
             "previous-runtime-identity"
         );
     }
