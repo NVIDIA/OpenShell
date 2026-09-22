@@ -662,13 +662,6 @@ impl ComputeRuntime {
             capabilities.extension.clone(),
         )
         .map_err(|error| ComputeError::Message(error.to_string()))?;
-        if capabilities.supports_sandbox_authentication
-            && !capabilities.supports_runtime_identity_binding
-        {
-            return Err(ComputeError::Precondition(format!(
-                "compute driver '{driver_name}' authenticates sandboxes but does not support runtime identity binding"
-            )));
-        }
         info!(
             configured_driver = %driver_name,
             advertised_driver = %capabilities.driver_name,
@@ -5894,7 +5887,6 @@ impl ComputeDriver for NoopTestDriver {
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: self.sandbox_authentication.is_some(),
-                supports_runtime_identity_binding: self.sandbox_authentication.is_some(),
                 driver_reports_runtime_readiness: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
@@ -6486,7 +6478,6 @@ mod tests {
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
-                supports_runtime_identity_binding: false,
                 driver_reports_runtime_readiness: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
@@ -6673,8 +6664,6 @@ mod tests {
         start_expected_runtime_identities: TestMutex<Vec<String>>,
         start_outcome: TestMutex<ControlledLifecycleOutcome>,
         runtime_identity: TestMutex<String>,
-        advertises_sandbox_authentication: AtomicBool,
-        advertises_runtime_identity_binding: AtomicBool,
         get_started: Notify,
         get_release: Semaphore,
         get_blocked: AtomicBool,
@@ -6714,8 +6703,6 @@ mod tests {
                 start_expected_runtime_identities: TestMutex::new(Vec::new()),
                 start_outcome: TestMutex::new(ControlledLifecycleOutcome::Ok),
                 runtime_identity: TestMutex::new(String::new()),
-                advertises_sandbox_authentication: AtomicBool::new(false),
-                advertises_runtime_identity_binding: AtomicBool::new(false),
                 get_started: Notify::new(),
                 get_release: Semaphore::new(0),
                 get_blocked: AtomicBool::new(false),
@@ -6789,13 +6776,6 @@ mod tests {
                 .runtime_identity
                 .lock()
                 .expect("runtime identity lock poisoned") = runtime_identity.into();
-        }
-
-        fn set_binding_capabilities(&self, authentication: bool, binding: bool) {
-            self.advertises_sandbox_authentication
-                .store(authentication, Ordering::SeqCst);
-            self.advertises_runtime_identity_binding
-                .store(binding, Ordering::SeqCst);
         }
 
         fn set_get_outcome(&self, outcome: ControlledGetOutcome) {
@@ -6881,12 +6861,7 @@ mod tests {
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 gateway_manages_lifecycle: false,
-                supports_sandbox_authentication: self
-                    .advertises_sandbox_authentication
-                    .load(Ordering::SeqCst),
-                supports_runtime_identity_binding: self
-                    .advertises_runtime_identity_binding
-                    .load(Ordering::SeqCst),
+                supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
@@ -7199,28 +7174,6 @@ mod tests {
         runtime.store = store;
         enable_runtime_identity_binding(&mut runtime);
         (directory, runtime)
-    }
-
-    #[tokio::test]
-    async fn incompatible_authenticating_driver_is_rejected_during_initialization() {
-        let driver = ControlledDriver::new();
-        driver.set_binding_capabilities(true, false);
-        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
-
-        let error = ComputeRuntime::from_driver(
-            "legacy-driver".to_string(),
-            driver,
-            None,
-            store,
-            SandboxIndex::new(),
-            SandboxWatchBus::new(),
-            TracingLogBus::new(),
-            Arc::new(SupervisorSessionRegistry::new()),
-        )
-        .await
-        .expect_err("driver without the binding contract must be rejected");
-
-        assert!(error.to_string().contains("runtime identity binding"));
     }
 
     #[tokio::test]

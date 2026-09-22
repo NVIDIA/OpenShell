@@ -150,7 +150,6 @@ impl FakeComputeDriver {
                     default_image: "openshell/sandbox:test".to_string(),
                     gateway_manages_lifecycle: false,
                     supports_sandbox_authentication: false,
-                    supports_runtime_identity_binding: false,
                     driver_reports_runtime_readiness: false,
                     resource_capabilities: None,
                     rootfs_tar_staging_dir: String::new(),

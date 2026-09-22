@@ -511,13 +511,14 @@ It validates the projected token with Kubernetes `TokenReview`, checks the live
 pod UID, and verifies the pod's controlling Sandbox CR UID and sandbox ID. The
 driver returns both the sandbox ID and an opaque runtime identity derived from
 the namespace, immutable Sandbox CR UID, and authenticated supervisor Pod UID.
-Drivers that authenticate sandboxes must advertise this runtime-binding
-contract; the gateway rejects incompatible drivers during initialization. The
-gateway records the runtime identity when provisioning succeeds and requires
-an exact match before issuing a sandbox JWT. If binding validation or storage
-fails after a lifecycle call succeeds, the gateway compensates that call before
-returning the error. This correlates credential authentication with the durable
-runtime record rather than authorizing from the sandbox ID alone.
+Advertising sandbox authentication includes the runtime-binding contract. The
+gateway requires non-empty runtime identities from successful create, start,
+and authentication responses. It records the runtime identity when provisioning
+succeeds and requires an exact match before issuing a sandbox JWT. If binding
+validation or storage fails after a lifecycle call succeeds, the gateway
+compensates that call before returning the error. This correlates credential
+authentication with the durable runtime record rather than authorizing from the
+sandbox ID alone.
 
 `StartSandbox` carries the previously recorded opaque identity. Kubernetes
 requires exactly one label-selected Sandbox CR and verifies that its namespace
