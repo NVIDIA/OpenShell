@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from openshell._proto import datamodel_pb2, openshell_pb2, sandbox_pb2
+from openshell._proto import datamodel_pb2, openshell_pb2, policy_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -28,20 +28,20 @@ if TYPE_CHECKING:
 # Policy helpers
 # =============================================================================
 
-_SAFE_FILESYSTEM = sandbox_pb2.FilesystemPolicy(
+_SAFE_FILESYSTEM = policy_pb2.FilesystemPolicy(
     include_workdir=True,
     read_only=["/usr", "/lib", "/etc", "/app", "/var/log"],
     read_write=["/sandbox", "/tmp"],
 )
-_SAFE_LANDLOCK = sandbox_pb2.LandlockPolicy(compatibility="best_effort")
-_SAFE_PROCESS = sandbox_pb2.ProcessPolicy(run_as_user="sandbox", run_as_group="sandbox")
+_SAFE_LANDLOCK = policy_pb2.LandlockPolicy(compatibility="best_effort")
+_SAFE_PROCESS = policy_pb2.ProcessPolicy(run_as_user="sandbox", run_as_group="sandbox")
 
 
-def _safe_policy() -> sandbox_pb2.SandboxPolicy:
+def _safe_policy() -> policy_pb2.PolicyDocument:
     """Build a safe baseline policy for testing."""
-    return sandbox_pb2.SandboxPolicy(
+    return policy_pb2.PolicyDocument(
         version=1,
-        filesystem=_SAFE_FILESYSTEM,
+        filesystem_policy=_SAFE_FILESYSTEM,
         landlock=_SAFE_LANDLOCK,
         process=_SAFE_PROCESS,
     )
@@ -56,11 +56,11 @@ def test_create_sandbox_rejects_root_user(
     sandbox_client: SandboxClient,
 ) -> None:
     """Server rejects CreateSandbox with run_as_user='root'."""
-    policy = sandbox_pb2.SandboxPolicy(
+    policy = policy_pb2.PolicyDocument(
         version=1,
-        filesystem=_SAFE_FILESYSTEM,
+        filesystem_policy=_SAFE_FILESYSTEM,
         landlock=_SAFE_LANDLOCK,
-        process=sandbox_pb2.ProcessPolicy(
+        process=policy_pb2.ProcessPolicy(
             run_as_user="root",
             run_as_group="sandbox",
         ),
@@ -85,9 +85,9 @@ def test_create_sandbox_rejects_path_traversal(
     sandbox_client: SandboxClient,
 ) -> None:
     """Server rejects CreateSandbox with '..' in filesystem paths."""
-    policy = sandbox_pb2.SandboxPolicy(
+    policy = policy_pb2.PolicyDocument(
         version=1,
-        filesystem=sandbox_pb2.FilesystemPolicy(
+        filesystem_policy=policy_pb2.FilesystemPolicy(
             include_workdir=True,
             read_only=["/usr/../etc/shadow"],
             read_write=["/tmp"],
@@ -115,9 +115,9 @@ def test_create_sandbox_rejects_overly_broad_paths(
     sandbox_client: SandboxClient,
 ) -> None:
     """Server rejects CreateSandbox with read_write=['/']."""
-    policy = sandbox_pb2.SandboxPolicy(
+    policy = policy_pb2.PolicyDocument(
         version=1,
-        filesystem=sandbox_pb2.FilesystemPolicy(
+        filesystem_policy=policy_pb2.FilesystemPolicy(
             include_workdir=True,
             read_only=["/usr"],
             read_write=["/"],
@@ -147,17 +147,15 @@ def test_create_sandbox_materializes_default_mcp_version(
     """An omitted MCP options stanza is stored with the pinned default version."""
     policy = _safe_policy()
     policy.network_policies["mcp_default"].CopyFrom(
-        sandbox_pb2.NetworkPolicyRule(
+        policy_pb2.NetworkPolicyRule(
             name="mcp_default",
             endpoints=[
-                sandbox_pb2.NetworkEndpoint(
+                policy_pb2.NetworkEndpoint(
                     host="mcp.example.com",
-                    port=443,
+                    ports=[443],
                     protocol="mcp",
                     rules=[
-                        sandbox_pb2.L7Rule(
-                            allow=sandbox_pb2.L7Allow(method="initialize")
-                        )
+                        policy_pb2.L7Rule(allow=policy_pb2.L7Allow(method="initialize"))
                     ],
                 )
             ],
@@ -217,9 +215,9 @@ def test_update_policy_rejects_immutable_fields(
         stub = sandbox_client._stub
 
         # Try to update with a modified filesystem policy (immutable field)
-        unsafe_policy = sandbox_pb2.SandboxPolicy(
+        unsafe_policy = policy_pb2.PolicyDocument(
             version=1,
-            filesystem=sandbox_pb2.FilesystemPolicy(
+            filesystem_policy=policy_pb2.FilesystemPolicy(
                 include_workdir=True,
                 read_only=["/usr/../etc/shadow"],
                 read_write=["/tmp"],

@@ -6,8 +6,7 @@ use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal}
 use crate::config_update_operation::CONFIG_UPDATE_OPERATION_OBJECT_TYPE;
 use crate::grpc::test_support::{authed_request, test_server_state};
 use crate::persistence::WriteCondition;
-use crate::storage_proto::StoredConfigUpdateOperation;
-use openshell_core::proto::SandboxSpec;
+use crate::storage_proto::{StoredConfigUpdateOperation, StoredSandboxSpec as SandboxSpec};
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use prost::Message;
 use std::collections::HashMap;

@@ -28,9 +28,6 @@ use openshell_core::proto::{
 };
 use openshell_core::rpc_error::{ERROR_DOMAIN, decode_details};
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
-use openshell_policy::{
-    network_access_preset_to_str, network_enforcement_mode_to_str, network_tls_mode_to_str,
-};
 use openshell_providers::{
     ProviderTypeProfile, RealDiscoveryContext, discover_from_profile, parse_profile_json,
     parse_profile_yaml, profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
@@ -2402,19 +2399,15 @@ fn format_provider_profile_details(profile: &ProviderProfile) -> String {
             &endpoint.host
         };
         let _ = writeln!(rendered, "  {host}");
-        // The endpoint contract gives the repeated ports field precedence over
-        // the single port; display the effective declared set in that order.
-        let ports = if !endpoint.ports.is_empty() {
+        let ports = if endpoint.ports.is_empty() {
+            "not specified".to_string()
+        } else {
             endpoint
                 .ports
                 .iter()
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
                 .join(", ")
-        } else if endpoint.port != 0 {
-            endpoint.port.to_string()
-        } else {
-            "not specified".to_string()
         };
         let _ = writeln!(rendered, "    Ports: {ports}");
         if !endpoint.path.is_empty() {
@@ -2428,15 +2421,12 @@ fn format_provider_profile_details(profile: &ProviderProfile) -> String {
         let _ = writeln!(rendered, "    Protocol: {protocol}");
         // A declared L7 protocol does not imply inspection when TLS handling
         // selects a raw tunnel. Keep this separate from the declared rules.
-        // Unknown protobuf values must remain visible rather than appearing
-        // to select the valid default mode.
-        let tls = match network_tls_mode_to_str(endpoint.tls) {
-            Some("") => "auto (default)".to_string(),
-            Some("skip") => "skip (raw tunnel; no L7 inspection or credential rewrite)".to_string(),
-            Some("terminate") => "terminate (automatic TLS detection)".to_string(),
-            Some("passthrough") => "passthrough (automatic TLS detection)".to_string(),
-            Some(tls) => tls.to_string(),
-            None => format!("unknown({})", endpoint.tls),
+        let tls = match endpoint.tls.as_str() {
+            "" => "auto (default)".to_string(),
+            "skip" => "skip (raw tunnel; no L7 inspection or credential rewrite)".to_string(),
+            "terminate" => "terminate (automatic TLS detection)".to_string(),
+            "passthrough" => "passthrough (automatic TLS detection)".to_string(),
+            tls => tls.to_string(),
         };
         let _ = writeln!(rendered, "    TLS: {tls}");
         let _ = writeln!(
@@ -2450,14 +2440,13 @@ fn format_provider_profile_details(profile: &ProviderProfile) -> String {
             mcp.and_then(|options| options.allow_all_known_mcp_methods);
         // An explicit rule set can include writes even when other endpoints
         // use read-only presets. Report its shape without guessing its access.
-        let access = match network_access_preset_to_str(endpoint.access) {
-            Some("") if !endpoint.rules.is_empty() => "custom rules".to_string(),
-            Some("") if is_mcp && allow_all_known_mcp_methods == Some(true) => {
+        let access = match endpoint.access.as_str() {
+            "" if !endpoint.rules.is_empty() => "custom rules".to_string(),
+            "" if is_mcp && allow_all_known_mcp_methods == Some(true) => {
                 "all known MCP methods (subject to tool and deny rules)".to_string()
             }
-            Some("") => "not specified".to_string(),
-            Some(access) => access.to_string(),
-            None => format!("unknown({})", endpoint.access),
+            "" => "not specified".to_string(),
+            access => access.to_string(),
         };
         let _ = writeln!(rendered, "    Access: {access}");
         if !endpoint.rules.is_empty() || !endpoint.deny_rules.is_empty() {
@@ -2468,10 +2457,9 @@ fn format_provider_profile_details(profile: &ProviderProfile) -> String {
                 endpoint.deny_rules.len()
             );
         }
-        let enforcement = match network_enforcement_mode_to_str(endpoint.enforcement) {
-            Some("") => "audit (default)".to_string(),
-            Some(enforcement) => enforcement.to_string(),
-            None => format!("unknown({})", endpoint.enforcement),
+        let enforcement = match endpoint.enforcement.as_str() {
+            "" => "audit (default)".to_string(),
+            enforcement => enforcement.to_string(),
         };
         let _ = writeln!(rendered, "    Enforcement: {enforcement}");
         if is_mcp {
@@ -2858,18 +2846,17 @@ mod tests {
         let profile = ProviderProfile {
             id: "custom".to_string(),
             endpoints: vec![
-                openshell_core::proto::NetworkEndpoint {
+                openshell_core::proto::policy::NetworkEndpoint {
                     host: "api.example.com".to_string(),
-                    port: 443,
                     ports: vec![8443, 9443],
                     ..Default::default()
                 },
-                openshell_core::proto::NetworkEndpoint {
+                openshell_core::proto::policy::NetworkEndpoint {
                     host: "write.example.com".to_string(),
-                    port: 443,
+                    ports: vec![443],
                     protocol: "rest".to_string(),
-                    access: openshell_core::proto::NetworkAccessPreset::ReadWrite.into(),
-                    enforcement: openshell_core::proto::NetworkEnforcementMode::Audit.into(),
+                    access: "read-write".to_string(),
+                    enforcement: "audit".to_string(),
                     ..Default::default()
                 },
             ],
@@ -2900,7 +2887,7 @@ credentials:
     header_name: authorization
 endpoints:
   - host: api.example.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-only
     enforcement: enforce
@@ -2955,17 +2942,17 @@ binaries: [/usr/bin/curl]
     fn profile_description_preserves_unknown_security_modes() {
         // Exercise each independent wire field with other modes left valid.
         // Unknown access must also take precedence over the inferred rule label.
-        for value in [-1, 99] {
+        for value in ["experimental", "future"] {
             for field in ["TLS", "Access", "Enforcement"] {
-                let mut endpoint = openshell_core::proto::NetworkEndpoint {
+                let mut endpoint = openshell_core::proto::policy::NetworkEndpoint {
                     host: "api.example.com".to_string(),
-                    rules: vec![openshell_core::proto::L7Rule::default()],
+                    rules: vec![openshell_core::proto::policy::L7Rule::default()],
                     ..Default::default()
                 };
                 match field {
-                    "TLS" => endpoint.tls = value,
-                    "Access" => endpoint.access = value,
-                    "Enforcement" => endpoint.enforcement = value,
+                    "TLS" => endpoint.tls = value.to_string(),
+                    "Access" => endpoint.access = value.to_string(),
+                    "Enforcement" => endpoint.enforcement = value.to_string(),
                     _ => unreachable!("test cases enumerate the security mode fields"),
                 }
                 let profile = ProviderProfile {
@@ -2974,8 +2961,8 @@ binaries: [/usr/bin/curl]
                 };
                 let rendered = format_provider_profile_details(&profile);
                 assert!(
-                    rendered.contains(&format!("    {field}: unknown({value})\n")),
-                    "unknown {field} must not appear as a valid default: {rendered}"
+                    rendered.contains(&format!("    {field}: {value}\n")),
+                    "unknown {field} must remain visible: {rendered}"
                 );
             }
         }
@@ -2983,17 +2970,15 @@ binaries: [/usr/bin/curl]
 
     #[test]
     fn profile_description_displays_each_access_preset() {
-        use openshell_core::proto::NetworkAccessPreset;
-
         for (access, expected) in [
-            (NetworkAccessPreset::Unspecified, "not specified"),
-            (NetworkAccessPreset::ReadOnly, "read-only"),
-            (NetworkAccessPreset::ReadWrite, "read-write"),
-            (NetworkAccessPreset::Full, "full"),
+            ("", "not specified"),
+            ("read-only", "read-only"),
+            ("read-write", "read-write"),
+            ("full", "full"),
         ] {
             let profile = ProviderProfile {
-                endpoints: vec![openshell_core::proto::NetworkEndpoint {
-                    access: access.into(),
+                endpoints: vec![openshell_core::proto::policy::NetworkEndpoint {
+                    access: access.to_string(),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -3011,7 +2996,7 @@ id: mcp-review
 display_name: MCP Review
 endpoints:
   - host: mcp.example.com
-    port: 443
+    ports: [443]
     protocol: mcp
     enforcement: enforce
     mcp:
@@ -3046,8 +3031,8 @@ binaries: [/usr/bin/curl]
 
             // Explicit rules remain relevant when the method default is enabled,
             // and independent tool-name validation must not disappear from view.
-            proto.endpoints[0].rules = vec![openshell_core::proto::L7Rule {
-                allow: Some(openshell_core::proto::L7Allow {
+            proto.endpoints[0].rules = vec![openshell_core::proto::policy::L7Rule {
+                allow: Some(openshell_core::proto::policy::L7Allow {
                     method: "tools/list".to_string(),
                     ..Default::default()
                 }),
@@ -3082,7 +3067,7 @@ credentials:
     auth_style: bearer
 endpoints:
   - host: api.example.com
-    port: 443
+    ports: [443]
     protocol: rest
     enforcement: enforce
     allow_encoded_slash: true

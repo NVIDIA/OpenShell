@@ -199,7 +199,7 @@ func TestSandboxTemplate_CreateSandboxFromTemplateResolvesWorkloadAndGovernance(
 	client := NewClient()
 	ctx := context.Background()
 	gpuCount := uint32(1)
-	policy := &types.SandboxPolicy{
+	policy := &types.PolicyDocument{
 		Version: 1,
 		NetworkPolicies: map[string]types.NetworkPolicyRule{
 			"api": {Name: "api"},

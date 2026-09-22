@@ -51,7 +51,7 @@
 # POLICY_L4 (allow api.github.com:443 with credential injection, deny everything else):
 #   network_policies:
 #     github_api:
-#       endpoints: [{ host: api.github.com, port: 443, protocol: rest, access: full }]
+#       endpoints: [{ host: api.github.com, ports: [443], protocol: rest, access: full }]
 #       binaries:  [{ path: /usr/bin/curl }]
 #
 # POLICY_L7_READONLY (L7 read-only enforcement):
@@ -59,7 +59,7 @@
 #     github_api:
 #       endpoints:
 #         - host: api.github.com
-#           port: 443
+#           ports: [443]
 #           protocol: rest
 #           enforcement: enforce
 #           access: read-only
@@ -71,7 +71,7 @@
 # POLICY_TLS_SKIP (L4 with tls: skip — raw tunnel):
 #   network_policies:
 #     github_api:
-#       endpoints: [{ host: api.github.com, port: 443, tls: skip }]
+#       endpoints: [{ host: api.github.com, ports: [443], tls: skip }]
 #       binaries:  [{ path: /usr/bin/curl }]
 #
 # =============================================================================
@@ -205,7 +205,7 @@ network_policies:
     name: github-api-l4
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: full
@@ -230,7 +230,7 @@ network_policies:
     name: github-api-l7-readonly
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: read-only
@@ -255,7 +255,7 @@ network_policies:
     name: github-api-cred-inject
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: full
@@ -280,7 +280,7 @@ network_policies:
     name: github-api-skip
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         tls: skip
     binaries:
       - { path: /usr/bin/curl }

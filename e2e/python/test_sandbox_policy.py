@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from openshell._proto import datamodel_pb2, sandbox_pb2
+from openshell._proto import datamodel_pb2, policy_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -23,21 +23,21 @@ if TYPE_CHECKING:
     from openshell import Sandbox
 
 
-_BASE_FILESYSTEM = sandbox_pb2.FilesystemPolicy(
+_BASE_FILESYSTEM = policy_pb2.FilesystemPolicy(
     include_workdir=True,
     read_only=["/usr", "/lib", "/etc", "/app", "/var/log", "/proc", "/dev/urandom"],
     read_write=["/sandbox", "/tmp"],
 )
-_BASE_LANDLOCK = sandbox_pb2.LandlockPolicy(compatibility="best_effort")
-_BASE_PROCESS = sandbox_pb2.ProcessPolicy(run_as_user="sandbox", run_as_group="sandbox")
+_BASE_LANDLOCK = policy_pb2.LandlockPolicy(compatibility="best_effort")
+_BASE_PROCESS = policy_pb2.ProcessPolicy(run_as_user="sandbox", run_as_group="sandbox")
 
 
 def _base_policy(
-    network_policies: dict[str, sandbox_pb2.NetworkPolicyRule] | None = None,
-) -> sandbox_pb2.SandboxPolicy:
-    return sandbox_pb2.SandboxPolicy(
+    network_policies: dict[str, policy_pb2.NetworkPolicyRule] | None = None,
+) -> policy_pb2.PolicyDocument:
+    return policy_pb2.PolicyDocument(
         version=1,
-        filesystem=_BASE_FILESYSTEM,
+        filesystem_policy=_BASE_FILESYSTEM,
         landlock=_BASE_LANDLOCK,
         process=_BASE_PROCESS,
         network_policies=network_policies or {},
@@ -63,17 +63,17 @@ def _network_rule(
     *,
     binary: str = "/**",
     allowed_ips: list[str] | None = None,
-) -> sandbox_pb2.NetworkPolicyRule:
-    return sandbox_pb2.NetworkPolicyRule(
+) -> policy_pb2.NetworkPolicyRule:
+    return policy_pb2.NetworkPolicyRule(
         name="test_rule",
         endpoints=[
-            sandbox_pb2.NetworkEndpoint(
+            policy_pb2.NetworkEndpoint(
                 host=host,
-                port=port,
+                ports=[port],
                 allowed_ips=allowed_ips or [],
             )
         ],
-        binaries=[sandbox_pb2.NetworkBinary(path=binary)],
+        binaries=[policy_pb2.NetworkBinary(path=binary)],
     )
 
 
@@ -127,7 +127,7 @@ def test_policy_applies_to_exec_commands(
 )
 def test_transparent_tcp_policy_denies_unauthorized_connections(
     sandbox: Callable[..., Sandbox],
-    policy: sandbox_pb2.SandboxPolicy,
+    policy: policy_pb2.PolicyDocument,
     host: str,
     port: int,
 ) -> None:
@@ -152,21 +152,21 @@ def test_conflicting_destination_metadata_is_rejected(
     port = 19876
     policy = _base_policy(
         network_policies={
-            "user_rule": sandbox_pb2.NetworkPolicyRule(
+            "user_rule": policy_pb2.NetworkPolicyRule(
                 name="user_rule",
-                endpoints=[sandbox_pb2.NetworkEndpoint(host=target, port=port)],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+                endpoints=[policy_pb2.NetworkEndpoint(host=target, ports=[port])],
+                binaries=[policy_pb2.NetworkBinary(path="/**")],
             ),
-            "approved_rule": sandbox_pb2.NetworkPolicyRule(
+            "approved_rule": policy_pb2.NetworkPolicyRule(
                 name="approved_rule",
                 endpoints=[
-                    sandbox_pb2.NetworkEndpoint(
+                    policy_pb2.NetworkEndpoint(
                         host=target,
-                        port=port,
+                        ports=[port],
                         allowed_ips=["10.200.0.0/24"],
                     )
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+                binaries=[policy_pb2.NetworkBinary(path="/**")],
             ),
         }
     )

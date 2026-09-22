@@ -37,8 +37,8 @@ use openshell_core::proto::{
     WatchSandboxRequest, relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{
-    BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
-    SandboxTemplate, SshSession,
+    BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox as PublicSandbox,
+    SandboxPhase, SandboxTemplate, SshSession,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryOutcome,
@@ -65,12 +65,16 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique_with_catalog,
 };
 use super::validation::{
-    level_matches, source_matches, validate_and_canonicalize_policy, validate_dns1123_label,
-    validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
-    validate_policy_safety, validate_sandbox_governance_spec, validate_sandbox_spec,
+    level_matches, source_matches, validate_and_canonicalize_policy,
+    validate_canonical_policy_size, validate_dns1123_label, validate_exec_request_fields,
+    validate_no_reserved_provider_policy_keys, validate_policy_safety,
+    validate_sandbox_governance_spec, validate_sandbox_spec,
 };
 use super::{MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN};
 use crate::persistence::current_time_ms;
+#[cfg(test)]
+use crate::storage_proto::StoredSandboxSpec;
+use crate::storage_proto::{StoredSandbox as Sandbox, sandbox_spec_from_public, sandbox_to_public};
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
 const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
@@ -321,7 +325,7 @@ struct SandboxCreateTelemetryAttrs {
 fn emit_sandbox_create_telemetry(
     state: &Arc<ServerState>,
     request: &CreateSandboxRequest,
-    created_sandbox: Option<&Sandbox>,
+    created_sandbox: Option<&PublicSandbox>,
     outcome: TelemetryOutcome,
 ) {
     let compute_driver = state.compute.telemetry_compute_driver();
@@ -338,7 +342,7 @@ fn emit_sandbox_create_telemetry(
 
 fn sandbox_create_telemetry_attrs(
     request: &CreateSandboxRequest,
-    created_sandbox: Option<&Sandbox>,
+    created_sandbox: Option<&PublicSandbox>,
 ) -> SandboxCreateTelemetryAttrs {
     if !request.workload_template.trim().is_empty() {
         let spec = created_sandbox
@@ -500,32 +504,38 @@ async fn handle_create_sandbox_inner(
         template.image = state.compute.default_image().to_string();
     }
 
-    if let Some(ref mut policy) = spec.policy {
-        super::policy::clear_provider_credentialed_markers(policy);
-        validate_no_reserved_provider_policy_keys(policy)?;
-        *policy = validate_and_canonicalize_policy(policy.clone())?;
+    let mut stored_spec = sandbox_spec_from_public(spec)?;
+    let internal_policy = stored_spec
+        .policy
+        .take()
+        .map(|mut policy| {
+            super::policy::clear_provider_credentialed_markers(&mut policy);
+            validate_no_reserved_provider_policy_keys(&policy)?;
+            validate_and_canonicalize_policy(policy)
+        })
+        .transpose()?;
+    if let Some(policy) = internal_policy.as_ref() {
+        // Process identity and MCP default materialization can increase the
+        // internal message. Bound the exact value that compute will receive
+        // and persistence will encode.
+        validate_canonical_policy_size(policy, "spec.policy")?;
     }
 
-    // Process identity and MCP default materialization can increase the
-    // protobuf size. Recheck the exact canonical spec before any middleware or
-    // compute boundary can observe or persist it. The initial check remains
-    // above so requests that are already oversized still fail before I/O.
-    validate_sandbox_spec(&request.name, &spec)?;
-
-    if let Some(ref policy) = spec.policy {
+    if let Some(ref policy) = internal_policy {
         validate_policy_safety(policy)?;
         crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
     }
     super::policy::validate_candidate_sandbox_credential_policy(
         state,
         &workspace,
-        &spec.providers,
-        spec.policy.as_ref(),
+        &stored_spec.providers,
+        internal_policy.as_ref(),
     )
     .await?;
 
     let now_ms = current_time_ms();
 
+    stored_spec.policy = internal_policy;
     let mut sandbox = Sandbox {
         metadata: Some(ObjectMeta {
             id: id.clone(),
@@ -537,7 +547,7 @@ async fn handle_create_sandbox_inner(
             workspace,
             deletion_time: None,
         }),
-        spec: Some(spec),
+        spec: Some(stored_spec),
         status: None,
         created_from_workload_template,
     };
@@ -677,7 +687,7 @@ async fn handle_create_sandbox_inner(
         "CreateSandbox request completed successfully"
     );
     Ok(Response::new(SandboxResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(sandbox_to_public(&sandbox)),
         service_urls,
     }))
 }
@@ -842,7 +852,7 @@ pub(super) async fn handle_get_sandbox(
     )
     .await?;
     Ok(Response::new(SandboxResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(sandbox_to_public(&sandbox)),
         service_urls: HashMap::new(),
     }))
 }
@@ -899,7 +909,7 @@ pub(super) async fn handle_list_sandboxes(
         .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
     let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
     Ok(Response::new(ListSandboxesResponse {
-        sandboxes: page.messages,
+        sandboxes: page.messages.iter().map(sandbox_to_public).collect(),
         next_page_token,
     }))
 }
@@ -1281,7 +1291,6 @@ pub(super) async fn handle_attach_sandbox_provider(
     {
         candidate_spec.providers.push(request.provider.clone());
     }
-    validate_sandbox_spec(&sandbox_name, &candidate_spec)?;
     let provider_profile_catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -1375,7 +1384,7 @@ pub(super) async fn handle_attach_sandbox_provider(
     );
 
     Ok(Response::new(AttachSandboxProviderResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(sandbox_to_public(&sandbox)),
         attached,
         receipt: Some(receipt),
     }))
@@ -1496,7 +1505,7 @@ pub(super) async fn handle_detach_sandbox_provider(
     );
 
     Ok(Response::new(DetachSandboxProviderResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(sandbox_to_public(&sandbox)),
         detached,
         receipt: Some(receipt),
     }))
@@ -1598,7 +1607,7 @@ async fn handle_stop_sandbox_inner(
     let sandbox = state.compute.stop_sandbox(workspace, name).await?;
     info!(sandbox_name = %name, "StopSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(sandbox_to_public(&sandbox)),
         service_urls: HashMap::new(),
     }))
 }
@@ -1653,7 +1662,7 @@ async fn handle_start_sandbox_inner(
         .project_endpoint_status(&mut sandbox, remote_authority);
     info!(sandbox_name = %name, "StartSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
-        sandbox: Some(sandbox),
+        sandbox: Some(sandbox_to_public(&sandbox)),
         service_urls: HashMap::new(),
     }))
 }
@@ -1805,7 +1814,7 @@ pub(super) async fn handle_watch_sandbox(
                         .send(Ok(SandboxStreamEvent {
                             payload: Some(
                                 openshell_core::proto::sandbox_stream_event::Payload::Sandbox(
-                                    sandbox.clone(),
+                                    sandbox_to_public(&sandbox),
                                 ),
                             ),
                         }))
@@ -1893,7 +1902,14 @@ pub(super) async fn handle_watch_sandbox(
                                 match state.store.get_message::<Sandbox>(&sandbox_id).await {
                                     Ok(Some(sandbox)) => {
                                         state.sandbox_index.update_from_sandbox(&sandbox);
-                                        if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone()))})).await.is_err() {
+                                        let event = SandboxStreamEvent {
+                                            payload: Some(
+                                                openshell_core::proto::sandbox_stream_event::Payload::Sandbox(
+                                                    sandbox_to_public(&sandbox),
+                                                ),
+                                            ),
+                                        };
+                                        if tx.send(Ok(event)).await.is_err() {
                                             return;
                                         }
                                         if stop_on_terminal {
@@ -3423,6 +3439,30 @@ mod tests {
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{GpuResourceRequirements, SandboxServiceExposure, ServiceEndpoint};
 
+    fn authored_policy(
+        mut policy: openshell_core::proto::SandboxPolicy,
+    ) -> openshell_core::proto::policy::PolicyDocument {
+        if policy.version == 0 {
+            policy.version = 1;
+        }
+        openshell_policy::project_base_policy(&policy).expect("test policy must be authorable")
+    }
+
+    fn authored_mcp_policy_with_versions(
+        versions: &[&str],
+    ) -> openshell_core::proto::policy::PolicyDocument {
+        let mut policy = authored_policy(mcp_policy_with_versions(&["2025-11-25"]));
+        policy.network_policies.get_mut("mcp").unwrap().endpoints[0]
+            .mcp
+            .as_mut()
+            .unwrap()
+            .versions = versions
+            .iter()
+            .map(|version| (*version).to_string())
+            .collect();
+        policy
+    }
+
     // ---- shell_escape ----
 
     #[test]
@@ -3462,7 +3502,10 @@ mod tests {
             request_id: String::new(),
             spec: Some(SandboxSpec {
                 providers: vec!["github".to_string()],
-                policy: Some(openshell_core::proto::SandboxPolicy::default()),
+                policy: Some(openshell_core::proto::policy::PolicyDocument {
+                    version: 1,
+                    ..Default::default()
+                }),
                 ..SandboxSpec::default()
             }),
             workload_template: "gpu-kata".to_string(),
@@ -3471,10 +3514,13 @@ mod tests {
             )),
             ..CreateSandboxRequest::default()
         };
-        let created = Sandbox {
+        let created = PublicSandbox {
             spec: Some(SandboxSpec {
                 providers: vec!["github".to_string()],
-                policy: Some(openshell_core::proto::SandboxPolicy::default()),
+                policy: Some(openshell_core::proto::policy::PolicyDocument {
+                    version: 1,
+                    ..Default::default()
+                }),
                 resource_requirements: Some(ResourceRequirements {
                     gpu: Some(GpuResourceRequirements { count: Some(1) }),
                 }),
@@ -3484,7 +3530,7 @@ mod tests {
                 name: "gpu-kata".to_string(),
                 resource_version: "7".to_string(),
             }),
-            ..Sandbox::default()
+            ..PublicSandbox::default()
         };
 
         assert_eq!(
@@ -3864,9 +3910,17 @@ mod tests {
                 workspace: "default".to_string(),
                 deletion_time: None,
             }),
-            spec: Some(SandboxSpec {
+            spec: Some(StoredSandboxSpec {
                 log_level: "debug".to_string(),
-                policy: Some(openshell_core::proto::SandboxPolicy::default()),
+                policy: Some(
+                    openshell_policy::lower_authored_policy(
+                        openshell_core::proto::policy::PolicyDocument {
+                            version: 1,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+                ),
                 providers,
                 ..Default::default()
             }),
@@ -3875,6 +3929,95 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Ready as i32);
         sandbox.set_current_policy_version(7);
         sandbox
+    }
+
+    fn unprojectable_stored_policy() -> openshell_core::proto::SandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "legacy".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "legacy".to_string(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: "legacy.example.com".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    mcp: Some(openshell_core::proto::McpOptions {
+                        strict_tool_names: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    #[tokio::test]
+    async fn list_sandboxes_returns_every_sandbox_when_one_policy_cannot_project() {
+        let state = test_server_state().await;
+        for name in ["good-a", "bad", "good-b"] {
+            let mut sandbox = test_sandbox(name, Vec::new());
+            if name == "bad" {
+                sandbox.spec.as_mut().unwrap().policy = Some(unprojectable_stored_policy());
+            }
+            state.store.put_message(&sandbox).await.unwrap();
+        }
+
+        let response = handle_list_sandboxes(
+            &state,
+            authed_request(ListSandboxesRequest {
+                page_size: 100,
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.sandboxes.len(), 3);
+        let bad = response
+            .sandboxes
+            .iter()
+            .find(|sandbox| sandbox.object_name() == "bad")
+            .unwrap();
+        assert!(bad.spec.as_ref().unwrap().policy.is_none());
+        assert!(
+            bad.status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| condition.r#type == "PolicyProjection"
+                    && condition.status == "False"
+                    && condition.reason == "InvalidStoredPolicy")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_by_name_succeeds_with_unprojectable_policy() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox("bad-delete", Vec::new());
+        sandbox.spec.as_mut().unwrap().policy = Some(unprojectable_stored_policy());
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let response = handle_delete_sandbox(
+            &state,
+            authed_request(DeleteSandboxRequest {
+                name: "bad-delete".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(response.sandbox_id, "sandbox-bad-delete");
     }
 
     fn test_workload_template(name: &str) -> SandboxWorkloadTemplate {
@@ -4707,7 +4850,7 @@ mod tests {
                 request_id: String::new(),
                 name: "reserved-policy-key".to_string(),
                 spec: Some(SandboxSpec {
-                    policy: Some(policy),
+                    policy: Some(authored_policy(policy)),
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
@@ -4817,7 +4960,10 @@ mod tests {
             authed_request(CreateSandboxRequest {
                 name: "mcp-canonical".to_string(),
                 spec: Some(SandboxSpec {
-                    policy: Some(mcp_policy_with_versions(&["2025-11-25", "2025-03-26"])),
+                    policy: Some(authored_policy(mcp_policy_with_versions(&[
+                        "2025-11-25",
+                        "2025-03-26",
+                    ]))),
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
@@ -4876,7 +5022,7 @@ mod tests {
                 authed_request(CreateSandboxRequest {
                     name: sandbox_name.to_string(),
                     spec: Some(SandboxSpec {
-                        policy: Some(mcp_policy_with_options(mcp)),
+                        policy: Some(authored_policy(mcp_policy_with_options(mcp))),
                         ..Default::default()
                     }),
                     labels: HashMap::new(),
@@ -4962,11 +5108,7 @@ mod tests {
                 );
 
                 let raw_size = policy.encoded_len();
-                if spelling == "explicit" {
-                    assert_eq!(raw_size, target_size, "{sandbox_name}");
-                } else {
-                    assert!(raw_size < target_size, "{sandbox_name}: {raw_size}");
-                }
+                assert!(raw_size < target_size, "{sandbox_name}: {raw_size}");
 
                 let canonical = validate_and_canonicalize_policy(policy.clone())
                     .expect("defaultable MCP policy must be canonicalizable");
@@ -4977,7 +5119,7 @@ mod tests {
                     authed_request(CreateSandboxRequest {
                         name: sandbox_name.clone(),
                         spec: Some(SandboxSpec {
-                            policy: Some(policy),
+                            policy: Some(authored_policy(policy)),
                             ..Default::default()
                         }),
                         labels: HashMap::new(),
@@ -5047,7 +5189,7 @@ mod tests {
                 authed_request(CreateSandboxRequest {
                     name: sandbox_name.to_string(),
                     spec: Some(SandboxSpec {
-                        policy: Some(mcp_policy_with_versions(versions)),
+                        policy: Some(authored_mcp_policy_with_versions(versions)),
                         ..Default::default()
                     }),
                     labels: HashMap::new(),
@@ -5072,6 +5214,47 @@ mod tests {
                 "invalid MCP versions must not persist sandbox {sandbox_name}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_stores_canonical_internal_policy_and_projects_response() {
+        let state = test_server_state().await;
+        let request_policy = authored_policy(mcp_policy_with_options(None));
+        let expected_internal = validate_and_canonicalize_policy(
+            super::super::policy::lower_public_policy(request_policy.clone()).unwrap(),
+        )
+        .unwrap();
+
+        let response = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "policy-boundary".to_string(),
+                spec: Some(SandboxSpec {
+                    policy: Some(request_policy),
+                    ..Default::default()
+                }),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "policy-boundary")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_policy = stored.spec.unwrap().policy.unwrap();
+        assert_eq!(stored_policy, expected_internal);
+        assert_eq!(
+            response.sandbox.unwrap().spec.unwrap().policy.unwrap(),
+            openshell_policy::project_base_policy(&stored_policy).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -5260,13 +5443,18 @@ mod tests {
         .unwrap();
         let original_id = original.object_id().to_string();
         let original_name = original.object_name().to_string();
+        let mut replacement = state
+            .store
+            .get_message_by_name::<Sandbox>("default", &original_name)
+            .await
+            .unwrap()
+            .expect("created sandbox should be stored");
 
         state
             .store
             .delete(Sandbox::object_type(), &original_id)
             .await
             .unwrap();
-        let mut replacement = original;
         let replacement_id = uuid::Uuid::new_v4().to_string();
         let metadata = replacement.metadata.as_mut().unwrap();
         metadata.id.clone_from(&replacement_id);
@@ -5343,7 +5531,7 @@ mod tests {
                 request_id: String::new(),
                 name: "partial-id".to_string(),
                 spec: Some(SandboxSpec {
-                    policy: Some(policy),
+                    policy: Some(authored_policy(policy)),
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
@@ -5414,7 +5602,7 @@ mod tests {
                 request_id: String::new(),
                 name: "kube-partial-id".to_string(),
                 spec: Some(SandboxSpec {
-                    policy: Some(policy),
+                    policy: Some(authored_policy(policy)),
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
@@ -6146,7 +6334,7 @@ mod tests {
                 name: "from-template".to_string(),
                 spec: Some(SandboxSpec {
                     providers: vec!["work-github".to_string()],
-                    policy: Some(policy),
+                    policy: Some(authored_policy(policy)),
                     command: vec!["echo".to_string(), "template-create".to_string()],
                     tty: false,
                     ..Default::default()

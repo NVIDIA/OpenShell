@@ -15,18 +15,18 @@ discovery:
   credentials: [api_token]
 endpoints:
   - host: api-1.github.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-only
     enforcement: enforce
   - host: api.github.com
-    port: 443
+    ports: [443]
     path: /graphql
     protocol: graphql
     access: read-only
     enforcement: enforce
   - host: github.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-only
     enforcement: enforce

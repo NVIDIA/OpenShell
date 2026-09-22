@@ -18,7 +18,7 @@ discovery:
   credentials: [api_key]
 endpoints:
   - host: integrate.api.nvidia.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce

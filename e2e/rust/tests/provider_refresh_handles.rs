@@ -128,7 +128,7 @@ credentials:
           secret: true
 endpoints:
   - host: host.openshell.internal
-    port: {resource_port}
+    ports: [{resource_port}]
     path: /probe
     protocol: rest
     access: full
@@ -170,7 +170,7 @@ network_policies:
     name: refresh_probe
     endpoints:
       - host: host.openshell.internal
-        port: {resource_port}
+        ports: [{resource_port}]
         path: /probe
         protocol: rest
         access: full

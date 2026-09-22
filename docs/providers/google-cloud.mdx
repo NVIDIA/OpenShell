@@ -171,7 +171,7 @@ network_policies:
     name: gcp-apis
     endpoints:
       - host: "*.googleapis.com"
-        port: 443
+        ports: [443]
         protocol: rest
         access: read-write
         enforcement: enforce

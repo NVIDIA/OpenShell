@@ -6,12 +6,13 @@ use openshell_core::proto::{
     DeleteProviderProfileRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
     DeleteSandboxRequest, DeleteSandboxTemplateRequest, DeleteServiceRequest,
     DeleteWorkspaceRequest, DeletionOutcome, Provider, RemoveWorkspaceMemberRequest,
-    RevokeSshSessionRequest, Sandbox, SshSession,
+    RevokeSshSessionRequest, SshSession,
 };
 use tonic::Code;
 
 use super::test_support::{authed_request, test_server_state};
 use super::{provider, sandbox, service, workspace};
+use crate::storage_proto::StoredSandbox as Sandbox;
 
 fn metadata(id: &str) -> ObjectMeta {
     ObjectMeta {

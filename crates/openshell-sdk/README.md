@@ -124,7 +124,7 @@ client
 let _sandbox = client
     .create_sandbox_from_template(SandboxTemplateCreateSpec {
         template_name: "python".to_string(),
-        policy: Some(openshell_sdk::raw::proto::SandboxPolicy {
+        policy: Some(openshell_sdk::raw::proto::policy::PolicyDocument {
             version: 1,
             ..Default::default()
         }),

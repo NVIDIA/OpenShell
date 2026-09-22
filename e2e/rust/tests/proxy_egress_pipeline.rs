@@ -145,7 +145,7 @@ credentials:
     header_name: authorization
 endpoints:
   - host: {TEST_SERVER_HOST}
-    port: {port}
+    ports: [{port}]
     path: /probe
     protocol: rest
     access: full
@@ -204,7 +204,7 @@ network_policies:
     name: proxy_egress_test
     endpoints:
       - host: {host}
-        port: {port}
+        ports: [{port}]
 {endpoint_options}
 {PRIVATE_ALLOWED_IPS}
     binaries:
@@ -302,7 +302,7 @@ network_policies:
     name: terminating
     endpoints:
       - host: {host}
-        port: {port}
+        ports: [{port}]
 {PRIVATE_ALLOWED_IPS}
     binaries:
       - path: "/**"
@@ -310,7 +310,7 @@ network_policies:
     name: passthrough
     endpoints:
       - host: {host}
-        port: {port}
+        ports: [{port}]
         tls: skip
 {PRIVATE_ALLOWED_IPS}
     binaries:
@@ -344,11 +344,11 @@ network_policies:
   destination_denials:
     name: destination_denials
     endpoints:
-      - { host: 169.254.169.254, port: 80 }
-      - { host: 127.0.0.1, port: 80 }
-      - { host: 203.0.113.10, port: 6443 }
+      - { host: 169.254.169.254, ports: [80] }
+      - { host: 127.0.0.1, ports: [80] }
+      - { host: 203.0.113.10, ports: [6443] }
       - host: 203.0.113.10
-        port: 8080
+        ports: [8080]
         allowed_ips: ["198.51.100.0/24"]
     binaries:
       - path: "/**"
@@ -386,10 +386,10 @@ network_policies:
     name: destination_successes
     endpoints:
       - host: {ip}
-        port: {port}
+        ports: [{port}]
         allowed_ips: ["{explicit_ip}/32"]
       - host: {implicit_ip}
-        port: {port}
+        ports: [{port}]
     binaries:
       - path: "/**"
 "#,

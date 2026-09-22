@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use openshell_core::proto::Sandbox;
+use crate::storage_proto::StoredSandbox as Sandbox;
 
 #[derive(Debug, Clone, Default)]
 pub struct SandboxIndex {

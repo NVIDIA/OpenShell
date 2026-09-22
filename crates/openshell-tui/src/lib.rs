@@ -1437,7 +1437,12 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
         // to "sandbox". For the default image, let the server apply the
         // sandbox's own default policy.
         let policy = if has_custom_image {
-            Some(openshell_policy::restrictive_default_policy())
+            Some(
+                openshell_policy::project_base_policy(
+                    &openshell_policy::restrictive_default_policy(),
+                )
+                .expect("restrictive default policy must project to the public schema"),
+            )
         } else {
             None
         };

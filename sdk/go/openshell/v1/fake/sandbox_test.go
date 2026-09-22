@@ -823,7 +823,7 @@ func TestFakeSandboxCreateWithPolicy(t *testing.T) {
 
 	spec := &types.SandboxSpec{
 		LogLevel: "debug",
-		Policy: &types.SandboxPolicy{
+		Policy: &types.PolicyDocument{
 			Version: 3,
 			Filesystem: &types.FilesystemPolicy{
 				IncludeWorkdir: true,
@@ -841,7 +841,7 @@ func TestFakeSandboxCreateWithPolicy(t *testing.T) {
 				"web": {
 					Name: "web",
 					Endpoints: []types.PolicyNetworkEndpoint{
-						{Host: "api.example.com", Port: 443, Protocol: "rest"},
+						{Host: "api.example.com", Ports: []uint32{443}, Protocol: "rest"},
 					},
 				},
 			},
@@ -881,7 +881,7 @@ func TestFakeSandboxCreateWithPolicy(t *testing.T) {
 	assert.Equal(t, "web", webRule.Name)
 	require.Len(t, webRule.Endpoints, 1)
 	assert.Equal(t, "api.example.com", webRule.Endpoints[0].Host)
-	assert.Equal(t, uint32(443), webRule.Endpoints[0].Port)
+	assert.Equal(t, []uint32{443}, webRule.Endpoints[0].Ports)
 
 	// Deep-copy isolation: mutate input spec, verify stored copy unchanged
 	spec.Policy.Version = 99

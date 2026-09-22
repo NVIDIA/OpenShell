@@ -201,11 +201,11 @@ network_policies:
   claude_code:
     name: claude-code
     endpoints:
-      - { host: api.anthropic.com, port: 443, protocol: rest, enforcement: enforce, access: full }
-      - { host: statsig.anthropic.com, port: 443 }
-      - { host: sentry.io, port: 443 }
-      - { host: raw.githubusercontent.com, port: 443 }
-      - { host: platform.claude.com, port: 443 }
+      - { host: api.anthropic.com, ports: [443], protocol: rest, enforcement: enforce, access: full }
+      - { host: statsig.anthropic.com, ports: [443] }
+      - { host: sentry.io, ports: [443] }
+      - { host: raw.githubusercontent.com, ports: [443] }
+      - { host: platform.claude.com, ports: [443] }
     binaries:
       - { path: /usr/local/bin/claude }
       - { path: /usr/bin/node }
@@ -214,7 +214,7 @@ network_policies:
   nvidia_inference:
     name: nvidia-inference
     endpoints:
-      - { host: integrate.api.nvidia.com, port: 443 }
+      - { host: integrate.api.nvidia.com, ports: [443] }
     binaries:
       - { path: /usr/bin/curl }
       - { path: /bin/bash }
@@ -226,7 +226,7 @@ network_policies:
     name: github-git
     endpoints:
       - host: github.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         rules:
@@ -248,7 +248,7 @@ network_policies:
     name: github-api
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         path: "/repos/<org>/<repo>/**"
         protocol: rest
         enforcement: enforce
@@ -258,7 +258,7 @@ network_policies:
               method: "*"
               path: "/repos/<org>/<repo>/**"
       - host: api.github.com
-        port: 443
+        ports: [443]
         path: "/graphql"
         protocol: graphql
         enforcement: enforce
@@ -283,12 +283,12 @@ network_policies:
   pypi:
     name: pypi
     endpoints:
-      - { host: pypi.org, port: 443 }
-      - { host: files.pythonhosted.org, port: 443 }
-      - { host: github.com, port: 443 }
-      - { host: objects.githubusercontent.com, port: 443 }
-      - { host: api.github.com, port: 443 }
-      - { host: downloads.python.org, port: 443 }
+      - { host: pypi.org, ports: [443] }
+      - { host: files.pythonhosted.org, ports: [443] }
+      - { host: github.com, ports: [443] }
+      - { host: objects.githubusercontent.com, ports: [443] }
+      - { host: api.github.com, ports: [443] }
+      - { host: downloads.python.org, ports: [443] }
     binaries:
       - { path: /sandbox/.venv/bin/python }
       - { path: /sandbox/.venv/bin/python3 }
@@ -302,11 +302,11 @@ network_policies:
   vscode:
     name: vscode
     endpoints:
-      - { host: update.code.visualstudio.com, port: 443 }
-      - { host: "*.vo.msecnd.net", port: 443 }
-      - { host: vscode.download.prss.microsoft.com, port: 443 }
-      - { host: marketplace.visualstudio.com, port: 443 }
-      - { host: "*.gallerycdn.vsassets.io", port: 443 }
+      - { host: update.code.visualstudio.com, ports: [443] }
+      - { host: "*.vo.msecnd.net", ports: [443] }
+      - { host: vscode.download.prss.microsoft.com, ports: [443] }
+      - { host: marketplace.visualstudio.com, ports: [443] }
+      - { host: "*.gallerycdn.vsassets.io", ports: [443] }
     binaries:
       - { path: /usr/bin/curl }
       - { path: /usr/bin/wget }

@@ -22,9 +22,9 @@ use openshell_core::proto::{
     EditDraftChunkResponse, ExposeServiceRequest, ImportProviderProfilesRequest,
     ImportProviderProfilesResponse, Provider, ProviderMutationReceipt, ProviderProfile,
     ProviderProfileDiagnostic, ProviderResponse, RejectDraftChunkRequest, RejectDraftChunkResponse,
-    RotateProviderCredentialRequest, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
-    ServiceEndpointResponse, StartSandboxRequest, StopSandboxRequest, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    RotateProviderCredentialRequest, RotateProviderCredentialResponse, Sandbox as PublicSandbox,
+    SandboxResponse, ServiceEndpointResponse, StartSandboxRequest, StopSandboxRequest,
+    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
     WorkspaceSelector,
 };
@@ -45,7 +45,8 @@ use crate::grpc::{policy, provider, sandbox, service};
 use crate::persistence::{ObjectType, SetResourceVersion, Store};
 use crate::storage_proto::{
     StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
-    StoredProviderProfile,
+    StoredProviderProfileWire as StoredProviderProfile, StoredSandbox as Sandbox,
+    sandbox_to_public,
 };
 use crate::{ServerState, config_update_operation};
 
@@ -285,6 +286,11 @@ async fn live<T: Message + Default + ObjectType + SetResourceVersion>(
         .ok_or_else(replay_unavailable)
 }
 
+async fn live_sandbox(store: &Store, id: &str) -> Result<PublicSandbox, Status> {
+    let sandbox: Sandbox = live(store, id).await?;
+    Ok(sandbox_to_public(&sandbox))
+}
+
 async fn selected_scope(
     state: &ServerState,
     principal: &Principal,
@@ -412,7 +418,7 @@ macro_rules! sandbox_scoped_mutation {
 }
 
 fn sandbox_receipt(
-    sandbox: Option<&Sandbox>,
+    sandbox: Option<&PublicSandbox>,
     changed: bool,
     service_urls: HashMap<String, String>,
 ) -> Result<Outcome, Status> {
@@ -441,7 +447,7 @@ macro_rules! sandbox_mutation {
                     return Err(replay_unavailable());
                 };
                 Ok(SandboxResponse {
-                    sandbox: Some(live(store, &id).await?),
+                    sandbox: Some(live_sandbox(store, &id).await?),
                     service_urls: HashMap::new(),
                 })
             }
@@ -467,7 +473,7 @@ scoped_mutation!(
             return Err(replay_unavailable());
         };
         Ok(SandboxResponse {
-            sandbox: Some(live(store, &id).await?),
+            sandbox: Some(live_sandbox(store, &id).await?),
             service_urls,
         })
     }
@@ -516,7 +522,7 @@ macro_rules! attachment_mutation {
                     return Err(replay_unavailable());
                 };
                 Ok($resp {
-                    sandbox: Some(live(store, &id).await?),
+                    sandbox: Some(live_sandbox(store, &id).await?),
                     $field: changed,
                     receipt: Some(receipt.restore(store).await?),
                 })
@@ -750,7 +756,7 @@ async fn restore_profiles(
         profiles.push(crate::provider_profile_sources::profile_response_payload(
             stored.profile.ok_or_else(replay_unavailable)?,
             reference.version,
-        ));
+        )?);
     }
     Ok(profiles)
 }

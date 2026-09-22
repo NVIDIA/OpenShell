@@ -29,7 +29,7 @@ credentials:
           scopes: [beta]
 endpoints:
   - host: alpha.default.svc.cluster.local
-    port: 80
+    ports: [80]
     protocol: rest
     tls: none
     access: read-write
@@ -37,7 +37,7 @@ endpoints:
     allowed_ips:
       - 10.43.0.0/16
   - host: beta.default.svc.cluster.local
-    port: 80
+    ports: [80]
     protocol: rest
     tls: none
     access: read-write

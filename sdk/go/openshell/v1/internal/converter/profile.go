@@ -6,7 +6,7 @@ package converter
 import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
-	sbv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
+	policyv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/policyv1"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
@@ -83,26 +83,29 @@ func CredentialTokenGrantTypeToProto(t types.CredentialTokenGrantType) pb.Provid
 // --- NetworkEndpoint ---
 
 // NetworkEndpointFromProto converts a proto NetworkEndpoint to an SDK NetworkEndpoint.
-// Only Host, Port, and Protocol are mapped; additional proto fields are ignored.
-func NetworkEndpointFromProto(ep *sbv1.NetworkEndpoint) *types.NetworkEndpoint {
+// Only Host, Ports, and Protocol are mapped; additional proto fields are ignored.
+func NetworkEndpointFromProto(ep *policyv1.NetworkEndpoint) *types.NetworkEndpoint {
 	if ep == nil {
 		return nil
 	}
-	return &types.NetworkEndpoint{
+	result := &types.NetworkEndpoint{
 		Host:     ep.GetHost(),
-		Port:     ep.GetPort(),
 		Protocol: ep.GetProtocol(),
 	}
+	if ports := ep.GetPorts(); len(ports) > 0 {
+		result.Ports = append([]uint32(nil), ports...)
+	}
+	return result
 }
 
 // NetworkEndpointToProto converts an SDK NetworkEndpoint to a proto NetworkEndpoint.
-func NetworkEndpointToProto(ep *types.NetworkEndpoint) *sbv1.NetworkEndpoint {
+func NetworkEndpointToProto(ep *types.NetworkEndpoint) *policyv1.NetworkEndpoint {
 	if ep == nil {
 		return nil
 	}
-	return &sbv1.NetworkEndpoint{
+	return &policyv1.NetworkEndpoint{
 		Host:     ep.Host,
-		Port:     ep.Port,
+		Ports:    append([]uint32(nil), ep.Ports...),
 		Protocol: ep.Protocol,
 	}
 }
@@ -110,7 +113,7 @@ func NetworkEndpointToProto(ep *types.NetworkEndpoint) *sbv1.NetworkEndpoint {
 // --- NetworkBinary ---
 
 // NetworkBinaryFromProto converts a proto NetworkBinary to an SDK NetworkBinary.
-func NetworkBinaryFromProto(b *sbv1.NetworkBinary) *types.NetworkBinary {
+func NetworkBinaryFromProto(b *policyv1.NetworkBinary) *types.NetworkBinary {
 	if b == nil {
 		return nil
 	}
@@ -120,11 +123,11 @@ func NetworkBinaryFromProto(b *sbv1.NetworkBinary) *types.NetworkBinary {
 }
 
 // NetworkBinaryToProto converts an SDK NetworkBinary to a proto NetworkBinary.
-func NetworkBinaryToProto(b *types.NetworkBinary) *sbv1.NetworkBinary {
+func NetworkBinaryToProto(b *types.NetworkBinary) *policyv1.NetworkBinary {
 	if b == nil {
 		return nil
 	}
-	return &sbv1.NetworkBinary{
+	return &policyv1.NetworkBinary{
 		Path: b.Path,
 	}
 }
@@ -421,7 +424,7 @@ func ProviderProfileToProto(p *types.ProviderProfile) *pb.ProviderProfile {
 
 	// Endpoints
 	if len(p.Endpoints) > 0 {
-		result.Endpoints = make([]*sbv1.NetworkEndpoint, len(p.Endpoints))
+		result.Endpoints = make([]*policyv1.NetworkEndpoint, len(p.Endpoints))
 		for i := range p.Endpoints {
 			result.Endpoints[i] = NetworkEndpointToProto(&p.Endpoints[i])
 		}
@@ -429,7 +432,7 @@ func ProviderProfileToProto(p *types.ProviderProfile) *pb.ProviderProfile {
 
 	// Binaries
 	if len(p.Binaries) > 0 {
-		result.Binaries = make([]*sbv1.NetworkBinary, len(p.Binaries))
+		result.Binaries = make([]*policyv1.NetworkBinary, len(p.Binaries))
 		for i := range p.Binaries {
 			result.Binaries[i] = NetworkBinaryToProto(&p.Binaries[i])
 		}

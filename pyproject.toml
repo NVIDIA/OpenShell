@@ -18,7 +18,10 @@ dependencies = [
     "grpcio>=1.60",
     "googleapis-common-protos>=1.63",
     "httpx>=0.27",
-    "protobuf>=4.25",
+    # protovalidate 1.0 uses descriptor APIs removed in protobuf 7. The lower
+    # bound matches the protoc runtime version used for checked wheel stubs.
+    "protobuf>=6.31.1,<7",
+    "protovalidate==1.0.0",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -62,7 +65,7 @@ include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["python"]
-include = ["openshell*"]
+include = ["openshell*", "buf*"]
 namespaces = false
 
 [tool.setuptools.package-data]

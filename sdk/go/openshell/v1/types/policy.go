@@ -88,8 +88,8 @@ type PolicyChunk struct {
 	ReviewToken                  string
 	CurrentEffectivePolicyHash   string
 	CandidateEffectivePolicyHash string
-	CurrentEffectivePolicy       *SandboxPolicy
-	CandidateEffectivePolicy     *SandboxPolicy
+	CurrentEffectivePolicy       *PolicyDocument
+	CandidateEffectivePolicy     *PolicyDocument
 }
 
 // DraftChunkApproval binds one bulk approval decision to a reviewed chunk.
@@ -110,11 +110,11 @@ type DraftPolicy struct {
 	LastAnalyzedAt time.Time
 }
 
-// SandboxPolicy is the top-level security policy configuration for a sandbox.
+// PolicyDocument is the top-level security policy configuration for a sandbox.
 // It contains filesystem access rules, Landlock LSM configuration, process
 // identity rules, and named network access policies.
-type SandboxPolicy struct {
-	// Version is the policy version number. The server may override this on write.
+type PolicyDocument struct {
+	// Version is the authored schema version and must be 1.
 	Version uint32
 	// Filesystem controls which directories the sandbox can access.
 	// Nil means no filesystem policy is specified.
@@ -193,7 +193,7 @@ type SandboxPolicyRevision struct {
 	// LoadedAt is when this revision was loaded by the sandbox.
 	LoadedAt time.Time
 	// Policy is the typed security policy for this revision. Nil when not requested or absent.
-	Policy *SandboxPolicy
+	Policy *PolicyDocument
 	// Provenance is immutable metadata supplied with this policy revision.
 	Provenance map[string]string
 }

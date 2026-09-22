@@ -15,7 +15,7 @@ discovery:
   credentials: [api_token]
 endpoints:
   - host: slack.com
-    port: 443
+    ports: [443]
     protocol: rest
     enforcement: enforce
     rules:

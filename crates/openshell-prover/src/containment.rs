@@ -81,7 +81,9 @@ impl ContainmentEndpoint for Endpoint {
 
 /// Parse one captured YAML or JSON input using the canonical authored schema.
 pub fn parse_policy_str(source: &str) -> Result<ContainmentPolicy, ParsePolicyError> {
-    let document = openshell_policy_schema::parse_policy(source)
+    let generated = openshell_policy_schema::parse_policy_proto(source)
+        .map_err(|error| ParsePolicyError(format!("invalid policy: {error:#}")))?;
+    let document = PolicyDocument::try_from(generated)
         .map_err(|error| ParsePolicyError(format!("invalid policy: {error:#}")))?;
     let mut filesystem_policy = document.effective_filesystem_policy();
     normalize_filesystem_paths(&mut filesystem_policy)?;
@@ -1559,10 +1561,7 @@ fn validate_shared_endpoint(context: &str, endpoint: &Endpoint) -> Result<(), Un
             "{context} endpoint path {reason}"
         )));
     }
-    if endpoint.host.is_empty()
-        || endpoint.effective_ports().is_empty()
-        || (endpoint.port != 0 && !endpoint.ports.is_empty())
-    {
+    if endpoint.host.is_empty() || endpoint.effective_ports().is_empty() {
         return Err(UnsupportedFeature::policy_shape(format!(
             "{context} has no unambiguous host and port"
         )));
@@ -1962,9 +1961,7 @@ fn resource_limit_reason(
                 }
             }
             for endpoint in &rule.endpoints {
-                let endpoint_port_entries =
-                    usize::from(endpoint.ports.is_empty() && endpoint.port != 0)
-                        .max(endpoint.ports.len());
+                let endpoint_port_entries = endpoint.ports.len();
                 port_entry_count = port_entry_count.saturating_add(endpoint_port_entries);
                 if port_entry_count > MAX_PORT_ENTRIES {
                     return Some(resource_limit_detail(
@@ -2281,10 +2278,10 @@ mod tests {
     #[test]
     fn l4_contains_rest_but_not_the_reverse() {
         let l4 = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let rest = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - { host: api.example.com, ports: [443], protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
             check_within_boundary(&l4, &rest, options()),
@@ -2300,7 +2297,7 @@ mod tests {
     fn network_containment_covers_disabled_binary_identity() {
         let boundary = parse("version: 1\n");
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: []\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: []\n",
         );
         let result = check_within_boundary(&boundary, &candidate, options());
         assert!(matches!(
@@ -2328,12 +2325,12 @@ mod tests {
         for (host, protocol) in cases {
             let endpoint = if protocol == "rest" {
                 format!(
-                    "{{ host: {host}, port: 443, protocol: rest, enforcement: enforce, access: read-only }}"
+                    "{{ host: {host}, ports: [443], protocol: rest, enforcement: enforce, access: read-only }}"
                 )
             } else if protocol == "tcp" {
-                format!("{{ host: {host}, port: 443, protocol: tcp }}")
+                format!("{{ host: {host}, ports: [443], protocol: tcp }}")
             } else {
-                format!("{{ host: {host}, port: 443 }}")
+                format!("{{ host: {host}, ports: [443] }}")
             };
             let candidate = parse(&format!(
                 "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{endpoint}]\n    binaries: []\n"
@@ -2356,10 +2353,10 @@ mod tests {
     #[test]
     fn underscore_hosts_preserve_exact_and_wildcard_containment() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  boundary:\n    endpoints: [{ host: '*.example.com', port: 443 }]\n    binaries: []\n",
+            "version: 1\nnetwork_policies:\n  boundary:\n    endpoints: [{ host: '*.example.com', ports: [443] }]\n    binaries: []\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  candidate:\n    endpoints: [{ host: api_internal.example.com, port: 443 }]\n    binaries: []\n",
+            "version: 1\nnetwork_policies:\n  candidate:\n    endpoints: [{ host: api_internal.example.com, ports: [443] }]\n    binaries: []\n",
         );
         let boundary = fixed_test_ips(boundary);
         let candidate = fixed_test_ips(candidate);
@@ -2369,10 +2366,10 @@ mod tests {
         ));
 
         let exact_boundary = parse(
-            "version: 1\nnetwork_policies:\n  boundary:\n    endpoints: [{ host: _service.example.com, port: 443, protocol: tcp }]\n    binaries: []\n",
+            "version: 1\nnetwork_policies:\n  boundary:\n    endpoints: [{ host: _service.example.com, ports: [443], protocol: tcp }]\n    binaries: []\n",
         );
         let exact_candidate = parse(
-            "version: 1\nnetwork_policies:\n  candidate:\n    endpoints: [{ host: _service.example.com, port: 443, protocol: tcp }]\n    binaries: []\n",
+            "version: 1\nnetwork_policies:\n  candidate:\n    endpoints: [{ host: _service.example.com, ports: [443], protocol: tcp }]\n    binaries: []\n",
         );
         assert!(matches!(
             check_within_boundary(&exact_boundary, &exact_candidate, options()),
@@ -2438,7 +2435,7 @@ mod tests {
             assert!(unsupported_host_glob(unsupported));
 
             let candidate = parse(&format!(
-                "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{{ host: {unsupported}, port: 443 }}]\n    binaries: []\n"
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{{ host: {unsupported}, ports: [443] }}]\n    binaries: []\n"
             ));
             assert!(matches!(
                 check_within_boundary(&parse("version: 1\n"), &candidate, options()),
@@ -2452,10 +2449,10 @@ mod tests {
     #[test]
     fn differing_binary_selectors_are_checked_when_identity_is_required() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/wget }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: /usr/bin/wget }]\n",
         );
         let result = check_within_boundary(&boundary, &candidate, options());
         assert!(matches!(
@@ -2474,10 +2471,10 @@ mod tests {
     #[test]
     fn explicit_deny_removes_authority() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: full\n        deny_rules: [{ method: DELETE, path: /** }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        access: full\n        deny_rules: [{ method: DELETE, path: /** }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: DELETE, path: /private/resource } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: DELETE, path: /private/resource } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let result = check_within_boundary(&boundary, &candidate, options());
         assert!(matches!(result, CheckResult::Exceeds(_)), "{result:?}");
@@ -2486,10 +2483,10 @@ mod tests {
     #[test]
     fn overlapping_exact_deny_and_wildcard_is_unsupported() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: 'api*.example.com', port: 443, protocol: rest, enforcement: enforce, access: full }\n    binaries: [{ path: /usr/bin/curl }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: full\n        deny_rules: [{ method: GET, path: '/**' }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: 'api*.example.com', ports: [443], protocol: rest, enforcement: enforce, access: full }\n    binaries: [{ path: /usr/bin/curl }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        access: full\n        deny_rules: [{ method: GET, path: '/**' }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: 'api*.example.com', port: 443, protocol: rest, enforcement: enforce, access: full }\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: 'api*.example.com', ports: [443], protocol: rest, enforcement: enforce, access: full }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let result = check_within_boundary(&boundary, &candidate, options());
         assert!(
@@ -2505,10 +2502,10 @@ mod tests {
     #[test]
     fn ancestor_binary_can_supply_a_boundary_deny() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: /usr/bin/curl }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: /usr/bin/python3 }]\n",
+            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, ports: [443], protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: /usr/bin/curl }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: /usr/bin/python3 }]\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: /usr/bin/curl }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: /usr/bin/node }]\n",
+            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, ports: [443], protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: /usr/bin/curl }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: /usr/bin/node }]\n",
         );
         let result = check_within_boundary(&boundary, &candidate, options());
         assert!(
@@ -2533,11 +2530,11 @@ mod tests {
     #[test]
     fn exact_boundary_deny_under_candidate_glob_requires_image_resolution() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: '/**' }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: /venv/bin/python }]\n",
+            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, ports: [443], protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: '/**' }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: /venv/bin/python }]\n",
         );
         for pattern in ["/venv/bin/*", "/venv/bin/py**", "/venv/bin/**thon"] {
             let candidate = parse(
-            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: '/**' }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: 'BINARY_GLOB' }]\n".replace("BINARY_GLOB", pattern).as_str(),
+            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, ports: [443], protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: '/**' }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: 'BINARY_GLOB' }]\n".replace("BINARY_GLOB", pattern).as_str(),
         );
             assert!(matches!(
                 check_within_boundary(&boundary, &candidate, options()),
@@ -2550,10 +2547,10 @@ mod tests {
     #[test]
     fn definite_network_expansion_precedes_symlink_uncertainty() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: '/**' }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: /venv/bin/python }]\n",
+            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, ports: [443], protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: '/**' }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: /venv/bin/python }]\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: '/**' }]\n  extra:\n    endpoints: [{ host: extra.example.com, port: 443 }]\n    binaries: [{ path: '/**' }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: '/venv/bin/*' }]\n",
+            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, ports: [443], protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: '/**' }]\n  extra:\n    endpoints: [{ host: extra.example.com, ports: [443] }]\n    binaries: [{ path: '/**' }]\n  deny:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        access: read-only\n        deny_rules: [{ method: '*', path: '/**' }]\n    binaries: [{ path: '/venv/bin/*' }]\n",
         );
         assert!(matches!(
             check_within_boundary(&boundary, &candidate, options()),
@@ -2564,10 +2561,10 @@ mod tests {
     #[test]
     fn overlapping_l4_and_rest_authority_is_unsupported() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - { host: api.example.com, port: 443 }\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - { host: api.example.com, ports: [443] }\n      - { host: api.example.com, ports: [443], protocol: rest, enforcement: enforce, access: read-only }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
             check_within_boundary(&boundary, &candidate, options()),
@@ -2580,10 +2577,10 @@ mod tests {
     fn methods_longer_than_sixty_four_bytes_are_in_the_action_domain() {
         let method = "X".repeat(65);
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, rules: [{ allow: { method: GET, path: '/**' } }] }\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - { host: api.example.com, ports: [443], protocol: rest, enforcement: enforce, rules: [{ allow: { method: GET, path: '/**' } }] }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let candidate = parse(&format!(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - {{ host: api.example.com, port: 443, protocol: rest, enforcement: enforce, rules: [{{ allow: {{ method: {method}, path: '/**' }} }}] }}\n    binaries: [{{ path: /usr/bin/curl }}]\n"
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - {{ host: api.example.com, ports: [443], protocol: rest, enforcement: enforce, rules: [{{ allow: {{ method: {method}, path: '/**' }} }}] }}\n    binaries: [{{ path: /usr/bin/curl }}]\n"
         ));
         let result = check_within_boundary(&boundary, &candidate, options());
         assert!(matches!(
@@ -2599,13 +2596,13 @@ mod tests {
     #[test]
     fn rest_methods_and_paths_must_be_narrower() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: GET, path: '/repos/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: GET, path: '/repos/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let narrower = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: GET, path: '/repos/NVIDIA/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: GET, path: '/repos/NVIDIA/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let broader_method = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: POST, path: '/repos/NVIDIA/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: POST, path: '/repos/NVIDIA/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let options = CheckOptions::new(Duration::from_secs(30));
         let result = check_within_boundary(&boundary, &narrower, options);
@@ -2624,10 +2621,10 @@ mod tests {
     #[test]
     fn structural_fast_path_does_not_ignore_separate_boundary_denies() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, rules: [{ allow: { method: GET, path: '/repos/**' } }] }\n    binaries: [{ path: /usr/bin/curl }]\n  deny:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, access: full, deny_rules: [{ method: GET, path: '/repos/private/**' }] }\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, ports: [443], protocol: rest, enforcement: enforce, rules: [{ allow: { method: GET, path: '/repos/**' } }] }\n    binaries: [{ path: /usr/bin/curl }]\n  deny:\n    endpoints:\n      - { host: api.example.com, ports: [443], protocol: rest, enforcement: enforce, access: full, deny_rules: [{ method: GET, path: '/repos/private/**' }] }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, rules: [{ allow: { method: GET, path: '/repos/private/**' } }] }\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  allow:\n    endpoints:\n      - { host: api.example.com, ports: [443], protocol: rest, enforcement: enforce, rules: [{ allow: { method: GET, path: '/repos/private/**' } }] }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(!network_is_structurally_contained(
             &boundary, &candidate, true
@@ -2655,7 +2652,7 @@ mod tests {
     #[test]
     fn mcp_authority_fails_closed_in_both_inputs() {
         let mcp = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: mcp\n        enforcement: enforce\n        access: full\n        mcp: {}\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: mcp\n        enforcement: enforce\n        access: full\n        mcp: {}\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let empty = parse("version: 1\n");
         for (boundary, candidate, side) in [(&mcp, &empty, "boundary"), (&empty, &mcp, "candidate")]
@@ -2677,10 +2674,10 @@ mod tests {
     fn exact_binary_under_a_boundary_glob_requires_image_resolution() {
         for pattern in ["/usr/bin/*3", "/usr/bin/py**", "/usr/bin/**3"] {
             let boundary = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: 'BINARY_GLOB' }]\n".replace("BINARY_GLOB", pattern).as_str(),
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: 'BINARY_GLOB' }]\n".replace("BINARY_GLOB", pattern).as_str(),
         );
             let candidate = parse(
-                "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/python3 }]\n",
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: /usr/bin/python3 }]\n",
             );
             let result = check_within_boundary(&boundary, &candidate, options());
             assert!(
@@ -2697,10 +2694,10 @@ mod tests {
     #[test]
     fn unrelated_boundary_glob_does_not_make_exact_containment_unsupported() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n  unrelated:\n    endpoints: [{ host: other.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
+            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: /usr/bin/curl }]\n  unrelated:\n    endpoints: [{ host: other.example.com, ports: [443] }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
             check_within_boundary(&boundary, &candidate, options()),
@@ -2711,10 +2708,10 @@ mod tests {
     #[test]
     fn redundant_boundary_glob_does_not_hide_equivalent_exact_containment() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n  glob:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
+            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: /usr/bin/curl }]\n  glob:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let result = check_within_boundary(&boundary, &candidate, options());
         assert!(matches!(result, CheckResult::Within(_)), "{result:?}");
@@ -2723,10 +2720,10 @@ mod tests {
     #[test]
     fn unrelated_universal_glob_does_not_hide_symlink_ambiguity() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  ambiguous:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n  unrelated:\n    endpoints: [{ host: unrelated.example.com, port: 80 }]\n    binaries: [{ path: '/**' }]\n",
+            "version: 1\nnetwork_policies:\n  ambiguous:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: '/usr/bin/*' }]\n  unrelated:\n    endpoints: [{ host: unrelated.example.com, ports: [80] }]\n    binaries: [{ path: '/**' }]\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
             check_within_boundary(&boundary, &candidate, options()),
@@ -2738,10 +2735,10 @@ mod tests {
     #[test]
     fn shared_glob_does_not_hide_exact_binary_symlink_ambiguity() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  shared:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
+            "version: 1\nnetwork_policies:\n  shared:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  shared:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }, { path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  shared:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: '/usr/bin/*' }, { path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
             check_within_boundary(&boundary, &candidate, options()),
@@ -2753,10 +2750,10 @@ mod tests {
     #[test]
     fn wildcard_endpoint_overlap_does_not_hide_symlink_ambiguity() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  shared:\n    endpoints: [{ host: '*.example.com', port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
+            "version: 1\nnetwork_policies:\n  shared:\n    endpoints: [{ host: '*.example.com', ports: [443] }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  shared:\n    endpoints: [{ host: '*.example.com', port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  shared:\n    endpoints: [{ host: '*.example.com', ports: [443] }]\n    binaries: [{ path: '/usr/bin/*' }]\n  exact:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let boundary = fixed_test_ips(boundary);
         let candidate = fixed_test_ips(candidate);
@@ -2770,10 +2767,10 @@ mod tests {
     #[test]
     fn ambiguity_check_preserves_shared_unrelated_globs() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n  ambiguous:\n    endpoints: [{ host: unrelated.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n  shared:\n    endpoints: [{ host: shared.example.com, port: 443 }, { host: mirror.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
+            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: /usr/bin/curl }]\n  ambiguous:\n    endpoints: [{ host: unrelated.example.com, ports: [443] }]\n    binaries: [{ path: '/usr/bin/*' }]\n  shared:\n    endpoints: [{ host: shared.example.com, ports: [443] }, { host: mirror.example.com, ports: [443] }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n  shared:\n    endpoints: [{ host: mirror.example.com, port: 443 }, { host: shared.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
+            "version: 1\nnetwork_policies:\n  exact:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: /usr/bin/curl }]\n  shared:\n    endpoints: [{ host: mirror.example.com, ports: [443] }, { host: shared.example.com, ports: [443] }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
         );
         assert!(matches!(
             check_within_boundary(&boundary, &candidate, options()),
@@ -2784,10 +2781,10 @@ mod tests {
     #[test]
     fn reflexive_and_rule_order_invariant() {
         let first = parse(
-            "version: 1\nnetwork_policies:\n  a:\n    endpoints: [{ host: '*.example.com', port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n  b:\n    endpoints: [{ host: api.example.org, port: 8443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  a:\n    endpoints: [{ host: '*.example.com', ports: [443] }]\n    binaries: [{ path: '/usr/bin/*' }]\n  b:\n    endpoints: [{ host: api.example.org, ports: [8443] }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let second = parse(
-            "version: 1\nnetwork_policies:\n  b:\n    endpoints: [{ host: api.example.org, port: 8443 }]\n    binaries: [{ path: /usr/bin/curl }]\n  a:\n    endpoints: [{ host: '*.example.com', port: 443 }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
+            "version: 1\nnetwork_policies:\n  b:\n    endpoints: [{ host: api.example.org, ports: [8443] }]\n    binaries: [{ path: /usr/bin/curl }]\n  a:\n    endpoints: [{ host: '*.example.com', ports: [443] }]\n    binaries: [{ path: '/usr/bin/*' }]\n",
         );
         let reflexive = check_within_boundary(&first, &first, options());
         assert!(matches!(reflexive, CheckResult::Within(_)), "{reflexive:?}");
@@ -2832,7 +2829,7 @@ mod tests {
             "version: 1
 network_policies:
   n:
-    endpoints: [{ host: l4-0.example.com, port: 443 }]
+    endpoints: [{ host: l4-0.example.com, ports: [443] }]
 ",
         )
         .network_policies["n"]
@@ -2842,7 +2839,7 @@ network_policies:
             "version: 1
 network_policies:
   n:
-    endpoints: [{ host: rest.example.com, port: 443, protocol: rest, enforcement: enforce, access: read-only }]
+    endpoints: [{ host: rest.example.com, ports: [443], protocol: rest, enforcement: enforce, access: read-only }]
 ",
         )
         .network_policies["n"]
@@ -2884,7 +2881,7 @@ network_policies:
             "version: 1
 network_policies:
   n:
-    endpoints: [{ host: api.example.com, port: 443 }]
+    endpoints: [{ host: api.example.com, ports: [443] }]
 ",
         )
         .network_policies["n"]
@@ -3050,17 +3047,17 @@ network_policies:
             "version: 1
 network_policies:
   n:
-    endpoints: [{ host: api.example.com, port: 443 }, { host: API.EXAMPLE.COM, port: 443, protocol: rest }]
+    endpoints: [{ host: api.example.com, ports: [443] }, { host: API.EXAMPLE.COM, ports: [443], protocol: rest }]
 ",
             "version: 1
 network_policies:
   n:
-    endpoints: [{ host: '*.example.com', ports: [80, 443] }, { host: api.other.test, port: 443, protocol: rest }]
+    endpoints: [{ host: '*.example.com', ports: [80, 443] }, { host: api.other.test, ports: [443], protocol: rest }]
 ",
             "version: 1
 network_policies:
   n:
-    endpoints: [{ host: api.example.com, port: 80 }, { host: api.example.com, port: 443, protocol: rest }]
+    endpoints: [{ host: api.example.com, ports: [80] }, { host: api.example.com, ports: [443], protocol: rest }]
 ",
             "version: 1
 network_policies:
@@ -3070,9 +3067,9 @@ network_policies:
             "version: 1
 network_policies:
   a:
-    endpoints: [{ host: api.example.com, port: 443 }]
+    endpoints: [{ host: api.example.com, ports: [443] }]
   b:
-    endpoints: [{ host: api.example.com, port: 443 }, { host: api.example.com, port: 443, protocol: rest }]
+    endpoints: [{ host: api.example.com, ports: [443] }, { host: api.example.com, ports: [443], protocol: rest }]
 ",
         ];
         for source in policies {
@@ -3089,11 +3086,10 @@ network_policies:
             "version: 1
 network_policies:
   api:
-    endpoints: [{ host: api.example.com, port: 443 }]
+    endpoints: [{ host: api.example.com, ports: [443] }]
 ",
         );
         let endpoint = &mut policy.network_policies.get_mut("api").unwrap().endpoints[0];
-        endpoint.port = 0;
         endpoint.ports = (1..=32_768).collect();
         endpoint.allowed_ips = vec!["10.0.0.0/8".to_owned(); MAX_IP_RANGES / 2];
         let second = endpoint.clone();
@@ -3186,10 +3182,10 @@ network_policies:
     #[test]
     fn deprecated_tls_spelling_does_not_change_authority() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        tls: terminate\n        enforcement: enforce\n        access: read-only\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        tls: terminate\n        enforcement: enforce\n        access: read-only\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let candidate = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules:\n          - allow: { method: GET, path: '/v1/**' }\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        rules:\n          - allow: { method: GET, path: '/v1/**' }\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
             check_within_boundary(&boundary, &candidate, options()),
@@ -3200,17 +3196,17 @@ network_policies:
     #[test]
     fn host_wildcards_do_not_cross_or_elide_labels() {
         let boundary = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: '*.example.com', port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: '*.example.com', ports: [443] }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let nested = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: deep.api.example.com, port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: deep.api.example.com, ports: [443] }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         assert!(matches!(
             check_within_boundary(&boundary, &nested, options()),
             CheckResult::Exceeds(_)
         ));
         let recursive = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: '**.example.com', port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: '**.example.com', ports: [443] }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let recursive = fixed_test_ips(recursive);
         let nested = fixed_test_ips(nested);
@@ -3395,31 +3391,31 @@ network_policies:
         let policies = [
             (
                 "binary path",
-                "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, port: 443 }]\n    binaries: [{ path: '/usr/bin/é*' }]\n",
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: api.example.com, ports: [443] }]\n    binaries: [{ path: '/usr/bin/é*' }]\n",
             ),
             (
                 "endpoint host",
-                "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: 'é.example.com', port: 443 }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints: [{ host: 'é.example.com', ports: [443] }]\n    binaries: [{ path: /usr/bin/curl }]\n",
             ),
             (
                 "endpoint path",
-                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - { host: api.example.com, port: 443, protocol: rest, enforcement: enforce, path: '/é/**', access: full }\n    binaries: [{ path: /usr/bin/curl }]\n",
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - { host: api.example.com, ports: [443], protocol: rest, enforcement: enforce, path: '/é/**', access: full }\n    binaries: [{ path: /usr/bin/curl }]\n",
             ),
             (
                 "REST allow method",
-                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: 'GÉT', path: '/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: 'GÉT', path: '/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
             ),
             (
                 "REST allow path",
-                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: GET, path: '/é/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: GET, path: '/é/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
             ),
             (
                 "REST deny method",
-                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: GET, path: '/**' } }]\n        deny_rules: [{ method: 'DÉLETE', path: '/**' }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: GET, path: '/**' } }]\n        deny_rules: [{ method: 'DÉLETE', path: '/**' }]\n    binaries: [{ path: /usr/bin/curl }]\n",
             ),
             (
                 "REST deny path",
-                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: GET, path: '/**' } }]\n        deny_rules: [{ method: GET, path: '/é/**' }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+                "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: GET, path: '/**' } }]\n        deny_rules: [{ method: GET, path: '/é/**' }]\n    binaries: [{ path: /usr/bin/curl }]\n",
             ),
         ];
         let empty = parse("version: 1\n");
@@ -3458,7 +3454,7 @@ network_policies:
         );
 
         let policy = parse(
-            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: \"G\\0ET\", path: '/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
+            "version: 1\nnetwork_policies:\n  n:\n    endpoints:\n      - host: api.example.com\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        rules: [{ allow: { method: \"G\\0ET\", path: '/**' } }]\n    binaries: [{ path: /usr/bin/curl }]\n",
         );
         let empty = parse("version: 1\n");
         for (boundary, candidate, label) in [

@@ -14,8 +14,8 @@ use openshell_core::proto::{
     CreateWorkspaceResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse, GetWorkspaceRequest,
     GetWorkspaceResponse, ListWorkspaceMembersRequest, ListWorkspaceMembersResponse,
     ListWorkspacesRequest, ListWorkspacesResponse, Provider, RemoveWorkspaceMemberRequest,
-    RemoveWorkspaceMemberResponse, Sandbox, SandboxWorkloadTemplate, ServiceEndpoint, SshSession,
-    Workspace, WorkspaceMember, WorkspaceRole,
+    RemoveWorkspaceMemberResponse, SandboxWorkloadTemplate, ServiceEndpoint, SshSession, Workspace,
+    WorkspaceMember, WorkspaceRole,
 };
 use prost::Message;
 use tonic::{Request, Response, Status};
@@ -30,7 +30,7 @@ use crate::persistence::{
 };
 use crate::storage_proto::{
     StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
-    StoredProviderProfile,
+    StoredProviderProfileWire as StoredProviderProfile, StoredSandbox as Sandbox,
 };
 use std::collections::HashMap;
 

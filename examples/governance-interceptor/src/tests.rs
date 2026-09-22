@@ -227,7 +227,7 @@ fn policy_yaml_with_dynamic_rule() -> String {
 name: example-api
 endpoints:
 - host: example.com
-  port: 443
+  ports: [443]
   protocol: rest
   enforcement: enforce
   access: read-only"#,
@@ -566,7 +566,7 @@ fn profile_signature_rejects_missing_hash_algorithm() {
 fn policy_patch_uses_protobuf_json_names() {
     let service = service();
     let state = policy_state(&service);
-    assert!(state.policy.get("filesystem").is_some());
+    assert!(state.policy.get("filesystemPolicy").is_some());
     assert!(state.policy.get("networkPolicies").is_some());
     assert!(state.policy.get("filesystem_policy").is_none());
     assert!(state.policy.get("network_policies").is_none());
@@ -642,7 +642,7 @@ fn sandbox_policy_sync_requires_current_signed_governance_policy() {
     let mut widened = state.policy.clone();
     widened["networkPolicies"]["sandbox_added"] = json!({
         "name": "sandbox-added",
-        "endpoints": [{"host": "sandbox-added.example", "port": 443}],
+        "endpoints": [{"host": "sandbox-added.example", "ports": [443]}],
     });
     let copied_annotations = service
         .evaluate_inner(&sandbox_evaluation(

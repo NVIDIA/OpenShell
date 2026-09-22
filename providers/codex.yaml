@@ -48,22 +48,22 @@ discovery:
   credentials: [access_token, refresh_token, account_id, id_token]
 endpoints:
   - host: api.openai.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce
   - host: auth.openai.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce
   - host: chatgpt.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce
   - host: ab.chatgpt.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce

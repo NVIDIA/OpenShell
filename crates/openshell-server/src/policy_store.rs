@@ -4,8 +4,8 @@
 use crate::persistence::{
     DraftChunkRecord, PersistenceError, PersistenceResult, PolicyRecord, SetResourceVersion, Store,
 };
-use crate::storage_proto::{DraftChunkPayload, PolicyRevisionPayload};
-use openshell_core::proto::{NetworkPolicyRule, Sandbox, SandboxPolicy as ProtoSandboxPolicy};
+use crate::storage_proto::{DraftChunkPayload, PolicyRevisionPayload, StoredSandbox as Sandbox};
+use openshell_core::proto::{NetworkPolicyRule, SandboxPolicy as ProtoSandboxPolicy};
 use prost::Message;
 use std::collections::HashMap;
 
@@ -628,9 +628,9 @@ pub fn draft_chunk_record_from_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_proto::StoredSandboxSpec as SandboxSpec;
     use openshell_core::proto::{
-        ConfigurationAdmissionState as Admission, SandboxConfigurationAdmission, SandboxSpec,
-        SandboxStatus,
+        ConfigurationAdmissionState as Admission, SandboxConfigurationAdmission, SandboxStatus,
     };
 
     #[test]
@@ -672,8 +672,8 @@ mod tests {
                     }),
                     ..Default::default()
                 };
-                let result =
-                    project_policy_revision_onto_sandbox(&write, &sandbox.encode_to_vec(), 1);
+                let payload = sandbox.encode_to_vec();
+                let result = project_policy_revision_onto_sandbox(&write, &payload, 1);
                 if activated == Some(false) && state != Admission::Accepted {
                     let (projected, changed) = result.unwrap();
                     assert!(changed);

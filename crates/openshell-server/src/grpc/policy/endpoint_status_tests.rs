@@ -5,6 +5,7 @@ use super::super::tests::{mcp_policy_with_versions, test_sandbox, with_sandbox};
 use super::super::{handle_get_sandbox_config, handle_report_policy_status, handle_update_config};
 use super::*;
 use crate::grpc::test_support::{authed_request, test_server_state};
+use crate::grpc::validation::validate_and_canonicalize_policy;
 use openshell_core::endpoint_status::endpoint_id;
 use openshell_core::proto::{
     EndpointObservation, GetSandboxConfigRequest, GetSandboxRequest, NetworkEndpoint,
@@ -232,7 +233,14 @@ async fn unchanged_policy_revision_preserves_endpoint_evidence() {
         &state,
         authed_request(UpdateConfigRequest {
             sandbox: sandbox_id.to_string(),
-            policy: sandbox.spec.expect("sandbox spec").policy,
+            policy: sandbox
+                .spec
+                .expect("sandbox spec")
+                .policy
+                .as_ref()
+                .map(openshell_policy::project_base_policy)
+                .transpose()
+                .unwrap(),
             annotations: HashMap::from([("audit".to_string(), "v2".to_string())]),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
@@ -277,6 +285,7 @@ async fn loaded_policy_comparison_uses_one_provider_profile_snapshot() {
         .expect("sandbox spec")
         .policy
         .expect("sandbox policy");
+    let internal_policy = policy;
     state
         .store
         .put_policy_revision(
@@ -284,7 +293,7 @@ async fn loaded_policy_comparison_uses_one_provider_profile_snapshot() {
             sandbox_id,
             "default",
             2,
-            &policy.encode_to_vec(),
+            &internal_policy.encode_to_vec(),
             &report.policy_hash,
         )
         .await
@@ -347,7 +356,7 @@ async fn loaded_policy_hash_cycle_resets_endpoint_evidence() {
             &state,
             authed_request(UpdateConfigRequest {
                 sandbox: sandbox_id.to_string(),
-                policy: Some(policy),
+                policy: Some(openshell_policy::project_base_policy(&policy).unwrap()),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -392,7 +401,7 @@ async fn global_policy_update_waits_for_endpoint_report_guard() {
     let policy = mcp_policy_with_versions(&["2025-11-25"]);
     let updates = [
         UpdateConfigRequest {
-            policy: Some(policy),
+            policy: Some(openshell_policy::project_base_policy(&policy).unwrap()),
             global: true,
             ..Default::default()
         },
@@ -1052,7 +1061,8 @@ async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
         .put_message(&sandbox)
         .await
         .expect("store sandbox");
-    let active_policy = mcp_policy_with_versions(&["2025-11-25"]);
+    let active_policy = validate_and_canonicalize_policy(mcp_policy_with_versions(&["2025-11-25"]))
+        .expect("active policy must canonicalize");
     let policy_hash = deterministic_policy_hash(&active_policy);
     let initial_active =
         initial_endpoint_status(&active_policy.network_policies["mcp"].endpoints[0]);

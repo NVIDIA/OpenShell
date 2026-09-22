@@ -210,7 +210,7 @@ func TestFakePolicy_DeepCopyWithPolicy(t *testing.T) {
 		Version:    1,
 		PolicyHash: "sha256:with-policy",
 		Status:     types.PolicyLoadStatusLoaded,
-		Policy: &types.SandboxPolicy{
+		Policy: &types.PolicyDocument{
 			NetworkPolicies: map[string]types.NetworkPolicyRule{
 				"rule-1": {Name: "rule-1"},
 			},
@@ -221,7 +221,7 @@ func TestFakePolicy_DeepCopyWithPolicy(t *testing.T) {
 		Version:    1,
 		PolicyHash: "sha256:sb-policy",
 		Status:     types.PolicyLoadStatusLoaded,
-		Policy: &types.SandboxPolicy{
+		Policy: &types.PolicyDocument{
 			NetworkPolicies: map[string]types.NetworkPolicyRule{
 				"rule-2": {Name: "rule-2"},
 			},

@@ -11,10 +11,10 @@ use crate::policy_store::{
     policy_payload_from_record, policy_record_for_atomic_write, policy_record_from_parts,
     project_policy_revision_onto_sandbox,
 };
+use crate::storage_proto::StoredSandbox as Sandbox;
 use openshell_core::SetResourceVersion;
 use openshell_core::paths::set_file_owner_only;
-use openshell_core::proto::Sandbox;
-use prost::Message;
+use prost::Message as _;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePoolOptions};
 use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqlitePool};
 use std::path::{Path, PathBuf};

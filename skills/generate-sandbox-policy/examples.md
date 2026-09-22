@@ -24,8 +24,8 @@ network_policies:
   claude_anthropic:
     name: claude_anthropic
     endpoints:
-      - { host: api.anthropic.com, port: 443 }
-      - { host: statsig.anthropic.com, port: 443 }
+      - { host: api.anthropic.com, ports: [443] }
+      - { host: statsig.anthropic.com, ports: [443] }
     binaries:
       - { path: /usr/local/bin/claude }
 ```
@@ -46,7 +46,7 @@ network_policies:
     name: github_readonly
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: read-only
@@ -68,7 +68,7 @@ network_policies:
     name: nvidia_api
     endpoints:
       - host: integrate.api.nvidia.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: full
@@ -90,7 +90,7 @@ network_policies:
     name: data_service
     endpoints:
       - host: data-svc.internal
-        port: 8080
+        ports: [8080]
         protocol: rest
         enforcement: audit
         access: read-write
@@ -112,12 +112,12 @@ network_policies:
     name: code_hosting_readonly
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: read-only
       - host: api.gitlab.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: read-only
@@ -156,7 +156,7 @@ network_policies:
     name: openai_inference
     endpoints:
       - host: api.openai.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         rules:
@@ -202,7 +202,7 @@ network_policies:
     name: nvidia_inference
     endpoints:
       - host: integrate.api.nvidia.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         rules:
@@ -235,7 +235,7 @@ network_policies:
     name: github_with_issues
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         rules:
@@ -300,7 +300,7 @@ network_policies:
     name: github_api_readonly
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: read-only
@@ -351,7 +351,7 @@ network_policies:
     name: nvidia_inference
     endpoints:
       - host: integrate.api.nvidia.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         rules:
@@ -411,7 +411,7 @@ network_policies:
     name: data_service
     endpoints:
       - host: data-svc.internal
-        port: 8080
+        ports: [8080]
         protocol: rest
         enforcement: audit
         access: read-write
@@ -495,7 +495,7 @@ network_policies:
     name: project_management
     endpoints:
       - host: pm-api.example.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         rules:
@@ -563,8 +563,8 @@ network_policies:
   claude_anthropic:
     name: claude_anthropic
     endpoints:
-      - { host: api.anthropic.com, port: 443 }
-      - { host: statsig.anthropic.com, port: 443 }
+      - { host: api.anthropic.com, ports: [443] }
+      - { host: statsig.anthropic.com, ports: [443] }
     binaries:
       - { path: /usr/local/bin/claude }
 
@@ -572,7 +572,7 @@ network_policies:
     name: internal_docs_readonly
     endpoints:
       - host: docs.internal
-        port: 8080
+        ports: [8080]
         protocol: rest
         enforcement: enforce
         access: read-only
@@ -598,7 +598,7 @@ network_policies:
     name: corp_metrics
     endpoints:
       - host: metrics.corp.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         rules:
@@ -632,7 +632,7 @@ network_policies:
     name: internal_api
     endpoints:
       - host: api.internal.corp
-        port: 8080
+        ports: [8080]
         allowed_ips:
           - "10.0.5.0/24"
     binaries:
@@ -655,7 +655,7 @@ network_policies:
   private_services:
     name: private_services
     endpoints:
-      - port: 8080
+      - ports: [8080]
         allowed_ips:
           - "10.0.5.0/24"
           - "10.0.6.0/24"
@@ -682,7 +682,7 @@ network_policies:
     name: db_proxy_readonly
     endpoints:
       - host: db-proxy.internal
-        port: 3128
+        ports: [3128]
         protocol: rest
         enforcement: enforce
         access: read-only
@@ -707,7 +707,7 @@ network_policies:
     name: metrics_internal
     endpoints:
       - host: metrics.internal
-        port: 9090
+        ports: [9090]
         allowed_ips:
           - "10.0.5.20"
     binaries:
@@ -740,7 +740,7 @@ An exact IP is treated as `/32` — only that specific address is permitted.
     name: github_readonly
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: read-only
@@ -768,8 +768,8 @@ Before:
   claude_code:
     name: claude_code
     endpoints:
-      - { host: api.anthropic.com, port: 443 }
-      - { host: statsig.anthropic.com, port: 443 }
+      - { host: api.anthropic.com, ports: [443] }
+      - { host: statsig.anthropic.com, ports: [443] }
     binaries:
       - { path: /usr/local/bin/claude }
 ```
@@ -779,9 +779,9 @@ After:
   claude_code:
     name: claude_code
     endpoints:
-      - { host: api.anthropic.com, port: 443 }
-      - { host: statsig.anthropic.com, port: 443 }
-      - { host: sentry.io, port: 443 }
+      - { host: api.anthropic.com, ports: [443] }
+      - { host: statsig.anthropic.com, ports: [443] }
+      - { host: sentry.io, ports: [443] }
     binaries:
       - { path: /usr/local/bin/claude }
 ```
@@ -836,7 +836,7 @@ network_policies:
     name: github_readonly
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: read-only
@@ -847,7 +847,7 @@ network_policies:
     name: anthropic_full
     endpoints:
       - host: api.anthropic.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: full

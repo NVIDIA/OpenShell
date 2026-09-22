@@ -20,7 +20,7 @@ use openshell_core::endpoint_status::initial_endpoint_status;
 use openshell_core::mcp::is_mcp_protocol;
 use openshell_core::proto::{
     EndpointResult, EndpointStatus, PolicySource, ReportEndpointStatusRequest,
-    ReportEndpointStatusResponse, Sandbox, SandboxPolicy as ProtoSandboxPolicy, SandboxStatus,
+    ReportEndpointStatusResponse, SandboxPolicy as ProtoSandboxPolicy, SandboxStatus,
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -28,6 +28,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::warn;
+
+use crate::storage_proto::StoredSandbox as Sandbox;
 
 const ENDPOINT_STARTUP_RECONCILIATION_PAGE_SIZE: u32 = 100;
 const ENDPOINT_DISCONNECT_RETRY_INITIAL_BACKOFF: std::time::Duration =

@@ -554,7 +554,7 @@ fn write_profile(profile_type: &str, token_port: u16, target_port: u16) -> Named
         .tempfile()
         .expect("create provider profile temp file");
     let profile = format!(
-        r"id: {profile_type}
+        r#"id: {profile_type}
 display_name: Podman token exchange e2e
 description: Podman e2e provider profile for two-stage token exchange
 category: other
@@ -581,7 +581,7 @@ credentials:
         subject_token_type: {TOKEN_TYPE_ACCESS_TOKEN}
 endpoints:
   - host: host.openshell.internal
-    port: {target_port}
+    ports: [{target_port}]
     protocol: rest
     tls: none
     access: read-write
@@ -592,8 +592,10 @@ endpoints:
       - 172.0.0.0/8
       - 192.168.0.0/16
 binaries:
-  - /usr/local/bin/python3
-"
+  - path: /usr/bin/curl
+  - path: /usr/local/bin/curl
+  - path: /usr/local/bin/python3
+"#
     );
     file.write_all(profile.as_bytes())
         .expect("write provider profile");

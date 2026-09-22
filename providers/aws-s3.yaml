@@ -91,7 +91,7 @@ endpoints:
   # wildcard does not cover extra labels like dualstack unless listed.
   # us-east-1 uses the global endpoint without a region label.
   - host: "*.s3.amazonaws.com"
-    port: 443
+    ports: [443]
     protocol: rest
     tls: terminate
     access: read-write
@@ -99,7 +99,7 @@ endpoints:
     credential_signing: sigv4
     signing_service: s3
   - host: "s3.amazonaws.com"
-    port: 443
+    ports: [443]
     protocol: rest
     tls: terminate
     access: read-write
@@ -107,7 +107,7 @@ endpoints:
     credential_signing: sigv4
     signing_service: s3
   - host: "*.s3.*.amazonaws.com"
-    port: 443
+    ports: [443]
     protocol: rest
     tls: terminate
     access: read-write
@@ -115,7 +115,7 @@ endpoints:
     credential_signing: sigv4
     signing_service: s3
   - host: "s3.*.amazonaws.com"
-    port: 443
+    ports: [443]
     protocol: rest
     tls: terminate
     access: read-write
@@ -123,7 +123,7 @@ endpoints:
     credential_signing: sigv4
     signing_service: s3
   - host: "*.s3.dualstack.*.amazonaws.com"
-    port: 443
+    ports: [443]
     protocol: rest
     tls: terminate
     access: read-write
@@ -131,7 +131,7 @@ endpoints:
     credential_signing: sigv4
     signing_service: s3
   - host: "s3.dualstack.*.amazonaws.com"
-    port: 443
+    ports: [443]
     protocol: rest
     tls: terminate
     access: read-write

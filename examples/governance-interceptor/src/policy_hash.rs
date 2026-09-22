@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use openshell_core::proto::{ProviderProfile, SandboxPolicy};
+use openshell_core::proto::{ProviderProfile, policy::PolicyDocument};
 use prost::Message;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -10,13 +10,13 @@ use crate::proto_json::decode_message_to_json;
 
 pub(crate) const HASH_ALGORITHM: &str = "openshell-governance-protojson-sha256-v2";
 const HASH_PREFIX: &str = "sha256:v2:";
-const SANDBOX_POLICY_TYPE: &str = "openshell.sandbox.v1.SandboxPolicy";
+const SANDBOX_POLICY_TYPE: &str = "openshell.policy.v1.PolicyDocument";
 const PROVIDER_PROFILE_TYPE: &str = "openshell.v1.ProviderProfile";
 const POLICY_DOMAIN: &str = "openshell-governance-policy";
 const PROFILE_DOMAIN: &str = "openshell-governance-provider-profile";
 const PROFILE_SNAPSHOT_DOMAIN: &str = "openshell-governance-provider-profile-snapshot";
 
-pub(crate) fn canonical_policy_hash(policy: &SandboxPolicy) -> Result<String, String> {
+pub(crate) fn canonical_policy_hash(policy: &PolicyDocument) -> Result<String, String> {
     canonical_message_hash(SANDBOX_POLICY_TYPE, policy, POLICY_DOMAIN)
 }
 
@@ -141,9 +141,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use std::collections::HashMap;
 
-    use openshell_core::proto::{
-        GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, NetworkEndpoint,
-        NetworkPolicyRule,
+    use openshell_core::proto::policy::{
+        GraphqlOperation, L7Allow, L7DenyRule, L7Rule, Matcher, NetworkEndpoint, NetworkPolicyRule,
+        ParameterMatcher, matcher, parameter_matcher,
     };
 
     use super::*;
@@ -215,13 +215,13 @@ mod tests {
 
     #[test]
     fn digest_format_is_explicitly_v2() {
-        let digest = canonical_policy_hash(&SandboxPolicy::default()).unwrap();
+        let digest = canonical_policy_hash(&PolicyDocument::default()).unwrap();
         assert!(is_v2_digest(&digest));
         assert!(!is_v2_digest("sha256:deadbeef"));
         assert!(!is_v2_digest(&format!("{HASH_PREFIX}{}", "A".repeat(64))));
     }
 
-    fn policy_with_nested_maps(reverse: bool) -> SandboxPolicy {
+    fn policy_with_nested_maps(reverse: bool) -> PolicyDocument {
         let allow = L7Allow {
             query: map(reverse, [("state", "open"), ("label", "bug")]),
             params: map(reverse, [("name", "search"), ("kind", "tool")]),
@@ -235,7 +235,7 @@ mod tests {
         };
         let endpoint = NetworkEndpoint {
             host: "api.example.com".to_string(),
-            port: 443,
+            ports: vec![443],
             rules: vec![L7Rule { allow: Some(allow) }],
             deny_rules: vec![deny],
             graphql_persisted_queries: map(
@@ -249,7 +249,7 @@ mod tests {
         } else {
             [("api", "api.example.com"), ("unused", "unused.example.com")]
         };
-        SandboxPolicy {
+        PolicyDocument {
             version: 1,
             network_policies: rules
                 .into_iter()
@@ -259,7 +259,7 @@ mod tests {
                     } else {
                         vec![NetworkEndpoint {
                             host: host.to_string(),
-                            port: 443,
+                            ports: vec![443],
                             ..NetworkEndpoint::default()
                         }]
                     };
@@ -273,7 +273,7 @@ mod tests {
                     )
                 })
                 .collect(),
-            ..SandboxPolicy::default()
+            ..PolicyDocument::default()
         }
     }
 
@@ -287,11 +287,20 @@ mod tests {
         }
     }
 
-    impl MapValue for L7QueryMatcher {
+    impl MapValue for Matcher {
         fn from_test_value(value: &str) -> Self {
             Self {
-                glob: value.to_string(),
-                ..Self::default()
+                kind: Some(matcher::Kind::Glob(value.to_string())),
+            }
+        }
+    }
+
+    impl MapValue for ParameterMatcher {
+        fn from_test_value(value: &str) -> Self {
+            Self {
+                kind: Some(parameter_matcher::Kind::Matcher(Matcher::from_test_value(
+                    value,
+                ))),
             }
         }
     }

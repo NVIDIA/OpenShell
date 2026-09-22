@@ -55,6 +55,7 @@ pub use middleware::validate_json_with_config as validate_network_middleware_jso
 // The authored serde tree lives in `openshell-policy-schema`. These local
 // aliases keep the protobuf adapter readable while exposing consumer-facing
 // names from the schema crate.
+use openshell_policy_schema::proto as authored;
 use openshell_policy_schema::{
     AnyMatcher as QueryAnyDef, FilesystemPolicy as FilesystemDef,
     GraphqlOperation as GraphqlOperationDef, JsonRpcConfig as JsonRpcConfigDef,
@@ -158,10 +159,15 @@ fn matcher_def_to_proto(matcher: QueryMatcherDef) -> L7QueryMatcher {
     }
 }
 
-fn matcher_proto_to_def(matcher: L7QueryMatcher) -> QueryMatcherDef {
+fn matcher_proto_to_def(mut matcher: L7QueryMatcher) -> QueryMatcherDef {
     if matcher.any.is_empty() {
         QueryMatcherDef::Glob(matcher.glob)
     } else {
+        // The runtime historically treated alternatives as a set without
+        // requiring unique wire values. Preserve that meaning when projecting
+        // old records into the stricter public authored contract.
+        let mut seen = BTreeSet::new();
+        matcher.any.retain(|value| seen.insert(value.clone()));
         QueryMatcherDef::Any(QueryAnyDef { any: matcher.any })
     }
 }
@@ -521,15 +527,8 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                         let protocol = e.protocol;
                         let allow_rules = e.rules;
                         let deny_rules = e.deny_rules;
-                        // Normalize port/ports: ports takes precedence, else
-                        // single port is promoted to ports array.
-                        let normalized_ports: Vec<u32> = if !e.ports.is_empty() {
-                            e.ports.into_iter().map(u32::from).collect()
-                        } else if e.port > 0 {
-                            vec![u32::from(e.port)]
-                        } else {
-                            vec![]
-                        };
+                        let normalized_ports: Vec<u32> =
+                            e.ports.into_iter().map(u32::from).collect();
                         NetworkEndpoint {
                             host: e.host,
                             path: e.path,
@@ -675,10 +674,9 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
                     .endpoints
                     .iter()
                     .map(|e| -> Result<_> {
-                        // Use compact form: if ports has exactly 1 element,
-                        // emit port (scalar). If >1, emit ports (array).
-                        // Proto uses u32; authored ports are u16. Reject an
-                        // invalid protobuf value instead of silently clamping.
+                        // The public contract always emits a ports list. The
+                        // internal message may still carry an older scalar
+                        // port, so projection promotes it before validation.
                         let checked = |value: u32| {
                             u16::try_from(value).map_err(|_| {
                                 miette::miette!(
@@ -688,17 +686,14 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
                                 )
                             })
                         };
-                        let (port, ports) = if e.ports.len() > 1 {
-                            (
-                                0,
-                                e.ports
-                                    .iter()
-                                    .copied()
-                                    .map(checked)
-                                    .collect::<Result<Vec<_>>>()?,
-                            )
+                        let ports = if e.ports.is_empty() {
+                            vec![checked(e.port)?]
                         } else {
-                            (checked(e.ports.first().copied().unwrap_or(e.port))?, vec![])
+                            e.ports
+                                .iter()
+                                .copied()
+                                .map(checked)
+                                .collect::<Result<Vec<_>>>()?
                         };
                         let protocol = e.protocol.clone();
                         let mcp_allow_all_known_mcp_methods = !is_mcp_protocol(&protocol)
@@ -735,7 +730,6 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
                         Ok(NetworkEndpointDef {
                             host: e.host.clone(),
                             path: e.path.clone(),
-                            port,
                             ports,
                             protocol,
                             tls: network_tls_mode_to_str(e.tls)
@@ -863,22 +857,157 @@ pub fn is_valid_sandbox_identity(value: &str) -> bool {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Lower an author-controlled public policy into the normalized internal model.
+///
+/// Runtime authority fields do not exist in the public message. Lowering
+/// therefore always produces a base policy with those fields cleared.
+pub fn lower_authored_policy(policy: authored::PolicyDocument) -> Result<SandboxPolicy> {
+    openshell_policy_schema::validate_authored_policy(&policy)?;
+    let document = PolicyFile::try_from(policy)?;
+    to_proto(document)
+}
+
+/// Project an internal base policy into the public author-controlled model.
+///
+/// The projection is canonical and intentionally removes runtime provenance.
+pub fn project_base_policy(policy: &SandboxPolicy) -> Result<authored::PolicyDocument> {
+    validate_proto_version_for_authored_serialization(policy)?;
+    validate_policy_enum_values(policy)?;
+    let mut canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
+        .map_err(|error| miette::miette!("cannot project invalid sandbox policy: {error}"))?;
+    deduplicate_projected_endpoint_ports(&mut canonical);
+    authored::PolicyDocument::try_from(from_proto(&canonical)?)
+}
+
+/// Preserve the historical internal port-list set semantics at the public
+/// projection boundary. Older durable records could contain duplicate ports;
+/// retaining the first occurrence keeps enforcement unchanged while producing
+/// a document accepted by the stricter authored protobuf contract.
+fn deduplicate_projected_endpoint_ports(policy: &mut SandboxPolicy) {
+    for rule in policy.network_policies.values_mut() {
+        for endpoint in &mut rule.endpoints {
+            let mut seen = BTreeSet::new();
+            endpoint.ports.retain(|port| seen.insert(*port));
+        }
+    }
+}
+
+/// Project an internal effective policy into a read-only public view.
+///
+/// Provider-derived rules may remain visible, but internal authority markers
+/// are omitted. Callers must not treat this view as an authorable base policy.
+pub fn project_effective_policy(policy: &SandboxPolicy) -> Result<authored::PolicyDocument> {
+    project_base_policy(policy)
+}
+
+/// Lower one public rule through the same checked policy boundary.
+pub fn lower_authored_rule(
+    rule_name: &str,
+    rule: authored::NetworkPolicyRule,
+) -> Result<NetworkPolicyRule> {
+    let policy = authored::PolicyDocument {
+        version: 1,
+        filesystem_policy: None,
+        landlock: None,
+        process: None,
+        network_policies: HashMap::from([(rule_name.to_string(), rule)]),
+        network_middlewares: HashMap::new(),
+    };
+    lower_authored_policy(policy)?
+        .network_policies
+        .remove(rule_name)
+        .ok_or_else(|| miette::miette!("lowered policy did not retain rule '{rule_name}'"))
+}
+
+/// Project one internal rule into the public author-controlled model.
+pub fn project_authored_rule(
+    rule_name: &str,
+    rule: &NetworkPolicyRule,
+) -> Result<authored::NetworkPolicyRule> {
+    let internal = SandboxPolicy {
+        version: 1,
+        network_policies: HashMap::from([(rule_name.to_string(), rule.clone())]),
+        ..Default::default()
+    };
+    project_base_policy(&internal)?
+        .network_policies
+        .remove(rule_name)
+        .ok_or_else(|| miette::miette!("projected policy did not retain rule '{rule_name}'"))
+}
+
+/// Lower one public L7 allow rule for an incremental merge operation.
+pub fn lower_authored_l7_rule(rule: authored::L7Rule) -> Result<L7Rule> {
+    openshell_policy_schema::validate_authored_l7_rule(&rule)?;
+    let definition = L7RuleDef::try_from(rule)?;
+    Ok(L7Rule {
+        allow: Some(allow_def_to_proto("", definition.allow)),
+    })
+}
+
+/// Lower one public L7 deny rule for an incremental merge operation.
+pub fn lower_authored_l7_deny_rule(rule: authored::L7DenyRule) -> Result<L7DenyRule> {
+    openshell_policy_schema::validate_authored_l7_deny_rule(&rule)?;
+    Ok(deny_def_to_proto("", L7DenyRuleDef::try_from(rule)?))
+}
+
+/// Validate one public binary selector used by an incremental merge target.
+pub fn validate_authored_network_binary(binary: &authored::NetworkBinary) -> Result<()> {
+    openshell_policy_schema::validate_authored_network_binary(binary)
+}
+
+/// Project one normalized L7 allow rule for an incremental merge operation.
+pub fn project_authored_l7_rule(rule: &L7Rule) -> Result<authored::L7Rule> {
+    let allow = rule
+        .allow
+        .clone()
+        .ok_or_else(|| miette::miette!("L7Rule.allow is required"))?;
+    L7RuleDef {
+        allow: allow_proto_to_def("", allow, false),
+    }
+    .try_into()
+}
+
+/// Project one normalized L7 deny rule for an incremental merge operation.
+pub fn project_authored_l7_deny_rule(rule: &L7DenyRule) -> Result<authored::L7DenyRule> {
+    deny_proto_to_def("", rule, false).try_into()
+}
+
+/// Parse compatible policy YAML directly into the public generated message.
+pub fn parse_authored_policy(yaml: &str) -> Result<authored::PolicyDocument> {
+    openshell_policy_schema::parse_policy_proto(yaml)
+}
+
+/// Parse a compatible policy YAML file into the public generated message.
+pub fn parse_authored_policy_file(path: &Path) -> Result<authored::PolicyDocument> {
+    openshell_policy_schema::parse_policy_proto_file(
+        path,
+        openshell_policy_schema::ParseLimits::default(),
+    )
+}
+
+/// Serialize a public generated policy to canonical YAML.
+pub fn serialize_authored_policy(policy: &authored::PolicyDocument) -> Result<String> {
+    openshell_policy_schema::serialize_policy_proto(policy)
+}
+
+/// Convert a public generated policy to canonical authored JSON.
+pub fn authored_policy_to_json_value(
+    policy: &authored::PolicyDocument,
+) -> Result<serde_json::Value> {
+    openshell_policy_schema::policy_proto_to_json_value(policy)
+}
+
 // Validate raw authored values and their relationship to the endpoint protocol
 // before conversion. Keeping validation outside the Serde error wrapper makes
 // actionable MCP diagnostics the top-level user-facing error.
 /// Parse a sandbox policy from a YAML string.
 pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
-    let raw = openshell_policy_schema::parse_policy(yaml)?;
-    to_proto(raw)
+    lower_authored_policy(parse_authored_policy(yaml)?)
 }
 
 /// Parse a sandbox policy from a regular file using the shared bounded reader.
 pub fn parse_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
-    let raw = openshell_policy_schema::parse_policy_file(
-        path,
-        openshell_policy_schema::ParseLimits::default(),
-    )?;
-    to_proto(raw)
+    lower_authored_policy(parse_authored_policy_file(path)?)
 }
 
 /// Serialize a proto sandbox policy to a YAML string.
@@ -887,12 +1016,7 @@ pub fn parse_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
 /// canonical YAML field names (e.g. `filesystem_policy`, not `filesystem`)
 /// and is round-trippable through `parse_sandbox_policy`.
 pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
-    validate_proto_version_for_authored_serialization(policy)?;
-    validate_policy_enum_values(policy)?;
-    let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
-        .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
-    let yaml_repr = from_proto(&canonical)?;
-    openshell_policy_schema::serialize_policy(&yaml_repr)
+    serialize_authored_policy(&project_base_policy(policy)?)
 }
 
 /// Convert a proto sandbox policy into the canonical policy JSON representation.
@@ -900,12 +1024,7 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
 /// The shape mirrors the YAML schema used by [`serialize_sandbox_policy`], so
 /// automation can use the same documented field names in either format.
 pub fn sandbox_policy_to_json_value(policy: &SandboxPolicy) -> Result<serde_json::Value> {
-    validate_proto_version_for_authored_serialization(policy)?;
-    validate_policy_enum_values(policy)?;
-    let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
-        .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
-    let json_repr = from_proto(&canonical)?;
-    openshell_policy_schema::policy_to_json_value(&json_repr)
+    authored_policy_to_json_value(&project_base_policy(policy)?)
 }
 
 fn validate_proto_version_for_authored_serialization(policy: &SandboxPolicy) -> Result<()> {
@@ -956,6 +1075,19 @@ pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolic
         parse_sandbox_policy_file(Path::new(p))?
     } else if let Ok(policy_path) = std::env::var("OPENSHELL_SANDBOX_POLICY") {
         parse_sandbox_policy_file(Path::new(&policy_path))?
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(policy))
+}
+
+/// Load an authored policy for a public API request using the standard source
+/// resolution order.
+pub fn load_authored_policy(cli_path: Option<&str>) -> Result<Option<authored::PolicyDocument>> {
+    let policy = if let Some(path) = cli_path {
+        parse_authored_policy_file(Path::new(path))?
+    } else if let Ok(policy_path) = std::env::var("OPENSHELL_SANDBOX_POLICY") {
+        parse_authored_policy_file(Path::new(&policy_path))?
     } else {
         return Ok(None);
     };
@@ -1876,11 +2008,27 @@ pub fn validate_and_canonicalize_sandbox_policy(
         .map_err(|violations| PolicyValidationError { violations })?;
     materialize_default_mcp_versions(&mut policy);
     canonicalize_mcp_version_allowlists(&mut policy);
+    canonicalize_endpoint_ports(&mut policy);
     debug_assert!(
         validate_sandbox_policy(&policy).is_ok(),
         "validated MCP canonicalization must preserve every policy invariant"
     );
     Ok(policy)
+}
+
+/// Materialize the effective port list while retaining the legacy scalar field.
+/// This gives policies authored with `port` and `ports` one internal identity.
+fn canonicalize_endpoint_ports(policy: &mut SandboxPolicy) {
+    for rule in policy.network_policies.values_mut() {
+        for endpoint in &mut rule.endpoints {
+            if endpoint.ports.is_empty() && endpoint.port != 0 {
+                endpoint.ports.push(endpoint.port);
+            }
+            if let Some(first) = endpoint.ports.first().copied() {
+                endpoint.port = first;
+            }
+        }
+    }
 }
 
 /// Replace absent protobuf MCP options and empty revision lists with the
@@ -1988,7 +2136,7 @@ network_policies:
   github:
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: https
     binaries:
       - path: /usr/bin/curl
@@ -2012,7 +2160,7 @@ network_policies:
     name: internal
     endpoints:
       - host: db.internal.corp
-        port: 5432
+        ports: [5432]
         allowed_ips:
           - "10.0.5.0/24"
           - "10.0.6.0/24"
@@ -2039,7 +2187,7 @@ network_policies:
     name: my-custom-api-name
     endpoints:
       - host: api.example.com
-        port: 443
+        ports: [443]
     binaries:
       - path: /usr/bin/curl
 ";
@@ -2075,7 +2223,7 @@ network_policies:
     name: api
     endpoints:
       - host: api.example.com
-        port: 443
+        ports: [443]
         protocol: rest
     binaries:
       - path: /usr/bin/curl
@@ -2200,7 +2348,7 @@ network_policies:
   github_api:
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         tls: skp
         enforcement: enforc
@@ -2335,7 +2483,7 @@ network_policies:
   test:
     name: test_policy
     endpoints:
-      - { host: example.com, port: 443 }
+      - { host: example.com, ports: [443] }
     binaries:
       - { path: /usr/bin/curl }
 ";
@@ -2359,16 +2507,18 @@ network_policies:
     name: query_test
     endpoints:
       - host: api.example.com
-        port: 8080
+        ports: [8080]
         protocol: rest
         rules:
           - allow:
               method: GET
               path: /download
               query:
-                slug: "my-*"
+                slug:
+                  glob: "my-*"
                 tag:
-                  any: ["foo-*", "bar-*"]
+                  any:
+                    values: ["foo-*", "bar-*"]
     binaries:
       - path: /usr/bin/curl
 "#;
@@ -2408,7 +2558,7 @@ network_policies:
     middleware: [redact]
     endpoints:
       - host: api.example.com
-        port: 443
+        ports: [443]
 ";
         assert!(parse_sandbox_policy(policy_attachment).is_err());
 
@@ -2418,7 +2568,7 @@ network_policies:
   api:
     endpoints:
       - host: api.example.com
-        port: 443
+        ports: [443]
         middleware: [redact]
 ";
         assert!(parse_sandbox_policy(endpoint_attachment).is_err());
@@ -2545,7 +2695,7 @@ network_policies:
     fn mcp_version_endpoint_yaml(protocol: &str, mcp_body: Option<&str>) -> String {
         let mcp = mcp_body.map_or_else(String::new, |body| format!("        mcp:\n{body}"));
         format!(
-            "version: 1\nnetwork_policies:\n  versioned:\n    endpoints:\n      - host: mcp.example.com\n        port: 443\n        protocol: {protocol}\n{mcp}"
+            "version: 1\nnetwork_policies:\n  versioned:\n    endpoints:\n      - host: mcp.example.com\n        ports: [443]\n        protocol: {protocol}\n{mcp}"
         )
     }
 
@@ -2610,10 +2760,8 @@ network_policies:
     }
 
     #[test]
-    fn mcp_version_yaml_rejects_explicit_empty_duplicate_unknown_and_misplaced_values() {
+    fn mcp_version_yaml_uses_protobuf_empty_semantics_and_rejects_invalid_values() {
         let cases = [
-            ("null allowlist", "mcp", Some("          versions: null\n")),
-            ("empty allowlist", "mcp", Some("          versions: []\n")),
             (
                 "empty identifier",
                 "mcp",
@@ -2661,11 +2809,34 @@ network_policies:
             assert!(parse_sandbox_policy(&yaml).is_err(), "{case} must fail");
         }
 
+        let policy = parse_sandbox_policy(&mcp_version_endpoint_yaml(
+            "mcp",
+            Some("          versions: []\n"),
+        ))
+        .expect("an empty repeated field uses protobuf omission semantics");
+        assert_eq!(
+            policy.network_policies["versioned"].endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("MCP defaults")
+                .versions,
+            default_mcp_versions()
+        );
+
+        assert!(
+            parse_sandbox_policy(&mcp_version_endpoint_yaml(
+                "mcp",
+                Some("          versions: null\n"),
+            ))
+            .is_err(),
+            "typed nulls must not collapse to protobuf omission"
+        );
+
         let mut null_mcp = mcp_version_endpoint_yaml("mcp", None);
         null_mcp.push_str("        mcp: null\n");
         assert!(
             parse_sandbox_policy(&null_mcp).is_err(),
-            "an explicit null MCP stanza must fail"
+            "typed null messages must not collapse to protobuf omission"
         );
     }
 
@@ -2719,12 +2890,13 @@ network_policies:
     fn protobuf_missing_and_empty_mcp_options_materialize_the_same_default() {
         let missing = mcp_version_policy("mcp", None);
         let empty = mcp_version_policy("mcp", Some(McpOptions::default()));
-        let explicit = mcp_version_policy(
+        let explicit = validate_and_canonicalize_sandbox_policy(mcp_version_policy(
             "mcp",
             Some(mcp_version_options(
                 &[DEFAULT_MCP_PROTOCOL_VERSION.as_str()],
             )),
-        );
+        ))
+        .expect("explicit default must canonicalize");
 
         for raw in [&missing, &empty] {
             assert!(matches!(
@@ -3467,8 +3639,81 @@ network_policies:
     }
 
     #[test]
-    fn validate_rejects_yaml_tcp_endpoint_without_host_or_port() {
-        let policy = parse_sandbox_policy(
+    fn authored_projection_deduplicates_legacy_internal_ports() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    ports: vec![443, 443, 8443],
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+
+        let authored = project_base_policy(&policy).expect("legacy policy should project");
+        assert_eq!(
+            authored.network_policies["api"].endpoints[0].ports,
+            [443, 8443]
+        );
+        let lowered = lower_authored_policy(authored).expect("projected policy should lower");
+        assert_eq!(
+            lowered.network_policies["api"].endpoints[0].ports,
+            [443, 8443]
+        );
+    }
+
+    #[test]
+    fn authored_projection_deduplicates_legacy_matcher_alternatives() {
+        let mut policy = parse_sandbox_policy(
+            r"
+version: 1
+network_policies:
+  mcp:
+    endpoints:
+      - host: mcp.example.com
+        ports: [443]
+        protocol: mcp
+        mcp: {}
+        rules:
+          - allow:
+              method: tools/call
+              tool:
+                any:
+                  values: [read_status]
+",
+        )
+        .unwrap();
+        let allow = policy.network_policies.get_mut("mcp").unwrap().endpoints[0].rules[0]
+            .allow
+            .as_mut()
+            .unwrap();
+        allow.params.get_mut("name").unwrap().any = vec!["read_status".into(); 2];
+        allow.query.insert(
+            "state".to_string(),
+            L7QueryMatcher {
+                any: vec!["open".into(), "open".into()],
+                ..Default::default()
+            },
+        );
+
+        let authored = project_base_policy(&policy).expect("legacy matchers should project");
+        let lowered = lower_authored_policy(authored).expect("projected matchers should lower");
+        let allow = lowered.network_policies["mcp"].endpoints[0].rules[0]
+            .allow
+            .as_ref()
+            .unwrap();
+        assert_eq!(allow.params["name"].any, ["read_status"]);
+        assert_eq!(allow.query["state"].any, ["open"]);
+    }
+
+    #[test]
+    fn validate_rejects_yaml_tcp_endpoint_without_host_or_ports() {
+        let error = parse_sandbox_policy(
             r#"
 version: 1
 network_policies:
@@ -3478,9 +3723,23 @@ network_policies:
         protocol: tcp
 "#,
         )
-        .expect("policy syntax should parse before semantic validation");
+        .expect_err("the portable ports constraint must reject the endpoint first");
+        assert!(format!("{error:?}").contains("ports"));
 
-        let violations = validate_sandbox_policy(&policy).expect_err("endpoint is incomplete");
+        let policy = parse_sandbox_policy(
+            r#"
+version: 1
+network_policies:
+  invalid:
+    endpoints:
+      - host: ""
+        ports: [443]
+        protocol: tcp
+"#,
+        )
+        .expect("portable validation should accept the structurally complete endpoint");
+
+        let violations = validate_sandbox_policy(&policy).expect_err("the host is incomplete");
         assert!(violations.iter().any(|violation| matches!(
             violation,
             PolicyViolation::MissingTcpEndpointHost { policy_name } if policy_name == "invalid"
@@ -3490,10 +3749,6 @@ network_policies:
                 "protocol tcp requires a DNS hostname; hostless allowed_ips endpoints are supported only by the forward proxy",
             )
         }));
-        assert!(violations.iter().any(|violation| matches!(
-            violation,
-            PolicyViolation::MissingEndpointPort { policy_name, .. } if policy_name == "invalid"
-        )));
     }
 
     #[test]
@@ -3504,7 +3759,7 @@ version: 1
 network_policies:
   legacy-proxy:
     endpoints:
-      - port: 9443
+      - ports: [9443]
         allowed_ips:
           - 10.0.5.0/24
 ",
@@ -3523,7 +3778,7 @@ version: 1
 network_policies:
   native-tcp:
     endpoints:
-      - port: 6379
+      - ports: [6379]
         protocol: tcp
         allowed_ips:
           - 10.0.5.0/24
@@ -4270,7 +4525,7 @@ network_policies:
   test:
     name: test
     endpoints:
-      - { host: api.example.com, port: 443 }
+      - { host: api.example.com, ports: [443] }
     binaries:
       - { path: /usr/bin/curl }
 ";
@@ -4289,7 +4544,7 @@ network_policies:
     name: test
     endpoints:
       - host: api.example.com
-        port: 443
+        ports: [443]
         path: "/graphql"
         protocol: graphql
         rules:
@@ -4316,7 +4571,7 @@ network_policies:
   gcp_storage:
     endpoints:
       - host: storage.googleapis.com
-        port: 443
+        ports: [443]
         protocol: rest
         credential_binding:
           provider: work-gcp
@@ -4365,28 +4620,24 @@ network_policies:
     }
 
     #[test]
-    fn serialize_single_port_uses_compact_form() {
+    fn serialize_single_port_uses_public_ports_list() {
         let yaml = r"
 version: 1
 network_policies:
   test:
     name: test
     endpoints:
-      - { host: api.example.com, port: 443 }
+      - { host: api.example.com, ports: [443] }
     binaries:
       - { path: /usr/bin/curl }
 ";
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
-        // Should use compact `port: 443` form, not `ports: [443]`
         assert!(
-            yaml_out.contains("port: 443"),
-            "Single port should serialize as compact form, got:\n{yaml_out}"
+            yaml_out.contains("ports:\n          - 443"),
+            "single ports must serialize as a list, got:\n{yaml_out}"
         );
-        assert!(
-            !yaml_out.contains("ports:"),
-            "Single port should not produce ports array, got:\n{yaml_out}"
-        );
+        assert!(!yaml_out.contains("\n        port:"));
     }
 
     #[test]
@@ -4397,7 +4648,7 @@ network_policies:
   test:
     name: test
     endpoints:
-      - { host: "*.example.com", port: 443 }
+      - { host: "*.example.com", ports: [443] }
     binaries:
       - { path: /usr/bin/curl }
 "#;
@@ -4415,7 +4666,7 @@ network_policies:
     name: test
     endpoints:
       - host: "*.example.com"
-        port: 443
+        ports: [443]
     binaries:
       - { path: /usr/bin/curl }
 "#;
@@ -4437,7 +4688,7 @@ network_policies:
     name: github
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         access: read-write
         deny_rules:
@@ -4466,7 +4717,7 @@ network_policies:
     name: github
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         access: full
         deny_rules:
@@ -4475,7 +4726,8 @@ network_policies:
           - method: DELETE
             path: "/repos/*/branches/*/protection"
             query:
-              force: "true"
+              force:
+                glob: "true"
     binaries:
       - path: /usr/bin/curl
 "#;
@@ -4501,7 +4753,7 @@ network_policies:
     name: test
     endpoints:
       - host: api.example.com
-        port: 443
+        ports: [443]
         protocol: rest
         access: full
         deny_rules:
@@ -4509,7 +4761,8 @@ network_policies:
             path: /action
             query:
               type:
-                any: ["admin-*", "root-*"]
+                any:
+                  values: ["admin-*", "root-*"]
     binaries:
       - path: /usr/bin/curl
 "#;
@@ -4527,7 +4780,7 @@ network_policies:
     name: github_graphql
     endpoints:
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: graphql
         enforcement: enforce
         persisted_queries: allow_registered
@@ -4578,7 +4831,7 @@ network_policies:
     name: jsonrpc_api
     endpoints:
       - host: jsonrpc.example.com
-        port: 443
+        ports: [443]
         protocol: json-rpc
         enforcement: enforce
         json_rpc:
@@ -4607,7 +4860,7 @@ network_policies:
     name: mcp
     endpoints:
       - host: mcp.example.com
-        port: 443
+        ports: [443]
         path: /mcp
         protocol: mcp
         enforcement: enforce
@@ -4623,10 +4876,12 @@ network_policies:
           - allow:
               method: tools/call
               tool:
-                any: [search_web, list_tools]
+                any:
+                  values: [search_web, list_tools]
         deny_rules:
           - method: tools/call
-            tool: send_email
+            tool:
+              glob: send_email
     binaries:
       - path: /usr/bin/curl
 ";
@@ -4661,7 +4916,7 @@ network_policies:
     name: mcp
     endpoints:
       - host: mcp.example.com
-        port: 443
+        ports: [443]
         protocol: mcp
         mcp:
           versions: [2025-03-26]
@@ -4670,11 +4925,13 @@ network_policies:
         rules:
           - allow:
               method: tools/call
-              tool: search_web
+              tool:
+                glob: search_web
         deny_rules:
           - method: tools/call
             tool:
-              any: [send_email, delete_resource]
+              any:
+                values: [send_email, delete_resource]
     binaries:
       - path: /usr/bin/curl
 ";
@@ -4684,7 +4941,7 @@ network_policies:
 
         assert!(yaml_out.contains("protocol: mcp"));
         assert!(yaml_out.contains("method: tools/call"));
-        assert!(yaml_out.contains("tool: search_web"));
+        assert!(yaml_out.contains("glob: search_web"));
         assert!(yaml_out.contains("any:"));
         assert!(yaml_out.contains("- send_email"));
         assert!(yaml_out.contains("- delete_resource"));
@@ -4703,7 +4960,7 @@ network_policies:
   mcp:
     endpoints:
       - host: mcp.example.com
-        port: 443
+        ports: [443]
         protocol: mcp
         mcp: {}
         rules:
@@ -4711,8 +4968,14 @@ network_policies:
               method: tools/call
               params:
                 arguments:
-                  any: "first"
-                  other: "second"
+                  object:
+                    fields:
+                      any:
+                        matcher:
+                          glob: "first"
+                      other:
+                        matcher:
+                          glob: "second"
 "#;
 
         let proto = parse_sandbox_policy(yaml).expect("authored policy must parse");
@@ -4726,8 +4989,8 @@ network_policies:
 
         let serialized = serialize_sandbox_policy(&proto).expect("protobuf policy must serialize");
         assert!(serialized.contains("arguments:"));
-        assert!(serialized.contains("any: first"));
-        assert!(serialized.contains("other: second"));
+        assert!(serialized.contains("glob: first"));
+        assert!(serialized.contains("glob: second"));
 
         let reparsed =
             parse_sandbox_policy(&serialized).expect("serialized protobuf policy must parse again");
@@ -4742,7 +5005,7 @@ network_policies:
   jsonrpc_api:
     endpoints:
       - host: jsonrpc.example.com
-        port: 443
+        ports: [443]
         protocol: json-rpc
         json_rpc:
           max_body_bytes: 131072
@@ -4768,7 +5031,7 @@ network_policies:
     name: discord_gateway
     endpoints:
       - host: gateway.example.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: full
@@ -4795,7 +5058,7 @@ network_policies:
     name: slack_api
     endpoints:
       - host: slack.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: read-write
@@ -4821,7 +5084,7 @@ network_policies:
   vendor_api:
     endpoints:
       - host: api.vendor.example
-        port: 443
+        ports: [443]
         tls: skip
         allow_uninspected_credentials: true
 ";
@@ -4847,7 +5110,7 @@ network_policies:
   gateway:
     endpoints:
       - host: gateway.example.com
-        port: 443
+        ports: [443]
         protocol: rest
         access: full
     binaries:
@@ -4869,7 +5132,7 @@ network_policies:
   test:
     endpoints:
       - host: example.com
-        port: 443
+        ports: [443]
         deny_rules:
           - method: POST
             path: /foo
@@ -4886,7 +5149,7 @@ network_policies:
   legacy:
     endpoints:
       - host: example.com
-        port: 443
+        ports: [443]
     binaries:
       - path: /usr/bin/curl
         harness: true
@@ -4895,7 +5158,7 @@ network_policies:
         let error = parse_sandbox_policy(yaml).expect_err("removed harness field must be rejected");
         let error_debug = format!("{error:?}");
         assert!(
-            error_debug.contains("unknown field") && error_debug.contains("harness"),
+            error_debug.contains("unrecognized field") && error_debug.contains("harness"),
             "unexpected error: {error_debug}"
         );
     }
@@ -4908,7 +5171,7 @@ network_policies:
   test:
     endpoints:
       - host: example.com
-        port: 70000
+        ports: [70000]
 ";
         assert!(
             parse_sandbox_policy(yaml).is_err(),

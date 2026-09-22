@@ -20,7 +20,7 @@ use crate::auth::principal::{Principal, SandboxIdentitySource};
 use openshell_core::proto::{
     ExtensionServiceCredential, GetCurrentUserRequest, GetCurrentUserResponse,
     GetSandboxConfigRequest, IssueSandboxTokenRequest, IssueSandboxTokenResponse,
-    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, Sandbox,
+    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse,
 };
 use openshell_extension_core::{ExtensionAudience, ExtensionCallerKind, MAX_EXTENSION_TOKEN_TTL};
 use std::collections::{HashMap, HashSet};
@@ -28,6 +28,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
+
+use crate::storage_proto::StoredSandbox as Sandbox;
 
 #[allow(clippy::result_large_err, clippy::unused_async)]
 pub async fn handle_get_current_user(
@@ -447,8 +449,8 @@ mod tests {
     use crate::tracing_bus::TracingLogBus;
     use openshell_bootstrap::jwt::generate_jwt_key;
     use openshell_core::Config;
+    use openshell_core::proto::SandboxPhase;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
-    use openshell_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
     use std::collections::HashMap;
     use std::time::Duration;
 
@@ -515,7 +517,7 @@ mod tests {
                 workspace: "default".to_string(),
                 deletion_time: None,
             }),
-            spec: Some(SandboxSpec {
+            spec: Some(crate::storage_proto::StoredSandboxSpec {
                 policy: None,
                 ..Default::default()
             }),

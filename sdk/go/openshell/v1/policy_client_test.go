@@ -12,7 +12,7 @@ import (
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
-	sbv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
+	policyv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/policyv1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -216,7 +216,7 @@ func TestPolicyGetDraft(t *testing.T) {
 				Stage:            "initial",
 				HitCount:         3,
 				Binary:           "/usr/bin/curl",
-				ProposedRule: &sbv1.NetworkPolicyRule{
+				ProposedRule: &policyv1.NetworkPolicyRule{
 					Name: "allow-dns-rule",
 				},
 			},
@@ -961,7 +961,7 @@ func TestPolicyEditDraftChunk(t *testing.T) {
 	rule := &NetworkPolicyRule{
 		Name: "allow-https",
 		Endpoints: []PolicyNetworkEndpoint{
-			{Host: "example.com", Port: 443, Protocol: "tcp"},
+			{Host: "example.com", Ports: []uint32{443}, Protocol: "tcp"},
 		},
 	}
 

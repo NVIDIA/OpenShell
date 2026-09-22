@@ -16,7 +16,7 @@ network_policies:
     name: my-api
     endpoints:
       - host: api-1.example.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: full

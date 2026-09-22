@@ -23,6 +23,7 @@ export type {
   HealthStatus,
   ListOptions,
   Page,
+  PolicyDocument,
   PolicySourceName,
   ProviderChange,
   ProviderChangeOptions,
@@ -30,7 +31,6 @@ export type {
   SandboxConfig,
   SandboxFromTemplateSpec,
   SandboxPhaseName,
-  SandboxPolicy,
   SandboxRef,
   SandboxResources,
   SandboxServiceLevel,
@@ -52,7 +52,14 @@ export type {
   WaitOptions,
   WorkspaceListScope,
 } from './client.js';
-export { errorCode, OpenShellClient, Pager, SandboxClient, SandboxTemplateClient } from './client.js';
+export {
+  errorCode,
+  OpenShellClient,
+  Pager,
+  SandboxClient,
+  SandboxTemplateClient,
+  validatePolicyDocument,
+} from './client.js';
 export type { ErrorInfo, FieldViolation, SdkErrorCode } from './errors.js';
 export { fromConnect, SdkError } from './errors.js';
 export type { ClientCredentialsOptions, OidcTokenProvider } from './oidc.js';

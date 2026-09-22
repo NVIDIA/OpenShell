@@ -34,7 +34,7 @@ type SandboxSpec struct {
 	GPU      bool
 	GPUCount *uint32
 	// Policy is the security policy for the sandbox. Nil means no policy specified.
-	Policy  *SandboxPolicy
+	Policy  *PolicyDocument
 	Command []string
 	TTY     bool
 }

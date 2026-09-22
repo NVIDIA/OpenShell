@@ -279,7 +279,7 @@ func TestSandboxConfigFromProto(t *testing.T) {
 	sc := SandboxConfigFromProto(resp)
 
 	require.NotNil(t, sc)
-	require.NotNil(t, sc.Policy, "typed SandboxPolicy must be populated")
+	require.NotNil(t, sc.Policy, "typed PolicyDocument must be populated")
 	assert.Equal(t, uint32(7), sc.Policy.Version)
 	require.NotNil(t, sc.Policy.Filesystem)
 	assert.Equal(t, []string{"/etc"}, sc.Policy.Filesystem.ReadOnly)
@@ -447,8 +447,8 @@ func TestConfigUpdateToProto(t *testing.T) {
 func TestConfigUpdateToProto_WithPolicy(t *testing.T) {
 	cu := &v1.ConfigUpdate{
 		Name: "sb-policy",
-		Policy: &v1.SandboxPolicy{
-			Version: 3,
+		Policy: &v1.PolicyDocument{
+			Version: 1,
 			Filesystem: &v1.FilesystemPolicy{
 				ReadOnly: []string{"/etc"},
 			},
@@ -459,10 +459,10 @@ func TestConfigUpdateToProto_WithPolicy(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NotNil(t, req)
-	require.NotNil(t, req.Policy, "typed SandboxPolicy must be converted to proto")
-	assert.Equal(t, uint32(3), req.Policy.GetVersion())
-	require.NotNil(t, req.Policy.GetFilesystem())
-	assert.Equal(t, []string{"/etc"}, req.Policy.GetFilesystem().GetReadOnly())
+	require.NotNil(t, req.Policy, "typed PolicyDocument must be converted to proto")
+	assert.Equal(t, uint32(1), req.Policy.GetVersion())
+	require.NotNil(t, req.Policy.GetFilesystemPolicy())
+	assert.Equal(t, []string{"/etc"}, req.Policy.GetFilesystemPolicy().GetReadOnly())
 }
 
 func TestConfigUpdateToProto_WithDeleteSetting(t *testing.T) {
@@ -603,7 +603,7 @@ func TestPolicyMergeOperationToProto_AddRule(t *testing.T) {
 			RuleName: "allow-api", Rule: v1.NetworkPolicyRule{
 				Name: "allow-api",
 				Endpoints: []v1.PolicyNetworkEndpoint{
-					{Host: "api.example.com", Port: 443, Protocol: "tcp"},
+					{Host: "api.example.com", Ports: []uint32{443}, Protocol: "tcp"},
 				},
 				Binaries: []v1.PolicyNetworkBinary{
 					{Path: "/usr/bin/curl"},
@@ -623,7 +623,7 @@ func TestPolicyMergeOperationToProto_AddRule(t *testing.T) {
 	assert.Equal(t, "allow-api", ar.GetRule().GetName())
 	require.Len(t, ar.GetRule().GetEndpoints(), 1)
 	assert.Equal(t, "api.example.com", ar.GetRule().GetEndpoints()[0].GetHost())
-	assert.Equal(t, uint32(443), ar.GetRule().GetEndpoints()[0].GetPort())
+	assert.Equal(t, []uint32{443}, ar.GetRule().GetEndpoints()[0].GetPorts())
 	require.Len(t, ar.GetRule().GetBinaries(), 1)
 	assert.Equal(t, "/usr/bin/curl", ar.GetRule().GetBinaries()[0].GetPath())
 }
@@ -746,6 +746,38 @@ func TestPolicyMergeOperationToProto_AddAllowRules(t *testing.T) {
 	assert.Equal(t, "/health", aar.GetRules()[0].GetAllow().GetPath())
 }
 
+func TestPolicyMergeOperationToProto_ValidatesPublicPolicyFragments(t *testing.T) {
+	tests := map[string]*v1.PolicyMergeOperation{
+		"missing allow": {
+			AddAllowRules: &v1.AddAllowRules{
+				Target: &v1.L7RuleTarget{AnyBinary: true},
+				Rules:  []v1.L7Rule{{}},
+			},
+		},
+		"empty matcher": {
+			AddDenyRules: &v1.AddDenyRules{
+				Target: &v1.L7RuleTarget{AnyBinary: true},
+				DenyRules: []v1.L7DenyRule{{
+					Query: map[string]v1.L7QueryMatcher{"owner": {}},
+				}},
+			},
+		},
+		"empty target binary": {
+			AddAllowRules: &v1.AddAllowRules{
+				Target: &v1.L7RuleTarget{Binaries: []v1.PolicyNetworkBinary{{}}},
+			},
+		},
+	}
+
+	for name, operation := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := PolicyMergeOperationToProto(operation)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "validation")
+		})
+	}
+}
+
 func TestPolicyMergeOperationToProto_L7TargetDeepCopy(t *testing.T) {
 	for _, kind := range []string{"allow", "deny"} {
 		t.Run(kind, func(t *testing.T) {
@@ -858,7 +890,7 @@ func TestConfigUpdateToProto_WithMergeOperations(t *testing.T) {
 					RuleName: "new-rule", Rule: v1.NetworkPolicyRule{
 						Name: "new-rule",
 						Endpoints: []v1.PolicyNetworkEndpoint{
-							{Host: "svc.local", Port: 8080},
+							{Host: "svc.local", Ports: []uint32{8080}},
 						},
 					},
 				},

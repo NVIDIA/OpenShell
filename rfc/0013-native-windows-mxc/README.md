@@ -295,12 +295,13 @@ backend already honors `network.proxy`, so this design requires no MXC changes.
 
 ### Part 3 - Policy translation between OpenShell and MXC
 
-OpenShell policy is authored as YAML and parsed to the `SandboxPolicy` proto by
-the shared cross-platform `openshell-policy` crate. The MXC driver does not
-re-parse YAML; a dedicated Rust policy mapper (embedded in the driver and called
-automatically) maps the proto IR to MXC `ContainerConfig` and **rejects rather
-than silently drops** anything MXC cannot enforce. MXC imposes a provision-time
-vs exec-time split.
+OpenShell policy is authored as YAML, parsed as the public `PolicyDocument`, and
+lowered to the internal `SandboxPolicy` proto by the shared cross-platform
+`openshell-policy` crate. The MXC driver does not re-parse YAML; a dedicated
+Rust policy mapper (embedded in the driver and called automatically) maps the
+internal proto IR to MXC `ContainerConfig` and **rejects rather than silently
+drops** anything MXC cannot enforce. MXC imposes a provision-time vs exec-time
+split.
 
 | OpenShell policy | Where enforced | MXC mapping | When |
 |---|---|---|---|

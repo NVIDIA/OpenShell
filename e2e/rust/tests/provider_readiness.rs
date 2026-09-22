@@ -926,10 +926,10 @@ fn write_profile(
         "id": name, "display_name": "Provider readiness E2E", "category": "other",
         "credentials": [{"name": "synthetic", "env_vars": [TOKEN_ENV], "required": true,
             "auth_style": "bearer", "header_name": "authorization"}],
-        "endpoints": [{"host": host, "port": port, "path": "/v1/**", "protocol": "rest",
+        "endpoints": [{"host": host, "ports": [port], "path": "/v1/**", "protocol": "rest",
             "access": "full", "enforcement": "enforce",
             "allowed_ips": [host]}],
-        "binaries": [python],
+        "binaries": [{"path": python}],
     });
     std::fs::write(path, document.to_string())
         .map_err(|_| "could not write synthetic profile".to_string())
@@ -949,7 +949,7 @@ fn write_policy(
     let endpoints = [(host, port), (host, other_port), (other_host, port)]
         .into_iter()
         .map(|(host, port)| {
-            json!({"host": host, "port": port, "path": "/**", "protocol": "rest",
+            json!({"host": host, "ports": [port], "path": "/**", "protocol": "rest",
             "access": "full", "enforcement": "enforce",
             "allowed_ips": [host]})
         })

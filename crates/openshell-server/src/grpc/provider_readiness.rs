@@ -13,7 +13,7 @@ use openshell_core::proto::{
     ProviderDesiredIdentity, ProviderMutationKind, ProviderMutationReceipt,
     ProviderReadinessObservation, ProviderReadinessReason, ProviderReadinessState,
     ProviderReadinessStatus, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
-    Sandbox, SandboxPhase, SupervisorHello,
+    SandboxPhase, SupervisorHello,
 };
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use tonic::{Request, Response, Status};
@@ -24,6 +24,7 @@ use crate::auth::guard::{enforce_sandbox_scope, ensure_sandbox_principal_scope};
 use crate::auth::workspace_authz::MinWorkspaceRole;
 use crate::config_update_operation;
 use crate::persistence::ObjectType;
+use crate::storage_proto::StoredSandbox as Sandbox;
 
 const REPORT_INTERVAL_SECONDS: u32 = 5;
 const OBSERVATION_TTL_SECONDS: u32 = 15;

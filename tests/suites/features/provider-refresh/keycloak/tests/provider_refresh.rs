@@ -180,7 +180,7 @@ credentials:
           secret: true
 endpoints:
   - host: keycloak.test.invalid
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-only
     enforcement: enforce

@@ -10,7 +10,7 @@ use axum::{
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use openshell_core::config::ServiceRoutingConfig;
-use openshell_core::proto::{Sandbox, SandboxPhase, ServiceEndpoint, TcpRelayTarget, relay_open};
+use openshell_core::proto::{SandboxPhase, ServiceEndpoint, TcpRelayTarget, relay_open};
 use openshell_core::{ObjectId, VERSION};
 use openshell_ocsf::{
     ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint, EventContext,
@@ -26,6 +26,7 @@ use tracing::{info, warn};
 
 use crate::ServerState;
 use crate::persistence::{ObjectType, Store};
+use crate::storage_proto::StoredSandbox as Sandbox;
 
 const ENDPOINT_OBJECT_TYPE: &str = "service_endpoint";
 const ROUTING_RULE_NAME: &str = "sandbox_service_routing";

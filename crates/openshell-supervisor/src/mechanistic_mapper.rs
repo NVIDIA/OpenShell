@@ -209,6 +209,8 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
             .first()
             .map_or_else(|| "connect".to_string(), |d| d.denial_stage.clone());
 
+        let proposed_rule = openshell_policy::project_authored_rule(&rule_name, &proposed_rule)
+            .expect("mechanistically generated rule must project to the public policy schema");
         proposals.push(PolicyChunk {
             id: String::new(), // Assigned by the gateway on persist
             status: "pending".to_string(),
@@ -532,7 +534,7 @@ mod tests {
         let rule = proposals[0].proposed_rule.as_ref().unwrap();
         assert_eq!(rule.endpoints.len(), 1);
         assert_eq!(rule.endpoints[0].host, "api.example.com");
-        assert_eq!(rule.endpoints[0].port, 443);
+        assert_eq!(rule.endpoints[0].ports, vec![443]);
         assert_eq!(rule.binaries.len(), 1);
         assert_eq!(rule.binaries[0].path, "/usr/bin/curl");
         // No L7 fields when no samples provided.
@@ -589,11 +591,8 @@ mod tests {
         // L7 fields should be set.
         assert_eq!(ep.protocol, "rest");
         // tls field is no longer set (auto-detection handles it).
-        assert_eq!(
-            ep.tls,
-            openshell_core::proto::NetworkTlsMode::Unspecified as i32
-        );
-        assert_eq!(ep.enforcement, NetworkEnforcementMode::Enforce as i32);
+        assert!(ep.tls.is_empty());
+        assert_eq!(ep.enforcement, "enforce");
 
         // Should have L7 rules.
         assert!(!ep.rules.is_empty());

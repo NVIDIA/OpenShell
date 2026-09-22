@@ -8,8 +8,10 @@ use super::{POLICY_SETTING_KEY, load_global_settings, load_sandbox_settings};
 use crate::compute::provisioning_deadline::ConfigurationChange;
 use crate::persistence::{ObjectId, ObjectName, ObjectType, ObjectWorkspace, Store};
 use crate::policy_store::PolicyStoreExt;
-use crate::storage_proto::StoredProviderProfile;
-use openshell_core::proto::{Provider, Sandbox};
+use crate::storage_proto::{
+    StoredProviderProfileWire as StoredProviderProfile, StoredSandbox as Sandbox,
+};
+use openshell_core::proto::Provider;
 use openshell_core::time::timestamp_to_millis;
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -234,7 +236,7 @@ mod tests {
         let mut sandbox = sandbox();
         let policy = openshell_policy::restrictive_default_policy();
         let hash = openshell_core::policy_identity::deterministic_policy_hash(&policy);
-        sandbox.spec = Some(openshell_core::proto::SandboxSpec {
+        sandbox.spec = Some(crate::storage_proto::StoredSandboxSpec {
             policy: Some(policy.clone()),
             ..Default::default()
         });

@@ -109,6 +109,50 @@ message StoredProviderProfile {
   openshell.v1.ProviderProfile profile = 2;
 }
 
+// Durable provider-profile envelope. It mirrors StoredProviderProfile on the
+// wire while retaining internal endpoint and binary policy messages.
+message StoredProviderProfileWire {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  StoredProviderProfileData profile = 2;
+}
+
+message StoredProviderProfileData {
+  string id = 1;
+  string display_name = 2;
+  string description = 3;
+  openshell.v1.ProviderProfileCategory category = 4;
+  repeated openshell.v1.ProviderProfileCredential credentials = 5;
+  repeated openshell.sandbox.v1.NetworkEndpoint endpoints = 6;
+  repeated openshell.sandbox.v1.NetworkBinary binaries = 7;
+  bool inference_capable = 8;
+  openshell.v1.ProviderProfileDiscovery discovery = 9;
+  uint64 resource_version = 10;
+  map<string, string> annotations = 11;
+  string source = 12;
+  string scope = 13;
+}
+
+// Durable sandbox object. The field numbers mirror openshell.v1.Sandbox, but
+// its policy remains the gateway's internal runtime representation.
+message StoredSandbox {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  StoredSandboxSpec spec = 2;
+  openshell.v1.SandboxStatus status = 3;
+  openshell.v1.SandboxWorkloadTemplateProvenance created_from_workload_template = 20;
+}
+
+message StoredSandboxSpec {
+  string log_level = 1;
+  map<string, string> environment = 5;
+  openshell.v1.SandboxTemplate template = 6;
+  openshell.sandbox.v1.SandboxPolicy policy = 7;
+  repeated string providers = 8;
+  openshell.v1.ResourceRequirements resource_requirements = 9;
+  repeated string command = 12;
+  bool tty = 13;
+  string provider_attachment_epoch = 14;
+}
+
 // Durable, non-secret progress for a sandbox-scoped desired-state mutation.
 // The target_* fields let a recovery worker bind the exact effective snapshot
 // revision after the desired-state transaction commits.

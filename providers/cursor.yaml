@@ -26,15 +26,15 @@ description: Cursor editor server bootstrap and update endpoints
 category: agent
 endpoints:
   - host: cursor.blob.core.windows.net
-    port: 443
+    ports: [443]
   - host: api2.cursor.sh
-    port: 443
+    ports: [443]
   - host: repo.cursor.sh
-    port: 443
+    ports: [443]
   - host: download.cursor.sh
-    port: 443
+    ports: [443]
   - host: cursor.download.prss.microsoft.com
-    port: 443
+    ports: [443]
 binaries:
   - /usr/bin/curl
   - /usr/bin/wget

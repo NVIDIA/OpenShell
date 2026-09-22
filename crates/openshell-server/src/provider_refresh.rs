@@ -2098,7 +2098,10 @@ mod tests {
     };
     use crate::credentials::CredentialRuntime;
     use crate::persistence::{current_time_ms, test_store};
-    use crate::storage_proto::StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState;
+    use crate::storage_proto::{
+        StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
+        StoredSandbox as Sandbox, StoredSandboxSpec as SandboxSpec,
+    };
 
     fn proto_duration(seconds: i64) -> prost_types::Duration {
         prost_types::Duration { seconds, nanos: 0 }
@@ -2127,7 +2130,7 @@ mod tests {
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{
         CredentialHandle, Provider, ProviderCredentialRefreshRecoveryAction,
-        ProviderCredentialRefreshStrategy, Sandbox, SandboxSpec,
+        ProviderCredentialRefreshStrategy,
     };
     use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
     use std::collections::HashMap;

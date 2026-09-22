@@ -3,8 +3,9 @@
 
 use super::{ObjectListQuery, ObjectType, PersistenceError, Store, generate_name, test_store};
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
+use crate::storage_proto::{StoredSandbox as Sandbox, StoredSandboxSpec as SandboxSpec};
 use openshell_core::proto::datamodel::v1::ObjectMeta as ProtoObjectMeta;
-use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
+use openshell_core::proto::{ObjectForTest, SandboxPolicy};
 use prost::Message;
 use std::collections::HashMap as StdHashMap;
 
@@ -1945,8 +1946,6 @@ async fn cas_concurrent_updates_one_succeeds() {
 
 #[tokio::test]
 async fn cas_update_message_cas_succeeds() {
-    use openshell_core::proto::Sandbox;
-
     let store = test_store().await;
 
     // Create a sandbox
@@ -1986,8 +1985,63 @@ async fn cas_update_message_cas_succeeds() {
 }
 
 #[tokio::test]
+async fn status_only_update_preserves_stored_policy_bytes() {
+    let store = test_store().await;
+    let endpoint = openshell_core::proto::NetworkEndpoint {
+        host: "legacy.example.com".to_string(),
+        port: 0,
+        ports: vec![443, 443],
+        advisor_proposed: true,
+        provider_credentialed: true,
+        ..Default::default()
+    };
+    let policy = SandboxPolicy {
+        version: 1,
+        network_policies: StdHashMap::from([(
+            "legacy".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "legacy".to_string(),
+                endpoints: vec![endpoint],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let original_policy_bytes = policy.encode_to_vec();
+    let sandbox = Sandbox {
+        metadata: Some(ProtoObjectMeta {
+            id: "status-only-policy".to_string(),
+            name: "status-only-policy".to_string(),
+            workspace: "default".to_string(),
+            ..Default::default()
+        }),
+        spec: Some(SandboxSpec {
+            policy: Some(policy),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    store.put_message(&sandbox).await.unwrap();
+
+    store
+        .update_message_cas::<Sandbox, _>("status-only-policy", 0, |sandbox| {
+            sandbox.set_phase(2);
+        })
+        .await
+        .unwrap();
+
+    let row = store
+        .get(Sandbox::object_type(), "status-only-policy")
+        .await
+        .unwrap()
+        .unwrap();
+    let stored = Sandbox::decode(row.payload.as_slice()).unwrap();
+    let rewritten_policy_bytes = stored.spec.unwrap().policy.unwrap().encode_to_vec();
+    assert_eq!(rewritten_policy_bytes, original_policy_bytes);
+}
+
+#[tokio::test]
 async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
-    use openshell_core::proto::Sandbox;
     use std::sync::Arc;
 
     let store = Arc::new(test_store().await);
@@ -2060,8 +2114,6 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
 
 #[tokio::test]
 async fn cas_update_message_cas_rejects_workspace_change() {
-    use openshell_core::proto::Sandbox;
-
     let store = test_store().await;
 
     let sandbox = Sandbox {
@@ -2103,8 +2155,6 @@ async fn cas_update_message_cas_rejects_workspace_change() {
 
 #[tokio::test]
 async fn cas_update_message_cas_rejects_name_change() {
-    use openshell_core::proto::Sandbox;
-
     let store = test_store().await;
 
     let sandbox = Sandbox {

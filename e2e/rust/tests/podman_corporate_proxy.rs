@@ -396,7 +396,7 @@ network_policies:
     name: corporate_proxy_e2e
     endpoints:
       - host: {ALLOWED_ALIAS}
-        port: {UPSTREAM_PORT}
+        ports: [{UPSTREAM_PORT}]
         tls: skip
         enforcement: enforce
         allowed_ips:

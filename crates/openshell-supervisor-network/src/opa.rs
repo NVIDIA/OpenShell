@@ -3439,7 +3439,7 @@ network_policies:
     name: parity
     endpoints:
       - host: rest.parity.test
-        port: 443
+        ports: [443]
         path: /items/**
         protocol: rest
         enforcement: enforce
@@ -3447,7 +3447,7 @@ network_policies:
         rules:
           - allow: { method: GET, path: /items/** }
       - host: graphql.parity.test
-        port: 443
+        ports: [443]
         path: /graphql
         protocol: graphql
         enforcement: enforce
@@ -3458,7 +3458,7 @@ network_policies:
               operation_name: GetWidget
               fields: [id, name]
       - host: websocket.parity.test
-        port: 443
+        ports: [443]
         path: /graphql
         protocol: websocket
         enforcement: enforce
@@ -3469,7 +3469,7 @@ network_policies:
               operation_type: subscription
               fields: [messageAdded]
       - host: jsonrpc.parity.test
-        port: 443
+        ports: [443]
         path: /rpc
         protocol: json-rpc
         enforcement: enforce
@@ -3477,7 +3477,7 @@ network_policies:
         rules:
           - allow: { method: status.get }
       - host: mcp.parity.test
-        port: 443
+        ports: [443]
         path: /mcp
         protocol: mcp
         enforcement: enforce
@@ -3487,7 +3487,7 @@ network_policies:
         rules:
           - allow:
               method: tools/call
-              tool: read_status
+              tool: { glob: read_status }
     binaries:
       - { path: /usr/bin/curl }
 "#;
@@ -3649,10 +3649,13 @@ network_policies:
                 "GET"
             };
             let path = if protocol == "rest" { "path: /**" } else { "" };
-            let deny_matcher = if protocol == "rest" {
-                "\"read_sec*\""
+            let (allow_matcher, deny_matcher) = if protocol == "rest" {
+                ("{glob: \"read_*\"}", "{glob: \"read_sec*\"}")
             } else {
-                "{any: [read_secret, read_private]}"
+                (
+                    "{matcher: {glob: \"read_*\"}}",
+                    "{matcher: {any: {values: [read_secret, read_private]}}}",
+                )
             };
             let source = format!(
                 r#"
@@ -3662,14 +3665,14 @@ network_policies:
     name: matchers
     endpoints:
       - host: matchers.parity.test
-        port: 443
+        ports: [443]
         protocol: {protocol}
         enforcement: enforce
         rules:
           - allow:
               method: {method}
               {path}
-              {selector}: {{name: "read_*"}}
+              {selector}: {{name: {allow_matcher}}}
         deny_rules:
           - method: {method}
             {path}
@@ -3689,11 +3692,14 @@ network_policies:
             endpoint.advisor_proposed = true;
             let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto)
                 .expect("runtime provenance fixture must canonicalize");
-            let mut data: serde_json::Value = serde_yml::from_str(&source).unwrap();
+            let mut data: serde_json::Value =
+                serde_json::from_str(&proto_to_opa_data_json(&proto, 0)).unwrap();
             let endpoint = &mut data["network_policies"]["matchers"]["endpoints"][0];
+            endpoint.as_object_mut().unwrap().remove("endpoint_id");
+            endpoint.as_object_mut().unwrap().remove("policy_hash");
             endpoint["provider_credentialed"] = true.into();
             endpoint["advisor_proposed"] = true.into();
-            // Versionless data and runtime provenance are accepted OPA inputs.
+            // Versionless internal data and runtime provenance are accepted OPA inputs.
             data.as_object_mut().unwrap().remove("version");
             let yaml_engine = OpaEngine::from_strings(TEST_POLICY, &data.to_string()).unwrap();
             let proto_engine = OpaEngine::from_proto(&proto).unwrap();
@@ -3771,7 +3777,7 @@ network_policies:
     name: parity
     endpoints:
       - host: sql-l4.parity.test
-        port: 443
+        ports: [443]
         protocol: "{protocol}"
         {fields}
     binaries:
@@ -8735,7 +8741,7 @@ network_policies:
     name: native_tcp
     endpoints:
       - host: database.example.com
-        port: 5432
+        ports: [5432]
         protocol: tcp
     binaries:
       - path: /usr/bin/client
@@ -8783,7 +8789,7 @@ network_policies:
     name: native_tcp
     endpoints:
       - host: database.example.com
-        port: 5432
+        ports: [5432]
         protocol: tcp
         credential_binding:
           provider: database
@@ -10971,7 +10977,7 @@ network_policies:
   grant:
     endpoints:
       - host: example.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         rules: [{{ allow: {{ method: GET, path: "/**" }} }}]
@@ -10979,7 +10985,7 @@ network_policies:
   deny:
     endpoints:
       - host: example.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         rules: [{{ allow: {{ method: GET, path: "/**" }} }}]

@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
-	sbv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
+	policyv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/policyv1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -201,10 +201,10 @@ func seedProfile(mock *mockProfileServer, id, displayName string, category pb.Pr
 		Credentials: []*pb.ProviderProfileCredential{
 			{Name: "api-key", Description: "API Key", Required: true, Refresh: &pb.ProviderCredentialRefresh{}},
 		},
-		Endpoints: []*sbv1.NetworkEndpoint{
-			{Host: "localhost", Port: 8080, Protocol: "http"},
+		Endpoints: []*policyv1.NetworkEndpoint{
+			{Host: "localhost", Ports: []uint32{8080}, Protocol: "http"},
 		},
-		Binaries: []*sbv1.NetworkBinary{
+		Binaries: []*policyv1.NetworkBinary{
 			{Path: "/usr/bin/provider"},
 		},
 	}
@@ -289,7 +289,7 @@ func TestProfileGet(t *testing.T) {
 	// Verify endpoint deep copy
 	require.Len(t, profile.Endpoints, 1)
 	assert.Equal(t, "localhost", profile.Endpoints[0].Host)
-	assert.Equal(t, uint32(8080), profile.Endpoints[0].Port)
+	assert.Equal(t, []uint32{8080}, profile.Endpoints[0].Ports)
 	// Verify binary deep copy
 	require.Len(t, profile.Binaries, 1)
 	assert.Equal(t, "/usr/bin/provider", profile.Binaries[0].Path)

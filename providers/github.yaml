@@ -37,12 +37,12 @@ endpoints:
   # writes require an explicit policy proposal so the agentic loop +
   # prover can audit each capability change.
   - host: api.github.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-only
     enforcement: enforce
   - host: api.github.com
-    port: 443
+    ports: [443]
     path: /graphql
     protocol: graphql
     access: read-only
@@ -53,7 +53,7 @@ endpoints:
   # clone/fetch works while push (git-receive-pack) stays denied — enabling
   # push requires an explicit policy proposal.
   - host: github.com
-    port: 443
+    ports: [443]
     protocol: rest
     enforcement: enforce
     rules:

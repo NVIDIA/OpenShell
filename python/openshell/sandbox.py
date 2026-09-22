@@ -30,6 +30,7 @@ from ._proto import (
 )
 from .errors import _error_mapping_channel
 from .mutations import DeletionOutcome, DeletionResult
+from .policy import validate_policy_document
 
 _ClientCallDetailsBase = namedtuple(
     "_ClientCallDetailsBase",
@@ -792,6 +793,8 @@ class SandboxClient:
         service_exposures: Sequence[ServiceExposure] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
+        if request_spec.HasField("policy"):
+            validate_policy_document(request_spec.policy)
         response = self._stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),
@@ -820,6 +823,8 @@ class SandboxClient:
         if not workload_template.strip():
             raise SandboxError("workload_template is required")
         request_spec = spec if spec is not None else openshell_pb2.SandboxSpec()
+        if request_spec.HasField("policy"):
+            validate_policy_document(request_spec.policy)
         response = self._stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
                 workspace_scope=_workspace_scope(workspace),

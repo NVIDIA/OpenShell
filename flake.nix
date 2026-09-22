@@ -58,6 +58,8 @@
           git
           # Required to find packages.
           pkg-config
+          # Rust Protovalidate compiles its bundled constraint descriptors.
+          protobuf
           # Coverage.
           lcov
           kubernetes-helm

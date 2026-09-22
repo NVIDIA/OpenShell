@@ -23,7 +23,7 @@ network_policies:
     name: test-network-reject
     endpoints:
       - host: api.example.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: read-only

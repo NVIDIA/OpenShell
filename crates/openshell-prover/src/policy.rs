@@ -257,13 +257,15 @@ impl PolicyModel {
 
 /// Parse an `OpenShell` policy YAML file into a `PolicyModel`.
 pub fn parse_policy(path: &Path) -> miette::Result<PolicyModel> {
-    let document = openshell_policy_schema::parse_policy_file(path, ParseLimits::default())?;
+    let generated = openshell_policy_schema::parse_policy_proto_file(path, ParseLimits::default())?;
+    let document = PolicyDocument::try_from(generated)?;
     Ok(project_policy(document))
 }
 
 /// Parse a policy YAML string into a `PolicyModel`.
 pub fn parse_policy_str(yaml: &str) -> miette::Result<PolicyModel> {
-    let document = openshell_policy_schema::parse_policy(yaml)?;
+    let generated = openshell_policy_schema::parse_policy_proto(yaml)?;
+    let document = PolicyDocument::try_from(generated)?;
     Ok(project_policy(document))
 }
 
@@ -310,9 +312,10 @@ fn project_endpoint(endpoint: AuthoredEndpoint) -> Endpoint {
         .into_iter()
         .map(|rule| project_allow(rule.allow))
         .collect();
+    let port = endpoint.ports.first().copied().unwrap_or_default();
     Endpoint {
         host: endpoint.host,
-        port: endpoint.port,
+        port,
         ports: endpoint.ports,
         protocol: endpoint.protocol,
         tls: endpoint.tls,

@@ -154,7 +154,7 @@ func TestConfigGetSandbox(t *testing.T) {
 	assert.Equal(t, uint32(1), sc.GlobalPolicyVersion)
 	assert.Equal(t, uint64(7), sc.ProviderEnvRevision)
 
-	// Typed SandboxPolicy.
+	// Typed PolicyDocument.
 	require.NotNil(t, sc.Policy)
 	assert.Equal(t, uint32(4), sc.Policy.Version)
 	require.NotNil(t, sc.Policy.Filesystem)
@@ -442,8 +442,8 @@ func TestConfigUpdate_WithPolicy(t *testing.T) {
 
 	update := &ConfigUpdate{
 		Name: "my-sandbox",
-		Policy: &types.SandboxPolicy{
-			Version: 5,
+		Policy: &types.PolicyDocument{
+			Version: 1,
 			Filesystem: &types.FilesystemPolicy{
 				ReadOnly: []string{"/usr"},
 			},
@@ -462,9 +462,9 @@ func TestConfigUpdate_WithPolicy(t *testing.T) {
 	mock.mu.Unlock()
 
 	require.NotNil(t, req.GetPolicy())
-	assert.Equal(t, uint32(5), req.GetPolicy().GetVersion())
-	require.NotNil(t, req.GetPolicy().GetFilesystem())
-	assert.Equal(t, []string{"/usr"}, req.GetPolicy().GetFilesystem().GetReadOnly())
+	assert.Equal(t, uint32(1), req.GetPolicy().GetVersion())
+	require.NotNil(t, req.GetPolicy().GetFilesystemPolicy())
+	assert.Equal(t, []string{"/usr"}, req.GetPolicy().GetFilesystemPolicy().GetReadOnly())
 }
 
 func TestConfigUpdate_RejectsUnrepresentableMiddlewareConfigBeforeRPC(t *testing.T) {
@@ -472,7 +472,7 @@ func TestConfigUpdate_RejectsUnrepresentableMiddlewareConfigBeforeRPC(t *testing
 	client, cleanup := setupConfigTest(t, mock)
 	defer cleanup()
 
-	_, err := client.Update(context.Background(), "default", &ConfigUpdate{Policy: &SandboxPolicy{
+	_, err := client.Update(context.Background(), "default", &ConfigUpdate{Policy: &PolicyDocument{
 		NetworkMiddlewares: map[string]types.NetworkMiddlewareConfig{
 			"audit": {Config: map[string]any{"invalid": make(chan int)}},
 		},

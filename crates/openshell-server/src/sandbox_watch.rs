@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, watch};
 use tonic::Status;
 
 use crate::persistence::Store;
-use openshell_core::proto::Sandbox;
+use crate::storage_proto::StoredSandbox as Sandbox;
 
 /// How often [`spawn_store_poller`] rechecks watched sandboxes for writes made
 /// by other gateway replicas.

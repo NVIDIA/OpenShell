@@ -4,15 +4,84 @@
 package converter
 
 import (
+	"errors"
 	"testing"
 
+	"buf.build/go/protovalidate"
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
+	policyv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/policyv1"
 	sbv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/structpb"
 )
+
+func TestPolicyDocumentValidationRuleIDs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		policy *policyv1.PolicyDocument
+		ruleID string
+	}{
+		{name: "version", policy: &policyv1.PolicyDocument{}, ruleID: "uint32.const"},
+		{
+			name: "missing ports",
+			policy: &policyv1.PolicyDocument{Version: 1, NetworkPolicies: map[string]*policyv1.NetworkPolicyRule{
+				"api": {Endpoints: []*policyv1.NetworkEndpoint{{Host: "api.example.com"}}},
+			}},
+			ruleID: "repeated.min_items",
+		},
+		{
+			name: "duplicate ports",
+			policy: &policyv1.PolicyDocument{Version: 1, NetworkPolicies: map[string]*policyv1.NetworkPolicyRule{
+				"api": {Endpoints: []*policyv1.NetworkEndpoint{{Host: "api.example.com", Ports: []uint32{443, 443}}}},
+			}},
+			ruleID: "repeated.unique",
+		},
+		{
+			name: "port range",
+			policy: &policyv1.PolicyDocument{Version: 1, NetworkPolicies: map[string]*policyv1.NetworkPolicyRule{
+				"api": {Endpoints: []*policyv1.NetworkEndpoint{{Host: "api.example.com", Ports: []uint32{65536}}}},
+			}},
+			ruleID: "uint32.gte_lte",
+		},
+		{
+			name: "binary path",
+			policy: &policyv1.PolicyDocument{Version: 1, NetworkPolicies: map[string]*policyv1.NetworkPolicyRule{
+				"api": {Binaries: []*policyv1.NetworkBinary{{}}},
+			}},
+			ruleID: "string.min_len",
+		},
+		{
+			name: "matcher choice",
+			policy: &policyv1.PolicyDocument{Version: 1, NetworkPolicies: map[string]*policyv1.NetworkPolicyRule{
+				"api": {Endpoints: []*policyv1.NetworkEndpoint{{
+					Host: "api.example.com", Ports: []uint32{443}, Rules: []*policyv1.L7Rule{{
+						Allow: &policyv1.L7Allow{Query: map[string]*policyv1.Matcher{"owner": {}}},
+					}},
+				}}},
+			}},
+			ruleID: "required",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := protovalidate.Validate(test.policy)
+			require.Error(t, err)
+			var validationErr *protovalidate.ValidationError
+			require.True(t, errors.As(err, &validationErr), "unexpected error: %v", err)
+			for _, violation := range validationErr.Violations {
+				if violation.Proto.GetRuleId() == test.ruleID {
+					return
+				}
+			}
+			t.Fatalf("expected rule ID %q in %v", test.ruleID, err)
+		})
+	}
+}
 
 // --- PolicyLoadStatus ---
 
@@ -85,10 +154,10 @@ func TestPolicyChunkFromProto(t *testing.T) {
 		Binary:            "/usr/bin/curl",
 		ValidationResult:  "valid",
 		RejectionReason:   "",
-		ProposedRule: &sbv1.NetworkPolicyRule{
+		ProposedRule: &policyv1.NetworkPolicyRule{
 			Name: "web-api",
-			Endpoints: []*sbv1.NetworkEndpoint{
-				{Host: "api.example.com", Port: 443, Protocol: "rest"},
+			Endpoints: []*policyv1.NetworkEndpoint{
+				{Host: "api.example.com", Ports: []uint32{443}, Protocol: "rest"},
 			},
 		},
 	}
@@ -175,18 +244,190 @@ func TestDraftPolicyFromProto_EmptyChunks(t *testing.T) {
 	assert.Empty(t, draft.Chunks)
 }
 
-// --- SandboxPolicy ---
+// --- PolicyDocument ---
 
-func TestSandboxPolicyFromProtoNil(t *testing.T) {
-	assert.Nil(t, SandboxPolicyFromProto(nil))
+func TestPolicyDocumentFromProtoNil(t *testing.T) {
+	assert.Nil(t, PolicyDocumentFromProto(nil))
 }
 
-func TestSandboxPolicyToProtoNil(t *testing.T) {
-	assert.Nil(t, SandboxPolicyToProto(nil))
+func TestPolicyDocumentToProtoNil(t *testing.T) {
+	assert.Nil(t, PolicyDocumentToProto(nil))
+}
+
+func TestPolicyDocumentFromInternalProtoExplicitProjection(t *testing.T) {
+	strictToolNames := false
+	allowAllMethods := true
+	middlewareConfig, err := structpb.NewStruct(map[string]any{"model": "guard-v1"})
+	require.NoError(t, err)
+
+	internal := &sbv1.SandboxPolicy{
+		Version: 1,
+		Filesystem: &sbv1.FilesystemPolicy{
+			IncludeWorkdir: true,
+			ReadOnly:       []string{"/usr"},
+			ReadWrite:      []string{"/sandbox"},
+		},
+		Landlock: &sbv1.LandlockPolicy{Compatibility: "hard_requirement"},
+		Process:  &sbv1.ProcessPolicy{RunAsUser: "sandbox", RunAsGroup: "sandbox"},
+		NetworkPolicies: map[string]*sbv1.NetworkPolicyRule{
+			"api": {
+				Name: "api",
+				Binaries: []*sbv1.NetworkBinary{
+					{Path: "/usr/bin/curl"},
+				},
+				Endpoints: []*sbv1.NetworkEndpoint{
+					{
+						Host:        "mcp.example.com",
+						Port:        443,
+						Protocol:    "mcp",
+						Tls:         sbv1.NetworkTlsMode_NETWORK_TLS_MODE_SKIP,
+						Enforcement: sbv1.NetworkEnforcementMode_NETWORK_ENFORCEMENT_MODE_ENFORCE,
+						Access:      sbv1.NetworkAccessPreset_NETWORK_ACCESS_PRESET_FULL,
+						Rules: []*sbv1.L7Rule{{Allow: &sbv1.L7Allow{
+							Method: "tools/call",
+							Query: map[string]*sbv1.L7QueryMatcher{
+								"tenant": {Glob: "team-*"},
+							},
+							Params: map[string]*sbv1.L7QueryMatcher{
+								"name":            {Glob: "weather.*"},
+								"arguments.limit": {Any: []string{"10", "20"}},
+							},
+						}}},
+						DenyRules: []*sbv1.L7DenyRule{{
+							Method: "tools/call",
+							Params: map[string]*sbv1.L7QueryMatcher{
+								"name": {Any: []string{"admin.delete", "admin.reset"}},
+							},
+						}},
+						JsonRpcMaxBodyBytes: 12345,
+						Mcp: &sbv1.McpOptions{
+							StrictToolNames:         &strictToolNames,
+							AllowAllKnownMcpMethods: &allowAllMethods,
+							Versions:                []string{"2025-11-25"},
+						},
+						AllowUninspectedCredentials: true,
+						AdvisorProposed:             true,
+						ProviderCredentialed:        true,
+					},
+					{
+						Host:                    "rpc.example.com",
+						Ports:                   []uint32{8443, 9443},
+						Protocol:                "json-rpc",
+						JsonRpcMaxBodyBytes:     67890,
+						CredentialBinding:       &sbv1.NetworkCredentialBinding{Provider: "static-provider"},
+						GraphqlPersistedQueries: map[string]*sbv1.GraphqlOperation{"hash": {OperationType: "query", Fields: []string{"viewer"}}},
+					},
+				},
+			},
+		},
+		NetworkMiddlewares: map[string]*sbv1.NetworkMiddlewareConfig{
+			"guard": {
+				Name:       "guard",
+				Middleware: "content_guard",
+				Config:     middlewareConfig,
+				OnError:    "fail_closed",
+				Order:      10,
+				Endpoints:  &sbv1.MiddlewareEndpointSelector{Include: []string{"*.example.com"}},
+			},
+		},
+	}
+
+	policy := PolicyDocumentFromInternalProto(internal)
+	require.NotNil(t, policy)
+	assert.Equal(t, uint32(1), policy.Version)
+	require.NotNil(t, policy.Filesystem)
+	assert.Equal(t, []string{"/usr"}, policy.Filesystem.ReadOnly)
+	require.NotNil(t, policy.Landlock)
+	assert.Equal(t, "hard_requirement", policy.Landlock.Compatibility)
+	require.NotNil(t, policy.Process)
+	assert.Equal(t, "sandbox", policy.Process.RunAsUser)
+
+	rule := policy.NetworkPolicies["api"]
+	assert.Equal(t, []v1.PolicyNetworkBinary{{Path: "/usr/bin/curl"}}, rule.Binaries)
+	require.Len(t, rule.Endpoints, 2)
+	mcp := rule.Endpoints[0]
+	assert.Equal(t, []uint32{443}, mcp.Ports, "legacy internal scalar port must become the public ports list")
+	assert.Equal(t, v1.NetworkTLSModeSkip, mcp.TLS)
+	assert.Equal(t, v1.NetworkEnforcementModeEnforce, mcp.Enforcement)
+	assert.Equal(t, v1.NetworkAccessPresetFull, mcp.Access)
+	assert.True(t, mcp.AllowUninspectedCredentials)
+	require.NotNil(t, mcp.Mcp)
+	assert.Equal(t, uint32(12345), mcp.Mcp.MaxBodyBytes)
+	assert.Equal(t, []string{"2025-11-25"}, mcp.Mcp.Versions)
+	require.NotNil(t, mcp.Mcp.StrictToolNames)
+	assert.False(t, *mcp.Mcp.StrictToolNames)
+	require.NotNil(t, mcp.Mcp.AllowAllKnownMcpMethods)
+	assert.True(t, *mcp.Mcp.AllowAllKnownMcpMethods)
+	assert.Zero(t, mcp.JSONRPCMaxBodyBytes, "the shared internal body limit belongs to the MCP stanza")
+	require.Len(t, mcp.Rules, 1)
+	require.NotNil(t, mcp.Rules[0].Allow)
+	assert.Empty(t, mcp.Rules[0].Allow.Method, "canonical MCP tool rules omit the implied method")
+	require.NotNil(t, mcp.Rules[0].Allow.Tool)
+	assert.Equal(t, "weather.*", mcp.Rules[0].Allow.Tool.Glob)
+	require.NotNil(t, mcp.Rules[0].Allow.Params["arguments"].Object)
+	require.NotNil(t, mcp.Rules[0].Allow.Params["arguments"].Object["limit"].Matcher)
+	assert.Equal(t, []string{"10", "20"}, mcp.Rules[0].Allow.Params["arguments"].Object["limit"].Matcher.Any)
+	require.Len(t, mcp.DenyRules, 1)
+	require.NotNil(t, mcp.DenyRules[0].Tool)
+	assert.Equal(t, []string{"admin.delete", "admin.reset"}, mcp.DenyRules[0].Tool.Any)
+
+	rpc := rule.Endpoints[1]
+	assert.Equal(t, []uint32{8443, 9443}, rpc.Ports)
+	assert.Equal(t, uint32(67890), rpc.JSONRPCMaxBodyBytes)
+	assert.Nil(t, rpc.Mcp)
+	require.NotNil(t, rpc.CredentialBinding)
+	assert.Equal(t, "static-provider", rpc.CredentialBinding.Provider)
+	assert.Equal(t, []string{"viewer"}, rpc.GraphqlPersistedQueries["hash"].Fields)
+
+	middleware := policy.NetworkMiddlewares["guard"]
+	assert.Equal(t, "guard-v1", middleware.Config["model"])
+	require.NotNil(t, middleware.Endpoints)
+	assert.Equal(t, []string{"*.example.com"}, middleware.Endpoints.Include)
+
+	// The public SDK result must not alias the supervisor response.
+	internal.Filesystem.ReadOnly[0] = "/mutated"
+	internal.NetworkPolicies["api"].Endpoints[0].Port = 80
+	internal.NetworkPolicies["api"].Endpoints[0].Mcp.Versions[0] = "mutated"
+	assert.Equal(t, "/usr", policy.Filesystem.ReadOnly[0])
+	assert.Equal(t, []uint32{443}, policy.NetworkPolicies["api"].Endpoints[0].Ports)
+	assert.Equal(t, []string{"2025-11-25"}, policy.NetworkPolicies["api"].Endpoints[0].Mcp.Versions)
+}
+
+func TestPolicyDocumentFromInternalProtoDeduplicatesLegacyValues(t *testing.T) {
+	internal := &sbv1.SandboxPolicy{
+		Version: 1,
+		NetworkPolicies: map[string]*sbv1.NetworkPolicyRule{
+			"api": {
+				Endpoints: []*sbv1.NetworkEndpoint{{
+					Host:     "api.example.com",
+					Ports:    []uint32{443, 8443, 443},
+					Protocol: "http",
+					Rules: []*sbv1.L7Rule{{Allow: &sbv1.L7Allow{
+						Method: "GET",
+						Query: map[string]*sbv1.L7QueryMatcher{
+							"state": {Any: []string{"open", "closed", "open"}},
+						},
+					}}},
+				}},
+			},
+		},
+	}
+
+	policy := PolicyDocumentFromInternalProto(internal)
+	require.NotNil(t, policy)
+	endpoint := policy.NetworkPolicies["api"].Endpoints[0]
+	assert.Equal(t, []uint32{443, 8443}, endpoint.Ports)
+	require.NotNil(t, endpoint.Rules[0].Allow)
+	assert.Equal(t, []string{"open", "closed"}, endpoint.Rules[0].Allow.Query["state"].Any)
+
+	// Policy updates use the checked conversion path, so a projected policy
+	// must satisfy the public protobuf uniqueness constraints before submission.
+	_, err := PolicyDocumentToProtoChecked(policy)
+	require.NoError(t, err)
 }
 
 func TestSandboxPolicyRoundTrip(t *testing.T) {
-	original := &v1.SandboxPolicy{
+	original := &v1.PolicyDocument{
 		Version: 5,
 		Filesystem: &v1.FilesystemPolicy{
 			IncludeWorkdir: true,
@@ -204,22 +445,22 @@ func TestSandboxPolicyRoundTrip(t *testing.T) {
 			"web-api": {
 				Name: "web-api",
 				Endpoints: []v1.PolicyNetworkEndpoint{
-					{Host: "api.example.com", Port: 443, Protocol: "rest"},
+					{Host: "api.example.com", Ports: []uint32{443}, Protocol: "rest"},
 				},
 			},
 			"db": {
 				Name: "db",
 				Endpoints: []v1.PolicyNetworkEndpoint{
-					{Host: "db.internal", Port: 5432, Protocol: "tcp"},
+					{Host: "db.internal", Ports: []uint32{5432}, Protocol: "tcp"},
 				},
 			},
 		},
 	}
 
-	proto := SandboxPolicyToProto(original)
+	proto := PolicyDocumentToProto(original)
 	require.NotNil(t, proto)
 
-	roundTrip := SandboxPolicyFromProto(proto)
+	roundTrip := PolicyDocumentFromProto(proto)
 	require.NotNil(t, roundTrip)
 
 	assert.Equal(t, original.Version, roundTrip.Version)
@@ -254,30 +495,30 @@ func TestSandboxPolicyRoundTrip(t *testing.T) {
 
 func TestSandboxPolicyDeepCopy(t *testing.T) {
 	// Build a proto, convert to SDK, mutate proto, verify SDK is isolated.
-	proto := &sbv1.SandboxPolicy{
+	proto := &policyv1.PolicyDocument{
 		Version: 1,
-		Filesystem: &sbv1.FilesystemPolicy{
+		FilesystemPolicy: &policyv1.FilesystemPolicy{
 			IncludeWorkdir: true,
 			ReadOnly:       []string{"/original"},
 			ReadWrite:      []string{"/tmp"},
 		},
-		NetworkPolicies: map[string]*sbv1.NetworkPolicyRule{
+		NetworkPolicies: map[string]*policyv1.NetworkPolicyRule{
 			"rule1": {
 				Name: "rule1",
-				Endpoints: []*sbv1.NetworkEndpoint{
-					{Host: "original.host", Port: 80},
+				Endpoints: []*policyv1.NetworkEndpoint{
+					{Host: "original.host", Ports: []uint32{80}},
 				},
 			},
 		},
 	}
 
-	sdk := SandboxPolicyFromProto(proto)
+	sdk := PolicyDocumentFromProto(proto)
 	require.NotNil(t, sdk)
 
 	// Mutate proto source after conversion.
 	proto.Version = 99
-	proto.Filesystem.ReadOnly[0] = "mutated"
-	proto.Filesystem.ReadWrite[0] = "mutated"
+	proto.FilesystemPolicy.ReadOnly[0] = "mutated"
+	proto.FilesystemPolicy.ReadWrite[0] = "mutated"
 	proto.NetworkPolicies["rule1"].Name = "mutated"
 	proto.NetworkPolicies["rule1"].Endpoints[0].Host = "mutated.host"
 
@@ -289,25 +530,25 @@ func TestSandboxPolicyDeepCopy(t *testing.T) {
 	assert.Equal(t, "original.host", sdk.NetworkPolicies["rule1"].Endpoints[0].Host)
 
 	// Also test ToProto deep-copy isolation.
-	protoOut := SandboxPolicyToProto(sdk)
+	protoOut := PolicyDocumentToProto(sdk)
 	require.NotNil(t, protoOut)
 
 	// Mutate SDK after ToProto conversion.
 	sdk.Filesystem.ReadOnly[0] = "sdk-mutated"
 
 	// Proto output must be unaffected.
-	assert.Equal(t, "/original", protoOut.Filesystem.ReadOnly[0])
+	assert.Equal(t, "/original", protoOut.FilesystemPolicy.ReadOnly[0])
 }
 
 func TestSandboxPolicyPartialSubPolicies(t *testing.T) {
 	t.Run("only filesystem", func(t *testing.T) {
-		original := &v1.SandboxPolicy{
+		original := &v1.PolicyDocument{
 			Version: 1,
 			Filesystem: &v1.FilesystemPolicy{
 				ReadOnly: []string{"/etc"},
 			},
 		}
-		roundTrip := SandboxPolicyFromProto(SandboxPolicyToProto(original))
+		roundTrip := PolicyDocumentFromProto(PolicyDocumentToProto(original))
 		require.NotNil(t, roundTrip)
 		require.NotNil(t, roundTrip.Filesystem)
 		assert.Nil(t, roundTrip.Landlock)
@@ -316,13 +557,13 @@ func TestSandboxPolicyPartialSubPolicies(t *testing.T) {
 	})
 
 	t.Run("only landlock", func(t *testing.T) {
-		original := &v1.SandboxPolicy{
+		original := &v1.PolicyDocument{
 			Version: 2,
 			Landlock: &v1.LandlockPolicy{
 				Compatibility: "hard_requirement",
 			},
 		}
-		roundTrip := SandboxPolicyFromProto(SandboxPolicyToProto(original))
+		roundTrip := PolicyDocumentFromProto(PolicyDocumentToProto(original))
 		require.NotNil(t, roundTrip)
 		assert.Nil(t, roundTrip.Filesystem)
 		require.NotNil(t, roundTrip.Landlock)
@@ -332,12 +573,12 @@ func TestSandboxPolicyPartialSubPolicies(t *testing.T) {
 	})
 
 	t.Run("only process", func(t *testing.T) {
-		original := &v1.SandboxPolicy{
+		original := &v1.PolicyDocument{
 			Process: &v1.ProcessPolicy{
 				RunAsUser: "nobody",
 			},
 		}
-		roundTrip := SandboxPolicyFromProto(SandboxPolicyToProto(original))
+		roundTrip := PolicyDocumentFromProto(PolicyDocumentToProto(original))
 		require.NotNil(t, roundTrip)
 		assert.Nil(t, roundTrip.Filesystem)
 		assert.Nil(t, roundTrip.Landlock)
@@ -346,12 +587,12 @@ func TestSandboxPolicyPartialSubPolicies(t *testing.T) {
 	})
 
 	t.Run("only network policies", func(t *testing.T) {
-		original := &v1.SandboxPolicy{
+		original := &v1.PolicyDocument{
 			NetworkPolicies: map[string]v1.NetworkPolicyRule{
 				"r1": {Name: "r1"},
 			},
 		}
-		roundTrip := SandboxPolicyFromProto(SandboxPolicyToProto(original))
+		roundTrip := PolicyDocumentFromProto(PolicyDocumentToProto(original))
 		require.NotNil(t, roundTrip)
 		assert.Nil(t, roundTrip.Filesystem)
 		assert.Nil(t, roundTrip.Landlock)
@@ -360,11 +601,11 @@ func TestSandboxPolicyPartialSubPolicies(t *testing.T) {
 	})
 
 	t.Run("empty network policies map preserved", func(t *testing.T) {
-		proto := &sbv1.SandboxPolicy{
-			NetworkPolicies: map[string]*sbv1.NetworkPolicyRule{},
+		proto := &policyv1.PolicyDocument{
+			NetworkPolicies: map[string]*policyv1.NetworkPolicyRule{},
 		}
 		// Proto empty map is non-nil, so converter creates an empty SDK map.
-		sdk := SandboxPolicyFromProto(proto)
+		sdk := PolicyDocumentFromProto(proto)
 		require.NotNil(t, sdk)
 		require.NotNil(t, sdk.NetworkPolicies)
 		assert.Empty(t, sdk.NetworkPolicies)
@@ -471,9 +712,9 @@ func TestSandboxPolicyRevisionFromProto_WithPolicy(t *testing.T) {
 		Version:    1,
 		PolicyHash: "sha256:def",
 		Status:     pb.PolicyStatus_POLICY_STATUS_LOADED,
-		Policy: &sbv1.SandboxPolicy{
+		Policy: &policyv1.PolicyDocument{
 			Version: 2,
-			Filesystem: &sbv1.FilesystemPolicy{
+			FilesystemPolicy: &policyv1.FilesystemPolicy{
 				ReadOnly: []string{"/etc"},
 			},
 		},
@@ -481,7 +722,7 @@ func TestSandboxPolicyRevisionFromProto_WithPolicy(t *testing.T) {
 
 	rev := SandboxPolicyRevisionFromProto(proto)
 	require.NotNil(t, rev)
-	require.NotNil(t, rev.Policy, "typed SandboxPolicy should be populated when proto policy is set")
+	require.NotNil(t, rev.Policy, "typed PolicyDocument should be populated when proto policy is set")
 	assert.Equal(t, uint32(2), rev.Policy.Version)
 	require.NotNil(t, rev.Policy.Filesystem)
 	assert.Equal(t, []string{"/etc"}, rev.Policy.Filesystem.ReadOnly)
@@ -615,10 +856,10 @@ func TestDraftHistoryEntryFromProto_Nil(t *testing.T) {
 
 // --- NetworkMiddleware ---
 
-func TestSandboxPolicyFromProto_WithMiddleware(t *testing.T) {
-	proto := &sbv1.SandboxPolicy{
+func TestPolicyDocumentFromProto_WithMiddleware(t *testing.T) {
+	proto := &policyv1.PolicyDocument{
 		Version: 3,
-		NetworkMiddlewares: map[string]*sbv1.NetworkMiddlewareConfig{
+		NetworkMiddlewares: map[string]*policyv1.NetworkMiddleware{
 			"sigv4-rewriter": {
 				Name:       "sigv4-rewriter",
 				Middleware: "aws-sigv4",
@@ -631,7 +872,7 @@ func TestSandboxPolicyFromProto_WithMiddleware(t *testing.T) {
 					})
 					return s
 				}(),
-				Endpoints: &sbv1.MiddlewareEndpointSelector{
+				Endpoints: &policyv1.MiddlewareEndpointSelector{
 					Include: []string{"*.bedrock.amazonaws.com"},
 					Exclude: []string{"sts.amazonaws.com"},
 				},
@@ -639,7 +880,7 @@ func TestSandboxPolicyFromProto_WithMiddleware(t *testing.T) {
 		},
 	}
 
-	policy := SandboxPolicyFromProto(proto)
+	policy := PolicyDocumentFromProto(proto)
 
 	require.NotNil(t, policy)
 	require.Contains(t, policy.NetworkMiddlewares, "sigv4-rewriter")
@@ -657,7 +898,7 @@ func TestSandboxPolicyFromProto_WithMiddleware(t *testing.T) {
 }
 
 func TestSandboxPolicyMiddlewareRoundTrip(t *testing.T) {
-	original := &v1.SandboxPolicy{
+	original := &v1.PolicyDocument{
 		Version: 5,
 		NetworkMiddlewares: map[string]v1.NetworkMiddlewareConfig{
 			"rate-limiter": {
@@ -675,10 +916,10 @@ func TestSandboxPolicyMiddlewareRoundTrip(t *testing.T) {
 		},
 	}
 
-	proto := SandboxPolicyToProto(original)
+	proto := PolicyDocumentToProto(original)
 	require.NotNil(t, proto)
 
-	roundTrip := SandboxPolicyFromProto(proto)
+	roundTrip := PolicyDocumentFromProto(proto)
 	require.NotNil(t, roundTrip)
 
 	require.Contains(t, roundTrip.NetworkMiddlewares, "rate-limiter")
@@ -692,17 +933,17 @@ func TestSandboxPolicyMiddlewareRoundTrip(t *testing.T) {
 }
 
 func TestSandboxPolicyMiddlewareDeepCopy(t *testing.T) {
-	proto := &sbv1.SandboxPolicy{
-		NetworkMiddlewares: map[string]*sbv1.NetworkMiddlewareConfig{
+	proto := &policyv1.PolicyDocument{
+		NetworkMiddlewares: map[string]*policyv1.NetworkMiddleware{
 			"test": {
-				Endpoints: &sbv1.MiddlewareEndpointSelector{
+				Endpoints: &policyv1.MiddlewareEndpointSelector{
 					Include: []string{"original.com"},
 				},
 			},
 		},
 	}
 
-	policy := SandboxPolicyFromProto(proto)
+	policy := PolicyDocumentFromProto(proto)
 	proto.NetworkMiddlewares["test"].Endpoints.Include[0] = "mutated.com"
 
 	assert.Equal(t, "original.com", policy.NetworkMiddlewares["test"].Endpoints.Include[0])

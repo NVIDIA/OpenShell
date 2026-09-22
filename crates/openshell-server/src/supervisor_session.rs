@@ -20,7 +20,7 @@ use openshell_core::proto::{
     PeerRelayFrame, PeerRelayInit, ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen,
     ReportEndpointStatusRequest, ReportEndpointStatusResponse, ReportMainProcessExitRequest,
     ReportMainProcessExitResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
-    Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget, SupervisorMessage, gateway_message,
+    SandboxPhase, SessionAccepted, SshRelayTarget, SupervisorMessage, gateway_message,
     open_shell_client, peer_relay_frame, relay_open, supervisor_message,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
@@ -29,6 +29,7 @@ use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::grpc::provider_readiness::ProviderReadinessEvidence;
 use crate::persistence::ObjectId;
+use crate::storage_proto::StoredSandbox as Sandbox;
 use crate::supervisor_owner::{OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwnerIndex};
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;

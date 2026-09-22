@@ -7,6 +7,29 @@
 //! pure schema validation, and lexical policy-path normalization. Runtime and
 //! protobuf adaptation intentionally live in `openshell-policy`.
 
+/// Generated public authored-policy messages.
+pub mod proto {
+    #![allow(
+        clippy::all,
+        clippy::pedantic,
+        clippy::nursery,
+        dead_code,
+        unused_imports,
+        unused_qualifications,
+        rust_2018_idioms
+    )]
+
+    include!(concat!(env!("OUT_DIR"), "/openshell.policy.v1.rs"));
+}
+
+mod generated;
+
+pub use generated::{
+    parse_policy_proto, parse_policy_proto_file, policy_proto_to_json_value,
+    serialize_policy_proto, validate_authored_l7_deny_rule, validate_authored_l7_rule,
+    validate_authored_network_binary, validate_authored_policy,
+};
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
@@ -218,11 +241,7 @@ pub struct NetworkEndpoint {
     pub host: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
-    /// Single port (backwards compat). Mutually exclusive with `ports`.
-    /// Uses `u16` to reject invalid values >65535 at parse time.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub port: u16,
-    /// Multiple ports. When non-empty, this endpoint covers all listed ports.
+    /// Destination ports. Every authored endpoint has at least one unique port.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -455,12 +474,6 @@ pub struct MiddlewareEndpointSelector {
     pub include: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
-}
-
-// Signature dictated by serde's `skip_serializing_if`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_zero(value: &u16) -> bool {
-    *value == 0
 }
 
 // Signature dictated by serde's `skip_serializing_if`.
@@ -728,7 +741,6 @@ fn inspect_endpoint(value: &serde_yml::Value, path: &str) -> InspectionResult {
         &[
             "host",
             "path",
-            "port",
             "ports",
             "protocol",
             "tls",
@@ -1020,14 +1032,10 @@ impl NetworkPolicyRule {
 }
 
 impl NetworkEndpoint {
-    /// Effective authored ports. A non-empty `ports` list takes precedence.
+    /// Effective authored ports.
     #[must_use]
     pub fn effective_ports(&self) -> Vec<u16> {
-        if self.ports.is_empty() {
-            (self.port != 0).then_some(self.port).into_iter().collect()
-        } else {
-            self.ports.clone()
-        }
+        self.ports.clone()
     }
 
     /// Whether this endpoint is uninspected L4 traffic.
@@ -1130,7 +1138,7 @@ mod tests {
     #[test]
     fn rejects_oversized_port() {
         assert!(parse_policy(
-            "version: 1\nnetwork_policies:\n  x:\n    endpoints:\n      - host: x\n        port: 65536\n",
+            "version: 1\nnetwork_policies:\n  x:\n    endpoints:\n      - host: x\n        ports: [65536]\n",
         )
         .is_err());
     }
@@ -1141,7 +1149,7 @@ mod tests {
             "version: 1\nfilesystem_policy: null\n",
             "version: 1\nprocess: null\n",
             "version: 1\nmetadata: null\n",
-            "version: 1\nnetwork_policies:\n  x:\n    endpoints:\n      - host: x\n        port: 443\n        mcp: null\n",
+            "version: 1\nnetwork_policies:\n  x:\n    endpoints:\n      - host: x\n        ports: [443]\n        mcp: null\n",
         ] {
             assert!(
                 parse_policy(source).is_err(),
@@ -1181,7 +1189,7 @@ mod tests {
                 "network_policies.api.future",
             ),
             (
-                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, future: true }] } }\n",
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, ports: [443], future: true }] } }\n",
                 "network_policies.api.endpoints[0].future",
             ),
             (
@@ -1197,39 +1205,39 @@ mod tests {
                 "network_middlewares.audit.endpoints.future",
             ),
             (
-                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, credential_binding: { provider: p, future: true } }] } }\n",
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, ports: [443], credential_binding: { provider: p, future: true } }] } }\n",
                 "network_policies.api.endpoints[0].credential_binding.future",
             ),
             (
-                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, json_rpc: { future: true } }] } }\n",
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, ports: [443], json_rpc: { future: true } }] } }\n",
                 "network_policies.api.endpoints[0].json_rpc.future",
             ),
             (
-                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, protocol: mcp, mcp: { future: true } }] } }\n",
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, ports: [443], protocol: mcp, mcp: { future: true } }] } }\n",
                 "network_policies.api.endpoints[0].mcp.future",
             ),
             (
-                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, graphql_persisted_queries: { op: { future: true } } }] } }\n",
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, ports: [443], graphql_persisted_queries: { op: { future: true } } }] } }\n",
                 "network_policies.api.endpoints[0].graphql_persisted_queries.op.future",
             ),
             (
-                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, rules: [{ future: true, allow: {} }] }] } }\n",
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, ports: [443], rules: [{ future: true, allow: {} }] }] } }\n",
                 "network_policies.api.endpoints[0].rules[0].future",
             ),
             (
-                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, rules: [{ allow: { future: true } }] }] } }\n",
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, ports: [443], rules: [{ allow: { future: true } }] }] } }\n",
                 "network_policies.api.endpoints[0].rules[0].allow.future",
             ),
             (
-                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, deny_rules: [{ future: true }] }] } }\n",
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, ports: [443], deny_rules: [{ future: true }] }] } }\n",
                 "network_policies.api.endpoints[0].deny_rules[0].future",
             ),
             (
-                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, rules: [{ allow: { query: { q: { any: [one], future: true } } } }] }] } }\n",
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, ports: [443], rules: [{ allow: { query: { q: { any: [one], future: true } } } }] }] } }\n",
                 "network_policies.api.endpoints[0].rules[0].allow.query.q.future",
             ),
             (
-                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, port: 443, rules: [{ allow: { tool: { any: [one], future: true } } }] }] } }\n",
+                "version: 1\nnetwork_policies: { api: { endpoints: [{ host: example.com, ports: [443], rules: [{ allow: { tool: { any: [one], future: true } } }] }] } }\n",
                 "network_policies.api.endpoints[0].rules[0].allow.tool.future",
             ),
         ];
@@ -1256,7 +1264,7 @@ network_policies:
   mcp:
     endpoints:
       - host: mcp.example.com
-        port: 443
+        ports: [443]
         protocol: mcp
         mcp: {}
         rules:
@@ -1280,7 +1288,7 @@ network_policies:
   mcp:
     endpoints:
       - host: mcp.example.com
-        port: 443
+        ports: [443]
         protocol: mcp
         mcp: {}
         rules:
@@ -1340,7 +1348,7 @@ network_policies:
   api:
     endpoints:
       - host: example.com
-        port: 443
+        ports: [443]
         review: { required: true, reason: human approval }
         rules:
           - allow:

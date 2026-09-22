@@ -22,8 +22,11 @@ use sha2::{Digest, Sha256};
 use tonic::Status;
 use tracing::debug;
 
-use crate::persistence::{ObjectListQuery, ObjectType, Store};
-use crate::storage_proto::StoredProviderProfile;
+use crate::persistence::{ObjectListQuery, Store};
+use crate::storage_proto::{
+    StoredProviderProfileData, StoredProviderProfileWire as StoredProviderProfile,
+    provider_profile_from_public, provider_profile_to_public,
+};
 
 const USER_SOURCE_ID: &str = "user";
 
@@ -38,12 +41,6 @@ pub enum ProfileScope {
 pub struct ScopedSnapshotProfile {
     pub scope: ProfileScope,
     pub profile: ProviderProfile,
-}
-
-impl ObjectType for StoredProviderProfile {
-    fn object_type() -> &'static str {
-        "provider_profile"
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -100,7 +97,7 @@ impl ProviderProfileSource for UserProviderProfileSource {
             let resource_version = stored_profile_resource_version(&stored);
             hasher.update(resource_version.to_le_bytes());
             if let Some(profile) = stored.profile {
-                let mut profile = profile_response_payload(profile, resource_version);
+                let mut profile = profile_response_payload(profile, resource_version)?;
                 normalize_provider_profile_mcp_fields(&mut profile);
                 hasher.update(profile.encode_to_vec());
                 profiles.push(ScopedSnapshotProfile {
@@ -121,7 +118,7 @@ impl ProviderProfileSource for UserProviderProfileSource {
                 let resource_version = stored_profile_resource_version(&stored);
                 hasher.update(resource_version.to_le_bytes());
                 if let Some(profile) = stored.profile {
-                    let mut profile = profile_response_payload(profile, resource_version);
+                    let mut profile = profile_response_payload(profile, resource_version)?;
                     normalize_provider_profile_mcp_fields(&mut profile);
                     hasher.update(profile.encode_to_vec());
                     profiles.push(ScopedSnapshotProfile {
@@ -552,12 +549,15 @@ fn build_effective_profiles(
                 .iter()
                 .filter(|sp| sp.scope == ProfileScope::Platform)
                 .map(|sp| {
-                    (
-                        source_id.to_string(),
-                        ProviderTypeProfile::from_proto(&sp.profile),
-                    )
+                    ProviderTypeProfile::try_from_proto(&sp.profile)
+                        .map(|profile| (source_id.to_string(), profile))
                 })
-                .collect();
+                .collect::<Result<_, _>>()
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "provider profile source '{source_id}' is invalid: {error}"
+                    ))
+                })?;
             if !platform.is_empty() {
                 validate_source_profiles(source_id, &platform)?;
             }
@@ -566,12 +566,15 @@ fn build_effective_profiles(
                 .iter()
                 .filter(|sp| sp.scope == ProfileScope::Workspace)
                 .map(|sp| {
-                    (
-                        source_id.to_string(),
-                        ProviderTypeProfile::from_proto(&sp.profile),
-                    )
+                    ProviderTypeProfile::try_from_proto(&sp.profile)
+                        .map(|profile| (source_id.to_string(), profile))
                 })
-                .collect();
+                .collect::<Result<_, _>>()
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "provider profile source '{source_id}' is invalid: {error}"
+                    ))
+                })?;
             if !workspace.is_empty() {
                 validate_source_profiles(source_id, &workspace)?;
             }
@@ -580,12 +583,15 @@ fn build_effective_profiles(
                 .profiles
                 .iter()
                 .map(|sp| {
-                    (
-                        source_id.to_string(),
-                        ProviderTypeProfile::from_proto(&sp.profile),
-                    )
+                    ProviderTypeProfile::try_from_proto(&sp.profile)
+                        .map(|profile| (source_id.to_string(), profile))
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "provider profile source '{source_id}' is invalid: {error}"
+                    ))
+                })?;
             validate_source_profiles(source_id, &source_profiles)?;
         }
 
@@ -718,7 +724,7 @@ fn profile_snapshot_revision(profiles: &[ProviderProfile]) -> String {
 pub fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
     use crate::persistence::current_time_ms;
     let now_ms = current_time_ms();
-    let profile = profile_storage_payload(profile);
+    let profile = profile_storage_payload(profile).expect("test provider profile must be valid");
     StoredProviderProfile {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: uuid::Uuid::new_v4().to_string(),
@@ -734,19 +740,21 @@ pub fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfil
     }
 }
 
-pub fn profile_storage_payload(mut profile: ProviderProfile) -> ProviderProfile {
+pub fn profile_storage_payload(
+    mut profile: ProviderProfile,
+) -> Result<StoredProviderProfileData, Status> {
     profile.resource_version = 0;
     profile.source = String::new();
     profile.scope = String::new();
-    profile
+    provider_profile_from_public(&profile)
 }
 
 pub fn profile_response_payload(
-    mut profile: ProviderProfile,
+    mut profile: StoredProviderProfileData,
     resource_version: u64,
-) -> ProviderProfile {
+) -> Result<ProviderProfile, Status> {
     profile.resource_version = resource_version;
-    profile
+    provider_profile_to_public(&profile)
 }
 
 pub fn stored_profile_resource_version(stored: &StoredProviderProfile) -> u64 {
@@ -919,19 +927,19 @@ mod tests {
         let mut profile = profile(id);
         profile
             .endpoints
-            .push(openshell_core::proto::NetworkEndpoint {
+            .push(openshell_core::proto::policy::NetworkEndpoint {
                 host: "mcp.example.com".to_string(),
-                port: 443,
+                ports: vec![443],
                 protocol: "mcp".to_string(),
-                mcp: Some(openshell_core::proto::McpOptions {
+                mcp: Some(openshell_core::proto::policy::McpConfig {
                     versions: versions
                         .iter()
                         .map(|version| (*version).to_string())
                         .collect(),
                     ..Default::default()
                 }),
-                rules: vec![openshell_core::proto::L7Rule {
-                    allow: Some(openshell_core::proto::L7Allow {
+                rules: vec![openshell_core::proto::policy::L7Rule {
+                    allow: Some(openshell_core::proto::policy::L7Allow {
                         method: "tools/list".to_string(),
                         ..Default::default()
                     }),
@@ -945,13 +953,13 @@ mod tests {
         let mut profile = profile(id);
         profile
             .endpoints
-            .push(openshell_core::proto::NetworkEndpoint {
+            .push(openshell_core::proto::policy::NetworkEndpoint {
                 host: "mcp.example.com".to_string(),
-                port: 443,
+                ports: vec![443],
                 protocol: "mcp".to_string(),
                 mcp: None,
-                rules: vec![openshell_core::proto::L7Rule {
-                    allow: Some(openshell_core::proto::L7Allow {
+                rules: vec![openshell_core::proto::policy::L7Rule {
+                    allow: Some(openshell_core::proto::policy::L7Allow {
                         method: "tools/list".to_string(),
                         ..Default::default()
                     }),
@@ -1066,7 +1074,7 @@ mod tests {
     fn mcp_profile_normalization_preserves_malformed_explicit_evidence() {
         let mut malformed = profile_with_mcp_versions(
             "malformed-version-profile",
-            &["latest", "2025-11-25", "2025-11-25"],
+            &["2025-11-25", "2025-11-25", "latest"],
         );
         malformed.description = "unrelated source-owned field".to_string();
         let original = malformed.clone();
@@ -1095,7 +1103,7 @@ mod tests {
         assert!(
             error
                 .message()
-                .contains("duplicate MCP protocol version '2025-11-25'"),
+                .contains("duplicate protocol version '2025-11-25'"),
             "validation must reject the preserved duplicate before the later unsupported alias: {error}"
         );
     }
@@ -1601,7 +1609,7 @@ mod tests {
         use crate::persistence::current_time_ms;
         let now_ms = current_time_ms();
         let proto = profile(id);
-        let proto = profile_storage_payload(proto);
+        let proto = profile_storage_payload(proto).unwrap();
         StoredProviderProfile {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: uuid::Uuid::new_v4().to_string(),

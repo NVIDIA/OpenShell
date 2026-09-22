@@ -36,7 +36,7 @@ discovery:
   credentials: [api_key]
 endpoints:
   - host: api.openai.com
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce

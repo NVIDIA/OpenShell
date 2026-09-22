@@ -18,13 +18,13 @@ use crate::provider_profile_sources::{
 };
 use crate::storage_proto::{
     StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
-    StoredProviderProfile,
+    StoredProviderProfileWire as StoredProviderProfile,
 };
 use openshell_core::metadata::ObjectWorkspace;
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshStrategy,
     ProviderCredentialTokenGrantAudienceOverride, ProviderCredentialTokenGrantType,
-    ProviderProfile, ProviderProfileCredential, Sandbox, StaticCredentialBinding,
+    ProviderProfile, ProviderProfileCredential, StaticCredentialBinding,
     StaticCredentialEndpointBinding,
 };
 use openshell_core::telemetry::{
@@ -36,6 +36,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use tonic::Status;
 use tracing::warn;
+
+use crate::storage_proto::StoredSandbox as Sandbox;
 
 use super::validation::{validate_provider_fields, validate_provider_mutable_fields};
 use super::{MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_PROVIDER_CONFIG_ENTRIES};
@@ -1165,13 +1167,13 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                 .endpoints
                 .iter()
                 .flat_map(|endpoint| {
-                    endpoint_ports(endpoint.port, &endpoint.ports)
-                        .into_iter()
-                        .map(move |port| StaticCredentialEndpointBinding {
+                    endpoint.ports.iter().copied().map(move |port| {
+                        StaticCredentialEndpointBinding {
                             host: endpoint.host.clone(),
                             port,
                             path: endpoint.path.clone(),
-                        })
+                        }
+                    })
                 })
                 .collect::<Vec<_>>()
         });
@@ -1521,7 +1523,7 @@ fn insert_dynamic_credentials_for_profile(
             continue;
         }
         for endpoint in &profile.endpoints {
-            for port in endpoint_ports(endpoint.port, &endpoint.ports) {
+            for &port in &endpoint.ports {
                 insert_dynamic_credentials_for_endpoint(
                     dynamic_creds,
                     &endpoint.host,
@@ -1533,14 +1535,6 @@ fn insert_dynamic_credentials_for_profile(
                 );
             }
         }
-    }
-}
-
-fn endpoint_ports(port: u32, ports: &[u32]) -> Vec<u32> {
-    if ports.is_empty() {
-        if port == 0 { Vec::new() } else { vec![port] }
-    } else {
-        ports.iter().copied().filter(|port| *port != 0).collect()
     }
 }
 
@@ -2104,7 +2098,7 @@ fn dynamic_token_grant_bindings_for_profile(
             continue;
         }
         for endpoint in &profile.endpoints {
-            for port in endpoint_ports(endpoint.port, &endpoint.ports) {
+            for &port in &endpoint.ports {
                 push_dynamic_token_grant_bindings_for_endpoint(
                     &mut bindings,
                     provider_name,
@@ -2812,7 +2806,7 @@ pub(super) async fn handle_import_provider_profiles(
 
     let mut imported = Vec::with_capacity(profiles.len());
     for (_, profile) in profiles {
-        let mut stored = stored_provider_profile_for_workspace(profile.to_proto(), &workspace);
+        let mut stored = stored_provider_profile_for_workspace(profile.to_proto(), &workspace)?;
         let profile_labels = stored.object_labels();
         let profile_labels_json = if profile_labels.as_ref().is_none_or(HashMap::is_empty) {
             None
@@ -2843,7 +2837,7 @@ pub(super) async fn handle_import_provider_profiles(
         imported.push(profile_response_payload(
             stored.profile.unwrap_or_default(),
             resource_version,
-        ));
+        )?);
     }
 
     Ok(Response::new(ImportProviderProfilesResponse {
@@ -2951,7 +2945,7 @@ pub(super) async fn handle_update_provider_profiles(
         )));
     }
 
-    stored.profile = Some(profile_storage_payload(profile.to_proto()));
+    stored.profile = Some(profile_storage_payload(profile.to_proto())?);
     let labels_json = stored
         .object_labels()
         .filter(|labels| !labels.is_empty())
@@ -2978,7 +2972,7 @@ pub(super) async fn handle_update_provider_profiles(
     }
     replay_facts.resource(&stored)?;
     let resource_version = stored_profile_resource_version(&stored);
-    let profile = profile_response_payload(stored.profile.unwrap_or_default(), resource_version);
+    let profile = profile_response_payload(stored.profile.unwrap_or_default(), resource_version)?;
 
     Ok(Response::new(UpdateProviderProfilesResponse {
         diagnostics: Vec::new(),
@@ -3158,7 +3152,8 @@ pub(super) async fn get_provider_type_profile(
         if let Some(profile) = sp.profile.as_ref()
             && normalize_profile_id(&profile.id) == id_norm
         {
-            return Ok(Some(ProviderTypeProfile::from_proto(profile)));
+            let profile = crate::storage_proto::provider_profile_to_public(profile)?;
+            return Ok(Some(ProviderTypeProfile::from_proto(&profile)));
         }
     }
     // Fall back to builtin profiles (workspace-agnostic).
@@ -3436,7 +3431,16 @@ fn profiles_from_import_items(
                 });
             }
         }
-        profiles.push((source, ProviderTypeProfile::from_proto(profile)));
+        match ProviderTypeProfile::try_from_proto(profile) {
+            Ok(profile) => profiles.push((source, profile)),
+            Err(error) => diagnostics.push(ProfileValidationDiagnostic {
+                source,
+                profile_id: profile.id.clone(),
+                field: "profile".to_string(),
+                message: error.to_string(),
+                severity: "error".to_string(),
+            }),
+        }
     }
     (profiles, diagnostics)
 }
@@ -3674,10 +3678,10 @@ async fn profile_attached_sandbox_diagnostics(
                     .credentials
                     .keys()
                     .any(|key| !is_non_injectable_provider_credential(&provider, key));
-                let has_usable_endpoint = profile.to_proto().endpoints.iter().any(|endpoint| {
-                    !endpoint_ports(endpoint.port, &endpoint.ports).is_empty()
-                        && !endpoint.host.trim().is_empty()
-                });
+                let has_usable_endpoint =
+                    profile.to_proto().endpoints.iter().any(|endpoint| {
+                        !endpoint.ports.is_empty() && !endpoint.host.trim().is_empty()
+                    });
                 let has_policy_binding = super::policy::policy_has_credential_binding_for_provider(
                     &base_policy,
                     provider_name,
@@ -3782,11 +3786,11 @@ async fn profile_attached_sandbox_diagnostics(
 fn stored_provider_profile_for_workspace(
     profile: ProviderProfile,
     workspace: &str,
-) -> StoredProviderProfile {
+) -> Result<StoredProviderProfile, Status> {
     use crate::persistence::current_time_ms;
     let now_ms = current_time_ms();
-    let profile = profile_storage_payload(profile);
-    StoredProviderProfile {
+    let profile = profile_storage_payload(profile)?;
+    Ok(StoredProviderProfile {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: uuid::Uuid::new_v4().to_string(),
             name: profile.id.clone(),
@@ -3798,12 +3802,12 @@ fn stored_provider_profile_for_workspace(
             deletion_time: None,
         }),
         profile: Some(profile),
-    }
+    })
 }
 
 #[cfg(test)]
 fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
-    stored_provider_profile_for_workspace(profile, "default")
+    stored_provider_profile_for_workspace(profile, "default").unwrap()
 }
 
 fn proto_diagnostic(diagnostic: ProfileValidationDiagnostic) -> ProviderProfileDiagnostic {
@@ -5140,6 +5144,10 @@ mod tests {
         authed_request, test_server_state, test_server_state_without_provider_profiles,
     };
     use crate::grpc::{MAX_MAP_KEY_LEN, MAX_PROVIDER_TYPE_LEN};
+    use crate::storage_proto::{StoredSandbox as Sandbox, StoredSandboxSpec as SandboxSpec};
+    use openshell_core::proto::policy::{
+        L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule,
+    };
 
     /// An in-memory store with the example profiles imported at platform scope.
     ///
@@ -5162,14 +5170,13 @@ mod tests {
         AttachSandboxProviderRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
         CreateWorkspaceRequest, DeleteProviderProfileRequest, DeleteProviderRefreshRequest,
         DeleteProviderRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
-        GetProviderRequest, ImportProviderProfilesRequest, L7Allow, L7Rule,
-        LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-        NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
+        GetProviderRequest, ImportProviderProfilesRequest, LintProviderProfilesRequest,
+        ListProviderProfilesRequest, ListProvidersRequest, ProviderCredentialRefresh,
         ProviderCredentialRefreshMaterial, ProviderCredentialTokenGrant,
         ProviderCredentialTokenGrantAudienceOverride, ProviderCredentialTokenGrantSubjectToken,
         ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
         ProviderProfileCredential, ProviderProfileImportItem, RotateProviderCredentialRequest,
-        Sandbox, SandboxPolicy, SandboxSpec, UpdateProviderProfilesRequest, UpdateProviderRequest,
+        UpdateProviderProfilesRequest, UpdateProviderRequest,
     };
     use openshell_core::{ObjectId, ObjectName};
     use tonic::{Code, Request};
@@ -5353,7 +5360,7 @@ mod tests {
                 .iter()
                 .map(|(host, _)| NetworkEndpoint {
                     host: (*host).to_string(),
-                    port: 80,
+                    ports: vec![80],
                     ..Default::default()
                 })
                 .collect(),
@@ -5388,10 +5395,10 @@ mod tests {
         profile.credentials = vec![token_grant_credential("access_token")];
         profile.endpoints = vec![NetworkEndpoint {
             host: host.to_string(),
-            port,
+            ports: vec![port],
             path: path.to_string(),
             protocol: "rest".to_string(),
-            access: openshell_core::proto::NetworkAccessPreset::Full as i32,
+            access: "full".to_string(),
             ..Default::default()
         }];
         handle_import_provider_profiles(
@@ -5531,10 +5538,10 @@ mod tests {
         profile.credentials = vec![token_grant_credential("access_token")];
         profile.endpoints = vec![NetworkEndpoint {
             host: "api.example.com".to_string(),
-            port: 443,
+            ports: vec![443],
             path: "/v1/**".to_string(),
             protocol: "rest".to_string(),
-            access: openshell_core::proto::NetworkAccessPreset::Full as i32,
+            access: "full".to_string(),
             ..Default::default()
         }];
         let response = handle_import_provider_profiles(
@@ -5621,7 +5628,7 @@ mod tests {
         updated_profile.display_name = "Updated API".to_string();
         updated_profile.endpoints = vec![NetworkEndpoint {
             host: "api.updated.example".to_string(),
-            port: 443,
+            ports: vec![443],
             ..Default::default()
         }];
         let response = handle_update_provider_profiles(
@@ -5891,10 +5898,10 @@ mod tests {
         profile.credentials = vec![token_grant_credential("access_token")];
         profile.endpoints = vec![NetworkEndpoint {
             host: "api.example.com".to_string(),
-            port: 443,
+            ports: vec![443],
             path: "/v1/**".to_string(),
             protocol: "rest".to_string(),
-            access: openshell_core::proto::NetworkAccessPreset::Full as i32,
+            access: "full".to_string(),
             ..Default::default()
         }];
         let response = handle_update_provider_profiles(
@@ -6143,7 +6150,7 @@ mod tests {
         let mut profile = custom_profile(id);
         profile.endpoints.push(NetworkEndpoint {
             host: String::new(),
-            port: 0,
+            ports: vec![0],
             ..Default::default()
         });
         profile
@@ -6602,7 +6609,7 @@ mod tests {
         let mut initial_profile = custom_profile("fanout-ambiguity");
         initial_profile.endpoints.push(NetworkEndpoint {
             host: "other.example.com".to_string(),
-            port: 443,
+            ports: vec![443],
             ..Default::default()
         });
         let imported = handle_import_provider_profiles(
@@ -6646,21 +6653,27 @@ mod tests {
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["fanout-provider".to_string()],
-                    policy: Some(SandboxPolicy {
-                        network_policies: HashMap::from([(
-                            "base".to_string(),
-                            NetworkPolicyRule {
-                                name: "base".to_string(),
-                                endpoints: vec![NetworkEndpoint {
-                                    host: "api.example.com".to_string(),
-                                    port: 443,
-                                    ..Default::default()
-                                }],
+                    policy: Some(
+                        openshell_policy::lower_authored_policy(
+                            openshell_core::proto::policy::PolicyDocument {
+                                version: 1,
+                                network_policies: HashMap::from([(
+                                    "base".to_string(),
+                                    NetworkPolicyRule {
+                                        name: "base".to_string(),
+                                        endpoints: vec![NetworkEndpoint {
+                                            host: "api.example.com".to_string(),
+                                            ports: vec![443],
+                                            ..Default::default()
+                                        }],
+                                        ..Default::default()
+                                    },
+                                )]),
                                 ..Default::default()
                             },
-                        )]),
-                        ..Default::default()
-                    }),
+                        )
+                        .unwrap(),
+                    ),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -6672,8 +6685,8 @@ mod tests {
         conflicting_profile.resource_version = resource_version;
         conflicting_profile.endpoints.push(NetworkEndpoint {
             host: "api.example.com".to_string(),
-            port: 443,
-            tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
+            ports: vec![443],
+            tls: "skip".to_string(),
             ..Default::default()
         });
         let response = handle_update_provider_profiles(
@@ -6889,6 +6902,10 @@ mod tests {
     #[tokio::test]
     async fn import_provider_profiles_rejects_mixed_batch_without_partial_import() {
         let state = test_server_state().await;
+        let mut oversized = custom_profile("bulk-bad");
+        oversized.binaries.push(NetworkBinary {
+            path: "x".repeat(4097),
+        });
         let response = handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
@@ -6899,7 +6916,7 @@ mod tests {
                         source: "bulk-one.yaml".to_string(),
                     },
                     ProviderProfileImportItem {
-                        profile: Some(custom_profile_with_invalid_endpoint("bulk-bad")),
+                        profile: Some(oversized),
                         source: "bulk-bad.yaml".to_string(),
                     },
                     ProviderProfileImportItem {
@@ -6920,8 +6937,10 @@ mod tests {
         assert!(response.profiles.is_empty());
         assert!(response.diagnostics.iter().any(|diagnostic| {
             diagnostic.profile_id == "bulk-bad"
-                && diagnostic.field == "endpoints[0]"
-                && diagnostic.message.contains("invalid endpoint")
+                && diagnostic.field == "profile"
+                && diagnostic
+                    .message
+                    .contains("invalid authored network policy")
         }));
 
         for id in ["bulk-one", "bulk-two"] {
@@ -7055,8 +7074,10 @@ mod tests {
         assert!(!response.valid);
         assert!(response.diagnostics.iter().any(|diagnostic| {
             diagnostic.profile_id == "lint-bad"
-                && diagnostic.field == "endpoints[0]"
-                && diagnostic.message.contains("invalid endpoint")
+                && diagnostic.field == "profile"
+                && diagnostic
+                    .message
+                    .contains("invalid authored network policy")
         }));
 
         for id in ["lint-one", "lint-two"] {
@@ -7258,10 +7279,10 @@ mod tests {
         let state = test_server_state().await;
         state
             .store
-            .put_message(&stored_provider_profile_for_workspace(
-                custom_profile("global-custom"),
-                "",
-            ))
+            .put_message(
+                &stored_provider_profile_for_workspace(custom_profile("global-custom"), "")
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let catalog = state
@@ -9829,7 +9850,7 @@ mod tests {
         profile.credentials = vec![static_credential("token", "GITHUB_TOKEN", true)];
         profile.endpoints = vec![NetworkEndpoint {
             host: "github.enterprise.example".to_string(),
-            port: 443,
+            ports: vec![443],
             allow_uninspected_credentials: true,
             ..Default::default()
         }];
@@ -9999,7 +10020,7 @@ mod tests {
         ];
         profile.endpoints = vec![NetworkEndpoint {
             host: "api.example.com".to_string(),
-            port: 443,
+            ports: vec![443],
             allow_uninspected_credentials: true,
             ..Default::default()
         }];
@@ -11014,10 +11035,10 @@ mod tests {
         profile.credentials = vec![refreshable_credential("access_token", "ACCESS_TOKEN")];
         profile.endpoints = vec![NetworkEndpoint {
             host: "api.example.com".to_string(),
-            port: 443,
+            ports: vec![443],
             path: "/v1/**".to_string(),
             protocol: "rest".to_string(),
-            access: openshell_core::proto::NetworkAccessPreset::Full as i32,
+            access: "full".to_string(),
             ..Default::default()
         }];
         handle_import_provider_profiles(
@@ -12686,7 +12707,7 @@ mod tests {
 
     #[tokio::test]
     async fn handler_flow_resolves_credentials_from_sandbox_providers() {
-        use openshell_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
+        use openshell_core::proto::SandboxPhase;
 
         let store = test_store().await;
 
@@ -12755,7 +12776,7 @@ mod tests {
 
     #[tokio::test]
     async fn handler_flow_returns_empty_when_no_providers() {
-        use openshell_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
+        use openshell_core::proto::SandboxPhase;
 
         let store = test_store().await;
 
@@ -12792,8 +12813,6 @@ mod tests {
 
     #[tokio::test]
     async fn handler_flow_returns_none_for_unknown_sandbox() {
-        use openshell_core::proto::Sandbox;
-
         let store = test_store().await;
         let result = store.get_message::<Sandbox>("nonexistent").await.unwrap();
         assert!(result.is_none());
@@ -14846,11 +14865,10 @@ mod tests {
     #[tokio::test]
     async fn provider_with_global_profile_resolves_platform_scoped_profile() {
         use crate::persistence::{ObjectName, WriteCondition};
-        use prost::Message;
-
         let store = test_store().await;
 
-        let stored = stored_provider_profile_for_workspace(custom_profile("global-custom"), "");
+        let stored =
+            stored_provider_profile_for_workspace(custom_profile("global-custom"), "").unwrap();
         store
             .put_if(
                 StoredProviderProfile::object_type(),

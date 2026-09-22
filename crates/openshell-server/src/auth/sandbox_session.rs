@@ -6,13 +6,14 @@
 use std::collections::HashMap;
 
 use openshell_core::jwt::{AuthenticatedSandboxSession, CredentialEpoch, SessionJwtError};
-use openshell_core::proto::{Sandbox, SandboxPhase};
+use openshell_core::proto::SandboxPhase;
 use openshell_core::sandbox_generation::SandboxGenerationId;
 use sha2::{Digest as _, Sha256};
 use tonic::Status;
 use uuid::Uuid;
 
 use crate::persistence::Store;
+use crate::storage_proto::StoredSandbox as Sandbox;
 
 pub const RUNTIME_GENERATION_ANNOTATION: &str = "internal.openshell.ai/runtime-generation";
 pub const AUTH_EPOCH_ANNOTATION: &str = "internal.openshell.ai/auth-epoch";

@@ -21,10 +21,10 @@ use openshell_core::proto::gateway_interceptor::v1::{
     interceptor_evaluation,
 };
 use openshell_core::proto::{
-    ListSandboxesRequest, ProviderProfile, Sandbox, SandboxPhase, SandboxPolicy,
-    UpdateConfigRequest, open_shell_client::OpenShellClient,
+    ListSandboxesRequest, ProviderProfile, Sandbox, SandboxPhase, UpdateConfigRequest,
+    open_shell_client::OpenShellClient, policy::PolicyDocument,
 };
-use openshell_policy::parse_sandbox_policy;
+use openshell_policy::parse_authored_policy;
 use openshell_providers::{ProviderTypeProfile, normalize_profile_id};
 use policy_hash::{
     HASH_ALGORITHM, canonical_policy_hash, canonical_profile_hash,
@@ -58,7 +58,7 @@ const PROFILE_JWT_SUBJECT_PREFIX: &str = "provider-profile:";
 const CREATE_SANDBOX_CORRELATION_PREFIX: &str = "governance:create-sandbox";
 const RELOAD_CORRELATION_PREFIX: &str = "governance:reload-policy";
 const SERVICE: &str = "openshell.v1.OpenShell";
-const SANDBOX_POLICY_TYPE: &str = "openshell.sandbox.v1.SandboxPolicy";
+const SANDBOX_POLICY_TYPE: &str = "openshell.policy.v1.PolicyDocument";
 const DEFAULT_POLICY_WATCH_INTERVAL_MS: u64 = 1_000;
 
 #[derive(Clone)]
@@ -243,7 +243,7 @@ struct GovernanceInterceptorService {
 #[derive(Clone, Debug)]
 struct PolicyState {
     policy: Value,
-    policy_proto: SandboxPolicy,
+    policy_document: PolicyDocument,
     policy_hash: String,
     policy_signature: String,
     policy_signature_kid: String,
@@ -668,13 +668,13 @@ fn validate_signed_policy_payload(
     policy_state: &PolicyState,
     policy_signer: &PolicySigner,
 ) -> Result<(), String> {
-    let sandbox_policy = sandbox_policy_from_interceptor_json(policy)?;
-    let sandbox_policy_hash = canonical_policy_hash(&sandbox_policy)?;
+    let policy_document = policy_document_from_interceptor_json(policy)?;
+    let policy_document_hash = canonical_policy_hash(&policy_document)?;
     policy_signer
-        .verify_policy_signature(signature, &sandbox_policy_hash)
+        .verify_policy_signature(signature, &policy_document_hash)
         .map_err(|err| format!("sandbox policy signature is invalid: {err}"))?;
-    if sandbox_policy_hash != policy_state.policy_hash
-        || sandbox_policy != policy_state.policy_proto
+    if policy_document_hash != policy_state.policy_hash
+        || policy_document != policy_state.policy_document
     {
         return Err("sandbox policy must match the provider governance baseline".to_string());
     }
@@ -802,15 +802,15 @@ fn load_policy_state(
     policy_yaml: &str,
     policy_signer: &PolicySigner,
 ) -> Result<PolicyState, String> {
-    let policy_proto = parse_sandbox_policy(policy_yaml)
+    let policy_document = parse_authored_policy(policy_yaml)
         .map_err(|err| format!("failed to parse policy YAML: {err}"))?;
-    let policy = sandbox_policy_to_proto_json(&policy_proto)?;
+    let policy = policy_document_to_proto_json(&policy_document)?;
     let policy = normalize_for_struct(policy)?;
-    let policy_hash = canonical_policy_hash(&policy_proto)?;
+    let policy_hash = canonical_policy_hash(&policy_document)?;
     let policy_signature = policy_signer.sign_policy(&policy_hash)?;
     Ok(PolicyState {
         policy,
-        policy_proto,
+        policy_document,
         policy_hash,
         policy_signature,
         policy_signature_kid: policy_signer.kid().to_string(),
@@ -1083,15 +1083,15 @@ fn now_secs() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
-fn sandbox_policy_to_proto_json(policy: &SandboxPolicy) -> Result<Value, String> {
+fn policy_document_to_proto_json(policy: &PolicyDocument) -> Result<Value, String> {
     decode_message_to_json(SANDBOX_POLICY_TYPE, policy)
         .map_err(|err| format!("failed to render policy protobuf JSON: {err}"))
 }
 
-fn sandbox_policy_from_interceptor_json(policy: &Value) -> Result<SandboxPolicy, String> {
+fn policy_document_from_interceptor_json(policy: &Value) -> Result<PolicyDocument, String> {
     let bytes = encode_json_to_message(SANDBOX_POLICY_TYPE, policy)
         .map_err(|err| format!("sandbox policy cannot be decoded as protobuf JSON: {err}"))?;
-    SandboxPolicy::decode(bytes.as_slice())
+    PolicyDocument::decode(bytes.as_slice())
         .map_err(|err| format!("sandbox policy protobuf payload is invalid: {err}"))
 }
 
@@ -1269,7 +1269,7 @@ async fn propagate_policy_to_running_sandboxes(
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
-                    policy: Some(policy_state.policy_proto.clone()),
+                    policy: Some(policy_state.policy_document.clone()),
                     annotations: policy_update_annotations(policy_state, &correlation_id),
                     expected_resource_version: resource_version,
                     ..Default::default()

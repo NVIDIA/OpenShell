@@ -51,6 +51,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .include_file("openshell.rs")
+        // The public authored-policy package is generated exactly once by
+        // openshell-policy-schema. API messages refer to that Rust type.
+        .extern_path(".openshell.policy.v1", "::openshell_policy_schema::proto")
         // Emit a binary FileDescriptorSet so the server can enumerate every
         // RPC at runtime (used by the per-handler auth exhaustiveness test).
         .file_descriptor_set_path(&descriptor_path)

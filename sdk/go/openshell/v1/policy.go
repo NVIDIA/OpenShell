@@ -9,8 +9,8 @@ import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 )
 
-// SandboxPolicy is the top-level security policy configuration for a sandbox.
-type SandboxPolicy = types.SandboxPolicy
+// PolicyDocument is the top-level security policy configuration for a sandbox.
+type PolicyDocument = types.PolicyDocument
 
 // FilesystemPolicy controls which directories the sandbox can access.
 type FilesystemPolicy = types.FilesystemPolicy

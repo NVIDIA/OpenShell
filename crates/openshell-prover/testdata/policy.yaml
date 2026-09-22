@@ -34,14 +34,14 @@ network_policies:
     endpoints:
       # REST API — L7 enforced, read-only
       - host: api.github.com
-        port: 443
+        ports: [443]
         protocol: rest
         enforcement: enforce
         access: read-only
       # github.com — for git clone.
       # No protocol field — L4 only.
       - host: github.com
-        port: 443
+        ports: [443]
     binaries:
       - { path: /usr/local/bin/claude }
       - { path: /usr/bin/git }

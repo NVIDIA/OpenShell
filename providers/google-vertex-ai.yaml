@@ -86,22 +86,22 @@ discovery:
   credentials: [service_account_token, gcloud_adc_token]
 endpoints:
   - host: "*-aiplatform.googleapis.com"
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce
   - host: "aiplatform.googleapis.com"
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce
   - host: "aiplatform.us.rep.googleapis.com"
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce
   - host: "aiplatform.eu.rep.googleapis.com"
-    port: 443
+    ports: [443]
     protocol: rest
     access: read-write
     enforcement: enforce
