@@ -1366,8 +1366,8 @@ mod linux {
         sandbox_id: String,
         spec: AgentSpecWire,
         policy: SandboxPolicyWire,
-        ca_cert: Option<Vec<u8>>,
-        ca_bundle: Option<Vec<u8>>,
+        ca_cert: Option<String>,
+        ca_bundle: Option<String>,
         provider_env_revision: u64,
         provider_env: std::collections::HashMap<String, String>,
     }
@@ -2361,8 +2361,8 @@ mod linux {
             sandbox_id: String,
             spec: AgentSpecWire,
             policy: SandboxPolicyWire,
-            ca_cert: Option<Vec<u8>>,
-            ca_bundle: Option<Vec<u8>>,
+            ca_cert: Option<String>,
+            ca_bundle: Option<String>,
             provider_env_revision: u64,
             provider_env: std::collections::HashMap<String, String>,
         ) -> Response {
@@ -2641,8 +2641,8 @@ mod linux {
     }
 
     fn install_ca_material(
-        ca_cert: Option<Vec<u8>>,
-        ca_bundle: Option<Vec<u8>>,
+        ca_cert: Option<String>,
+        ca_bundle: Option<String>,
     ) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>, String> {
         let (ca_cert, ca_bundle) = match (ca_cert, ca_bundle) {
             (Some(ca_cert), Some(ca_bundle)) => (ca_cert, ca_bundle),
@@ -2655,8 +2655,8 @@ mod linux {
         };
         install_ca_material_at(
             Path::new(openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR),
-            &ca_cert,
-            &ca_bundle,
+            ca_cert.as_bytes(),
+            ca_bundle.as_bytes(),
         )
     }
 

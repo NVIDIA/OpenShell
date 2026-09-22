@@ -371,15 +371,17 @@ impl ReadyBoundary for RemoteReady {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let (ca_cert, ca_bundle) = if let Some((ca_cert, ca_bundle)) = ca_paths {
-            let ca_cert = tokio::fs::read(&ca_cert).await.map_err(|error| {
+            let ca_cert = tokio::fs::read_to_string(&ca_cert).await.map_err(|error| {
                 BackendError::Process(format!("read host proxy CA {}: {error}", ca_cert.display()))
             })?;
-            let ca_bundle = tokio::fs::read(&ca_bundle).await.map_err(|error| {
-                BackendError::Process(format!(
-                    "read host proxy CA bundle {}: {error}",
-                    ca_bundle.display()
-                ))
-            })?;
+            let ca_bundle = tokio::fs::read_to_string(&ca_bundle)
+                .await
+                .map_err(|error| {
+                    BackendError::Process(format!(
+                        "read host proxy CA bundle {}: {error}",
+                        ca_bundle.display()
+                    ))
+                })?;
             (Some(ca_cert), Some(ca_bundle))
         } else {
             (None, None)
@@ -3166,8 +3168,8 @@ mod tests {
                     sandbox_id: context.sandbox_id,
                     spec: AgentSpecWire::from(context.agent),
                     policy: Box::new(SandboxPolicyWire::from(context.policy)),
-                    ca_cert: Some(vec![b'c'; 16 * 1024]),
-                    ca_bundle: Some(vec![b'b'; 256 * 1024]),
+                    ca_cert: Some("c".repeat(16 * 1024)),
+                    ca_bundle: Some("b".repeat(256 * 1024)),
                     provider_env_revision: 0,
                     provider_env: HashMap::new(),
                 })
@@ -3225,8 +3227,8 @@ mod tests {
                     sandbox_id: context.sandbox_id,
                     spec: AgentSpecWire::from(context.agent),
                     policy: Box::new(SandboxPolicyWire::from(context.policy)),
-                    ca_cert: Some(vec![b'c'; 16 * 1024]),
-                    ca_bundle: Some(vec![b'b'; 256 * 1024]),
+                    ca_cert: Some("c".repeat(16 * 1024)),
+                    ca_bundle: Some("b".repeat(256 * 1024)),
                     provider_env_revision: 0,
                     provider_env: HashMap::new(),
                 })

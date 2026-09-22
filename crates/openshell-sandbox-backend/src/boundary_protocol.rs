@@ -672,8 +672,8 @@ pub enum Request {
         sandbox_id: String,
         spec: AgentSpecWire,
         policy: Box<SandboxPolicyWire>,
-        ca_cert: Option<Vec<u8>>,
-        ca_bundle: Option<Vec<u8>>,
+        ca_cert: Option<String>,
+        ca_bundle: Option<String>,
         provider_env_revision: u64,
         provider_env: std::collections::HashMap<String, String>,
     },
@@ -1472,8 +1472,8 @@ mod tests {
                     landlock: LandlockPolicy::default(),
                     process: ProcessPolicy::default(),
                 })),
-                ca_cert: Some(b"test certificate".to_vec()),
-                ca_bundle: Some(b"test bundle".to_vec()),
+                ca_cert: Some("test certificate".to_string()),
+                ca_bundle: Some("test bundle".to_string()),
                 provider_env_revision: 7,
                 provider_env: std::collections::HashMap::from([(
                     "OPENAI_API_KEY".to_string(),
@@ -1524,6 +1524,35 @@ mod tests {
             envelope.validate_payload_digest(),
             Err(FrameError::PayloadDigestMismatch)
         ));
+    }
+
+    #[test]
+    fn start_agent_with_large_ca_bundle_fits_in_frame_limit() {
+        let request = RequestEnvelope::new(Request::StartAgent {
+            sandbox_id: "sandbox-1".to_string(),
+            spec: AgentSpecWire {
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                workdir: None,
+                timeout_secs: 5,
+                interactive: false,
+            },
+            policy: Box::new(SandboxPolicyWire::from(SandboxPolicy {
+                version: 1,
+                filesystem: FilesystemPolicy::default(),
+                network: NetworkPolicy::default(),
+                landlock: LandlockPolicy::default(),
+                process: ProcessPolicy::default(),
+            })),
+            ca_cert: Some("A".repeat(16 * 1024)),
+            ca_bundle: Some("B".repeat(400 * 1024)),
+            provider_env_revision: 0,
+            provider_env: std::collections::HashMap::new(),
+        })
+        .expect("request envelope");
+        let frame = encode_frame(&request).expect("large CA bundle must fit in frame limit");
+        let decoded: RequestEnvelope = decode_frame(&frame).expect("round-trip");
+        assert_eq!(decoded, request);
     }
 
     #[test]
