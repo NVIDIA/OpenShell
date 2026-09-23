@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::debug;
 
+const MAX_IDENTITY_CACHE_ENTRIES: usize = 4096;
+
 #[derive(Clone)]
 struct FileFingerprint {
     len: u64,
@@ -97,6 +99,16 @@ pub struct BinaryIdentityCache {
     hashes: Mutex<HashMap<PathBuf, CachedBinary>>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SuppliedIdentityError {
+    #[error("{0}")]
+    Unavailable(String),
+    #[error(
+        "Binary identity cache capacity exhausted (maximum {MAX_IDENTITY_CACHE_ENTRIES} pinned paths)"
+    )]
+    CapacityExhausted,
+}
+
 impl Default for BinaryIdentityCache {
     fn default() -> Self {
         Self::new()
@@ -123,45 +135,55 @@ impl BinaryIdentityCache {
 
     /// Atomically verify or pin every authorization-capable executable in a
     /// backend-supplied identity chain.
-    pub fn verify_or_cache_supplied_identity(&self, identity: &BinaryIdentity) -> Result<()> {
+    pub(crate) fn verify_or_cache_supplied_identity(
+        &self,
+        identity: &BinaryIdentity,
+    ) -> std::result::Result<(), SuppliedIdentityError> {
         let mut supplied = HashMap::new();
         for executable in std::iter::once(&identity.executable).chain(&identity.ancestors) {
             if executable.path.as_os_str().is_empty() || !executable.path.is_absolute() {
-                return Err(miette::miette!(
+                return Err(SuppliedIdentityError::Unavailable(format!(
                     "Invalid executable identity path: {} must be absolute",
                     executable.path.display()
-                ));
+                )));
             }
             let digest = executable.digest.ok_or_else(|| {
-                miette::miette!(
+                SuppliedIdentityError::Unavailable(format!(
                     "Invalid executable identity evidence: {} has missing digest",
                     executable.path.display()
-                )
+                ))
             })?;
             if let Some(existing) = supplied.insert(executable.path.clone(), digest)
                 && existing != digest
             {
-                return Err(miette::miette!(
+                return Err(SuppliedIdentityError::Unavailable(format!(
                     "Invalid executable identity: conflicting evidence for {}",
                     executable.path.display()
-                ));
+                )));
             }
         }
 
-        let mut hashes = self
-            .hashes
-            .lock()
-            .map_err(|_| miette::miette!("Binary identity cache lock poisoned"))?;
+        let mut hashes = self.hashes.lock().map_err(|_| {
+            SuppliedIdentityError::Unavailable("Binary identity cache lock poisoned".to_string())
+        })?;
 
         for (path, digest) in &supplied {
             if let Some(existing) = hashes.get(path)
                 && existing.hash != digest.to_string()
             {
-                return Err(miette::miette!(
+                return Err(SuppliedIdentityError::Unavailable(format!(
                     "Binary integrity violation: {} executable changed",
                     path.display()
-                ));
+                )));
             }
+        }
+
+        let new_entry_count = supplied
+            .keys()
+            .filter(|path| !hashes.contains_key(*path))
+            .count();
+        if new_entry_count > MAX_IDENTITY_CACHE_ENTRIES.saturating_sub(hashes.len()) {
+            return Err(SuppliedIdentityError::CapacityExhausted);
         }
 
         for (path, digest) in supplied {
@@ -230,6 +252,12 @@ impl BinaryIdentityCache {
             return Err(miette::miette!(
                 "Binary integrity violation: {} executable changed",
                 cache_path.display()
+            ));
+        }
+
+        if !hashes.contains_key(cache_path) && hashes.len() >= MAX_IDENTITY_CACHE_ENTRIES {
+            return Err(miette::miette!(
+                "Binary identity cache capacity exhausted (maximum {MAX_IDENTITY_CACHE_ENTRIES} pinned paths)"
             ));
         }
 
@@ -424,6 +452,61 @@ mod tests {
                 .unwrap()
                 .contains_key(Path::new("/sandbox/other"))
         );
+    }
+
+    #[test]
+    fn supplied_identity_capacity_rejection_is_atomic() {
+        let cache = BinaryIdentityCache::new();
+        for index in 0..4095 {
+            cache
+                .verify_or_cache_supplied_identity(&supplied_identity(
+                    &format!("/sandbox/pinned-{index}"),
+                    Some("11"),
+                    &[],
+                ))
+                .unwrap();
+        }
+        let overflowing_chain = supplied_identity(
+            "/sandbox/new-leaf",
+            Some("22"),
+            &[("/sandbox/new-ancestor", Some("33"))],
+        );
+
+        let error = cache
+            .verify_or_cache_supplied_identity(&overflowing_chain)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("capacity"));
+        let hashes = cache.hashes.lock().unwrap();
+        assert_eq!(hashes.len(), 4095);
+        assert!(!hashes.contains_key(Path::new("/sandbox/new-leaf")));
+        assert!(!hashes.contains_key(Path::new("/sandbox/new-ancestor")));
+    }
+
+    #[test]
+    fn legacy_identity_observation_respects_cache_capacity() {
+        let executable = tempfile::NamedTempFile::new().unwrap();
+        let cache = BinaryIdentityCache::new();
+        for index in 0..4096 {
+            cache
+                .verify_or_cache_with_paths(
+                    &PathBuf::from(format!("/sandbox/pinned-{index}")),
+                    executable.path(),
+                    |_| Ok("11".repeat(32)),
+                )
+                .unwrap();
+        }
+
+        let error = cache
+            .verify_or_cache_with_paths(Path::new("/sandbox/overflow"), executable.path(), |_| {
+                Ok("11".repeat(32))
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("capacity"));
+        assert_eq!(cache.hashes.lock().unwrap().len(), 4096);
     }
 
     #[test]

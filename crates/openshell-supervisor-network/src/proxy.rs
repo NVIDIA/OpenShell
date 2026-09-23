@@ -7,7 +7,7 @@ pub(crate) mod destination;
 mod egress;
 mod relay;
 
-use crate::identity::BinaryIdentityCache;
+use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 #[cfg(target_os = "linux")]
@@ -617,25 +617,29 @@ async fn preauthorize_transparent_open(
             return None;
         }
     };
-    let mut decision = authorize_supplied_identity(
+    let supplied_authorization = authorize_supplied_identity_with_denial(
         opa_engine,
         identity_cache,
         EgressIntent::connect(host.clone(), destination.port()),
         &binary_identity,
     );
+    let mut decision = supplied_authorization.decision;
     if let NetworkAction::Deny { reason } = &decision.action {
-        warn!(%destination, %reason, "Denied staged transparent connection");
-        emit_staged_transparent_denial(
-            destination,
-            &binary_identity,
-            reason,
-            "transparent_tcp_policy_denied",
+        let (denial, status_detail) = supplied_authorization.denial.map_or(
+            (TcpOpenDenial::PolicyDenied, "transparent_tcp_policy_denied"),
+            |denial| match denial {
+                SuppliedIdentityDenial::IdentityUnavailable => (
+                    TcpOpenDenial::IdentityUnavailable,
+                    "transparent_tcp_identity_unavailable",
+                ),
+                SuppliedIdentityDenial::ResourceExhausted => (
+                    TcpOpenDenial::ResourceExhausted,
+                    "transparent_tcp_resource_exhausted",
+                ),
+            },
         );
-        let denial = if binary_identity.is_err() {
-            TcpOpenDenial::IdentityUnavailable
-        } else {
-            TcpOpenDenial::PolicyDenied
-        };
+        warn!(%destination, %reason, "Denied staged transparent connection");
+        emit_staged_transparent_denial(destination, &binary_identity, reason, status_detail);
         let _ = completion.send(TcpOpenDecision::Denied(denial));
         return None;
     }
@@ -3354,6 +3358,26 @@ fn authorize_supplied_identity(
     intent: EgressIntent,
     identity: &Result<ContractBinaryIdentity, ResolveError>,
 ) -> EgressDecision {
+    authorize_supplied_identity_with_denial(engine, identity_cache, intent, identity).decision
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SuppliedIdentityDenial {
+    IdentityUnavailable,
+    ResourceExhausted,
+}
+
+struct SuppliedIdentityAuthorization {
+    decision: EgressDecision,
+    denial: Option<SuppliedIdentityDenial>,
+}
+
+fn authorize_supplied_identity_with_denial(
+    engine: &OpaEngine,
+    identity_cache: &BinaryIdentityCache,
+    intent: EgressIntent,
+    identity: &Result<ContractBinaryIdentity, ResolveError>,
+) -> SuppliedIdentityAuthorization {
     let deny = |reason: String,
                 binary: Option<PathBuf>,
                 ancestors: Vec<PathBuf>,
@@ -3372,12 +3396,15 @@ fn authorize_supplied_identity(
     let identity = match identity {
         Ok(identity) => identity,
         Err(error) => {
-            return deny(
-                format!("backend identity resolution failed: {error}"),
-                None,
-                vec![],
-                vec![],
-            );
+            return SuppliedIdentityAuthorization {
+                decision: deny(
+                    format!("backend identity resolution failed: {error}"),
+                    None,
+                    vec![],
+                    vec![],
+                ),
+                denial: Some(SuppliedIdentityDenial::IdentityUnavailable),
+            };
         }
     };
     let ancestor_paths = identity
@@ -3386,12 +3413,19 @@ fn authorize_supplied_identity(
         .map(|ancestor| ancestor.path.clone())
         .collect::<Vec<_>>();
     if let Err(error) = identity_cache.verify_or_cache_supplied_identity(identity) {
-        return deny(
-            error.to_string(),
-            Some(identity.executable.path.clone()),
-            ancestor_paths,
-            identity.cmdline_paths.clone(),
-        );
+        let denial = match &error {
+            SuppliedIdentityError::Unavailable(_) => SuppliedIdentityDenial::IdentityUnavailable,
+            SuppliedIdentityError::CapacityExhausted => SuppliedIdentityDenial::ResourceExhausted,
+        };
+        return SuppliedIdentityAuthorization {
+            decision: deny(
+                error.to_string(),
+                Some(identity.executable.path.clone()),
+                ancestor_paths,
+                identity.cmdline_paths.clone(),
+            ),
+            denial: Some(denial),
+        };
     }
     let digest = identity
         .executable
@@ -3405,7 +3439,7 @@ fn authorize_supplied_identity(
         ancestors: ancestor_paths.clone(),
         cmdline_paths: identity.cmdline_paths.clone(),
     };
-    match engine.authorize_egress(&input) {
+    let decision = match engine.authorize_egress(&input) {
         Ok(authorization) => EgressDecision {
             intent,
             action: authorization.action.clone(),
@@ -3423,6 +3457,10 @@ fn authorize_supplied_identity(
             ancestor_paths,
             identity.cmdline_paths.clone(),
         ),
+    };
+    SuppliedIdentityAuthorization {
+        decision,
+        denial: None,
     }
 }
 
@@ -6920,6 +6958,138 @@ process:
         assert_eq!(
             denied_result.await.unwrap(),
             TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_transparent_open_reports_invalid_identity_as_unavailable() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            r#"
+network_policies:
+  allowed:
+    name: allowed
+    endpoints:
+      - host: 203.0.113.7
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#,
+        )
+        .unwrap();
+        let identity_cache = BinaryIdentityCache::new();
+        let (stream, _peer) = tokio::io::duplex(64);
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        let pending = PendingTcpOpen {
+            stream: Box::new(stream),
+            binary_identity: Ok(ContractBinaryIdentity {
+                executable: ContractExecutableIdentity {
+                    path: PathBuf::from("/usr/bin/curl"),
+                    digest: None,
+                },
+                ancestors: Vec::new(),
+                cmdline_paths: Vec::new(),
+            }),
+            destination: "203.0.113.7:443".parse().unwrap(),
+            socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
+                socket_cookie: 7,
+                nonblocking: false,
+                process_generation: 1,
+            },
+            policy_generation: engine.current_generation(),
+            timing: MediationTiming::default(),
+            decision,
+        };
+
+        assert!(
+            preauthorize_transparent_open(pending, None, &engine, &identity_cache, None, None)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            completion.await.unwrap(),
+            TcpOpenDecision::Denied(TcpOpenDenial::IdentityUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_transparent_open_reports_identity_cache_capacity_exhaustion() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            r#"
+network_policies:
+  allowed:
+    name: allowed
+    endpoints:
+      - host: 203.0.113.7
+        port: 443
+    binaries:
+      - path: /sandbox/overflow
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#,
+        )
+        .unwrap();
+        let identity_cache = BinaryIdentityCache::new();
+        for index in 0..4096 {
+            identity_cache
+                .verify_or_cache_supplied_identity(&ContractBinaryIdentity {
+                    executable: ContractExecutableIdentity {
+                        path: PathBuf::from(format!("/sandbox/pinned-{index}")),
+                        digest: Some("11".repeat(32).parse().unwrap()),
+                    },
+                    ancestors: Vec::new(),
+                    cmdline_paths: Vec::new(),
+                })
+                .unwrap();
+        }
+        let (stream, _peer) = tokio::io::duplex(64);
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        let pending = PendingTcpOpen {
+            stream: Box::new(stream),
+            binary_identity: Ok(ContractBinaryIdentity {
+                executable: ContractExecutableIdentity {
+                    path: PathBuf::from("/sandbox/overflow"),
+                    digest: Some("22".repeat(32).parse().unwrap()),
+                },
+                ancestors: Vec::new(),
+                cmdline_paths: Vec::new(),
+            }),
+            destination: "203.0.113.7:443".parse().unwrap(),
+            socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
+                socket_cookie: 7,
+                nonblocking: false,
+                process_generation: 1,
+            },
+            policy_generation: engine.current_generation(),
+            timing: MediationTiming::default(),
+            decision,
+        };
+
+        assert!(
+            preauthorize_transparent_open(pending, None, &engine, &identity_cache, None, None)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            completion.await.unwrap(),
+            TcpOpenDecision::Denied(TcpOpenDenial::ResourceExhausted)
         );
     }
 
