@@ -121,7 +121,13 @@ the gateway uid can access it.
 Sandbox create supports `--cpu` and `--memory` for per-sandbox compute sizing.
 Docker and Podman apply them as runtime limits. Kubernetes applies them as both
 container requests and limits. The VM driver accepts the fields but currently
-ignores them.
+ignores them. The MXC driver rejects CPU and memory requests because its current
+backends cannot enforce them.
+
+API clients that populate `SandboxTemplate.resources` directly must encode the
+`cpu` and `memory` values under `limits` or `requests` as non-empty strings.
+The gateway rejects malformed sections and non-string values with
+`InvalidArgument` instead of forwarding them as opaque driver configuration.
 
 Sandbox create also accepts experimental driver-owned config through
 `--driver-config-json`. The value is a JSON object keyed by driver name. The

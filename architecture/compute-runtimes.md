@@ -295,7 +295,10 @@ delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 Per-sandbox CPU and memory values currently enter the driver layer through
 template resource limits. Docker and Podman apply them as runtime limits.
 Kubernetes mirrors each limit into the matching request. VM accepts the fields
-but currently ignores them.
+but currently ignores them. MXC rejects them because its current backends cannot
+enforce them. At the public protobuf boundary, the gateway requires well-known
+`cpu` and `memory` entries under `limits` or `requests` to be non-empty strings;
+unknown resource entries remain available for platform-specific handling.
 
 Reusable sandbox workload templates are resolved before the compute-driver
 boundary. Drivers do not receive a separate template resource; the gateway

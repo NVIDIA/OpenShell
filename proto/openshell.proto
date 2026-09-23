@@ -979,7 +979,8 @@ message SandboxTemplate {
   map<string, string> annotations = 5;
   // Additional environment variables injected by the template.
   map<string, string> environment = 6;
-  // Platform-specific compute resource requirements and limits.
+  // Platform-specific compute resource requirements and limits. Well-known
+  // cpu and memory entries under limits or requests must be non-empty strings.
   google.protobuf.Struct resources = 7;
   reserved 9;
   reserved "volume_claim_templates";
