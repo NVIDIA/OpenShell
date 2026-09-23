@@ -314,7 +314,8 @@ output. One attachment owns stdin at a time. Use `sandbox exec --tty --
 
 Press `Ctrl-P`, then `Ctrl-Q` to disconnect without terminating the main
 process. `Ctrl-C` retains its normal terminal behavior and interrupts the
-foreground process.
+foreground process. For read-only attachments, `Ctrl-C` only exits the
+current viewer.
 
 Launch VS Code or Cursor directly into the sandbox workspace:
 
