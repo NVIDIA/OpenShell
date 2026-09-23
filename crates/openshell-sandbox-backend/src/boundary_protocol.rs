@@ -57,6 +57,32 @@ pub const BOUNDARY_CONNECTION_WINDOW_BYTES: u32 = BOUNDARY_MAX_CONCURRENT_STREAM
 // HTTP/2 caps any flow-control window at 2^31 - 1.
 const _: () = assert!(BOUNDARY_CONNECTION_WINDOW_BYTES <= i32::MAX as u32);
 
+/// Fence field used by a persisted sandbox bootstrap document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceWireFormat {
+    /// Backend-native evidence consumed by runtimes released before `outer_fence`.
+    LegacyDriverFence,
+    /// Backend-neutral guarantees consumed by current runtimes.
+    OuterFence,
+}
+
+/// Require a bootstrap document to contain exactly one supported fence field.
+pub fn fence_wire_format(
+    object: &serde_json::Map<String, serde_json::Value>,
+    description: &str,
+) -> Result<FenceWireFormat, BackendError> {
+    match (
+        object.contains_key("driver_fence"),
+        object.contains_key("outer_fence"),
+    ) {
+        (true, false) => Ok(FenceWireFormat::LegacyDriverFence),
+        (false, true) => Ok(FenceWireFormat::OuterFence),
+        _ => Err(BackendError::Descriptor(format!(
+            "decode {description}: expected exactly one of driver_fence or outer_fence"
+        ))),
+    }
+}
+
 /// Capability masks measured from `/proc/<pid>/status` by the `OpenShell`
 /// co-located runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1431,6 +1457,28 @@ pub enum FrameError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fence_wire_format_requires_exactly_one_supported_field() {
+        let legacy = serde_json::json!({"driver_fence": {}});
+        assert_eq!(
+            fence_wire_format(legacy.as_object().unwrap(), "test bootstrap").unwrap(),
+            FenceWireFormat::LegacyDriverFence
+        );
+
+        let current = serde_json::json!({"outer_fence": {}});
+        assert_eq!(
+            fence_wire_format(current.as_object().unwrap(), "test bootstrap").unwrap(),
+            FenceWireFormat::OuterFence
+        );
+
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"driver_fence": {}, "outer_fence": {}}),
+        ] {
+            assert!(fence_wire_format(invalid.as_object().unwrap(), "test bootstrap").is_err());
+        }
+    }
 
     fn complete_audit_evidence() -> NativeLinuxSandboxAuditEvidence {
         NativeLinuxSandboxAuditEvidence {

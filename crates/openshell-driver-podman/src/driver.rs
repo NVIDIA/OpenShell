@@ -1210,7 +1210,7 @@ impl PodmanComputeDriver {
                             child_env,
                             launch_authentication: &launch_authentication,
                             fence_wire_format:
-                                crate::isolation::BootstrapFenceWireFormat::OuterFence,
+                                openshell_sandbox_backend::boundary_protocol::FenceWireFormat::OuterFence,
                         },
                     )?;
                     self.client
