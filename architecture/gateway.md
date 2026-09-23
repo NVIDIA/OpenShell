@@ -516,23 +516,48 @@ whatever each bus kept; it does not align their depths.
 The broadcast receivers are subscribed before replay, so an event buffered during
 initialization could appear in both replay and the live receiver; the producer
 tracks the highest replayed seq and suppresses live events at or below it, so
-each event is delivered once. That mark is per source. The two tails are read at
-different instants and bounded independently, so one shared mark would let the
-deeper source censor the shallower one — with `event_tail` unset the mark rises
-to the newest buffered log while no platform event is replayed at all, and
-platform events published during initialization are discarded as duplicates of a
-replay that never ran. Subscribing never mints a cursor space, so a
-resume against a torn-down sandbox cannot create the space its stale cursor is
-then checked against. Clients track the highest observed `cursor` and pass it as
-`resume_after_cursor` on reconnect.
+each event is delivered once. That mark is per source, because the two tails are
+read at different instants and bounded independently — one shared mark would let
+the deeper source censor the shallower one, discarding the shallower source's own
+live arrivals as duplicates of a replay that never ran. Subscribing never mints a
+cursor space, so a resume against a torn-down sandbox cannot create the space its
+stale cursor is then checked against. Clients track the highest observed `cursor`
+and pass it as `resume_after_cursor` on reconnect.
 
-The epoch is validated twice on resume: once before reading the tails and again
-once both are in hand, before anything is emitted. The check and each read take
-their locks separately, so a teardown plus a republish can retire the validated
-space and install a replacement in between; the reads would then apply the old
-space's seq to the replacement's buffers, and a trimmed-range check that only
-compares numbers would report no gap while skipping the replacement's lower
-events. The second look ends the stream with `OUT_OF_RANGE` instead.
+On resume, both bus reads happen under one lock — `TracingLogBus::snapshot_after`
+— rather than as two independent calls. A publish landing between two
+independently-locked reads would be visible to whichever ran second and not the
+other, desyncing their high-water marks against a live stream that treats them as
+read at the same instant; holding the cursor-space lock (the same one every
+publish holds across its own tail insert) across both reads closes that window.
+The epoch is validated once before the reads, under this scheme — a second
+post-read check isn't needed once there's no window left for a teardown and
+republish to land in.
+
+#### Coverage floor
+
+A cursor is one opaque scalar shared by both sources; a client tracks its single
+highest observed value, not one per source. That's only safe if, for whatever
+cursor a batch hands out, *every* followed source can vouch it covered
+everything up to that point — otherwise a later resume replays each bus
+unconditionally past the cursor (`tail_after` isn't bounded by `log_tail_lines`
+or `event_tail`), and anything a shallower source withheld below that cursor is
+excluded forever with no gap reported, since it was never evicted, just never
+sent.
+
+`log_tail_lines` and `event_tail` bound the two tails independently, so their
+depths are routinely asymmetric — `event_tail` has no default, so `follow_events`
+without setting it replays no platform backlog at all. On connect, the server
+computes each followed source's **coverage floor** — the newest event that
+source's own window excluded — and withholds every event, from either source, at
+or above the smallest nonzero floor. A log event that clears the log bus's own
+floor can still sit at or past the platform bus's floor; handing it out would
+still let the client's cursor outrun platform's unreplayed backlog.
+
+This can withhold far more than either depth parameter alone implies — even the
+entire batch — whenever a followed sibling has any backlog the request didn't
+ask to replay. That is a deliberate trade-off: an emptier initial batch is
+preferable to a resume that silently and permanently drops events.
 
 ## Persistence
 
