@@ -78,7 +78,13 @@ openshell sandbox create \
   -- claude
 ```
 
-Driver config is disabled by default. Enable it with `allow_driver_config = true` in the driver's gateway configuration. Attached resources such as volumes must carry operator-approved labels. See [External Resource Admission](/how-it-works/gateways/configuration#external-resource-admission).
+Driver config is disabled by default except for MXC, whose required workload
+command uses driver config. MXC also disables resource label admission by
+default because its host filesystem grants have no trusted label resolver;
+explicitly enabling admission rejects MXC sandbox creates. Enable driver config
+for other drivers with `allow_driver_config = true` in the driver's gateway
+configuration. When resource admission is enabled, attached resources such as
+volumes must carry operator-approved labels. See [External Resource Admission](/how-it-works/gateways/configuration#external-resource-admission).
 
 To pin specific GPUs, pass `cdi_devices` for Docker or Podman, or `gpu_device_ids` for MicroVM, together with `--gpu`:
 

@@ -47,6 +47,7 @@ tempfile = "3"
 base64 = { workspace = true }
 rustls = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 # Used by the drift guard test (handled_fields_inventory) to parse YAML into a
 # generic serde_json::Value for key enumeration.
 serde_yml = { workspace = true }
