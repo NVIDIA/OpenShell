@@ -96,6 +96,11 @@ sudo loginctl enable-linger $USER
 
 ## Snap
 
+The OpenShell snap requires a running Docker daemon. Docker can come from the
+Docker snap, a distribution package, Docker's package repository, or another
+compatible installation method. Ensure that the Docker daemon is installed and
+running before installing the OpenShell snap.
+
 Install the OpenShell snap from the Snap Store:
 
 ```shell
@@ -115,36 +120,29 @@ typically `~/snap/openshell/common`. Gateway registrations live under
 
 ### Snap store installs
 
-When installing from the Snap Store, snapd automatically connects the `home`,
-`network`, and `network-bind` plugs. The `docker` plug still
-requires manual connection:
-
-```shell
-sudo snap connect openshell:docker docker:docker-daemon
-```
-
-The snap declares `default-provider: docker` on the Docker plug so snapd will
-offer to install the Docker snap, but the connection itself must be made
-manually.
+When installing OpenShell from the Snap Store, snapd automatically connects all
+required interfaces. The `docker` plug connects to the system `:docker` slot,
+which exposes the installed Docker daemon regardless of how Docker was
+packaged. The `log-observe` and `system-observe` plugs are also automatically
+connected through the OpenShell snap's store assertions.
 
 ### Locally built snap packages
 
-When installing a locally built `.snap` file, no plugs are connected by default:
+To install a locally-built snap, one can install directly from a `.snap` file
+with the `--dangerous` flag to acknowledge that it has not been signed by the
+Snap Store. Thus, it lacks the store assertions which tell snapd to auto-
+connect the privileged interfaces, so they must be connected manually.
 
 ```shell
 sudo snap install ./openshell_*.snap --dangerous
-sudo snap connect openshell:home
-sudo snap connect openshell:network
-sudo snap connect openshell:network-bind
-sudo snap connect openshell:docker docker:docker-daemon
 sudo snap connect openshell:log-observe
 sudo snap connect openshell:system-observe
+sudo snap connect openshell:docker :docker
 ```
 
 The `log-observe` and `system-observe` plugs are needed for the gateway service
-to read logs and inspect system processes. The `docker` plug requires the
-`docker:docker-daemon` slot from the Docker snap and does not work with
-system-installed Docker.
+to read logs and inspect system processes. The `docker` plug connects to the
+same system `:docker` slot used by Store installations.
 
 ### Gateway service
 

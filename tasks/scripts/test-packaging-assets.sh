@@ -79,8 +79,18 @@ assert_not_contains "$spec" '%%S/openshell/tls'
 
 # Schema-v2 package startup wiring.
 snap_wrapper="${ROOT}/tasks/scripts/snap-gateway-wrapper.sh"
+snapcraft="${ROOT}/snapcraft.yaml"
+snap_install_docs="${ROOT}/docs/about/installation.mdx"
+snap_canary="${ROOT}/.github/workflows/release-canary.yml"
+snap_repro="${ROOT}/nix/test-guest/scripts/snap-gateway-repro.sh"
+snap_docker_hook="${ROOT}/snap/hooks/connect-plug-docker"
 package_deb="${ROOT}/tasks/scripts/package-deb.sh"
 assert_file_exists "$snap_wrapper"
+assert_file_exists "$snapcraft"
+assert_file_exists "$snap_install_docs"
+assert_file_exists "$snap_canary"
+assert_file_exists "$snap_repro"
+assert_file_exists "$snap_docker_hook"
 assert_file_exists "$package_deb"
 assert_contains "$service" "ExecStartPre=/usr/bin/openshell-gateway config preflight"
 assert_contains "$package_deb" "\$src_dir/openshell-gateway.service"
@@ -92,6 +102,26 @@ assert_contains \
 assert_contains "$snap_wrapper" "config preflight -- --config \"\$CANONICAL_CONFIG_FILE\" \"\$@\""
 assert_not_contains "$snap_wrapper" "[ -f \"\$CANONICAL_CONFIG_FILE\" ]"
 bash "$ROOT/tasks/scripts/test-snap-gateway-wrapper.sh" "$snap_wrapper"
+
+# Store installs autoconnect all required interfaces. Assertionless local Snap
+# tests connect only the privileged plugs, with Docker using the system slot.
+for snap_file in \
+  "$snapcraft" \
+  "$snap_install_docs" \
+  "$snap_canary" \
+  "$snap_repro" \
+  "$snap_docker_hook"; do
+  assert_not_contains "$snap_file" "docker:docker-daemon"
+  assert_not_contains "$snap_file" "default-provider: docker"
+done
+assert_not_contains "$snap_install_docs" "snap connect openshell:home"
+assert_not_contains "$snap_install_docs" "snap connect openshell:network"
+assert_not_contains "$snap_install_docs" "snap connect openshell:network-bind"
+assert_not_contains "$snap_canary" "snap install docker"
+assert_not_contains "$snap_repro" "snap install docker"
+assert_contains "$snap_install_docs" "snap connect openshell:docker :docker"
+assert_contains "$snap_canary" "snap connect openshell:docker :docker"
+assert_contains "$snap_repro" "snap connect openshell:docker :docker"
 if ! awk '/config preflight/ { seen = 1 } /generate-certs/ { exit !seen }' "$service"; then
   echo "FAIL: Debian preflight must precede certificate generation" >&2
   exit 1

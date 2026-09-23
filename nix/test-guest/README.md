@@ -79,9 +79,9 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 | Rocky Linux 9 | Yes | Yes | No | Yes | `.rpm` |
 
 The `snapd` configuration is available for Ubuntu and prepares snapd for
-local Snap lifecycle experiments. It does not install Docker, because the Snap
-gateway reproduction uses the Docker **Snap** and its `docker:docker-daemon`
-interface rather than the host-package Docker configuration.
+local Snap lifecycle experiments. Combine it with the `docker` configuration
+to test the Snap gateway against package-installed Docker through the system
+`:docker` slot.
 
 `podman-rootless` configures the explicit rootless Podman guest setup used by
 OpenShell tests. It supports Fedora and Ubuntu 26.04 or later. Ubuntu adds the
@@ -301,12 +301,15 @@ nix run .#test-guest -- \
 The gateway Snap must be native to the guest architecture. Copy an existing
 Snap artifact and the reproduction script into a prepared Ubuntu guest, then
 run the script as root. It follows the Release Canary ordering exactly: install
-the Snap, connect Docker/log/system interfaces, and immediately query the
-gateway. On each failure it prints snapd and gateway journals.
+the Snap, manually connect the privileged Docker/log/system interfaces, and
+immediately query the gateway. These connections are required because the local
+Snap is installed with `--dangerous` and therefore has no Snap Store
+assertions. On each failure the script prints snapd and gateway journals.
 
 ```shell
 nix run .#test-guest -- \
   --distro ubuntu-24-04 \
+  --with docker \
   --with snapd \
   --keep \
   --copy ./openshell_*.snap:/tmp/openshell.snap \
