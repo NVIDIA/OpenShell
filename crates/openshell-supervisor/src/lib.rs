@@ -1428,13 +1428,7 @@ const PROXY_BASELINE_READ_ONLY: &[&str] = &[
 // policy.
 const PROXY_BASELINE_READ_WRITE: &[&str] = &["/tmp", "/dev/null"];
 
-/// GPU allowances belong to the workload-side sandbox, which can inspect its
-/// assigned devices. A remote supervisor may run on a GPU host even when the
-/// workload has no GPU, so its device namespace must not influence policy.
-fn baseline_enrichment_paths(include_proxy: bool) -> (Vec<String>, Vec<String>) {
-    if !include_proxy {
-        return (Vec::new(), Vec::new());
-    }
+fn proxy_baseline_paths() -> (Vec<String>, Vec<String>) {
     (
         PROXY_BASELINE_READ_ONLY
             .iter()
@@ -1508,7 +1502,10 @@ where
 ///
 /// Returns `true` if the policy was modified (caller may want to sync back).
 fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
-    let (ro, rw) = baseline_enrichment_paths(!proto.network_policies.is_empty());
+    if proto.network_policies.is_empty() {
+        return false;
+    }
+    let (ro, rw) = proxy_baseline_paths();
 
     // Baseline paths are system-injected, not user-specified.  Skip paths
     // that do not exist in this container image to avoid noisy warnings from
@@ -1554,10 +1551,10 @@ fn proto_sync_payload_for_enriched_policy(
 /// paths required by proxy-mode sandboxes. Used for the
 /// local-file code path where no proto is available.
 fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
-    let (ro, rw) = baseline_enrichment_paths(matches!(policy.network.mode, NetworkMode::Proxy));
-    if ro.is_empty() && rw.is_empty() {
+    if !matches!(policy.network.mode, NetworkMode::Proxy) {
         return;
     }
+    let (ro, rw) = proxy_baseline_paths();
 
     let mut modified = false;
     for path in &ro {
@@ -1618,14 +1615,14 @@ mod baseline_tests {
 
     #[test]
     fn proxy_baseline_keeps_proc_read_only_on_every_host() {
-        let (ro, rw) = baseline_enrichment_paths(true);
+        let (ro, rw) = proxy_baseline_paths();
         assert!(ro.contains(&"/proc".to_string()));
         assert!(!rw.contains(&"/proc".to_string()));
     }
 
     #[test]
     fn baseline_read_write_does_not_hardcode_sandbox() {
-        let (_ro, rw) = baseline_enrichment_paths(true);
+        let (_ro, rw) = proxy_baseline_paths();
         assert!(rw.contains(&"/tmp".to_string()));
         assert!(rw.contains(&"/dev/null".to_string()));
         assert!(!rw.contains(&"/sandbox".to_string()));
@@ -1633,7 +1630,7 @@ mod baseline_tests {
 
     #[test]
     fn no_duplicate_paths_in_baseline() {
-        let (ro, rw) = baseline_enrichment_paths(true);
+        let (ro, rw) = proxy_baseline_paths();
         // No path should appear in both lists.
         for path in &ro {
             assert!(
