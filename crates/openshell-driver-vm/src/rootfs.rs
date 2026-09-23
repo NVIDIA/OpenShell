@@ -876,52 +876,40 @@ pub fn ext4_image_has_directory(image_path: &Path, guest_path: &str) -> Result<b
     let quoted_path = debugfs_quote_absolute_path(guest_path)
         .ok_or_else(|| format!("invalid debugfs guest path '{guest_path}'"))?;
     let command = format!("stat {quoted_path}");
-    let mut last_error = None;
-
-    for candidate in e2fs_tool_candidates("debugfs") {
-        let label = candidate.display().to_string();
-        match Command::new(&candidate)
-            .arg("-R")
-            .arg(&command)
-            .arg(image_path)
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                // debugfs exits 0 whether or not the path exists; the answer
-                // is only in its output.
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if stdout.contains("Type: directory") {
-                    return Ok(true);
-                }
-                if stdout.contains("Type: ") || stderr.contains("File not found") {
-                    return Ok(false);
-                }
-                return Err(format!(
-                    "debugfs command '{command}' produced unrecognized output for {}\nstdout: {stdout}\nstderr: {stderr}",
-                    image_path.display()
-                ));
+    let output = e2fs_command("debugfs")?
+        .arg("-R")
+        .arg(&command)
+        .arg(image_path)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            // debugfs exits 0 whether or not the path exists; the answer
+            // is only in its output.
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stdout.contains("Type: directory") {
+                return Ok(true);
             }
-            Ok(output) => {
-                last_error = Some(format!(
-                    "{label} failed with status {}\nstdout: {}\nstderr: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ));
+            if stdout.contains("Type: ") || stderr.contains("File not found") {
+                return Ok(false);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                last_error = Some(format!("{label} not found"));
-            }
-            Err(error) => last_error = Some(format!("run {label}: {error}")),
+            Err(format!(
+                "debugfs command '{command}' produced unrecognized output for {}\nstdout: {stdout}\nstderr: {stderr}",
+                image_path.display()
+            ))
         }
+        Ok(output) => Err(format!(
+            "debugfs command '{command}' failed for {}: debugfs failed with status {}\nstdout: {}\nstderr: {}. Install e2fsprogs (debugfs) and retry",
+            image_path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(error) => Err(format!(
+            "debugfs command '{command}' failed for {}: {error}. Install e2fsprogs (debugfs) and retry",
+            image_path.display()
+        )),
     }
-
-    Err(format!(
-        "debugfs command '{command}' failed for {}: {}. Install e2fsprogs (debugfs) and retry",
-        image_path.display(),
-        last_error.unwrap_or_else(|| "debugfs not found".to_string())
-    ))
 }
 
 fn sandbox_guest_user_ids_from_image_path(
@@ -1563,10 +1551,15 @@ mod tests {
 
     #[test]
     fn ext4_image_has_directory_distinguishes_directories_files_and_missing_paths() {
-        if !e2fs_tool_candidates("debugfs")
-            .iter()
-            .any(|candidate| Command::new(candidate).arg("-V").output().is_ok())
-        {
+        let available = e2fs_command("debugfs")
+            .and_then(|mut command| {
+                command
+                    .arg("-V")
+                    .output()
+                    .map_err(|error| error.to_string())
+            })
+            .is_ok();
+        if !available {
             return;
         }
 
