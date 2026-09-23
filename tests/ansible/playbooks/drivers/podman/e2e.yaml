@@ -1,0 +1,95 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Run Podman E2E archive tests
+  hosts: all
+  gather_facts: false
+  vars:
+    podman_e2e_test_root: /var/lib/openshell-driver-tests/podman-e2e
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Create Podman E2E test directory
+      become: true
+      ansible.builtin.file:
+        path: "{{ podman_e2e_test_root }}"
+        state: directory
+        owner: tmachine
+        group: tmachine
+        mode: "0700"
+
+    - name: Install Podman E2E test bundle
+      become: true
+      ansible.builtin.unarchive:
+        src: "{{ openshell_podman_e2e_test_bundle }}"
+        dest: "{{ podman_e2e_test_root }}"
+        owner: tmachine
+        group: tmachine
+
+    - name: Remove any previous OpenShell gateway registration
+      ansible.builtin.command:
+        argv: [/usr/local/bin/openshell, gateway, remove, tmachine]
+      changed_when: false
+      failed_when: false
+
+    - name: Register the configured OpenShell gateway
+      ansible.builtin.command:
+        argv: [/usr/local/bin/openshell, gateway, add, http://127.0.0.1:17670, --local, --name, tmachine]
+
+    - name: Run Podman E2E archive tests
+      ansible.builtin.command:
+        argv:
+          - cargo-nextest
+          - nextest
+          - run
+          - --archive-file
+          - "{{ podman_e2e_test_root }}/tests.tar.zst"
+          - --workspace-remap
+          - "{{ podman_e2e_test_root }}"
+          - --test-threads
+          - "1"
+          - --no-fail-fast
+      environment:
+        CONTAINER_ENGINE: podman
+        CONTAINER_HOST: unix:///run/user/1000/podman/podman.sock
+        HOME: /home/tmachine
+        OPENSHELL_BIN: /usr/local/bin/openshell
+        OPENSHELL_E2E_CONTAINER_ENGINE_UNSET_XDG_CONFIG_HOME: "1"
+        OPENSHELL_E2E_DRIVER: podman
+        OPENSHELL_E2E_NETWORK_NAME: tmachine
+        OPENSHELL_E2E_SANDBOX_NAMESPACE: tmachine
+        OPENSHELL_GATEWAY: tmachine
+        OPENSHELL_PODMAN_SOCKET: /run/user/1000/podman/podman.sock
+        XDG_RUNTIME_DIR: /run/user/1000
+      register: podman_e2e_test_result
+      changed_when: false
+      failed_when: false
+
+    - name: Show Podman E2E test diagnostics
+      ansible.builtin.debug:
+        var: podman_e2e_test_result.stderr_lines
+
+    - name: Show Podman E2E test result
+      ansible.builtin.debug:
+        var: podman_e2e_test_result.stdout_lines
+
+    - name: Capture OpenShell gateway journal after Podman E2E test failure
+      become: true
+      ansible.builtin.command:
+        argv: [journalctl, --unit, openshell-gateway.service, --no-pager, --lines, "200"]
+      changed_when: false
+      failed_when: false
+      when: podman_e2e_test_result.rc != 0
+      register: podman_e2e_gateway_journal
+
+    - name: Show OpenShell gateway journal after Podman E2E test failure
+      ansible.builtin.debug:
+        var: podman_e2e_gateway_journal.stdout_lines
+      when: podman_e2e_test_result.rc != 0
+
+    - name: Require Podman E2E archive success
+      ansible.builtin.assert:
+        that: [podman_e2e_test_result.rc == 0]
+        fail_msg: Podman E2E archive tests failed

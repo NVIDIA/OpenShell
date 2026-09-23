@@ -251,6 +251,23 @@ Rust tests that still apply. Run the Podman-backed Rust CLI e2e suite:
 mise run e2e:podman
 ```
 
+Run the portable subset in a disposable rootless Podman guest:
+
+```shell
+nix run .#build-artifacts
+nix run .#tmachine -- test fedora-podman-rootless binaries e2e-podman
+nix run .#tmachine -- test fedora-podman-rootless binaries driver-podman
+```
+
+The `e2e-podman` testsuite runs a nextest archive built with the corresponding
+Rust feature. The separate `driver-podman` testsuite compares OpenShell and
+direct Podman user-namespace mappings for the default, `auto`, `keep-id`, and
+private profiles. The E2E archive excludes binaries that still depend on
+wrapper-owned gateway controls, host fixtures, missing guest tools, or
+nondeterministic relay setup.
+`tests/artifacts.nix` keeps the explicit follow-up list so those binaries cannot
+appear as false passes or silently re-enter the archive.
+
 Run the VM-backed Rust CLI e2e suite:
 
 ```shell
