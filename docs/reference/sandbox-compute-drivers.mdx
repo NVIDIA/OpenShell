@@ -380,6 +380,8 @@ Stopped VM state directories contain a marker that prevents startup from
 launching the VM. The driver retains `sandbox.pb`, `overlay.ext4`, and extension
 state, then removes the marker and restores the same overlay on start.
 
+CPU-only VMs do not inherit GPU filesystem allowances from the host. A policy can keep `/proc` read-only on a GPU-equipped host. For GPU-assigned VMs, the sandbox discovers GPU paths inside the guest.
+
 For maintainer-level implementation details, refer to the [VM driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md).
 
 ### Enable the VM Driver

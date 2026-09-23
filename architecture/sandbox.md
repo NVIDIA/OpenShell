@@ -135,8 +135,11 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 | Outer network fence | The component that owns network enforcement prevents any missed or unsupported kernel path from escaping. Current examples are Docker `network_mode=none`, a NIC-less VM, and Kubernetes NetworkPolicy. |
 | Policy proxy | Evaluates destination, binary identity, TLS/L7 rules, SSRF checks, and inference interception. |
 
-The supervisor may enrich baseline filesystem allowances for runtime-required
-paths, such as proxy support files or GPU device paths when a GPU is present.
+The supervisor may enrich baseline filesystem allowances for proxy support
+files. GPU allowances are added by the workload-side sandbox only when the
+immutable driver resource claims request a GPU and GPU devices are visible
+inside the workload. Host supervisor device discovery must not influence these
+allowances; a CPU-only VM preserves read-only `/proc` even on a GPU host.
 These internal allowances must stay sandbox-scoped and avoid exposing host
 secrets. For example, MXC governed egress grants the generated public CA bundle
 while the ephemeral CA private key remains in the host proxy's memory.

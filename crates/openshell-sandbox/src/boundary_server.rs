@@ -82,7 +82,12 @@ mod linux {
     const MAX_REPLAY_LEDGER_ENTRIES: usize = 4096;
     const MAX_RETAINED_EXEC_PROCESSES: usize = 64;
 
+    // NVML may traverse the persistenced socket directory during initialization;
+    // WSL2 supplies GPU libraries under /usr/lib/wsl and the /dev/dxg device.
     const GPU_BASELINE_READ_ONLY: &[&str] = &["/run/nvidia-persistenced", "/usr/lib/wsl"];
+    // CUDA opens device nodes read-write and writes thread names through
+    // /proc/<pid>/task/<tid>/comm during cuInit(). A /proc/self rule would bind
+    // to the launcher's inodes, not those of its workload children.
     const GPU_BASELINE_READ_WRITE: &[&str] = &[
         "/dev/nvidiactl",
         "/dev/nvidia-uvm",
@@ -97,8 +102,8 @@ mod linux {
     }
 
     /// Add the filesystem paths required by GPU devices visible inside the
-    /// workload container. The companion supervisor intentionally has no GPU
-    /// devices, so it cannot discover these paths on the sandbox's behalf.
+    /// workload. The supervisor's device namespace can differ from the
+    /// workload's, so discovery must happen here, gated by the resource claim.
     fn enrich_gpu_filesystem_paths(
         policy: &mut openshell_core::policy::SandboxPolicy,
         gpu_requested: bool,

@@ -1557,6 +1557,7 @@ impl VmDriver {
             agent_uid: sandbox_owner_state.uid,
             agent_gid: sandbox_owner_state.gid,
             child_env: merged_environment(&sandbox),
+            gpu_requested: is_gpu,
         }
         .provision()
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
