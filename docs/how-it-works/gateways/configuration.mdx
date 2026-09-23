@@ -537,8 +537,8 @@ The gateway refuses to start when a peer endpoint is configured on a multi-repli
 
 ### External Resource Admission
 
-Every compute driver disables caller-supplied `template.driver_config` by
-default. An operator can enable it without disabling resource approval:
+Compute drivers other than MXC disable caller-supplied `template.driver_config`
+by default. An operator can enable it without disabling resource approval:
 
 ```toml
 [openshell.drivers.kubernetes]
@@ -553,7 +553,9 @@ enabled = true
 ```
 
 Use the same fields under the selected Docker, Podman, VM, MXC, or external
-driver table. Omitted admission settings use the labels above. A supplied map
+driver table. Omitted admission settings use the labels above, except for MXC:
+MXC allows caller driver config and disables resource label admission by
+default. A supplied map
 replaces the defaults, and every entry must match. An explicitly empty map is
 invalid while enforcement is enabled. `${workspace}` is the entire label value
 and resolves to the authorized OpenShell workspace name, not a Kubernetes
@@ -608,9 +610,10 @@ The exception does not approve unrelated host mounts or non-GPU devices.
 Raw host bind mounts and supplemental image mounts have no trusted label
 resolver and are rejected while admission is enabled. Publisher image labels
 cannot grant operator approval. Docker's existing unsupported image-mount
-restriction remains. MXC host filesystem grants likewise require disabling
-admission until a resolver exists. MXC's command config and VM upload workflows
-encoded in driver JSON require explicit driver-config opt-in.
+restriction remains. MXC host filesystem grants likewise cannot pass enabled
+admission until a resolver exists. MXC permits its required command config by
+default; VM upload workflows encoded in driver JSON require explicit
+driver-config opt-in.
 
 `allow_driver_config` applies to nonempty caller config, including saved
 templates and non-storage overrides. An absent config or `{}` does not require
@@ -831,18 +834,29 @@ compute_driver = "mxc"
 
 [openshell.drivers.mxc]
 wxc_exec_path           = "C:\\mxc-kit\\bin\\wxc-exec.exe"
+allow_driver_config     = true
 backend                 = "process_container"
 default_configuration_id = "composable"
 pc_least_privilege      = false
 pc_capabilities         = []
 debug                   = false
 etw_audit               = true
+
+[openshell.drivers.mxc.resource_admission]
+enabled = false
 ```
 
 `etw_audit` defaults to `false`. When enabled, the gateway account must be an
 administrator or belong to the Windows Performance Log Users group. Workload
 commands and working directories remain sandbox-scoped and must be supplied in
-the `mxc` driver configuration when creating a sandbox.
+the `mxc` driver configuration when creating a sandbox. Unlike other drivers,
+MXC defaults to `allow_driver_config = true` and
+`resource_admission.enabled = false`: its required command uses driver config,
+and its host filesystem grants have no trusted label resolver. The gateway
+warns at startup that label admission is disabled. You can explicitly set
+either field in this table; omitting `enabled` from a partial admission table
+keeps it disabled. Setting `resource_admission.enabled = true` rejects
+MXC sandbox creates until a trusted resolver is available.
 
 The driver records executable identity in process audit events and omits raw
 command arguments because they can contain credentials or personal data. See

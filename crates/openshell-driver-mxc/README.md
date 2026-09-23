@@ -4,11 +4,13 @@ OpenShell compute driver backed by **Microsoft MXC** (`wxc-exec`) on Windows.
 
 ## Design
 
-Caller driver config is disabled by default, so command-based MXC workflows
-need explicit administrator opt-in. Host filesystem grants have no trusted
-label resolver and are rejected while resource admission is enabled.
+MXC allows caller driver config by default because every workload requires a
+command. It disables resource label admission by default because its host
+filesystem grants have no trusted label resolver. An operator can explicitly
+enable admission, but sandbox creates will then reject those grants until a
+resolver exists. These MXC defaults differ from the other compute drivers.
 See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission)
-for the independent controls and the security consequences of opting out.
+for the independent controls and the security consequences of disabled admission.
 
 This driver implements the gateway's ordinary in-process `ComputeDriver`
 contract and is linked into `openshell-gateway`. It sets

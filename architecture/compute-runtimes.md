@@ -31,6 +31,10 @@ Trusted deployment configuration can explicitly disable label admission, but
 that opt-out does not waive other ownership and isolation checks. This boundary
 assumes operators control approval metadata and runtime resource replacement;
 it does not provide atomic mount authorization or instantaneous revocation.
+MXC defaults to disabled label admission because its required host filesystem
+grants have no trusted label resolver. It also allows the caller command config
+required for every MXC workload. Explicit operator admission settings override
+these defaults; enabling label admission currently rejects MXC creates.
 
 Each runtime receives a sandbox spec and canonical policy from the gateway and
 is responsible for:

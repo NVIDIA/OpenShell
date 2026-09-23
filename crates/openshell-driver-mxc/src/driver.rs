@@ -15,8 +15,8 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::struct_to_json_value;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -62,6 +62,7 @@ pub struct MxcComputeConfig {
     /// Permit caller-supplied driver JSON. Does not waive resource admission.
     pub allow_driver_config: bool,
     /// Operator-owned external attachment approval policy.
+    #[serde(deserialize_with = "deserialize_mxc_resource_admission")]
     pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     /// Path to `wxc-exec.exe`. Required for live runs.
     pub wxc_exec_path: String,
@@ -91,13 +92,40 @@ pub struct MxcComputeConfig {
     pub etw_audit: bool,
 }
 
+fn deserialize_mxc_resource_admission<'de, D>(
+    deserializer: D,
+) -> Result<openshell_core::resource_admission::ResourceAdmissionConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PartialAdmission {
+        #[serde(default)]
+        enabled: bool,
+        required_labels: Option<BTreeMap<String, String>>,
+    }
+
+    let partial = PartialAdmission::deserialize(deserializer)?;
+    let mut config = openshell_core::resource_admission::ResourceAdmissionConfig {
+        enabled: partial.enabled,
+        ..Default::default()
+    };
+    if let Some(required_labels) = partial.required_labels {
+        config.required_labels = required_labels;
+    }
+    Ok(config)
+}
+
 impl Default for MxcComputeConfig {
     fn default() -> Self {
         Self {
             wxc_exec_path: "wxc-exec.exe".into(),
-            allow_driver_config: false,
-            resource_admission:
-                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
+            allow_driver_config: true,
+            resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig {
+                enabled: false,
+                ..Default::default()
+            },
             backend: MxcBackend::default(),
             pc_least_privilege: false,
             pc_capabilities: Vec::new(),
@@ -1258,26 +1286,19 @@ mod lifecycle_tests {
     };
     use std::time::Duration;
 
-    fn host_grants_config() -> MxcComputeConfig {
-        MxcComputeConfig {
-            allow_driver_config: true,
+    #[tokio::test]
+    async fn explicitly_enabled_admission_rejects_host_grants() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig {
             resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig {
-                enabled: false,
+                enabled: true,
                 ..Default::default()
             },
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn admission_rejects_host_grants_even_with_driver_config_enabled() {
-        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig {
-            allow_driver_config: true,
             ..Default::default()
         });
         let sandbox = driver_sandbox("sb-admission");
         let error = backend.validate_sandbox_create(&sandbox).unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("MXC host filesystem grants"));
         assert!(backend.create_sandbox(&sandbox).await.is_err());
         assert!(backend.get_sandbox("sb-admission").await.is_none());
     }
@@ -1357,11 +1378,31 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn mxc_config_defaults_to_default_deny_process_container() {
+    fn mxc_config_defaults_allow_command_and_disable_label_admission() {
         let config = MxcComputeConfig::default();
         assert_eq!(config.backend, MxcBackend::ProcessContainer);
+        assert!(config.allow_driver_config);
+        assert!(!config.resource_admission.enabled);
         assert!(!config.egress_proxy);
         assert!(config.egress_proxy_addr.is_empty());
+    }
+
+    #[test]
+    fn mxc_toml_omitting_admission_keys_uses_mxc_defaults() {
+        // `driver_config_from_context` passes the contents of
+        // [openshell.drivers.mxc] to this type. Keep this representative
+        // operator configuration aligned with the gateway's admission
+        // acknowledgement defaults.
+        let config: MxcComputeConfig = toml::from_str(
+            r#"
+wxc_exec_path = "C:\\mxc-kit\\bin\\wxc-exec.exe"
+backend = "process_container"
+"#,
+        )
+        .expect("MXC config should deserialize");
+
+        assert!(config.allow_driver_config);
+        assert!(!config.resource_admission.enabled);
     }
 
     #[test]
@@ -1472,7 +1513,7 @@ mod lifecycle_tests {
             "-Command".into(),
             format!("Set-Content -LiteralPath {hello} -Value hi"),
         ];
-        let backend = MxcComputeBackend::new_mocked(host_grants_config());
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
         let policy = fs_policy(&[&share]);
         let sb = with_policy(driver_sandbox_with_command("sb-pos", &share, cmd), policy);
@@ -1533,7 +1574,7 @@ mod lifecycle_tests {
             "-Command".into(),
             format!("Set-Content -LiteralPath {hello} -Value hi"),
         ];
-        let backend = MxcComputeBackend::new_mocked(host_grants_config());
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
         let policy = fs_policy(&[&share]);
         let sb = with_policy(driver_sandbox_with_command("sb-pc", &share, cmd), policy);
@@ -1585,7 +1626,7 @@ mod lifecycle_tests {
             backend: MxcBackend::ProcessContainer,
             egress_proxy: true,
             egress_proxy_addr: "127.0.0.1:18080".into(),
-            ..host_grants_config()
+            ..Default::default()
         };
         let backend = MxcComputeBackend::new_mocked(config);
         let mut stream = backend.watch_sandboxes().await;
@@ -1694,7 +1735,7 @@ mod lifecycle_tests {
             "-Command".into(),
             format!("Set-Content -LiteralPath {out_path} -Value hi"),
         ];
-        let backend = MxcComputeBackend::new_mocked(host_grants_config());
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
         // Subscribe to the watch stream BEFORE create so we catch the denial event.
         let mut stream = backend.watch_sandboxes().await;
@@ -1753,7 +1794,7 @@ mod lifecycle_tests {
             "-Command".into(),
             format!("$null = '{share}'; Start-Sleep -Seconds 60"),
         ];
-        let backend = MxcComputeBackend::new_mocked(host_grants_config());
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
         let policy = fs_policy(&[&share]);
         let sandbox = with_policy(driver_sandbox_with_command("sb-stop", "", command), policy);
         backend
@@ -1783,7 +1824,7 @@ mod lifecycle_tests {
         let tmp = tempfile::tempdir().unwrap();
         let share = tmp.path().to_string_lossy().replace('\\', "/");
 
-        let backend = MxcComputeBackend::new_mocked(host_grants_config());
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
         let mut policy = fs_policy(&[&share]);
         policy.network_policies.insert(
@@ -1811,7 +1852,7 @@ mod lifecycle_tests {
         let config = MxcComputeConfig {
             egress_proxy: true,
             egress_proxy_addr: "127.0.0.1:18080".into(),
-            ..host_grants_config()
+            ..Default::default()
         };
         let backend = MxcComputeBackend::new_mocked(config);
 
