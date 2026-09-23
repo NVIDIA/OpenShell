@@ -73,6 +73,10 @@ against that pin rather than an untrusted `/etc/hosts` entry.
 Tests that run support containers publish their ports on the host and address
 them through this alias, since network-scoped Podman DNS aliases are unavailable
 to the host-networked supervisor.
+Credential endpoint tests use Podman's `host.containers.internal` as the second
+host alias when checking that a token bound to `host.openshell.internal` does
+not work at a different hostname. Podman's network boundary may deny that
+alternate host before the HTTP credential check returns a response.
 
 The channel contains the sandbox bootstrap and sandbox-side TLS identity only.
 Supervisor private keys and the runtime descriptor stay in the supervisor's private filesystem.

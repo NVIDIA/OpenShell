@@ -7,6 +7,7 @@ use std::io::Write;
 use std::process::Stdio;
 
 use openshell_e2e::harness::binary::openshell_cmd;
+use openshell_e2e::harness::container::is_e2e_driver;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::io::AsyncReadExt;
@@ -184,7 +185,7 @@ binaries: [/usr/bin/bash]
     Ok(file)
 }
 
-fn write_binding_policy(port: u16) -> Result<NamedTempFile, String> {
+fn write_binding_policy(port: u16, unbound_host: &str) -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|e| format!("create binding policy: {e}"))?;
     let policy = format!(
         r#"version: 1
@@ -211,7 +212,7 @@ network_policies:
         protocol: rest
         access: full
         enforcement: enforce
-      - host: host.docker.internal
+      - host: {unbound_host}
         port: {port}
         path: /**
         protocol: rest
@@ -342,6 +343,11 @@ async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
 
 #[tokio::test]
 async fn static_provider_credentials_are_bound_to_profile_endpoints() {
+    let unbound_host = if is_e2e_driver("podman") {
+        "host.containers.internal"
+    } else {
+        "host.docker.internal"
+    };
     let server = HostServer::start_with_auth_check("", Some("Bearer e2e-bound-secret"))
         .await
         .expect("start credential echo server");
@@ -357,11 +363,11 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
         BINDING_PROFILE_B_ID,
         "E2E static endpoint binding B",
         "BOUND_TOKEN_B",
-        "host.docker.internal",
+        unbound_host,
         server.port,
     )
     .expect("write provider B binding profile");
-    let policy = write_binding_policy(server.port).expect("write binding policy");
+    let policy = write_binding_policy(server.port, unbound_host).expect("write binding policy");
     let profile_a_path = profile_a.path().to_string_lossy().into_owned();
     let profile_b_path = profile_b.path().to_string_lossy().into_owned();
     let policy_path = policy.path().to_string_lossy().into_owned();
@@ -420,9 +426,9 @@ http_request() {{
   exec 3>&- 3<&-
 }}
 http_request host.openshell.internal /allowed/check; allowed="$HTTP_BODY"
-http_request host.docker.internal /allowed/check; host_denied="$HTTP_STATUS"
+http_request {unbound_host} /allowed/check; host_connect_exit=$?; host_denied="$HTTP_STATUS"
 http_request host.openshell.internal /other/check; path_denied="$HTTP_STATUS"
-printf 'ALLOWED=%s HOST_DENIED=%s PATH_DENIED=%s\n' "$allowed" "$host_denied" "$path_denied"
+printf 'ALLOWED=%s HOST_DENIED=%s HOST_CONNECT_EXIT=%s PATH_DENIED=%s\n' "$allowed" "$host_denied" "$host_connect_exit" "$path_denied"
 "#,
         server.port
     );
@@ -455,8 +461,15 @@ printf 'ALLOWED=%s HOST_DENIED=%s PATH_DENIED=%s\n' "$allowed" "$host_denied" "$
         "credential should resolve at the bound endpoint:\n{}\nlogs:\n{logs}",
         guard.create_output,
     );
+    let host_denied_by_http = guard.create_output.contains("HOST_DENIED=403");
+    let host_denied_by_podman_boundary = is_e2e_driver("podman")
+        && guard.create_output.contains("HOST_CONNECT_EXIT=1")
+        && guard.create_output.contains(&format!(
+            "/dev/tcp/{unbound_host}/{}: Permission denied",
+            server.port
+        ));
     assert!(
-        guard.create_output.contains("HOST_DENIED=403"),
+        host_denied_by_http || host_denied_by_podman_boundary,
         "same placeholder must be denied at an unbound host:\n{}",
         guard.create_output
     );

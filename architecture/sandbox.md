@@ -36,6 +36,8 @@ container `/etc/hosts` contents.
 The host-networked Podman supervisor cannot use DNS aliases scoped to a
 separate Podman fixture network; host-backed fixtures use published ports and
 the pinned host alias.
+Podman also recognizes `host.containers.internal` as a separate host alias;
+driver-specific credential tests use it to verify hostname binding.
 The sandbox probes HTTP/2 connection liveness every five seconds and closes
 connections that miss a ten-second acknowledgement deadline. Closing a
 connection freezes the owned workload process tree and cancels its stream
