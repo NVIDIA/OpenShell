@@ -1597,6 +1597,7 @@ impl ForwardMiddlewarePipeline<'_> {
         C: TokioAsyncRead + TokioAsyncWrite + Unpin + Send,
     {
         let validate;
+        let accept_without_reevaluation = |_body: &[u8]| Ok(None);
         let transformed_body_policy = match &self.l7_reevaluation {
             Some(l7) => {
                 validate = crate::l7::relay::transformed_body_validator(
@@ -1607,7 +1608,12 @@ impl ForwardMiddlewarePipeline<'_> {
                 );
                 openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate)
             }
-            None => openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+            // The forward-proxy request is already fully buffered before this
+            // pipeline runs. Keep it on the compatibility path until the
+            // forward relay can carry a storage-backed request body.
+            None => openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(
+                &accept_without_reevaluation,
+            ),
         };
 
         self.exchange
@@ -4839,6 +4845,7 @@ where
             host: options.host,
             port: options.port,
         },
+        None,
         response_middleware,
         options.endpoint_observer,
     )
@@ -5838,8 +5845,14 @@ async fn handle_forward_proxy(
             exchange: &middleware_exchange,
             l7_reevaluation,
         };
-        forward_request_bytes = match pipeline.apply(request, client).await? {
+        let middleware_result = pipeline.apply(request, client).await?;
+        forward_request_bytes = match middleware_result {
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request.raw_header,
+            crate::l7::middleware::MiddlewareApplyResult::Streamed { .. } => {
+                return Err(miette::miette!(
+                    "forward middleware unexpectedly returned a storage-backed request body"
+                ));
+            }
             crate::l7::middleware::MiddlewareApplyResult::Denied { denial, .. } => {
                 emit_activity_simple(activity_tx, true, "middleware");
                 let response = denial.as_ref().map_or_else(
@@ -6758,6 +6771,7 @@ process:
                             seconds: 1,
                             nanos: 0,
                         }),
+                        ..Default::default()
                     }],
                     expected_audience: String::new(),
                     extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -6783,16 +6797,6 @@ process:
                     reason: String::new(),
                 },
             ))
-        }
-
-        async fn evaluate_http_request(
-            &self,
-            _request: tonic::Request<openshell_core::proto::HttpRequestEvaluation>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::HttpRequestResult>,
-            tonic::Status,
-        > {
-            Err(tonic::Status::unimplemented("WebSocket-only test service"))
         }
 
         async fn open_websocket_session(
@@ -6854,6 +6858,10 @@ process:
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreReturn as i32,
                     max_payload_bytes: 8192,
                     request_timeout: None,
+                    http_protocol_version: 1,
+                    supported_http_body_modes: vec![
+                        openshell_core::proto::HttpBodyMode::Buffered as i32,
+                    ],
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -6873,20 +6881,10 @@ process:
             Ok(())
         }
 
-        async fn evaluate_http_request(
-            &self,
-            _request: openshell_core::middleware::HttpRequestView<'_>,
-        ) -> Result<openshell_core::proto::HttpRequestResult> {
-            Ok(openshell_core::proto::HttpRequestResult {
-                decision: openshell_core::proto::Decision::Allow as i32,
-                ..Default::default()
-            })
-        }
-
         async fn open_http_response_pre_return(
             &self,
-            mut requests: mpsc::Receiver<openshell_core::proto::HttpResponseEvent>,
-        ) -> std::result::Result<openshell_core::middleware::HttpResponseResultStream, tonic::Status>
+            mut requests: mpsc::Receiver<openshell_core::proto::HttpEvent>,
+        ) -> std::result::Result<openshell_core::middleware::HttpResultStream, tonic::Status>
         {
             let (sender, receiver) = mpsc::channel(2);
             let expected_path = self.expected_path.clone();
@@ -6895,21 +6893,36 @@ process:
             tokio::spawn(async move {
                 while let Some(event) = requests.recv().await {
                     match event.event {
-                        Some(openshell_core::proto::http_response_event::Event::Preflight(
-                            preflight,
-                        )) => {
-                            let target = preflight.target.expect("response target");
+                        Some(openshell_core::proto::http_event::Event::Preflight(preflight)) => {
+                            let Some(openshell_core::proto::http_preflight::Head::Response(head)) =
+                                preflight.head
+                            else {
+                                panic!("response head")
+                            };
+                            let target = head.target.expect("response target");
                             assert_eq!(target.path, expected_path);
                             assert!(!target.path.contains(&forbidden_path_fragment));
-                            let action = if block {
-                                openshell_core::proto::http_response_preflight_result::Action::BlockDelivery(
-                                    openshell_core::proto::HttpResponseBlockDelivery {},
-                                )
+                            let result = if block {
+                                openshell_core::proto::HttpResult {
+                                    result: Some(
+                                        openshell_core::proto::http_result::Result::Reject(
+                                            openshell_core::proto::HttpReject {
+                                                diagnostics: Some(
+                                                    openshell_core::proto::MiddlewareDiagnostics {
+                                                        reason_code: "query_guard".into(),
+                                                        ..Default::default()
+                                                    },
+                                                ),
+                                            },
+                                        ),
+                                    ),
+                                }
                             } else {
-                                openshell_core::proto::http_response_preflight_result::Action::Inspect(
-                                    openshell_core::proto::HttpResponsePreflightInspect {
-                                        body_mode: openshell_core::proto::HttpResponseBodyMode::HeadersOnly as i32,
-                                        header_mutations: vec![openshell_core::proto::HeaderMutation {
+                                openshell_core::proto::HttpResult {
+                                    result: Some(openshell_core::proto::http_result::Result::PreflightResult(
+                                        openshell_core::proto::HttpPreflightResult {
+                                            decision: Some(openshell_core::proto::http_preflight_result::Decision::ContinueWithoutBody(openshell_core::proto::HttpContinue::default())),
+                                            header_mutations: vec![openshell_core::proto::HeaderMutation {
                                             operation: Some(
                                                 openshell_core::proto::header_mutation::Operation::Write(
                                                     openshell_core::proto::WriteHeader {
@@ -6920,30 +6933,18 @@ process:
                                                 ),
                                             ),
                                         }],
-                                    },
-                                )
-                            };
-                            let result = openshell_core::proto::HttpResponseEventResult {
-                                result: Some(
-                                    openshell_core::proto::http_response_event_result::Result::PreflightResult(
-                                        openshell_core::proto::HttpResponsePreflightResult {
-                                            action: Some(action),
-                                            reason_code: if block {
-                                                "query_guard".into()
-                                            } else {
-                                                String::new()
-                                            },
                                             ..Default::default()
                                         },
-                                    ),
-                                ),
+                                    )),
+                                }
                             };
                             if sender.send(Ok(result)).await.is_err() {
                                 break;
                             }
                         }
-                        Some(openshell_core::proto::http_response_event::Event::SessionEnd(_))
-                        | None => break,
+                        Some(openshell_core::proto::http_event::Event::SessionEnd(_)) | None => {
+                            break;
+                        }
                         Some(_) => panic!("headers-only response received an unexpected event"),
                     }
                 }
@@ -6966,6 +6967,10 @@ process:
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
                     request_timeout: None,
+                    http_protocol_version: 1,
+                    supported_http_body_modes: vec![
+                        openshell_core::proto::HttpBodyMode::Buffered as i32,
+                    ],
                 }],
                 expected_audience: String::new(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
@@ -6985,16 +6990,42 @@ process:
             Ok(())
         }
 
-        async fn evaluate_http_request(
+        async fn open_http_request_pre_credentials(
             &self,
-            _request: openshell_core::middleware::HttpRequestView<'_>,
-        ) -> Result<openshell_core::proto::HttpRequestResult> {
-            self.entered.notify_one();
-            self.release.notified().await;
-            Ok(openshell_core::proto::HttpRequestResult {
-                decision: openshell_core::proto::Decision::Allow as i32,
-                ..Default::default()
-            })
+            mut requests: mpsc::Receiver<openshell_core::proto::HttpEvent>,
+        ) -> std::result::Result<openshell_core::middleware::HttpResultStream, tonic::Status>
+        {
+            let entered = Arc::clone(&self.entered);
+            let release = Arc::clone(&self.release);
+            let (sender, receiver) = mpsc::channel(2);
+            tokio::spawn(async move {
+                use openshell_core::proto::{
+                    HttpEvent, HttpPreflightResult, HttpResult, http_event, http_preflight_result,
+                    http_result,
+                };
+                let Some(HttpEvent {
+                    event: Some(http_event::Event::Preflight(_)),
+                }) = requests.recv().await
+                else {
+                    return;
+                };
+                entered.notify_one();
+                release.notified().await;
+                let _ = sender
+                    .send(Ok(HttpResult {
+                        result: Some(http_result::Result::PreflightResult(HttpPreflightResult {
+                            decision: Some(http_preflight_result::Decision::ContinueWithoutBody(
+                                openshell_core::proto::HttpContinue::default(),
+                            )),
+                            ..Default::default()
+                        })),
+                    }))
+                    .await;
+                while requests.recv().await.is_some() {}
+            });
+            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
         }
     }
 
@@ -8523,6 +8554,9 @@ network_policies:
             crate::l7::middleware::MiddlewareApplyResult::Denied { denial } => {
                 assert!(denial.is_none());
             }
+            crate::l7::middleware::MiddlewareApplyResult::Streamed { .. } => {
+                panic!("body-aware forward middleware must use the buffered policy path")
+            }
             crate::l7::middleware::MiddlewareApplyResult::Allowed(_) => {
                 panic!("policy-invalid transformed request must be denied")
             }
@@ -8620,6 +8654,9 @@ network_policies:
         let (outcome, ()) = tokio::join!(pipeline.apply(request, &mut client), revoke);
         let request = match outcome.expect("middleware pipeline") {
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request,
+            crate::l7::middleware::MiddlewareApplyResult::Streamed { .. } => {
+                panic!("forward middleware compatibility path must stay buffered")
+            }
             crate::l7::middleware::MiddlewareApplyResult::Denied { .. } => {
                 panic!("blocking middleware should allow after release")
             }

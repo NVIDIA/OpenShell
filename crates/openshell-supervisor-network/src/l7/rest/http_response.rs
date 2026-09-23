@@ -843,11 +843,6 @@ fn emit_http_response_middleware_invocations(
     }
     for invocation in invocations {
         if let Some(event) =
-            http_response_middleware_fail_open_finding_event(policy_name, target, invocation)
-        {
-            openshell_ocsf::ocsf_emit!(event);
-        }
-        if let Some(event) =
             http_response_middleware_block_finding_event(policy_name, target, invocation)
         {
             openshell_ocsf::ocsf_emit!(event);
@@ -982,51 +977,6 @@ fn http_response_middleware_block_finding_event(
             )
             .unmapped("phase", "pre_return")
             .message("HTTP response delivery blocked by middleware")
-            .build(),
-    )
-}
-
-pub(super) fn http_response_middleware_fail_open_finding_event(
-    policy_name: &str,
-    target: &HttpRequestTarget,
-    invocation: &openshell_supervisor_middleware::HttpResponseInvocation,
-) -> Option<openshell_ocsf::OcsfEvent> {
-    if !invocation.failed
-        || invocation.outcome
-            != openshell_supervisor_middleware::HttpResponseInvocationOutcome::FailOpen
-    {
-        return None;
-    }
-    let failure_category = invocation
-        .failure_category
-        .as_deref()
-        .unwrap_or("middleware_failure");
-    Some(
-        openshell_ocsf::DetectionFindingBuilder::new(ocsf_ctx())
-            .severity(openshell_ocsf::SeverityId::Medium)
-            .finding_info(openshell_ocsf::FindingInfo::new(
-                "openshell.middleware.http_response_fail_open",
-                "HTTP response middleware failed open",
-            ))
-            .evidence_pairs(&[
-                ("policy", policy_name),
-                ("middleware_config", invocation.config_name.as_str()),
-                (
-                    "middleware_implementation",
-                    invocation.implementation.as_str(),
-                ),
-                ("host", target.host.as_str()),
-                ("phase", "pre_return"),
-                ("failure_category", failure_category),
-            ])
-            .unmapped("middleware_config", invocation.config_name.as_str())
-            .unmapped(
-                "middleware_implementation",
-                invocation.implementation.as_str(),
-            )
-            .unmapped("phase", "pre_return")
-            .unmapped("failure_category", failure_category)
-            .message("HTTP response middleware failed and response inspection was bypassed")
             .build(),
     )
 }
@@ -1790,7 +1740,7 @@ async fn process_response_unit<C: AsyncWrite + Unpin>(
     unit: Vec<u8>,
     framing: &mut ResponseOutputState<'_>,
 ) -> Result<()> {
-    let output = session.push_body(unit).await;
+    let output = session.push_body(unit);
     if let Some(guard) = framing.generation_guard {
         guard.ensure_current()?;
     }

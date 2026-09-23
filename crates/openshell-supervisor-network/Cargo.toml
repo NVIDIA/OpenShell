@@ -21,8 +21,8 @@ openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" 
 async-trait = "0.1"
 
 apollo-parser = { workspace = true }
-aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 http = { workspace = true }
 base64 = { workspace = true }

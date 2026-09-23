@@ -242,8 +242,8 @@ pub struct MiddlewareServiceFileConfig {
     /// trusted-network deployments only.
     #[serde(default)]
     pub allow_insecure_transport: bool,
-    /// Operator-owned logical payload limit for every binding exposed by this
-    /// service, including HTTP bodies and complete WebSocket messages.
+    /// Operator-owned logical payload limit for payload-bearing bindings,
+    /// including HTTP bodies and complete WebSocket messages.
     #[serde(alias = "max_body_bytes")]
     pub max_payload_bytes: u64,
     /// Default RPC timeout using an integer with an `ms` or `s` suffix.

@@ -7,7 +7,7 @@ description: "Configure proxy-side AWS SigV4 request signing so sandbox agents c
 keywords: "Generative AI, Cybersecurity, AI Agents, AWS, SigV4, Bedrock, S3, Credential Signing, Sandbox"
 ---
 
-AWS SigV4 credential signing lets sandbox agents call AWS services (Bedrock, S3, STS, and others) through the proxy's CONNECT tunnel. The proxy intercepts outbound requests, strips the sandbox client's placeholder `Authorization` header, and re-signs the request with real AWS credentials from the provider. The sandbox never sees the real credentials.
+AWS SigV4 credential signing lets sandbox agents call AWS services (Bedrock, S3, STS, and others) through the proxy's CONNECT tunnel. The proxy strips the sandbox client's placeholder `Authorization` header and re-signs the request with real AWS credentials from the provider. The sandbox and external middleware never see the real credentials.
 
 ## Prerequisites
 

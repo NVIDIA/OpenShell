@@ -14,14 +14,14 @@ use std::sync::LazyLock;
 
 use miette::{Result, miette};
 use openshell_core::proto::{
-    Decision, Finding, HttpRequestResult, MiddlewareBinding, SupervisorMiddlewareOperation,
+    Decision, Finding, HttpBodyMode, MiddlewareBinding, SupervisorMiddlewareOperation,
     SupervisorMiddlewarePhase, WebSocketMessageResult, web_socket_message_result,
 };
 use regex::Regex;
 use serde::Deserialize;
 
 pub const NAME: &str = "openshell/regex";
-const MAX_PAYLOAD_BYTES: u64 = 256 * 1024;
+pub const MAX_PAYLOAD_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -56,12 +56,16 @@ pub fn describe() -> Vec<MiddlewareBinding> {
             phase: SupervisorMiddlewarePhase::PreCredentials as i32,
             max_payload_bytes: MAX_PAYLOAD_BYTES,
             request_timeout: None,
+            http_protocol_version: 1,
+            supported_http_body_modes: vec![HttpBodyMode::Buffered as i32],
         },
         MiddlewareBinding {
             operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
             phase: SupervisorMiddlewarePhase::PreCredentials as i32,
             max_payload_bytes: MAX_PAYLOAD_BYTES,
             request_timeout: None,
+            http_protocol_version: 0,
+            supported_http_body_modes: Vec::new(),
         },
     ]
 }
@@ -91,31 +95,29 @@ pub fn validate_config(config: &prost_types::Struct) -> Result<()> {
     RegexConfig::from_struct(config).map(|_| ())
 }
 
-/// Evaluate a borrowed HTTP body and return a replacement only when a pattern matches.
-pub fn evaluate_http_request(
-    config: &prost_types::Struct,
-    body: &[u8],
-) -> Result<HttpRequestResult> {
+#[derive(Debug)]
+pub struct HttpBodyEvaluation {
+    pub replacement: Option<Vec<u8>>,
+    pub findings: Vec<Finding>,
+    pub metadata: HashMap<String, String>,
+}
+
+/// Evaluate a complete HTTP body and return a replacement only when a pattern matches.
+pub fn evaluate_http_body(config: &prost_types::Struct, body: &[u8]) -> Result<HttpBodyEvaluation> {
     validate_config(config)?;
     let text =
         std::str::from_utf8(body).map_err(|_| miette!("{NAME} requires UTF-8 request bodies"))?;
     let (body, matches) = apply_replacements(text);
     let (findings, metadata) = findings_and_metadata(&matches);
-    let has_body = !matches.is_empty();
-    let result = HttpRequestResult {
-        decision: Decision::Allow as i32,
-        reason: String::new(),
-        body: match body {
-            Cow::Borrowed(_) => Vec::new(),
-            Cow::Owned(body) => body.into_bytes(),
-        },
-        has_body,
-        header_mutations: Vec::new(),
+    let replacement = match body {
+        Cow::Borrowed(_) => None,
+        Cow::Owned(body) => Some(body.into_bytes()),
+    };
+    Ok(HttpBodyEvaluation {
+        replacement,
         findings,
         metadata,
-        reason_code: String::new(),
-    };
-    Ok(result)
+    })
 }
 
 pub fn evaluate_websocket_text(
