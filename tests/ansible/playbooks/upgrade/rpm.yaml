@@ -216,6 +216,10 @@
             systemctl --user status openshell-gateway.service --no-pager
             journalctl --user -u openshell-gateway.service --no-pager -n 200
             podman ps -a
+            for container in $(podman ps -aq); do
+              echo "=== podman logs: ${container} ==="
+              podman logs "${container}" 2>&1
+            done
             podman images
             sudo cat /var/lib/openshell-qualification/gateway.toml
           args:
