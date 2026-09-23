@@ -320,8 +320,9 @@ credential Secrets.
 In managed and operator workspace modes, the chart creates an
 `openshell-workspace-secret-source` Role and RoleBinding in the sandbox
 namespace. That Role grants `get` on only the gateway client TLS Secret and, in
-managed mode, the configured image-pull Secrets, which the gateway copies into
-workspace namespaces.
+managed mode, the configured image-pull Secrets. The gateway stages their
+contents into each sandbox runtime generation's Secrets in the workspace
+namespace.
 
 The namespaced Role covers sandbox lifecycle and identity:
 

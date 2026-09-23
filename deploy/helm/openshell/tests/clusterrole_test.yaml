@@ -103,18 +103,13 @@ tests:
             resources: ["secrets"]
             verbs: ["get", "create", "patch", "delete"]
 
-  - it: restricts operator TLS sync to the configured secret
+  - it: names no Secrets in operator mode
     set:
       server.drivers.kubernetes.workspaceMode: operator
       server.tls.clientTlsSecretName: custom-client-tls
     asserts:
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            resourceNames: ["custom-client-tls"]
-            verbs: ["get", "patch"]
+      - notExists:
+          path: rules[*].resourceNames
 
   - it: grants operator bootstrap secret lifecycle permissions when TLS and credential storage are disabled
     set:
@@ -134,7 +129,7 @@ tests:
             resources: ["secrets"]
             verbs: ["get", "create", "patch", "delete"]
 
-  - it: restricts managed copies to TLS and configured image-pull secrets
+  - it: names no Secrets in managed mode
     set:
       server.drivers.kubernetes.workspaceMode: managed
       server.tls.clientTlsSecretName: custom-client-tls
@@ -142,34 +137,8 @@ tests:
         - name: registry-one
         - name: registry-two
     asserts:
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            resourceNames: ["custom-client-tls", "registry-one", "registry-two"]
-            verbs: ["get", "patch"]
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            verbs: ["create", "delete"]
-
-  - it: restricts managed copies to image-pull secrets when TLS is disabled
-    set:
-      server.drivers.kubernetes.workspaceMode: managed
-      server.disableTls: true
-      server.sandboxImagePullSecrets:
-        - name: registry-one
-    asserts:
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            resourceNames: ["registry-one"]
-            verbs: ["get", "patch"]
+      - notExists:
+          path: rules[*].resourceNames
       - contains:
           path: rules
           content:

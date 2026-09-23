@@ -99,7 +99,8 @@ and PriorityClasses need matching administrator-owned labels; namespace
 membership and read-only access do not grant approval. GPU devices and
 operator-selected image-pull Secrets do not need admission labels. In managed
 mode, inspect the configured source image-pull Secret in the gateway namespace
-and the gateway-owned copy in the workspace namespace. Legacy workloads without
+and the generation copies (`openshell.ai/component=image-pull`) in the workspace
+namespace. Legacy workloads without
 admission provenance need recreation. Do not
 automatically label control-plane resources or disable enforcement as a repair.
 

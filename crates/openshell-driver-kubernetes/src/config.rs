@@ -634,6 +634,20 @@ impl KubernetesComputeConfig {
         !matches!(self.workspace_mode, WorkspaceMode::Shared)
     }
 
+    /// Where supervisor Pods read the gateway client TLS material. Outside
+    /// shared mode it is staged into each generation's bootstrap Secret.
+    #[must_use]
+    pub fn supervisor_client_tls(&self) -> crate::sandbox_runtime::SupervisorClientTls<'_> {
+        use crate::sandbox_runtime::SupervisorClientTls;
+        if self.client_tls_secret_name.is_empty() {
+            SupervisorClientTls::Disabled
+        } else if self.is_multi_namespace() {
+            SupervisorClientTls::Bootstrap
+        } else {
+            SupervisorClientTls::Secret(&self.client_tls_secret_name)
+        }
+    }
+
     /// Compute the K8s resource name for a sandbox.
     ///
     /// - **Shared:** `{workspace}--{name}` (namespace doesn't provide isolation).

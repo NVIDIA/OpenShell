@@ -110,7 +110,10 @@ The driver creates each sandbox generation in a fail-closed order:
 3. Inspect the admitted Pod identity, security context, DNS settings, and
    generation-specific Secret reference.
 4. Create a gated supervisor Pod and separate immutable Secrets for sandbox and
-   supervisor trust material.
+   supervisor trust material. Outside shared mode, the supervisor Secret also
+   carries the gateway client TLS material. In managed mode, the driver also
+   creates immutable copies of the configured image-pull Secrets for the
+   generation.
 5. Remove both scheduling gates.
 6. Publish readiness only after the supervisor attaches, confirms enforcement,
    and registers the gateway relay.
