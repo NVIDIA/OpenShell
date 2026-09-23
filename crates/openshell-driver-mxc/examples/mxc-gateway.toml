@@ -17,10 +17,15 @@ wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
 # mode and does not deny access to paths omitted from the sandbox policy.
 backend = "process_container"
 
-# process_container only: request a Less-Privileged AppContainer.
-# pc_least_privilege = false
-# process_container only: AppContainer capabilities to grant.
-# pc_capabilities = []
+# process_container only: request a Less-Privileged AppContainer. Defaults to
+# false when omitted. Without it the sandbox can reach host services that issue
+# network requests on its behalf.
+pc_least_privilege = true
+
+# process_container only: AppContainer capabilities to grant. registryRead is
+# required by pc_least_privilege so Winsock can initialize; it grants no network
+# access. Grant network with egress_proxy, not internetClient.
+pc_capabilities = ["registryRead"]
 
 # isolation_session only. Never use "small" (known OS bug).
 default_configuration_id = "composable"
