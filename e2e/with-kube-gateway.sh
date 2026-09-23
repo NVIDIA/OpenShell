@@ -54,6 +54,12 @@
 #   installing OpenShell. This is used by HA CI so the gateway can run multiple
 #   replicas without requiring the OpenShell chart to own a database.
 #
+# Gateway API controller:
+#   Set OPENSHELL_E2E_KUBE_GATEWAY_CONTROLLER to `envoy` or `agentgateway` to
+#   route the test through that controller. The default, `none`, port-forwards
+#   directly to the OpenShell Service. OPENSHELL_E2E_KUBE_USE_ENVOY remains a
+#   compatibility alias for `envoy`.
+#
 # Credential-driver fixture:
 #   Set OPENSHELL_E2E_CREDENTIAL_DRIVERS=1 to enable one credential storage
 #   backend. Set OPENSHELL_E2E_CREDENTIAL_DRIVER to `kubernetes-secrets` or
@@ -107,6 +113,23 @@ ENVOY_CHART_VERSION="${OPENSHELL_E2E_ENVOY_VERSION:-v1.7.2}"
 ENVOY_GATEWAY_MANIFEST="${ROOT}/deploy/kube/manifests/envoy-gateway-openshell.yaml"
 ENVOY_HELM_INSTALLED=0
 ENVOY_GATEWAY_CONFIG_APPLIED=0
+AGENTGATEWAY_NAMESPACE="agentgateway-system"
+AGENTGATEWAY_GATEWAY_NAME="openshell-ingress"
+AGENTGATEWAY_HELM_INSTALLED=0
+GATEWAY_CONTROLLER="${OPENSHELL_E2E_KUBE_GATEWAY_CONTROLLER:-}"
+if [ -z "${GATEWAY_CONTROLLER}" ]; then
+  case "${OPENSHELL_E2E_KUBE_USE_ENVOY:-0}" in
+    1 | true | TRUE | yes | YES) GATEWAY_CONTROLLER="envoy" ;;
+    *) GATEWAY_CONTROLLER="none" ;;
+  esac
+fi
+case "${GATEWAY_CONTROLLER}" in
+  none | envoy | agentgateway) ;;
+  *)
+    echo "ERROR: OPENSHELL_E2E_KUBE_GATEWAY_CONTROLLER must be none, envoy, or agentgateway" >&2
+    exit 2
+    ;;
+esac
 VAULT_FIXTURE_DEPLOYED=0
 VAULT_NAMESPACE="${OPENSHELL_E2E_VAULT_NAMESPACE:-openbao}"
 VAULT_RELEASE_NAME="${OPENSHELL_E2E_VAULT_RELEASE_NAME:-openbao}"
@@ -190,10 +213,11 @@ deploy_postgres_fixture() {
 }
 
 use_envoy_gateway() {
-  case "${OPENSHELL_E2E_KUBE_USE_ENVOY:-0}" in
-    1 | true | TRUE | yes | YES) return 0 ;;
-    *) return 1 ;;
-  esac
+  [ "${GATEWAY_CONTROLLER}" = "envoy" ]
+}
+
+use_agentgateway() {
+  [ "${GATEWAY_CONTROLLER}" = "agentgateway" ]
 }
 
 install_envoy_gateway() {
@@ -211,6 +235,13 @@ install_envoy_gateway() {
 
   kctl apply -f "${ENVOY_GATEWAY_MANIFEST}"
   ENVOY_GATEWAY_CONFIG_APPLIED=1
+}
+
+install_agentgateway() {
+  echo "Installing agentgateway..."
+  AGENTGATEWAY_HELM_INSTALLED=1
+  OPENSHELL_AGENTGATEWAY_KUBE_CONTEXT="${KUBE_CONTEXT}" \
+    "${ROOT}/tasks/scripts/agentgateway-k8s-setup.sh" install
 }
 
 wait_for_envoy_service() {
@@ -245,6 +276,47 @@ wait_for_envoy_service() {
   return 1
 }
 
+wait_for_agentgateway_service() {
+  for _ in $(seq 1 60); do
+    if kctl -n "${AGENTGATEWAY_NAMESPACE}" get service \
+      "${AGENTGATEWAY_GATEWAY_NAME}" >/dev/null 2>&1 \
+      && kctl -n "${AGENTGATEWAY_NAMESPACE}" wait --for=condition=Ready pod \
+        -l "gateway.networking.k8s.io/gateway-name=${AGENTGATEWAY_GATEWAY_NAME}" \
+        --timeout=5s >/dev/null 2>&1; then
+      printf '%s/%s\n' "${AGENTGATEWAY_NAMESPACE}" "${AGENTGATEWAY_GATEWAY_NAME}"
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "ERROR: agentgateway proxy Service ${AGENTGATEWAY_GATEWAY_NAME} was not ready." >&2
+  kctl -n "${AGENTGATEWAY_NAMESPACE}" get gateway,service,pod -o wide >&2 || true
+  kctl -n "${NAMESPACE}" get grpcroute -o yaml >&2 || true
+  return 1
+}
+
+wait_for_gateway_route() {
+  local accepted=""
+  local resolved=""
+
+  for _ in $(seq 1 60); do
+    accepted="$(kctl -n "${NAMESPACE}" get grpcroute "${RELEASE_NAME}" \
+      -o jsonpath='{range .status.parents[*].conditions[?(@.type=="Accepted")]}{.status}{end}' \
+      2>/dev/null || true)"
+    resolved="$(kctl -n "${NAMESPACE}" get grpcroute "${RELEASE_NAME}" \
+      -o jsonpath='{range .status.parents[*].conditions[?(@.type=="ResolvedRefs")]}{.status}{end}' \
+      2>/dev/null || true)"
+    if [[ "${accepted}" == *True* && "${resolved}" == *True* ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "ERROR: GRPCRoute ${NAMESPACE}/${RELEASE_NAME} was not accepted." >&2
+  kctl -n "${NAMESPACE}" get grpcroute "${RELEASE_NAME}" -o yaml >&2 || true
+  return 1
+}
+
 start_gateway_portforward() {
   local elapsed=0
   local pf_timeout=30
@@ -260,6 +332,12 @@ start_gateway_portforward() {
     target_service="${target_service_ref#*/}"
     target_port=80
     echo "Starting kubectl port-forward -n ${target_namespace} svc/${target_service} ${LOCAL_PORT}:${target_port} (Envoy Gateway)..."
+  elif use_agentgateway; then
+    target_service_ref="$(wait_for_agentgateway_service)"
+    target_namespace="${target_service_ref%%/*}"
+    target_service="${target_service_ref#*/}"
+    target_port=80
+    echo "Starting kubectl port-forward -n ${target_namespace} svc/${target_service} ${LOCAL_PORT}:${target_port} (agentgateway)..."
   else
     echo "Starting kubectl port-forward svc/${target_service} ${LOCAL_PORT}:${target_port}..."
   fi
@@ -580,6 +658,13 @@ cleanup() {
         --ignore-not-found >/dev/null 2>&1 || true
     fi
     ENVOY_HELM_INSTALLED=0
+  fi
+
+  if [ "${AGENTGATEWAY_HELM_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
+    OPENSHELL_AGENTGATEWAY_KUBE_CONTEXT="${KUBE_CONTEXT}" \
+      "${ROOT}/tasks/scripts/agentgateway-k8s-setup.sh" delete \
+      >/dev/null 2>&1 || true
+    AGENTGATEWAY_HELM_INSTALLED=0
   fi
 
   if [ "${CLUSTER_CREATED_BY_US}" = "1" ] && [ -n "${CLUSTER_NAME}" ]; then
@@ -1341,6 +1426,9 @@ fi
 if use_envoy_gateway; then
   helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway.yaml")
   install_envoy_gateway
+elif use_agentgateway; then
+  helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway-agentgateway.yaml")
+  install_agentgateway
 fi
 
 if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
@@ -1391,6 +1479,10 @@ else
     "${helm_post_renderer_args[@]}" \
     --wait --timeout 5m
   HELM_INSTALLED=1
+
+  if [ "${GATEWAY_CONTROLLER}" != "none" ]; then
+    wait_for_gateway_route || exit 1
+  fi
 
   if [ -n "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET:-}" ]; then
     kctl -n "${NAMESPACE}" create secret docker-registry \

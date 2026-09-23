@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: Gateway API resources
+templates:
+  - templates/gateway.yaml
+  - templates/grpcroute.yaml
+release:
+  name: openshell
+  namespace: openshell
+
+tests:
+  - it: attaches a GRPCRoute to a named listener on a shared agentgateway Gateway
+    template: templates/grpcroute.yaml
+    set:
+      grpcRoute.enabled: true
+      grpcRoute.gateway.create: false
+      grpcRoute.gateway.name: openshell-ingress
+      grpcRoute.gateway.namespace: agentgateway-system
+      grpcRoute.gateway.sectionName: grpc
+    asserts:
+      - equal:
+          path: spec.parentRefs[0]
+          value:
+            name: openshell-ingress
+            namespace: agentgateway-system
+            sectionName: grpc
+
+  - it: omits the listener name when sectionName is empty
+    template: templates/grpcroute.yaml
+    set:
+      grpcRoute.enabled: true
+    asserts:
+      - notExists:
+          path: spec.parentRefs[0].sectionName
+
+  - it: creates a dedicated Gateway for agentgateway
+    template: templates/gateway.yaml
+    set:
+      grpcRoute.enabled: true
+      grpcRoute.gateway.create: true
+      grpcRoute.gateway.className: agentgateway
+      grpcRoute.gateway.name: openshell-ingress
+    asserts:
+      - equal:
+          path: metadata.name
+          value: openshell-ingress
+      - equal:
+          path: spec.gatewayClassName
+          value: agentgateway
+      - equal:
+          path: spec.listeners[0].protocol
+          value: HTTP
+
+  - it: keeps Envoy Gateway as the default class for chart-created Gateways
+    template: templates/gateway.yaml
+    set:
+      grpcRoute.enabled: true
+      grpcRoute.gateway.create: true
+    asserts:
+      - equal:
+          path: spec.gatewayClassName
+          value: eg

@@ -12,6 +12,9 @@ spec:
   parentRefs:
     - name: {{ default (include "openshell.fullname" .) .Values.grpcRoute.gateway.name }}
       namespace: {{ default .Release.Namespace .Values.grpcRoute.gateway.namespace }}
+      {{- with .Values.grpcRoute.gateway.sectionName }}
+      sectionName: {{ . }}
+      {{- end }}
   {{- if .Values.grpcRoute.hostnames }}
   hostnames:
     {{- toYaml .Values.grpcRoute.hostnames | nindent 4 }}
