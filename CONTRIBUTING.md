@@ -369,9 +369,16 @@ The lane supports x64 and ARM64 and builds `openshell-gateway.exe`,
 Docker, Kubernetes, Podman, or VM-backed execution on Windows.
 
 Install Visual Studio C++ Build Tools, a compatible Windows SDK, Rust through
-rustup, mise, and the Visual Studio LLVM tools used by `bindgen`. Run every task
-with `--skip-tools`; mise orchestrates the commands but does not install the
-Windows compiler toolchain.
+rustup, mise, and the Visual Studio LLVM tools used by `bindgen`. Test-bearing
+tasks also require the pinned `cargo-nextest` tool. Install it once through
+mise:
+
+```powershell
+mise install --locked github:nextest-rs/nextest
+```
+
+Run every task with `--skip-tools`; mise orchestrates the commands but does not
+install the Windows compiler toolchain.
 
 | Task | Purpose |
 |---|---|

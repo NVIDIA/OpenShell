@@ -74,7 +74,7 @@ sandbox request.
 | Driver lifecycle | Launch and monitor `wxc-exec` | `provision` -> `start` -> `exec`; stop/delete issue `stop` and `deprovision` |
 | Filesystem | Read-only/read-write grants with default-deny behavior | Explicit grant-only compatibility mode; not equivalent to ProcessContainer default deny |
 | Portable UI policy | Supported completely | Every explicit `ui` section is rejected before provisioning |
-| Governed network policy | Supported through the host proxy when enabled | Rejected because the backend cannot enforce the loopback-only proxy path |
+| Governed network policy | Supported through the host proxy when enabled | Rejected because the backend cannot enforce the loopback-only proxy path; without an explicit network policy, the backend retains MXC's default-allow egress |
 | Supervisor relay and dynamic forwarding | Optional | Optional |
 
 Neither backend implements interactive `sandbox connect` or interactive exec
@@ -112,7 +112,7 @@ The production mapping in
 | Policy area | Windows enforcement |
 |---|---|
 | Filesystem | `read_only` and `read_write` become MXC path grants. `include_workdir` adds the resolved working directory as read-write. The mapper normalizes separators but does not translate Linux-rooted locations into Windows paths. ProcessContainer supplies the default-deny boundary; IsolationSession supplies only the requested grants. |
-| Network | An explicit network policy requires governed egress on ProcessContainer. The mapper gives MXC loopback-only egress and returns the complete network policy to a per-sandbox host CONNECT proxy. MXC denies direct Internet access; the proxy evaluates destinations, ports, TLS/L7 rules, credential bindings, and binary rules against the configured agent command as its static process identity. Network middleware configuration is rejected because the host proxy does not receive the gateway middleware registry. IsolationSession rejects network policy. |
+| Network | An explicit network policy requires governed egress on ProcessContainer. The mapper gives MXC loopback-only egress and returns the complete network policy to a per-sandbox host CONNECT proxy. MXC denies direct Internet access; the proxy evaluates destinations, ports, TLS/L7 rules, credential bindings, and binary rules against the configured agent command as its static process identity. Network middleware configuration is rejected because the host proxy does not receive the gateway middleware registry. IsolationSession rejects explicit network policy; without one, it retains MXC's default-allow egress. |
 | UI | ProcessContainer maps graphical UI, directional clipboard access, and input injection into MXC's top-level `ui` object. An absent section maps to the restrictive UI posture. Within an explicit section, omitted fields deny. IsolationSession rejects even an empty explicit section. |
 | Process | MXC supplies the Windows process-isolation boundary, but the mapper has no portable equivalent for `run_as_user` or `run_as_group`; callers must not treat those fields as enforced Windows identity controls. The canonical command, environment, and working directory are launch inputs rather than process-policy grants. |
 | Landlock | MXC has no equivalent for the Linux Landlock compatibility mode, including `hard_requirement`. The mapper reports a non-blocking warning; Windows filesystem assurance comes from the selected MXC backend's native semantics, not Landlock. |
@@ -194,9 +194,10 @@ target-readiness handshakes.
 The driver serializes startup against stop and delete with a per-sandbox
 lifecycle gate. Stop and delete signal the owned process and wait for confirmed
 termination before reporting success. IsolationSession delete also
-deprovisions the MXC session. Process exit, mapping failure, relay failure, and
-MXC invocation errors produce watch or platform events that the gateway folds
-into persisted public status.
+deprovisions the MXC session. Process exit, relay failure, and MXC invocation
+errors produce watch or platform events that the gateway folds into persisted
+public status. Policy mapping failures reject the create request before the
+driver publishes a registry entry, so they do not produce lifecycle events.
 
 Runtime ownership is not durable. The registry, process handles, proxy handles,
 relay channels, and IsolationSession IDs live in gateway memory. A restarted

@@ -121,6 +121,7 @@ The lane targets a Windows host with Visual Studio Build Tools and rustup.
 | Windows SDK | `where.exe rc.exe` from a Developer PowerShell | Install an SDK containing target libraries and ARM64 tools. |
 | Rust via rustup | `rustc --version` | Add each target being validated: `x86_64-pc-windows-msvc` and/or `aarch64-pc-windows-msvc`. The wrapper also adds the selected target. |
 | mise | `mise --version` | Used as a task runner only. |
+| cargo-nextest | `cargo nextest --version` | Required by `windows:test:*` and `windows:ci`. Install the pinned version with `mise install --locked github:nextest-rs/nextest` before running tasks with `--skip-tools`. |
 | Git | `git --version` | Needed for checkout and sync work. |
 | PowerShell | `$PSVersionTable.PSVersion` | Windows PowerShell 5.1 works; PowerShell 7 is quieter with mise shell hooks. |
 
@@ -262,8 +263,8 @@ crypto dependency builds.
 |---|---|
 | `windows:check:x64` | `cargo check --workspace` for `x86_64-pc-windows-msvc`, excluding unsupported Windows packages as top-level workspace targets. |
 | `windows:check:arm64` | `cargo check --workspace` for `aarch64-pc-windows-msvc`, with the same top-level exclusions. |
-| `windows:build:x64` | Release-builds `openshell-gateway.exe` and `openshell.exe` for x64. |
-| `windows:build:arm64` | Release-builds `openshell-gateway.exe` and `openshell.exe` for ARM64. |
+| `windows:build:x64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, and `openshell-supervisor-relay.exe` for x64. |
+| `windows:build:arm64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, and `openshell-supervisor-relay.exe` for ARM64. |
 | `windows:test:x64` | Runs native x64 workspace tests with `--no-fail-fast`, excluding unsupported Windows packages as top-level workspace targets. |
 | `windows:test:arm64` | Runs native ARM64 workspace tests with `--no-fail-fast` and the same package exclusions. Rejects non-ARM64 hosts. |
 | `windows:test:unsupported:x64` | Re-runs focused `openshell-gateway` tests for unsupported Windows driver behavior. |

@@ -15,6 +15,12 @@ maintaining the existing build-only Windows MSVC lane.
 
 ## Commands
 
+Install the pinned test runner once before using test-bearing tasks:
+
+```powershell
+mise install --locked github:nextest-rs/nextest
+```
+
 Use `--skip-tools` for all Windows mise tasks:
 
 ```powershell
