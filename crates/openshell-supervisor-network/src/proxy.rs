@@ -3131,13 +3131,33 @@ fn resolve_process_identity(
         ancestors: vec![],
     })?;
 
+    resolve_socket_owner_identities(socket_owners, entrypoint_pid, identity_cache)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_socket_owner_identities(
+    socket_owners: crate::procfs::TcpPeerSocketOwners,
+    entrypoint_pid: u32,
+    identity_cache: &BinaryIdentityCache,
+) -> std::result::Result<ResolvedIdentity, IdentityError> {
     let mut identities = Vec::with_capacity(socket_owners.owners.len());
     for owner in &socket_owners.owners {
-        identities.push(resolve_owner_identity(
-            owner.pid,
-            entrypoint_pid,
-            identity_cache,
-        )?);
+        match resolve_owner_identity(owner.pid, entrypoint_pid, identity_cache) {
+            Ok(identity) => identities.push(identity),
+            Err(error) => {
+                // A process can exit after the socket-owner scan. Its fd is
+                // gone, so it cannot affect the identity of surviving owners.
+                // Keep other lookup failures fail-closed.
+                let process = format!("/proc/{}", owner.pid);
+                if matches!(
+                    std::fs::metadata(process),
+                    Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+                ) {
+                    continue;
+                }
+                return Err(error);
+            }
+        }
     }
 
     let Some(first_identity) = identities.first() else {
@@ -3178,8 +3198,9 @@ fn resolve_process_identity(
         });
     }
 
+    let lowest_pid = identities.iter().map(|identity| identity.binary_pid).min();
     let mut identity = identities.swap_remove(0);
-    if let Some(lowest_pid) = socket_owners.owners.iter().map(|owner| owner.pid).min() {
+    if let Some(lowest_pid) = lowest_pid {
         identity.binary_pid = lowest_pid;
     }
     Ok(identity)
@@ -5016,7 +5037,6 @@ async fn handle_forward_proxy(
         .await
         .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?
     };
-
     debug!(
         transport = ?decision.intent.transport,
         identity = ?decision.identity,
@@ -7007,6 +7027,15 @@ process:
         }
     }
 
+    fn test_backend_identity(executable: &std::path::Path) -> ContractBinaryIdentity {
+        ContractBinaryIdentity {
+            binary_path: executable.to_path_buf(),
+            binary_digest: Some("00".repeat(32).parse().expect("test digest")),
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+        }
+    }
+
     async fn drive_raw_request_through_handler(raw: Vec<u8>) -> Vec<u8> {
         let policy = include_str!("../data/sandbox-policy.rego");
         let data = r#"
@@ -7137,6 +7166,7 @@ network_policies: {}
                 .expect("bind MCP upstream listener");
             let upstream_port = upstream_listener.local_addr().unwrap().port();
             let executable = std::env::current_exe().expect("current executable");
+            let supplied_identity: Result<_, ResolveError> = Ok(test_backend_identity(&executable));
             let data = format!(
                 r#"
 network_middlewares:
@@ -7235,7 +7265,7 @@ network_policies:
                     request.as_bytes(),
                     request.len(),
                     &mut proxy_connection,
-                    None,
+                    Some(&supplied_identity),
                     socket_addrs,
                     engine,
                     Arc::new(BinaryIdentityCache::new()),
@@ -7258,7 +7288,11 @@ network_policies:
             drop(proxy_connection);
 
             let response = client.await.expect("join MCP client");
-            assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+            assert!(
+                response.starts_with(b"HTTP/1.1 200 OK"),
+                "unexpected MCP proxy response: {}",
+                String::from_utf8_lossy(&response)
+            );
             let forwarded = upstream.await.expect("join MCP upstream");
             assert!(forwarded.starts_with("POST /mcp HTTP/1.1\r\n"));
             if version_header.is_empty() {
@@ -7289,6 +7323,7 @@ network_policies:
             .expect("bind upstream listener");
         let upstream_port = upstream_listener.local_addr().unwrap().port();
         let executable = std::env::current_exe().expect("current executable");
+        let supplied_identity: Result<_, ResolveError> = Ok(test_backend_identity(&executable));
         let data = format!(
             r#"
 network_middlewares:
@@ -7359,7 +7394,7 @@ network_policies:
                 request.as_bytes(),
                 request.len(),
                 &mut proxy_connection,
-                None,
+                Some(&supplied_identity),
                 socket_addrs,
                 engine,
                 Arc::new(BinaryIdentityCache::new()),
@@ -7413,6 +7448,7 @@ network_policies:
             .expect("bind upstream listener");
         let upstream_port = upstream_listener.local_addr().unwrap().port();
         let executable = std::env::current_exe().expect("current executable");
+        let supplied_identity: Result<_, ResolveError> = Ok(test_backend_identity(&executable));
         let data = format!(
             r#"
 network_middlewares:
@@ -7477,7 +7513,11 @@ network_policies:
                 .await
                 .expect("connect proxy");
             let response = read_http_headers_unbounded(&mut socket).await;
-            assert!(String::from_utf8_lossy(&response).contains("101 Switching Protocols"));
+            assert!(
+                String::from_utf8_lossy(&response).contains("101 Switching Protocols"),
+                "unexpected WebSocket proxy response: {}",
+                String::from_utf8_lossy(&response)
+            );
             socket
                 .write_all(
                     &crate::l7::websocket::compressed_masked_text_frame_for_test(
@@ -7502,7 +7542,7 @@ network_policies:
                 request.as_bytes(),
                 request.len(),
                 &mut proxy_connection,
-                None,
+                Some(&supplied_identity),
                 socket_addrs,
                 engine,
                 Arc::new(BinaryIdentityCache::new()),
@@ -7521,10 +7561,9 @@ network_policies:
             .await
         });
         let scenario = tokio::time::timeout(std::time::Duration::from_mins(1), async {
-            let (client, upstream) = tokio::join!(client, upstream);
-            client.expect("join plaintext WebSocket client");
+            client.await.expect("join plaintext WebSocket client");
             assert_eq!(
-                upstream.expect("join plaintext WebSocket upstream"),
+                upstream.await.expect("join plaintext WebSocket upstream"),
                 r#"{"token":"[REDACTED]"}"#
             );
         })
@@ -12905,6 +12944,29 @@ network_policies:
                 err.reason
             ),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_socket_owner_does_not_hide_a_surviving_owner() {
+        let current_pid = std::process::id();
+        let owners = crate::procfs::TcpPeerSocketOwners {
+            inode: 42,
+            owners: vec![
+                crate::procfs::SocketOwner {
+                    pid: i32::MAX.cast_unsigned(),
+                    source: crate::procfs::SocketOwnerSource::ProcFallback,
+                },
+                crate::procfs::SocketOwner {
+                    pid: current_pid,
+                    source: crate::procfs::SocketOwnerSource::ProcFallback,
+                },
+            ],
+        };
+        let identity =
+            resolve_socket_owner_identities(owners, current_pid, &BinaryIdentityCache::new())
+                .unwrap_or_else(|error| panic!("surviving owner: {}", error.reason));
+        assert_eq!(identity.binary_pid, current_pid);
     }
 
     #[cfg(target_os = "linux")]
