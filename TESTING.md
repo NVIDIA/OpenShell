@@ -43,10 +43,16 @@ mod tests {
 Run Rust tests only:
 
 ```bash
-mise run test:rust     # cargo test --workspace
+mise run test:rust     # nix run .#rust-test
 ```
 
-Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:check` to check them directly. If one is stale, refresh it with Cargo using its adjacent manifest, review the diff, and commit the update.
+Rust validation checks tracked Cargo lockfiles; run
+`mise run rust:lockfiles:check` to check them directly. If one is stale, refresh
+it with Cargo using its adjacent manifest, review the diff, and commit the
+update.
+The Rust validation tasks are Nix apps, and the mise tasks provide compatibility
+aliases. You can invoke the test suite directly with `nix run .#rust-test` and
+the lockfile check with `nix run .#cargo-lockfiles`.
 
 ### Native Windows validation
 
