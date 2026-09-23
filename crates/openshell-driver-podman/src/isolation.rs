@@ -15,9 +15,9 @@ use openshell_isolation_interface::contract::{
 };
 use openshell_sandbox_backend::ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
-    SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
-    generate_sandbox_tls_material,
+    BoundaryConfig, BoundaryListener, FenceWireFormat, GatewayVerificationKey,
+    SandboxRuntimeDescriptor, SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
+    fence_wire_format, generate_sandbox_tls_material,
 };
 use serde::{Deserialize, Serialize};
 
@@ -29,12 +29,6 @@ pub const RUNTIME_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descri
 pub const AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
 pub const RESTART_METADATA_PATH: &str = "/.openshell/supervisor/restart-metadata.json";
 const SOCKET_PATH: &str = "/.openshell/channel/sandbox/control.sock";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BootstrapFenceWireFormat {
-    LegacyDriverFence,
-    OuterFence,
-}
 
 #[derive(Serialize)]
 #[serde(tag = "backend", rename_all = "kebab-case")]
@@ -80,32 +74,21 @@ impl PodmanOuterFenceEvidence<'_> {
     }
 }
 
-pub fn fence_wire_format_from_slice(
-    encoded: &[u8],
-) -> Result<BootstrapFenceWireFormat, ComputeDriverError> {
+pub fn fence_wire_format_from_slice(encoded: &[u8]) -> Result<FenceWireFormat, ComputeDriverError> {
     let value: serde_json::Value = serde_json::from_slice(encoded).map_err(invalid)?;
     let object = value
         .as_object()
         .ok_or_else(|| invalid("bootstrap payload must be a JSON object"))?;
-    match (
-        object.contains_key("driver_fence"),
-        object.contains_key("outer_fence"),
-    ) {
-        (true, false) => Ok(BootstrapFenceWireFormat::LegacyDriverFence),
-        (false, true) => Ok(BootstrapFenceWireFormat::OuterFence),
-        _ => Err(invalid(
-            "bootstrap payload must contain exactly one of driver_fence or outer_fence",
-        )),
-    }
+    fence_wire_format(object, "Podman bootstrap payload").map_err(invalid)
 }
 
 fn encode_fence_compatible<T: Serialize>(
     value: &T,
-    format: BootstrapFenceWireFormat,
+    format: FenceWireFormat,
     container_id: &str,
 ) -> Result<Vec<u8>, ComputeDriverError> {
     let mut value = serde_json::to_value(value).map_err(invalid)?;
-    if format == BootstrapFenceWireFormat::LegacyDriverFence {
+    if format == FenceWireFormat::LegacyDriverFence {
         let object = value
             .as_object_mut()
             .ok_or_else(|| invalid("bootstrap payload must be a JSON object"))?;
@@ -266,7 +249,7 @@ pub fn bootstrap_archives(
     allow_extra_supplementary_groups: bool,
     child_env: HashMap<String, String>,
     launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
-    fence_wire_format: BootstrapFenceWireFormat,
+    fence_wire_format: FenceWireFormat,
 ) -> Result<BootstrapArchives, ComputeDriverError> {
     launch_authentication.validate().map_err(invalid)?;
     let session_id = launch_authentication.supervisor.session_id;
@@ -575,7 +558,7 @@ mod tests {
             false,
             child_env.clone(),
             &authentication,
-            BootstrapFenceWireFormat::OuterFence,
+            FenceWireFormat::OuterFence,
         )
         .unwrap();
         let workload = files(&archives.channel);
@@ -671,7 +654,7 @@ mod tests {
             false,
             HashMap::new(),
             &authentication(),
-            BootstrapFenceWireFormat::LegacyDriverFence,
+            FenceWireFormat::LegacyDriverFence,
         )
         .unwrap();
         let workload = files(&archives.channel);
@@ -688,7 +671,7 @@ mod tests {
         ] {
             assert_eq!(
                 fence_wire_format_from_slice(encoded).unwrap(),
-                BootstrapFenceWireFormat::LegacyDriverFence
+                FenceWireFormat::LegacyDriverFence
             );
             let value: serde_json::Value = serde_json::from_slice(encoded).unwrap();
             assert!(value.get("outer_fence").is_none());

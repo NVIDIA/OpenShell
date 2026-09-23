@@ -60,7 +60,7 @@ use openshell_core::{
 };
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{
-    GatewayVerificationKey, SandboxRuntimeDescriptor, SandboxTlsClientConfig,
+    FenceWireFormat, GatewayVerificationKey, SandboxRuntimeDescriptor, SandboxTlsClientConfig,
     SandboxTlsServerConfig, generate_sandbox_tls_material,
 };
 use opentelemetry::trace::TraceContextExt as _;
@@ -4745,12 +4745,12 @@ async fn refresh_docker_boundary_authentication(
             "Docker sandbox runtime descriptor is missing during authentication rotation",
         ));
     };
-    let wire_format = if boundary_format == isolation::DockerFenceWireFormat::LegacyDriverFence
-        || descriptor_format == isolation::DockerFenceWireFormat::LegacyDriverFence
+    let wire_format = if boundary_format == FenceWireFormat::LegacyDriverFence
+        || descriptor_format == FenceWireFormat::LegacyDriverFence
     {
-        isolation::DockerFenceWireFormat::LegacyDriverFence
+        FenceWireFormat::LegacyDriverFence
     } else {
-        isolation::DockerFenceWireFormat::OuterFence
+        FenceWireFormat::OuterFence
     };
     let session_id = authentication.supervisor.session_id;
     let tls = generate_sandbox_tls_material(session_id)
@@ -4837,7 +4837,7 @@ async fn read_docker_runtime_descriptor(
 async fn read_docker_runtime_descriptor_with_format(
     sandbox_id: &str,
     config: &DockerDriverRuntimeConfig,
-) -> Result<Option<(SandboxRuntimeDescriptor, isolation::DockerFenceWireFormat)>, Status> {
+) -> Result<Option<(SandboxRuntimeDescriptor, FenceWireFormat)>, Status> {
     let path = docker_boundary_state_dir_by_id(sandbox_id, config)?.join(RUNTIME_DESCRIPTOR_FILE);
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
