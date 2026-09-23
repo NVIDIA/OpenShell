@@ -332,13 +332,13 @@ fn conversion(message: &str, field: u32) -> Option<Conversion> {
             Some(D { new_tag: 116 })
         }
         ("openshell.sandbox.v1.MiddlewareBinding", 4) => Some(DS { new_tag: 104 }),
-        ("openshell.sandbox.v1.NetworkEndpoint", 4) => Some(E { tag: 4, kind: Tls }),
+        ("openshell.sandbox.v1.NetworkEndpoint", 4) => Some(E { tag: 27, kind: Tls }),
         ("openshell.sandbox.v1.NetworkEndpoint", 5) => Some(E {
-            tag: 5,
+            tag: 28,
             kind: Enforcement,
         }),
         ("openshell.sandbox.v1.NetworkEndpoint", 6) => Some(E {
-            tag: 6,
+            tag: 29,
             kind: Access,
         }),
         _ => None,

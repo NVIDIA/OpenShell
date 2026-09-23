@@ -128,10 +128,12 @@ mod tests {
     // the additive file map while retaining the rest of the response.
     // Service authorization also extends both schemas additively. Legacy
     // payloads retain the safe Strip default.
+    // NetworkEndpoint retains the pre.4 string fields while current enum fields
+    // use new tags, changing both schema fingerprints without changing ownership.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "2e156c6ad3c8eb51bcd30dc13b173fe339b38207a1b1f98f7be2e0cad8e3bd45";
+        "013858ac39a29d738626115f9bdc70f30c5bcf21072dd42cddb2e77a14d721d1";
     const DURABLE_SCHEMA_SHA256: &str =
-        "38165d9d76f49fcfe98a12f241e032838a2376c1d1a87ea2796fd33b9b1a3541";
+        "6f53e9371c30c7d8586f588363f618aaccbe7bba36e8c27f2a5f829f7535bd55";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
