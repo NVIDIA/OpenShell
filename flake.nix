@@ -163,6 +163,10 @@
             type = "app";
             program = "${rustTasks.lint}/bin/openshell-rust-lint";
           };
+          rust-format = {
+            type = "app";
+            program = "${rustTasks.format}/bin/openshell-rust-format";
+          };
           rust-format-check = {
             type = "app";
             program = "${rustTasks.formatCheck}/bin/openshell-rust-format-check";

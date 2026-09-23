@@ -63,6 +63,16 @@ in
     '';
   };
 
+  format = mkRustTask {
+    name = "openshell-rust-format";
+    text = ''
+      cargo fmt --all
+      cargo fmt --manifest-path e2e/rust/Cargo.toml --all
+      cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all
+      cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all
+    '';
+  };
+
   formatCheck = mkRustTask {
     name = "openshell-rust-format-check";
     text = ''

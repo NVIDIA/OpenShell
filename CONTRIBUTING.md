@@ -470,6 +470,7 @@ invoke the corresponding Nix apps directly:
 | `mise run rust:check`               | `nix run .#rust-check`         |
 | `mise run rust:lockfiles:check`     | `nix run .#cargo-lockfiles`    |
 | `mise run rust:lint`                | `nix run .#rust-lint`          |
+| `mise run rust:format`              | `nix run .#rust-format`        |
 | `mise run rust:format:check`        | `nix run .#rust-format-check`  |
 | `mise run rust:deny:policy`         | `nix run .#rust-deny-policy`   |
 | `mise run test:rust`                | `nix run .#rust-test`          |

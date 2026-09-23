@@ -29,7 +29,8 @@ hide = true
 
 ["rust:format"]
 description = "Format Rust code"
-run = [
+run = "nix run .#rust-format"
+run_windows = [
   "cargo fmt --all",
   "cargo fmt --manifest-path e2e/rust/Cargo.toml --all",
   "cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all",
