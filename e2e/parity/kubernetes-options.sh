@@ -52,6 +52,14 @@ write_config() {
   local run_dir=$5
   local gateway_id="step8-${variant}-${RUN_ID}"
   local pull_policy
+  local print_to_stdout=false
+
+  # macOS does not permit redirecting a heredoc directly to /dev/stdout.
+  # Keep --print-config portable for the deterministic contract test.
+  if [ "${path}" = /dev/stdout ]; then
+    path="$(mktemp "${TMPDIR:-/tmp}/openshell-parity-config.XXXXXX")"
+    print_to_stdout=true
+  fi
 
   if [ "${variant}" = baseline ]; then
     pull_policy=IfNotPresent
@@ -132,8 +140,6 @@ image_pull_secrets = ["parity-pull-secret"]
 service_account_name = "parity-sandbox"
 supervisor_image = "${SUPERVISOR_IMAGE}"
 supervisor_image_pull_policy = "${pull_policy}"
-supervisor_sideload_method = "init-container"
-topology = "combined"
 grpc_endpoint = "http://host.openshell.internal:${port}"
 ssh_socket_path = "/run/openshell/parity-kubernetes-ssh.sock"
 client_tls_secret_name = "parity-client-tls"
@@ -143,10 +149,14 @@ sa_token_ttl_secs = 600
 workspace_default_storage_size = "64Mi"
 workspace_storage_class = "standard"
 default_runtime_class_name = "${RUNTIME_CLASS}"
-app_armor_profile = "Unconfined"
 sandbox_uid = 1000
 sandbox_gid = 1000
 EOF
+  fi
+
+  if ${print_to_stdout}; then
+    cat "${path}"
+    rm -f "${path}"
   fi
 }
 
@@ -358,7 +368,6 @@ check(env['OPENSHELL_SSH_SOCKET_PATH']=='/run/openshell/parity-kubernetes-ssh.so
 check(env['OPENSHELL_SANDBOX_UID']=='1000' and env['OPENSHELL_SANDBOX_GID']=='1000','sandbox identity differs')
 check(('host.openshell.internal',host_ip) in hosts and ('host.docker.internal',host_ip) in hosts,'host aliases differ')
 check(spec['runtimeClassName']==runtime_class and spec.get('hostUsers',True) is not False,'RuntimeClass or user namespace posture differs')
-check(agent['securityContext']['appArmorProfile']['type']=='Unconfined','AppArmor profile differs')
 check(agent['resources']['requests']=={'cpu':'250m','memory':'128Mi'},'resource requests differ')
 check(agent['resources']['limits']=={'cpu':'250m','memory':'128Mi'},'resource limits differ')
 check(vols['openshell-sa-token']['projected']['sources'][0]['serviceAccountToken']['expirationSeconds']==600,'ServiceAccount token TTL differs')
@@ -369,22 +378,17 @@ check(pvc['spec']['resources']['requests']['storage']=='64Mi','PVC storage reque
 labels=sb['metadata']['labels']
 for key in ('openshell.ai/sandbox-id','openshell.ai/sandbox-name','openshell.ai/sandbox-workspace','openshell.ai/gateway-id','openshell.ai/managed-by'):
     check(labels.get(key),f'managed label {key} missing')
-observed_sideload='init-container' if 'openshell-supervisor-install' in inits else 'unknown'
-observed_topology='combined' if [c['name'] for c in spec['containers']]==['agent'] else 'other'
 observed_workspace_mode='shared' if pvc['metadata']['namespace']==pod['metadata']['namespace'] and pvc['metadata']['name'].startswith('workspace-default--') else 'other'
-check(observed_sideload=='init-container','supervisor sideload method differs')
-check(observed_topology=='combined','supervisor topology differs')
 check(observed_workspace_mode=='shared','workspace placement differs')
 normalized={
  'scenario':'kubernetes-core-options','pod_phase':'Running','sandbox_ready':True,
  'sandbox_image':agent['image'],'sandbox_image_pull_policy':agent['imagePullPolicy'],
  'image_pull_secrets':['parity-pull-secret'],'service_account':'parity-sandbox',
  'supervisor_image':install['image'],'supervisor_image_pull_policy':install['imagePullPolicy'],
- 'supervisor_sideload_method':observed_sideload,'topology':observed_topology,
  'callback_endpoint_host':'host.openshell.internal','callback_exec':True,
  'ssh_socket_path':env['OPENSHELL_SSH_SOCKET_PATH'],'client_tls_secret':'parity-client-tls',
  'host_gateway_ip':host_ip,'sa_token_ttl_secs':600,'runtime_class_handler':'runc',
- 'enable_user_namespaces':False,'app_armor_profile':'Unconfined','sandbox_uid':1000,'sandbox_gid':1000,
+ 'enable_user_namespaces':False,'sandbox_uid':1000,'sandbox_gid':1000,
  'workspace_mode':observed_workspace_mode,'workspace_storage':'64Mi','workspace_storage_class':'standard','pvc_phase':'Bound',
  'cpu':'250m','memory':'128Mi','managed_labels':True,
 }

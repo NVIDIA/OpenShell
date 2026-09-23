@@ -5,57 +5,12 @@ suite: gateway TOML config shape
 templates:
   - templates/gateway-config.yaml
   - templates/deployment.yaml
-  - templates/peer-role.yaml
-  - templates/peer-service.yaml
   - templates/statefulset.yaml
 release:
   name: openshell
   namespace: my-namespace
 
 tests:
-  - it: defaults to label admission with caller driver config disabled
-    template: templates/gateway-config.yaml
-    asserts:
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: '(?m)^allow_driver_config\s*=\s*false$'
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.resource_admission\]\s*enabled\s*=\s*true'
-      - notMatchRegex:
-          path: data["gateway.toml"]
-          pattern: '\[openshell\.drivers\.kubernetes\.resource_admission\.required_labels\]'
-
-  - it: preserves explicit admission opt-out without enabling driver config
-    template: templates/gateway-config.yaml
-    set:
-      server.drivers.kubernetes.resourceAdmission.enabled: false
-    asserts:
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: '(?m)^allow_driver_config\s*=\s*false$'
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.resource_admission\]\s*enabled\s*=\s*false'
-
-  - it: renders replacement labels and literal workspace substitution
-    template: templates/gateway-config.yaml
-    set:
-      server.drivers.kubernetes.allowDriverConfig: true
-      server.drivers.kubernetes.resourceAdmission.requiredLabels:
-        platform.example.com/sandbox-attachable: "approved"
-        platform.example.com/team: '${workspace}'
-    asserts:
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: '"platform.example.com/sandbox-attachable" = "approved"'
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: '"platform.example.com/team" = "\$\{workspace\}"'
-      - notMatchRegex:
-          path: data["gateway.toml"]
-          pattern: 'openshell.ai/sandbox-attachable'
-
   - it: identifies the gateway by chart fullname by default
     template: templates/gateway-config.yaml
     asserts:
@@ -66,7 +21,9 @@ tests:
   - it: renders an explicit gateway name
     template: templates/gateway-config.yaml
     set:
-      server.name: production-us-west
+      gatewayConfig:
+        openshell.gateway:
+          name: production-us-west
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -153,8 +110,10 @@ tests:
   - it: renders OTLP tracing configuration when configured
     template: templates/gateway-config.yaml
     set:
-      server.otlp.endpoint: http://otel-collector.observability.svc:4317
-      server.otlp.serviceName: production-gateway
+      gatewayConfig:
+        openshell.gateway.otlp:
+          endpoint: http://otel-collector.observability.svc:4317
+          service_name: production-gateway
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -170,9 +129,12 @@ tests:
   - it: renders OIDC transport security settings
     template: templates/gateway-config.yaml
     set:
-      server.oidc.issuer: https://issuer.example.com
-      server.oidc.dangerouslyAllowInsecureHttp: false
-      server.oidc.jwksAllowedOrigins[0]: https://keys.example.com
+      gatewayConfig:
+        openshell.gateway.oidc:
+          issuer: https://issuer.example.com
+          dangerously_allow_insecure_http: false
+          jwks_allowed_origins:
+            - https://keys.example.com
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -184,7 +146,8 @@ tests:
   - it: treats a null OTLP map as disabled
     template: templates/gateway-config.yaml
     set:
-      server.otlp: null
+      gatewayConfig:
+        openshell.gateway.otlp: null
     asserts:
       - notMatchRegex:
           path: data["gateway.toml"]
@@ -194,20 +157,22 @@ tests:
     template: templates/statefulset.yaml
     set:
       server.disableTls: true
-      server.oidc.issuer: https://issuer.example.com
-      server.oidc.caConfigMapName: openshell-oidc-ca
+      oidc.caConfigMapName: openshell-oidc-ca
+      gatewayConfig:
+        openshell.gateway.oidc:
+          issuer: https://issuer.example.com
     asserts:
       - equal:
-          path: spec.template.spec.containers[0].volumeMounts[4].name
+          path: spec.template.spec.containers[0].volumeMounts[3].name
           value: oidc-ca
       - equal:
-          path: spec.template.spec.containers[0].volumeMounts[4].mountPath
+          path: spec.template.spec.containers[0].volumeMounts[3].mountPath
           value: /etc/openshell-tls/oidc-ca
       - equal:
-          path: spec.template.spec.volumes[3].name
+          path: spec.template.spec.volumes[2].name
           value: oidc-ca
       - equal:
-          path: spec.template.spec.volumes[3].configMap.name
+          path: spec.template.spec.volumes[2].configMap.name
           value: openshell-oidc-ca
 
   # Regression for the P1 bug Drew flagged: grpc_endpoint MUST live in the
@@ -234,49 +199,43 @@ tests:
   - it: renders canonical image pull policies in the Kubernetes driver table
     template: templates/gateway-config.yaml
     set:
-      server.sandboxImagePullPolicy: if_not_present
-      supervisor.image.pullPolicy: never
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          image_pull_policy: if_not_present
+          supervisor_image_pull_policy: never
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?image_pull_policy\s*=\s*"if_not_present".*?supervisor_image_pull_policy\s*=\s*"never"'
 
-  - it: translates legacy Kubernetes pull policy values to canonical gateway values
+  - it: preserves Kubernetes driver image pull policy values
     template: templates/gateway-config.yaml
     set:
-      server.sandboxImagePullPolicy: Always
-      supervisor.image.pullPolicy: IfNotPresent
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          image_pull_policy: always
+          supervisor_image_pull_policy: if_not_present
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?image_pull_policy\s*=\s*"always".*?supervisor_image_pull_policy\s*=\s*"if_not_present"'
 
-  - it: rejects unsupported sandbox image pull policies
-    template: templates/statefulset.yaml
-    set:
-      server.sandboxImagePullPolicy: Sometimes
-    asserts:
-      - failedTemplate:
-          errorMessage: 'image pull policy "Sometimes" must be one of: always, if_not_present, never, Always, IfNotPresent, Never'
-
-  - it: rejects unsupported supervisor image pull policies
-    template: templates/statefulset.yaml
-    set:
-      supervisor.image.pullPolicy: newer
-    asserts:
-      - failedTemplate:
-          errorMessage: 'image pull policy "newer" must be one of: always, if_not_present, never, Always, IfNotPresent, Never'
-
-  - it: renders driver-owned Kubernetes settings only in its driver table
+  - it: derives the Kubernetes host gateway IP from the pod host alias owner
     template: templates/gateway-config.yaml
     set:
-      server.hostGatewayIP: 10.0.0.1
-      server.enableUserNamespaces: true
-      supervisor.image.tag: test
+      server.hostGatewayIP: 10.23.45.67
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          host_gateway_ip: 192.0.2.1
+          enable_user_namespaces: true
+          supervisor_image: ghcr.io/nvidia/openshell/supervisor:test
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?namespace\s*=\s*"my-namespace".*?default_image\s*=.*?supervisor_image\s*=.*?host_gateway_ip\s*=\s*"10\.0\.0\.1".*?client_tls_secret_name\s*=.*?service_account_name\s*=\s*"openshell-sandbox".*?enable_user_namespaces\s*=\s*true.*?sa_token_ttl_secs\s*='
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?client_tls_secret_name\s*=.*?default_image\s*=.*?enable_user_namespaces\s*=\s*true.*?host_gateway_ip\s*=\s*"10\.23\.45\.67".*?namespace\s*=\s*"my-namespace".*?sa_token_ttl_secs\s*=.*?service_account_name\s*=\s*"openshell-sandbox".*?supervisor_image\s*='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'host_gateway_ip\s*=\s*"192\.0\.2\.1"'
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\][^\[]*?(sandbox_namespace|default_image|supervisor_image|client_tls_secret_name|service_account_name|host_gateway_ip|enable_user_namespaces|sa_token_ttl_secs)\s*='
@@ -284,10 +243,44 @@ tests:
           path: data["gateway.toml"]
           pattern: 'guest_tls_(ca|cert|key)\s*='
 
+  - it: derives TLS runtime fields from chart-owned TLS resources
+    template: templates/gateway-config.yaml
+    set:
+      server.disableTls: false
+      server.tls.clientTlsSecretName: chart-client-tls
+      gatewayConfig:
+        openshell.gateway:
+          disable_tls: true
+        openshell.drivers.kubernetes:
+          client_tls_secret_name: conflicting-client-tls
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?disable_tls\s*=\s*false'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?client_tls_secret_name\s*=\s*"chart-client-tls"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'conflicting-client-tls'
+
+  - it: restores chart-owned TLS runtime paths when gatewayConfig omits the TLS table
+    template: templates/gateway-config.yaml
+    set:
+      server.disableTls: false
+      gatewayConfig:
+        openshell.gateway.tls: null
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.tls\].*?cert_path\s*=\s*"/etc/openshell-tls/server/tls\.crt".*?key_path\s*=\s*"/etc/openshell-tls/server/tls\.key"'
+
   - it: renders user namespace enablement under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     set:
-      server.enableUserNamespaces: true
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          enable_user_namespaces: true
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -296,15 +289,17 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\][^\[]*?enable_user_namespaces'
 
-  - it: renders operator-owned upstream proxy settings under the Kubernetes driver
+  - it: renders proxy settings from the Kubernetes driver configuration
     template: templates/gateway-config.yaml
     set:
-      upstreamProxy.url: http://proxy.corp.example:8080
-      upstreamProxy.noProxy: .svc.cluster.local,10.96.0.0/12
-      upstreamProxy.authSecret.name: corporate-proxy-auth
-      upstreamProxy.authSecret.key: credentials
-      upstreamProxy.authAllowInsecure: true
-      upstreamProxy.connectByHostname: true
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          https_proxy: http://proxy.corp.example:8080
+          no_proxy: .svc.cluster.local,10.96.0.0/12
+          proxy_auth_secret_name: corporate-proxy-auth
+          proxy_auth_secret_key: credentials
+          proxy_auth_allow_insecure: true
+          proxy_connect_by_hostname: true
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -325,47 +320,28 @@ tests:
           path: data["gateway.toml"]
           pattern: 'proxy_connect_by_hostname\s*=\s*true'
 
-  - it: renders proxy_ca_bundle when a corporate CA ConfigMap is configured
+  - it: renders the default supervisor image from gatewayConfig
     template: templates/gateway-config.yaml
-    set:
-      upstreamProxy.url: https://proxy.corp.example:3130
-      upstreamProxy.caBundle.configMapName: corporate-proxy-ca
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?proxy_ca_bundle\s*=\s*"/etc/openshell-tls/proxy-ca/ca\.crt"'
+          pattern: 'supervisor_image\s*=\s*"ghcr\.io/nvidia/openshell/supervisor:0\.0\.0"'
 
-  - it: omits proxy_ca_bundle when no corporate CA ConfigMap is configured
+  - it: renders the default sandbox runtime image from gatewayConfig
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_runtime_image\s*=\s*"ghcr\.io/nvidia/openshell/sandbox:0\.0\.0"'
+
+  - it: renders independent sandbox runtime and supervisor image overrides from gatewayConfig
     template: templates/gateway-config.yaml
     set:
-      upstreamProxy.url: http://proxy.corp.example:8080
-    asserts:
-      - notMatchRegex:
-          path: data["gateway.toml"]
-          pattern: 'proxy_ca_bundle\s*='
-
-  - it: uses the gateway built-in supervisor image by default
-    template: templates/gateway-config.yaml
-    asserts:
-      - notMatchRegex:
-          path: data["gateway.toml"]
-          pattern: 'supervisor_image\s*='
-
-  - it: uses the gateway built-in sandbox runtime image by default
-    template: templates/gateway-config.yaml
-    asserts:
-      - notMatchRegex:
-          path: data["gateway.toml"]
-          pattern: 'sandbox_runtime_image\s*='
-
-  - it: renders independent sandbox runtime and supervisor image overrides
-    template: templates/gateway-config.yaml
-    set:
-      sandboxRuntime.image.repository: registry.example.com/openshell/sandbox
-      sandboxRuntime.image.tag: sandbox-build
-      sandboxRuntime.image.pullPolicy: Always
-      supervisor.image.repository: registry.example.com/openshell/supervisor
-      supervisor.image.tag: supervisor-build
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          sandbox_runtime_image: registry.example.com/openshell/sandbox:sandbox-build
+          sandbox_runtime_image_pull_policy: always
+          supervisor_image: registry.example.com/openshell/supervisor:supervisor-build
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -377,30 +353,34 @@ tests:
           path: data["gateway.toml"]
           pattern: 'supervisor_image\s*=\s*"registry\.example\.com/openshell/supervisor:supervisor-build"'
 
-  - it: renders a supervisor tag override with the official repository
+  - it: renders a supervisor image override
     template: templates/gateway-config.yaml
     set:
-      supervisor.image.tag: 1.2.3
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_image: ghcr.io/nvidia/openshell/supervisor:1.2.3
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: 'supervisor_image\s*=\s*"ghcr\.io/nvidia/openshell/supervisor:1\.2\.3"'
 
-  - it: renders a supervisor repository override with the effective gateway tag
+  - it: renders a supervisor repository image override
     template: templates/gateway-config.yaml
     set:
-      image.tag: gateway-build
-      supervisor.image.repository: registry.example.com/openshell/supervisor
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_image: registry.example.com/openshell/supervisor:gateway-build
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: 'supervisor_image\s*=\s*"registry\.example\.com/openshell/supervisor:gateway-build"'
 
-  - it: renders complete supervisor repository and tag overrides
+  - it: renders a complete supervisor image override
     template: templates/gateway-config.yaml
     set:
-      supervisor.image.repository: registry.example.com/openshell/supervisor
-      supervisor.image.tag: supervisor-build
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_image: registry.example.com/openshell/supervisor:supervisor-build
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -416,9 +396,11 @@ tests:
   - it: renders sandbox image pull secrets under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     set:
-      server.sandboxImagePullSecrets:
-        - name: regcred
-        - name: backup-regcred
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          image_pull_secrets:
+            - regcred
+            - backup-regcred
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -451,7 +433,9 @@ tests:
   - it: renders explicit unauthenticated user dev mode when enabled
     template: templates/gateway-config.yaml
     set:
-      server.auth.allowUnauthenticatedUsers: true
+      gatewayConfig:
+        openshell.gateway.auth:
+          allow_unauthenticated_users: true
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -477,7 +461,9 @@ tests:
   - it: renders retain-last-valid policy validation posture
     template: templates/gateway-config.yaml
     set:
-      server.policyValidationFailureMode: retain_last_valid
+      gatewayConfig:
+        openshell.gateway:
+          policy_validation_failure_mode: retain_last_valid
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -486,8 +472,10 @@ tests:
   - it: renders the gRPC rate limit under [openshell.gateway] when both values are positive
     template: templates/gateway-config.yaml
     set:
-      server.grpcRateLimit.requests: 120
-      server.grpcRateLimit.windowSeconds: 60
+      gatewayConfig:
+        openshell.gateway:
+          grpc_rate_limit_requests: 120
+          grpc_rate_limit_window_seconds: 60
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -495,41 +483,6 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\].*?grpc_rate_limit_window_seconds\s*=\s*60'
-
-  # The validation lives in gateway-config.yaml but surfaces through the
-  # statefulset checksum include, so the failure is asserted against that
-  # template (mirrors the postgres serviceBindings failure test below).
-  - it: fails to render when only requests is positive
-    template: templates/statefulset.yaml
-    set:
-      server.grpcRateLimit.requests: 120
-    asserts:
-      - failedTemplate:
-          errorMessage: "server.grpcRateLimit requires both requests and windowSeconds to be positive to enable rate limiting, or both 0/unset to disable it"
-
-  - it: fails to render when only windowSeconds is positive
-    template: templates/statefulset.yaml
-    set:
-      server.grpcRateLimit.windowSeconds: 60
-    asserts:
-      - failedTemplate:
-          errorMessage: "server.grpcRateLimit requires both requests and windowSeconds to be positive to enable rate limiting, or both 0/unset to disable it"
-
-  - it: fails to render when requests is negative
-    template: templates/statefulset.yaml
-    set:
-      server.grpcRateLimit.requests: -1
-    asserts:
-      - failedTemplate:
-          errorMessage: "server.grpcRateLimit.requests and server.grpcRateLimit.windowSeconds must not be negative; they map to unsigned gateway settings"
-
-  - it: fails to render when windowSeconds is negative
-    template: templates/statefulset.yaml
-    set:
-      server.grpcRateLimit.windowSeconds: -5
-    asserts:
-      - failedTemplate:
-          errorMessage: "server.grpcRateLimit.requests and server.grpcRateLimit.windowSeconds must not be negative; they map to unsigned gateway settings"
 
   - it: uses the configured existing sandbox service account name
     template: templates/gateway-config.yaml
@@ -553,6 +506,10 @@ tests:
       server.disableTls: true
       certManager.enabled: false
       pkiInitJob.enabled: false
+      gatewayConfig:
+        openshell.gateway:
+          disable_tls: true
+        openshell.gateway.tls: null
     template: templates/gateway-config.yaml
     asserts:
       - matchRegex:
@@ -566,6 +523,9 @@ tests:
     template: templates/gateway-config.yaml
     set:
       server.tls.enableMtls: false
+      gatewayConfig:
+        openshell.gateway.tls:
+          client_ca_path: null
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -591,6 +551,9 @@ tests:
     template: templates/gateway-config.yaml
     set:
       server.tls.clientCaSecretName: ""
+      gatewayConfig:
+        openshell.gateway.tls:
+          client_ca_path: null
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -613,6 +576,13 @@ tests:
       certManager.serverDnsNames:
         - gateway.example.com
       server.tls.clientCaSecretName: ""
+      gatewayConfig:
+        openshell.gateway.tls:
+          client_ca_path: null
+          external_cert_path: /etc/openshell-tls/server-external/tls.crt
+          external_key_path: /etc/openshell-tls/server-external/tls.key
+          external_server_names:
+            - gateway.example.com
     asserts:
       - notMatchRegex:
           path: data["gateway.toml"]
@@ -633,6 +603,9 @@ tests:
       certManager.enabled: true
       certManager.clientCaFromServerTlsSecret: true
       server.tls.clientCaSecretName: ""
+      gatewayConfig:
+        openshell.gateway.tls:
+          client_ca_path: null
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -654,6 +627,9 @@ tests:
       certManager.clientCaFromServerTlsSecret: false
       pkiInitJob.enabled: true
       server.tls.clientCaSecretName: ""
+      gatewayConfig:
+        openshell.gateway.tls:
+          client_ca_path: null
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -675,6 +651,11 @@ tests:
         - openshell
         - "*.dev.openshell.localhost"
       pkiInitJob.enabled: false
+      gatewayConfig:
+        openshell.gateway.tls:
+          server_sans:
+            - openshell
+            - "*.dev.openshell.localhost"
     template: templates/gateway-config.yaml
     asserts:
       - matchRegex:
@@ -695,128 +676,6 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: "server.tls.clientCaSecretName cannot be null; omit the key to use the chart default (openshell-server-client-ca), or set to \"\" to disable client certificate verification for HTTPS-only mode"
-
-  - it: configures gateway peer identity and projected peer token
-    template: templates/statefulset.yaml
-    asserts:
-      - equal:
-          path: spec.serviceName
-          value: openshell-peer
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_PEER_SERVICE_NAME
-            value: openshell-peer
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_PEER_TOKEN_AUDIENCE
-            value: openshell-gateway-peer
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_PEER_TLS_SERVER_NAME
-            value: openshell.my-namespace.svc.cluster.local
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_PEER_TLS_CA_FILE
-            value: /etc/openshell-tls/server/ca.crt
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_PEER_TLS_CERT_FILE
-            value: /etc/openshell-tls/peer-client/tls.crt
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_PEER_TLS_KEY_FILE
-            value: /etc/openshell-tls/peer-client/tls.key
-      - contains:
-          path: spec.template.spec.containers[0].volumeMounts
-          content:
-            name: gateway-peer-token
-            mountPath: /var/run/secrets/openshell-peer
-            readOnly: true
-      - contains:
-          path: spec.template.spec.containers[0].volumeMounts
-          content:
-            name: peer-client-tls
-            mountPath: /etc/openshell-tls/peer-client
-            readOnly: true
-      - equal:
-          path: spec.template.spec.volumes[2].projected.sources[0].serviceAccountToken.audience
-          value: openshell-gateway-peer
-
-  - it: configures gateway peer identity and projected peer token for Deployment
-    template: templates/deployment.yaml
-    set:
-      workload.kind: deployment
-      server.externalDbSecret: my-pg-secret
-      server.disableTls: true
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_POD_IP
-            valueFrom:
-              fieldRef:
-                fieldPath: status.podIP
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_PEER_ENDPOINT
-            value: http://$(OPENSHELL_POD_IP):8080
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_PEER_SERVICE_NAME
-            value: openshell-peer
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_PEER_TOKEN_AUDIENCE
-            value: openshell-gateway-peer
-      - contains:
-          path: spec.template.spec.containers[0].volumeMounts
-          content:
-            name: gateway-peer-token
-            mountPath: /var/run/secrets/openshell-peer
-            readOnly: true
-      - equal:
-          path: spec.template.spec.volumes[2].projected.sources[0].serviceAccountToken.audience
-          value: openshell-gateway-peer
-
-  - it: renders headless gateway peer service
-    template: templates/peer-service.yaml
-    asserts:
-      - equal:
-          path: metadata.name
-          value: openshell-peer
-      - equal:
-          path: spec.clusterIP
-          value: None
-      - equal:
-          path: spec.publishNotReadyAddresses
-          value: true
-
-  - it: grants release-namespace pod lookup for gateway peer identity validation
-    template: templates/peer-role.yaml
-    asserts:
-      - hasDocuments:
-          count: 2
-      - equal:
-          path: metadata.namespace
-          value: my-namespace
-        documentIndex: 0
-      - equal:
-          path: rules[0].resources[0]
-          value: pods
-        documentIndex: 0
-      - equal:
-          path: subjects[0].name
-          value: openshell
-        documentIndex: 1
 
   - it: fails when legacy postgres.enabled is set
     template: templates/statefulset.yaml
@@ -840,7 +699,9 @@ tests:
       workload.kind: deployment
       replicaCount: 2
       server.externalDbSecret: my-pg-secret
-      server.credentialDrivers.kubernetesSecrets.enabled: true
+      gatewayConfig:
+        openshell.gateway:
+          credential_drivers: [kubernetes-secrets]
     asserts:
       - equal:
           path: kind
@@ -895,7 +756,9 @@ tests:
       replicaCount: 2
       server.externalDbSecret: my-pg-secret
       workload.allowMultiReplicaStatefulSet: true
-      server.credentialDrivers.kubernetesSecrets.enabled: true
+      gatewayConfig:
+        openshell.gateway:
+          credential_drivers: [kubernetes-secrets]
     asserts:
       - equal:
           path: kind
@@ -961,7 +824,9 @@ tests:
                 key: uri
   - it: renders provider SPIFFE token grants while keeping gateway JWT auth
     set:
-      server.providerTokenGrants.spiffe.enabled: true
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
     template: templates/gateway-config.yaml
     asserts:
       - matchRegex:
@@ -976,7 +841,9 @@ tests:
 
   - it: mounts the gateway SPIFFE socket while keeping sandbox JWT auth
     set:
-      server.providerTokenGrants.spiffe.enabled: true
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
     template: templates/statefulset.yaml
     asserts:
       - contains:
@@ -1032,12 +899,14 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: "(?ms)name\\s*=\\s*\\\"openshell\\\".*?\\[openshell\\.drivers\\.kubernetes\\].*?namespace\\s*=\\s*\\\"my-namespace\\\".*?grpc_endpoint\\s*=\\s*\\\"https://openshell\\.my-namespace\\.svc\\.cluster\\.local:8080\\\""
+          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?grpc_endpoint\\s*=\\s*\\\"https://openshell\\.my-namespace\\.svc\\.cluster\\.local:8080\\\".*?namespace\\s*=\\s*\\\"my-namespace\\\".*?\\[openshell\\.gateway\\].*?name\\s*=\\s*\\\"openshell\\\""
 
   - it: uses an explicit server grpc endpoint verbatim
     template: templates/gateway-config.yaml
     set:
-      server.grpcEndpoint: https://gateway.example.test:9443
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          grpc_endpoint: https://gateway.example.test:9443
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -1047,6 +916,12 @@ tests:
     template: templates/gateway-config.yaml
     set:
       server.disableTls: true
+      gatewayConfig:
+        openshell.gateway:
+          disable_tls: true
+        openshell.gateway.tls: null
+        openshell.drivers.kubernetes:
+          client_tls_secret_name: null
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -1054,63 +929,3 @@ tests:
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: "client_tls_secret_name\\s*="
-
-  - it: accepts Always pull policy spelling for sandbox and supervisor
-    template: templates/gateway-config.yaml
-    set:
-      server.sandboxImagePullPolicy: Always
-      supervisor.image.pullPolicy: Always
-    asserts:
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?image_pull_policy\\s*=\\s*\\\"always\\\".*?supervisor_image_pull_policy\\s*=\\s*\\\"always\\\""
-
-  - it: accepts IfNotPresent pull policy spelling for sandbox and supervisor
-    template: templates/gateway-config.yaml
-    set:
-      server.sandboxImagePullPolicy: IfNotPresent
-      supervisor.image.pullPolicy: IfNotPresent
-    asserts:
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?image_pull_policy\\s*=\\s*\\\"if_not_present\\\".*?supervisor_image_pull_policy\\s*=\\s*\\\"if_not_present\\\""
-
-  - it: accepts Never pull policy spelling for sandbox and supervisor
-    template: templates/gateway-config.yaml
-    set:
-      server.sandboxImagePullPolicy: Never
-      supervisor.image.pullPolicy: Never
-    asserts:
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?image_pull_policy\\s*=\\s*\\\"never\\\".*?supervisor_image_pull_policy\\s*=\\s*\\\"never\\\""
-
-  - it: accepts canonical lowercase pull policies for sandbox and supervisor
-    template: templates/gateway-config.yaml
-    set:
-      server.sandboxImagePullPolicy: always
-      supervisor.image.pullPolicy: always
-    asserts:
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?image_pull_policy\\s*=\\s*\\\"always\\\".*?supervisor_image_pull_policy\\s*=\\s*\\\"always\\\""
-
-  - it: accepts canonical if_not_present pull policies for sandbox and supervisor
-    template: templates/gateway-config.yaml
-    set:
-      server.sandboxImagePullPolicy: if_not_present
-      supervisor.image.pullPolicy: if_not_present
-    asserts:
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?image_pull_policy\\s*=\\s*\\\"if_not_present\\\".*?supervisor_image_pull_policy\\s*=\\s*\\\"if_not_present\\\""
-
-  - it: accepts canonical never pull policies for sandbox and supervisor
-    template: templates/gateway-config.yaml
-    set:
-      server.sandboxImagePullPolicy: never
-      supervisor.image.pullPolicy: never
-    asserts:
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: "(?ms)\\[openshell\\.drivers\\.kubernetes\\].*?image_pull_policy\\s*=\\s*\\\"never\\\".*?supervisor_image_pull_policy\\s*=\\s*\\\"never\\\""

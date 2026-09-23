@@ -5,6 +5,16 @@
 Gateway pod template shared by the StatefulSet and Deployment workload shapes.
 */}}
 {{- define "openshell.gatewayPodTemplate" -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- $gatewayRuntimeConfig := get $gatewayConfig "openshell.gateway" | default dict -}}
+{{- $oidcRuntimeConfig := get $gatewayConfig "openshell.gateway.oidc" | default dict -}}
+{{- $kubernetesRuntimeConfig := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
+{{- $spiffeSocketPath := get $kubernetesRuntimeConfig "provider_spiffe_workload_api_socket_path" -}}
+{{- $hasExternalCredentialDriver := or (eq (include "openshell.credentialDriverEnabled" (list . "kubernetes-secrets")) "true") (eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true") -}}
+{{- $vaultCredentialDriverEnabled := eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true" -}}
+{{- $credentialDrivers := .Values.credentialDrivers | default dict -}}
+{{- $vaultResources := get $credentialDrivers "vault" | default dict -}}
+{{- $vaultCaConfigMapName := get $vaultResources "caConfigMapName" -}}
 metadata:
   annotations:
     # Roll the gateway workload when the rendered gateway TOML changes - the
@@ -52,51 +62,7 @@ spec:
         - {{ .Values.server.dbUrl | quote }}
         {{- end }}
       env:
-        - name: OPENSHELL_REPLICA_ID
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
-        - name: OPENSHELL_POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
-        - name: OPENSHELL_POD_NAMESPACE
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.namespace
-        {{- if eq (include "openshell.workloadKind" .) "deployment" }}
-        - name: OPENSHELL_POD_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.podIP
-        - name: OPENSHELL_PEER_ENDPOINT
-          value: {{ printf "%s://$(OPENSHELL_POD_IP):%d" (ternary "http" "https" (default false .Values.server.disableTls)) (int .Values.service.port) | quote }}
-        {{- end }}
-        - name: OPENSHELL_SERVICE_ACCOUNT_NAME
-          value: {{ include "openshell.serviceAccountName" . | quote }}
-        - name: OPENSHELL_PEER_SERVICE_NAME
-          value: {{ include "openshell.peerServiceName" . | quote }}
-        - name: OPENSHELL_PEER_TOKEN_AUDIENCE
-          value: "openshell-gateway-peer"
-        - name: OPENSHELL_PEER_SERVICE_ACCOUNT_TOKEN_FILE
-          value: /var/run/secrets/openshell-peer/token
-        - name: OPENSHELL_PEER_POD_LABELS
-          value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s" (include "openshell.name" .) .Release.Name | quote }}
-        {{- if not .Values.server.disableTls }}
-        - name: OPENSHELL_PEER_TLS_SERVER_NAME
-          value: {{ printf "%s.%s.svc.cluster.local" (include "openshell.fullname" .) .Release.Namespace | quote }}
-        {{- if or .Values.pkiInitJob.enabled .Values.certManager.enabled }}
-        - name: OPENSHELL_PEER_TLS_CA_FILE
-          value: /etc/openshell-tls/server/ca.crt
-        {{- end }}
-        {{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" }}
-        - name: OPENSHELL_PEER_TLS_CERT_FILE
-          value: /etc/openshell-tls/peer-client/tls.crt
-        - name: OPENSHELL_PEER_TLS_KEY_FILE
-          value: /etc/openshell-tls/peer-client/tls.key
-        {{- end }}
-        {{- end }}
-        {{- if not (or .Values.server.credentialDrivers.kubernetesSecrets.enabled .Values.server.credentialDrivers.vault.enabled) }}
+        {{- if not $hasExternalCredentialDriver }}
         - name: {{ include "openshell.credentialStorageKeyEncryptionKeyEnvName" . }}
           valueFrom:
             secretKeyRef:
@@ -114,7 +80,7 @@ spec:
         # mounted at /etc/openshell/gateway.toml. Secret-bearing settings use
         # env vars that the TOML references by name. Some process-level
         # settings consumed by libraries outside gateway code also remain here.
-        {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+        {{- if and (get $oidcRuntimeConfig "issuer") .Values.oidc.caConfigMapName }}
         # OIDC issuer custom-CA: rustls/reqwest read SSL_CERT_FILE for
         # outbound TLS verification. This is a process-level env var
         # consumed by the TLS stack itself, not by gateway code, so it
@@ -124,9 +90,9 @@ spec:
         {{- end }}
         - name: OPENSHELL_TELEMETRY_ENABLED
           value: {{ .Values.server.telemetryEnabled | quote }}
-        {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
+        {{- if $spiffeSocketPath }}
         - name: OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET
-          value: {{ .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
+          value: {{ $spiffeSocketPath | quote }}
         {{- end }}
       volumeMounts:
         {{- if eq (include "openshell.workloadKind" .) "statefulset" }}
@@ -143,9 +109,6 @@ spec:
         - name: sandbox-jwt
           mountPath: /etc/openshell-jwt
           readOnly: true
-        - name: gateway-peer-token
-          mountPath: /var/run/secrets/openshell-peer
-          readOnly: true
         {{- if not .Values.server.disableTls }}
         - name: tls-cert
           mountPath: /etc/openshell-tls/server
@@ -156,22 +119,19 @@ spec:
           readOnly: true
         {{- end }}
         {{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" }}
-        - name: peer-client-tls
-          mountPath: /etc/openshell-tls/peer-client
-          readOnly: true
         - name: tls-client-ca
           mountPath: /etc/openshell-tls/client-ca
           readOnly: true
         {{- end }}
         {{- end }}
-        {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+        {{- if and (get $oidcRuntimeConfig "issuer") .Values.oidc.caConfigMapName }}
         - name: oidc-ca
           mountPath: /etc/openshell-tls/oidc-ca
           readOnly: true
         {{- end }}
-        {{- if and .Values.server.credentialDrivers.vault.enabled .Values.server.credentialDrivers.vault.caConfigMapName }}
+        {{- if and $vaultCredentialDriverEnabled $vaultCaConfigMapName }}
         - name: vault-ca
-          mountPath: /etc/openshell-tls/vault-ca
+          mountPath: /etc/openshell-tls/vault
           readOnly: true
         {{- end }}
         {{- if .Values.upstreamProxy.caBundle.configMapName }}
@@ -179,9 +139,9 @@ spec:
           mountPath: /etc/openshell-tls/proxy-ca
           readOnly: true
         {{- end }}
-        {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
+        {{- if $spiffeSocketPath }}
         - name: spiffe-workload-api
-          mountPath: {{ dir .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
+          mountPath: {{ dir $spiffeSocketPath | quote }}
           readOnly: true
         {{- end }}
       ports:
@@ -229,14 +189,6 @@ spec:
       secret:
         secretName: {{ include "openshell.sandboxJwtSecretName" . }}
         defaultMode: {{ .Values.server.sandboxJwt.secretDefaultMode | default 0400 }}
-    - name: gateway-peer-token
-      projected:
-        defaultMode: 0400
-        sources:
-          - serviceAccountToken:
-              path: token
-              audience: openshell-gateway-peer
-              expirationSeconds: 3600
     {{- if not .Values.server.disableTls }}
     - name: tls-cert
       secret:
@@ -247,9 +199,6 @@ spec:
         secretName: {{ include "openshell.fullname" . }}-server-external-tls
     {{- end }}
     {{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" }}
-    - name: peer-client-tls
-      secret:
-        secretName: {{ .Values.server.tls.clientTlsSecretName }}
     - name: tls-client-ca
       secret:
         {{- if or (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
@@ -262,15 +211,15 @@ spec:
         {{- end }}
     {{- end }}
     {{- end }}
-    {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+    {{- if and (get $oidcRuntimeConfig "issuer") .Values.oidc.caConfigMapName }}
     - name: oidc-ca
       configMap:
-        name: {{ .Values.server.oidc.caConfigMapName }}
+        name: {{ .Values.oidc.caConfigMapName }}
     {{- end }}
-    {{- if and .Values.server.credentialDrivers.vault.enabled .Values.server.credentialDrivers.vault.caConfigMapName }}
+    {{- if and $vaultCredentialDriverEnabled $vaultCaConfigMapName }}
     - name: vault-ca
       configMap:
-        name: {{ .Values.server.credentialDrivers.vault.caConfigMapName }}
+        name: {{ $vaultCaConfigMapName }}
         items:
           - key: ca.crt
             path: ca.crt
@@ -280,12 +229,10 @@ spec:
       configMap:
         name: {{ .Values.upstreamProxy.caBundle.configMapName | quote }}
         items:
-          # The mounted filename stays fixed so the rendered proxy_ca_bundle
-          # path does not depend on the operator's ConfigMap key.
           - key: {{ .Values.upstreamProxy.caBundle.key | default "ca.crt" | quote }}
             path: ca.crt
     {{- end }}
-    {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
+    {{- if $spiffeSocketPath }}
     - name: spiffe-workload-api
       csi:
         driver: csi.spiffe.io

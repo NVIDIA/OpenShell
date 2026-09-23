@@ -82,7 +82,8 @@ restricts them.
 Kubernetes policies are additive. Keep sandbox namespaces under administrative
 control so another principal cannot add permissive policies, create Pods with
 OpenShell labels, or read bootstrap Secrets. Set
-`supervisor.sandboxRuntime.networkPolicyEnforced: true` only after you verify that the
+`gatewayConfig.openshell.drivers.kubernetes.sandbox_runtime.network_policy_enforced: true`
+only after you verify that the
 cluster CNI enforces both ingress and egress policies for these namespaces.
 
 ## Bootstrap a Sandbox

@@ -10,10 +10,11 @@
 #
 # Features: the default set includes `e2e-host-gateway` so tests that rely on
 # the sandbox-side `host.openshell.internal` alias compile and run. The
-# wrapper detects the cluster's host-routable IP and wires it into the chart
-# via `server.hostGatewayIP`. Targeting a cluster where the test host is
-# unreachable from pods? Set OPENSHELL_E2E_KUBERNETES_FEATURES=e2e to drop the
-# alias-dependent tests entirely.
+# wrapper detects the cluster's host-routable IP and passes it through the
+# chart-owned server.hostGatewayIP input, which derives the runtime field.
+# Targeting a
+# cluster where the test host is unreachable from pods? Set
+# OPENSHELL_E2E_KUBERNETES_FEATURES=e2e to drop the alias-dependent tests.
 #
 # Results: `run_suite` writes a JUnit + HTML report under `results/`. Set
 # `OPENSHELL_E2E_REPORT_NAME` to name it per run when invoking this script repeatedly.

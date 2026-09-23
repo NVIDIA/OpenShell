@@ -101,12 +101,6 @@ EXTERNAL_PG_FIXTURE_SERVICE="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_USER="openshell"
 EXTERNAL_PG_FIXTURE_PASSWORD="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_DATABASE="openshell"
-ENVOY_RELEASE_NAME="${OPENSHELL_E2E_ENVOY_RELEASE_NAME:-envoy-gateway}"
-ENVOY_NAMESPACE="${OPENSHELL_E2E_ENVOY_NAMESPACE:-envoy-gateway-system}"
-ENVOY_CHART_VERSION="${OPENSHELL_E2E_ENVOY_VERSION:-v1.7.2}"
-ENVOY_GATEWAY_MANIFEST="${ROOT}/deploy/kube/manifests/envoy-gateway-openshell.yaml"
-ENVOY_HELM_INSTALLED=0
-ENVOY_GATEWAY_CONFIG_APPLIED=0
 VAULT_FIXTURE_DEPLOYED=0
 VAULT_NAMESPACE="${OPENSHELL_E2E_VAULT_NAMESPACE:-openbao}"
 VAULT_RELEASE_NAME="${OPENSHELL_E2E_VAULT_RELEASE_NAME:-openbao}"
@@ -117,8 +111,6 @@ VAULT_DNS_ALIAS="${VAULT_RELEASE_NAME}-0"
 VAULT_CA_FILE="${WORKDIR}/openbao-ca.crt"
 CORPORATE_PROXY_FIXTURE_DEPLOYED=0
 CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
-CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP="openshell-e2e-proxy-ca"
-CORPORATE_PROXY_CA_FIXTURE_DEPLOYED=0
 OPENSHIFT_DETECTED=0
 OPENSHIFT_SANDBOX_SCC_GRANTED=0
 OPENSHIFT_POSTGRES_SCC_GRANTED=0
@@ -157,6 +149,53 @@ kube_workload_ref() {
   return 1
 }
 
+# Verify the ConfigMap checksum causes a live gateway rollout. This belongs in
+# the harness, before port-forwards are established, because replacing a pod
+# necessarily interrupts any existing port-forward to it.
+verify_gateway_config_rollout() {
+  local workload_ref old_checksum new_checksum old_pod_uid new_pod_uid attempt
+  local pod_selector="app.kubernetes.io/instance=${RELEASE_NAME},app.kubernetes.io/name=openshell"
+
+  workload_ref="$(kube_workload_ref "${RELEASE_NAME}")"
+  old_checksum="$(kctl -n "${NAMESPACE}" get "${workload_ref}" -o jsonpath='{.spec.template.metadata.annotations.checksum/gateway-config}')"
+  old_pod_uid="$(kctl -n "${NAMESPACE}" get pods -l "${pod_selector}" -o jsonpath='{.items[0].metadata.uid}')"
+  if [[ -z "${old_checksum}" || -z "${old_pod_uid}" ]]; then
+    echo "ERROR: gateway workload is missing its ConfigMap checksum or ready pod" >&2
+    return 1
+  fi
+
+  echo "Verifying ConfigMap-only gateway configuration rollout..."
+  helmctl upgrade "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
+    --namespace "${NAMESPACE}" \
+    --reuse-values \
+    "${helm_values_args[@]}" \
+    --set "fullnameOverride=openshell" \
+    --set "image.repository=${REGISTRY_VALUE}/gateway" \
+    --set "image.tag=${IMAGE_TAG_VALUE}" \
+    --set-string "gatewayConfig.openshell\\.drivers\\.kubernetes.supervisor_image=${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}" \
+    "${helm_extra_args[@]}" \
+    "${helm_post_renderer_args[@]}" \
+    --set-string 'gatewayConfig.openshell\.gateway.log_level=debug' \
+    --wait --timeout 5m
+
+  new_checksum="$(kctl -n "${NAMESPACE}" get "${workload_ref}" -o jsonpath='{.spec.template.metadata.annotations.checksum/gateway-config}')"
+  if [[ -z "${new_checksum}" || "${new_checksum}" == "${old_checksum}" ]]; then
+    echo "ERROR: ConfigMap-only gateway configuration change did not update workload checksum" >&2
+    return 1
+  fi
+  kctl -n "${NAMESPACE}" rollout status "${workload_ref}" --timeout=5m || return 1
+
+  for attempt in $(seq 1 60); do
+    new_pod_uid="$(kctl -n "${NAMESPACE}" get pods -l "${pod_selector}" -o jsonpath='{.items[0].metadata.uid}')"
+    if [[ -n "${new_pod_uid}" && "${new_pod_uid}" != "${old_pod_uid}" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: gateway workload rolled out without replacing its pod" >&2
+  return 1
+}
+
 deploy_postgres_fixture() {
   local secret_name="$1"
   local pg_uri
@@ -187,122 +226,6 @@ deploy_postgres_fixture() {
     --ignore-not-found >/dev/null 2>&1 || true
   kctl -n "${NAMESPACE}" create secret generic "${secret_name}" \
     --from-literal=uri="${pg_uri}"
-}
-
-use_envoy_gateway() {
-  case "${OPENSHELL_E2E_KUBE_USE_ENVOY:-0}" in
-    1 | true | TRUE | yes | YES) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-install_envoy_gateway() {
-  echo "Installing Envoy Gateway (${ENVOY_CHART_VERSION})..."
-  helmctl upgrade --install "${ENVOY_RELEASE_NAME}" \
-    oci://docker.io/envoyproxy/gateway-helm \
-    --version "${ENVOY_CHART_VERSION}" \
-    --namespace "${ENVOY_NAMESPACE}" --create-namespace \
-    --wait --timeout 5m
-  ENVOY_HELM_INSTALLED=1
-
-  if ! kctl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
-    kctl create namespace "${NAMESPACE}"
-  fi
-
-  kctl apply -f "${ENVOY_GATEWAY_MANIFEST}"
-  ENVOY_GATEWAY_CONFIG_APPLIED=1
-}
-
-wait_for_envoy_service() {
-  local svc_ref=""
-  local svc_namespace=""
-
-  for _ in $(seq 1 60); do
-    svc_ref="$(kctl get svc -A \
-      -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
-      -o jsonpath='{range .items[0]}{.metadata.namespace}{"/"}{.metadata.name}{end}' \
-      2>/dev/null || true)"
-    if [ -n "${svc_ref}" ]; then
-      svc_namespace="${svc_ref%%/*}"
-      if kctl -n "${svc_namespace}" wait --for=condition=Ready pod \
-        -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
-        --timeout=5s >/dev/null 2>&1; then
-        printf '%s\n' "${svc_ref}"
-        return 0
-      fi
-    fi
-    sleep 2
-  done
-
-  echo "ERROR: Envoy proxy Service for Gateway ${RELEASE_NAME} was not ready." >&2
-  kctl -n "${NAMESPACE}" get gateway,grpcroute -o wide >&2 || true
-  kctl get svc -A \
-    -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
-    -o wide >&2 || true
-  kctl get pods -A \
-    -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
-    -o wide >&2 || true
-  return 1
-}
-
-start_gateway_portforward() {
-  local elapsed=0
-  local pf_timeout=30
-  local target_port=8080
-  local target_namespace="${NAMESPACE}"
-  local target_service="${RELEASE_NAME}"
-  local target_service_ref=""
-
-  LOCAL_PORT="$(e2e_pick_port)"
-  if use_envoy_gateway; then
-    target_service_ref="$(wait_for_envoy_service)"
-    target_namespace="${target_service_ref%%/*}"
-    target_service="${target_service_ref#*/}"
-    target_port=80
-    echo "Starting kubectl port-forward -n ${target_namespace} svc/${target_service} ${LOCAL_PORT}:${target_port} (Envoy Gateway)..."
-  else
-    echo "Starting kubectl port-forward svc/${target_service} ${LOCAL_PORT}:${target_port}..."
-  fi
-
-  kctl -n "${target_namespace}" port-forward "svc/${target_service}" \
-    "${LOCAL_PORT}:${target_port}" >"${PORTFORWARD_LOG}" 2>&1 &
-  PORTFORWARD_PID=$!
-
-  while [ "${elapsed}" -lt "${pf_timeout}" ]; do
-    if ! kill -0 "${PORTFORWARD_PID}" 2>/dev/null; then
-      echo "ERROR: kubectl port-forward exited before becoming reachable" >&2
-      cat "${PORTFORWARD_LOG}" >&2 || true
-      return 1
-    fi
-    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
-      return 0
-    fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-
-  echo "ERROR: port-forward did not accept TCP within ${pf_timeout}s" >&2
-  cat "${PORTFORWARD_LOG}" >&2 || true
-  return 1
-}
-
-stop_gateway_portforward() {
-  local pid
-  local pid_var
-  for pid_var in PORTFORWARD_PID PORTFORWARD_HEALTH_PID; do
-    pid="${!pid_var}"
-    [ -n "${pid}" ] || continue
-    kill "${pid}" >/dev/null 2>&1 || true
-    for _ in $(seq 1 10); do
-      if ! kill -0 "${pid}" >/dev/null 2>&1; then
-        break
-      fi
-      sleep 0.5
-    done
-    kill -KILL "${pid}" >/dev/null 2>&1 || true
-    wait "${pid}" >/dev/null 2>&1 || true
-    printf -v "${pid_var}" '%s' ""
-  done
 }
 
 cleanup_postgres_fixture() {
@@ -444,7 +367,15 @@ cleanup_vault_fixture() {
 cleanup() {
   local exit_code=$?
 
-  stop_gateway_portforward
+  if [ -n "${PORTFORWARD_PID}" ]; then
+    kill "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
+    wait "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
+  fi
+
+  if [ -n "${PORTFORWARD_HEALTH_PID}" ]; then
+    kill "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
+    wait "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
+  fi
 
   if [ "${exit_code}" -ne 0 ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
     if command -v kubectl >/dev/null 2>&1 \
@@ -506,24 +437,8 @@ cleanup() {
     cleanup_vault_fixture
   fi
 
-  if [ "${ENVOY_GATEWAY_CONFIG_APPLIED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
-    if command -v kubectl >/dev/null 2>&1; then
-      kctl -n "${NAMESPACE}" delete backendtrafficpolicy.gateway.envoyproxy.io \
-        openshell-grpc-timeouts --ignore-not-found --wait=false \
-        >/dev/null 2>&1 || true
-      kctl delete gatewayclass.gateway.networking.k8s.io eg \
-        --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    fi
-    ENVOY_GATEWAY_CONFIG_APPLIED=0
-  fi
-
   if [ "${CORPORATE_PROXY_FIXTURE_DEPLOYED}" = "1" ]; then
     kctl -n "${NAMESPACE}" delete secret "${CORPORATE_PROXY_FIXTURE_SECRET}" \
-      --ignore-not-found >/dev/null 2>&1 || true
-  fi
-
-  if [ "${CORPORATE_PROXY_CA_FIXTURE_DEPLOYED}" = "1" ]; then
-    kctl -n "${NAMESPACE}" delete configmap "${CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP}" \
       --ignore-not-found >/dev/null 2>&1 || true
   fi
 
@@ -570,18 +485,6 @@ cleanup() {
     fi
   fi
 
-  if [ "${ENVOY_HELM_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
-    if command -v helm >/dev/null 2>&1; then
-      helmctl uninstall "${ENVOY_RELEASE_NAME}" --namespace "${ENVOY_NAMESPACE}" \
-        --wait --timeout 60s >/dev/null 2>&1 || true
-    fi
-    if command -v kubectl >/dev/null 2>&1; then
-      kctl delete namespace "${ENVOY_NAMESPACE}" --wait=true --timeout=60s \
-        --ignore-not-found >/dev/null 2>&1 || true
-    fi
-    ENVOY_HELM_INSTALLED=0
-  fi
-
   if [ "${CLUSTER_CREATED_BY_US}" = "1" ] && [ -n "${CLUSTER_NAME}" ]; then
     if command -v k3d >/dev/null 2>&1 && k3d cluster list "${CLUSTER_NAME}" \
         >/dev/null 2>&1; then
@@ -597,7 +500,16 @@ trap cleanup EXIT
 # --- DB-scenario helpers (used only when OPENSHELL_E2E_KUBE_DB_SCENARIOS=1) ---
 
 scenario_stop_portforward() {
-  stop_gateway_portforward
+  if [ -n "${PORTFORWARD_PID}" ]; then
+    kill "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
+    wait "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
+    PORTFORWARD_PID=""
+  fi
+  if [ -n "${PORTFORWARD_HEALTH_PID}" ]; then
+    kill "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
+    wait "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
+    PORTFORWARD_HEALTH_PID=""
+  fi
 }
 
 scenario_cleanup_release() {
@@ -654,10 +566,8 @@ run_scenario() {
     --set "fullnameOverride=openshell" \
     --set "image.repository=${REGISTRY_VALUE}/gateway" \
     --set "image.tag=${IMAGE_TAG_VALUE}" \
-    --set "sandboxRuntime.image.repository=${REGISTRY_VALUE}/sandbox" \
-    --set "sandboxRuntime.image.tag=${IMAGE_TAG_VALUE}" \
-    --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
-    --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    --set-string "gatewayConfig.openshell\\.drivers\\.kubernetes.sandbox_runtime_image=${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}" \
+    --set-string "gatewayConfig.openshell\\.drivers\\.kubernetes.supervisor_image=${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}" \
     "${helm_post_renderer_args[@]}" \
     "$@" \
     --wait --timeout 5m
@@ -672,7 +582,7 @@ run_scenario() {
     fi
   else
     # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
-    if ! start_gateway_portforward; then
+    if ! start_grpc_portforward; then
       scenario_record_failure "${scenario_label}" "port-forward failed"
       return
     fi
@@ -699,9 +609,6 @@ run_scenario() {
   export CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
   export OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
-  export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
-  export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
-  export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
 
   e2e_import_example_provider_profiles \
@@ -1147,6 +1054,10 @@ fi
 helm_extra_args=()
 helm_post_renderer_args=()
 helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
+helm_extra_args+=(--set 'gatewayConfig.openshell\.drivers\.kubernetes.sandbox_runtime.network_policy_enforced=true')
+# Keep the runtime configuration aligned with the locally built/imported image
+# without creating a second Helm values API for driver configuration.
+helm_extra_args+=(--set-string "gatewayConfig.openshell\\.drivers\\.kubernetes.supervisor_image=${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}")
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" != "1" ]; then
     echo "ERROR: external Kubernetes driver e2e requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=1." >&2
@@ -1158,7 +1069,10 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   )
 fi
 if [ -n "${HOST_GATEWAY_IP}" ]; then
-  helm_extra_args+=(--set "server.hostGatewayIP=${HOST_GATEWAY_IP}")
+  # server.hostGatewayIP owns both the gateway runtime field and sandbox-pod
+  # hostAliases. Exercise the public chart input rather than bypassing it with
+  # a direct gatewayConfig override.
+  helm_extra_args+=(--set-string "server.hostGatewayIP=${HOST_GATEWAY_IP}")
 fi
 
 helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
@@ -1203,20 +1117,15 @@ if [ "${OPENSHELL_E2E_KUBE_CORPORATE_PROXY:-0}" = "1" ]; then
     export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-45}"
   fi
   CORPORATE_PROXY_VALUES="${WORKDIR}/corporate-proxy-values.yaml"
-  # `https-ca` terminates TLS on the proxy listener itself, so the supervisor
-  # must trust the operator CA bundle before it can even issue CONNECT.
-  CORPORATE_PROXY_SCHEME="http"
-  if [ "${CORPORATE_PROXY_MODE}" = "https-ca" ]; then
-    CORPORATE_PROXY_SCHEME="https"
-  fi
   cat >"${CORPORATE_PROXY_VALUES}" <<EOF
-upstreamProxy:
-  url: ${CORPORATE_PROXY_SCHEME}://host.openshell.internal:${CORPORATE_PROXY_PORT}
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    https_proxy: http://host.openshell.internal:${CORPORATE_PROXY_PORT}
 EOF
   if [ "${CORPORATE_PROXY_MODE}" = "no-proxy" ]; then
     CORPORATE_PROXY_UPSTREAM_PORT="$(e2e_pick_port)"
     cat >>"${CORPORATE_PROXY_VALUES}" <<EOF
-  noProxy: host.openshell.internal
+    no_proxy: host.openshell.internal
 EOF
   fi
   case "${CORPORATE_PROXY_MODE}" in
@@ -1231,55 +1140,6 @@ EOF
       kctl -n "${NAMESPACE}" create secret generic "${CORPORATE_PROXY_FIXTURE_SECRET}" \
         --from-literal=proxy-auth=malformed --dry-run=client -o yaml | kctl apply -f -
       CORPORATE_PROXY_FIXTURE_DEPLOYED=1
-      ;;
-    https-ca)
-      kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
-      kctl -n "${NAMESPACE}" create secret generic "${CORPORATE_PROXY_FIXTURE_SECRET}" \
-        --from-literal=proxy-auth=proxyuser:proxypass --dry-run=client -o yaml | kctl apply -f -
-      CORPORATE_PROXY_FIXTURE_DEPLOYED=1
-
-      # Mint a private CA and a listener leaf for the proxy. The leaf must be
-      # CA:FALSE with a serverAuth EKU, or rustls rejects it regardless of
-      # whether the issuing CA is trusted.
-      CORPORATE_PROXY_TLS_DIR="${WORKDIR}/corporate-proxy-tls"
-      mkdir -p "${CORPORATE_PROXY_TLS_DIR}"
-      openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-        -keyout "${CORPORATE_PROXY_TLS_DIR}/ca.key" \
-        -out "${CORPORATE_PROXY_TLS_DIR}/ca.crt" \
-        -subj "/CN=OpenShell E2E Corporate Proxy CA" >/dev/null 2>&1
-      openssl req -newkey rsa:2048 -nodes \
-        -keyout "${CORPORATE_PROXY_TLS_DIR}/proxy.key" \
-        -out "${CORPORATE_PROXY_TLS_DIR}/proxy.csr" \
-        -subj "/CN=host.openshell.internal" >/dev/null 2>&1
-      cat >"${CORPORATE_PROXY_TLS_DIR}/leaf.ext" <<EXT
-basicConstraints=critical,CA:FALSE
-keyUsage=critical,digitalSignature,keyEncipherment
-extendedKeyUsage=serverAuth
-subjectAltName=DNS:host.openshell.internal
-EXT
-      openssl x509 -req -days 1 \
-        -in "${CORPORATE_PROXY_TLS_DIR}/proxy.csr" \
-        -CA "${CORPORATE_PROXY_TLS_DIR}/ca.crt" \
-        -CAkey "${CORPORATE_PROXY_TLS_DIR}/ca.key" \
-        -CAcreateserial \
-        -extfile "${CORPORATE_PROXY_TLS_DIR}/leaf.ext" \
-        -out "${CORPORATE_PROXY_TLS_DIR}/proxy.crt" >/dev/null 2>&1
-
-      # The CA ConfigMap belongs to the gateway release namespace: the gateway
-      # reads it and stages the bundle per sandbox, so it is never sourced
-      # from a workload namespace.
-      kctl -n "${NAMESPACE}" create configmap "${CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP}" \
-        --from-file=ca.crt="${CORPORATE_PROXY_TLS_DIR}/ca.crt" \
-        --dry-run=client -o yaml | kctl apply -f -
-      CORPORATE_PROXY_CA_FIXTURE_DEPLOYED=1
-      cat >>"${CORPORATE_PROXY_VALUES}" <<EOF
-  caBundle:
-    configMapName: ${CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP}
-EOF
-      OPENSHELL_E2E_CORPORATE_PROXY_TLS_CERT="$(cat "${CORPORATE_PROXY_TLS_DIR}/proxy.crt")"
-      OPENSHELL_E2E_CORPORATE_PROXY_TLS_KEY="$(cat "${CORPORATE_PROXY_TLS_DIR}/proxy.key")"
-      export OPENSHELL_E2E_CORPORATE_PROXY_TLS_CERT
-      export OPENSHELL_E2E_CORPORATE_PROXY_TLS_KEY
       ;;
     missing-secret) ;;
     *) echo "ERROR: unknown corporate proxy e2e mode '${CORPORATE_PROXY_MODE}'" >&2; exit 2 ;;
@@ -1314,10 +1174,6 @@ if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
     fi
     helm_values_args+=(--values "${values_file}")
   done
-fi
-if use_envoy_gateway; then
-  helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway.yaml")
-  install_envoy_gateway
 fi
 
 if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
@@ -1363,14 +1219,16 @@ else
     --set "fullnameOverride=openshell" \
     --set "image.repository=${REGISTRY_VALUE}/gateway" \
     --set "image.tag=${IMAGE_TAG_VALUE}" \
-    --set "sandboxRuntime.image.repository=${REGISTRY_VALUE}/sandbox" \
-    --set "sandboxRuntime.image.tag=${IMAGE_TAG_VALUE}" \
-    --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
-    --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    --set-string "gatewayConfig.openshell\\.drivers\\.kubernetes.sandbox_runtime_image=${REGISTRY_VALUE}/sandbox:${IMAGE_TAG_VALUE}" \
+    --set-string "gatewayConfig.openshell\\.drivers\\.kubernetes.supervisor_image=${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}" \
     "${helm_extra_args[@]}" \
     "${helm_post_renderer_args[@]}" \
     --wait --timeout 5m
   HELM_INSTALLED=1
+
+  if [ "${OPENSHELL_E2E_KUBE_CONFIG_ROLLOUT:-0}" = "1" ]; then
+    verify_gateway_config_rollout || exit 1
+  fi
 
   if [ -n "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET:-}" ]; then
     kctl -n "${NAMESPACE}" create secret docker-registry \
@@ -1378,9 +1236,6 @@ else
       --docker-server=registry.example.test \
       --docker-username=e2e-user \
       --docker-password=e2e-password
-    kctl -n "${NAMESPACE}" label secret \
-      "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET}" \
-      openshell.ai/sandbox-attachable=true
   fi
 
   if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
@@ -1389,7 +1244,7 @@ else
     openshift_register_route_gateway || exit 1
   else
     # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
-    start_gateway_portforward || exit 1
+    start_grpc_portforward || exit 1
     GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
     GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
     e2e_register_plaintext_gateway \
@@ -1410,9 +1265,6 @@ else
   export CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
   export OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
-  export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
-  export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
-  export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
 
   e2e_import_example_provider_profiles \

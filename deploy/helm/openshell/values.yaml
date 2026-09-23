@@ -26,65 +26,31 @@ image:
   # -- Gateway image tag. Defaults to the chart appVersion when empty.
   tag: ""
 
-# Trusted workload-side runtime image.
+# Deprecated compatibility inputs retained for 0.1.x. Prefer gatewayConfig.
+# When both are set, gatewayConfig takes precedence.
 sandboxRuntime:
   image:
-    # -- Sandbox runtime image repository. Changing it uses the effective gateway image tag unless tag is also set.
     repository: ghcr.io/nvidia/openshell/sandbox
-    # -- Sandbox runtime image pull policy. Defaults to the gateway image pull policy when empty.
     pullPolicy: ""
-    # -- Sandbox runtime image tag override. Empty uses the version pinned into the gateway unless repository is changed.
     tag: ""
-
-# Trusted control-side runtime image.
 supervisor:
   image:
-    # -- Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set.
     repository: ghcr.io/nvidia/openshell/supervisor
-    # -- Sandbox supervisor pull policy. Leave unset to use the Kubernetes
-    # image default. Prefer always, if_not_present, or never; the chart also
-    # accepts legacy Kubernetes spellings Always, IfNotPresent, and Never.
     pullPolicy: null
-    # -- Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed.
     tag: ""
   sandboxRuntime:
-    # -- Required operator acknowledgement that the cluster CNI enforces NetworkPolicy.
     networkPolicyEnforced: false
-    # -- Workload boundary TLS listener port.
     boundaryPort: 5500
-
-# -- Operator-owned corporate forward proxy for policy-approved TLS egress
-# from Kubernetes sandboxes. The workload cannot select or override it.
 upstreamProxy:
-  # -- Proxy URL in http://host:port or https://host:port form. An https:// proxy
-  # whose certificate is not publicly trusted also needs caBundle below.
   url: ""
-  # -- Comma-separated destinations that bypass only the corporate proxy.
   noProxy: ""
   authSecret:
-    # -- Existing Secret in the sandbox namespace containing a user:pass value.
     name: ""
-    # -- Secret key containing the proxy credential.
     key: ""
-  # -- Required when authSecret is configured because Basic auth to an HTTP proxy is cleartext.
   authAllowInsecure: false
-  # -- Last-resort option for hostname-filtering proxy ACLs. It lets the proxy resolve CONNECT targets.
   connectByHostname: false
   caBundle:
-    # -- ConfigMap in the release namespace holding the corporate proxy CA bundle.
-    # Required for an https:// proxy with a private CA, and for a TLS-intercepting
-    # proxy that re-signs upstream certificates. The gateway reads it and stages it
-    # into each sandbox's immutable supervisor bootstrap Secret, so the anchor stays
-    # in the gateway's trust domain rather than the workload namespace.
-    # Supply only the CA that signs your proxy's certificate, or that the proxy
-    # re-signs intercepted upstream certificates with. Public roots already come
-    # from the supervisor image and its TLS stack, so a full merged trust bundle
-    # (for example an OpenShift config.openshift.io/inject-trusted-cabundle
-    # ConfigMap) adds hundreds of kilobytes of duplicated roots and can exceed
-    # the sandbox boundary's control-frame budget.
     configMapName: ""
-    # -- Key inside that ConfigMap. Change this only to reuse an existing
-    # ConfigMap whose key is not ca.crt.
     key: ca.crt
 
 # -- Image pull secrets attached to gateway and helper pods.
@@ -203,20 +169,62 @@ tolerations: []
 # -- Affinity rules for the gateway pod.
 affinity: {}
 
+# -- Non-secret gateway application configuration. Top-level keys name TOML
+# tables and are rendered into the mounted gateway.toml file. Kubernetes
+# resource inputs remain outside this map; template expressions derive the
+# corresponding runtime values from their resource owner.
+gatewayConfig:
+  openshell:
+    version: 2
+  openshell.gateway:
+    name: '{{ include "openshell.fullname" . }}'
+    bind_address: '0.0.0.0:{{ .Values.service.port }}'
+    health_bind_address: '0.0.0.0:{{ .Values.service.healthPort }}'
+    metrics_bind_address: '0.0.0.0:{{ .Values.service.metricsPort }}'
+    log_level: info
+    compute_driver: kubernetes
+    enable_loopback_service_http: true
+    policy_validation_failure_mode: fail_closed
+  openshell.gateway.gateway_jwt:
+    signing_key_path: /etc/openshell-jwt/signing.pem
+    public_key_path: /etc/openshell-jwt/public.pem
+    kid_path: /etc/openshell-jwt/kid
+    gateway_id: '{{ include "openshell.fullname" . }}'
+    ttl_secs: 3600
+  openshell.gateway.tls:
+    cert_path: /etc/openshell-tls/server/tls.crt
+    key_path: /etc/openshell-tls/server/tls.key
+    client_ca_path: /etc/openshell-tls/client-ca/ca.crt
+  openshell.drivers.kubernetes:
+    namespace: '{{ include "openshell.sandboxNamespace" . }}'
+    default_image: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+    client_tls_secret_name: '{{ .Values.server.tls.clientTlsSecretName }}'
+    gateway_id: '{{ include "openshell.fullname" . }}'
+    grpc_endpoint: '{{ include "openshell.grpcEndpoint" . }}'
+    service_account_name: '{{ include "openshell.sandboxServiceAccountName" . }}'
+    sa_token_ttl_secs: 3600
+  openshell.drivers.kubernetes.managed_ssh_ingress:
+    enabled: true
+    gateway_namespace: '{{ .Release.Namespace }}'
+    gateway_pod_selector:
+      app.kubernetes.io/name: '{{ include "openshell.name" . }}'
+      app.kubernetes.io/instance: '{{ .Release.Name }}'
+  openshell.gateway.credential_storage:
+    key_encryption_key_env: '{{ include "openshell.credentialStorageKeyEncryptionKeyEnvName" . }}'
+
 # Server configuration
 server:
-  # -- Operator-facing gateway name. Defaults to the chart fullname so all
-  # replicas in one installation share an identity. Set explicitly when one
-  # telemetry collector receives spans from multiple namespaces or clusters.
-  name: ""
-  # -- Gateway log level.
-  logLevel: info
-  # OpenTelemetry trace export over OTLP/gRPC. Leave endpoint empty to disable.
-  otlp:
-    # -- OTLP/gRPC collector endpoint, conventionally using port 4317.
-    endpoint: ""
-    # -- Gateway OpenTelemetry service name. Empty uses openshell-gateway.
-    serviceName: ""
+  # Deprecated chart-owned Kubernetes packaging inputs. Prefer gatewayConfig
+  # for runtime settings; these remain for 0.1.x compatibility.
+  drivers:
+    kubernetes:
+      allowDriverConfig: false
+      workspaceMode: shared
+      operatorNamespaceLabel: ""
+      operatorNamespaceFile: ""
+      resourceAdmission:
+        enabled: true
+        requiredLabels: null
   # -- Enable anonymous OpenShell telemetry from the gateway and the sandbox
   # supervisors it launches.
   telemetryEnabled: true
@@ -230,37 +238,6 @@ server:
   # from this Secret instead of using dbUrl. The Secret must contain a
   # `uri` key, e.g. postgresql://user:pass@host:5432/dbname.
   externalDbSecret: ""
-  # -- Default sandbox image used when requests do not specify one.
-  sandboxImage: "nvcr.io/nvidia/base/ubuntu:24.04"
-  # -- Pull policy for sandbox pods. Leave unset to use the Kubernetes image
-  # default (Always for :latest, IfNotPresent otherwise). Prefer always,
-  # if_not_present, or never; the chart also accepts legacy Kubernetes spellings
-  # Always, IfNotPresent, and Never.
-  sandboxImagePullPolicy: null
-  # -- Image pull secrets attached to sandbox pods. Referenced Secrets must exist
-  # in the sandbox namespace.
-  sandboxImagePullSecrets: []
-  # -- Default storage size for the workspace PVC in sandbox pods.
-  # Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi").
-  # Empty = built-in default (2Gi).
-  workspaceDefaultStorageSize: ""
-  # -- Kubernetes StorageClass for the workspace PVC in sandbox pods.
-  # Empty (default) = omit storageClassName, using the cluster's default
-  # StorageClass. Set this on clusters with no default StorageClass, otherwise
-  # the workspace PVC stays Pending and the sandbox never starts.
-  workspaceStorageClass: ""
-  # -- Default Kubernetes runtimeClassName for sandbox pods.
-  # Applied when a CreateSandbox request does not specify one.
-  # Empty (default) = omit the field, using the cluster's default RuntimeClass.
-  # Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it
-  # to all sandboxes that don't explicitly override it.
-  defaultRuntimeClassName: ""
-  # -- gRPC endpoint sandboxes call back into the gateway. Leave empty to derive
-  # it from the chart fullname, release namespace, service port, and
-  # disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080.
-  # Override only when sandboxes must reach the gateway via a different
-  # hostname (e.g. an external ingress or a host alias).
-  grpcEndpoint: ""
   # The gateway terminates TLS directly. Its client CA authenticates sandbox
   # callbacks; OIDC-enabled listeners permit bearer-only user clients while
   # still validating any client certificate they present.
@@ -269,53 +246,9 @@ server:
   # to this IP, allowing them to reach services running on the Docker host.
   # Auto-detected by the cluster entrypoint script.
   hostGatewayIP: ""
-  # -- Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox
-  # pods. Requires Kubernetes 1.33+ with user namespace support available
-  # (beta through 1.35, GA in 1.36+), plus a supporting container runtime and
-  # Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host
-  # UID and capabilities become namespaced.
-  enableUserNamespaces: false
-  # Kubernetes compute driver settings.
-  drivers:
-    kubernetes:
-      # -- Allow caller driver JSON; external resources still require approval.
-      allowDriverConfig: false
-      resourceAdmission:
-        # -- Require operator approval labels on external sandbox attachments (GPU attachments exempt).
-        enabled: true
-        # -- Replacement label map; null uses the built-in admission labels. Empty map is invalid when enabled.
-        requiredLabels: null
-      # -- How workspaces map to Kubernetes namespaces.
-      # "shared" (default): all sandboxes in a single namespace.
-      # "managed": auto-creates per-workspace namespaces.
-      # "operator": uses pre-provisioned namespaces.
-      workspaceMode: "shared"
-      # -- K8s label selector for namespace discovery in operator mode.
-      # The driver watches namespaces matching this label.
-      operatorNamespaceLabel: ""
-      # -- Path to a JSON file containing an array of namespace names
-      # allowed in operator mode. Hot-reloaded on change.
-      operatorNamespaceFile: ""
   # -- Disable TLS entirely - the server listens on plaintext HTTP.
   # Set to true when a reverse proxy / tunnel terminates TLS at the edge.
   disableTls: false
-  # -- Enable plaintext HTTP routing for loopback sandbox service URLs on
-  # TLS-enabled gateways.
-  enableLoopbackServiceHttp: true
-  # -- Posture when a candidate sandbox policy fails validation. `fail_closed`
-  # deactivates the previous policy; `retain_last_valid` keeps it active.
-  policyValidationFailureMode: fail_closed
-  # Optional gateway-wide gRPC request rate limit. Applies only to gRPC API
-  # traffic after protocol multiplexing; health, metrics, and loopback service
-  # HTTP routes are not rate limited. Both values must be positive to enable the
-  # limit, otherwise it is omitted from the rendered config and stays disabled.
-  grpcRateLimit:
-    # -- Maximum gRPC requests allowed per window. Must be positive (alongside
-    # windowSeconds) to enable rate limiting; 0 (default) disables it.
-    requests: 0
-    # -- gRPC rate-limit window length in seconds. Must be positive (alongside
-    # requests) to enable rate limiting; 0 (default) disables it.
-    windowSeconds: 0
   # Default credential storage settings (used when no credential driver is
   # enabled). The gateway encrypts provider credentials in the database using
   # AES-256-GCM with a key-encryption key (KEK). By default, the Helm chart
@@ -328,53 +261,6 @@ server:
     # with a base64-encoded 32-byte value. Required for GitOps workflows that
     # render manifests with `helm template` (where `lookup` is unavailable).
     existingSecret: ""
-  # Provider credential drivers store provider credential secret material in an
-  # external or native backend. When no driver is enabled, the gateway uses its
-  # default encrypted database credential storage with a retained Kubernetes
-  # Secret for the shared key-encryption key.
-  credentialDrivers:
-    kubernetesSecrets:
-      # -- Enable the in-tree Kubernetes Secret credential driver.
-      # WARNING: The RBAC Role grants read/write access to ALL Secrets in the
-      # configured namespace. Use a dedicated namespace to limit blast radius.
-      enabled: false
-      # -- Namespace where OpenShell-managed provider Secret objects are stored.
-      # Empty = Helm release namespace. A dedicated namespace is RECOMMENDED
-      # to isolate OpenShell-managed Secrets from other workloads.
-      namespace: ""
-      # -- Deprecated compatibility field. Credential storage no longer supports user-authored namespace references.
-      allowReferenceNamespace: false
-      rbac:
-        # -- Create a Role/RoleBinding granting the gateway ServiceAccount read/write access to managed provider Secrets.
-        create: true
-    vault:
-      # -- Enable the in-tree Vault credential driver.
-      enabled: false
-      # -- Vault service base URL. Non-loopback endpoints must use HTTPS, for example https://vault.vault.svc.cluster.local:8200.
-      address: ""
-      # -- ConfigMap containing the private Vault CA certificate bundle in the ca.crt key. Leave empty to use platform trust roots.
-      caConfigMapName: ""
-      # -- Default KV mount name.
-      mount: secret
-      # -- Default KV engine version. Use "1" or "2".
-      kvVersion: "2"
-      # -- Authentication method. Use "kubernetes" in-cluster or "token_file" for local/dev validation.
-      authMethod: kubernetes
-      # -- Vault Kubernetes auth role when authMethod is kubernetes.
-      role: ""
-      # -- Vault Kubernetes auth mount.
-      kubernetesAuthMount: kubernetes
-      # -- ServiceAccount token path used for Kubernetes auth.
-      serviceAccountTokenPath: /var/run/secrets/kubernetes.io/serviceaccount/token
-      # -- Mounted token file path when authMethod is token_file.
-      tokenPath: ""
-      # -- HTTP request timeout in seconds. Empty = driver default.
-      timeoutSecs: ""
-  auth:
-    # -- UNSAFE: accept unauthenticated CLI/user requests as a local developer
-    # principal. Intended only for trusted local Skaffold/k3d development or a
-    # fully trusted fronting proxy. Leave false for shared or production clusters.
-    allowUnauthenticatedUsers: false
   tls:
     # -- K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server.
     certSecretName: openshell-server-tls
@@ -398,60 +284,21 @@ server:
     # -- Name of the Opaque Secret holding the signing key material. Empty
     # falls back to the chart fullname with "-jwt-keys" appended.
     signingSecretName: ""
-    # -- Stable gateway identity embedded in iss/aud of every minted token.
-    # Defaults to the release name so HA replicas share identity.
-    gatewayId: ""
-    # -- Token TTL in seconds. Defaults to 3600 (1h).
-    ttlSecs: 3600
-    # -- Lifetime (seconds) of the projected ServiceAccount token kubelet
-    # writes into each sandbox pod for the IssueSandboxToken bootstrap
-    # exchange. Kubelet enforces a minimum of 600s; the driver clamps
-    # values outside [600, 86400]. Default 3600 — generous, since the
-    # supervisor consumes the token within seconds of pod start.
-    k8sSaTokenTtlSecs: 3600
     # -- File mode for the mounted JWT signing key Secret. Default 0400
     # (owner-read only). Override to 0440 or 0444 if the container UID
     # does not match the volume file owner.
     secretDefaultMode: ""
-  # Dynamic provider token grants. When SPIFFE is enabled here, both the
-  # gateway and sandbox supervisors mount the SPIFFE Workload API socket so
-  # token-exchange profiles can use gateway- and sandbox-scoped JWT-SVIDs.
-  # Supervisor-to-gateway authentication still uses gateway-minted sandbox JWTs.
-  providerTokenGrants:
-    spiffe:
-      # -- Mount the SPIFFE Workload API socket into gateway and sandbox pods for dynamic provider token grants.
-      enabled: false
-      # -- Path to the SPIFFE Workload API socket mounted into gateway and sandbox pods.
-      workloadApiSocketPath: /spiffe-workload-api/spire-agent.sock
-  # OIDC (OpenID Connect) configuration for JWT-based authentication.
-  # When issuer is set, the server validates Bearer tokens on gRPC requests.
-  oidc:
-    # -- OIDC issuer URL (e.g. https://keycloak.example.com/realms/openshell).
-    issuer: ""
-    # -- Development only: permit cleartext OIDC requests to numeric loopback
-    # addresses. This never permits HTTP to hostnames or non-loopback addresses.
-    dangerouslyAllowInsecureHttp: false
-    # -- Additional trusted HTTPS origins allowed to serve JWKS. The issuer
-    # origin is always allowed. Entries must not include a path or query.
-    jwksAllowedOrigins: []
-    # -- Expected audience claim for the API resource server.
-    # This should match the server's --oidc-audience, NOT the CLI client ID.
-    audience: "openshell-cli"
-    # -- JWKS key cache TTL in seconds. Must be greater than zero.
-    jwksTtl: 3600
-    # -- Dot-separated path to the roles array in the JWT claims.
-    # Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups".
-    rolesClaim: ""
-    # -- Role name for admin access. Leave empty (with userRole also empty) for
-    # authentication-only mode. Both must be set or both empty.
-    adminRole: ""
-    # -- Role name for standard user access.
-    userRole: ""
-    # -- Dot-separated path to the scopes array in the JWT claims.
-    scopesClaim: ""
-    # -- Name of a ConfigMap containing a CA certificate bundle (key: ca.crt)
-    # for verifying the OIDC issuer's TLS certificate. Required when the
-    # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).
+# Kubernetes resource reference for a private-CA OIDC issuer. The OIDC
+# runtime settings themselves belong in gatewayConfig.openshell.gateway.oidc.
+oidc:
+  caConfigMapName: ""
+
+# Kubernetes resource references for external credential drivers. Runtime
+# driver settings remain in gatewayConfig.
+credentialDrivers:
+  vault:
+    # -- ConfigMap containing the private Vault/OpenBao CA certificate under
+    # the ca.crt key. Helm mounts it only when the Vault driver is selected.
     caConfigMapName: ""
 
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.

@@ -684,6 +684,17 @@ mod tests {
     }
 
     #[test]
+    fn gateway_rate_limits_reject_negative_values_during_toml_parsing() {
+        for field in ["grpc_rate_limit_requests", "grpc_rate_limit_window_seconds"] {
+            let tmp = write_tmp(&format!("[openshell.gateway]\n{field} = -1\n"));
+            assert!(
+                matches!(load(tmp.path()), Err(ConfigFileError::Parse { .. })),
+                "{field} must reject negative values because gateway rate limits are unsigned"
+            );
+        }
+    }
+
+    #[test]
     fn canonical_compute_driver_is_singular() {
         let file: ConfigFile = toml::from_str(
             r#"
