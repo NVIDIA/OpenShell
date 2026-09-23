@@ -15,17 +15,10 @@ navigation:
     path: about/how-it-works.mdx
   - page: "Installation"
     path: about/installation.mdx
-  - page: "Run an Agent"
+  - page: "Run Your First Agent"
     path: about/run-an-agent.mdx
   - page: "Support Matrix"
     path: reference/support-matrix.mdx
-- section: "Tutorials"
-  slug: tutorials
-  contents:
-  - page: "Quickstart"
-    path: get-started/quickstart.mdx
-  - folder: get-started/tutorials
-    skip-slug: true
 - section: "Manage OpenShell"
   slug: manage
   contents:
@@ -40,11 +33,8 @@ navigation:
       path: reference/gateway-config.mdx
     - page: "Container Deployment"
       path: reference/container-gateway.mdx
-  - section: "Workspaces"
-    slug: workspaces
-    contents:
-    - page: "Overview"
-      path: sandboxes/manage-workspaces.mdx
+  - page: "Workspaces"
+    path: sandboxes/manage-workspaces.mdx
   - section: "Sandboxes"
     slug: sandboxes
     contents:
@@ -61,13 +51,8 @@ navigation:
       path: providers/profiles.mdx
     - page: "AWS"
       path: providers/aws-sigv4.mdx
-    - section: "Google"
-      slug: google
-      contents:
-      - page: "Google Cloud"
-        path: providers/google-cloud.mdx
-      - page: "Google Vertex AI"
-        path: providers/google-vertex-ai.mdx
+    - page: "Google"
+      path: providers/google-cloud.mdx
   - section: "Policies"
     slug: policies
     contents:
@@ -81,11 +66,8 @@ navigation:
       path: reference/policy-prover.mdx
     - page: "Base Image Policy"
       path: reference/default-policy.mdx
-  - section: "Inference"
-    slug: inference
-    contents:
-    - page: "Overview"
-      path: sandboxes/inference-routing.mdx
+  - page: "Inference"
+    path: sandboxes/inference-routing.mdx
 - section: "Extensibility"
   slug: extensibility
   contents:
@@ -103,6 +85,15 @@ navigation:
   title: "Observability"
 - folder: kubernetes
   title: "Kubernetes"
+- section: "Tutorials"
+  slug: tutorials
+  contents:
+  - page: "First Network Policy"
+    path: get-started/tutorials/first-network-policy.mdx
+  - page: "GitHub Push Access"
+    path: get-started/tutorials/github-sandbox.mdx
+  - page: "Microsoft Graph Provider Refresh"
+    path: get-started/tutorials/microsoft-graph-provider-refresh.mdx
 - section: "SDK Reference"
   slug: sdk
   contents:
