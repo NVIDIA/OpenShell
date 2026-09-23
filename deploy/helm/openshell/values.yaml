@@ -72,6 +72,8 @@ supervisor:
   sandboxRuntime:
     # -- Workload boundary TLS listener port.
     boundaryPort: 5500
+    # -- Deprecated acknowledgement retained for 0.1.x values files.
+    networkPolicyEnforced: false
 
 sandbox:
   image:
@@ -290,10 +292,7 @@ gatewayConfig:
     gateway_id: '{{ include "openshell.fullname" . }}'
     grpc_endpoint: '{{ include "openshell.grpcEndpoint" . }}'
     service_account_name: '{{ include "openshell.sandboxServiceAccountName" . }}'
-    supervisor_sideload_method: '{{ include "openshell.supervisorSideloadMethod" . }}'
-    topology: '{{ .Values.supervisor.topology }}'
     sa_token_ttl_secs: 3600
-    app_armor_profile: Unconfined
   openshell.drivers.kubernetes.managed_ssh_ingress:
     enabled: true
     gateway_namespace: '{{ .Release.Namespace }}'

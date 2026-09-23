@@ -45,8 +45,8 @@ render default
 default_manifest="${work_dir}/default.yaml"
 default_toml="${work_dir}/default.toml"
 toml "${default_manifest}" "${default_toml}"
-service_name="$(yq ea -e -r 'select(.kind == "Service") | .metadata.name' "${default_manifest}")"
-service_port="$(yq ea -e -r 'select(.kind == "Service") | .spec.ports[] | select(.name == "grpc") | .port' "${default_manifest}")"
+service_name="$(yq ea -e -r 'select(.kind == "Service" and .metadata.name == "resource-coherence-openshell") | .metadata.name' "${default_manifest}")"
+service_port="$(yq ea -e -r 'select(.kind == "Service" and .metadata.name == "resource-coherence-openshell") | .spec.ports[] | select(.name == "grpc") | .port' "${default_manifest}")"
 workload_port="$(workload_value "${default_manifest}" '.spec.template.spec.containers[] | select(.name == "openshell-gateway") | .ports[] | select(.name == "grpc") | .containerPort')"
 config_map="$(yq ea -e -r 'select(.kind == "ConfigMap" and (.data | has("gateway.toml"))) | .metadata.name' "${default_manifest}")"
 mounted_config_map="$(workload_value "${default_manifest}" '.spec.template.spec.volumes[] | select(.name == "gateway-config") | .configMap.name')"
@@ -74,7 +74,7 @@ route_toml="${work_dir}/openshift-route.toml"
 toml "${route_manifest}" "${route_toml}"
 route_service="$(yq ea -e -r 'select(.kind == "Route") | .spec.to.name' "${route_manifest}")"
 route_port="$(yq ea -e -r 'select(.kind == "Route") | .spec.port.targetPort' "${route_manifest}")"
-[[ "${route_service}" == "$(yq ea -e -r 'select(.kind == "Service") | .metadata.name' "${route_manifest}")" && "${route_port}" == "grpc" ]]
+[[ "${route_service}" == "$(yq ea -e -r "select(.kind == \"Service\" and .metadata.name == \"${route_service}\") | .metadata.name" "${route_manifest}")" && "${route_port}" == "grpc" ]]
 [[ "$(workload_value "${route_manifest}" '.spec.template.spec.volumes[] | select(.name == "tls-external-cert") | .secret.secretName')" == "${route_service}-server-external-tls" ]]
 [[ "$(yq ea -e -r 'select(.kind == "Certificate") | .spec.secretName' "${route_manifest}" | grep -Fx "${route_service}-server-external-tls")" == "${route_service}-server-external-tls" ]]
 grep -F 'external_cert_path = "/etc/openshell-tls/server-external/tls.crt"' "${route_toml}" >/dev/null
