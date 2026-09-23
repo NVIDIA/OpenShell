@@ -47,8 +47,10 @@ Review a profile before importing it, especially its executable paths and
 network endpoints.
 
 ```shell
-openshell provider profile import -f provider-profile.yaml --global
-openshell provider list-profiles
+curl -LsSfO https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/claude-code.yaml
+openshell profile import -f claude-code.yaml --global
+ANTHROPIC_API_KEY=<your-key> \
+  openshell provider create --name my-claude --type claude-code --from-existing
 ```
 
 The repository includes example profiles in
@@ -59,14 +61,14 @@ profile schema and import workflow.
 
 ## Launch the Agent
 
-Pass the agent command after `--` and attach the provider profiles it needs.
+Pass the agent command after `--` and attach the provider instances it needs.
 For example, this command starts Claude Code from an image your team built with
 the `claude` executable installed:
 
 ```shell
 openshell sandbox create \
   --from registry.example.com/team/claude-code:1.0 \
-  --provider claude-code \
+  --provider my-claude \
   -- claude
 ```
 
@@ -122,8 +124,6 @@ policy after reviewing the requested access.
 
 ## Next Steps
 
-- For a complete image-to-sandbox workflow, refer to the
-  [Quickstart](/get-started/quickstart).
 - For sandbox lifecycle, resources, templates, files, and connectivity, refer
   to [Sandboxes](/sandboxes/manage-sandboxes).
 - For the restrictive fallback policy, refer to

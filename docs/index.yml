@@ -19,7 +19,7 @@ navigation:
     path: about/run-an-agent.mdx
   - page: "Support Matrix"
     path: reference/support-matrix.mdx
-- section: "Manage OpenShell"
+- section: "How It Works"
   slug: manage
   contents:
   - section: "Gateways"
@@ -40,7 +40,7 @@ navigation:
     contents:
     - page: "Overview"
       path: sandboxes/manage-sandboxes.mdx
-    - page: "Compute Drivers"
+    - page: "Runtimes"
       path: reference/sandbox-compute-drivers.mdx
   - section: "Providers"
     slug: providers
@@ -64,7 +64,7 @@ navigation:
       path: reference/policy-schema.mdx
     - page: "Prover"
       path: reference/policy-prover.mdx
-    - page: "Base Image Policy"
+    - page: "Default Policy"
       path: reference/default-policy.mdx
   - page: "Inference"
     path: sandboxes/inference-routing.mdx

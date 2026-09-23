@@ -20,11 +20,11 @@ The gateway is responsible for:
 
 OpenShell separates gateway access from the compute driver that runs sandboxes. Use [Installation](/about/installation) to install OpenShell, choose a compute driver, and start a gateway. This page covers working with gateway entries after a gateway exists.
 
-## Gateway Compute Drivers
+## Gateway Runtimes
 
 A gateway provisions sandboxes through the compute driver configured for that gateway.
 
-| Compute Driver | Where sandboxes run | Best for |
+| Runtime | Where sandboxes run | Best for |
 |---|---|---|
 | Docker | Containers on the gateway host. | Solo development, quick iteration, and single-machine gateways. |
 | Podman | Rootless containers on the gateway host. | Workstations that avoid a rootful Docker daemon. |

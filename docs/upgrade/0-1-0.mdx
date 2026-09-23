@@ -9,11 +9,7 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Upgrade, Migrati
 
 Upgrading from OpenShell 0.0.x to 0.1.0? Start with the section that matches how you use the platform.
 
-<Warning>
-This is a working outline for 0.1.0. Some changes are still in flight, so check the final release notes before upgrading production.
-</Warning>
-
-Each item links to the pull request that defines the change. Links marked open describe work that is not final yet.
+Each item links to the pull request that defines the change.
 
 ## Operators
 
@@ -47,9 +43,9 @@ If you run OpenShell for a team, start here.
   openshell-gateway config preflight --path /etc/openshell/gateway.toml
   ```
 
-- **Move Helm application settings to `gatewayConfig`.** Express gateway settings with the schema-v2 TOML hierarchy. Keep TLS keys, passwords, client secrets, RBAC, Services, image settings, and volumes in the chart-owned values and Secret interfaces ([open PR #3384](https://github.com/NVIDIA/OpenShell/pull/3384)).
+- **Move Helm application settings to `gatewayConfig`.** Express gateway settings with the schema-v2 TOML hierarchy. Keep TLS keys, passwords, client secrets, RBAC, Services, image settings, and volumes in the chart-owned values and Secret interfaces ([PR #3384](https://github.com/NVIDIA/OpenShell/pull/3384)).
 
-- **Review the default workload image.** The fallback becomes the minimal `docker.io/library/alpine:3.22` image, which includes no agent CLI or image-baked policy. Bare image aliases are removed, so specify a fully qualified image that you built with the required agents, tools, and startup behavior. The runtime fallback policy denies network access and no longer grants `/app`; images without an OCI `USER` run as UID and GID `1000` ([PR #3386](https://github.com/NVIDIA/OpenShell/pull/3386)).
+- **Review the default workload image.** The fallback becomes the minimal `nvcr.io/nvidia/base/ubuntu:24.04` image, which includes no agent CLI or image-baked policy. Bare image aliases are removed, so specify a fully qualified image that you built with the required agents, tools, and startup behavior. The runtime fallback policy denies network access and no longer grants `/app`; images without an OCI `USER` run as UID and GID `1000` ([PR #3386](https://github.com/NVIDIA/OpenShell/pull/3386)).
 
 - **Preserve credential encryption material.** New provider credentials use the active gateway credential driver, with encrypted database storage as the default. Preserve the generated key-encryption-key Secret, reconfigure refresh grants, and recreate credentials before switching credential drivers. Do not configure an empty `credential_drivers` list or run mixed gateway versions against the same refresh records ([PR #2437](https://github.com/NVIDIA/OpenShell/pull/2437)).
 
@@ -87,7 +83,7 @@ If you use OpenShell through the CLI, policies, APIs, or SDKs, review these chan
 
 - **Replace managed inference routes.** The `openshell inference` commands, route APIs, and `inference.local` endpoint are removed. Attach a provider to each sandbox and call its native endpoint with its native model and request format. See [Migrate from Managed Inference Routes](/sandboxes/inference-routing#migrate-from-managed-inference-routes) and [PR #3195](https://github.com/NVIDIA/OpenShell/pull/3195).
 
-- **Remove `NetworkBinary.harness`.** Write policy and profile binaries as scalar paths such as `- /usr/bin/curl` ([PR #3222](https://github.com/NVIDIA/OpenShell/pull/3222)).
+- **Remove `NetworkBinary.harness`.** In authored policies, keep each binary as an object containing only `path`, such as `- path: /usr/bin/curl`. In provider profiles, write binaries as scalar paths such as `- /usr/bin/curl` ([PR #3222](https://github.com/NVIDIA/OpenShell/pull/3222)).
 
 - **Fix unknown policy fields.** The authored policy schema rejects misspelled, obsolete, and other unknown fields instead of ignoring them ([PR #3334](https://github.com/NVIDIA/OpenShell/pull/3334)).
 
@@ -103,7 +99,7 @@ If you use OpenShell through the CLI, policies, APIs, or SDKs, review these chan
 
 - **Use protobuf time types.** Replace scalar millisecond, second, and string fields with `google.protobuf.Timestamp` and `google.protobuf.Duration`. Preserve the distinction between an absent field and a zero value. See [Protobuf Time Types](/reference/protobuf-time-types) and [PR #3113](https://github.com/NVIDIA/OpenShell/pull/3113).
 
-- **Replace offset pagination.** Send `page_size` and the opaque `page_token`, then continue while `next_page_token` is non-empty. Curated SDK list methods may return lazy, single-pass pagers; use `list_all` or `ListAll` only when the full collection is required ([PR #3249](https://github.com/NVIDIA/OpenShell/pull/3249), [PR #3256](https://github.com/NVIDIA/OpenShell/pull/3256), [open PR #3279](https://github.com/NVIDIA/OpenShell/pull/3279)).
+- **Replace offset pagination.** Send `page_size` and the opaque `page_token`, then continue while `next_page_token` is non-empty. Curated SDK list methods may return lazy, single-pass pagers; use `list_all` or `ListAll` only when the full collection is required ([PR #3249](https://github.com/NVIDIA/OpenShell/pull/3249), [PR #3256](https://github.com/NVIDIA/OpenShell/pull/3256), [PR #3279](https://github.com/NVIDIA/OpenShell/pull/3279)).
 
 - **Handle typed deletion outcomes.** Replace `deleted`, `removed`, and `revoked` booleans with `DeletionOutcome`. Treat `ACCEPTED` as asynchronous, use the returned sandbox ID when waiting, and set `allow_missing` only when absence is acceptable. See [SDK Migration for Deletion](/reference/api-errors#sdk-migration-for-deletion) and [PR #3317](https://github.com/NVIDIA/OpenShell/pull/3317).
 
