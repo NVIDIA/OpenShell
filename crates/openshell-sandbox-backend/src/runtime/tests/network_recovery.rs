@@ -19,6 +19,8 @@ enum Reply {
     /// Like `Disconnect`, but the boundary retires the connection after the
     /// transport closes, as the real disconnect callback can.
     DisconnectLate,
+    /// Like `DisconnectLate`, but retirement waits for `PeerState::retire`.
+    DisconnectGated,
     /// Close the first accept stream without a response on a live connection.
     DropFirstAccept,
     /// Stop answering on the first connection once it is confirmed.
@@ -36,6 +38,8 @@ struct PeerState {
     events: Mutex<Vec<(usize, &'static str)>>,
     accepting: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    retire: tokio::sync::Notify,
+    rejected_attaches: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -116,6 +120,7 @@ impl NetworkPeer {
                 // This rejects reconnect storms that a stateless mock permits.
                 let active = *self.state.active.lock().unwrap();
                 if active.is_some_and(|active| active != self.connection) {
+                    self.state.rejected_attaches.fetch_add(1, Ordering::AcqRel);
                     Response::Error {
                         kind: BoundaryErrorKind::Unavailable,
                         message: "another connection with this epoch is still active".into(),
@@ -145,7 +150,7 @@ impl NetworkPeer {
                 );
                 self.state.accepting.notify_one();
                 match self.state.reply {
-                    Reply::DisconnectLate if self.connection == 1 => {
+                    Reply::DisconnectLate | Reply::DisconnectGated if self.connection == 1 => {
                         self.disconnect.notify_one();
                         return std::future::pending().await;
                     }
@@ -173,6 +178,7 @@ impl NetworkPeer {
                     }
                     Reply::Disconnect { .. }
                     | Reply::DisconnectLate
+                    | Reply::DisconnectGated
                     | Reply::DropFirstAccept
                     | Reply::Blackhole => network_response(),
                 }
@@ -263,6 +269,8 @@ impl Fixture {
             events: Mutex::new(Vec::new()),
             accepting: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            retire: tokio::sync::Notify::new(),
+            rejected_attaches: AtomicUsize::new(0),
         });
         let server_state = state.clone();
         let server = tokio::spawn(async move {
@@ -299,9 +307,16 @@ impl Fixture {
                         _ = tokio::io::copy_bidirectional(&mut tls, &mut bridge) => {},
                         () = disconnect.notified() => {},
                     }
-                    if matches!(state.reply, Reply::DisconnectLate) {
-                        drop(tls);
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    match state.reply {
+                        Reply::DisconnectLate => {
+                            drop(tls);
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                        Reply::DisconnectGated if connection == 1 => {
+                            drop(tls);
+                            state.retire.notified().await;
+                        }
+                        _ => {}
                     }
                     let mut active = state.active.lock().unwrap();
                     if *active == Some(connection) {
@@ -539,4 +554,51 @@ async fn recovery_closes_an_unresponsive_connection_before_reattaching() {
     assert_ne!(client.connection_generation().await, generation);
     assert_eq!(*fixture.state.active.lock().unwrap(), Some(2));
     assert_eq!(fixture.state.connections.load(Ordering::Acquire), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_during_delayed_retirement_wait_for_the_confirmed_replacement() {
+    let fixture = Fixture::new(Reply::DisconnectGated).await;
+    let first = RemoteNetworkMediation {
+        client: fixture.source.client.clone(),
+    };
+    let first = tokio::spawn(async move { first.accept_tcp().await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture.state.rejected_attaches.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovery must reach a same-epoch attach rejection");
+
+    // Start an ordinary request while recovery waits for retirement.
+    let second = RemoteNetworkMediation {
+        client: fixture.source.client.clone(),
+    };
+    let second = tokio::spawn(async move { second.accept_tcp().await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fixture.state.retire.notify_one();
+
+    for pending in [first, second] {
+        let pending = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("request must finish on the confirmed replacement")
+            .unwrap()
+            .unwrap();
+        verify_connection(pending).await;
+    }
+    let events = fixture.state.events.lock().unwrap().clone();
+    let confirmed: Vec<usize> = events
+        .iter()
+        .filter(|(connection, kind)| *connection > 1 && *kind == "confirm")
+        .map(|(connection, _)| *connection)
+        .collect();
+    assert_eq!(confirmed.len(), 1, "one confirmed replacement: {events:?}");
+    assert!(
+        events
+            .iter()
+            .filter(|(connection, kind)| *connection > 1 && *kind == "accept")
+            .all(|(connection, _)| *connection == confirmed[0]),
+        "no request may run on an unconfirmed connection: {events:?}"
+    );
 }

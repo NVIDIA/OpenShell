@@ -1583,7 +1583,6 @@ impl BoundaryClient {
             cached.transport.abort();
         }
 
-        *self.grpc_channel.lock().await = None;
         *self.mediation.lock().await = None;
         let attach = self
             .attach_request
@@ -1591,8 +1590,12 @@ impl BoundaryClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let Some(attach) = attach else {
+            *self.grpc_channel.lock().await = None;
             return Ok(());
         };
+        // Keep the aborted channel cached until the confirmed replacement is
+        // swapped in. Concurrent callers then fail fast and wait on this
+        // recovery instead of caching a connection that never attached.
         let credential = BoundaryCredential::capture(&self.sandbox_bearer)?;
         let deadline = tokio::time::Instant::now() + CONNECT_RETRY_TIMEOUT;
         let (channel, transport) = loop {
