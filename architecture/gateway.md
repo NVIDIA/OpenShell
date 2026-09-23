@@ -446,9 +446,13 @@ For in-memory SQLite, the adapter retains a dedicated keepalive connection for
 the store lifetime. Operational connection replacement therefore preserves the
 shared in-memory schema and objects instead of creating an empty database.
 
-The SQLite adapter tightens the on-disk database file to mode `0o600` on every
-connect so that provider API keys, SSH session tokens, and sandbox metadata are
-not readable by other local users on shared hosts. The same restriction is
+The SQLite adapter tightens the on-disk database file to owner-only access on
+every connect so that provider API keys, SSH session tokens, and sandbox
+metadata are not readable by other local users on shared hosts. On Unix the
+file mode is set to `0o600`. On Windows a protected, owner-only DACL is
+applied (inherited ACEs stripped; if the file has a foreign owner, ownership
+is also claimed — the call fails hard if it cannot, rather than leaving the
+foreign owner's implicit `WRITE_DAC` right intact). The same restriction is
 reapplied to the `<db>-wal` and `<db>-shm` sidecars (created by SQLite's
 default WAL journal mode), which mirror the same sensitive contents.
 

@@ -1652,7 +1652,8 @@ WHERE "object_type" = ?1 AND "scope" = ?2
 /// and `<db>-shm` (shared memory index). They mirror the same sensitive data
 /// as the main file, so they get the same `0o600` treatment whenever they exist on disk.
 ///
-/// Delegates to `set_file_owner_only`, which is a no-op on non-Unix platforms.
+/// Delegates to `set_file_owner_only`, which restricts to an owner-only ACL
+/// on Windows and `0o600` on Unix.
 pub(super) fn restrict_db_file_permissions(path: &Path) -> PersistenceResult<()> {
     set_file_owner_only(path).map_err(|err| PersistenceError::Database(err.to_string()))?;
 

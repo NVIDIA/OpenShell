@@ -41,6 +41,9 @@ tempfile = { version = "3", optional = true }
 nix = { workspace = true }
 rustix = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+
 [features]
 default = ["telemetry"]
 ## Compile in anonymous telemetry emission support. On by default; disable with

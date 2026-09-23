@@ -1261,4 +1261,17 @@ mod tests {
             & 0o777;
         assert_eq!(key_encryption_key_mode, 0o600);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn generated_key_encryption_key_file_is_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_encryption_key_path = tmp.path().join(DEFAULT_KEY_ENCRYPTION_KEY_FILE);
+        let _crypto = crypto_for_key_encryption_key_path(&key_encryption_key_path);
+        assert!(
+            !openshell_core::paths::is_file_permissions_too_open(&key_encryption_key_path),
+            "expected owner-only ACL on {}",
+            key_encryption_key_path.display()
+        );
+    }
 }
