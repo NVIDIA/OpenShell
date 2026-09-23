@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: Gateway RBAC creation
+templates:
+  - templates/role.yaml
+  - templates/rolebinding.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: creates the namespaced sandbox Role and RoleBinding by default
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: openshell-sandbox
+
+  - it: keeps the namespaced Role and RoleBinding when only cluster-scoped RBAC is disabled
+    set:
+      rbac.clusterScoped.create: false
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: openshell-sandbox
+
+  - it: omits the namespaced Role and RoleBinding when chart-managed RBAC is disabled
+    set:
+      rbac.create: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: creates the namespaced Role and RoleBinding when legacy values omit the rbac block
+    set:
+      rbac: null
+    asserts:
+      - hasDocuments:
+          count: 1

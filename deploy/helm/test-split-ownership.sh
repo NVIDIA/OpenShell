@@ -22,6 +22,32 @@ if yq ea -e \
   exit 1
 fi
 
+helm template openshell "${repo_root}/deploy/helm/openshell" \
+  --namespace openshell \
+  --set agentSandbox.preflight.enabled=false \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
+  --set rbac.clusterScoped.create=false \
+  >"${work_dir}/namespace-admin.yaml"
+
+cluster_scoped_kinds="$(
+  yq ea -N -r \
+    'select(.kind == "ClusterRole" or .kind == "ClusterRoleBinding") |
+     [.kind, .metadata.name] | join(" ")' \
+    "${work_dir}/namespace-admin.yaml"
+)"
+if [[ -n "${cluster_scoped_kinds}" ]]; then
+  echo "gateway chart rendered cluster-scoped objects despite rbac.clusterScoped.create=false:" >&2
+  echo "${cluster_scoped_kinds}" >&2
+  exit 1
+fi
+
+if ! yq ea -e \
+  'select(.kind == "ServiceAccount" and .metadata.name == "openshell")' \
+  "${work_dir}/namespace-admin.yaml" >/dev/null 2>&1; then
+  echo "gateway chart dropped the gateway ServiceAccount with rbac.clusterScoped.create=false" >&2
+  exit 1
+fi
+
 helm template openshell-workspace "${repo_root}/deploy/helm/openshell-workspace" \
   --namespace app-a \
   --set gateway.serviceAccount.name=openshell \
