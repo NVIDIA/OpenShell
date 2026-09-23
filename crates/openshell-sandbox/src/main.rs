@@ -197,6 +197,11 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
     openshell_isolation_interface::linux::task_memory::probe_child_access()
         .into_diagnostic()
         .wrap_err("same-UID task-memory probe")?;
+    // The successful production-shaped parent-to-child round trip above is
+    // the task-memory evidence. Do not test /proc/self/mem here: this trusted
+    // broker is intentionally nondumpable, so that fallback is inaccessible
+    // even though /proc/<dumpable-child>/mem remains available to mediation.
+    let task_memory_copy = true;
     probe_landlock_allow_deny().wrap_err("Landlock allow/deny probe")?;
     let notification =
         openshell_isolation_interface::linux::seccomp_notify::probe_notification_api()
@@ -233,7 +238,7 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         landlock_allow_deny: true,
         seccomp_notification: notification.notification_round_trip(),
         seccomp_addfd_send: notification.addfd_send(),
-        task_memory_copy: notification.task_memory_copy(),
+        task_memory_copy,
         connected_send_fast_path: notification.connected_send_fast_path(),
         socket_virtualization: true,
         dns_relay_bind: true,
@@ -257,8 +262,8 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
             addfd_send: notification.addfd_send(),
             retained_socket_operation: true,
             proc_fd_identity: true,
-            task_memory_read: notification.task_memory_copy(),
-            task_memory_write: notification.task_memory_copy(),
+            task_memory_read: task_memory_copy,
+            task_memory_write: task_memory_copy,
             cancellation: notification.wait_killable_recv,
             // Legacy plain listener (< 5.19) disables broker output writes;
             // satisfies the `cancellation || writes_disabled` launch invariant.

@@ -205,6 +205,13 @@ The sandbox reserves `SIGUSR2` with a non-restarting no-op handler for these
 broker threads; startup rejects a conflicting handler. This signal disposition
 is process-global kernel state, while registrations and cancellation state are
 owned by the broker. Workload exec resets the caught handler to its default.
+The broker copies pointer-bearing syscall arguments from a same-UID workload
+child with `process_vm_readv` / `process_vm_writev`, falling back to
+`/proc/<pid>/mem` when those system calls are unavailable or blocked. Runtime
+qualification keeps the trusted broker non-dumpable and proves read/write
+access against a dumpable child, matching the production process topology.
+It never treats access to the broker's own memory as workload evidence.
+
 This sandbox runtime requires Landlock ABI v3 (Linux 6.2, or an equivalent
 vendor backport). The seccomp listener is installed in one of two cancellation
 modes, and the launch confirmation enforces the invariant

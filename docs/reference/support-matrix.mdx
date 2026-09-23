@@ -103,12 +103,17 @@ when it runs inside a container or microVM:
 | -------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | [Landlock LSM](https://docs.kernel.org/security/landlock.html) | Required | ABI 3 or newer, introduced in Linux 6.2, with Landlock enabled. The mandatory baseline protects private channel and bootstrap files, including against truncation. A filesystem policy's `best_effort` setting never disables this baseline. |
 | seccomp | Required | Nested user-notification filters and atomic `SECCOMP_IOCTL_NOTIF_ADDFD` with `SECCOMP_ADDFD_FLAG_SEND`, usable under the runtime's existing seccomp profile without added capabilities. The sandbox actively probes these operations before admitting the workload. |
+| Task-memory access | Required | The non-dumpable broker must be able to read and write a same-UID, dumpable workload child's memory through `process_vm_readv` / `process_vm_writev` or `/proc/<pid>/mem`. The sandbox actively probes the production parent-to-child topology before admitting the workload. |
 | seccomp `WAIT_KILLABLE_RECV` | Recommended (Linux 5.19+) | Keeps a notified workload thread in a kill-only wait so the broker can safely write mediated results into workload memory. Without it (kernels &lt; 5.19, for example RHEL 9.x / RHCOS 5.14) the sandbox still starts, in a reduced **legacy read-only** mode described below. |
 
 A kernel version alone does not establish support. A disabled Landlock LSM or a
 runtime profile that blocks the required seccomp operations causes launch to
 fail closed. An upstream Linux 6.2 or newer kernel provides the required
 Landlock ABI; distribution backports must pass the same active qualification.
+The broker remains non-dumpable during qualification. A runtime may satisfy
+task-memory access through `/proc/<pid>/mem` even when its kernel omits the
+`process_vm_readv` and `process_vm_writev` system calls; OpenShell qualifies the
+same parent-to-executed-child access shape used by mediated workloads.
 
 ### Legacy read-only mode (kernels before Linux 5.19)
 

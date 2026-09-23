@@ -162,18 +162,11 @@ impl NotificationProbeReport {
         self.features.0 & 2 != 0
     }
 
-    /// Whether process-VM read and write syscalls are admitted for same-process
-    /// memory, before the stronger child-credential probe runs in a driver.
-    #[must_use]
-    pub fn task_memory_copy(self) -> bool {
-        self.features.0 & 4 != 0
-    }
-
     /// Whether connected null-destination `sendto` bypassed notification while
     /// destination-bearing and unsafe-flag variants remained mediated.
     #[must_use]
     pub fn connected_send_fast_path(self) -> bool {
-        self.features.0 & 8 != 0
+        self.features.0 & 4 != 0
     }
 }
 
@@ -465,11 +458,10 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
 pub fn probe_notification_api() -> io::Result<NotificationProbeReport> {
     let wait_killable_recv = probe_scalar_round_trip()?;
     probe_addfd_send()?;
-    probe_task_memory_copy()?;
     probe_connected_sendto_fast_path()?;
     Ok(NotificationProbeReport {
         wait_killable_recv,
-        features: NotificationProbeFeatures(1 | 2 | 4 | 8),
+        features: NotificationProbeFeatures(1 | 2 | 4),
     })
 }
 
@@ -582,32 +574,6 @@ fn probe_addfd_send() -> io::Result<()> {
     launcher
         .join()
         .map_err(|_| io::Error::other("ADDFD launcher panicked"))??;
-    Ok(())
-}
-
-fn probe_task_memory_copy() -> io::Result<()> {
-    let source = 0x1122_3344_5566_7788_u64;
-    let tid = std::process::id();
-    let mut source_bytes = [0_u8; size_of::<u64>()];
-    crate::linux::task_memory::read_exact(
-        tid,
-        std::ptr::addr_of!(source) as u64,
-        &mut source_bytes,
-    )?;
-    let mut copied = u64::from_ne_bytes(source_bytes);
-    if copied != source {
-        return Err(io::Error::other("task-memory probe read wrong value"));
-    }
-
-    let replacement = 0xaabb_ccdd_eeff_0011_u64;
-    crate::linux::task_memory::write_exact(
-        tid,
-        std::ptr::addr_of_mut!(copied) as u64,
-        &replacement.to_ne_bytes(),
-    )?;
-    if copied != replacement {
-        return Err(io::Error::other("task-memory probe wrote wrong value"));
-    }
     Ok(())
 }
 
@@ -991,7 +957,11 @@ fn ioctl_ptr(fd: RawFd, request: libc::c_ulong, argument: *mut libc::c_void) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use super::*;
+
+    const NONDUMPABLE_PROBE_CHILD: &str = "OPENSHELL_NONDUMPABLE_PROBE_CHILD";
 
     #[test]
     fn filter_rejects_empty_syscall_set() {
@@ -1004,8 +974,91 @@ mod tests {
         let report = probe_notification_api().expect("active notification probe");
         assert!(report.notification_round_trip());
         assert!(report.addfd_send());
-        assert!(report.task_memory_copy());
         assert!(report.connected_send_fast_path());
+    }
+
+    #[test]
+    fn notification_probe_ignores_unavailable_self_task_memory() {
+        if std::env::var_os(NONDUMPABLE_PROBE_CHILD).is_some() {
+            // Match the production broker posture and Kata kernels that omit
+            // CONFIG_CROSS_MEMORY_ATTACH. The notification API probe must not
+            // inspect this trusted process through /proc/self/mem: a
+            // nondumpable non-root process cannot open that file, while the
+            // separately qualified dumpable workload child remains readable.
+            if unsafe { libc::geteuid() } == 0 {
+                // SAFETY: this disposable subprocess permanently drops its
+                // supplementary groups and root identity before probing.
+                assert_eq!(unsafe { libc::setgroups(0, std::ptr::null()) }, 0);
+                assert_eq!(unsafe { libc::setgid(65_534) }, 0);
+                assert_eq!(unsafe { libc::setuid(65_534) }, 0);
+            }
+            // SAFETY: PR_SET_DUMPABLE accepts one scalar flag and only
+            // tightens this disposable test process.
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+            let self_mem_error = std::fs::File::open("/proc/self/mem")
+                .expect_err("nondumpable unprivileged self memory must be inaccessible");
+            assert_eq!(self_mem_error.kind(), io::ErrorKind::PermissionDenied);
+            install_process_vm_enosys_filter().expect("install process-VM ENOSYS filter");
+            probe_notification_api().expect("probe notification API without self task memory");
+            return;
+        }
+
+        let executable = std::env::current_exe().expect("resolve test executable");
+        let status = Command::new(executable)
+            .arg("--exact")
+            .arg("linux::seccomp_notify::tests::notification_probe_ignores_unavailable_self_task_memory")
+            .arg("--nocapture")
+            .env(NONDUMPABLE_PROBE_CHILD, "1")
+            .status()
+            .expect("run disposable nondumpable probe process");
+        assert!(status.success(), "nondumpable probe child failed: {status}");
+    }
+
+    fn install_process_vm_enosys_filter() -> io::Result<()> {
+        const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+        let syscall_number = |number: libc::c_long| {
+            u32::try_from(number).map_err(|_| io::Error::other("syscall number does not fit u32"))
+        };
+        let mut instructions = [
+            stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
+            jump(
+                BPF_JMP_JEQ_K,
+                syscall_number(libc::SYS_process_vm_readv)?,
+                0,
+                1,
+            ),
+            stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::ENOSYS.unsigned_abs()),
+            jump(
+                BPF_JMP_JEQ_K,
+                syscall_number(libc::SYS_process_vm_writev)?,
+                0,
+                1,
+            ),
+            stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::ENOSYS.unsigned_abs()),
+            stmt(BPF_RET_K, SECCOMP_RET_ALLOW),
+        ];
+        let length = u16::try_from(instructions.len())
+            .map_err(|_| io::Error::other("test seccomp filter is too large"))?;
+        let mut program = libc::sock_fprog {
+            len: length,
+            filter: instructions.as_mut_ptr(),
+        };
+        set_no_new_privileges()?;
+        // SAFETY: program references the complete live test filter. No flags
+        // are required because the disposable process has one calling thread.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                SECCOMP_SET_MODE_FILTER,
+                0,
+                std::ptr::addr_of_mut!(program),
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     #[test]
