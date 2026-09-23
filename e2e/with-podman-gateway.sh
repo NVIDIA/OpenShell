@@ -196,7 +196,7 @@ cleanup() {
         local workload_ids workload_id
         workload_ids="$(podman_cmd ps -aq --filter "label=openshell.managed=true" \
           --filter "label=openshell.ai/sandbox-id=${sandbox_id}" \
-          --filter "label=openshell.io/isolation-role=sandbox" 2>/dev/null || true)"
+          --filter "label=openshell.ai/isolation-role=sandbox" 2>/dev/null || true)"
         for workload_id in ${workload_ids}; do
           podman_cmd rm -f "${workload_id}" >/dev/null 2>&1 || true
         done

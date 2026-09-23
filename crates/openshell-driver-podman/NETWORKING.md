@@ -39,8 +39,8 @@ does not share the workload's PID, mount, or network namespaces.
 ## Troubleshooting
 
 Inspect both containers with the same sandbox-ID label, distinguishing
-`openshell.io/isolation-role=sandbox` from
-`openshell.io/isolation-role=supervisor`.
+`openshell.ai/isolation-role=sandbox` from
+`openshell.ai/isolation-role=supervisor`.
 
 - Sandbox fails its qualification probe: use its log to identify the denied
   kernel/runtime primitive. Do not add capabilities or disable runtime seccomp.
