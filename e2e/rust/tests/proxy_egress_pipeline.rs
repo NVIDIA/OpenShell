@@ -614,10 +614,9 @@ impl PipelineProbeServer {
                         }
                     }
                     observed.lock().unwrap().extend_from_slice(&request);
+                    // Keep the first response reusable so the queued request reaches policy evaluation.
                     let _ = stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                        )
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                         .await;
                 });
             }
