@@ -105,6 +105,8 @@ bash "$ROOT/tasks/scripts/test-snap-gateway-wrapper.sh" "$snap_wrapper"
 
 # Store installs autoconnect all required interfaces. Assertionless local Snap
 # tests connect only the privileged plugs, with Docker using the system slot.
+# Manual connection to the system Docker slot requires snapd 2.77.
+assert_contains "$snapcraft" "assumes: [snapd2.77]"
 for snap_file in \
   "$snapcraft" \
   "$snap_install_docs" \

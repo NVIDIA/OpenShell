@@ -45,11 +45,10 @@ description: |
 base: core24
 grade: stable
 confinement: strict
-assumes:
-  # The system :docker slot was added in snapd 2.76, but manual connection to
-  # that slot without snap-declaration overrides from the store, such as when
-  # installing a locally-built snap, was only allowed starting with snapd 2.77.
-  - snapd2.77
+# The system :docker slot was added in snapd 2.76, but manual connection to
+# that slot without snap-declaration overrides from the store, such as when
+# installing a locally-built snap, was only allowed starting with snapd 2.77.
+assumes: [snapd2.77]
 license: Apache-2.0
 website: https://docs.nvidia.com/openshell/latest/index.html
 source-code: https://github.com/NVIDIA/OpenShell
