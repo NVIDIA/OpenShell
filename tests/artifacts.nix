@@ -117,6 +117,9 @@ let
     "podman_gateway_start"
     "podman_oci_identity"
     "provider_auto_create"
+    # The provider-refresh feature suite covers revoked Keycloak grants. This
+    # binary instead covers stable workload handles across repeated rotations
+    # and explicit refresh reconfiguration in a long-running sandbox.
     "provider_refresh_handles"
     "provider_token_exchange"
     "proxy_egress_pipeline"
