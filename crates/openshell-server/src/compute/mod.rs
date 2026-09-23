@@ -7192,6 +7192,43 @@ mod tests {
     }
 
     #[test]
+    fn driver_template_maps_string_cpu_and_memory_resources() {
+        let template = SandboxTemplate {
+            resources: Some(prost_types::Struct {
+                fields: [
+                    (
+                        "limits",
+                        struct_value([("cpu", string_value("2")), ("memory", string_value("1Gi"))]),
+                    ),
+                    (
+                        "requests",
+                        struct_value([
+                            ("cpu", string_value("500m")),
+                            ("memory", string_value("512Mi")),
+                        ]),
+                    ),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+            }),
+            ..Default::default()
+        };
+
+        let driver = driver_sandbox_template_from_public(&template, "mxc").unwrap();
+        assert_eq!(
+            driver.resources,
+            Some(DriverResourceRequirements {
+                cpu_request: "500m".to_string(),
+                cpu_limit: "2".to_string(),
+                memory_request: "512Mi".to_string(),
+                memory_limit: "1Gi".to_string(),
+            })
+        );
+        assert!(driver.platform_config.is_none());
+    }
+
+    #[test]
     fn build_platform_config_preserves_non_typed_resource_fields() {
         let template = SandboxTemplate {
             resources: Some(prost_types::Struct {

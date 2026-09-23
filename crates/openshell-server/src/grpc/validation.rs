@@ -360,6 +360,7 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
                 ),
             ));
         }
+        validate_template_resources(s)?;
     }
     if let Some(ref s) = tmpl.driver_config {
         let size = s.encoded_len();
@@ -372,6 +373,57 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
             ));
         }
         reject_gateway_owned_driver_config_keys(s)?;
+    }
+
+    Ok(())
+}
+
+/// Validate the well-known Kubernetes-style resource fields before the public
+/// `Struct` is split into typed driver requirements and opaque platform data.
+///
+/// Unknown resource names remain platform-specific, but CPU and memory must be
+/// non-empty strings so malformed requests cannot be silently passed through
+/// as opaque data and ignored by a compute driver.
+fn validate_template_resources(resources: &prost_types::Struct) -> Result<(), Status> {
+    use prost_types::value::Kind;
+
+    for section_name in ["limits", "requests"] {
+        let Some(section_value) = resources.fields.get(section_name) else {
+            continue;
+        };
+        let field_prefix = format!("spec.template.resources.{section_name}");
+        let Some(Kind::StructValue(section)) = section_value.kind.as_ref() else {
+            return Err(invalid_argument(
+                &field_prefix,
+                format!("template.resources.{section_name} must be an object"),
+            ));
+        };
+
+        for resource_name in ["cpu", "memory"] {
+            let Some(resource_value) = section.fields.get(resource_name) else {
+                continue;
+            };
+            let field = format!("{field_prefix}.{resource_name}");
+            match resource_value.kind.as_ref() {
+                Some(Kind::StringValue(value)) if !value.is_empty() => {}
+                Some(Kind::StringValue(_)) => {
+                    return Err(invalid_argument(
+                        &field,
+                        format!(
+                            "template.resources.{section_name}.{resource_name} must not be empty"
+                        ),
+                    ));
+                }
+                _ => {
+                    return Err(invalid_argument(
+                        &field,
+                        format!(
+                            "template.resources.{section_name}.{resource_name} must be a string"
+                        ),
+                    ));
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1410,6 +1462,154 @@ mod tests {
         let err = validate_sandbox_spec("ok", &spec).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("template.resources"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_string_cpu_and_memory_resources() {
+        use prost_types::{Struct, Value, value::Kind};
+
+        let section = |fields: [(&str, &str); 2]| Value {
+            kind: Some(Kind::StructValue(Struct {
+                fields: fields
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (
+                            name.to_string(),
+                            Value {
+                                kind: Some(Kind::StringValue(value.to_string())),
+                            },
+                        )
+                    })
+                    .collect(),
+            })),
+        };
+        let resources = Struct {
+            fields: [
+                (
+                    "limits".to_string(),
+                    section([("cpu", "1"), ("memory", "1Gi")]),
+                ),
+                (
+                    "requests".to_string(),
+                    section([("cpu", "500m"), ("memory", "512Mi")]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                resources: Some(resources),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        validate_sandbox_spec("ok", &spec).unwrap();
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_non_string_cpu_resource() {
+        use prost_types::{Struct, Value, value::Kind};
+
+        let resources = Struct {
+            fields: std::iter::once((
+                "limits".to_string(),
+                Value {
+                    kind: Some(Kind::StructValue(Struct {
+                        fields: std::iter::once((
+                            "cpu".to_string(),
+                            Value {
+                                kind: Some(Kind::NumberValue(1.0)),
+                            },
+                        ))
+                        .collect(),
+                    })),
+                },
+            ))
+            .collect(),
+        };
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                resources: Some(resources),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        let details = err.get_error_details();
+        assert_eq!(
+            details.bad_request().unwrap().field_violations[0].field,
+            "spec.template.resources.limits.cpu"
+        );
+        assert!(err.message().contains("must be a string"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_non_object_resource_section() {
+        use prost_types::{Struct, Value, value::Kind};
+
+        let resources = Struct {
+            fields: std::iter::once((
+                "requests".to_string(),
+                Value {
+                    kind: Some(Kind::NumberValue(1.0)),
+                },
+            ))
+            .collect(),
+        };
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                resources: Some(resources),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        let details = err.get_error_details();
+        assert_eq!(
+            details.bad_request().unwrap().field_violations[0].field,
+            "spec.template.resources.requests"
+        );
+        assert!(err.message().contains("must be an object"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_empty_memory_resource() {
+        use prost_types::{Struct, Value, value::Kind};
+
+        let resources = Struct {
+            fields: std::iter::once((
+                "limits".to_string(),
+                Value {
+                    kind: Some(Kind::StructValue(Struct {
+                        fields: std::iter::once((
+                            "memory".to_string(),
+                            Value {
+                                kind: Some(Kind::StringValue(String::new())),
+                            },
+                        ))
+                        .collect(),
+                    })),
+                },
+            ))
+            .collect(),
+        };
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                resources: Some(resources),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("must not be empty"));
     }
 
     #[test]

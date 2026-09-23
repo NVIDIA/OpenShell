@@ -26,6 +26,7 @@ it does not implement the Linux `ConnectSupervisor` protocol.
 | Network policy | With `egress_proxy = true` on `process_container`, an explicit `network_policies` rule activates MXC 0.8 loopback-only egress plus the full policy enforced by a per-sandbox OpenShell host CONNECT proxy. The driver injects proxy environment variables for proxy-aware clients; direct Internet access remains denied by MXC. A policy without network rules does not activate the proxy. Otherwise rejected synchronously. `isolation_session` remains fail-closed. |
 | Provider credentials | The child receives revision-scoped placeholders and non-secret provider environment only. The per-sandbox host proxy retains the resolver and substitutes credentials only for their bound endpoints. |
 | Process policy | Unsupported; MXC supplies OS isolation only. |
+| Resource limits | Unsupported; MXC exposes no CPU rate control or memory limiting to non-WSLC backends. `CreateSandbox` rejects any request carrying `cpu_limit`, `cpu_request`, `memory_limit`, or `memory_request` synchronously rather than silently discarding them. |
 | Dynamic forwarding | Supported through `openshell-supervisor-relay`; interactive exec/connect remain unsupported. |
 | Network middleware | Rejected before launch until the host proxy receives the gateway middleware registry. |
 | ETW/OCSF audit | Optional Windows Sandboxing ETW consumer attributes host events to OpenShell sandboxes and emits OCSF records. |

@@ -1006,12 +1006,22 @@ impl MxcComputeBackend {
                     "mxc driver does not support GPU sandboxes",
                 ));
             }
-            if let Some(tmpl) = &spec.template
-                && !tmpl.agent_socket_path.is_empty()
-            {
-                return Err(tonic::Status::invalid_argument(
-                    "mxc driver does not support agent_socket_path (no in-sandbox supervisor)",
-                ));
+            if let Some(tmpl) = &spec.template {
+                if !tmpl.agent_socket_path.is_empty() {
+                    return Err(tonic::Status::invalid_argument(
+                        "mxc driver does not support agent_socket_path (no in-sandbox supervisor)",
+                    ));
+                }
+                if let Some(resources) = &tmpl.resources
+                    && (!resources.cpu_limit.is_empty()
+                        || !resources.cpu_request.is_empty()
+                        || !resources.memory_limit.is_empty()
+                        || !resources.memory_request.is_empty())
+                {
+                    return Err(tonic::Status::invalid_argument(
+                        "mxc driver does not support cpu/memory resource limits (no Job Object enforcement); omit --cpu/--memory or use a driver that supports them",
+                    ));
+                }
             }
         }
         sandbox_config(sandbox)?;
@@ -2577,7 +2587,9 @@ fn make_sandbox_with_condition(
 mod lifecycle_tests {
     use super::*;
     use futures::StreamExt;
-    use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+    use openshell_core::proto::compute::v1::{
+        DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+    };
     use openshell_core::proto::{
         FilesystemPolicy, MiddlewareEndpointSelector, NetworkBinary, NetworkEndpoint,
         NetworkMiddlewareConfig, NetworkPolicyRule, SandboxPolicy, StaticCredentialBinding,
@@ -3784,6 +3796,30 @@ mod lifecycle_tests {
         assert!(error.message().contains("egress_proxy"));
         assert!(error.message().contains("pc_network_allow"));
         assert!(error.message().contains("unrestricted egress fallback"));
+    }
+
+    #[test]
+    fn cpu_and_memory_limits_are_rejected_fail_closed() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        let mut sandbox = driver_sandbox("sb-cpu-memory-limits");
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .resources = Some(DriverResourceRequirements {
+            cpu_limit: "1".into(),
+            memory_limit: "512Mi".into(),
+            ..Default::default()
+        });
+
+        let error = backend
+            .validate_sandbox_create(&sandbox)
+            .expect_err("cpu/memory limits are not enforceable on mxc and must fail closed");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("cpu/memory"));
     }
 
     #[tokio::test]

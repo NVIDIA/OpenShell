@@ -1746,7 +1746,8 @@ type SandboxTemplate struct {
 	Annotations map[string]string `protobuf:"bytes,5,rep,name=annotations,proto3" json:"annotations,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Additional environment variables injected by the template.
 	Environment map[string]string `protobuf:"bytes,6,rep,name=environment,proto3" json:"environment,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Platform-specific compute resource requirements and limits.
+	// Platform-specific compute resource requirements and limits. Well-known
+	// cpu and memory entries under limits or requests must be non-empty strings.
 	Resources *structpb.Struct `protobuf:"bytes,7,opt,name=resources,proto3" json:"resources,omitempty"`
 	// Enable Kubernetes user namespace isolation (hostUsers: false).
 	// When true, container UID 0 maps to a non-root host UID and capabilities
