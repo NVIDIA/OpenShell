@@ -197,8 +197,10 @@ impl NetworkPeer {
 fn network_response() -> Response {
     Response::NetworkConnected {
         identity: BinaryIdentityWire::Resolved {
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_digest: None,
+            executable: crate::boundary_protocol::ExecutableIdentityWire {
+                path: PathBuf::from("/usr/bin/curl"),
+                digest: None,
+            },
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
         },
@@ -315,7 +317,7 @@ impl Drop for Fixture {
 async fn verify_connection(mut pending: PendingTcpOpen) {
     assert_eq!(pending.destination, "203.0.113.1:443".parse().unwrap());
     assert_eq!(
-        pending.binary_identity.unwrap().binary_path,
+        pending.binary_identity.unwrap().executable.path,
         PathBuf::from("/usr/bin/curl")
     );
     assert_eq!(

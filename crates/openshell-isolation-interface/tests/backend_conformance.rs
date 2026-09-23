@@ -97,9 +97,10 @@ impl<K: MockKind> NetworkMediationSource for MockSource<K> {
         Ok(PendingTcpOpen {
             stream: Box::new(near),
             binary_identity: Ok(BinaryIdentity {
-                binary_path: PathBuf::from("/usr/bin/agent"),
-                binary_digest: K::HAS_DIGEST
-                    .then(|| "00".repeat(32).parse().expect("valid digest")),
+                executable: ExecutableIdentity {
+                    path: PathBuf::from("/usr/bin/agent"),
+                    digest: K::HAS_DIGEST.then(|| "00".repeat(32).parse().expect("valid digest")),
+                },
                 ancestors: vec![],
                 cmdline_paths: vec![],
             }),
@@ -619,7 +620,7 @@ async fn runtime_interfaces_survive_lifecycle_consumption() {
 
     let conn = source.accept_tcp().await.expect("accept after consumption");
     let identity = conn.binary_identity.expect("identity resolves");
-    assert_eq!(identity.binary_path, PathBuf::from("/usr/bin/agent"));
+    assert_eq!(identity.executable.path, PathBuf::from("/usr/bin/agent"));
 }
 
 // ---------------------------------------------------------------------------
@@ -786,10 +787,10 @@ async fn pending_network_open_carries_socket_bound_identity() {
         .await
         .expect("accept");
     let identity = conn.binary_identity.expect("identity resolves");
-    assert_eq!(identity.binary_path, PathBuf::from("/usr/bin/agent"));
+    assert_eq!(identity.executable.path, PathBuf::from("/usr/bin/agent"));
     // A missing digest is `None`, never an empty value.
     assert_eq!(
-        identity.binary_digest.expect("digest").to_string(),
+        identity.executable.digest.expect("digest").to_string(),
         "00".repeat(32)
     );
     assert_eq!(conn.destination, "203.0.113.10:443".parse().unwrap());
@@ -803,7 +804,7 @@ async fn missing_digest_is_none_never_empty() {
     let source = MockSource::<Secondary>(PhantomData);
     let conn = source.accept_tcp().await.expect("accept");
     let identity = conn.binary_identity.expect("identity resolves");
-    assert!(identity.binary_digest.is_none());
+    assert!(identity.executable.digest.is_none());
 }
 
 #[test]

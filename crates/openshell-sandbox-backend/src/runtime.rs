@@ -2413,8 +2413,10 @@ mod tests {
                 request: vec![1, 2, 3],
                 transport: openshell_isolation_interface::contract::DnsTransport::Udp,
                 identity: crate::boundary_protocol::BinaryIdentityWire::Resolved {
-                    binary_path: PathBuf::from("/usr/bin/dig"),
-                    binary_digest: Some("a".repeat(64).parse().unwrap()),
+                    executable: crate::boundary_protocol::ExecutableIdentityWire {
+                        path: PathBuf::from("/usr/bin/dig"),
+                        digest: Some("a".repeat(64).parse().unwrap()),
+                    },
                     ancestors: Vec::new(),
                     cmdline_paths: Vec::new(),
                 },
@@ -2442,7 +2444,7 @@ mod tests {
         let query = session.accept_dns().await.unwrap();
         assert_eq!(query.message, [1, 2, 3]);
         assert_eq!(
-            query.binary_identity.unwrap().binary_path,
+            query.binary_identity.unwrap().executable.path,
             PathBuf::from("/usr/bin/dig")
         );
         query.response.send(Ok(vec![4, 5, 6])).unwrap();

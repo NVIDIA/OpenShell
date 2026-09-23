@@ -848,22 +848,32 @@ pub trait BoundaryLoopbackConnector: Send + Sync {
 // Mediation and binary identity
 // ============================================================================
 
+/// Path and digest evidence for one executable in a process identity chain.
+///
+/// Every instance is authorization-capable, whether it describes the process
+/// that owns a connection or one of its executable ancestors. A missing digest
+/// is `None`, never an empty value; binary-scoped policy cannot authorize an
+/// executable whose digest is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutableIdentity {
+    /// Absolute executable path in the workload filesystem namespace.
+    pub path: PathBuf,
+    /// Digest of the resolved executable object. `None` when unavailable.
+    pub digest: Option<Sha256Digest>,
+}
+
 /// Executable identity for one accepted connection, resolved by the backend and
 /// delivered on [`PendingTcpOpen`] before the mediation service evaluates
 /// policy.
 ///
-/// A missing digest is `None`, never an empty value; policy that requires an
-/// unavailable identity field cannot authorize the connection. How a backend
-/// resolves identity is private to that backend; the shape and the fail-closed
-/// semantics do not change.
+/// How a backend resolves identity is private to that backend; the shape and
+/// fail-closed semantics do not change.
 #[derive(Debug, Clone)]
 pub struct BinaryIdentity {
-    /// Absolute path of the executable resolved for the accepted connection.
-    pub binary_path: PathBuf,
-    /// Digest of the resolved executable object. `None` when unavailable.
-    pub binary_digest: Option<Sha256Digest>,
-    /// Ancestor process binaries, nearest first.
-    pub ancestors: Vec<PathBuf>,
+    /// Executable that owns the accepted connection.
+    pub executable: ExecutableIdentity,
+    /// Ancestor process executables, nearest first.
+    pub ancestors: Vec<ExecutableIdentity>,
     /// Absolute script/interpreter paths drawn from the process cmdlines.
     /// Diagnostic context; never authorizes.
     pub cmdline_paths: Vec<PathBuf>,
