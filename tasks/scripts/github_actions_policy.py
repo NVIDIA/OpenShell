@@ -19,7 +19,7 @@ import urllib.request
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import yaml
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
@@ -55,6 +55,7 @@ class Reference:
     value: str
     path: str
     line: int
+    context: Literal["job", "step"]
 
 
 @dataclass(frozen=True)
@@ -113,7 +114,7 @@ def discover_references(source: str, path: str) -> list[Reference]:
 
     references: list[Reference] = []
 
-    def collect_step_or_job(mapping: MappingNode) -> None:
+    def collect_uses(mapping: MappingNode, context: Literal["job", "step"]) -> None:
         for value in values_for(mapping, "uses"):
             line = value.start_mark.line + 1
             if (
@@ -122,7 +123,9 @@ def discover_references(source: str, path: str) -> list[Reference]:
             ):
                 raise EvaluationError(f"uses value must be a string at {path}:{line}")
             references.append(
-                Reference(_parse_uses_value(value.value, path, line), path, line)
+                Reference(
+                    _parse_uses_value(value.value, path, line), path, line, context
+                )
             )
 
     if re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", path, re.IGNORECASE):
@@ -132,12 +135,12 @@ def discover_references(source: str, path: str) -> list[Reference]:
             for _, job_value in jobs_value.value:
                 if not isinstance(job_value, MappingNode):
                     continue
-                collect_step_or_job(job_value)
+                collect_uses(job_value, "job")
                 for steps_value in values_for(job_value, "steps"):
                     if isinstance(steps_value, SequenceNode):
                         for step_value in steps_value.value:
                             if isinstance(step_value, MappingNode):
-                                collect_step_or_job(step_value)
+                                collect_uses(step_value, "step")
     else:
         for runs_value in values_for(document, "runs"):
             if not isinstance(runs_value, MappingNode):
@@ -146,16 +149,17 @@ def discover_references(source: str, path: str) -> list[Reference]:
                 if isinstance(steps_value, SequenceNode):
                     for step_value in steps_value.value:
                         if isinstance(step_value, MappingNode):
-                            collect_step_or_job(step_value)
+                            collect_uses(step_value, "step")
     return references
 
 
 def added_references(base: list[Reference], head: list[Reference]) -> list[Reference]:
-    remaining = Counter(reference.value for reference in base)
+    remaining = Counter((reference.value, reference.context) for reference in base)
     added: list[Reference] = []
     for reference in head:
-        if remaining[reference.value] > 0:
-            remaining[reference.value] -= 1
+        identity = (reference.value, reference.context)
+        if remaining[identity] > 0:
+            remaining[identity] -= 1
         else:
             added.append(reference)
     return added
@@ -177,7 +181,11 @@ def _split_external_reference(value: str) -> tuple[str, str, str, bool]:
     parts = target.split("/")
     if len(parts) < 2 or not parts[0] or not parts[1] or not revision:
         raise EvaluationError(f"invalid external reference {value!r}")
-    reusable = len(parts) >= 5 and parts[2:4] == [".github", "workflows"]
+    reusable = (
+        len(parts) == 5
+        and parts[2:4] == [".github", "workflows"]
+        and re.fullmatch(r"[^/]+\.ya?ml", parts[4], re.IGNORECASE) is not None
+    )
     return parts[0], parts[1], revision, reusable
 
 
@@ -212,12 +220,20 @@ def evaluate_reference(
     is_verified_marketplace_action: Callable[[str, str], bool],
 ) -> Decision:
     value = reference.value
-    if value.startswith(("./", "$/", "docker://")):
+    if reference.context == "job":
+        if re.fullmatch(r"\./\.github/workflows/[^/]+\.ya?ml", value, re.IGNORECASE):
+            return Decision(True, "local reusable workflow")
+        if value.startswith(("./", "$/", "docker://")):
+            return Decision(False, "job-level uses must reference a reusable workflow")
+    elif value.startswith(("./", "$/", "docker://")):
         return Decision(True, "local or container reference")
     if not policy.enabled:
         return Decision(False, "GitHub Actions is disabled for the repository")
 
     owner, repository, revision, reusable = _split_external_reference(value)
+    if reference.context == "job" and not reusable:
+        return Decision(False, "job-level uses must reference a reusable workflow")
+    reusable = reference.context == "job"
     if (
         policy.sha_pinning_required
         and not reusable

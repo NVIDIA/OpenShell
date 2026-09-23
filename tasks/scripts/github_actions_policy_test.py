@@ -37,15 +37,19 @@ jobs:
             "owner/reusable/.github/workflows/build.yml@v1",
             ".github/workflows/ci.yml",
             4,
+            "job",
         ),
         policy.Reference(
             "actions/checkout@0123456789012345678901234567890123456789",
             ".github/workflows/ci.yml",
             6,
+            "step",
         ),
-        policy.Reference("./.github/actions/local", ".github/workflows/ci.yml", 7),
-        policy.Reference("docker://alpine:3.22", ".github/workflows/ci.yml", 8),
-        policy.Reference("owner/inline@sha", ".github/workflows/ci.yml", 9),
+        policy.Reference(
+            "./.github/actions/local", ".github/workflows/ci.yml", 7, "step"
+        ),
+        policy.Reference("docker://alpine:3.22", ".github/workflows/ci.yml", 8, "step"),
+        policy.Reference("owner/inline@sha", ".github/workflows/ci.yml", 9, "step"),
     ]
 
 
@@ -66,22 +70,40 @@ def test_discover_references_finds_quoted_uses_key() -> None:
     source = 'jobs:\n  build:\n    steps:\n      - "uses": attacker/action@v1\n'
 
     assert policy.discover_references(source, ".github/workflows/ci.yml") == [
-        policy.Reference("attacker/action@v1", ".github/workflows/ci.yml", 4)
+        policy.Reference("attacker/action@v1", ".github/workflows/ci.yml", 4, "step")
     ]
 
 
 def test_added_references_compares_occurrence_counts() -> None:
     base = [
-        policy.Reference("owner/action@old", "ci.yml", 2),
-        policy.Reference("owner/action@same", "ci.yml", 3),
+        policy.Reference("owner/action@old", "ci.yml", 2, "step"),
+        policy.Reference("owner/action@same", "ci.yml", 3, "step"),
     ]
     head = [
-        policy.Reference("owner/action@same", "ci.yml", 4),
-        policy.Reference("owner/action@new", "ci.yml", 5),
-        policy.Reference("owner/action@new", "ci.yml", 6),
+        policy.Reference("owner/action@same", "ci.yml", 4, "step"),
+        policy.Reference("owner/action@new", "ci.yml", 5, "step"),
+        policy.Reference("owner/action@new", "ci.yml", 6, "step"),
     ]
 
     assert policy.added_references(base, head) == head[1:]
+
+
+def test_added_references_detects_step_to_job_context_change() -> None:
+    base_source = """
+jobs:
+  build:
+    steps:
+      - uses: actions/checkout@0123456789012345678901234567890123456789
+"""
+    head_source = """
+jobs:
+  build:
+    uses: actions/checkout@0123456789012345678901234567890123456789
+"""
+    base = policy.discover_references(base_source, ".github/workflows/ci.yml")
+    head = policy.discover_references(head_source, ".github/workflows/ci.yml")
+
+    assert policy.added_references(base, head) == head
 
 
 def test_discover_references_ignores_uses_text_inside_block_scalar() -> None:
@@ -95,7 +117,7 @@ jobs:
 """
 
     assert policy.discover_references(source, ".github/workflows/ci.yml") == [
-        policy.Reference("owner/action@sha", ".github/workflows/ci.yml", 7)
+        policy.Reference("owner/action@sha", ".github/workflows/ci.yml", 7, "step")
     ]
 
 
@@ -112,7 +134,7 @@ jobs:
 """
 
     assert policy.discover_references(source, ".github/workflows/ci.yml") == [
-        policy.Reference("owner/action@sha", ".github/workflows/ci.yml", 7)
+        policy.Reference("owner/action@sha", ".github/workflows/ci.yml", 7, "step")
     ]
 
 
@@ -130,7 +152,9 @@ runs:
 """
 
     assert policy.discover_references(source, ".github/actions/test/action.yml") == [
-        policy.Reference("owner/action@sha", ".github/actions/test/action.yml", 8)
+        policy.Reference(
+            "owner/action@sha", ".github/actions/test/action.yml", 8, "step"
+        )
     ]
 
 
@@ -147,13 +171,52 @@ def selected_policy(**overrides: object) -> object:
     return policy.ActionsPolicy(**values)
 
 
+def test_job_action_reference_is_rejected() -> None:
+    source = """
+jobs:
+  build:
+    uses: actions/checkout@0123456789012345678901234567890123456789
+"""
+
+    [reference] = policy.discover_references(source, ".github/workflows/ci.yml")
+    decision = policy.evaluate_reference(
+        reference,
+        selected_policy(sha_pinning_required=True, github_owned_allowed=True),
+        repository_owner="NVIDIA",
+        is_verified_marketplace_action=lambda _owner, _repo: False,
+    )
+
+    assert not decision.allowed
+    assert "job-level uses must reference a reusable workflow" in decision.reason
+
+
+def test_step_workflow_path_does_not_bypass_sha_pinning() -> None:
+    source = """
+jobs:
+  build:
+    steps:
+      - uses: NVIDIA/tools/.github/workflows/helper@v1
+"""
+
+    [reference] = policy.discover_references(source, ".github/workflows/ci.yml")
+    decision = policy.evaluate_reference(
+        reference,
+        selected_policy(sha_pinning_required=True),
+        repository_owner="NVIDIA",
+        is_verified_marketplace_action=lambda _owner, _repo: False,
+    )
+
+    assert not decision.allowed
+    assert "full-length commit SHA" in decision.reason
+
+
 @pytest.mark.parametrize(
     "value",
     ["./.github/actions/local", "$/shared/action", "docker://alpine:3.22"],
 )
 def test_local_and_container_references_do_not_need_external_policy(value: str) -> None:
     decision = policy.evaluate_reference(
-        policy.Reference(value, "ci.yml", 1),
+        policy.Reference(value, "ci.yml", 1, "step"),
         selected_policy(),
         repository_owner="NVIDIA",
         is_verified_marketplace_action=lambda _owner, _repo: False,
@@ -192,7 +255,7 @@ def test_selected_policy_allows_supported_categories(
     value: str, policy_overrides: dict[str, object], reason: str
 ) -> None:
     decision = policy.evaluate_reference(
-        policy.Reference(value, "ci.yml", 1),
+        policy.Reference(value, "ci.yml", 1, "step"),
         selected_policy(**policy_overrides),
         repository_owner="NVIDIA",
         is_verified_marketplace_action=lambda _owner, _repo: False,
@@ -209,14 +272,17 @@ def test_verified_marketplace_applies_to_actions_but_not_reusable_workflows() ->
         return (owner, repo) == ("astral-sh", "setup-uv")
 
     action = policy.evaluate_reference(
-        policy.Reference("astral-sh/setup-uv@sha", "ci.yml", 1),
+        policy.Reference("astral-sh/setup-uv@sha", "ci.yml", 1, "step"),
         live_policy,
         repository_owner="NVIDIA",
         is_verified_marketplace_action=lookup,
     )
     workflow = policy.evaluate_reference(
         policy.Reference(
-            "astral-sh/setup-uv/.github/workflows/test.yml@main", "ci.yml", 2
+            "astral-sh/setup-uv/.github/workflows/test.yml@main",
+            "ci.yml",
+            2,
+            "job",
         ),
         live_policy,
         repository_owner="NVIDIA",
@@ -235,21 +301,26 @@ def test_sha_pinning_applies_to_external_actions_not_reusable_workflows() -> Non
     )
 
     unpinned = policy.evaluate_reference(
-        policy.Reference("owner/repo@v1", "ci.yml", 1),
+        policy.Reference("owner/repo@v1", "ci.yml", 1, "step"),
         live_policy,
         repository_owner="NVIDIA",
         is_verified_marketplace_action=lambda _owner, _repo: False,
     )
     pinned = policy.evaluate_reference(
         policy.Reference(
-            "owner/repo@0123456789012345678901234567890123456789", "ci.yml", 2
+            "owner/repo@0123456789012345678901234567890123456789",
+            "ci.yml",
+            2,
+            "step",
         ),
         live_policy,
         repository_owner="NVIDIA",
         is_verified_marketplace_action=lambda _owner, _repo: False,
     )
     reusable = policy.evaluate_reference(
-        policy.Reference("owner/repo/.github/workflows/ci.yml@main", "ci.yml", 3),
+        policy.Reference(
+            "owner/repo/.github/workflows/ci.yml@main", "ci.yml", 3, "job"
+        ),
         live_policy,
         repository_owner="NVIDIA",
         is_verified_marketplace_action=lambda _owner, _repo: False,
@@ -267,7 +338,7 @@ def test_negative_pattern_after_allow_pattern_wins() -> None:
     )
 
     decision = policy.evaluate_reference(
-        policy.Reference("owner/blocked@sha", "ci.yml", 1),
+        policy.Reference("owner/blocked@sha", "ci.yml", 1, "step"),
         live_policy,
         repository_owner="NVIDIA",
         is_verified_marketplace_action=lambda _owner, _repo: False,
@@ -283,7 +354,7 @@ def test_policy_pattern_owner_and_repository_are_case_insensitive() -> None:
     )
 
     decision = policy.evaluate_reference(
-        policy.Reference("Swatinem/rust-cache@sha", "ci.yml", 1),
+        policy.Reference("Swatinem/rust-cache@sha", "ci.yml", 1, "step"),
         live_policy,
         repository_owner="NVIDIA",
         is_verified_marketplace_action=lambda _owner, _repo: False,
@@ -294,7 +365,7 @@ def test_policy_pattern_owner_and_repository_are_case_insensitive() -> None:
 
 def test_enterprise_owned_organization_is_allowed() -> None:
     decision = policy.evaluate_reference(
-        policy.Reference("sibling-org/action@sha", "ci.yml", 1),
+        policy.Reference("sibling-org/action@sha", "ci.yml", 1, "step"),
         selected_policy(),
         repository_owner="NVIDIA",
         enterprise_organizations=frozenset({"nvidia", "sibling-org"}),
