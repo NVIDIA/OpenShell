@@ -103,6 +103,14 @@ The gateway connects to the operator-provided endpoint; it does not provision
 or supervise the remote driver. The operator must protect the socket so only
 the gateway uid can access it.
 
+The compute-driver lifecycle contract addresses sandboxes only by the stable
+`sandbox_id` assigned by the gateway. `GetSandbox`, `StopSandbox`,
+`StartSandbox`, and `DeleteSandbox` require that ID; drivers must not use a
+sandbox name as a fallback lookup key. `ListSandboxes` is unscoped and returns
+the complete inventory for that driver instance. Every returned sandbox must
+have a non-empty, globally unique ID. Names and workspaces in returned
+snapshots are descriptive metadata.
+
 Sandbox create supports `--cpu` and `--memory` for per-sandbox compute sizing.
 Docker and Podman apply them as runtime limits. Kubernetes applies them as both
 container requests and limits. The VM driver accepts the fields but currently

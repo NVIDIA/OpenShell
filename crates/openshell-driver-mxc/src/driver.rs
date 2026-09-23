@@ -544,12 +544,9 @@ impl MxcComputeBackend {
         self.map_sandbox_policy(&sandbox.id, policy, egress_addr)?;
         Ok(())
     }
-    pub async fn get_sandbox(&self, sandbox_name: &str) -> Option<DriverSandbox> {
+    pub async fn get_sandbox(&self, sandbox_id: &str) -> Option<DriverSandbox> {
         let registry = self.registry.lock().await;
-        registry
-            .values()
-            .find(|e| e.sandbox.name == sandbox_name)
-            .map(|e| e.sandbox.clone())
+        registry.get(sandbox_id).map(|e| e.sandbox.clone())
     }
 
     pub async fn list_sandboxes(&self) -> Vec<DriverSandbox> {
@@ -660,23 +657,20 @@ impl MxcComputeBackend {
 
         Ok(())
     }
-    pub async fn stop_sandbox(&self, sandbox_name: &str) -> Result<(), tonic::Status> {
-        let (sandbox_id, lifecycle_gate) = {
+    pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), tonic::Status> {
+        let lifecycle_gate = {
             let registry = self.registry.lock().await;
-            let entry = registry
-                .values()
-                .find(|entry| entry.sandbox.name == sandbox_name)
-                .ok_or_else(|| {
-                    tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
-                })?;
-            (entry.sandbox.id.clone(), entry.lifecycle_gate.clone())
+            let entry = registry.get(sandbox_id).ok_or_else(|| {
+                tonic::Status::not_found(format!("sandbox {sandbox_id} not found"))
+            })?;
+            entry.lifecycle_gate.clone()
         };
 
         let _lifecycle_guard = lifecycle_gate.lock().await;
         let (iso_id, mut isolation_stopped, cancel, monitor_task) = {
             let mut registry = self.registry.lock().await;
-            let entry = registry.get_mut(&sandbox_id).ok_or_else(|| {
-                tonic::Status::not_found(format!("sandbox {sandbox_name} not found"))
+            let entry = registry.get_mut(sandbox_id).ok_or_else(|| {
+                tonic::Status::not_found(format!("sandbox {sandbox_id} not found"))
             })?;
             (
                 entry.iso_sandbox_id.clone(),
@@ -703,7 +697,7 @@ impl MxcComputeBackend {
         }
 
         let mut registry = self.registry.lock().await;
-        if let Some(entry) = registry.get_mut(&sandbox_id) {
+        if let Some(entry) = registry.get_mut(sandbox_id) {
             entry.isolation_stopped = isolation_stopped;
             entry.host_proxy = None;
             entry.phase_state = PhaseState::Stopped;
@@ -724,21 +718,12 @@ impl MxcComputeBackend {
         }
         Ok(())
     }
-    pub async fn delete_sandbox(
-        &self,
-        sandbox_id: &str,
-        sandbox_name: &str,
-    ) -> Result<bool, tonic::Status> {
+    pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, tonic::Status> {
         let lifecycle_gate = {
             let registry = self.registry.lock().await;
             let Some(entry) = registry.get(sandbox_id) else {
                 return Ok(false);
             };
-            if entry.sandbox.name != sandbox_name {
-                return Err(tonic::Status::failed_precondition(
-                    "sandbox_id did not match sandbox_name",
-                ));
-            }
             entry.lifecycle_gate.clone()
         };
 

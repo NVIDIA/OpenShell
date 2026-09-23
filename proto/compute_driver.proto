@@ -370,10 +370,9 @@ message ValidateSandboxCreateRequest {
 message ValidateSandboxCreateResponse {}
 
 message GetSandboxRequest {
-  // Stable sandbox ID stored by the gateway.
+  // Required stable sandbox ID assigned by the gateway. This immutable ID is
+  // the sole sandbox reference at the compute-driver boundary.
   string sandbox_id = 1;
-  // Compute-runtime name used by the driver.
-  string name = 2;
 }
 
 message GetSandboxResponse {
@@ -381,10 +380,14 @@ message GetSandboxResponse {
   DriverSandbox sandbox = 1;
 }
 
+// Requests the complete sandbox inventory managed by this configured driver
+// instance. This collection is intentionally unscoped by workspace.
 message ListSandboxesRequest {}
 
 message ListSandboxesResponse {
-  // Platform-observed sandbox snapshots returned by the driver.
+  // Platform-observed sandbox snapshots returned by the driver. Every entry
+  // must carry a non-empty, globally unique DriverSandbox.id. Workspace and
+  // name are observation metadata, not collection keys.
   repeated DriverSandbox sandboxes = 1;
 }
 
@@ -400,19 +403,17 @@ message CreateSandboxResponse {
 }
 
 message StopSandboxRequest {
-  // Stable sandbox ID stored by the gateway.
+  // Required stable sandbox ID assigned by the gateway. This immutable ID is
+  // the sole sandbox reference at the compute-driver boundary.
   string sandbox_id = 1;
-  // Compute-runtime name used by the driver.
-  string name = 2;
 }
 
 message StopSandboxResponse {}
 
 message StartSandboxRequest {
-  // Stable sandbox ID stored by the gateway.
+  // Required stable sandbox ID assigned by the gateway. This immutable ID is
+  // the sole sandbox reference at the compute-driver boundary.
   string sandbox_id = 1;
-  // Compute-runtime name used by the driver.
-  string name = 2;
   // Fresh launch credentials for start-from-stopped. Empty only for drivers
   // that do not implement the OpenShell Sandbox Protocol.
   bytes launch_authentication = 3 [(openshell.options.v1.secret) = true];
@@ -433,10 +434,9 @@ message StartSandboxResponse {
 }
 
 message DeleteSandboxRequest {
-  // Stable sandbox ID stored by the gateway.
+  // Required stable sandbox ID assigned by the gateway. This immutable ID is
+  // the sole sandbox reference at the compute-driver boundary.
   string sandbox_id = 1;
-  // Compute-runtime name used by the driver.
-  string name = 2;
 }
 
 message DeleteSandboxResponse {
