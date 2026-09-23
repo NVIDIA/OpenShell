@@ -405,6 +405,8 @@ the serving gateway retries ownership lookup until the normal relay wait
 deadline. Each retry re-reads the owner record, so a supervisor reconnect or
 heartbeat can surface a new owner; if no fresh reachable owner appears before
 the deadline, the client operation fails rather than electing an owner itself.
+The owning gateway replays unclaimed relay opens when a supervisor reconnects,
+including when the previous session ended before the new one registered.
 Provider-readiness reports, endpoint-status reports, and provider-status reads
 also follow the durable owner record through unary peer RPCs. The owning replica
 validates the current supervisor session and keeps the in-memory evidence; a
