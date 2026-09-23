@@ -9,6 +9,13 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
+    - name: Install conformance test dependencies
+      become: true
+      ansible.builtin.package:
+        name:
+          - git
+        state: present
+
     - name: Create OpenShell conformance test directory
       become: true
       ansible.builtin.file:
@@ -64,6 +71,7 @@
           - "1"
           - --filterset
           - "{{ conformance_filter | default('all()') }}"
+          - --no-fail-fast
       environment:
         OPENSHELL_BIN: "{{ openshell_cli.stdout }}"
       register: conformance_result
