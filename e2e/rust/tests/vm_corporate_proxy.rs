@@ -54,6 +54,7 @@ const BYPASS_MARKER: &str = "vm-corp-proxy-e2e-bypass-upstream";
 const READY_MARKER: &str = "vm-corp-proxy-e2e-workload-done";
 
 /// Ports the fixtures bind and the guest addresses them by.
+#[derive(Debug)]
 struct FixturePorts {
     proxy: u16,
     allowed: u16,
@@ -63,11 +64,21 @@ struct FixturePorts {
 
 impl FixturePorts {
     fn pick() -> Self {
+        // find_free_port releases its listener before returning, so repeated
+        // calls can return the same port and accidentally authorize the
+        // "denied" fixture through an allowed endpoint.
+        let mut used = std::collections::HashSet::new();
+        let mut next = || loop {
+            let port = find_free_port();
+            if used.insert(port) {
+                break port;
+            }
+        };
         Self {
-            proxy: find_free_port(),
-            allowed: find_free_port(),
-            denied: find_free_port(),
-            bypass: find_free_port(),
+            proxy: next(),
+            allowed: next(),
+            denied: next(),
+            bypass: next(),
         }
     }
 }
@@ -424,7 +435,6 @@ filesystem_policy:
   read_only:
     - /usr
     - /lib
-    - /proc
     - /dev/urandom
     - /app
     - /etc
@@ -433,6 +443,7 @@ filesystem_policy:
     - /sandbox
     - /tmp
     - /dev/null
+    - /proc
 
 landlock:
   compatibility: best_effort
@@ -822,7 +833,8 @@ async fn vm_corporate_proxy_trusts_ca_bundle_for_https_proxy() {
     );
     assert!(
         !proxy_logs.contains(&format!(":{}", ports.denied)),
-        "policy-denied destination must never reach the https proxy:\n{proxy_logs}"
+        "policy-denied destination must never reach the https proxy; ports={ports:?}, workload output:\n{}\nproxy logs:\n{proxy_logs}",
+        sandbox.create_output,
     );
 
     sandbox.cleanup().await;
