@@ -152,6 +152,7 @@ Launch a sandbox with the Microsoft Graph provider attached:
 ```shell
 openshell sandbox create \
   --name microsoft-graph-mail \
+  --from registry.example.com/team/agent-tools:1.0 \
   --provider microsoft-mail \
   --no-auto-providers \
   -- /bin/sh

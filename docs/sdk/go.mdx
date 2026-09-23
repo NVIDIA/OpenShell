@@ -1,0 +1,126 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Go SDK"
+sidebar-title: "Go"
+description: "Install the OpenShell Go SDK, connect to a gateway, and manage a sandbox."
+keywords: "OpenShell, SDK, Go, Golang, gRPC, Sandbox"
+position: 1
+---
+
+Use the Go SDK to manage OpenShell resources from Go applications, operators,
+and controllers. Its typed subclients follow familiar Kubernetes client
+patterns. Use the SDK and gateway from the same OpenShell release when possible.
+
+## Install the SDK
+
+The SDK requires Go 1.25.13 or later. Add it to your Go module:
+
+```shell
+go get github.com/NVIDIA/OpenShell/sdk/go@latest
+```
+
+## Connect to a Gateway
+
+Pass a `host:port` address to `NewClient`. For a local gateway that allows
+unauthenticated plaintext connections:
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "time"
+
+    v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1"
+)
+
+func main() {
+    client, err := v1.NewClient(v1.Config{
+        Address: "127.0.0.1:8080",
+        Auth:    v1.NoAuth(),
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer client.Close()
+
+    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+    defer cancel()
+
+    health, err := client.Health().Check(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("gateway healthy: %v\n", health.Healthy)
+}
+```
+
+For an authenticated TLS gateway, provide the bearer token and TLS settings:
+
+```go
+client, err := v1.NewClient(v1.Config{
+    Address: "gateway.example.com:443",
+    Auth:    v1.StaticToken(os.Getenv("OPENSHELL_TOKEN")),
+    TLS:     &v1.TLSConfig{CAFile: "/path/to/ca.crt"},
+})
+```
+
+Omit `CAFile` to use system roots. For renewable OIDC service credentials, use
+`oidc.NewClientCredentialsAuth` from
+`github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/oidc`.
+
+## Create and Use a Sandbox
+
+Resource methods take an explicit workspace. The following example creates a
+sandbox in `default`, waits for readiness, runs a command, and requests
+deletion:
+
+```go
+sandbox, err := client.Sandboxes().Create(
+    ctx,
+    "default",
+    "sdk-example",
+    &v1.SandboxSpec{
+        Template: &v1.SandboxTemplate{
+            Image: "registry.example.com/team/python-agent:1.0",
+        },
+    },
+    nil,
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+sandbox, err = client.Sandboxes().WaitReady(ctx, "default", sandbox.Name)
+if err != nil {
+    log.Fatal(err)
+}
+
+result, err := client.Exec().Run(
+    ctx,
+    "default",
+    sandbox.Name,
+    []string{"python", "-c", "print('hello from OpenShell')"},
+)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Print(string(result.Stdout))
+
+if _, err := client.Sandboxes().Delete(ctx, "default", sandbox.Name); err != nil {
+    log.Fatal(err)
+}
+```
+
+The root client also exposes subclients for providers, services, files, SSH,
+TCP forwarding, policy, configuration, templates, and workspaces. List methods
+return lazy pagers so callers choose when to fetch the next page.
+
+## Next Steps
+
+- Review [Gateway Authentication](/reference/gateway-auth) before connecting a service to a production gateway.
+- Review [API Errors](/reference/api-errors) for the gateway error model.
+- Browse the [Go package reference](https://pkg.go.dev/github.com/NVIDIA/OpenShell/sdk/go/openshell/v1) for all exported types and methods.

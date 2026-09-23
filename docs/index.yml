@@ -25,11 +25,13 @@ navigation:
   title: "Observability"
 - folder: kubernetes
   title: "Kubernetes"
+- folder: sdk
+  title: "SDK Reference"
 - folder: reference
   title: "Reference"
 - folder: security
   title: "Security"
-- section: "Upgrade"
+- section: "Upgrade Guides"
   slug: upgrade
   contents:
   - page: "0.1.0"

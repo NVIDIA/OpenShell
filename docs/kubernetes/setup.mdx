@@ -217,21 +217,9 @@ The most commonly changed values are:
 
 ### Run multiple gateway replicas
 
-Use a Deployment and shared PostgreSQL for high availability:
-
-```yaml
-replicaCount: 2
-workload:
-  kind: deployment
-server:
-  externalDbSecret: openshell-postgres
-```
-
-The chart creates the peer Service, projected ServiceAccount identity, and RBAC
-that gateway replicas use to route exec, forwarding, file-sync, and service
-traffic to the replica holding the external supervisor's live session. Peer
-traffic uses the chart TLS materials when gateway TLS is enabled. Do not use
-the per-pod SQLite database with more than one replica.
+Use a Deployment and shared PostgreSQL to run more than one gateway replica.
+Refer to [High Availability](/kubernetes/high-availability) for the database
+Secret, Helm values, pod placement, verification, and failover behavior.
 
 Use a values file for repeatable deployments:
 
@@ -340,6 +328,7 @@ The gateway exposes `/healthz` for process liveness and `/readyz` for dependency
 ## Next Steps
 
 - Kubernetes sandboxes use separate workload and directly managed supervisor Pods; refer to [Sandbox runtime](/kubernetes/sandbox-runtime).
+- To run multiple gateway replicas, refer to [High Availability](/kubernetes/high-availability).
 - To enable automatic certificate rotation with cert-manager, refer to [Managing Certificates](/kubernetes/managing-certificates).
 - To expose the gateway externally without port-forwarding, refer to [Ingress](/kubernetes/ingress).
 - To configure OIDC or reverse-proxy authentication, refer to [Access Control](/kubernetes/access-control).

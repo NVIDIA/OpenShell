@@ -64,6 +64,10 @@ versions:
       message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>OpenShell 0.1.0 is coming soon.</strong> <a href="https://github.com/NVIDIA/OpenShell/milestone/10" target="_blank" rel="noreferrer">Track progress in the 0.1.0 milestone</a>, <a href="https://docs.nvidia.com/openshell/dev/index.html" target="_blank" rel="noreferrer">read the prerelease documentation</a>, or <a href="https://docs.nvidia.com/openshell/dev/about/installation#install-a-prerelease" target="_blank" rel="noreferrer">install a prerelease</a>.</span>'
 
 redirects:
+  - source: "/openshell/latest/about/supported-agents"
+    destination: "/openshell/latest/about/run-an-agent"
+  - source: "/openshell/dev/about/supported-agents"
+    destination: "/openshell/dev/about/run-an-agent"
   - source: "/openshell/latest/sandboxes/providers-v2"
     destination: "/openshell/latest/providers/profiles"
   # Paths are relative to the site root; subpath prefix matches instances + custom-domain.

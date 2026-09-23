@@ -1,8 +1,8 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "How OpenShell Works"
-sidebar-title: "How It Works"
+title: "Architecture"
+sidebar-title: "Architecture"
 description: "Understand the OpenShell architecture, runtime boundaries, gateways, sandboxes, and ecosystem integration points."
 keywords: "Generative AI, Cybersecurity, AI Agents, Architecture, Gateway, Sandbox, Providers"
 position: 2
@@ -90,7 +90,7 @@ device plugins without changing the gateway and sandbox contract.
 | [Gateways](/sandboxes/manage-gateways) | Authenticated control plane that owns API access, durable state, sandbox lifecycle, settings delivery, authorization, and relay coordination. |
 | [Providers](/sandboxes/manage-providers) | Credential and provider records that map logical agent needs to platform or user-managed secrets without exposing raw credentials to the agent process. |
 | [Policies](/sandboxes/policies) | Declarative controls for filesystem access, process identity, network egress, L7 rules, credential injection, and runtime policy updates. |
-| [Provider-backed Inference](/sandboxes/inference-routing) | Per-sandbox provider attachment, native model endpoints, and endpoint-bound credential injection. |
+| [Inference](/sandboxes/inference-routing) | Per-sandbox provider attachment, native model endpoints, and endpoint-bound credential injection. |
 
 ## Gateways and Sandboxes
 

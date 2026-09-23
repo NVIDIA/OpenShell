@@ -1,0 +1,215 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "High Availability"
+sidebar-title: "High Availability"
+description: "Run multiple OpenShell gateway replicas on Kubernetes with shared PostgreSQL and authenticated peer routing."
+keywords: "Generative AI, Cybersecurity, Kubernetes, High Availability, HA, Gateway, PostgreSQL, Replicas, Failover"
+position: 3
+---
+
+Run two or more gateway replicas when the OpenShell control plane must remain
+available during a gateway pod failure or rolling update. Every replica can
+serve API requests. The replicas share persistent state through PostgreSQL and
+relay session-bound requests to the replica connected to each sandbox
+supervisor.
+
+<Warning>
+Gateway replicas do not make PostgreSQL highly available. Use a managed
+PostgreSQL service or a separately operated PostgreSQL cluster with its own
+backup and failover plan.
+</Warning>
+
+## Requirements
+
+An HA gateway deployment requires:
+
+- Two or more schedulable Kubernetes nodes or failure domains.
+- PostgreSQL reachable from every gateway pod.
+- A Kubernetes Secret in the OpenShell namespace with the PostgreSQL connection
+  URI in a key named `uri`.
+- `workload.kind: deployment`. The default StatefulSet and per-pod SQLite
+  database are intended for a single gateway replica.
+- An ingress or load balancer that routes clients to the gateway Service. Refer
+  to [Ingress](/kubernetes/ingress) for a Gateway API configuration.
+
+The Helm chart rejects `replicaCount` values above `1` unless
+`server.externalDbSecret` is set. It also rejects a multi-replica StatefulSet
+unless `workload.allowMultiReplicaStatefulSet` is explicitly enabled. Use a
+Deployment for the standard HA configuration.
+
+## Create the PostgreSQL Secret
+
+Provision PostgreSQL outside the OpenShell chart, then create the connection
+Secret. The chart does not install PostgreSQL.
+
+```shell
+kubectl create namespace openshell
+
+kubectl -n openshell create secret generic openshell-postgres \
+  --from-literal=uri='postgresql://openshell:<password>@<postgres-host>:5432/openshell'
+```
+
+Use your PostgreSQL provider's required TLS parameters in the connection URI.
+Keep the Secret in the same namespace as the gateway release.
+
+## Configure Gateway Replicas
+
+Create `values-ha.yaml`:
+
+```yaml
+replicaCount: 2
+
+workload:
+  kind: deployment
+
+server:
+  externalDbSecret: openshell-postgres
+
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: openshell
+            app.kubernetes.io/instance: openshell
+        topologyKey: kubernetes.io/hostname
+```
+
+The anti-affinity rule places the two replicas on different nodes. The
+`app.kubernetes.io/instance` value must match the Helm release name. Change the
+topology key to a zone label when replicas must span availability zones. A
+required rule leaves a replica Pending when the cluster does not have enough
+matching failure domains; use preferred anti-affinity when scheduling the
+replica is more important than strict separation.
+
+Install or upgrade OpenShell:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
+  --values values-ha.yaml \
+  --wait
+```
+
+The chart shares its retained sandbox JWT signing material, TLS material, and
+default credential-storage encryption key across the gateway pods. Do not
+create different copies of those Secrets for individual replicas.
+
+## Verify the Deployment
+
+Wait for all gateway replicas to become ready:
+
+```shell
+kubectl -n openshell rollout status deployment/openshell
+kubectl -n openshell get pods \
+  -l app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell \
+  -o wide
+```
+
+Confirm that the client-facing Service and headless peer Service have ready
+endpoints:
+
+```shell
+kubectl -n openshell get service openshell openshell-peer
+kubectl -n openshell get endpointslice \
+  -l app.kubernetes.io/service-name=openshell
+kubectl -n openshell get endpointslice \
+  -l app.kubernetes.io/service-name=openshell-peer
+```
+
+If you changed the chart's generated names with `nameOverride` or
+`fullnameOverride`, use the rendered Service names instead.
+
+After registering the gateway with the CLI, verify that requests succeed:
+
+```shell
+openshell status
+openshell sandbox list
+```
+
+## Protect Voluntary Disruptions
+
+Add a PodDisruptionBudget so a voluntary disruption, such as node maintenance,
+does not evict every ready gateway pod at once:
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: openshell
+  namespace: openshell
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openshell
+      app.kubernetes.io/instance: openshell
+```
+
+Apply the manifest separately from the OpenShell chart. Match the namespace and
+release labels to your installation. A PodDisruptionBudget controls voluntary
+evictions; it does not protect against an unavailable node or failure domain.
+
+## How Peer Routing Works
+
+A sandbox supervisor keeps one active control stream to one gateway replica.
+That replica records ownership in PostgreSQL. When Kubernetes sends a client
+request to another replica, the receiving gateway relays exec, forwarding,
+file-sync, service, and status traffic to the owner through the headless peer
+Service.
+
+Peer RPCs use a projected, pod-bound ServiceAccount token with the
+`openshell-gateway-peer` audience. The receiving gateway validates the token
+with the Kubernetes TokenReview API, verifies the live pod identity and release
+labels, and authorizes only peer methods. When gateway TLS is enabled, peer
+connections also use the chart's TLS materials.
+
+You do not need session affinity at the ingress or client-facing Service.
+
+## Failure and Rollout Behavior
+
+When a non-owner gateway pod stops, Kubernetes removes it from ready Service
+endpoints and new requests go to another replica. Existing requests through the
+stopped pod disconnect and must be retried.
+
+When an owner gateway pod stops, its connected supervisors reconnect through
+the gateway Service and publish new ownership. Other replicas re-read ownership
+while waiting to relay a request. A request fails if no fresh, reachable owner
+appears before its normal deadline.
+
+Established streams do not move between gateway replicas. An interrupted exec,
+forwarding, or service stream must reconnect. File sync retries with a new SSH
+session instead of resuming the interrupted byte stream. Rolling updates can
+temporarily concentrate supervisor sessions on the replicas that stayed up;
+client requests remain routable through peer relay.
+
+## Scale the Gateway
+
+Change `replicaCount` in `values-ha.yaml`, then apply the release again:
+
+```shell
+helm upgrade openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
+  --values values-ha.yaml \
+  --wait
+```
+
+Keep at least two ready replicas when availability must survive one gateway pod
+failure. Size PostgreSQL connection capacity and the cluster nodes for the
+selected replica count.
+
+## Next Steps
+
+- To expose the gateway through a highly available data path, refer to
+  [Ingress](/kubernetes/ingress).
+- To configure automatic certificate renewal, refer to
+  [Managing Certificates](/kubernetes/managing-certificates).
+- To configure user authentication and authorization, refer to
+  [Access Control](/kubernetes/access-control).

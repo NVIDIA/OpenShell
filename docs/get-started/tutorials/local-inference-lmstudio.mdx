@@ -92,6 +92,7 @@ OpenAI-compatible request:
 ```shell
 openshell sandbox create \
   --name lmstudio-client \
+  --from registry.example.com/team/agent-tools:1.0 \
   --provider lmstudio \
   -- \
   curl http://host.openshell.internal:1234/v1/chat/completions \
@@ -134,6 +135,6 @@ API key even when LM Studio ignores it; use a literal non-secret value such as
 
 ## Next Steps
 
-- [Provider-backed Inference](/sandboxes/inference-routing)
+- [Inference](/sandboxes/inference-routing)
 - [Profiles](/providers/profiles)
 - [LM Studio CLI](https://lmstudio.ai/docs/cli)

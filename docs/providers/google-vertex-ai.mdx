@@ -95,6 +95,7 @@ Attach it while creating a sandbox:
 
 ```shell
 openshell sandbox create \
+  --from registry.example.com/team/agent:1.0 \
   --name vertex-agent \
   --provider vertex-local
 ```
@@ -182,7 +183,7 @@ workspace-global; the replacement intentionally grants access per sandbox.
 
 ## Next Steps
 
-- [Provider-backed Inference](/sandboxes/inference-routing)
+- [Inference](/sandboxes/inference-routing)
 - [Profiles](/providers/profiles)
 - [Providers](/sandboxes/manage-providers)
 - [Customize Sandbox Policies](/sandboxes/policies)
