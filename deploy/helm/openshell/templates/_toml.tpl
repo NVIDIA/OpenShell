@@ -101,6 +101,8 @@ field must not require a Helm template change.
 {{- define "openshell.gatewayConfigToml" -}}
 {{- $root := . -}}
 {{- $config := deepCopy (.Values.gatewayConfig | default dict) -}}
+{{- $kubernetesCompat := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
+{{- $_ := set $config "openshell.drivers.kubernetes" $kubernetesCompat -}}
 {{/* External credential drivers own their storage. Do not configure the
 chart-managed encrypted database store when any driver is selected: its KEK
 environment variable is intentionally not mounted in that mode. */}}
