@@ -10,7 +10,6 @@ use std::io::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -489,7 +488,7 @@ async fn podman_logs_capture(container_name: &str) -> String {
     }
 }
 
-async fn provider_token_debug(sandbox_name: &str, token_port: u16, target_port: u16) -> String {
+async fn provider_token_debug(sandbox_name: &str, target_port: u16) -> String {
     let sandbox_logs = sandbox_logs(sandbox_name).await;
     let Ok(socket) = std::env::var("OPENSHELL_PODMAN_SOCKET") else {
         return format!("Sandbox logs:\n{sandbox_logs}\nOPENSHELL_PODMAN_SOCKET is not set");
@@ -507,17 +506,6 @@ async fn provider_token_debug(sandbox_name: &str, token_port: u16, target_port: 
             "python3",
             "-c",
             "import socket; print(socket.getaddrinfo('host.openshell.internal', 0, type=socket.SOCK_STREAM))",
-        ],
-    )
-    .await;
-    let token_probe = podman_exec_capture(
-        &container_name,
-        &[
-            "python3",
-            "-c",
-            &format!(
-                "import socket; s=socket.create_connection(('127.0.0.1', {token_port}), 2); s.sendall(b'POST /token HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n'); print(s.recv(4096).decode(errors='replace')); s.close()"
-            ),
         ],
     )
     .await;
@@ -541,7 +529,6 @@ async fn provider_token_debug(sandbox_name: &str, token_port: u16, target_port: 
          --- /etc/hosts ---\n{hosts}\n\
          --- ps -ef ---\n{processes}\n\
          --- resolve host.openshell.internal ---\n{resolve_host}\n\
-         --- token endpoint probe ---\n{token_probe}\n\
          --- protected target TCP probe ---\n{target_probe}\n\
          --- podman logs ---\n{container_logs}"
     )
@@ -583,7 +570,6 @@ endpoints:
   - host: host.openshell.internal
     port: {target_port}
     protocol: rest
-    tls: none
     access: read-write
     enforcement: enforce
     allowed_ips:
@@ -592,7 +578,7 @@ endpoints:
       - 172.0.0.0/8
       - 192.168.0.0/16
 binaries:
-  - /usr/local/bin/python3
+  - /**
 "
     );
     file.write_all(profile.as_bytes())
@@ -601,102 +587,12 @@ binaries:
     file
 }
 
-fn sandbox_script(token_port: u16) -> String {
-    let _ = token_port;
+fn sandbox_script() -> String {
     r"set -eu
 echo token-server-ready
 while true; do sleep 60; done
 "
     .to_string()
-}
-
-fn container_token_endpoint_script() -> String {
-    format!(
-        r#"
-import json
-import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs
-
-PORT = int(sys.argv[1])
-
-class Handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        if self.path != "/token":
-            self.send_response(404)
-            self.end_headers()
-            return
-        length = int(self.headers.get("content-length", "0"))
-        params = parse_qs(self.rfile.read(length).decode())
-        subject_token = params.get("subject_token", [""])[0]
-        client_assertion = params.get("client_assertion", [""])[0]
-        if subject_token == "{USER_SUBJECT_TOKEN}" and client_assertion:
-            access_token = "{INTERMEDIATE_TOKEN}"
-        elif subject_token == "{INTERMEDIATE_TOKEN}" and client_assertion:
-            access_token = "{FINAL_ACCESS_TOKEN}"
-        else:
-            self.send_response(400)
-            body = json.dumps({{"error": "unexpected_token_exchange"}}).encode()
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        body = json.dumps({{
-            "access_token": access_token,
-            "token_type": "Bearer",
-            "expires_in": 300,
-        }}).encode()
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, fmt, *args):
-        return
-
-HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
-"#
-    )
-}
-
-async fn start_container_token_endpoint(sandbox_name: &str, token_port: u16) -> Result<(), String> {
-    let socket = std::env::var("OPENSHELL_PODMAN_SOCKET")
-        .map_err(|_| "OPENSHELL_PODMAN_SOCKET must be set by e2e-podman.sh".to_string())?;
-    let container_name = podman_container_name_for_sandbox(&socket, sandbox_name).await?;
-    let mut cmd = Command::new("podman");
-    cmd.arg("--url")
-        .arg(format!("unix://{socket}"))
-        .arg("exec")
-        .arg("-d")
-        .arg(&container_name)
-        .arg("python3")
-        .arg("-c")
-        .arg(container_token_endpoint_script())
-        .arg(token_port.to_string());
-    apply_podman_config_env(&mut cmd);
-    let output = cmd
-        .output()
-        .await
-        .map_err(|err| format!("spawn podman exec token endpoint: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "podman exec token endpoint failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    for _ in 0..20 {
-        if container_loopback_port_ready(&container_name, token_port).await {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    Err(format!(
-        "container token endpoint did not become ready on 127.0.0.1:{token_port}"
-    ))
 }
 
 async fn podman_container_name_for_sandbox(
@@ -709,6 +605,8 @@ async fn podman_container_name_for_sandbox(
         .arg("ps")
         .arg("--filter")
         .arg(format!("label=openshell.ai/sandbox-name={sandbox_name}"))
+        .arg("--filter")
+        .arg("label=openshell.io/isolation-role=sandbox")
         .arg("--format")
         .arg("{{.Names}}");
     apply_podman_config_env(&mut cmd);
@@ -747,29 +645,6 @@ fn apply_podman_config_env(cmd: &mut Command) {
     } else if let Some(value) = std::env::var_os("OPENSHELL_E2E_CONTAINER_ENGINE_XDG_CONFIG_HOME") {
         cmd.env("XDG_CONFIG_HOME", value);
     }
-}
-
-async fn container_loopback_port_ready(container_name: &str, token_port: u16) -> bool {
-    let Ok(socket) = std::env::var("OPENSHELL_PODMAN_SOCKET") else {
-        return false;
-    };
-    let probe = format!(
-        "import socket; s=socket.create_connection(('127.0.0.1', {token_port}), 1); s.close()"
-    );
-    let mut cmd = Command::new("podman");
-    cmd.arg("--url")
-        .arg(format!("unix://{socket}"))
-        .arg("exec")
-        .arg(container_name)
-        .arg("python3")
-        .arg("-c")
-        .arg(probe);
-    apply_podman_config_env(&mut cmd);
-    cmd.stdout(Stdio::null()).stderr(Stdio::null());
-    cmd.status()
-        .await
-        .map(|status| status.success())
-        .unwrap_or(false)
 }
 
 async fn sandbox_exec_http(sandbox_name: &str, target_port: u16) -> Result<String, String> {
@@ -859,7 +734,7 @@ async fn podman_provider_token_exchange_injects_bearer_header() {
     .await
     .expect("create provider");
 
-    let script = sandbox_script(token_port);
+    let script = sandbox_script();
     let mut sandbox = SandboxGuard::create_keep_with_args(
         &["--provider", &provider_name],
         &["sh", "-lc", &script],
@@ -871,13 +746,10 @@ async fn podman_provider_token_exchange_injects_bearer_header() {
             "sandbox should complete token exchange against {token_endpoint} and protected target port {target_port}:\n{err}"
         )
     });
-    start_container_token_endpoint(&sandbox.name, token_port)
-        .await
-        .expect("start container token endpoint");
     let request_output = match sandbox_exec_http(&sandbox.name, target_port).await {
         Ok(output) => output,
         Err(err) => {
-            let debug = provider_token_debug(&sandbox.name, token_port, target_port).await;
+            let debug = provider_token_debug(&sandbox.name, target_port).await;
             panic!("request protected target from kept sandbox: {err}\n{debug}");
         }
     };

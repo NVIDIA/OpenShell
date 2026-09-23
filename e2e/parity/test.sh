@@ -57,26 +57,29 @@ source "${ROOT}/e2e/support/gateway-common.sh"
 # shellcheck source=e2e/support/podman-gateway-config.sh
 source "${ROOT}/e2e/support/podman-gateway-config.sh"
 mkdir -p "${WORKDIR}/pki/client" "${WORKDIR}/jwt"
-e2e_write_podman_gateway_config "${WORKDIR}/v1.toml" 1 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test '' '' 0 ''
-e2e_write_podman_gateway_config "${WORKDIR}/v2.toml" 2 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test '' '' 0 ''
-e2e_write_podman_gateway_config "${WORKDIR}/v2-external.toml" 2 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 1 socket network 18181 image:test 15 supervisor:test '' '' 0 ''
+e2e_write_podman_gateway_config "${WORKDIR}/v1.toml" 1 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test sandbox:test '' '' 0 ''
+e2e_write_podman_gateway_config "${WORKDIR}/v2.toml" 2 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test sandbox:test '' '' 0 ''
+e2e_write_podman_gateway_config "${WORKDIR}/v2-external.toml" 2 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 1 socket network 18181 image:test 15 supervisor:test sandbox:test '' '' 0 ''
 assert_contains "${WORKDIR}/v1.toml" 'version = 1'
 assert_contains "${WORKDIR}/v1.toml" 'compute_drivers = ["podman"]'
 assert_contains "${WORKDIR}/v1.toml" 'image_pull_policy = "missing"'
 assert_contains "${WORKDIR}/v1.toml" 'health_check_interval_secs = 0'
+assert_contains "${WORKDIR}/v1.toml" 'sandbox_runtime_image = "sandbox:test"'
 assert_contains "${WORKDIR}/v1.toml" 'guest_tls_ca = '
 assert_contains "${WORKDIR}/v2.toml" 'version = 2'
 assert_contains "${WORKDIR}/v2.toml" 'compute_driver = "podman"'
 assert_contains "${WORKDIR}/v2.toml" 'image_pull_policy = "if_not_present"'
 assert_contains "${WORKDIR}/v2.toml" 'allow_driver_config = true'
+assert_contains "${WORKDIR}/v2.toml" 'sandbox_runtime_image = "sandbox:test"'
 assert_contains "${WORKDIR}/v2.toml" '[openshell.drivers.podman.resource_admission]'
 assert_not_contains "${WORKDIR}/v2.toml" 'health_check_interval_secs = 0'
 assert_contains "${WORKDIR}/v2-external.toml" 'socket_path = "socket"'
+assert_not_contains "${WORKDIR}/v2-external.toml" 'sandbox_runtime_image = "sandbox:test"'
 assert_not_contains "${WORKDIR}/v2-external.toml" 'allow_driver_config = true'
 assert_not_contains "${WORKDIR}/v2-external.toml" '[openshell.drivers.podman.resource_admission]'
 # V2 guest TLS is emitted before its driver table; V1 is driver-local.
-OPENSHELL_E2E_PODMAN_OPTION_PROFILE=podman-options e2e_write_podman_gateway_config "${WORKDIR}/v1-options.toml" 1 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test "" "" 0 ""
-OPENSHELL_E2E_PODMAN_OPTION_PROFILE=podman-options e2e_write_podman_gateway_config "${WORKDIR}/v2-options.toml" 2 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test "" "" 0 ""
+OPENSHELL_E2E_PODMAN_OPTION_PROFILE=podman-options e2e_write_podman_gateway_config "${WORKDIR}/v1-options.toml" 1 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test sandbox:test "" "" 0 ""
+OPENSHELL_E2E_PODMAN_OPTION_PROFILE=podman-options e2e_write_podman_gateway_config "${WORKDIR}/v2-options.toml" 2 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test sandbox:test "" "" 0 ""
 for config in "${WORKDIR}/v1-options.toml" "${WORKDIR}/v2-options.toml"; do
   assert_contains "${config}" 'sandbox_pids_limit = 31'
   assert_contains "${config}" 'health_check_interval_secs = 7'

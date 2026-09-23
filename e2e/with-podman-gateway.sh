@@ -113,7 +113,9 @@ if [ "${OPENSHELL_E2E_SPIFFE_FIXTURE:-0}" = "1" ]; then
   if [ -z "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" ]; then
     OPENSHELL_E2E_PROVIDER_SPIFFE_PORT="$(e2e_pick_port)"
     export OPENSHELL_E2E_PROVIDER_SPIFFE_LISTEN="0.0.0.0:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
-    export OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET="tcp:169.254.1.2:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
+    # Podman supervisors run with host networking, so reach the host-side
+    # Workload API fixture over loopback rather than the workload bridge.
+    export OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET="tcp:127.0.0.1:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
   fi
 fi
 GATEWAY_BIN=""
@@ -203,7 +205,7 @@ cleanup() {
         podman_cmd volume rm "openshell-channel-${sandbox_id}" >/dev/null 2>&1 || true
         podman_cmd volume rm -f "openshell-sandbox-${sandbox_id}-workspace" >/dev/null 2>&1 || true
         local secret_prefix
-        for secret_prefix in openshell-token openshell-proxy-auth openshell-tls-ca openshell-tls-cert openshell-tls-key; do
+        for secret_prefix in openshell-token openshell-proxy-auth openshell-resolver openshell-tls-ca openshell-tls-cert openshell-tls-key; do
           podman_cmd secret rm "${secret_prefix}-${sandbox_id}" >/dev/null 2>&1 || true
         done
       fi
@@ -701,6 +703,7 @@ e2e_write_podman_gateway_config \
   "${SANDBOX_RUNTIME_IMAGE}" \
   "${PODMAN_STOP_TIMEOUT_SECS}" \
   "${SUPERVISOR_RUNTIME_IMAGE}" \
+  "${SANDBOX_BOUNDARY_IMAGE}" \
   "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" \
   "${OPENSHELL_PODMAN_SOCKET:-}" \
   "${OIDC_MODE}" \

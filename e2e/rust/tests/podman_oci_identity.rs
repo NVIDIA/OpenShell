@@ -252,23 +252,30 @@ async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, contai
     let supervisor_id = container_id_for_role(&image.engine, &sandbox.name, "supervisor")
         .expect("find separate supervisor companion");
     assert_ne!(supervisor_id, container_id);
-    for id in [container_id, &supervisor_id] {
-        let user = run_engine(
-            &image.engine,
-            &["inspect", "--format", "{{.Config.User}}", id],
-        )
-        .unwrap();
-        assert_eq!(user, format!("{OCI_UID}:{OCI_GID}"));
-        let caps = run_engine(
-            &image.engine,
-            &["inspect", "--format", "{{.EffectiveCaps}}", id],
-        )
-        .unwrap();
-        assert_eq!(
-            caps, "[]",
-            "neither container may have effective capabilities"
-        );
-    }
+    let workload_user = run_engine(
+        &image.engine,
+        &["inspect", "--format", "{{.Config.User}}", container_id],
+    )
+    .unwrap();
+    assert_eq!(
+        workload_user, "0:0",
+        "the trusted rootless boundary starts as container root before dropping to the OCI identity"
+    );
+    let supervisor_user = run_engine(
+        &image.engine,
+        &["inspect", "--format", "{{.Config.User}}", &supervisor_id],
+    )
+    .unwrap();
+    assert_eq!(supervisor_user, format!("{OCI_UID}:{OCI_GID}"));
+    let supervisor_caps = run_engine(
+        &image.engine,
+        &["inspect", "--format", "{{.EffectiveCaps}}", &supervisor_id],
+    )
+    .unwrap();
+    assert_eq!(
+        supervisor_caps, "[]",
+        "the supervisor companion may not have effective capabilities"
+    );
     let network = run_engine(
         &image.engine,
         &[

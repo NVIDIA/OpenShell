@@ -4,15 +4,16 @@
 #![cfg(feature = "e2e")]
 
 //! Local-driver E2E regression for sandbox bootstrap JWT material and terminal
-//! main-process semantics. Local single-player gateways mint non-expiring
-//! bootstrap tokens. Stopping a Docker or Podman sandbox container is terminal
-//! and must not relaunch its canonical process; restarting the VM gateway still
-//! exercises driver recovery without deliberately stopping the sandbox.
+//! main-process semantics. Launch-scoped bootstrap tokens must remain valid long
+//! enough for local-driver recovery. Stopping a Docker or Podman sandbox
+//! workload is terminal and must not relaunch its canonical process; restarting
+//! the VM gateway still exercises driver recovery without deliberately stopping
+//! the sandbox.
 
 use std::fs;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use openshell_e2e::harness::cli::{wait_for_healthy, wait_for_sandbox_exec_contains};
@@ -63,16 +64,17 @@ impl LocalDriver {
         matches!(self, Self::Docker | Self::Podman)
     }
 
-    fn container_filters(self, namespace: &str, sandbox_name: &str) -> Vec<String> {
+    fn container_filters(self, namespace: &str, sandbox_name: &str, role: &str) -> Vec<String> {
         match self {
             Self::Docker => vec![
                 "label=openshell.ai/managed-by=openshell".to_string(),
-                "label=openshell.ai/isolation-role=sandbox".to_string(),
+                format!("label=openshell.ai/isolation-role={role}"),
                 format!("label=openshell.ai/sandbox-namespace={namespace}"),
                 format!("label=openshell.ai/sandbox-name={sandbox_name}"),
             ],
             Self::Podman => vec![
                 "label=openshell.managed=true".to_string(),
+                format!("label=openshell.io/isolation-role={role}"),
                 format!("label=openshell.ai/sandbox-name={sandbox_name}"),
             ],
             Self::Vm => Vec::new(),
@@ -102,14 +104,15 @@ fn run_engine(engine: &ContainerEngine, args: &[String]) -> Result<String, Strin
     Ok(stdout.trim().to_string())
 }
 
-fn sandbox_container_id(
+fn container_id_for_role(
     engine: &ContainerEngine,
     driver: LocalDriver,
     namespace: &str,
     sandbox_name: &str,
+    role: &str,
 ) -> Result<String, String> {
     let mut args = vec!["ps".to_string(), "-aq".to_string()];
-    for filter in driver.container_filters(namespace, sandbox_name) {
+    for filter in driver.container_filters(namespace, sandbox_name, role) {
         args.push("--filter".to_string());
         args.push(filter);
     }
@@ -123,10 +126,10 @@ fn sandbox_container_id(
     match ids.as_slice() {
         [id] => Ok((*id).to_string()),
         [] => Err(format!(
-            "no {driver:?} container found for sandbox '{sandbox_name}' in namespace '{namespace}'"
+            "no {driver:?} {role} container found for sandbox '{sandbox_name}' in namespace '{namespace}'"
         )),
         _ => Err(format!(
-            "multiple {driver:?} containers found for sandbox '{sandbox_name}' in namespace '{namespace}': {ids:?}"
+            "multiple {driver:?} {role} containers found for sandbox '{sandbox_name}' in namespace '{namespace}': {ids:?}"
         )),
     }
 }
@@ -175,16 +178,23 @@ async fn wait_for_container_running(
     }
 }
 
-fn read_bootstrap_token(engine: &ContainerEngine, container_id: &str) -> Result<String, String> {
+fn copy_bootstrap_token(engine: &ContainerEngine, container_id: &str) -> Result<String, String> {
+    let tempdir = tempfile::tempdir().map_err(|err| format!("create token tempdir: {err}"))?;
+    let destination = tempdir.path().join("sandbox.jwt");
     run_engine(
         engine,
         &[
-            "exec".to_string(),
-            container_id.to_string(),
-            "cat".to_string(),
-            CONTAINER_TOKEN_MOUNT_PATH.to_string(),
+            "cp".to_string(),
+            format!("{container_id}:{CONTAINER_TOKEN_MOUNT_PATH}"),
+            destination.display().to_string(),
         ],
-    )
+    )?;
+    fs::read_to_string(&destination).map_err(|err| {
+        format!(
+            "read copied bootstrap token '{}': {err}",
+            destination.display()
+        )
+    })
 }
 
 fn read_vm_bootstrap_token(sandbox_name: &str) -> Result<String, String> {
@@ -260,10 +270,19 @@ fn token_exp_claim(token: &str) -> Result<i64, String> {
         .ok_or_else(|| format!("sandbox JWT missing integer exp claim: {claims}"))
 }
 
-fn require_non_expiring_token(token: &str, context: &str) -> Result<(), String> {
+fn require_unexpired_token(token: &str, context: &str) -> Result<(), String> {
     let exp = token_exp_claim(token)?;
-    if exp != 0 {
-        return Err(format!("{context} should use exp=0, got exp={exp}"));
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| format!("system clock is before Unix epoch: {err}"))?
+            .as_secs(),
+    )
+    .map_err(|_| "current Unix timestamp does not fit in i64".to_string())?;
+    if exp <= now {
+        return Err(format!(
+            "{context} should expire in the future, got exp={exp}, now={now}"
+        ));
     }
     Ok(())
 }
@@ -274,28 +293,30 @@ async fn stop_container_sandbox(
     namespace: &str,
     sandbox_name: &str,
 ) -> Result<(), String> {
-    let container_id = sandbox_container_id(engine, driver, namespace, sandbox_name)?;
-    if driver == LocalDriver::Docker {
-        run_engine(
-            engine,
-            &[
-                "exec".to_string(),
-                container_id.clone(),
-                "sh".to_string(),
-                "-c".to_string(),
-                format!("test ! -r {CONTAINER_TOKEN_MOUNT_PATH}"),
-            ],
-        )
-        .map_err(|error| {
-            format!("Docker sandbox workload must not be able to read its bootstrap JWT: {error}")
-        })?;
-    } else {
-        let token = read_bootstrap_token(engine, &container_id)?;
-        require_non_expiring_token(&token, "local-driver bootstrap JWT")?;
+    let workload_id = container_id_for_role(engine, driver, namespace, sandbox_name, "sandbox")?;
+    run_engine(
+        engine,
+        &[
+            "exec".to_string(),
+            workload_id.clone(),
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("test ! -r {CONTAINER_TOKEN_MOUNT_PATH}"),
+        ],
+    )
+    .map_err(|error| {
+        format!("sandbox workload must not be able to read its bootstrap JWT: {error}")
+    })?;
+
+    if driver == LocalDriver::Podman {
+        let supervisor_id =
+            container_id_for_role(engine, driver, namespace, sandbox_name, "supervisor")?;
+        let token = copy_bootstrap_token(engine, &supervisor_id)?;
+        require_unexpired_token(&token, "local-driver bootstrap JWT")?;
     }
 
-    run_engine(engine, &["stop".to_string(), container_id.clone()])?;
-    wait_for_container_running(engine, &container_id, false, Duration::from_secs(60)).await
+    run_engine(engine, &["stop".to_string(), workload_id.clone()])?;
+    wait_for_container_running(engine, &workload_id, false, Duration::from_secs(60)).await
 }
 
 async fn wait_for_sandbox_error(sandbox_name: &str, timeout: Duration) -> Result<(), String> {
@@ -327,7 +348,7 @@ async fn wait_for_sandbox_error(sandbox_name: &str, timeout: Duration) -> Result
 
 async fn restart_vm_sandbox(gateway: &ManagedGateway, sandbox_name: &str) -> Result<(), String> {
     let token = read_vm_bootstrap_token(sandbox_name)?;
-    require_non_expiring_token(&token, "VM bootstrap JWT")?;
+    require_unexpired_token(&token, "VM bootstrap JWT")?;
 
     gateway.stop()?;
     gateway.start()?;
