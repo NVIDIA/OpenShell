@@ -186,6 +186,7 @@ Prerelease and `dev` tags are intended for testing changes ahead of a release. P
 See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - gateway-only configuration
+- [`ci/values-gateway-agentgateway.yaml`](ci/values-gateway-agentgateway.yaml) - attach to a shared agentgateway Gateway
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
 - [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - CI overlay for multi-replica external PostgreSQL testing
@@ -366,14 +367,15 @@ discovery endpoint or its TLS CA.
 | grpcRoute.backendTLSPolicy.enabled | bool | `false` | Create a BackendTLSPolicy resource for end-to-end TLS between the Gateway proxy and the OpenShell gateway pod. The traffic flow is: client → HTTPS → Gateway (terminate) → TLS (re-encrypt) → gateway pod. Requires server.disableTls=false and server.tls.enableMtls=false. The certgen hook auto-creates the backend CA ConfigMap. |
 | grpcRoute.backendTLSPolicy.hostname | string | `""` | Hostname the Gateway proxy validates against the backend's TLS certificate SAN. Defaults to the service FQDN (`<fullname>.<namespace>.svc.cluster.local`) when empty, which matches the SAN included by both cert-manager and the pkiInitJob. |
 | grpcRoute.enabled | bool | `false` | Create a Gateway API GRPCRoute for the gateway service. |
-| grpcRoute.gateway.className | string | `"eg"` | GatewayClass to reference. Envoy Gateway installs one named "eg". |
+| grpcRoute.gateway.className | string | `"eg"` | GatewayClass to reference when gateway.create is true. Envoy Gateway uses "eg"; agentgateway uses "agentgateway". |
 | grpcRoute.gateway.create | bool | `false` | When true, a Gateway resource is created in the release namespace. Set to false and provide name/namespace to attach to a pre-existing Gateway. |
 | grpcRoute.gateway.listener.allowedRoutes | string | `"Same"` | "Same" restricts attached routes to the release namespace; "All" allows any namespace. |
 | grpcRoute.gateway.listener.port | int | `80` | Listener port for the generated Gateway resource. Use 443 with protocol HTTPS. |
-| grpcRoute.gateway.listener.protocol | string | `"HTTP"` | Listener protocol for the generated Gateway resource: HTTP or HTTPS. HTTPS terminates TLS at the Envoy Gateway listener; pair it with server.disableTls=true so Envoy forwards plaintext to the gateway pod, and use OIDC for client identity (the gateway never sees the client cert). |
+| grpcRoute.gateway.listener.protocol | string | `"HTTP"` | Listener protocol for the generated Gateway resource: HTTP or HTTPS. HTTPS terminates TLS at the Gateway listener; pair it with server.disableTls=true so the controller forwards plaintext to the gateway pod, and use OIDC for client identity (the gateway never sees the client cert). |
 | grpcRoute.gateway.listener.tls.certificateRefs | list | `[]` | certificateRefs for the HTTPS listener. Required when protocol is HTTPS. Each entry needs a `name` pointing at a kubernetes.io/tls Secret in the Gateway's namespace. May reference a cert-manager-issued Secret or the existing openshell-server-tls Secret (its SANs must include the external hostname). |
 | grpcRoute.gateway.name | string | `""` | Name of the Gateway resource. Defaults to the chart fullname. |
 | grpcRoute.gateway.namespace | string | `""` | Namespace of the Gateway referenced by the GRPCRoute parentRef. Defaults to the release namespace. |
+| grpcRoute.gateway.sectionName | string | `""` | Listener name to select on the referenced Gateway. Leave empty to let the controller select a compatible listener. |
 | grpcRoute.hostnames | list | `[]` | Hostnames the GRPCRoute matches on. Leave empty to match all hosts. |
 | grpcRoute.replicaRouting.enabled | bool | `false` | Route requests carrying an `x-openshell-replica` header straight to that gateway replica. The CLI sets the header on long-lived sandbox connections (SSH, port forwards, exec) using the owner the gateway reports, so they skip the relay through a peer replica. Renders one Service per replica. Requires workload.kind=statefulset, workload.allowMultiReplicaStatefulSet=true, and at most 15 replicas. |
 | imagePullSecrets | list | `[]` | Image pull secrets attached to gateway and helper pods. |
