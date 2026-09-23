@@ -321,7 +321,10 @@ not retried.
 Press `Ctrl-P`, then `Ctrl-Q` to disconnect without terminating the main
 process. `Ctrl-C` retains its normal terminal behavior and interrupts the
 foreground process. For read-only attachments, `Ctrl-C` only exits the
-current viewer.
+current viewer. OpenSSH's `~.` escape reports the same status as a broken
+transport, so it starts automatic recovery instead of exiting. After `~.`, use
+`Ctrl-P`, then `Ctrl-Q` once OpenShell reattaches, or press `Ctrl-C` while the
+CLI is between retry attempts to cancel recovery.
 
 Launch VS Code or Cursor directly into the sandbox workspace:
 

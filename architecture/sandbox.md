@@ -678,7 +678,9 @@ sandbox workload directly. The relay supports:
 - Supervised CLI attachment. After an established SSH transport fails, the CLI
   remains alive, requests a fresh SSH session from the gateway, and reattaches
   to the same canonical main process within a bounded recovery window. It does
-  not stop or restart the sandbox to recover the client connection.
+  not stop or restart the sandbox to recover the client connection. The same
+  deadline bounds replacement-session RPCs. Process-targeted termination is
+  forwarded to the SSH child, which the CLI reaps before exiting.
 - Independent interactive shell sessions.
 - Command execution. Commands run through a login shell (`bash -lc`) by default,
   so the first of the user's `.bash_profile`, `.bash_login`, or `.profile` is

@@ -23,7 +23,7 @@ use std::io::{IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -56,6 +56,7 @@ const CONNECT_TERMINAL_STATUS_INTERVAL: Duration = Duration::from_millis(50);
 const CONNECT_RECOVERY_TIMEOUT: Duration = Duration::from_mins(1);
 const CONNECT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+const CONNECT_CHILD_TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const SSH_TRANSPORT_FAILURE_EXIT_CODE: i32 = 255;
 const SYNC_RETRY_ATTEMPTS: usize = 4;
 const SYNC_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -320,6 +321,145 @@ async fn run_main_attach(session: &SshSessionConfig, replace_process: bool) -> R
         .into_diagnostic()?
 }
 
+fn process_exit_code(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
+}
+
+#[cfg(unix)]
+struct TerminationSignals {
+    interrupt: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl TerminationSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).into_diagnostic()?,
+            quit: signal(SignalKind::quit()).into_diagnostic()?,
+            terminate: signal(SignalKind::terminate()).into_diagnostic()?,
+        })
+    }
+
+    async fn recv(&mut self) -> Signal {
+        tokio::select! {
+            _ = self.interrupt.recv() => Signal::SIGINT,
+            _ = self.quit.recv() => Signal::SIGQUIT,
+            _ = self.terminate.recv() => Signal::SIGTERM,
+        }
+    }
+}
+
+struct ConnectCancellation {
+    #[cfg(unix)]
+    signals: TerminationSignals,
+}
+
+impl ConnectCancellation {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            #[cfg(unix)]
+            signals: TerminationSignals::new()?,
+        })
+    }
+
+    async fn wait<F, T>(&mut self, future: F) -> std::result::Result<T, i32>
+    where
+        F: Future<Output = T>,
+    {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                biased;
+                result = future => Ok(result),
+                signal = self.signals.recv() => Err(128 + signal as i32),
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(future.await)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn forward_signal_to_child(child: &Child, signal: Signal) -> Result<()> {
+    let Some(pid) = child.id() else {
+        return Ok(());
+    };
+    let pid = i32::try_from(pid).into_diagnostic()?;
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(error) => Err(error).into_diagnostic(),
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_and_reap_child(child: &mut Child, signal: Signal) -> Result<i32> {
+    forward_signal_to_child(child, signal)?;
+    if let Ok(status) = tokio::time::timeout(CONNECT_CHILD_TERMINATION_TIMEOUT, child.wait()).await
+    {
+        status.into_diagnostic()?;
+    } else {
+        child.kill().await.into_diagnostic()?;
+        child.wait().await.into_diagnostic()?;
+    }
+    Ok(128 + signal as i32)
+}
+
+async fn run_main_attach_supervised(
+    session: &SshSessionConfig,
+    cancellation: &mut ConnectCancellation,
+) -> Result<i32> {
+    #[cfg(not(unix))]
+    let _ = cancellation;
+
+    let mut command = TokioCommand::from(main_attach_command(session));
+    command.kill_on_drop(true);
+
+    let mut child = command.spawn().into_diagnostic()?;
+
+    #[cfg(unix)]
+    {
+        tokio::select! {
+            biased;
+            status = child.wait() => Ok(process_exit_code(status.into_diagnostic()?)),
+            signal = cancellation.signals.recv() => terminate_and_reap_child(&mut child, signal).await,
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(process_exit_code(child.wait().await.into_diagnostic()?))
+    }
+}
+
+async fn await_before_recovery_deadline<F, T>(
+    deadline: Option<Instant>,
+    future: F,
+) -> std::result::Result<T, ()>
+where
+    F: Future<Output = T>,
+{
+    let Some(deadline) = deadline else {
+        return Ok(future.await);
+    };
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future)
+        .await
+        .map_err(|_| ())
+}
+
+fn print_connect_recovery_timeout() {
+    eprintln!(
+        "Unable to restore the sandbox connection within {} seconds.",
+        CONNECT_RECOVERY_TIMEOUT.as_secs()
+    );
+}
+
 fn should_recover_connect(
     exit_code: i32,
     attached_for: Duration,
@@ -421,19 +561,30 @@ async fn sandbox_connect_supervised(
 ) -> Result<i32> {
     let mut recovery_deadline = None;
     let mut retry_delay = CONNECT_RETRY_INITIAL_DELAY;
+    let mut cancellation = ConnectCancellation::new()?;
 
     loop {
         if recovery_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            eprintln!(
-                "Unable to restore the sandbox connection within {} seconds.",
-                CONNECT_RECOVERY_TIMEOUT.as_secs()
-            );
+            print_connect_recovery_timeout();
             return Ok(SSH_TRANSPORT_FAILURE_EXIT_CODE);
         }
 
-        let session = match ssh_session_config(server, name, tls, workspace, None).await {
-            Ok(session) => session,
-            Err(error)
+        let session_attempt = match Box::pin(cancellation.wait(await_before_recovery_deadline(
+            recovery_deadline,
+            ssh_session_config(server, name, tls, workspace, None),
+        )))
+        .await
+        {
+            Ok(attempt) => attempt,
+            Err(exit_code) => return Ok(exit_code),
+        };
+        let session = match session_attempt {
+            Err(()) => {
+                print_connect_recovery_timeout();
+                return Ok(SSH_TRANSPORT_FAILURE_EXIT_CODE);
+            }
+            Ok(Ok(session)) => session,
+            Ok(Err(error))
                 if recovery_deadline.is_some_and(|deadline| Instant::now() < deadline)
                     && connect_error_is_retryable(&error) =>
             {
@@ -442,19 +593,35 @@ async fn sandbox_connect_supervised(
                     error = %error,
                     "failed to create replacement SSH session; retrying"
                 );
-                tokio::time::sleep(retry_delay).await;
+                let now = Instant::now();
+                let delay = recovery_deadline
+                    .map_or(retry_delay, |deadline| retry_delay.min(deadline - now));
+                if let Err(exit_code) = cancellation.wait(tokio::time::sleep(delay)).await {
+                    return Ok(exit_code);
+                }
                 retry_delay = next_connect_retry_delay(retry_delay);
                 continue;
             }
-            Err(error) => return Err(error),
+            Ok(Err(error)) => return Err(error),
         };
 
         let attach_started = Instant::now();
-        let exit_code = run_main_attach(&session, false).await?;
+        let exit_code = run_main_attach_supervised(&session, &mut cancellation).await?;
         let attached_for = attach_started.elapsed();
         let recovery_active = recovery_deadline.is_some();
-        let main_has_terminal_result = exit_code == SSH_TRANSPORT_FAILURE_EXIT_CODE
-            && canonical_main_has_terminal_result(server, name, tls, workspace).await;
+        let main_has_terminal_result = if exit_code == SSH_TRANSPORT_FAILURE_EXIT_CODE {
+            match cancellation
+                .wait(canonical_main_has_terminal_result(
+                    server, name, tls, workspace,
+                ))
+                .await
+            {
+                Ok(has_result) => has_result,
+                Err(exit_code) => return Ok(exit_code),
+            }
+        } else {
+            false
+        };
 
         if !should_recover_connect(
             exit_code,
@@ -472,7 +639,9 @@ async fn sandbox_connect_supervised(
         if should_start_connect_recovery_window(attached_for, recovery_active) {
             recovery_deadline = Some(Instant::now() + CONNECT_RECOVERY_TIMEOUT);
             retry_delay = CONNECT_RETRY_INITIAL_DELAY;
-            eprintln!("Connection to sandbox lost; reconnecting...");
+            eprintln!(
+                "Connection to sandbox lost; reconnecting. To disconnect, press Ctrl-P then Ctrl-Q after reattachment; press Ctrl-C while retrying to cancel."
+            );
         }
 
         let Some(deadline) = recovery_deadline else {
@@ -480,14 +649,19 @@ async fn sandbox_connect_supervised(
         };
         let now = Instant::now();
         if now >= deadline {
-            eprintln!(
-                "Unable to restore the sandbox connection within {} seconds.",
-                CONNECT_RECOVERY_TIMEOUT.as_secs()
-            );
+            print_connect_recovery_timeout();
             return Ok(exit_code);
         }
 
-        tokio::time::sleep(std::cmp::min(retry_delay, deadline - now)).await;
+        if let Err(exit_code) = cancellation
+            .wait(tokio::time::sleep(std::cmp::min(
+                retry_delay,
+                deadline - now,
+            )))
+            .await
+        {
+            return Ok(exit_code);
+        }
         retry_delay = next_connect_retry_delay(retry_delay);
     }
 }
@@ -2129,6 +2303,19 @@ mod tests {
 
         let lifecycle = miette::miette!("sandbox is not ready");
         assert!(!connect_error_is_retryable(&lifecycle));
+    }
+
+    #[tokio::test]
+    async fn connect_recovery_deadline_bounds_stalled_session_creation() {
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let result = await_before_recovery_deadline(
+            Some(deadline),
+            std::future::pending::<std::result::Result<(), Report>>(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(Instant::now() >= deadline);
     }
 
     #[test]

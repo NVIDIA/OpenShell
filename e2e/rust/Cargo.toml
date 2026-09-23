@@ -232,7 +232,7 @@ tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
 tower = "0.5"
 url = "2"
-nix = { version = "0.29", features = ["user"] }
+nix = { version = "0.29", features = ["process", "signal", "term", "user"] }
 
 [dev-dependencies]
 serial_test = "3"

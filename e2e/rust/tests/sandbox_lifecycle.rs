@@ -232,6 +232,32 @@ fn find_process_with_args(expected_args: &[&str]) -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
+fn find_child_process_with_args(parent_pid: u32, expected_args: &[&str]) -> Option<u32> {
+    for entry in fs::read_dir("/proc").ok()?.filter_map(Result::ok) {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let status = fs::read_to_string(entry.path().join("status")).unwrap_or_default();
+        let process_parent = status.lines().find_map(|line| {
+            line.strip_prefix("PPid:")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        });
+        if process_parent != Some(parent_pid) {
+            continue;
+        }
+        let cmdline = fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
+        if expected_args
+            .iter()
+            .all(|expected| args.contains(&expected.as_bytes()))
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
 async fn wait_for_process_with_args(expected_args: &[&str]) -> u32 {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -855,6 +881,79 @@ async fn canonical_main_connect_recovers_its_ssh_transport() {
         .wait()
         .await
         .expect("wait for recovered attachment disconnect");
+    sandbox.cleanup().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn canonical_main_connect_forwards_pid_targeted_termination_and_reaps_ssh() {
+    use std::os::fd::OwnedFd;
+
+    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-lc", "exec sleep infinity"])
+        .await
+        .expect("create retained canonical main process");
+    let pty = nix::pty::openpty(None, None).expect("open pseudo-terminal");
+    let controller: OwnedFd = pty.master;
+    let follower: OwnedFd = pty.slave;
+
+    let mut connect_cmd = openshell_cmd();
+    connect_cmd
+        .args(["sandbox", "connect", &sandbox.name])
+        .stdin(
+            follower
+                .try_clone()
+                .expect("duplicate PTY follower for stdin"),
+        )
+        .stdout(
+            follower
+                .try_clone()
+                .expect("duplicate PTY follower for stdout"),
+        )
+        .stderr(
+            follower
+                .try_clone()
+                .expect("duplicate PTY follower for stderr"),
+        );
+    let mut connect = connect_cmd
+        .spawn()
+        .expect("spawn supervised PTY attachment");
+    let connect_pid = connect.id().expect("connect process ID");
+    drop(follower);
+
+    let ssh_pid = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(pid) =
+                find_child_process_with_args(connect_pid, &["-s", "sandbox", "openshell-main"])
+            {
+                return pid;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("supervised SSH child did not start");
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(connect_pid).expect("connect PID fits i32")),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .expect("send SIGTERM to only the OpenShell parent");
+
+    let status = tokio::time::timeout(Duration::from_secs(10), connect.wait())
+        .await
+        .expect("OpenShell parent did not terminate")
+        .expect("wait for OpenShell parent");
+    assert_eq!(status.code(), Some(143));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fs::metadata(format!("/proc/{ssh_pid}")).is_ok() {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("SSH child was not reaped after parent termination");
+
+    drop(controller);
     sandbox.cleanup().await;
 }
 
