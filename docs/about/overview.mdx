@@ -10,6 +10,17 @@ position: 1
 
 NVIDIA OpenShell is an open-source runtime for executing autonomous AI agents in sandboxed environments with kernel-level isolation. It combines sandbox runtime controls and a declarative YAML policy so teams can run agents without giving them unrestricted access to local files, credentials, and external networks.
 
+<Note>
+OpenShell 0.1.0 has landed. It brings:
+
+- A smaller default workload image with a stricter fallback policy.
+- Explicit provider profiles and provider attachment.
+- Version 2 gateway configuration and the Helm `gatewayConfig` interface.
+- Safer API contracts for workspaces, retries, pagination, exec sessions, and resumable watch streams.
+
+Coming from 0.0.x? Read the [0.1.0 upgrade guide](/upgrade/0-1-0) before upgrading.
+</Note>
+
 ## Why OpenShell Exists
 
 AI agents are most useful when they can read files, install packages, call APIs, and use credentials. That same access can create material risk. OpenShell is designed for this tradeoff: preserve agent capability while enforcing explicit controls over what the agent can access.
