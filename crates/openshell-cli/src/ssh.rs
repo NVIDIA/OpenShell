@@ -14,8 +14,8 @@ use openshell_core::forward::{
     validate_ssh_session_response, write_forward_pid,
 };
 use openshell_core::proto::{
-    CreateSshSessionRequest, GetSandboxRequest, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
-    tcp_forward_init,
+    CreateSshSessionRequest, GetSandboxRequest, SandboxPhase, SshRelayTarget, TcpForwardFrame,
+    TcpForwardInit, tcp_forward_init,
 };
 use std::fs;
 use std::future::Future;
@@ -47,6 +47,10 @@ const TERMINAL_RELAY_REGISTRATION_INTERVAL: Duration = Duration::from_millis(50)
 /// An SSH client that remained alive for this long was attached successfully,
 /// rather than failing during initial authentication or setup.
 const CONNECT_ESTABLISHED_DURATION: Duration = Duration::from_secs(2);
+/// Briefly wait for the gateway lifecycle projection to catch up with an SSH
+/// exit status before treating status 255 as a transport failure.
+const CONNECT_TERMINAL_STATUS_TIMEOUT: Duration = Duration::from_millis(500);
+const CONNECT_TERMINAL_STATUS_INTERVAL: Duration = Duration::from_millis(50);
 /// Time allowed to restore an established canonical-main attachment after its
 /// transport is lost.
 const CONNECT_RECOVERY_TIMEOUT: Duration = Duration::from_mins(1);
@@ -316,9 +320,65 @@ async fn run_main_attach(session: &SshSessionConfig, replace_process: bool) -> R
         .into_diagnostic()?
 }
 
-fn should_recover_connect(exit_code: i32, attached_for: Duration, recovery_active: bool) -> bool {
-    exit_code == SSH_TRANSPORT_FAILURE_EXIT_CODE
+fn should_recover_connect(
+    exit_code: i32,
+    attached_for: Duration,
+    recovery_active: bool,
+    main_has_terminal_result: bool,
+) -> bool {
+    !main_has_terminal_result
+        && exit_code == SSH_TRANSPORT_FAILURE_EXIT_CODE
         && (recovery_active || attached_for >= CONNECT_ESTABLISHED_DURATION)
+}
+
+async fn canonical_main_has_terminal_result(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> bool {
+    let probe = async {
+        let Ok(mut client) = grpc_client(server, tls).await else {
+            return false;
+        };
+        loop {
+            let Ok(response) = client
+                .get_sandbox(GetSandboxRequest {
+                    name: name.to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        workspace.to_string(),
+                    )),
+                })
+                .await
+            else {
+                return false;
+            };
+            let Some(sandbox) = response.into_inner().sandbox else {
+                return false;
+            };
+            let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+            if sandbox
+                .status
+                .as_ref()
+                .is_some_and(|status| status.exit_code.is_some())
+                || matches!(
+                    phase,
+                    SandboxPhase::Completed
+                        | SandboxPhase::Error
+                        | SandboxPhase::Stopping
+                        | SandboxPhase::Stopped
+                        | SandboxPhase::Deleting
+                )
+            {
+                return true;
+            }
+            tokio::time::sleep(CONNECT_TERMINAL_STATUS_INTERVAL).await;
+        }
+    };
+
+    tokio::time::timeout(CONNECT_TERMINAL_STATUS_TIMEOUT, probe)
+        .await
+        .unwrap_or(false)
 }
 
 fn should_start_connect_recovery_window(attached_for: Duration, recovery_active: bool) -> bool {
@@ -393,8 +453,15 @@ async fn sandbox_connect_supervised(
         let exit_code = run_main_attach(&session, false).await?;
         let attached_for = attach_started.elapsed();
         let recovery_active = recovery_deadline.is_some();
+        let main_has_terminal_result = exit_code == SSH_TRANSPORT_FAILURE_EXIT_CODE
+            && canonical_main_has_terminal_result(server, name, tls, workspace).await;
 
-        if !should_recover_connect(exit_code, attached_for, recovery_active) {
+        if !should_recover_connect(
+            exit_code,
+            attached_for,
+            recovery_active,
+            main_has_terminal_result,
+        ) {
             return Ok(exit_code);
         }
 
@@ -1997,6 +2064,7 @@ mod tests {
         assert!(should_recover_connect(
             SSH_TRANSPORT_FAILURE_EXIT_CODE,
             CONNECT_ESTABLISHED_DURATION,
+            false,
             false
         ));
         assert!(!should_recover_connect(
@@ -2004,12 +2072,20 @@ mod tests {
             CONNECT_ESTABLISHED_DURATION
                 .checked_sub(Duration::from_millis(1))
                 .unwrap(),
+            false,
             false
         ));
         assert!(!should_recover_connect(
             0,
             CONNECT_ESTABLISHED_DURATION,
+            false,
             false
+        ));
+        assert!(!should_recover_connect(
+            SSH_TRANSPORT_FAILURE_EXIT_CODE,
+            CONNECT_ESTABLISHED_DURATION,
+            false,
+            true
         ));
     }
 
@@ -2018,7 +2094,8 @@ mod tests {
         assert!(should_recover_connect(
             SSH_TRANSPORT_FAILURE_EXIT_CODE,
             Duration::ZERO,
-            true
+            true,
+            false
         ));
         assert!(!should_start_connect_recovery_window(
             CONNECT_ESTABLISHED_DURATION,

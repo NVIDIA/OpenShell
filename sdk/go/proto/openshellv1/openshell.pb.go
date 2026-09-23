@@ -1303,7 +1303,7 @@ type RefreshSandboxTokenResponse struct {
 	ExtensionCredentials []*ExtensionServiceCredential `protobuf:"bytes,3,rep,name=extension_credentials,json=extensionCredentials,proto3" json:"extension_credentials,omitempty"`
 	// Fresh Sandbox Protocol bearer token from the same atomic refresh.
 	SandboxToken string `protobuf:"bytes,4,opt,name=sandbox_token,json=sandboxToken,proto3" json:"sandbox_token,omitempty"`
-	// Absolute Sandbox Protocol token expiry. Required when sandbox_token is set.
+	// Absolute Sandbox Protocol token expiry. Absence means the token is non-expiring.
 	SandboxExpirationTime *timestamppb.Timestamp `protobuf:"bytes,105,opt,name=sandbox_expiration_time,json=sandboxExpirationTime,proto3" json:"sandbox_expiration_time,omitempty"`
 	// Launch generation to which both refreshed credentials are bound.
 	SessionId string `protobuf:"bytes,6,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`

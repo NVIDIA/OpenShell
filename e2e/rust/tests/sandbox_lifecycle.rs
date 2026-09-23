@@ -860,6 +860,62 @@ async fn canonical_main_connect_recovers_its_ssh_transport() {
 
 #[tokio::test]
 #[serial(sandbox_lifecycle)]
+async fn canonical_main_exit_255_is_not_retried_as_transport_failure() {
+    const READY_MARKER: &str = "exit-255-ready";
+    const RELEASE_PATH: &str = "/sandbox/.openshell-exit-255-release";
+    let script = format!(
+        "echo {READY_MARKER}; while [ ! -e '{RELEASE_PATH}' ]; do sleep 0.05; done; exit 255"
+    );
+    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", &script])
+        .await
+        .expect("create retained canonical main process");
+
+    let mut connect_cmd = openshell_cmd();
+    connect_cmd
+        .args(["sandbox", "connect", &sandbox.name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut connect = connect_cmd.spawn().expect("spawn supervised attachment");
+    let connect_stdout = connect.stdout.take().expect("connect stdout");
+    let mut connect_lines = BufReader::new(connect_stdout).lines();
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let line = connect_lines
+                .next_line()
+                .await
+                .expect("read attachment output")
+                .expect("attachment output should remain open");
+            if line.contains(READY_MARKER) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("attachment did not observe the canonical main process");
+
+    // Keep the attachment alive beyond the setup guard used to distinguish
+    // initial SSH failures from established transport failures.
+    sleep(Duration::from_secs(3)).await;
+    sandbox
+        .exec(&["touch", RELEASE_PATH])
+        .await
+        .expect("release canonical main process");
+
+    let status = tokio::time::timeout(Duration::from_secs(10), connect.wait()).await;
+    if status.is_err() {
+        connect.kill().await.expect("stop stuck attachment");
+    }
+    sandbox.cleanup().await;
+    let status = status
+        .expect("exit status 255 must not enter the transport recovery loop")
+        .expect("wait for canonical main attachment");
+    assert_eq!(status.code(), Some(255));
+}
+
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
 async fn sandbox_create_with_no_keep_cleans_up_after_tty_command() {
     let name = format!("tty-{:015x}", rand::random::<u64>() & 0x0fff_ffff_ffff_ffff);
     // Capture startup diagnostics before --no-keep removes a failed container.
