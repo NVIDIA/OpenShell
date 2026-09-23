@@ -40,7 +40,6 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
 notify = "8"
-rand = { workspace = true }
 rcgen = { workspace = true }
 
 [dev-dependencies]

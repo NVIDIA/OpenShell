@@ -111,6 +111,30 @@ scheduling randomness are not migrated. No SSH or PQC capability is asserted by
 the primitive capability report. OpenSSL, strict policy, module version discovery,
 and deployment qualification belong in follow-up work.
 
+Runtime refresh replay hashes and derived token IDs, bearer-cache fingerprints,
+Sandbox Protocol request digests and request-ID entropy, Kubernetes/VM runtime
+fence entropy, and rootfs staging-token entropy use the selected backend.
+These operations retain SHA-256, UUID v4 encoding where applicable, and existing
+hex encodings. Backend failures propagate; callers must not substitute another
+implementation or continue with a placeholder identity.
+
+The remaining first-party uses require explicit classification; the facade is
+not a whole-application crypto coverage claim:
+
+| Remaining use | Current scope and follow-up |
+| --- | --- |
+| VM image/archive digest verification and cached supervisor validation (`openshell-driver-vm`) | Security-relevant artifact integrity remains outside this runtime credential migration. Moving it requires covering the streaming readers, embedded-artifact cache, and build-time digest generation together; it must be addressed before claiming exclusive backend ownership. |
+| UUID generation outside Sandbox Protocol request envelopes | Includes runtime identities, authentication nonces, and session identifiers as well as ordinary correlation IDs. These still use the UUID library's entropy source. They are not attested by context posture; a follow-up must classify each use and propagate entropy failure through currently infallible constructors. |
+| DNS policy contract fingerprints (`openshell-supervisor-network::policy_dns`) | These bind cached DNS state to policy and are security-relevant. They remain outside this migration; migrating the cache identity API and its failure handling is required for exclusive backend ownership. |
+| Credential-storage names (`credentials`, Kubernetes Secrets, Vault) | Deterministic namespace derivation, not encryption or proof of authorization. These retain their current hashing implementation and stored names; backend coverage is not asserted for them. |
+| Endpoint IDs and pagination fingerprints | Deterministic identification/request matching, not authentication. These remain outside the selected-backend contract. |
+| Debug token fingerprints | Diagnostic display only; direct hashing remains outside the contract even though the input is a credential. |
+| Schema compatibility tests, content-cache identities, retry jitter, test fixtures | Non-authentication uses remain unchanged. |
+
+Cargo feature selection does not prevent a crate from adding another crypto
+dependency. Review first-party security-sensitive operations against this scope;
+no source-scanning boundary lint is installed.
+
 Durable proxy CA loading uses backend key import and `pki::issuer_from_der`.
 The helper uses `x509-parser` without verification features to read the subject,
 key usage, and subject key identifier. Missing identifiers use the selected

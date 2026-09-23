@@ -22,7 +22,6 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -39,6 +38,9 @@ libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true, features = ["fs", "process"] }
+
+[dev-dependencies]
+jsonwebtoken = { workspace = true }
 
 [build-dependencies]
 protoc-bin-vendored = { workspace = true }

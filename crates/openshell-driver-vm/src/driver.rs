@@ -1362,9 +1362,9 @@ impl VmDriver {
         let boundary_generation =
             match tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE)).await {
                 Ok(generation) if !generation.trim().is_empty() => generation.trim().to_string(),
-                Ok(_) => random_boundary_token(),
+                Ok(_) => random_boundary_token()?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    random_boundary_token()
+                    random_boundary_token()?
                 }
                 Err(error) => {
                     return Err(Status::internal(format!(
@@ -5536,12 +5536,14 @@ fn merged_environment(sandbox: &Sandbox) -> HashMap<String, String> {
     environment
 }
 
-fn random_boundary_token() -> String {
+fn random_boundary_token() -> Result<String, Status> {
     let mut token = String::with_capacity(64);
-    for byte in rand::random::<[u8; 32]>() {
+    for byte in openshell_crypto::random_bytes::<32>()
+        .map_err(|error| Status::internal(error.to_string()))?
+    {
         write!(&mut token, "{byte:02x}").expect("writing to String cannot fail");
     }
-    token
+    Ok(token)
 }
 
 fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<String> {

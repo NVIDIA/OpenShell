@@ -45,6 +45,11 @@ system-OpenSSL backend; its proof of concept, dynamic-link packaging, and strict
 FIPS operation are separate follow-up work. The crate README defines extension and coverage boundaries.
 Digest operations propagate backend failures through JWT and credential key-ID
 generation rather than requiring infallible provider operations.
+Runtime credential/replay fingerprints, request-integrity digests, and fence and
+staging-token entropy also use the facade and propagate failures. The crypto
+crate README explicitly classifies remaining artifact-integrity, UUID, policy
+cache, namespace, and diagnostic uses; selecting a backend does not attest those
+paths or automatically redirect direct crypto dependencies.
 Persisted CA metadata is parsed by `openshell-crypto` using `x509-parser`
 without verification features. rcgen's parser feature remains disabled because
 it couples parsing to built-in CSR verification backends. Backend keys implement

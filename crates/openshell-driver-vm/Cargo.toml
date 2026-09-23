@@ -50,7 +50,7 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 miette = { workspace = true, optional = true }
-rand = { workspace = true, optional = true }
+openshell-crypto = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -86,7 +86,7 @@ compute-driver = [
     "dep:polling",
     "dep:prost",
     "dep:prost-types",
-    "dep:rand",
+    "dep:openshell-crypto",
     "dep:rustix",
     "dep:sha2",
     "dep:tar",

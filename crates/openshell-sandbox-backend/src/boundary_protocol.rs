@@ -30,7 +30,6 @@ use openshell_isolation_interface::contract::{
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
@@ -636,7 +635,9 @@ impl RequestEnvelope {
     pub fn new(request: Request) -> Result<Self, FrameError> {
         let payload_digest = request_payload_digest(&request)?;
         Ok(Self {
-            request_id: uuid::Uuid::new_v4().to_string(),
+            request_id: uuid::Builder::from_random_bytes(openshell_crypto::random_bytes::<16>()?)
+                .into_uuid()
+                .to_string(),
             payload_digest,
             request,
         })
@@ -655,13 +656,19 @@ impl RequestEnvelope {
 }
 
 fn request_payload_digest(request: &Request) -> Result<String, FrameError> {
+    use std::fmt::Write as _;
+
     // Round-tripping through Value canonicalizes every JSON object by key. In
     // particular, this makes HashMap-backed provider environments stable
     // across process restarts and independently serialized retries.
     let normalized = serde_json::to_value(request).map_err(FrameError::Serialize)?;
     let payload = serde_json::to_vec(&normalized).map_err(FrameError::Serialize)?;
-    let digest = Sha256::digest(payload);
-    Ok(format!("{digest:x}"))
+    let digest = openshell_crypto::sha256(&payload)?;
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(encoded)
 }
 
 impl fmt::Debug for RequestEnvelope {
@@ -1401,6 +1408,8 @@ pub fn write_frame<T: Serialize>(writer: &mut impl Write, message: &T) -> Result
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
+    #[error("control frame cryptography failed: {0}")]
+    Crypto(#[from] openshell_crypto::CryptoError),
     #[error("control frame is truncated")]
     Truncated,
     #[error("control frame is too large: {0} bytes")]
