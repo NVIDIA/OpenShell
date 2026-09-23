@@ -267,6 +267,11 @@ access selects no preset. Unknown enum numbers are rejected before activation.
 - `deny_rules: []` (empty list) is rejected; remove it if no denials are needed.
 - `credential_signing` requires a resolvable AWS credential source before a sandbox policy can activate. Use an attached endpoint-bearing profile that declares `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` and covers the signed endpoint, or bind an attached endpointless profile that declares those keys with `credential_binding.provider`.
 
+For proxied HTTP responses, OpenShell completes delivery and signals EOF when
+the server sends `Connection: close` or an HTTP/1.0 response without keep-alive.
+This also applies to HTTPS and responses processed by middleware. A
+`Content-Length` or chunked body does not override the server's close decision.
+
 Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token provider-shaped aliases such as `provider-OPENSHELL-RESOLVE-ENV-API_TOKEN` when the referenced environment key exists in the configured provider credentials.
 
 Static provider placeholders also require the request host, port, and path to
