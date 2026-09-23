@@ -9,10 +9,17 @@ maintaining the existing build-only Windows MSVC lane.
 |---|---|
 | `tasks/windows.toml` | Mise task definitions for `windows:*`. |
 | `tasks/scripts/windows-msvc.ps1` | Visual Studio environment discovery, rustup target setup, Cargo invocation, logs, artifact report. |
-| `.github/workflows/windows-msvc.yml` | PR/merge-queue lint and test plus main/manual cache seeding and dependent binary builds on native x64 and ARM64 runners. |
-| `architecture/windows-msvc-build.md` | Human-readable design contract. |
+| `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus advisory main/manual cache seeding and dependent binary builds on native x64 and ARM64 runners. |
+| `CONTRIBUTING.md` | Human-readable Windows build prerequisites and commands. |
+| `architecture/windows.md` | Stable Windows/MXC runtime and cross-architecture boundaries. |
 
 ## Commands
+
+Install the pinned test runner once before using test-bearing tasks:
+
+```powershell
+mise install --locked github:nextest-rs/nextest
+```
 
 Use `--skip-tools` for all Windows mise tasks:
 

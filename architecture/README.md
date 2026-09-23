@@ -2,16 +2,17 @@
 
 OpenShell runs autonomous AI agents in sandboxed environments with explicit
 policy, credential, identity, and network boundaries. The target architecture is
-built around three stable runtime components: the **CLI**, the **Gateway**, and
-the **Supervisor**.
+built around stable user, control-plane, and runtime boundaries. Most runtimes
+place the runtime boundary in the **Supervisor**; driver-controlled runtimes such
+as Windows MXC enforce it through platform-native isolation and host services.
 
 The CLI, SDK, and TUI provide user-facing access. The gateway is the
 authenticated control plane: it owns API access, durable state, policy and
 settings delivery, provider configuration and attachments, and relay
-coordination. The supervisor runs inside every sandbox workload and is the local
-security boundary. It launches the agent as a restricted child process and
-enforces policy where process identity, filesystem access, network egress, and
-runtime credentials are visible.
+coordination. In supervisor-based runtimes, the supervisor runs inside the
+sandbox workload and launches the agent as a restricted child process. A
+driver-controlled runtime owns the equivalent lifecycle and enforcement duties
+without embedding the standard supervisor.
 
 Infrastructure-specific work sits behind integration boundaries. Compute,
 credentials, control-plane identity, and sandbox identity each have a driver or
@@ -42,6 +43,7 @@ flowchart TB
 
     subgraph INFRA["Integrated Infrastructure"]
         RUNTIME["Docker / Podman / Kubernetes / VM"]
+        MXC["Windows MXC"]
         SECRETSTORE["Eg: Keychain / Secret Service / Vault / Kubernetes Secrets"]
         IDP["Eg: mTLS / OIDC / Local identity"]
         WORKLOADID["Eg: SPIFFE / Gateway-issued workload identity"]
@@ -52,6 +54,11 @@ flowchart TB
         PROXY["Policy proxy"]
         POLICY["OPA policy engine"]
         AGENT["Restricted agent process"]
+    end
+
+    subgraph WINDP["Windows MXC Data Plane"]
+        MXCAGENT["MXC-isolated agent process"]
+        MXCPROXY["Host policy proxy (ProcessContainer only)"]
     end
 
     CLI -->|"gRPC / HTTP"| GW
@@ -70,10 +77,13 @@ flowchart TB
     SIDENT -->|"gRPC / UDS"| SIDRV
 
     CDRV --> RUNTIME
+    CDRV --> MXC
     CRDRV --> SECRETSTORE
     CPIDRV --> IDP
     SIDRV --> WORKLOADID
     RUNTIME -->|"provisions workload"| SUP
+    MXC -->|"driver-controlled launch"| MXCAGENT
+    MXCAGENT -. "governed egress" .-> MXCPROXY
 
     SUP -->|"outbound control, config, logs, relay"| GW
     SUP -->|"spawn + restrict"| AGENT
@@ -93,8 +103,8 @@ flowchart TB
 | Credentials subsystem | Logical provider and credential resolution. Secret storage and platform-native credential access belong to credentials drivers. |
 | Control-plane identity | Authentication and authorization for users, operators, and API clients. External identity verification belongs to identity drivers. |
 | Sandbox identity | Workload identity for supervisors and sandbox-to-sandbox authorization. Identity issuance or verification belongs to sandbox identity drivers. |
-| Supervisor | Sandbox-local security boundary. It prepares isolation, fetches config, injects credentials, runs relay endpoints, starts the proxy, and launches restricted agent processes. |
-| Policy proxy | Mandatory egress path for agent traffic. It enforces destination, binary identity, SSRF, TLS/L7, and endpoint-bound provider credential injection. |
+| Supervisor | Sandbox-local security boundary for supervisor-based runtimes. It prepares isolation, fetches config, injects credentials, runs relay endpoints, starts the proxy, and launches restricted agent processes. Driver-controlled runtimes must enforce supported behavior and explicitly define or reject unsupported behavior. |
+| Policy proxy | Mandatory path for policy-governed egress. It enforces destination, binary identity, SSRF, TLS/L7, and endpoint-bound provider credential injection. |
 
 ## Integrating with the Ecosystem
 
@@ -111,10 +121,12 @@ operations. They should stay thin, preserve
 native behavior by default, and report platform lifecycle events back through
 the shared contracts.
 
-The supervisor owns OpenShell sandbox semantics. Filesystem policy, process
-privilege reduction, network proxying, endpoint-bound credential injection,
-security logging, and gateway relay behavior should remain
-consistent across runtimes.
+The supervisor owns OpenShell sandbox semantics on supervisor-based runtimes.
+Driver-controlled runtimes own the corresponding platform-specific semantics
+and must explicitly define or reject policy they cannot enforce. Filesystem
+policy, process privilege reduction, network proxying, endpoint-bound credential
+injection, security logging, and gateway relay behavior should remain consistent
+where the runtime advertises those capabilities.
 
 This keeps OpenShell usable in local single-player setups, Kubernetes
 deployments, VM-backed sandboxes, and future third-party environments. A new
@@ -142,9 +154,11 @@ The compute-driver capability contract identifies whether a driver reports
 runtime readiness. Most drivers use the supervisor session model above. A
 driver that sets `driver_reports_runtime_readiness` may self-report readiness
 without a supervisor session. Every driver receives the canonical create-time
-policy in `DriverSandboxSpec`; drivers without a supervisor use the existing
-sandbox configuration API for later revisions. The Windows MXC driver reports
-its own readiness and does not expose interactive connect or governed egress.
+policy in `DriverSandboxSpec`; drivers without a supervisor may use the sandbox
+configuration API when they advertise live-update support. The Windows MXC
+driver reports its own readiness, does not support live updates, and does not
+expose interactive connect. ProcessContainer can establish governed egress at
+create time; IsolationSession rejects governed network policies.
 
 The gateway delivers desired state; the sandbox applies it locally. Policy,
 settings, provider attachments, and credential bindings flow from the gateway
@@ -173,7 +187,7 @@ that crate's `README.md`.
 | [Compute Runtimes](compute-runtimes.md) | Docker, Podman, Kubernetes, VM, sandbox images, and runtime-specific responsibilities. |
 | [Build](build.md) | Build artifacts, CI/E2E, docs site validation, and release packaging. |
 | [Google Vertex AI Provider](google-vertex-ai-provider.md) | Implementation reference for the `google-vertex-ai` provider, from CLI through gateway to sandbox. |
-| [Windows MSVC Build](windows-msvc-build.md) | Build-only native Windows MSVC lane (x64/ARM64) and unsupported-runtime behavior on Windows. |
+| [Windows](windows.md) | Windows/MXC runtime architecture, policy enforcement, networking, relay, audit, and trust boundaries. |
 
 ## `rfc/` vs `architecture/`
 
