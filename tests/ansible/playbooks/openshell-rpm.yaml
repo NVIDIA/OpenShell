@@ -1,0 +1,123 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Install OpenShell RPM packages
+  hosts: all
+  gather_facts: false
+  vars:
+    user_systemd_environment:
+      HOME: /home/tmachine
+      XDG_RUNTIME_DIR: /run/user/1000
+      DBUS_SESSION_BUS_ADDRESS: unix:path=/run/user/1000/bus
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Copy OpenShell RPM packages
+      become: true
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "/var/tmp/{{ item.name }}.rpm"
+        mode: "0644"
+      loop:
+        - { name: openshell, src: "{{ openshell_rpm }}" }
+        - { name: openshell-gateway, src: "{{ openshell_gateway_rpm }}" }
+
+    - name: Install OpenShell RPM packages
+      become: true
+      ansible.builtin.dnf:
+        name:
+          - /var/tmp/openshell.rpm
+          - /var/tmp/openshell-gateway.rpm
+        state: present
+        disable_gpg_check: true
+        allow_downgrade: true
+
+    - name: Copy OpenShell runtime images
+      become: true
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "/var/tmp/{{ item.name }}.tar"
+        owner: tmachine
+        group: tmachine
+        mode: "0600"
+      loop:
+        - { name: openshell-sandbox, src: "{{ openshell_sandbox_image }}" }
+        - { name: openshell-supervisor, src: "{{ openshell_supervisor_image }}" }
+
+    - name: Load OpenShell runtime images
+      become: true
+      become_user: tmachine
+      ansible.builtin.command:
+        argv: [podman, load, --input, "/var/tmp/{{ item }}.tar"]
+      loop: [openshell-sandbox, openshell-supervisor]
+      environment: "{{ user_systemd_environment }}"
+
+    - name: Create OpenShell qualification configuration directory
+      become: true
+      ansible.builtin.file:
+        path: /var/lib/openshell-qualification
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Configure OpenShell RPM runtime images for qualification
+      become: true
+      ansible.builtin.copy:
+        dest: /var/lib/openshell-qualification/gateway.toml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [openshell]
+          version = 2
+
+          [openshell.gateway]
+          compute_driver = "podman"
+
+          [openshell.drivers.podman]
+          socket_path = "/run/user/1000/podman/podman.sock"
+          sandbox_runtime_image = "docker.io/openshell/sandbox:tmachine"
+          supervisor_image = "docker.io/openshell/supervisor:tmachine"
+          health_check_interval_secs = 10
+
+    - name: Create OpenShell environment directory
+      ansible.builtin.file:
+        path: /home/tmachine/.config/openshell
+        state: directory
+        mode: "0700"
+
+    - name: Select qualification gateway configuration
+      ansible.builtin.copy:
+        dest: /home/tmachine/.config/openshell/gateway.env
+        mode: "0600"
+        content: |
+          OPENSHELL_GATEWAY_CONFIG=/var/lib/openshell-qualification/gateway.toml
+
+    - name: Start tmachine user manager
+      ansible.builtin.include_role:
+        name: tmachine_user_manager
+
+    - name: Start packaged OpenShell gateway service
+      ansible.builtin.systemd_service:
+        name: openshell-gateway.service
+        scope: user
+        daemon_reload: true
+        enabled: true
+        state: started
+      environment: "{{ user_systemd_environment }}"
+
+    - name: Wait for OpenShell gateway
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 17670
+        timeout: 60
+
+    - name: Register packaged OpenShell gateway
+      ansible.builtin.include_role:
+        name: openshell_client
+      vars:
+        openshell_client_gateway_endpoint: https://127.0.0.1:17670
+        openshell_client_gateway_name: openshell

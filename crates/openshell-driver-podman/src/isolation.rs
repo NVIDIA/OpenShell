@@ -15,9 +15,9 @@ use openshell_isolation_interface::contract::{
 };
 use openshell_sandbox_backend::ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
-    SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
-    generate_sandbox_tls_material,
+    BoundaryConfig, BoundaryListener, FenceWireFormat, GatewayVerificationKey,
+    SandboxRuntimeDescriptor, SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
+    fence_wire_format, generate_sandbox_tls_material,
 };
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +29,16 @@ pub const RUNTIME_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descri
 pub const AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
 pub const RESTART_METADATA_PATH: &str = "/.openshell/supervisor/restart-metadata.json";
 const SOCKET_PATH: &str = "/.openshell/channel/sandbox/control.sock";
+
+#[derive(Serialize)]
+#[serde(tag = "backend", rename_all = "kebab-case")]
+enum LegacyDriverFenceEvidence {
+    Podman {
+        container_id: String,
+        network_mode: String,
+        unexpected_networks: Vec<String>,
+    },
+}
 
 #[derive(Serialize)]
 struct PodmanOuterFenceEvidence<'a> {
@@ -62,6 +72,40 @@ impl PodmanOuterFenceEvidence<'_> {
         projection.validate(generation).map_err(invalid)?;
         Ok(projection)
     }
+}
+
+pub fn fence_wire_format_from_slice(encoded: &[u8]) -> Result<FenceWireFormat, ComputeDriverError> {
+    let value: serde_json::Value = serde_json::from_slice(encoded).map_err(invalid)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("bootstrap payload must be a JSON object"))?;
+    fence_wire_format(object, "Podman bootstrap payload").map_err(invalid)
+}
+
+fn encode_fence_compatible<T: Serialize>(
+    value: &T,
+    format: FenceWireFormat,
+    container_id: &str,
+) -> Result<Vec<u8>, ComputeDriverError> {
+    let mut value = serde_json::to_value(value).map_err(invalid)?;
+    if format == FenceWireFormat::LegacyDriverFence {
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| invalid("bootstrap payload must be a JSON object"))?;
+        if object.remove("outer_fence").is_none() {
+            return Err(invalid("bootstrap outer fence projection is missing"));
+        }
+        object.insert(
+            "driver_fence".to_string(),
+            serde_json::to_value(LegacyDriverFenceEvidence::Podman {
+                container_id: container_id.to_string(),
+                network_mode: "none".to_string(),
+                unexpected_networks: Vec::new(),
+            })
+            .map_err(invalid)?,
+        );
+    }
+    serde_json::to_vec(&value).map_err(invalid)
 }
 
 pub fn supervisor_name(id: &str) -> String {
@@ -205,6 +249,7 @@ pub fn bootstrap_archives(
     allow_extra_supplementary_groups: bool,
     child_env: HashMap<String, String>,
     launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
+    fence_wire_format: FenceWireFormat,
 ) -> Result<BootstrapArchives, ComputeDriverError> {
     launch_authentication.validate().map_err(invalid)?;
     let session_id = launch_authentication.supervisor.session_id;
@@ -290,7 +335,7 @@ pub fn bootstrap_archives(
     channel.directory("sandbox", 0o711, true)?;
     channel.file(
         "sandbox/bootstrap.json",
-        &serde_json::to_vec(&config).map_err(invalid)?,
+        &encode_fence_compatible(&config, fence_wire_format, container_id)?,
     )?;
     channel.file("sandbox/server.crt", tls.certificate_chain_pem.as_bytes())?;
     channel.file("sandbox/server.key", tls.private_key_pem.as_bytes())?;
@@ -302,7 +347,7 @@ pub fn bootstrap_archives(
     supervisor.directory(".openshell/supervisor", 0o700, true)?;
     supervisor.file(
         RUNTIME_DESCRIPTOR_PATH,
-        &serde_json::to_vec(&runtime_descriptor).map_err(invalid)?,
+        &encode_fence_compatible(&runtime_descriptor, fence_wire_format, container_id)?,
     )?;
     supervisor.file(
         AUTH_BUNDLE_PATH,
@@ -513,6 +558,7 @@ mod tests {
             false,
             child_env.clone(),
             &authentication,
+            FenceWireFormat::OuterFence,
         )
         .unwrap();
         let workload = files(&archives.channel);
@@ -588,5 +634,50 @@ mod tests {
         assert!(!userns_preserves_host_groups(Some("auto")));
         assert!(!userns_preserves_host_groups(Some("private")));
         assert!(!userns_preserves_host_groups(None));
+    }
+
+    #[test]
+    fn legacy_archives_preserve_driver_fence_wire_format() {
+        let identity = ResolvedWorkloadIdentity::new(
+            1000,
+            1001,
+            vec![],
+            "image".into(),
+            "sha256:image".into(),
+        )
+        .unwrap();
+        let archives = bootstrap_archives(
+            "sandbox",
+            "container",
+            "generation-1",
+            &identity,
+            false,
+            HashMap::new(),
+            &authentication(),
+            FenceWireFormat::LegacyDriverFence,
+        )
+        .unwrap();
+        let workload = files(&archives.channel);
+        let supervisor = files(&archives.supervisor);
+        for encoded in [
+            workload
+                .get(&PathBuf::from("sandbox/bootstrap.json"))
+                .unwrap(),
+            supervisor
+                .get(&PathBuf::from(
+                    RUNTIME_DESCRIPTOR_PATH.trim_start_matches('/'),
+                ))
+                .unwrap(),
+        ] {
+            assert_eq!(
+                fence_wire_format_from_slice(encoded).unwrap(),
+                FenceWireFormat::LegacyDriverFence
+            );
+            let value: serde_json::Value = serde_json::from_slice(encoded).unwrap();
+            assert!(value.get("outer_fence").is_none());
+            assert_eq!(value["driver_fence"]["backend"], "podman");
+            assert_eq!(value["driver_fence"]["container_id"], "container");
+            assert_eq!(value["driver_fence"]["network_mode"], "none");
+        }
     }
 }

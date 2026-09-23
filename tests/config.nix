@@ -102,6 +102,28 @@ let
           openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
         };
       }
+      {
+        name = "deb-upgrade-source";
+        use_galaxy = false;
+        playbooks = [ "ansible/playbooks/openshell-deb-upgrade-source.yaml" ];
+        inputs = {
+          openshell_deb = "../artifacts/upgrade/deb/source/openshell.deb";
+          openshell_upgrade_source_version = "../artifacts/upgrade/deb/source/version";
+          openshell_supervisor_image = "../artifacts/upgrade/source-images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../artifacts/upgrade/source-images/openshell-sandbox-tmachine.tar";
+        };
+      }
+      {
+        name = "rpm-upgrade-source";
+        use_galaxy = false;
+        playbooks = [ "ansible/playbooks/openshell-rpm-upgrade-source.yaml" ];
+        inputs = {
+          openshell_rpm = "../artifacts/upgrade/rpm/source/openshell.rpm";
+          openshell_gateway_rpm = "../artifacts/upgrade/rpm/source/openshell-gateway.rpm";
+          openshell_supervisor_image = "../artifacts/upgrade/source-images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../artifacts/upgrade/source-images/openshell-sandbox-tmachine.tar";
+        };
+      }
     ];
 
     testsuites = [
@@ -146,6 +168,25 @@ let
           openshell_podman_userns_auto_config = "suites/drivers/podman/fixtures/userns-auto.toml";
           openshell_podman_userns_keep_id_config = "suites/drivers/podman/fixtures/userns-keep-id.toml";
           openshell_podman_userns_private_config = "suites/drivers/podman/fixtures/userns-private.toml";
+        };
+      }
+      {
+        name = "deb-upgrade";
+        playbooks = [ "ansible/playbooks/upgrade/deb.yaml" ];
+        inputs = {
+          openshell_deb = "../artifacts/packages/openshell.deb";
+          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+        };
+      }
+      {
+        name = "rpm-upgrade";
+        playbooks = [ "ansible/playbooks/upgrade/rpm.yaml" ];
+        inputs = {
+          openshell_rpm = "../artifacts/packages/rpm/openshell.rpm";
+          openshell_gateway_rpm = "../artifacts/packages/rpm/openshell-gateway.rpm";
+          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
         };
       }
     ];

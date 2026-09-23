@@ -486,6 +486,7 @@ fn yaml_mcp_method(
     method.to_string()
 }
 
+#[allow(deprecated)]
 fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
     for (policy_name, rule) in &raw.network_policies {
         for (endpoint_index, endpoint) in rule.endpoints.iter().enumerate() {
@@ -532,6 +533,9 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                         };
                         NetworkEndpoint {
                             host: e.host,
+                            legacy_tls: String::new(),
+                            legacy_enforcement: String::new(),
+                            legacy_access: String::new(),
                             path: e.path,
                             port: normalized_ports.first().copied().unwrap_or(0),
                             ports: normalized_ports,

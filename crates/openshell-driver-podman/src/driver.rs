@@ -1164,6 +1164,7 @@ impl PodmanComputeDriver {
                         ),
                         child_env,
                         &launch_authentication,
+                        openshell_sandbox_backend::boundary_protocol::FenceWireFormat::OuterFence,
                     )?;
                     self.client
                         .copy_to_container(
@@ -1472,6 +1473,13 @@ impl PodmanComputeDriver {
         }
         let container_id = container.id;
         info!(sandbox_id = %sandbox_id, container = %container_id, "Starting sandbox container");
+        let archive = self
+            .client
+            .copy_from_container(&container_id, crate::isolation::BOOTSTRAP_PATH)
+            .await?;
+        let boundary_config =
+            extract_first_tar_entry(&archive).map_err(ComputeDriverError::Precondition)?;
+        let fence_wire_format = crate::isolation::fence_wire_format_from_slice(&boundary_config)?;
 
         // Fence delayed stop/die events from the previous container run before
         // issuing the start. Podman's event stream can deliver those events
@@ -1507,6 +1515,7 @@ impl PodmanComputeDriver {
                 crate::isolation::userns_preserves_host_groups(self.config.userns.as_deref()),
                 restart_metadata.child_env,
                 &launch_authentication,
+                fence_wire_format,
             )?;
             self.client
                 .copy_to_container(
@@ -2142,6 +2151,7 @@ mod tests {
             "lifecycle-start",
             vec![
                 StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"stopped"}]"#),
+                bootstrap_archive_response(),
                 StubResponse::new(
                     StatusCode::OK,
                     r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
@@ -2182,12 +2192,23 @@ mod tests {
             start_requests
                 .lock()
                 .expect("request log lock should not be poisoned")[1],
-            format!("GET {}", api_path("/libpod/containers/ctr-1/json"))
+            format!(
+                "GET {}",
+                api_path(
+                    "/libpod/containers/ctr-1/archive?path=%2F.openshell%2Fchannel%2Fsandbox%2Fbootstrap.json"
+                )
+            )
         );
         assert_eq!(
             start_requests
                 .lock()
                 .expect("request log lock should not be poisoned")[2],
+            format!("GET {}", api_path("/libpod/containers/ctr-1/json"))
+        );
+        assert_eq!(
+            start_requests
+                .lock()
+                .expect("request log lock should not be poisoned")[3],
             format!(
                 "POST {}",
                 api_path("/libpod/containers/openshell-supervisor-sandbox-1/stop?timeout=10")
@@ -2492,6 +2513,7 @@ mod tests {
             "trace-start",
             vec![
                 StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"stopped"}]"#),
+                bootstrap_archive_response(),
                 StubResponse::new(
                     StatusCode::OK,
                     r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
@@ -3381,6 +3403,19 @@ mod tests {
             StubResponse::new(StatusCode::NO_CONTENT, ""), // workload start
             StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor start
         ]
+    }
+
+    fn bootstrap_archive_response() -> StubResponse {
+        let mut archive = tar::Builder::new(Vec::new());
+        let bootstrap = br#"{"outer_fence":{}}"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bootstrap.len() as u64);
+        header.set_mode(0o600);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "bootstrap.json", bootstrap.as_slice())
+            .unwrap();
+        StubResponse::new(StatusCode::OK, archive.into_inner().unwrap())
     }
 
     fn fence_response() -> StubResponse {

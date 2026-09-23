@@ -60,7 +60,7 @@ use openshell_core::{
 };
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{
-    BoundaryConfig, GatewayVerificationKey, SandboxRuntimeDescriptor, SandboxTlsClientConfig,
+    FenceWireFormat, GatewayVerificationKey, SandboxRuntimeDescriptor, SandboxTlsClientConfig,
     SandboxTlsServerConfig, generate_sandbox_tls_material,
 };
 use opentelemetry::trace::TraceContextExt as _;
@@ -4725,25 +4725,32 @@ async fn refresh_docker_boundary_authentication(
 ) -> Result<(), Status> {
     let authentication = decode_docker_launch_authentication(encoded_authentication)?;
     let directory = docker_boundary_state_dir_by_id(sandbox_id, config)?;
-    let mut boundary_config = serde_json::from_slice::<BoundaryConfig>(
-        &tokio::fs::read(directory.join(BOUNDARY_CONFIG_FILE))
-            .await
-            .map_err(|error| {
-                Status::failed_precondition(format!(
-                    "read Docker sandbox bootstrap for authentication rotation: {error}"
-                ))
-            })?,
-    )
-    .map_err(|error| {
-        Status::failed_precondition(format!(
-            "decode Docker sandbox bootstrap for authentication rotation: {error}"
-        ))
-    })?;
-    let Some(mut runtime_descriptor) = read_docker_runtime_descriptor(sandbox_id, config).await?
+    let boundary_bytes = tokio::fs::read(directory.join(BOUNDARY_CONFIG_FILE))
+        .await
+        .map_err(|error| {
+            Status::failed_precondition(format!(
+                "read Docker sandbox bootstrap for authentication rotation: {error}"
+            ))
+        })?;
+    let (mut boundary_config, boundary_format) =
+        isolation::decode_boundary_config_compatible(&boundary_bytes).map_err(|error| {
+            Status::failed_precondition(format!(
+                "decode Docker sandbox bootstrap for authentication rotation: {error}"
+            ))
+        })?;
+    let Some((mut runtime_descriptor, descriptor_format)) =
+        read_docker_runtime_descriptor_with_format(sandbox_id, config).await?
     else {
         return Err(Status::failed_precondition(
             "Docker sandbox runtime descriptor is missing during authentication rotation",
         ));
+    };
+    let wire_format = if boundary_format == FenceWireFormat::LegacyDriverFence
+        || descriptor_format == FenceWireFormat::LegacyDriverFence
+    {
+        FenceWireFormat::LegacyDriverFence
+    } else {
+        FenceWireFormat::OuterFence
     };
     let session_id = authentication.supervisor.session_id;
     let tls = generate_sandbox_tls_material(session_id)
@@ -4760,12 +4767,12 @@ async fn refresh_docker_boundary_authentication(
         server_name: tls.server_name,
         trust_anchor_pem: tls.trust_anchor_pem,
     };
-    let encoded_boundary_config = boundary_config
-        .encode()
-        .map_err(|error| Status::internal(error.to_string()))?;
-    let descriptor = runtime_descriptor
-        .backend_descriptor()
-        .map_err(|error| Status::internal(error.to_string()))?;
+    let encoded_boundary_config =
+        isolation::encode_boundary_config_compatible(&boundary_config, wire_format)
+            .map_err(|error| Status::internal(error.to_string()))?;
+    let descriptor =
+        isolation::encode_runtime_descriptor_compatible(&runtime_descriptor, wire_format)
+            .map_err(|error| Status::internal(error.to_string()))?;
     let supervisor_auth = serde_json::to_vec(&authentication.supervisor)
         .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
     write_docker_boundary_file(
@@ -4783,11 +4790,7 @@ async fn refresh_docker_boundary_authentication(
         tls.private_key_pem.as_bytes(),
     )
     .await?;
-    write_docker_boundary_file(
-        &directory.join(RUNTIME_DESCRIPTOR_FILE),
-        &descriptor.payload,
-    )
-    .await?;
+    write_docker_boundary_file(&directory.join(RUNTIME_DESCRIPTOR_FILE), &descriptor).await?;
     write_docker_boundary_file(
         &directory.join(SUPERVISOR_AUTH_BUNDLE_FILE),
         &supervisor_auth,
@@ -4802,21 +4805,19 @@ async fn refresh_docker_supervisor_authentication(
 ) -> Result<(), Status> {
     let authentication = decode_docker_launch_authentication(encoded_authentication)?;
     let directory = docker_boundary_state_dir_by_id(sandbox_id, config)?;
-    let Some(runtime_descriptor) = read_docker_runtime_descriptor(sandbox_id, config).await? else {
+    let Some((runtime_descriptor, wire_format)) =
+        read_docker_runtime_descriptor_with_format(sandbox_id, config).await?
+    else {
         return Err(Status::failed_precondition(
             "Docker sandbox runtime descriptor is missing during supervisor authentication rotation",
         ));
     };
-    let descriptor = runtime_descriptor
-        .backend_descriptor()
-        .map_err(|error| Status::internal(error.to_string()))?;
+    let descriptor =
+        isolation::encode_runtime_descriptor_compatible(&runtime_descriptor, wire_format)
+            .map_err(|error| Status::internal(error.to_string()))?;
     let supervisor_auth = serde_json::to_vec(&authentication.supervisor)
         .map_err(|error| Status::internal(format!("encode Docker supervisor auth: {error}")))?;
-    write_docker_boundary_file(
-        &directory.join(RUNTIME_DESCRIPTOR_FILE),
-        &descriptor.payload,
-    )
-    .await?;
+    write_docker_boundary_file(&directory.join(RUNTIME_DESCRIPTOR_FILE), &descriptor).await?;
     write_docker_boundary_file(
         &directory.join(SUPERVISOR_AUTH_BUNDLE_FILE),
         &supervisor_auth,
@@ -4828,6 +4829,15 @@ async fn read_docker_runtime_descriptor(
     sandbox_id: &str,
     config: &DockerDriverRuntimeConfig,
 ) -> Result<Option<SandboxRuntimeDescriptor>, Status> {
+    read_docker_runtime_descriptor_with_format(sandbox_id, config)
+        .await
+        .map(|descriptor| descriptor.map(|(descriptor, _)| descriptor))
+}
+
+async fn read_docker_runtime_descriptor_with_format(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<Option<(SandboxRuntimeDescriptor, FenceWireFormat)>, Status> {
     let path = docker_boundary_state_dir_by_id(sandbox_id, config)?.join(RUNTIME_DESCRIPTOR_FILE);
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
@@ -4839,12 +4849,14 @@ async fn read_docker_runtime_descriptor(
             )));
         }
     };
-    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-        Status::internal(format!(
-            "decode Docker runtime descriptor {}: {error}",
-            path.display()
-        ))
-    })
+    isolation::decode_runtime_descriptor_compatible(&bytes)
+        .map(Some)
+        .map_err(|error| {
+            Status::internal(format!(
+                "decode Docker runtime descriptor {}: {error}",
+                path.display()
+            ))
+        })
 }
 
 async fn stage_docker_supervisor_bundle(

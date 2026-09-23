@@ -2597,6 +2597,10 @@ async fn handle_get_sandbox_config_inner(
 ) -> Result<Response<GetSandboxConfigResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
+    let legacy_supervisor = matches!(
+        &principal,
+        Principal::Sandbox(sandbox) if req.workspace_scope.is_none() && req.name == sandbox.sandbox_id
+    );
     let workspace = match &principal {
         Principal::Sandbox(_) if req.workspace_scope.is_none() => "",
         _ => crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
@@ -2609,7 +2613,35 @@ async fn handle_get_sandbox_config_inner(
         MinWorkspaceRole::User,
     )
     .await?;
-    Ok(Response::new(load_sandbox_config(state, &sandbox).await?))
+    let mut config = load_sandbox_config(state, &sandbox).await?;
+    if legacy_supervisor && let Some(policy) = config.policy.as_mut() {
+        populate_legacy_endpoint_modes(policy)?;
+    }
+    Ok(Response::new(config))
+}
+
+#[allow(deprecated)]
+fn populate_legacy_endpoint_modes(policy: &mut ProtoSandboxPolicy) -> Result<(), Status> {
+    for rule in policy.network_policies.values_mut() {
+        for endpoint in &mut rule.endpoints {
+            endpoint.legacy_tls = openshell_policy::network_tls_mode_to_str(endpoint.tls)
+                .ok_or_else(|| Status::internal("effective policy contains an unknown TLS mode"))?
+                .to_string();
+            endpoint.legacy_enforcement =
+                openshell_policy::network_enforcement_mode_to_str(endpoint.enforcement)
+                    .ok_or_else(|| {
+                        Status::internal("effective policy contains an unknown enforcement mode")
+                    })?
+                    .to_string();
+            endpoint.legacy_access =
+                openshell_policy::network_access_preset_to_str(endpoint.access)
+                    .ok_or_else(|| {
+                        Status::internal("effective policy contains an unknown access preset")
+                    })?
+                    .to_string();
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the same effective configuration for authenticated RPCs and trusted
@@ -7522,6 +7554,45 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic::Code;
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct LegacyNetworkEndpoint {
+        #[prost(string, tag = "4")]
+        tls: String,
+        #[prost(string, tag = "5")]
+        enforcement: String,
+        #[prost(string, tag = "6")]
+        access: String,
+    }
+
+    #[test]
+    fn legacy_endpoint_modes_remain_decodable_by_pre4_supervisors() {
+        use openshell_core::proto::{NetworkAccessPreset, NetworkEnforcementMode, NetworkTlsMode};
+
+        let mut policy = ProtoSandboxPolicy {
+            network_policies: HashMap::from([(
+                "api".to_string(),
+                NetworkPolicyRule {
+                    endpoints: vec![NetworkEndpoint {
+                        tls: NetworkTlsMode::Skip.into(),
+                        enforcement: NetworkEnforcementMode::Enforce.into(),
+                        access: NetworkAccessPreset::ReadWrite.into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        populate_legacy_endpoint_modes(&mut policy).unwrap();
+        let encoded = policy.network_policies["api"].endpoints[0].encode_to_vec();
+        let legacy = LegacyNetworkEndpoint::decode(encoded.as_slice()).unwrap();
+
+        assert_eq!(legacy.tls, "skip");
+        assert_eq!(legacy.enforcement, "enforce");
+        assert_eq!(legacy.access, "read-write");
+    }
 
     /// Wrap a request with a user `Principal` so handler scope guards treat
     /// the test caller as a CLI user. Most handler tests exercise

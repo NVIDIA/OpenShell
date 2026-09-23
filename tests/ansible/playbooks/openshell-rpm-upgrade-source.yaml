@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Install prerelease OpenShell RPM upgrade source
+  ansible.builtin.import_playbook: openshell-rpm.yaml
+
+- name: Record OpenShell RPM upgrade source
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Record installed source package versions
+      become: true
+      ansible.builtin.shell: |
+        set -euo pipefail
+        rpm --query --queryformat '%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' openshell openshell-gateway \
+          > /var/lib/openshell-qualification/upgrade-source-versions
+      args:
+        executable: /bin/bash
+      changed_when: true
