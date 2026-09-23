@@ -288,20 +288,24 @@ Shared implementations isolate each boundary's state and enforcement. Failure or
 
 ### Binary identity
 
-The backend resolves executable identity for every accepted connection and delivers the result on `MediatedConnection` before network mediation evaluates policy.
+The backend resolves executable identity for every accepted connection and delivers the result on `PendingTcpOpen` before network mediation evaluates policy.
 
 ```rust
+struct ExecutableIdentity {
+    path: PathBuf,                 // absolute executable path
+    digest: Option<Sha256Digest>,  // bytes of the resolved executable object
+}
+
 struct BinaryIdentity {
-    binary_path: PathBuf,                 // absolute executable path
-    binary_digest: Option<Sha256Digest>,  // bytes of the resolved executable object
-    ancestors: Vec<PathBuf>,              // nearest first
-    cmdline_paths: Vec<PathBuf>,          // diagnostic context; never authorizes
+    executable: ExecutableIdentity,
+    ancestors: Vec<ExecutableIdentity>,  // nearest first
+    cmdline_paths: Vec<PathBuf>,         // diagnostic context; never authorizes
 }
 ```
 
-Identity describes the executable identity resolved for the accepted connection before policy evaluation. Paths are expressed in the workload's filesystem namespace.
+Identity describes the executable identity resolved for the accepted connection before policy evaluation. Paths are expressed in the workload's filesystem namespace. Both the connection-owning executable and its ancestors can authorize access, so each carries integrity evidence as one inseparable path-and-digest value. Command-line paths are diagnostic context only and never authorize.
 
-If binary identity cannot be resolved, the connection is denied. `ResolveError` reports that failure. A missing digest is represented as `None`. How a backend resolves identity is implementation-specific.
+If binary identity cannot be resolved, the connection is denied. `ResolveError` reports that failure. A missing digest is represented as `None`; missing or conflicting evidence for any authorization-capable executable denies binary-scoped access. How a backend resolves identity is implementation-specific.
 
 Every identity field used for authorization is obtained by a trusted component from boundary or kernel state, rather than accepted as a workload claim. The result is bound to the active boundary and accepted connection; a transport tuple or workload-supplied identifier alone is not authoritative. Workload-supplied identity may be retained only as non-authorizing diagnostic context. If attribution is ambiguous or any required identity field cannot be established, the connection is denied.
 

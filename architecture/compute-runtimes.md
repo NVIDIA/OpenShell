@@ -408,6 +408,30 @@ and explicit `/sandbox` values select `/sandbox`; other paths must already
 exist without symlink or reserved-mount collisions and must be usable by the
 resolved identity. Kubernetes and VM use `/sandbox`.
 
+### Executable Identity Binding
+
+Every mediated network open carries a connection-bound `BinaryIdentity` from
+the isolation backend. The identity contains the socket-owning executable and
+each executable ancestor, nearest first, as an absolute workload path plus a
+SHA-256 digest. The backend resolves these values for the accepted connection
+and hashes already-open live executable objects rather than reopening their
+paths. Command-line paths remain diagnostic context and cannot authorize a
+request.
+
+Before policy evaluation, the supervisor validates and pins the complete leaf
+and ancestor chain in one runtime-scoped trust-on-first-use cache. It rejects
+missing digests, invalid paths, conflicting evidence within a chain, or a
+digest that differs from an existing path pin. Validation and insertion are
+atomic, so a rejected chain cannot leave partial pins.
+
+The cache is shared across authorization paths for the lifetime of the
+supervisor network runtime. Policy reloads replace policy state without
+clearing executable pins; restarting the runtime creates a new cache. OPA
+receives executable and ancestor paths plus endpoint policy context. Digests
+remain supervisor-side integrity evidence and are not policy inputs. Any
+unavailable, incomplete, or conflicting executable evidence fails closed
+before OPA can authorize the connection.
+
 The Kubernetes driver creates the namespace-wide empty-egress workload fence
 before a suspended Sandbox CR, then provisions split immutable bootstrap
 Secrets, the private runtime Service, and a gated supervisor Pod. A
