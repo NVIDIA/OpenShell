@@ -358,8 +358,12 @@ can recover that same successor for 30 seconds when the request matches, but it
 cannot authorize ordinary RPCs or choose another successor. Advancing the
 successor removes that retry path across every gateway replica. Short
 `gateway_jwt.ttl_secs` lifetimes still bound the exposure of a current bearer
-that has not yet been refreshed. Omitting `gateway_jwt.ttl_secs` uses a
-900-second lifetime. Explicit zero is rejected.
+that has not yet been refreshed. Omitting `gateway_jwt.ttl_secs` selects
+non-expiring launch-scoped gateway and Sandbox Protocol tokens for local
+single-player Docker, Podman, and VM gateways; both token profiles carry
+`exp = 0`. Typed extension JWTs retain a 900-second default when the field is
+omitted. Kubernetes and other shared deployments should set a positive TTL.
+Explicit zero is rejected.
 
 Gateway JWT signing-key rotation is currently an offline operator action. The
 runtime loads one active signing key and one matching public verification key

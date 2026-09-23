@@ -133,13 +133,19 @@ fn validate_sandbox_refresh(
 ) -> std::result::Result<ValidatedSandboxRefresh, crate::jwt::SessionJwtError> {
     let token = crate::jwt::SecretJwt::parse(response.sandbox_token.clone())?;
     let credential_epoch = crate::jwt::CredentialEpoch::new(response.credential_epoch)?;
-    let expiration_time = response
+    let expires_at = response
         .sandbox_expiration_time
         .as_ref()
-        .ok_or(crate::jwt::SessionJwtError::InvalidLifetime)?;
-    crate::time::validate_timestamp(expiration_time)
-        .map_err(|_| crate::jwt::SessionJwtError::InvalidLifetime)?;
-    let expires_at = expiration_time.seconds;
+        .map(|expiration_time| {
+            crate::time::validate_timestamp(expiration_time)
+                .map_err(|_| crate::jwt::SessionJwtError::InvalidLifetime)?;
+            if expiration_time.seconds == 0 {
+                return Err(crate::jwt::SessionJwtError::InvalidLifetime);
+            }
+            Ok(expiration_time.seconds)
+        })
+        .transpose()?
+        .unwrap_or(0);
     crate::jwt::SessionBearerTokenSlot::new(token.clone(), expires_at, credential_epoch)?;
     Ok(ValidatedSandboxRefresh {
         token,
@@ -710,17 +716,15 @@ mod auth_tests {
 
     #[cfg(feature = "jwt")]
     #[test]
-    fn sandbox_refresh_validation_rejects_missing_expiration() {
+    fn sandbox_refresh_validation_accepts_missing_expiration_as_non_expiring() {
         let response = crate::proto::RefreshSandboxTokenResponse {
             sandbox_token: "sandbox-token".to_string(),
             credential_epoch: 2,
             ..Default::default()
         };
 
-        assert_eq!(
-            validate_sandbox_refresh(&response).err(),
-            Some(crate::jwt::SessionJwtError::InvalidLifetime)
-        );
+        let refresh = validate_sandbox_refresh(&response).expect("non-expiring refresh");
+        assert_eq!(refresh.expires_at, 0);
     }
 
     #[cfg(feature = "jwt")]

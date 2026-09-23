@@ -2963,7 +2963,7 @@ mod tests {
                     material.public_key_pem.as_bytes(),
                     material.kid.clone(),
                     "test",
-                    Duration::from_mins(15),
+                    Some(Duration::from_mins(15)),
                 )
                 .expect("session authority"),
             );

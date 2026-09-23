@@ -859,7 +859,7 @@ message RefreshSandboxTokenResponse {
   repeated ExtensionServiceCredential extension_credentials = 3;
   // Fresh Sandbox Protocol bearer token from the same atomic refresh.
   string sandbox_token = 4 [(openshell.options.v1.secret) = true];
-  // Absolute Sandbox Protocol token expiry. Required when sandbox_token is set.
+  // Absolute Sandbox Protocol token expiry. Absence means the token is non-expiring.
   google.protobuf.Timestamp sandbox_expiration_time = 105;
   // Launch generation to which both refreshed credentials are bound.
   string session_id = 6;

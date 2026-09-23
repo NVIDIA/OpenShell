@@ -700,6 +700,10 @@ mod linux {
         }
 
         fn update(&self, expires_at: i64) {
+            if expires_at == 0 {
+                self.set_deadline(None);
+                return;
+            }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_secs());
@@ -710,11 +714,15 @@ mod linux {
         }
 
         fn update_deadline(&self, deadline: tokio::time::Instant) {
+            self.set_deadline(Some(deadline));
+        }
+
+        fn set_deadline(&self, deadline: Option<tokio::time::Instant>) {
             let _ = self.deadline.send_if_modified(|current| {
-                if *current == Some(deadline) {
+                if *current == deadline {
                     false
                 } else {
-                    *current = Some(deadline);
+                    *current = deadline;
                     true
                 }
             });
@@ -3678,7 +3686,7 @@ mod linux {
                 key.serialize_pem().as_bytes(),
                 "test-key",
                 "test-gateway",
-                DEFAULT_SESSION_TOKEN_TTL,
+                Some(DEFAULT_SESSION_TOKEN_TTL),
                 Arc::new(SystemJwtClock),
             )
             .expect("test session issuer");
@@ -3988,6 +3996,26 @@ mod linux {
             tokio::time::timeout(Duration::from_millis(250), closed.changed())
                 .await
                 .expect("updated connection deadline must fire")
+                .expect("expiry worker must keep the shutdown channel open");
+        }
+
+        #[tokio::test]
+        async fn non_expiring_connection_has_no_deadline() {
+            let (shutdown, mut closed) = tokio::sync::watch::channel(());
+            let expiry = ConnectionExpiry::new(shutdown);
+            expiry.update_deadline(tokio::time::Instant::now() + Duration::from_millis(20));
+            expiry.update(0);
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(80), closed.changed())
+                    .await
+                    .is_err(),
+                "non-expiring credentials must clear the connection deadline"
+            );
+            expiry.update_deadline(tokio::time::Instant::now() + Duration::from_millis(20));
+            tokio::time::timeout(Duration::from_millis(80), closed.changed())
+                .await
+                .expect("replacement connection deadline must fire")
                 .expect("expiry worker must keep the shutdown channel open");
         }
 

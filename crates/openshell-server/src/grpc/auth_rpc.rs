@@ -304,15 +304,13 @@ pub async fn handle_refresh_sandbox_token(
             .sandbox_token
             .expose_secret()
             .to_string(),
-        sandbox_expiration_time: Some(
-            openshell_core::time::timestamp_from_millis(
-                authentication
-                    .supervisor
-                    .sandbox_expires_at
-                    .saturating_mul(1000),
-            )
-            .map_err(|error| Status::internal(error.to_string()))?,
-        ),
+        sandbox_expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            authentication
+                .supervisor
+                .sandbox_expires_at
+                .saturating_mul(1000),
+        )
+        .map_err(|error| Status::internal(error.to_string()))?,
         session_id: authentication.supervisor.runtime_generation.to_string(),
         credential_epoch: authentication.supervisor.auth_epoch.get(),
     }))
@@ -447,7 +445,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    async fn state_with_issuer() -> Arc<ServerState> {
+    async fn state_with_ttl(ttl: Option<Duration>) -> Arc<ServerState> {
         let mat = generate_jwt_key().expect("jwt key");
         let store = Arc::new(
             Store::connect("sqlite::memory:?cache=shared")
@@ -483,7 +481,7 @@ mod tests {
                 mat.public_key_pem.as_bytes(),
                 mat.kid,
                 "test-gateway",
-                Duration::from_hours(1),
+                ttl,
             )
             .expect("session authority"),
         );
@@ -493,6 +491,10 @@ mod tests {
         let state = Arc::new(state);
         insert_sandbox(&state, "sandbox-a", &identity).await;
         state
+    }
+
+    async fn state_with_issuer() -> Arc<ServerState> {
+        state_with_ttl(Some(Duration::from_hours(1))).await
     }
 
     async fn insert_sandbox(
@@ -617,6 +619,25 @@ mod tests {
         assert!(!resp.token.is_empty());
         assert!(resp.expiration_time.is_some());
         assert!(resp.sandbox_expiration_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn refresh_propagates_non_expiring_session_credentials() {
+        let state = state_with_ttl(None).await;
+        let mut req = Request::new(RefreshSandboxTokenRequest {
+            extension_service_names: Vec::new(),
+        });
+        req.extensions_mut().insert(sandbox_principal("sandbox-a"));
+        let _ = authorize_refresh(&state, &mut req).await;
+        let resp = handle_refresh_sandbox_token(&state, req)
+            .await
+            .expect("refresh OK")
+            .into_inner();
+
+        assert!(!resp.token.is_empty());
+        assert!(!resp.sandbox_token.is_empty());
+        assert!(resp.expiration_time.is_none());
+        assert!(resp.sandbox_expiration_time.is_none());
     }
 
     #[tokio::test]

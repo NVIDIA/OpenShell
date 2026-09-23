@@ -121,7 +121,7 @@ impl SandboxSessionJwtAuthority {
         public_key_pem: &[u8],
         key_id: String,
         gateway_id: &str,
-        ttl: Duration,
+        ttl: Option<Duration>,
     ) -> Result<Self, String> {
         let clock = Arc::new(SystemJwtClock);
         let issuer = SessionJwtIssuer::from_ed25519_pem(

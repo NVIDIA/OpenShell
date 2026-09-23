@@ -389,7 +389,7 @@ mod tests {
             key.serialize_pem().as_bytes(),
             "current",
             "test",
-            DEFAULT_SESSION_TOKEN_TTL,
+            Some(DEFAULT_SESSION_TOKEN_TTL),
             clock.clone(),
         )
         .expect("issuer");
