@@ -826,8 +826,8 @@ compute_driver = "mxc"
 wxc_exec_path           = "C:\\mxc-kit\\bin\\wxc-exec.exe"
 backend                 = "process_container"
 default_configuration_id = "composable"
-pc_least_privilege      = false
-pc_capabilities         = []
+pc_least_privilege      = true
+pc_capabilities         = ["registryRead"]
 debug                   = false
 etw_audit               = true
 ```
@@ -836,6 +836,20 @@ etw_audit               = true
 administrator or belong to the Windows Performance Log Users group. Workload
 commands and working directories remain sandbox-scoped and must be supplied in
 the `mxc` driver configuration when creating a sandbox.
+
+`pc_least_privilege` requests a Less-Privileged AppContainer and defaults to
+`false`. Leave it enabled. A sandbox without it can reach host services that
+issue network requests on its behalf, so a workload sends outbound HTTP even
+when it declares no `network_policies`. Enabling it requires
+`pc_capabilities = ["registryRead"]`, without which the sandbox cannot
+initialize Winsock and most runtimes exit during startup. `registryRead` grants
+read access to the Winsock catalog keys and no network access.
+
+Grant network access with `egress_proxy`, which applies gateway network policy.
+Adding `internetClient` to `pc_capabilities` instead grants unrestricted
+outbound access that a sandbox's
+[`network_policies`](/reference/policy-schema#network-policies) cannot
+constrain.
 
 The driver records executable identity in process audit events and omits raw
 command arguments because they can contain credentials or personal data. See
