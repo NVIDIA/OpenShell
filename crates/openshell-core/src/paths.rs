@@ -256,9 +256,44 @@ mod windows_acl {
     /// Overwrite `path`'s DACL with a single, non-inherited ACE granting full
     /// control to the current user, stripping any inherited ACEs. `is_dir`
     /// controls whether the ACE propagates to children (directories only).
+    /// When `path` has a foreign owner, ownership is also claimed; an object
+    /// whose owner we cannot take produces an error rather than silently
+    /// leaving their implicit `WRITE_DAC` right intact.
     pub(super) fn restrict_to_current_user(path: &Path, is_dir: bool) -> Result<()> {
         let token_info = current_user_token_info()?;
         let sid = sid_from_token_info(&token_info);
+
+        let path_hstring = HSTRING::from(path.as_os_str());
+
+        // Query the current owner to decide whether to include
+        // OWNER_SECURITY_INFORMATION in the upcoming SetNamedSecurityInfoW
+        // call. Requesting it unconditionally fails with ACCESS_DENIED
+        // (0x80070005) when the current user already owns the file, because
+        // WRITE_OWNER is not implied by being the object's owner.
+        let mut current_owner = PSID::default();
+        let mut owner_sd = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: `path_hstring` is valid for the call; out-params are simple
+        // pointers filled by the API on success. The security descriptor is
+        // LocalAlloc-owned and freed below.
+        unsafe {
+            GetNamedSecurityInfoW(
+                PWSTR::from_raw(path_hstring.as_ptr().cast_mut()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(&raw mut current_owner),
+                None,
+                None,
+                None,
+                &raw mut owner_sd,
+            )
+        }
+        .ok()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to query owner of {}", path.display()))?;
+        let _owner_sd_guard = LocalFreeGuard(owner_sd.0);
+
+        // SAFETY: both SIDs come from Windows APIs and are valid for this block.
+        let already_owned = unsafe { EqualSid(sid, current_owner) }.is_ok();
 
         let trustee = TRUSTEE_W {
             TrusteeForm: TRUSTEE_IS_SID,
@@ -288,31 +323,32 @@ mod windows_acl {
             .wrap_err_with(|| format!("failed to build ACL for {}", path.display()))?;
         let _acl_guard = LocalFreeGuard(new_acl.cast());
 
-        let path_hstring = HSTRING::from(path.as_os_str());
+        // Include OWNER_SECURITY_INFORMATION only when the path has a foreign
+        // owner. When the current user is already the owner the flag is
+        // unnecessary and fails with ACCESS_DENIED on standard credentials.
+        // When the owner is foreign we must either take ownership or reject
+        // the path: a DACL-only update leaves the foreign owner's implicit
+        // WRITE_DAC right intact, letting them later replace this DACL
+        // (https://learn.microsoft.com/en-us/windows/win32/secauthz/owner-of-a-new-object).
+        let security_info = if already_owned {
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION
+        };
+        let owner_arg = if already_owned { None } else { Some(sid) };
+
         // SAFETY: `path_hstring` is a valid, NUL-terminated wide string for
         // the lifetime of this call; `new_acl` is a valid ACL just built
         // above; `sid` borrows from `token_info`, kept alive for this call.
-        // `PROTECTED_DACL_SECURITY_INFORMATION` is the flag that strips
-        // inherited ACEs, which is the entire point of this call.
-        //
-        // Setting the owner (not just the DACL) matters for a pre-existing or
-        // migrated sensitive path owned by another SID: a DACL-only update
-        // can succeed with WRITE_DAC while a foreign owner retains their
-        // implicit WRITE_DAC right and can later replace this DACL (see
-        // https://learn.microsoft.com/en-us/windows/win32/secauthz/owner-of-a-new-object).
-        // Setting the owner to a SID already present in the caller's own
-        // token needs only WRITE_OWNER on the object, not
-        // SeTakeOwnershipPrivilege; if the caller can't take ownership (a
-        // genuinely foreign-owned object), this call fails and the error
-        // propagates below instead of silently leaving the object insecure.
+        // `PROTECTED_DACL_SECURITY_INFORMATION` strips inherited ACEs.
         unsafe {
             SetNamedSecurityInfoW(
                 PWSTR::from_raw(path_hstring.as_ptr().cast_mut()),
                 SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION
-                    | DACL_SECURITY_INFORMATION
-                    | PROTECTED_DACL_SECURITY_INFORMATION,
-                Some(sid),
+                security_info,
+                owner_arg,
                 None,
                 Some(new_acl),
                 None,
@@ -320,12 +356,7 @@ mod windows_acl {
         }
         .ok()
         .into_diagnostic()
-        .wrap_err_with(|| {
-            format!(
-                "failed to set owner-only ACL and take ownership of {}",
-                path.display()
-            )
-        })?;
+        .wrap_err_with(|| format!("failed to set owner-only ACL on {}", path.display()))?;
 
         Ok(())
     }
@@ -425,24 +456,27 @@ mod windows_acl {
         .wrap_err_with(|| format!("failed to set an object-ACE DACL on {}", path.display()))
     }
 
-    /// Returns `true` if `path`'s DACL grants access to any trustee other
-    /// than the current user, or `None` if the ACL could not be read.
+    /// Returns `true` if `path`'s owner is not the current user, or if its
+    /// DACL grants access to any trustee other than the current user.
+    /// Returns `None` if the owner or ACL could not be read.
     pub(super) fn has_foreign_trustee(path: &Path) -> Option<bool> {
         let token_info = current_user_token_info().ok()?;
-        let owner_sid = sid_from_token_info(&token_info);
+        let user_sid = sid_from_token_info(&token_info);
 
         let path_hstring = HSTRING::from(path.as_os_str());
+        let mut owner: PSID = PSID::default();
         let mut dacl: *mut ACL = core::ptr::null_mut();
         let mut security_descriptor = PSECURITY_DESCRIPTOR::default();
         // SAFETY: `path_hstring` is valid for the call; the out-params are
         // simple pointers filled in by the API on success. The security
-        // descriptor `dacl` points into is LocalAlloc-owned and freed below.
+        // descriptor (which both `owner` and `dacl` point into) is
+        // LocalAlloc-owned and freed below.
         let status = unsafe {
             GetNamedSecurityInfoW(
                 PWSTR::from_raw(path_hstring.as_ptr().cast_mut()),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                None,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                Some(&raw mut owner),
                 None,
                 Some(&raw mut dacl),
                 None,
@@ -451,6 +485,15 @@ mod windows_acl {
         };
         status.ok().ok()?;
         let _sd_guard = LocalFreeGuard(security_descriptor.0);
+
+        // A foreign owner has implicit WRITE_DAC rights and can replace the
+        // DACL at any time, so reject the path regardless of what the DACL
+        // currently says.
+        // SAFETY: both SIDs come from Windows APIs and are valid for this call.
+        let owner_is_current_user = unsafe { EqualSid(user_sid, owner) }.is_ok();
+        if !owner_is_current_user {
+            return Some(true);
+        }
 
         // A NULL DACL is a real, distinct state from "unreadable ACL": per
         // the Win32 contract, it means the object grants full access to
@@ -510,7 +553,7 @@ mod windows_acl {
             let ace_sid = PSID((&raw const ace.SidStart).cast_mut().cast());
             // SAFETY: both SIDs come from Windows APIs (`GetTokenInformation`
             // and `GetAce`) and are valid for the duration of this call.
-            let is_owner = unsafe { EqualSid(owner_sid, ace_sid) }.is_ok();
+            let is_owner = unsafe { EqualSid(user_sid, ace_sid) }.is_ok();
             if !is_owner {
                 return Some(true);
             }
