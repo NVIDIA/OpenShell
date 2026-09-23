@@ -173,6 +173,10 @@
             systemctl --user status openshell-gateway.service --no-pager
             journalctl --user -u openshell-gateway.service --no-pager -n 200
             sudo docker ps -a
+            for container in $(sudo docker ps -aq); do
+              echo "=== docker logs: ${container} ==="
+              sudo docker logs "${container}" 2>&1
+            done
             sudo docker images
             sudo cat /var/lib/openshell-qualification/gateway.toml
           args:
