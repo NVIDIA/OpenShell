@@ -707,34 +707,45 @@ fn engine_type_for_protocol(protocol: L7Protocol) -> &'static str {
     }
 }
 
-async fn deny_h2c_upgrade_if_requested<C>(
+/// Refuses an upgrade the endpoint cannot inspect and reports whether the
+/// request was answered.
+///
+/// Every L7 request loop calls this before the L7 policy decision. A refusal
+/// records a policy denial for the endpoint, emits a parse-rejection event,
+/// and answers `403` regardless of enforcement mode; see
+/// `unsupported_upgrade_detail` for which upgrades each protocol refuses. The
+/// response carries the `unsupported_l7_protocol` error rather than the
+/// policy-denial body, because no policy rule can allow the request.
+async fn deny_unsupported_upgrade_if_requested<C>(
     req: &crate::l7::provider::L7Request,
     config: &L7EndpointConfig,
     ctx: &L7EvalContext,
+    observer: Option<&EndpointObserver>,
     client: &mut C,
 ) -> Result<bool>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    if !crate::l7::rest::request_is_h2c_upgrade(&req.raw_header) {
+    let Some(detail) =
+        crate::l7::rest::unsupported_upgrade_detail(&req.raw_header, config.protocol)
+    else {
         return Ok(false);
-    }
+    };
 
-    emit_parse_rejection(
-        ctx,
-        crate::l7::rest::UNSUPPORTED_H2C_UPGRADE_DETAIL,
-        engine_type_for_protocol(config.protocol),
-    );
-    crate::l7::rest::RestProvider::default()
-        .deny_with_redacted_target(
-            req,
-            &ctx.policy_name,
-            crate::l7::rest::UNSUPPORTED_H2C_UPGRADE_DETAIL,
-            client,
-            None,
-            Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
-        )
-        .await?;
+    if let Some(observer) = observer {
+        observer.observe(EndpointResult::PolicyDenied);
+    }
+    emit_parse_rejection(ctx, detail, engine_type_for_protocol(config.protocol));
+    crate::l7::rest::send_json_response(
+        &ctx.policy_name,
+        serde_json::json!({
+            "error": "unsupported_l7_protocol",
+            "detail": detail,
+        }),
+        client,
+        "403 Forbidden",
+    )
+    .await?;
     Ok(true)
 }
 
@@ -934,7 +945,9 @@ where
                 .await?;
             return Ok(());
         }
-        if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
+        if deny_unsupported_upgrade_if_requested(&req, config, ctx, observer.as_ref(), client)
+            .await?
+        {
             return Ok(());
         }
 
@@ -1283,6 +1296,26 @@ where
                     websocket_permessage_deflate,
                     websocket_subprotocol,
                 } => {
+                    // JSON-RPC and MCP rules apply to individual HTTP requests.
+                    // No current path forwards upgrade headers for these
+                    // protocols: the request-side refusal rejects them, and
+                    // request middleware cannot add upgrade or connection
+                    // headers. If a later change lets such a request reach an
+                    // upstream that answers `101`, close instead of relaying
+                    // frames that no rule would inspect.
+                    if config.protocol.is_jsonrpc_family() {
+                        warn!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            "closing JSON-RPC connection after unexpected protocol upgrade"
+                        );
+                        if let Some(session) = middleware_session.take() {
+                            session
+                                .end(openshell_core::proto::MiddlewareSessionEndReason::ProtocolError)
+                                .await;
+                        }
+                        return Ok(());
+                    }
                     let mut options = upgrade_options(
                         config,
                         ctx,
@@ -1751,7 +1784,7 @@ where
             reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
-        if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
+        if deny_unsupported_upgrade_if_requested(&req, config, ctx, None, client).await? {
             return Ok(());
         }
 
@@ -2218,6 +2251,11 @@ where
             reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
+        if deny_unsupported_upgrade_if_requested(&req, config, ctx, observer.as_ref(), client)
+            .await?
+        {
+            return Ok(());
+        }
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
         }
@@ -2510,7 +2548,7 @@ where
             reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
-        if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
+        if deny_unsupported_upgrade_if_requested(&req, config, ctx, None, client).await? {
             return Ok(());
         }
 
@@ -9026,6 +9064,382 @@ network_policies:
         drop(app);
         drop(upstream);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), relay).await;
+    }
+
+    /// A `tools/call` that no JSON-RPC-family fixture below allows.
+    const UNALLOWED_TOOL_CALL: &[u8] =
+        br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_resource","arguments":{}}}"#;
+
+    /// A receive-stream GET that also asks to switch to WebSocket.
+    const JSONRPC_WEBSOCKET_UPGRADE_REQUEST: &[u8] = b"GET /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nAccept: text/event-stream\r\nMCP-Protocol-Version: 2025-11-25\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    /// Builds two endpoints on one host and port so every request goes
+    /// through per-request route selection: a JSON-RPC-family endpoint at
+    /// `/mcp` that allows only `initialize`, and a REST endpoint at `/api/**`.
+    fn jsonrpc_and_rest_route_configs(
+        protocol: &str,
+        enforcement: &str,
+    ) -> (Vec<L7EndpointConfig>, TunnelPolicyEngine, L7EvalContext) {
+        let data = format!(
+            r#"
+network_policies:
+  shared_api:
+    name: shared_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: "/mcp"
+        protocol: {protocol}
+        enforcement: {enforcement}
+        rules:
+          - allow:
+              method: initialize
+      - host: mcp.example.test
+        port: 8000
+        path: "/api/**"
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/api/**"
+    binaries:
+      - {{ path: /usr/bin/python3 }}
+"#
+        );
+        let engine = OpaEngine::from_strings(TEST_POLICY, &data).unwrap();
+        let input = NetworkInput {
+            host: "mcp.example.test".into(),
+            port: 8000,
+            binary_path: PathBuf::from("/usr/bin/python3"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_configs, generation) = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap();
+        let configs: Vec<L7EndpointConfig> = endpoint_configs
+            .iter()
+            .map(|config| crate::l7::parse_l7_config(config).unwrap())
+            .collect();
+        assert_eq!(configs.len(), 2, "both endpoints must share the route");
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "mcp.example.test".into(),
+            port: 8000,
+            request_default_port: Some(8000),
+            policy_name: "shared_api".into(),
+            binary_path: "/usr/bin/python3".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            ..Default::default()
+        };
+        (configs, tunnel_engine, ctx)
+    }
+
+    /// Result of sending one upgrade request through a relay whose upstream
+    /// accepts every upgrade it receives.
+    struct UpgradeScenario {
+        /// The response head the client received, or empty if none arrived.
+        response: String,
+        /// The response body of a non-`101` response.
+        body: String,
+        /// Every byte the upstream received.
+        upstream_seen: Vec<u8>,
+    }
+
+    /// Sends `request`, answers any forwarded upgrade with a valid `101`, and
+    /// after a `101` writes `frame` as a WebSocket text message. The upstream
+    /// never refuses, so a relay that forwards the upgrade and then copies
+    /// bytes delivers `frame` to it.
+    async fn run_upgrade_scenario<F>(request: &[u8], frame: &[u8], relay: F) -> UpgradeScenario
+    where
+        F: FnOnce(
+            tokio::io::DuplexStream,
+            tokio::io::DuplexStream,
+        ) -> tokio::task::JoinHandle<Result<()>>,
+    {
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let (relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = relay(relay_client, relay_upstream);
+        let upstream_task = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut answered = false;
+            loop {
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    upstream.read(&mut buf),
+                )
+                .await;
+                let Ok(Ok(n)) = read else { break };
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buf[..n]);
+                if !answered && seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    answered = true;
+                    let _ = upstream
+                        .write_all(
+                            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                        )
+                        .await;
+                }
+            }
+            seen
+        });
+
+        app.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(2), app.read(&mut byte)).await;
+            let Ok(Ok(1)) = read else { break };
+            response.push(byte[0]);
+        }
+        let response = String::from_utf8_lossy(&response).into_owned();
+        let mut body = Vec::new();
+        if response.starts_with("HTTP/1.1 101") {
+            let _ = app.write_all(&masked_text_frame(frame)).await;
+        } else {
+            // Refusals close the connection after the body.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                app.read_to_end(&mut body),
+            )
+            .await;
+        }
+        drop(app);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay).await;
+        let upstream_seen = upstream_task.await.unwrap();
+        UpgradeScenario {
+            response,
+            body: String::from_utf8_lossy(&body).into_owned(),
+            upstream_seen,
+        }
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    fn assert_upgrade_denied_before_forwarding(scenario: &UpgradeScenario) {
+        assert!(
+            !contains_bytes(
+                &scenario.upstream_seen,
+                &masked_text_frame(UNALLOWED_TOOL_CALL)
+            ),
+            "an uninspected tools/call frame reached the upstream"
+        );
+        assert!(
+            scenario.upstream_seen.is_empty(),
+            "the upgrade request must not reach the upstream, got: {}",
+            String::from_utf8_lossy(&scenario.upstream_seen)
+        );
+        assert!(
+            scenario.response.starts_with("HTTP/1.1 403"),
+            "expected a 403 denial, got: {}",
+            scenario.response
+        );
+        assert!(
+            scenario.body.contains("\"unsupported_l7_protocol\"")
+                && scenario
+                    .body
+                    .contains(crate::l7::rest::UNSUPPORTED_JSONRPC_UPGRADE_DETAIL),
+            "expected the upgrade refusal, got: {}",
+            scenario.body
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_websocket_upgrade_refusal_records_policy_denied() {
+        use openshell_core::endpoint_status::EndpointStatusCommand;
+
+        for route_selected in [false, true] {
+            let (mut config, tunnel_engine, mut ctx) = mcp_test_relay_context();
+            let mut receiver = install_mcp_test_observation(&mut config, &mut ctx).await;
+            let scenario = run_upgrade_scenario(
+                JSONRPC_WEBSOCKET_UPGRADE_REQUEST,
+                UNALLOWED_TOOL_CALL,
+                move |mut client, mut upstream| {
+                    tokio::spawn(async move {
+                        if route_selected {
+                            relay_with_route_selection(
+                                &[config],
+                                tunnel_engine,
+                                &mut client,
+                                &mut upstream,
+                                &ctx,
+                            )
+                            .await
+                        } else {
+                            relay_with_inspection(
+                                &config,
+                                tunnel_engine,
+                                &mut client,
+                                &mut upstream,
+                                &ctx,
+                            )
+                            .await
+                        }
+                    })
+                },
+            )
+            .await;
+            assert_upgrade_denied_before_forwarding(&scenario);
+            assert!(
+                matches!(
+                    receiver.try_recv(),
+                    Ok(EndpointStatusCommand::Observe {
+                        result: EndpointResult::PolicyDenied,
+                        ..
+                    })
+                ),
+                "route_selected={route_selected}: refusal must record a policy denial"
+            );
+            assert!(
+                receiver.try_recv().is_err(),
+                "route_selected={route_selected}: one result per exchange"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn route_selected_mcp_websocket_upgrade_is_denied_before_forwarding() {
+        let (configs, tunnel_engine, ctx) = jsonrpc_and_rest_route_configs("mcp", "enforce");
+        let scenario = run_upgrade_scenario(
+            JSONRPC_WEBSOCKET_UPGRADE_REQUEST,
+            UNALLOWED_TOOL_CALL,
+            move |mut client, mut upstream| {
+                tokio::spawn(async move {
+                    relay_with_route_selection(
+                        &configs,
+                        tunnel_engine,
+                        &mut client,
+                        &mut upstream,
+                        &ctx,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        assert_upgrade_denied_before_forwarding(&scenario);
+    }
+
+    #[tokio::test]
+    async fn route_selected_audit_jsonrpc_websocket_upgrade_is_denied_before_forwarding() {
+        // Audit mode forwards requests that policy would deny, so the upgrade
+        // refusal must not depend on the policy decision.
+        let (configs, tunnel_engine, ctx) = jsonrpc_and_rest_route_configs("json-rpc", "audit");
+        let scenario = run_upgrade_scenario(
+            JSONRPC_WEBSOCKET_UPGRADE_REQUEST,
+            UNALLOWED_TOOL_CALL,
+            move |mut client, mut upstream| {
+                tokio::spawn(async move {
+                    relay_with_route_selection(
+                        &configs,
+                        tunnel_engine,
+                        &mut client,
+                        &mut upstream,
+                        &ctx,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        assert_upgrade_denied_before_forwarding(&scenario);
+    }
+
+    #[tokio::test]
+    async fn single_endpoint_mcp_websocket_upgrade_is_denied_before_forwarding() {
+        let (config, tunnel_engine, ctx) = mcp_test_relay_context();
+        let scenario = run_upgrade_scenario(
+            JSONRPC_WEBSOCKET_UPGRADE_REQUEST,
+            UNALLOWED_TOOL_CALL,
+            move |mut client, mut upstream| {
+                tokio::spawn(async move {
+                    relay_with_inspection(&config, tunnel_engine, &mut client, &mut upstream, &ctx)
+                        .await
+                })
+            },
+        )
+        .await;
+        assert_upgrade_denied_before_forwarding(&scenario);
+    }
+
+    #[tokio::test]
+    async fn route_selected_rest_websocket_upgrade_still_relays_beside_mcp() {
+        // The refusal is scoped to JSON-RPC-family endpoints: a REST upgrade
+        // on the same host and port keeps its documented raw relay.
+        let (configs, tunnel_engine, ctx) = jsonrpc_and_rest_route_configs("mcp", "enforce");
+        let frame = br#"{"type":"ping"}"#;
+        let scenario = run_upgrade_scenario(
+            b"GET /api/ws HTTP/1.1\r\nHost: mcp.example.test:8000\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            frame,
+            move |mut client, mut upstream| {
+                tokio::spawn(async move {
+                    relay_with_route_selection(
+                        &configs,
+                        tunnel_engine,
+                        &mut client,
+                        &mut upstream,
+                        &ctx,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        assert!(
+            scenario.response.starts_with("HTTP/1.1 101"),
+            "REST upgrade should still switch protocols, got: {}",
+            scenario.response
+        );
+        assert!(contains_bytes(
+            &scenario.upstream_seen,
+            &masked_text_frame(frame)
+        ));
+    }
+
+    #[tokio::test]
+    async fn route_selected_mcp_receive_stream_without_upgrade_is_still_forwarded() {
+        let (configs, tunnel_engine, ctx) = jsonrpc_and_rest_route_configs("mcp", "enforce");
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nAccept: text/event-stream\r\nMCP-Protocol-Version: 2025-11-25\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let forwarded = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_http_headers(&mut upstream),
+        )
+        .await
+        .expect("receive-stream GET should reach the upstream");
+        let forwarded = String::from_utf8_lossy(&forwarded);
+        assert!(forwarded.starts_with("GET /mcp HTTP/1.1\r\n"));
+        assert!(!forwarded.to_ascii_lowercase().contains("upgrade"));
+        relay.abort();
+        let _ = relay.await;
     }
 
     fn masked_text_frame(payload: &[u8]) -> Vec<u8> {

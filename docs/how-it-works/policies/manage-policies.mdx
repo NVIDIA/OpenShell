@@ -340,6 +340,7 @@ code in the response to find the cause:
 | `request_authority_mismatch` | The HTTP request's host or port differs from the connection's destination. | The client's `Host` header, including any non-default port, matches the connection. |
 | `credential_endpoint_mismatch` | A network rule allowed the request, but the provider credential is not bound to this destination. | The provider's profile endpoints or credential binding. Do not widen the network rule. |
 | `credential_placeholder_in_request_body` | The request body contains an invalid or revoked credential placeholder. | Remove the stale placeholder or restore the provider. |
+| `unsupported_l7_protocol` | The request used a protocol or upgrade that the endpoint cannot inspect, such as h2c or an `Upgrade` header sent to an MCP or JSON-RPC endpoint. No rule can allow it. | Send the request without the upgrade, or allow WebSocket traffic through a separate `protocol: websocket` endpoint. |
 
 ### A Change Fails to Load
 

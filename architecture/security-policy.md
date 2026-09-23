@@ -113,7 +113,10 @@ allowing them to continue under stale authorization. HTTP upgrades switch to
 raw relay by default. A `protocol: rest` endpoint can opt in to
 `websocket_credential_rewrite` for client-to-server WebSocket text messages
 after an allowed `101` upgrade; server-to-client traffic and all other upgraded
-protocols remain raw passthrough.
+protocols remain raw passthrough. JSON-RPC and MCP endpoints refuse every
+request that carries an `Upgrade` header with `403` before forwarding,
+whatever the enforcement mode, because their rules apply to individual HTTP
+requests and a raw relay would bypass them.
 
 A `protocol: tcp` hostname is a connection-routing constraint, not an
 application-authority boundary. Transparent capture validates the approved DNS
