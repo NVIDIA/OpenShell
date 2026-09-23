@@ -48,11 +48,11 @@ backend = "process_container"
 default_configuration_id = "composable"
 pc_least_privilege = false
 pc_capabilities = []
-# processContainer only: launch openshell-supervisor-relay instead of
-# the per-sandbox command directly, giving the driver a control
-# channel into the sandbox (launch handshake, dynamic `openshell forward
-# service` bridging). target_port is the launched command's own listening
-# port; 0 disables spawner wrapping (default -- the command runs directly).
+# Either backend: launch openshell-supervisor-relay instead of the per-sandbox
+# command directly, giving the driver a control channel into the sandbox
+# (launch handshake, dynamic `openshell forward service` bridging). target_port
+# is the launched command's own listening port; 0 disables spawner wrapping
+# (default -- the command runs directly).
 pc_relay_spawner_path = ""
 pc_relay_target_port  = 0
 # processContainer only: env-inheritance tier for the launched process
