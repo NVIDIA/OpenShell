@@ -144,6 +144,15 @@ View only failed job logs:
 gh run view <run-id> --log-failed
 ```
 
+For a failed `Integration Test Runner` k3s job, also download its
+`tmachine-diagnostics-ubuntu-k3s-kubernetes-binaries-conformance` artifact.
+It contains sanitized guest, service, Kubernetes node and pod, gateway, and
+sandbox state captured before the disposable VM is removed:
+
+```bash
+gh run download <run-id> --name tmachine-diagnostics-ubuntu-k3s-kubernetes-binaries-conformance
+```
+
 ## Wait for Run Completion (Scripting)
 
 Watch and wait for a run to complete:

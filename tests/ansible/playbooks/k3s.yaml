@@ -1,0 +1,140 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Provision disposable k3s cluster
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    k3s_version: v1.36.4+k3s1
+    k3s_binaries:
+      x86_64:
+        asset: k3s
+        sha256: 835873f37245fc615f547a2fe2af9402a347875f13fa64a1f136de644955ea3f
+      aarch64:
+        asset: k3s-arm64
+        sha256: c920706346d5ad4e5cd3c7bf1bb09ce71ebe07fec829e513e40f1caf98aed8bb
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Gather guest architecture
+      ansible.builtin.setup:
+        filter:
+          - ansible_architecture
+
+    - name: Select pinned k3s binary
+      ansible.builtin.set_fact:
+        k3s_binary: "{{ k3s_binaries[ansible_facts.architecture] | default({}) }}"
+
+    - name: Require a supported guest architecture
+      ansible.builtin.assert:
+        that: k3s_binary | length > 0
+        fail_msg: "k3s is unsupported on {{ ansible_facts.architecture }}"
+
+    - name: Download pinned k3s binary
+      ansible.builtin.get_url:
+        url: "https://github.com/k3s-io/k3s/releases/download/{{ k3s_version | urlencode }}/{{ k3s_binary.asset }}"
+        dest: /usr/local/bin/k3s
+        checksum: "sha256:{{ k3s_binary.sha256 }}"
+        mode: "0755"
+
+    - name: Install k3s systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/k3s.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Disposable k3s qualification cluster
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=notify
+          ExecStart=/usr/local/bin/k3s server --disable traefik --write-kubeconfig-mode 0600
+          KillMode=process
+          Delegate=yes
+          LimitNOFILE=1048576
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start k3s
+      ansible.builtin.systemd_service:
+        name: k3s.service
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Wait for kubeconfig
+      ansible.builtin.wait_for:
+        path: /etc/rancher/k3s/k3s.yaml
+        timeout: 180
+
+    - name: Wait for Kubernetes API readiness
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - --raw=/readyz
+      register: k3s_api_ready
+      retries: 60
+      delay: 5
+      until: k3s_api_ready.rc == 0
+      changed_when: false
+
+    - name: Wait for Kubernetes node readiness
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - wait
+          - node
+          - --all
+          - --for=condition=Ready
+          - --timeout=300s
+      changed_when: false
+
+    - name: Create private kubeconfig directory for tmachine
+      ansible.builtin.file:
+        path: /home/tmachine/.kube
+        state: directory
+        owner: tmachine
+        group: tmachine
+        mode: "0700"
+
+    - name: Expose guest-local kubeconfig to later qualification phases
+      ansible.builtin.copy:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "{{ kubeconfig }}"
+        remote_src: true
+        owner: tmachine
+        group: tmachine
+        mode: "0600"
+      no_log: true
+
+    - name: Read effective k3s version
+      ansible.builtin.command: k3s version
+      register: k3s_version_result
+      changed_when: false
+
+    - name: Read effective Kubernetes version
+      ansible.builtin.command: k3s kubectl version -o json
+      register: kubernetes_version_result
+      changed_when: false
+
+    - name: Read Kubernetes node state
+      ansible.builtin.command: k3s kubectl get nodes -o wide
+      register: kubernetes_nodes_result
+      changed_when: false
+
+    - name: Report cluster qualification inputs
+      ansible.builtin.debug:
+        msg:
+          - "{{ k3s_version_result.stdout_lines }}"
+          - "{{ kubernetes_version_result.stdout_lines }}"
+          - "{{ kubernetes_nodes_result.stdout_lines }}"
+          - "kubeconfig={{ kubeconfig }} (guest-local, mode 0600)"

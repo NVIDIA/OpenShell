@@ -1,0 +1,95 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Collect sanitized disposable Kubernetes guest diagnostics
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    sensitive_line: '(?i)^.*(?:token|password|secret|credential|authorization|bearer|private.key|BEGIN).*'
+  tasks:
+    - name: Read guest identity
+      ansible.builtin.command: uname -a
+      register: guest_identity
+      changed_when: false
+      failed_when: false
+
+    - name: Read systemd unit state
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - "{{ item }}"
+          - --property=ActiveState,SubState,Result,ExecMainStatus
+      loop:
+        - k3s.service
+        - openshell-gateway.service
+      register: unit_state
+      changed_when: false
+      failed_when: false
+
+    - name: Read recent k3s and gateway journal
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - --no-pager
+          - --output=short-iso
+          - --lines=150
+          - --unit
+          - "{{ item }}"
+      loop:
+        - k3s.service
+        - openshell-gateway.service
+      register: service_journal
+      changed_when: false
+      failed_when: false
+
+    - name: Read effective k3s and Kubernetes versions
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - k3s version
+        - k3s kubectl version -o json
+      register: cluster_versions
+      changed_when: false
+      failed_when: false
+
+    - name: Read Kubernetes node and pod state
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - "{{ item }}"
+          - --all-namespaces
+          - -o
+          - wide
+      loop:
+        - nodes
+        - pods
+      register: cluster_state
+      changed_when: false
+      failed_when: false
+
+    - name: Read recent Kubernetes events
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - events
+          - --all-namespaces
+          - --sort-by=.lastTimestamp
+      register: cluster_events
+      changed_when: false
+      failed_when: false
+
+    - name: Report sanitized guest, service, cluster, gateway, and sandbox state
+      ansible.builtin.debug:
+        msg:
+          guest: "{{ guest_identity.stdout_lines }}"
+          systemd: "{{ unit_state.results | map(attribute='stdout_lines') | list }}"
+          journal: "{{ service_journal.results | map(attribute='stdout_lines') | flatten | map('regex_replace', sensitive_line, '[redacted]') | list }}"
+          versions: "{{ cluster_versions.results | map(attribute='stdout_lines') | flatten | list }}"
+          nodes_and_pods: "{{ cluster_state.results | map(attribute='stdout_lines') | flatten | map('regex_replace', sensitive_line, '[redacted]') | list }}"
+          events: "{{ cluster_events.stdout_lines | map('regex_replace', sensitive_line, '[redacted]') | list }}"

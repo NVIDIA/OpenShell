@@ -26,6 +26,10 @@ pub struct Environment {
     pub name: String,
     pub machine: String,
     pub setup: Setup,
+    #[serde(default)]
+    pub variables: BTreeMap<String, String>,
+    #[serde(default)]
+    pub ephemeral: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -57,5 +61,51 @@ impl Config {
             .with_context(|| format!("failed to read configuration from {}", path.display()))?;
         serde_saphyr::from_str(&yaml)
             .with_context(|| format!("failed to parse configuration from {}", path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn environment_cluster_values_are_independent_of_installer_and_testsuite() {
+        let config: Config = serde_saphyr::from_str(
+            r#"
+machines:
+  - name: ubuntu
+    base_image: /tmp/ubuntu.qcow2
+environments:
+  - name: ubuntu-k3s
+    machine: ubuntu
+    ephemeral: true
+    variables:
+      kubeconfig: /home/tmachine/.kube/config
+      kubernetes_namespace: openshell
+    setup:
+      use_galaxy: false
+      playbooks: [k3s.yaml]
+installers:
+  - name: kubernetes-binaries
+    use_galaxy: false
+    playbooks: [gateway-kubernetes.yaml]
+    inputs: {}
+testsuites:
+  - name: conformance
+    playbooks: [conformance.yaml]
+    inputs: {}
+"#,
+        )
+        .unwrap();
+
+        let environment = &config.environments[0];
+        assert!(environment.ephemeral);
+        assert_eq!(
+            environment.variables["kubeconfig"],
+            "/home/tmachine/.kube/config"
+        );
+        assert_eq!(environment.variables["kubernetes_namespace"], "openshell");
+        assert_eq!(config.installers[0].name, "kubernetes-binaries");
+        assert_eq!(config.testsuites[0].name, "conformance");
     }
 }

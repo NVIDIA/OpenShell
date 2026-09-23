@@ -18,6 +18,7 @@ pub(super) async fn cached_layer(
     use_galaxy: bool,
     playbooks: &[PathBuf],
     inputs: &BTreeMap<String, PathBuf>,
+    variables: &BTreeMap<String, String>,
 ) -> Result<PathBuf> {
     let project_dirs = ProjectDirs::from("com", "nvidia", "tmachine").unwrap();
     let disks_dir = project_dirs.cache_dir().join("disks");
@@ -39,9 +40,9 @@ pub(super) async fn cached_layer(
 
     let image = QemuImage::create(base_image, temporary_disk.clone()).await;
     let vm = QemuVm::start(&image).await;
-    run_playbooks(playbooks, inputs).await?;
-    vm.shutdown().await;
-    vm.wait().await;
+    let result = run_playbooks(playbooks, inputs, variables).await;
+    vm.stop().await?;
+    result?;
 
     std::fs::rename(temporary_disk, &disk).unwrap();
     Ok(disk)
@@ -50,13 +51,24 @@ pub(super) async fn cached_layer(
 pub(super) async fn run_playbooks(
     playbooks: &[PathBuf],
     inputs: &BTreeMap<String, PathBuf>,
+    variables: &BTreeMap<String, String>,
 ) -> Result<()> {
     for playbook in playbooks {
-        crate::ansible::run(playbook, inputs)
+        crate::ansible::run(playbook, inputs, variables)
             .await
             .with_context(|| format!("failed to run playbook {}", playbook.display()))?;
     }
     Ok(())
+}
+
+pub(super) fn hash_variables(hasher: &mut Hasher, variables: &BTreeMap<String, String>) {
+    hasher.update(&(variables.len() as u64).to_le_bytes());
+    for (name, value) in variables {
+        hasher.update(&(name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
 }
 
 pub(super) fn hash_inputs(hasher: &mut Hasher, inputs: &BTreeMap<String, PathBuf>) -> Result<()> {

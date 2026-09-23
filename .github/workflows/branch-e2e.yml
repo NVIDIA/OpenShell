@@ -224,6 +224,7 @@ jobs:
       test-matrix: >-
         [
           {"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"conformance"},
+          {"environment":"ubuntu-k3s","installer":"kubernetes-binaries","testsuite":"conformance"},
           {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"conformance"},
           {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"conformance"}
         ]

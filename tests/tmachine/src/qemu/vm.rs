@@ -9,6 +9,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 
+use anyhow::{Context, Result};
 use tempfile::{TempDir, tempdir};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -38,43 +39,73 @@ impl QemuVm {
         Self { child, runtime_dir }
     }
 
-    pub(super) async fn wait(mut self) {
-        let status = self.child.wait().await.unwrap();
-        assert!(status.success());
+    pub(super) async fn stop(mut self) -> Result<()> {
+        if self.child.try_wait().context("check QEMU guest state")?.is_some() {
+            return Ok(());
+        }
+        if let Err(error) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), self.shutdown())
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("QEMU shutdown timed out")))
+        {
+            eprintln!("QEMU graceful shutdown failed: {error:#}; terminating guest");
+            if self.child.try_wait().context("check QEMU guest state")?.is_none() {
+                self.child.start_kill().context("kill QEMU guest")?;
+            }
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(30), self.child.wait()).await {
+            Ok(status) => {
+                status.context("wait for QEMU guest")?;
+            }
+            Err(_) => {
+                if self.child.try_wait().context("check QEMU guest state")?.is_none() {
+                    self.child
+                        .start_kill()
+                        .context("kill unresponsive QEMU guest")?;
+                }
+                self.child.wait().await.context("reap QEMU guest")?;
+            }
+        }
+        Ok(())
     }
 
-    pub(super) async fn shutdown(&self) {
+    async fn shutdown(&self) -> Result<()> {
         let stream = UnixStream::connect(self.runtime_dir.path().join("qmp.sock"))
             .await
-            .unwrap();
+            .context("connect QEMU monitor")?;
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         let mut response = String::new();
 
-        reader.read_line(&mut response).await.unwrap();
+        reader.read_line(&mut response).await?;
 
         writer
             .write_all(b"{\"execute\":\"qmp_capabilities\"}\r\n")
-            .await
-            .unwrap();
+            .await?;
         response.clear();
-        reader.read_line(&mut response).await.unwrap();
-        assert!(response.contains("\"return\""));
+        reader.read_line(&mut response).await?;
+        anyhow::ensure!(
+            response.contains("\"return\""),
+            "QEMU monitor rejected capabilities"
+        );
 
         writer
             .write_all(b"{\"execute\":\"system_powerdown\"}\r\n")
-            .await
-            .unwrap();
+            .await?;
 
         loop {
             response.clear();
-            let bytes_read = reader.read_line(&mut response).await.unwrap();
-            assert_ne!(bytes_read, 0);
+            let bytes_read = reader.read_line(&mut response).await?;
+            anyhow::ensure!(
+                bytes_read != 0,
+                "QEMU monitor closed before shutdown response"
+            );
 
             if response.contains("\"return\"") {
                 break;
             }
         }
+        Ok(())
     }
 }
 
