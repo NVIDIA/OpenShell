@@ -264,6 +264,10 @@ for explicit publication.
 CLI conformance runs after target provisioning and operates only through the
 configured OpenShell CLI. The smoke scenario verifies the black-box sandbox
 lifecycle by creating, inspecting, executing in, and deleting a sandbox. The
+dedicated sandbox-lifecycle scenarios verify stop/start persistence, a bounded
+two-sandbox startup burst across the supervisor's initial reconnect, and a
+deterministic in-flight relay across a forced reconnect when the driver supplies
+a helper. The guest runs at most two archive tests concurrently. The
 file-transfer scenario verifies portable upload and download behavior, Git-aware
 filtering, and sandbox workspace path safety.
 Feature suites use the same disposable guest but may provision isolated
@@ -314,6 +318,9 @@ with musl, and the gateway and supervisor with GNU. Image assembly stages
 the gateway, sandbox, and supervisor as separate binaries for their respective
 Dockerfiles. The helpers stage binaries under `artifacts/binaries` so local and
 CI builds expose the same inputs to tmachine and image assembly. The Ubuntu
+tmachine conformance tests consume the staged nextest archive, so local source
+changes to those tests require `nix run .#build-artifacts-test-archives` before
+running tmachine. The Ubuntu
 Docker and Fedora Podman environments import both local runtime images and
 configure the gateway to use them. The Ubuntu `deb` installer consumes
 `artifacts/packages/openshell.deb`; the `binaries` installer remains available
