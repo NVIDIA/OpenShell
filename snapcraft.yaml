@@ -45,6 +45,9 @@ description: |
 base: core24
 grade: stable
 confinement: strict
+assumes:
+  # The system :docker slot was added in snapd 2.76
+  - snapd2.76
 license: Apache-2.0
 website: https://docs.nvidia.com/openshell/latest/index.html
 source-code: https://github.com/NVIDIA/OpenShell
