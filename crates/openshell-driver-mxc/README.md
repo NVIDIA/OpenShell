@@ -49,8 +49,11 @@ wxc_exec_path = "C:\\path\\to\\wxc-exec.exe"
 # Default: process_container. isolation_session is grant-only and opt-in.
 backend = "process_container"
 default_configuration_id = "composable"
-pc_least_privilege = false
-pc_capabilities = []
+# Default: false. Leave enabled; without it the sandbox can reach host services
+# that issue network requests on its behalf. registryRead lets Winsock
+# initialize and grants no network access.
+pc_least_privilege = true
+pc_capabilities = ["registryRead"]
 # Pattern-C governed egress. The address is a loopback seed; each sandbox
 # receives a unique ephemeral proxy port.
 egress_proxy = false
