@@ -550,11 +550,15 @@ sent.
 `log_tail_lines` and `event_tail` bound the two tails independently, so their
 depths are routinely asymmetric — `event_tail` has no default, so `follow_events`
 without setting it replays no platform backlog at all. On connect, the server
-computes each followed source's **coverage floor** — the newest event that
-source's own window excluded — and withholds every event, from either source, at
-or above the smallest nonzero floor. A log event that clears the log bus's own
-floor can still sit at or past the platform bus's floor; handing it out would
-still let the client's cursor outrun platform's unreplayed backlog.
+computes each followed source's **coverage floor** — the *oldest* event that
+source's own window excluded, i.e. the smallest seq it cannot vouch for — and
+withholds every event, from either source, at or above the smallest nonzero
+floor. It has to be the oldest, not the newest: a source's own excluded set is a
+prefix of its own tail, but a sibling source's event can carry a seq strictly
+between that source's oldest and newest excluded items. A boundary drawn at the
+newest excluded item would let such a sibling event pass as safe, and handing it
+out would still let the client's cursor outrun the source's older, still-
+unreplayed backlog underneath it.
 
 This can withhold far more than either depth parameter alone implies — even the
 entire batch — whenever a followed sibling has any backlog the request didn't
