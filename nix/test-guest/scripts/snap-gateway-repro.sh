@@ -14,11 +14,10 @@ usage() {
 Usage: snap-gateway-repro.sh SNAP_FILE [ATTEMPTS] [READY_TIMEOUT_SECONDS]
 
 Install SNAP_FILE repeatedly using the Release Canary interface ordering.
-ATTEMPTS defaults to 1. READY_TIMEOUT_SECONDS defaults to 0, preserving the
-canary's immediate readiness check. Set it to a positive value to wait for
-automatic gateway recovery after the immediate check fails. Every failed
-attempt prints service, connection, snap-change, journal, gateway-log, and
-listener diagnostics.
+ATTEMPTS defaults to 1. READY_TIMEOUT_SECONDS defaults to 30, matching the
+Release Canary readiness window. Set it to 0 to require the intentionally
+stricter immediate readiness check. Every failed attempt prints service,
+connection, snap-change, journal, gateway-log, and listener diagnostics.
 EOF
 }
 
@@ -29,7 +28,7 @@ fi
 
 snap_file=$1
 attempts=${2:-1}
-ready_timeout=${3:-0}
+ready_timeout=${3:-30}
 if [ ! -f "${snap_file}" ]; then
 	echo "Snap file does not exist: ${snap_file}" >&2
 	exit 2
@@ -92,8 +91,8 @@ for attempt in $(seq 1 "${attempts}"); do
 		continue
 	fi
 
-	# This deliberately does not wait for the listener. It mirrors the canary
-	# and exposes a daemon that fails or races after late interface connections.
+	# Probe immediately, then allow the same recovery window as the canary unless
+	# the caller requests the stricter zero-timeout mode.
 	if ! runuser -u openshell -- /snap/bin/openshell gateway add \
 		http://127.0.0.1:17670 --local --name snap-docker ||
 		! runuser -u openshell -- /snap/bin/openshell gateway select snap-docker ||
@@ -102,7 +101,7 @@ for attempt in $(seq 1 "${attempts}"); do
 			echo "Gateway recovered automatically within ${ready_timeout}s"
 			continue
 		fi
-		echo "Gateway was not usable immediately after interface connection" >&2
+		echo "Gateway was not usable within ${ready_timeout}s after interface connection" >&2
 		diagnostics "${attempt}"
 		failures=$((failures + 1))
 	fi

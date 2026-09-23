@@ -314,12 +314,13 @@ nix run .#test-guest -- \
   --keep \
   --copy ./openshell_*.snap:/tmp/openshell.snap \
   --copy ./nix/test-guest/scripts/snap-gateway-repro.sh:/usr/local/bin/snap-gateway-repro \
-  -- sudo /usr/local/bin/snap-gateway-repro /tmp/openshell.snap 10 30
+  -- sudo /usr/local/bin/snap-gateway-repro /tmp/openshell.snap 10
 ```
 
 `--keep` retains the overlay and serial log when diagnosing a failure. The
-runner prints their location after shutdown. The final `30` accepts automatic
-recovery for up to 30 seconds; omit it to require the canary's immediate check.
+runner prints their location after shutdown. The reproduction defaults to the
+same 30-second readiness window as Release Canary. Pass `0` as the final
+argument to require the intentionally stricter immediate-readiness check.
 
 
 The destination must be an absolute guest path. Use bare octal permission bits
