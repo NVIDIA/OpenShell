@@ -43,6 +43,20 @@ pub const STREAM_STDIN_CLOSED: u8 = 4;
 pub const STREAM_NETWORK_DECISION: u8 = 5;
 pub const MAX_STREAM_FRAME_BYTES: usize = 64 * 1024;
 
+// Every relay, exec, and control exchange shares one HTTP/2 connection. The
+// connection window must exceed what all streams can hold unread, otherwise
+// stalled relays starve DNS and control traffic of connection-level credit.
+// h2 keeps at least two thirds of `connection - in-flight` advertised, so the
+// reserve stays usable even with every stream stalled at its window.
+pub const BOUNDARY_MAX_CONCURRENT_STREAMS: u32 = 128;
+pub const BOUNDARY_STREAM_WINDOW_BYTES: u32 = 256 * 1024;
+pub const BOUNDARY_CONNECTION_WINDOW_RESERVE_BYTES: u32 = 16 * 1024 * 1024;
+pub const BOUNDARY_CONNECTION_WINDOW_BYTES: u32 = BOUNDARY_MAX_CONCURRENT_STREAMS
+    * BOUNDARY_STREAM_WINDOW_BYTES
+    + BOUNDARY_CONNECTION_WINDOW_RESERVE_BYTES;
+// HTTP/2 caps any flow-control window at 2^31 - 1.
+const _: () = assert!(BOUNDARY_CONNECTION_WINDOW_BYTES <= i32::MAX as u32);
+
 /// Capability masks measured from `/proc/<pid>/status` by the `OpenShell`
 /// co-located runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

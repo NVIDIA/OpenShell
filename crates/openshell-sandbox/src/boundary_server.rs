@@ -49,8 +49,8 @@ mod linux {
         isolation_boundary_server::{IsolationBoundary, IsolationBoundaryServer},
     };
     use openshell_sandbox_backend::sandbox_auth::{
-        SandboxConnectionId, SandboxConnectionRegistry, SandboxProtocolAuthenticator,
-        SandboxProtocolPrincipal,
+        SandboxAuthError, SandboxConnectionId, SandboxConnectionRegistry,
+        SandboxProtocolAuthenticator, SandboxProtocolPrincipal,
     };
     use openshell_sandbox_backend::{
         ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM, GPU_RESOURCE_CLAIM,
@@ -59,7 +59,8 @@ mod linux {
     use tokio_stream::wrappers::ReceiverStream;
 
     use openshell_sandbox_backend::boundary_protocol::{
-        AgentSpecWire, BinaryIdentityWire, BoundaryConfig, BoundaryErrorKind,
+        AgentSpecWire, BOUNDARY_CONNECTION_WINDOW_BYTES, BOUNDARY_MAX_CONCURRENT_STREAMS,
+        BOUNDARY_STREAM_WINDOW_BYTES, BinaryIdentityWire, BoundaryConfig, BoundaryErrorKind,
         BoundaryListener as BoundaryListenerConfig, DnsQueryResultWire, ExecSpecWire,
         ExitStatusWire, MediationTimingWire, NativeLinuxSandboxAuditEvidence, OutputWindowWire,
         ProcessKindWire, ProcessSnapshotWire, Request, RequestEnvelope, Response, ResponseEnvelope,
@@ -598,12 +599,9 @@ mod linux {
         let result = tonic::transport::Server::builder()
             .http2_keepalive_interval(Some(CONTROL_KEEPALIVE_INTERVAL))
             .http2_keepalive_timeout(Some(CONTROL_KEEPALIVE_TIMEOUT))
-            .max_concurrent_streams(
-                u32::try_from(MAX_CONTROL_CONNECTIONS)
-                    .map_err(|error| format!("invalid control connection limit: {error}"))?,
-            )
-            .initial_stream_window_size(16 * 1024 * 1024)
-            .initial_connection_window_size(16 * 1024 * 1024)
+            .max_concurrent_streams(BOUNDARY_MAX_CONCURRENT_STREAMS)
+            .initial_stream_window_size(BOUNDARY_STREAM_WINDOW_BYTES)
+            .initial_connection_window_size(BOUNDARY_CONNECTION_WINDOW_BYTES)
             .add_service(
                 IsolationBoundaryServer::new(GrpcBoundaryService {
                     runtime: runtime.clone(),
@@ -1277,17 +1275,24 @@ mod linux {
         };
         let is_attach = supervisor_instance_id.is_some();
         let is_confirm = matches!(&request.request, Request::Confirm);
-        let response = ResponseEnvelope {
+        let mut response = ResponseEnvelope {
             request_id: request.request_id.clone(),
             response: runtime.dispatch(request),
         };
+        // Report commit failures to the supervisor: a silently closed stream
+        // is indistinguishable from transport loss.
         if is_attach && matches!(&response.response, Response::Attached { .. }) {
             let supervisor_instance_id = supervisor_instance_id
                 .ok_or_else(|| "attach request lost supervisor instance identity".to_string())?;
-            runtime.commit_attach(principal, supervisor_instance_id)?;
+            if let Err((kind, message)) = runtime.commit_attach(principal, supervisor_instance_id) {
+                response.response = guest_error(kind, message);
+            }
         }
-        if is_confirm && matches!(&response.response, Response::Confirmed { .. }) {
-            runtime.commit_confirm(principal)?;
+        if is_confirm
+            && matches!(&response.response, Response::Confirmed { .. })
+            && let Err((kind, message)) = runtime.commit_confirm(principal)
+        {
+            response.response = guest_error(kind, message);
         }
         write_frame(&mut stream, &response)
             .map_err(|error| format!("write control frame: {error}"))?;
@@ -1637,22 +1642,22 @@ mod linux {
             &self,
             principal: &SandboxProtocolPrincipal,
             supervisor_instance_id: openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId,
-        ) -> Result<(), String> {
+        ) -> Result<(), CommitError> {
             if let Some(replaced) = self
                 .connections
                 .attach(principal, supervisor_instance_id)
-                .map_err(|error| error.to_string())?
+                .map_err(connection_auth_error)?
             {
                 self.close_connection(replaced);
             }
             Ok(())
         }
 
-        fn commit_confirm(&self, principal: &SandboxProtocolPrincipal) -> Result<(), String> {
+        fn commit_confirm(&self, principal: &SandboxProtocolPrincipal) -> Result<(), CommitError> {
             let replaced = self
                 .connections
                 .confirm(principal)
-                .map_err(|error| error.to_string())?;
+                .map_err(connection_auth_error)?;
             let process = {
                 let state = lock(&self.state);
                 match &*state {
@@ -1669,13 +1674,19 @@ mod linux {
                     SupervisorConnectionState::Terminating | SupervisorConnectionState::Terminal
                 ) {
                     self.connections.mark_terminal();
-                    return Err("sandbox session is terminating".to_string());
+                    return Err((
+                        BoundaryErrorKind::Terminated,
+                        "sandbox session is terminating".to_string(),
+                    ));
                 }
                 if matches!(*connection, SupervisorConnectionState::Frozen { .. })
                     && let Some(process) = process
                 {
                     if !process.boundary_runtime.resume() {
-                        return Err("frozen workload could not be resumed".to_string());
+                        return Err((
+                            BoundaryErrorKind::Process,
+                            "frozen workload could not be resumed".to_string(),
+                        ));
                     }
                     tracing::info!(
                         connection_id = ?principal.connection_id(),
@@ -3066,6 +3077,17 @@ mod linux {
         )
     }
 
+    type CommitError = (BoundaryErrorKind, String);
+
+    fn connection_auth_error(error: SandboxAuthError) -> CommitError {
+        let kind = match error {
+            SandboxAuthError::ConnectionStillActive => BoundaryErrorKind::Unavailable,
+            SandboxAuthError::TerminalSession => BoundaryErrorKind::Terminated,
+            _ => BoundaryErrorKind::Denied,
+        };
+        (kind, error.to_string())
+    }
+
     fn guest_error(kind: BoundaryErrorKind, message: impl Into<String>) -> Response {
         Response::Error {
             kind,
@@ -4032,6 +4054,19 @@ mod linux {
                 *lock(&runtime.supervisor_connection),
                 SupervisorConnectionState::Connected(first_id)
             );
+            let early = runtime
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &token).metadata(),
+                )
+                .expect("early replacement principal");
+            assert!(
+                matches!(
+                    runtime.commit_attach(&early, supervisor_instance_id),
+                    Err((BoundaryErrorKind::Unavailable, _))
+                ),
+                "reattach before the old transport is retired must be retryable"
+            );
 
             runtime.transport_disconnected(first_id);
             let connection_state = *lock(&runtime.supervisor_connection);
@@ -4054,7 +4089,7 @@ mod linux {
                 .expect("reattach replacement");
             assert_eq!(
                 runtime.connections.require_active(&replacement),
-                Err(openshell_sandbox_backend::sandbox_auth::SandboxAuthError::ConnectionNotAttached)
+                Err(SandboxAuthError::ConnectionNotAttached)
             );
             runtime
                 .commit_confirm(&replacement)
@@ -4130,7 +4165,7 @@ mod linux {
             );
             assert_eq!(
                 runtime.connections.require_active(&principal),
-                Err(openshell_sandbox_backend::sandbox_auth::SandboxAuthError::TerminalSession)
+                Err(SandboxAuthError::TerminalSession)
             );
         }
 

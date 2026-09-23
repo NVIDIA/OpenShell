@@ -27,6 +27,12 @@ TCP Service, or VM vsock channel. Independent bidirectional `Exchange` RPCs
 carry lifecycle, exec, TCP, and forwarding traffic, while one persistent
 bidirectional `Mediate` RPC carries multiplexed DNS traffic. General application
 UDP is unsupported; UDP DNS remains mediated by the supervisor.
+Both ends size HTTP/2 flow control so the connection window exceeds the
+per-stream window times the concurrent-stream limit plus a reserve. Relays whose
+workload stops reading therefore stall only their own streams and cannot starve
+DNS, exec, or control traffic of connection-level credit. The supervisor caps
+concurrent TCP relay and pending-accept streams below the stream limit, so new
+workload connections queue before control exchanges lose stream slots.
 The sandbox probes HTTP/2 connection liveness every five seconds and closes
 connections that miss a ten-second acknowledgement deadline. Closing a
 connection freezes the owned workload process tree and cancels its stream
@@ -39,6 +45,12 @@ credentials to claim the existing runtime generation. Confirmation resumes the
 workload; expiration terminates it. A credential replacement does not displace
 the active connection until the new connection is confirmed. Idle healthy
 connections remain usable.
+A failed stream alone does not trigger reconnection. The supervisor first
+reconfirms on the current connection and keeps it if the boundary answers.
+Otherwise it closes that transport before replaying attach, and retries while
+the sandbox still reports the equal-epoch connection as active, until the
+boundary observes the disconnect. The sandbox reports attach and confirm
+rejections as typed errors rather than closing the stream.
 TCP mediation accepts use the same authenticated transport recovery as process waits. A healthy idle accept has no timeout. An interrupted pending open fails closed, while a replacement accept waits for new workload traffic; decisions and established byte streams are not replayed. Boundary rejections and failed recovery remain terminal to the proxy.
 
 A renewed Sandbox Protocol bearer is authenticated even when its credential epoch is unchanged. The supervisor confirms that bearer on the active physical connection and records its fingerprint only after confirmation succeeds, preserving pending streams and the mediation session. Changing the credential epoch still requires an authenticated replacement connection.
