@@ -1,0 +1,110 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "TypeScript SDK"
+sidebar-title: "TypeScript"
+description: "Install the OpenShell TypeScript SDK, connect to a gateway, and manage a sandbox."
+keywords: "OpenShell, SDK, TypeScript, Node.js, Connect, gRPC, Sandbox"
+position: 4
+---
+
+Use the TypeScript SDK in Node.js applications and automation. It provides a
+curated sandbox API and a raw generated client for the full gateway RPC surface.
+Use the SDK and gateway from the same OpenShell release when possible.
+
+## Install the SDK
+
+The package requires Node.js 20.3 or later and is currently distributed through
+GitHub Packages. Configure the `@nvidia` scope in your project `.npmrc`:
+
+```text
+@nvidia:registry=https://npm.pkg.github.com
+```
+
+Authenticate npm with a GitHub token that has `read:packages`, then install the
+package:
+
+```shell
+npm install @nvidia/openshell-sdk
+```
+
+## Connect to a Gateway
+
+`OpenShellClient.connect()` accepts a gateway URL. It constructs a lazy client,
+so call `health()` when startup must verify connectivity:
+
+```ts
+import { OpenShellClient } from '@nvidia/openshell-sdk'
+
+const client = await OpenShellClient.connect({
+  gateway: 'https://gateway.example.com',
+  oidcToken: process.env.OPENSHELL_TOKEN,
+})
+
+const health = await client.health()
+console.log(`${health.status}: ${health.version}`)
+```
+
+For long-running OIDC service automation, use a renewable client-credentials
+provider:
+
+```ts
+import { clientCredentials, OpenShellClient } from '@nvidia/openshell-sdk'
+
+const client = await OpenShellClient.connect({
+  gateway: 'https://gateway.example.com',
+  oidcTokenProvider: clientCredentials({
+    issuer: 'https://idp.example.com/realms/openshell',
+    clientId: 'openshell-service',
+    clientSecret: () => process.env.OPENSHELL_OIDC_CLIENT_SECRET!,
+    audience: 'openshell-gateway',
+  }),
+})
+```
+
+The provider retains credentials and tokens in memory and renews the access
+token before expiry.
+
+## Create and Use a Sandbox
+
+The curated client uses the `default` workspace unless you pass `workspace` in
+an operation's options:
+
+```ts
+const sandbox = await client.sandbox.create({
+  name: 'sdk-example',
+  image: 'registry.example.com/team/python-agent:1.0',
+})
+
+await client.sandbox.waitReady(sandbox.name, 120)
+
+const result = await client.sandbox.exec(
+  sandbox.name,
+  ['python', '-c', "print('hello from OpenShell')"],
+)
+console.log(result.stdout.toString())
+
+const deletion = await client.sandbox.delete(sandbox.name)
+if (deletion.outcome === 'accepted') {
+  await client.sandbox.waitDeleted(sandbox.name, 60, {
+    expectedSandboxId: deletion.sandboxId,
+  })
+}
+```
+
+`client.sandbox` also supports streaming and interactive exec, TCP forwarding,
+SSH sessions, sandbox provider attachment, configuration, and policy. Close
+operation-scoped streams and forwarding handles when finished. The root client
+does not retain a dedicated session and has no `close()` method.
+
+## Use the Raw Client
+
+Use `client.raw` for RPCs that the curated clients do not yet wrap. Import
+generated message schemas and types from `@nvidia/openshell-sdk/raw`. Raw calls
+return protobuf wire shapes, while curated calls return SDK-specific types.
+
+## Next Steps
+
+- Review [Gateway Authentication](/reference/gateway-auth) for OIDC and service authentication.
+- Review [API Errors](/reference/api-errors) for structured error handling.
+- See the [TypeScript SDK source documentation](https://github.com/NVIDIA/OpenShell/tree/main/sdk/typescript) for streaming, forwarding, and raw client examples.

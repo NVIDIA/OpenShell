@@ -1,8 +1,8 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Provider-backed Inference"
-sidebar-title: "Provider-backed Inference"
+title: "Inference"
+sidebar-title: "Inference"
 description: "Grant a sandbox access to model providers through provider profiles, attachments, and native endpoints."
 keywords: "Generative AI, Cybersecurity, Inference, Provider Profiles, Credentials, LLM"
 position: 8
@@ -60,6 +60,7 @@ openshell provider create \
 
 openshell sandbox create \
   --name inference-demo \
+  --from registry.example.com/team/python-agent:1.0 \
   --provider nvidia-prod \
   -- python app.py
 ```
@@ -161,6 +162,7 @@ openshell provider create --name ollama --type ollama-openai
 
 openshell sandbox create \
   --name ollama-client \
+  --from registry.example.com/team/python-agent:1.0 \
   --provider ollama \
   --env OPENAI_BASE_URL=http://host.openshell.internal:11434/v1 \
   -- python app.py
@@ -295,7 +297,7 @@ Special cases require additional work:
 - Host-local services need `host.openshell.internal` or a reachable LAN/service
   hostname, not `127.0.0.1` or `localhost`.
 - Google Vertex AI clients must use the native Vertex endpoint and
-  authentication behavior. See [Google Vertex AI](/providers/google-vertex-ai).
+  authentication behavior. See [Google](/providers/google-cloud#vertex-ai).
 - A bridge-fronted AWS Bedrock deployment needs a custom profile that declares
   the bridge endpoint and allowed client binaries.
 
@@ -313,4 +315,4 @@ headers, model selection, request shape, streaming, and timeout behavior.
 - [Profiles](/providers/profiles)
 - [Providers](/sandboxes/manage-providers)
 - [Customize Sandbox Policies](/sandboxes/policies)
-- [Google Vertex AI](/providers/google-vertex-ai)
+- [Google](/providers/google-cloud#vertex-ai)

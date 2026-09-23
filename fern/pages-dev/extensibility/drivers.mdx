@@ -1,0 +1,40 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Drivers"
+description: "Understand the compute and credential driver extension points in OpenShell."
+keywords: "OpenShell Extensions, Compute Drivers, Credential Drivers, Extensibility"
+---
+
+OpenShell uses drivers to connect the gateway to workload runtimes and
+credential stores. Drivers implement a stable capability boundary while the
+gateway owns the public API, authorization, workspace scoping, and resource
+lifecycle.
+
+## Compute Drivers
+
+Compute drivers create, inspect, and delete sandbox workloads. OpenShell ships
+drivers for Kubernetes, Docker, Podman, virtual machines, and Windows MXC. An
+external compute driver communicates with the gateway over a Unix domain
+socket and negotiates its protocol version and capabilities before serving
+requests.
+
+For built-in driver configuration and behavior, refer to
+[Runtimes](/reference/sandbox-compute-drivers).
+
+## Credential Drivers
+
+Credential drivers store provider credentials behind opaque handles. The
+gateway resolves those handles when a provider is attached without persisting
+the secret value in the provider record. OpenShell includes database,
+Kubernetes Secret, and Vault-compatible credential drivers.
+
+Configure the active credential driver in the
+[Gateway Configuration](/reference/gateway-config#credential-drivers).
+
+## Compatibility
+
+Drivers exchange peer metadata with the gateway and advertise their extension
+family capability. Upgrade both peers together when the protocol version
+changes. Refer to [Extensibility Overview](/extensibility/extension-negotiation)
+for the negotiation contract.

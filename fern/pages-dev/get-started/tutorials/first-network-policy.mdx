@@ -19,8 +19,9 @@ After completing this tutorial, you understand:
 
 ## Prerequisites
 
-- A working OpenShell installation. Complete the [Quickstart](/get-started/quickstart) before proceeding.
+- A working OpenShell installation with an active gateway. Refer to [Installation](/about/installation) before proceeding.
 - Docker Desktop running on your machine.
+- A user-owned workload image with `curl` installed.
 
 <Tip>
 To run every step of this tutorial, you can also use the automated demo script at the [examples/sandbox-policy-quickstart](https://github.com/NVIDIA/OpenShell/blob/main/examples/sandbox-policy-quickstart) directory in the NVIDIA OpenShell repository. It runs the full walkthrough in under a minute but without any user interaction.
@@ -38,7 +39,10 @@ bash examples/sandbox-policy-quickstart/demo.sh
 Start by creating a sandbox with no network policies. This gives you a clean environment to observe default-deny behavior.
 
 ```shell
-openshell sandbox create --name demo --no-auto-providers
+openshell sandbox create \
+  --name demo \
+  --from registry.example.com/team/agent-tools:1.0 \
+  --no-auto-providers
 ```
 
 `--no-auto-providers` skips the provider setup prompt since this tutorial uses `curl` instead of an AI agent.

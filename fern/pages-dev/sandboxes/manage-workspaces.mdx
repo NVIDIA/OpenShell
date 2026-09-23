@@ -1,8 +1,8 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Manage Workspaces and Access"
-sidebar-title: "Workspaces and Access"
+title: "Workspaces"
+sidebar-title: "Workspaces"
 description: "Create OpenShell workspaces, assign members, and understand platform and workspace roles."
 keywords: "Generative AI, Cybersecurity, Workspaces, Access Control, RBAC, OIDC, Membership, CLI"
 position: 3
@@ -141,7 +141,11 @@ can appear before or after the subcommand.
 ```shell
 openshell sandbox list --workspace team-ml
 openshell provider list --workspace team-ml
-openshell sandbox create --workspace team-ml --name research -- bash
+openshell sandbox create \
+  --workspace team-ml \
+  --name research \
+  --from registry.example.com/team/agent-tools:1.0 \
+  -- bash
 ```
 
 Set a default for the current shell with `OPENSHELL_WORKSPACE`:

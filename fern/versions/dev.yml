@@ -2,28 +2,115 @@ landing-page:
   page: Home
   path: ../pages-dev/index.mdx
 navigation:
-- folder: ../pages-dev/about
-  title: About NVIDIA OpenShell
-- section: Get Started
-  slug: get-started
+- section: About NVIDIA OpenShell
+  slug: about
   contents:
-  - page: Quickstart
-    path: ../pages-dev/get-started/quickstart.mdx
-  - folder: ../pages-dev/get-started/tutorials
-    skip-slug: true
-- folder: ../pages-dev/sandboxes
-  title: Manage OpenShell
-- folder: ../pages-dev/providers
-  title: Providers
-- folder: ../pages-dev/extensibility
-  title: Extensibility
+  - page: Why OpenShell
+    path: ../pages-dev/about/overview.mdx
+  - page: Architecture
+    path: ../pages-dev/about/how-it-works.mdx
+  - page: Installation
+    path: ../pages-dev/about/installation.mdx
+  - page: Run Your First Agent
+    path: ../pages-dev/about/run-an-agent.mdx
+  - page: Support Matrix
+    path: ../pages-dev/reference/support-matrix.mdx
+- section: How It Works
+  slug: manage
+  contents:
+  - section: Gateways
+    slug: gateways
+    contents:
+    - page: Overview
+      path: ../pages-dev/sandboxes/manage-gateways.mdx
+    - page: Authentication
+      path: ../pages-dev/reference/gateway-auth.mdx
+    - page: Configuration
+      path: ../pages-dev/reference/gateway-config.mdx
+    - page: Container Deployment
+      path: ../pages-dev/reference/container-gateway.mdx
+  - page: Workspaces
+    path: ../pages-dev/sandboxes/manage-workspaces.mdx
+  - section: Sandboxes
+    slug: sandboxes
+    contents:
+    - page: Overview
+      path: ../pages-dev/sandboxes/manage-sandboxes.mdx
+    - page: Runtimes
+      path: ../pages-dev/reference/sandbox-compute-drivers.mdx
+  - section: Providers
+    slug: providers
+    contents:
+    - page: Overview
+      path: ../pages-dev/sandboxes/manage-providers.mdx
+    - page: Profiles
+      path: ../pages-dev/providers/profiles.mdx
+    - page: AWS
+      path: ../pages-dev/providers/aws-sigv4.mdx
+    - page: Google
+      path: ../pages-dev/providers/google-cloud.mdx
+  - section: Policies
+    slug: policies
+    contents:
+    - page: Overview
+      path: ../pages-dev/sandboxes/policies.mdx
+    - page: Advisor
+      path: ../pages-dev/sandboxes/policy-advisor.mdx
+    - page: Schema
+      path: ../pages-dev/reference/policy-schema.mdx
+    - page: Prover
+      path: ../pages-dev/reference/policy-prover.mdx
+    - page: Default Policy
+      path: ../pages-dev/reference/default-policy.mdx
+  - page: Inference
+    path: ../pages-dev/sandboxes/inference-routing.mdx
+- section: Extensibility
+  slug: extensibility
+  contents:
+  - page: Overview
+    path: ../pages-dev/extensibility/extension-negotiation.mdx
+  - page: Middleware
+    path: ../pages-dev/extensibility/supervisor-middleware.mdx
+  - page: Interceptors
+    path: ../pages-dev/extensibility/gateway-interceptors.mdx
+  - page: Drivers
+    path: ../pages-dev/extensibility/drivers.mdx
+  - page: Isolation Backends
+    path: ../pages-dev/extensibility/isolation-backends.mdx
 - folder: ../pages-dev/observability
   title: Observability
 - folder: ../pages-dev/kubernetes
   title: Kubernetes
-- folder: ../pages-dev/reference
-  title: Reference
+- section: Tutorials
+  slug: tutorials
+  contents:
+  - page: First Network Policy
+    path: ../pages-dev/get-started/tutorials/first-network-policy.mdx
+  - page: GitHub Push Access
+    path: ../pages-dev/get-started/tutorials/github-sandbox.mdx
+  - page: Microsoft Graph Provider Refresh
+    path: ../pages-dev/get-started/tutorials/microsoft-graph-provider-refresh.mdx
+- section: SDK Reference
+  slug: sdk
+  contents:
+  - page: Go
+    path: ../pages-dev/sdk/go.mdx
+  - page: Rust
+    path: ../pages-dev/sdk/rust.mdx
+  - page: Python
+    path: ../pages-dev/sdk/python.mdx
+  - page: TypeScript
+    path: ../pages-dev/sdk/typescript.mdx
+  - page: API Errors
+    path: ../pages-dev/reference/api-errors.mdx
+  - page: Protobuf Time Types
+    path: ../pages-dev/reference/protobuf-time-types.mdx
 - folder: ../pages-dev/security
   title: Security
+- section: Upgrade Guides
+  slug: upgrade
+  contents:
+  - page: 0.1.0
+    path: ../pages-dev/upgrade/0-1-0.mdx
 - folder: ../pages-dev/resources
   title: Resources

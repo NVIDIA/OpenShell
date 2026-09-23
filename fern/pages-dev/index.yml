@@ -6,28 +6,115 @@ landing-page:
   path: index.mdx
 
 navigation:
-- folder: about
-  title: "About NVIDIA OpenShell"
-- section: "Get Started"
-  slug: get-started
+- section: "About NVIDIA OpenShell"
+  slug: about
   contents:
-  - page: "Quickstart"
-    path: get-started/quickstart.mdx
-  - folder: get-started/tutorials
-    skip-slug: true
-- folder: sandboxes
-  title: "Manage OpenShell"
-- folder: providers
-  title: "Providers"
-- folder: extensibility
-  title: "Extensibility"
+  - page: "Why OpenShell"
+    path: about/overview.mdx
+  - page: "Architecture"
+    path: about/how-it-works.mdx
+  - page: "Installation"
+    path: about/installation.mdx
+  - page: "Run Your First Agent"
+    path: about/run-an-agent.mdx
+  - page: "Support Matrix"
+    path: reference/support-matrix.mdx
+- section: "How It Works"
+  slug: manage
+  contents:
+  - section: "Gateways"
+    slug: gateways
+    contents:
+    - page: "Overview"
+      path: sandboxes/manage-gateways.mdx
+    - page: "Authentication"
+      path: reference/gateway-auth.mdx
+    - page: "Configuration"
+      path: reference/gateway-config.mdx
+    - page: "Container Deployment"
+      path: reference/container-gateway.mdx
+  - page: "Workspaces"
+    path: sandboxes/manage-workspaces.mdx
+  - section: "Sandboxes"
+    slug: sandboxes
+    contents:
+    - page: "Overview"
+      path: sandboxes/manage-sandboxes.mdx
+    - page: "Runtimes"
+      path: reference/sandbox-compute-drivers.mdx
+  - section: "Providers"
+    slug: providers
+    contents:
+    - page: "Overview"
+      path: sandboxes/manage-providers.mdx
+    - page: "Profiles"
+      path: providers/profiles.mdx
+    - page: "AWS"
+      path: providers/aws-sigv4.mdx
+    - page: "Google"
+      path: providers/google-cloud.mdx
+  - section: "Policies"
+    slug: policies
+    contents:
+    - page: "Overview"
+      path: sandboxes/policies.mdx
+    - page: "Advisor"
+      path: sandboxes/policy-advisor.mdx
+    - page: "Schema"
+      path: reference/policy-schema.mdx
+    - page: "Prover"
+      path: reference/policy-prover.mdx
+    - page: "Default Policy"
+      path: reference/default-policy.mdx
+  - page: "Inference"
+    path: sandboxes/inference-routing.mdx
+- section: "Extensibility"
+  slug: extensibility
+  contents:
+  - page: "Overview"
+    path: extensibility/extension-negotiation.mdx
+  - page: "Middleware"
+    path: extensibility/supervisor-middleware.mdx
+  - page: "Interceptors"
+    path: extensibility/gateway-interceptors.mdx
+  - page: "Drivers"
+    path: extensibility/drivers.mdx
+  - page: "Isolation Backends"
+    path: extensibility/isolation-backends.mdx
 - folder: observability
   title: "Observability"
 - folder: kubernetes
   title: "Kubernetes"
-- folder: reference
-  title: "Reference"
+- section: "Tutorials"
+  slug: tutorials
+  contents:
+  - page: "First Network Policy"
+    path: get-started/tutorials/first-network-policy.mdx
+  - page: "GitHub Push Access"
+    path: get-started/tutorials/github-sandbox.mdx
+  - page: "Microsoft Graph Provider Refresh"
+    path: get-started/tutorials/microsoft-graph-provider-refresh.mdx
+- section: "SDK Reference"
+  slug: sdk
+  contents:
+  - page: "Go"
+    path: sdk/go.mdx
+  - page: "Rust"
+    path: sdk/rust.mdx
+  - page: "Python"
+    path: sdk/python.mdx
+  - page: "TypeScript"
+    path: sdk/typescript.mdx
+  - page: "API Errors"
+    path: reference/api-errors.mdx
+  - page: "Protobuf Time Types"
+    path: reference/protobuf-time-types.mdx
 - folder: security
   title: "Security"
+- section: "Upgrade Guides"
+  slug: upgrade
+  contents:
+  - page: "0.1.0"
+    path: upgrade/0-1-0.mdx
 - folder: resources
   title: "Resources"

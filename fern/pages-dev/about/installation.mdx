@@ -3,10 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Installation"
 sidebar-title: "Installation"
-description: "Install OpenShell, choose a compute driver, and connect to a gateway."
+description: "Install OpenShell, choose a sandbox runtime, and connect to a gateway."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Installation, Setup, Gateway, Docker, Podman, MicroVM, Kubernetes"
 position: 3
 ---
+
+Install OpenShell on a local workstation, choose the runtime that runs
+your sandboxes, and verify the package-managed gateway configuration.
 
 ## Install OpenShell
 
@@ -20,37 +23,35 @@ The script detects your operating system and installs the OpenShell CLI, standal
 
 You can also download release artifacts directly from the [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
 
-### Install a prerelease
-
-Prerelease packages are retained as GitHub Actions artifacts for 90 days and require an authenticated [GitHub CLI](https://cli.github.com/) session. The `pre` alias installs the latest prerelease:
-
-```shell
-gh auth login
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
-  OPENSHELL_VERSION=pre sh
-```
-
-The installer rejects expired candidates, downloads only the artifact required for your platform, and installs with Debian, RPM, or Homebrew. Installed packages retain the candidate's exact version, such as `0.1.0-pre.3`. Prerelease tags do not create entries on the GitHub Releases page.
-
-The `openshell` package on PyPI provides the Python SDK only. It does not install the `openshell` CLI. Add the SDK to a Python project with:
-
-```shell
-uv add openshell
-```
-
 Use `openshell status` to confirm the CLI can reach the gateway.
 
-## Supported Compute Drivers
+## Release Cadence
 
-OpenShell supports several local compute drivers. Package-managed gateways leave the driver unset by default so the gateway can auto-detect an available driver. Set `compute_driver` in the gateway TOML when you need to pin a specific driver.
+OpenShell publishes stable versions as coordinated release sets. The default
+installer selects the newest stable release, and the `latest` documentation
+channel follows that release. Use the same version of the gateway, compute and
+credential drivers, supervisors, CLI, and SDK clients together.
 
-| Compute Driver | How It Is Configured | System Requirements |
+Between stable releases, numbered prereleases such as `0.1.0-pre.3` provide
+evaluation checkpoints. Rolling development builds track successful releases
+from `main` and use versions such as `0.0.0-dev.<commit-sha>`. Prerelease and
+development builds may change before the next stable release; their matching
+documentation is published in the `dev` channel.
+
+## Supported Runtimes
+
+OpenShell supports several sandbox runtimes. Package-managed gateways leave the
+runtime unset by default so the gateway can auto-detect an available backend.
+Set `compute_driver` in the gateway TOML when you need to pin a specific
+runtime.
+
+| Runtime | How It Is Configured | System Requirements |
 |---|---|---|
 | Podman | The gateway is configured to create rootless Podman containers through the Podman API socket. | Linux with Podman 5.x, cgroups v2, rootless networking, and an active Podman user socket. |
 | Docker | The gateway is configured to create containers through Docker Desktop or Docker Engine. | Docker Desktop or Docker Engine 28.0 or later on the gateway host. |
 | MicroVM | The gateway is configured to create VM-backed sandboxes. | Host virtualization support. MicroVM uses Hypervisor.framework on macOS, KVM on Linux, and QEMU for GPU-backed sandboxes on Linux. |
 
-For detailed driver behavior, refer to [Sandbox Compute Drivers](/reference/sandbox-compute-drivers). For gateway and sandbox operations, refer to [Gateways](/sandboxes/manage-gateways) and [Sandboxes](/sandboxes/manage-sandboxes).
+For detailed runtime behavior, refer to [Sandbox Runtimes](/reference/sandbox-compute-drivers). For gateway and sandbox operations, refer to [Gateways](/sandboxes/manage-gateways) and [Sandboxes](/sandboxes/manage-sandboxes).
 
 ## macOS
 
@@ -160,14 +161,6 @@ sudo systemctl restart snap.openshell.gateway
 
 Kubernetes deployments use the OpenShell Helm chart. For step-by-step installation, refer to [Kubernetes Setup](/kubernetes/setup). For chart values and packaging details, refer to the [Helm chart README](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md).
 
-## Next Steps
-
-- To create your first sandbox, refer to the [Quickstart](/get-started/quickstart).
-- To run the gateway as a container without the installer, refer to [Running the Gateway as a Container](/about/container-gateway).
-- To register, select, and inspect gateways, refer to [Gateways](/sandboxes/manage-gateways).
-- To supply API keys or tokens, refer to [Manage Providers](/sandboxes/manage-providers).
-- To control what the agent can access, refer to [Policies](/sandboxes/policies).
-
 ## Validate a package-managed gateway configuration
 
 Debian and Ubuntu packages validate the selected gateway configuration before
@@ -194,3 +187,11 @@ Snap replays its effective daemon arguments through preflight and gives a nonemp
 `OPENSHELL_GATEWAY_CONFIG` precedence over `SNAP_COMMON/gateway.toml`.
 See [Gateway Configuration](/reference/gateway-config#gateway-config-preflight)
 for preflight details and manual schema-v1 migration steps.
+
+## Next Steps
+
+- To prepare an image and launch an agent, refer to [Run Your First Agent](/about/run-an-agent).
+- To run the gateway as a container without the installer, refer to [Running the Gateway as a Container](/reference/container-gateway).
+- To register, select, and inspect gateways, refer to [Gateways](/sandboxes/manage-gateways).
+- To supply API keys or tokens, refer to [Manage Providers](/sandboxes/manage-providers).
+- To control what the agent can access, refer to [Policies](/sandboxes/policies).

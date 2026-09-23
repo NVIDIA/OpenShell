@@ -1,9 +1,9 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Sandbox Compute Drivers"
-sidebar-title: "Compute Drivers"
-description: "Reference for Docker, Podman, MicroVM, Kubernetes, and Windows MXC sandbox compute drivers."
+title: "Sandbox Runtimes"
+sidebar-title: "Runtimes"
+description: "Reference for Docker, Podman, MicroVM, Kubernetes, and Windows MXC sandbox runtimes."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, MicroVM, Kubernetes, MXC, Reference"
 position: 4
 ---
@@ -118,6 +118,7 @@ are driver names, such as `kubernetes`, and are not part of the nested schema.
 
 ```shell
 openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
   --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","priority_class_name":"batch-low"}}}' \
   -- claude
 ```
@@ -226,6 +227,7 @@ docker volume create --label openshell.ai/sandbox-attachable=true \
   --label openshell.ai/sandbox-attachable-workspace=default openshell-work
 
 openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
   --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
   -- claude
 ```
@@ -251,6 +253,7 @@ enabled = false
 
 ```shell
 openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
   --driver-config-json '{"docker":{"mounts":[{"type":"bind","source":"/srv/openshell/work","target":"/sandbox/work","read_only":false}]}}' \
   -- claude
 ```
@@ -319,6 +322,7 @@ podman volume create --label openshell.ai/sandbox-attachable=true \
   --label openshell.ai/sandbox-attachable-workspace=default openshell-work
 
 openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
   --driver-config-json '{"podman":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
   -- claude
 ```
@@ -344,6 +348,7 @@ enabled = false
 
 ```shell
 openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
   --driver-config-json '{"podman":{"mounts":[{"type":"bind","source":"/srv/openshell/work","target":"/sandbox/work","read_only":false}]}}' \
   -- claude
 ```
@@ -397,7 +402,7 @@ compute_driver = "vm"
 
 For a launch-time override, set `OPENSHELL_COMPUTE_DRIVER=vm` in the gateway environment and restart the service.
 
-Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `krun_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The default sandbox image is `nvcr.io/nvidia/base/ubuntu:24.04`. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket. The VM socket path is managed by the gateway and is not configurable through remote endpoint settings.
+Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `krun_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The default workload and bootstrap image is `nvcr.io/nvidia/base/ubuntu:24.04`; configure a user-owned image with the agents and tools required by the workload. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket. The VM socket path is managed by the gateway and is not configurable through remote endpoint settings.
 
 The gateway starts `openshell-driver-vm` over a private Unix socket and passes its process ID so the driver can reject unexpected local clients. The driver's standalone TCP listener is disabled unless `--allow-unauthenticated-tcp` is set for local development.
 
@@ -542,6 +547,7 @@ OpenShell-created `/sandbox` workspace PVC.
 
 ```shell
 openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
   --driver-config-json '{
     "kubernetes": {
       "volumes": [{
