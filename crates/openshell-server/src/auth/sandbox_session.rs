@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use openshell_core::jwt::{AuthenticatedSandboxSession, CredentialEpoch, SessionJwtError};
 use openshell_core::proto::{Sandbox, SandboxPhase};
 use openshell_core::sandbox_generation::SandboxGenerationId;
-use sha2::{Digest as _, Sha256};
+use openshell_crypto::CryptoError;
 use tonic::Status;
 use uuid::Uuid;
 
@@ -28,16 +28,15 @@ const REFRESH_ROTATION_ID_ANNOTATION: &str = "internal.openshell.ai/refresh-rota
 pub struct RefreshRequestHash(String);
 
 impl RefreshRequestHash {
-    #[must_use]
-    pub fn from_extension_services(names: &[String]) -> Self {
-        let mut digest = Sha256::new();
-        digest.update(b"openshell-refresh-v1\0");
+    pub fn from_extension_services(names: &[String]) -> Result<Self, CryptoError> {
+        let mut digest = openshell_crypto::sha256_digest()?;
+        digest.update(b"openshell-refresh-v1\0")?;
         for name in names {
             let length = u64::try_from(name.len()).unwrap_or(u64::MAX);
-            digest.update(length.to_be_bytes());
-            digest.update(name.as_bytes());
+            digest.update(&length.to_be_bytes())?;
+            digest.update(name.as_bytes())?;
         }
-        Self(hex::encode(digest.finalize()))
+        Ok(Self(hex::encode(digest.finish()?)))
     }
 
     fn parse(value: String) -> Result<Self, SessionJwtError> {
@@ -64,13 +63,15 @@ pub struct GatewayRefreshReplay {
 }
 
 impl GatewayRefreshReplay {
-    #[must_use]
-    pub fn sandbox_token_id(&self) -> Uuid {
+    pub fn sandbox_token_id(&self) -> Result<Uuid, CryptoError> {
         derive_token_id(self.rotation_id, b"sandbox")
     }
 
-    #[must_use]
-    pub fn extension_token_id(&self, service_name: &str, audience: &str) -> Uuid {
+    pub fn extension_token_id(
+        &self,
+        service_name: &str,
+        audience: &str,
+    ) -> Result<Uuid, CryptoError> {
         let mut label = Vec::with_capacity(service_name.len() + audience.len() + 11);
         label.extend_from_slice(b"extension\0");
         label.extend_from_slice(service_name.as_bytes());
@@ -80,15 +81,15 @@ impl GatewayRefreshReplay {
     }
 }
 
-fn derive_token_id(rotation_id: Uuid, label: &[u8]) -> Uuid {
-    let mut digest = Sha256::new();
-    digest.update(b"openshell-refresh-token-v1\0");
-    digest.update(rotation_id.as_bytes());
-    digest.update(label);
-    let digest = digest.finalize();
+fn derive_token_id(rotation_id: Uuid, label: &[u8]) -> Result<Uuid, CryptoError> {
+    let mut digest = openshell_crypto::sha256_digest()?;
+    digest.update(b"openshell-refresh-token-v1\0")?;
+    digest.update(rotation_id.as_bytes())?;
+    digest.update(label)?;
+    let digest = digest.finish()?;
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
-    Uuid::from_bytes(bytes)
+    Ok(Uuid::from_bytes(bytes))
 }
 
 /// The complete durable authorization identity for one sandbox runtime.
@@ -221,18 +222,17 @@ impl PersistedSandboxIdentity {
         }
     }
 
-    #[must_use]
     pub fn next_gateway_token(
         &self,
         request_hash: RefreshRequestHash,
         issued_at: i64,
         replay_grace_seconds: i64,
-    ) -> Self {
+    ) -> Result<Self, CryptoError> {
         let rotation_id = Uuid::new_v4();
-        Self {
+        Ok(Self {
             runtime_generation: self.runtime_generation.clone(),
             auth_epoch: self.auth_epoch,
-            gateway_token_id: derive_token_id(rotation_id, b"gateway"),
+            gateway_token_id: derive_token_id(rotation_id, b"gateway")?,
             refresh_replay: Some(GatewayRefreshReplay {
                 previous_gateway_token_id: self.gateway_token_id,
                 request_hash,
@@ -240,7 +240,7 @@ impl PersistedSandboxIdentity {
                 issued_at,
                 rotation_id,
             }),
-        }
+        })
     }
 }
 
@@ -382,6 +382,36 @@ mod tests {
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use uuid::Uuid;
 
+    #[test]
+    fn refresh_hashes_and_token_ids_preserve_legacy_bytes() {
+        assert_eq!(
+            RefreshRequestHash::from_extension_services(&["alpha".into(), "beta".into()])
+                .unwrap()
+                .to_string(),
+            "42627fafd657ebd41917ab717004cfd73b765d158e5c59404ba3af91ccc144e4"
+        );
+        for (label, expected) in [
+            (
+                b"sandbox".as_slice(),
+                "8b5ad747-0e41-46d0-9c9c-c7df0be60b55",
+            ),
+            (
+                b"extension\0svc\0aud".as_slice(),
+                "cc3d696b-f306-a46a-ea39-3186e5a4c4f3",
+            ),
+            (
+                b"gateway".as_slice(),
+                "2ad443ec-b10d-6c85-9cc8-2d08d60ed022",
+            ),
+        ] {
+            assert_eq!(
+                derive_token_id(Uuid::from_u128(1), label)
+                    .unwrap()
+                    .to_string(),
+                expected
+            );
+        }
+    }
     async fn persist_sandbox(store: &Store, phase: SandboxPhase) {
         let identity = PersistedSandboxIdentity {
             runtime_generation: SandboxGenerationId::parse("generation-a")
@@ -489,11 +519,12 @@ mod tests {
         persist_sandbox(&store, SandboxPhase::Ready).await;
         let first = principal(1, Uuid::from_u128(1));
 
-        let request_hash = RefreshRequestHash::from_extension_services(&[]);
+        let request_hash = RefreshRequestHash::from_extension_services(&[]).unwrap();
         let expected = authorize_persisted(&store, &first)
             .await
             .expect("current identity")
-            .next_gateway_token(request_hash.clone(), 100, 30);
+            .next_gateway_token(request_hash.clone(), 100, 30)
+            .unwrap();
         let next = rotate_gateway_token(&store, &first, &expected)
             .await
             .expect("rotate current gateway token");

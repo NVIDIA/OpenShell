@@ -210,7 +210,8 @@ pub async fn handle_refresh_sandbox_token(
     }
     let request_hash = crate::auth::sandbox_session::RefreshRequestHash::from_extension_services(
         &requested_extension_services,
-    );
+    )
+    .map_err(|error| Status::internal(error.to_string()))?;
     let issued_at = current_unix_seconds();
     let authorization = crate::auth::sandbox_session::authorize_refresh(
         &state.store,
@@ -221,14 +222,16 @@ pub async fn handle_refresh_sandbox_token(
     .await?;
     let (successor, should_rotate) = match authorization {
         crate::auth::sandbox_session::RefreshAuthorization::Current(identity) => (
-            identity.next_gateway_token(
-                request_hash,
-                issued_at,
-                REFRESH_REPLAY_GRACE
-                    .as_secs()
-                    .try_into()
-                    .unwrap_or(i64::MAX),
-            ),
+            identity
+                .next_gateway_token(
+                    request_hash,
+                    issued_at,
+                    REFRESH_REPLAY_GRACE
+                        .as_secs()
+                        .try_into()
+                        .unwrap_or(i64::MAX),
+                )
+                .map_err(|error| Status::internal(error.to_string()))?,
             true,
         ),
         crate::auth::sandbox_session::RefreshAuthorization::Replay(identity) => (identity, false),
@@ -393,7 +396,9 @@ fn mint_extension_credentials(
                         Some(sandbox_id),
                         ttl,
                         replay.issued_at,
-                        replay.extension_token_id(name, audience.as_str()),
+                        replay
+                            .extension_token_id(name, audience.as_str())
+                            .map_err(|error| Status::internal(error.to_string()))?,
                     )
                 },
             )?;

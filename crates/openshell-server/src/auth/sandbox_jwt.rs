@@ -161,7 +161,9 @@ impl SandboxSessionJwtAuthority {
         let token_metadata = identity
             .refresh_replay
             .as_ref()
-            .map(|replay| (replay.sandbox_token_id(), replay.issued_at));
+            .map(|replay| replay.sandbox_token_id().map(|id| (id, replay.issued_at)))
+            .transpose()
+            .map_err(|error| Status::internal(error.to_string()))?;
         self.mint_launch_with_metadata(
             sandbox_id,
             identity.runtime_generation.clone(),

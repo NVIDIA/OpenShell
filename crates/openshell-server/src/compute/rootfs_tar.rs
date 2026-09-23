@@ -18,7 +18,6 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use openshell_core::time::now_ms;
-use rand::RngCore;
 use tonic::Status;
 use tracing::{info, warn};
 
@@ -188,6 +187,7 @@ impl RootfsTarStagingRegistry {
 
         // The directory name uses independent randomness so the token never
         // appears in a filesystem path, a directory listing, or a log field.
+        let token = new_staging_token()?;
         let dir = staging_root.join(format!("{STAGING_DIR_PREFIX}{}", uuid::Uuid::new_v4()));
         create_private_dir(&dir).map_err(|err| {
             Status::internal(format!(
@@ -196,7 +196,6 @@ impl RootfsTarStagingRegistry {
         })?;
 
         let file = dir.join(&file_name);
-        let token = new_staging_token();
         let expires_at = Instant::now() + self.ttl;
         let expires_at_ms = now_ms() + i64::try_from(self.ttl.as_millis()).unwrap_or(i64::MAX);
 
@@ -323,10 +322,10 @@ impl RootfsTarStagingRegistry {
     }
 }
 
-fn new_staging_token() -> String {
-    let mut raw = [0u8; 32];
-    rand::rng().fill_bytes(&mut raw);
-    hex::encode(raw)
+fn new_staging_token() -> Result<String, Status> {
+    let raw = openshell_crypto::random_bytes::<32>()
+        .map_err(|error| Status::internal(error.to_string()))?;
+    Ok(hex::encode(raw))
 }
 
 /// Reject anything that would let `dir.join(file_name)` escape the request
