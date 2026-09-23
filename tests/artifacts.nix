@@ -100,9 +100,8 @@ let
   # managed-gateway controls, SPIFFE fixtures, caller driver-config setting,
   # guest tools, and matching workload-image identity behavior. The corporate
   # proxy and gateway-start binaries currently self-skip without wrapper-owned
-  # gateway metadata, so exclude them rather than report false passes. The
-  # dedicated driver-podman suite retains user-namespace coverage.
-  podmanE2eExcludedBinaries = [
+  # gateway metadata, so exclude them rather than report false passes.
+  podmanE2eFollowUpBinaries = [
     "credential_gating"
     "driver_config_volume"
     "forward_proxy_graphql_l7"
@@ -117,7 +116,6 @@ let
     "podman_corporate_proxy"
     "podman_gateway_start"
     "podman_oci_identity"
-    "podman_userns"
     "provider_auto_create"
     "provider_refresh_handles"
     "provider_token_exchange"
@@ -134,7 +132,7 @@ let
   ];
   podmanE2eArchiveFilter =
     let
-      excludedBinaries = map (binary: "binary(=${binary})") podmanE2eExcludedBinaries;
+      excludedBinaries = map (binary: "binary(=${binary})") podmanE2eFollowUpBinaries;
     in
     "kind(test) and not (${pkgs.lib.concatStringsSep " or " excludedBinaries})";
 

@@ -99,11 +99,6 @@ path = "tests/podman_oci_identity.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
-name = "podman_userns"
-path = "tests/podman_userns.rs"
-required-features = ["e2e-podman"]
-
-[[test]]
 name = "provider_refresh_handles"
 path = "tests/provider_refresh_handles.rs"
 required-features = ["e2e-podman"]

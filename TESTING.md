@@ -264,9 +264,10 @@ Rust feature. The separate `driver-podman` testsuite compares OpenShell and
 direct Podman user-namespace mappings for the default, `auto`, `keep-id`, and
 private profiles. The E2E archive excludes binaries that still depend on
 wrapper-owned gateway controls, host fixtures, missing guest tools, or
-nondeterministic relay setup.
-`tests/artifacts.nix` keeps the explicit follow-up list so those binaries cannot
-appear as false passes or silently re-enter the archive.
+nondeterministic relay setup. The `driver-podman` suite replaces the removed
+`podman_userns` E2E binary. `tests/artifacts.nix` keeps the follow-up exclusions
+explicit so those binaries cannot appear as false passes or silently re-enter
+the archive.
 
 Run the VM-backed Rust CLI e2e suite:
 
