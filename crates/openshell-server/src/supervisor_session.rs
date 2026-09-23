@@ -335,6 +335,9 @@ struct PendingRelay {
     sender: RelayStreamSender,
     sandbox_id: String,
     relay_open: RelayOpen,
+    /// Session that most recently received this relay open. Reconnect replay
+    /// skips relays already sent to the session being established.
+    last_sent_session_id: Option<String>,
     created_at: Instant,
 }
 
@@ -474,13 +477,13 @@ impl SupervisorSessionRegistry {
         &self,
         sandbox_id: &str,
         timeout: Duration,
-    ) -> Result<mpsc::Sender<GatewayMessage>, Status> {
+    ) -> Result<(String, mpsc::Sender<GatewayMessage>), Status> {
         let deadline = Instant::now() + timeout;
         let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
 
         loop {
-            if let Some(tx) = self.lookup_session(sandbox_id) {
-                return Ok(tx);
+            if let Some(session) = self.lookup_session_with_id(sandbox_id) {
+                return Ok(session);
             }
             if Instant::now() + backoff > deadline {
                 return Err(Status::unavailable("supervisor session not connected"));
@@ -490,12 +493,15 @@ impl SupervisorSessionRegistry {
         }
     }
 
-    fn lookup_session(&self, sandbox_id: &str) -> Option<mpsc::Sender<GatewayMessage>> {
+    fn lookup_session_with_id(
+        &self,
+        sandbox_id: &str,
+    ) -> Option<(String, mpsc::Sender<GatewayMessage>)> {
         self.sessions
             .lock()
             .unwrap()
             .get(sandbox_id)
-            .map(|s| s.tx.clone())
+            .map(|s| (s.session_id.clone(), s.tx.clone()))
     }
 
     pub fn has_session(&self, sandbox_id: &str) -> bool {
@@ -791,7 +797,7 @@ impl SupervisorSessionRegistry {
         if relay_open.channel_id.is_empty() {
             return Err(Status::invalid_argument("relay channel_id is required"));
         }
-        let tx = self
+        let (session_id, tx) = self
             .wait_for_session(sandbox_id, session_wait_timeout)
             .await?;
 
@@ -824,6 +830,7 @@ impl SupervisorSessionRegistry {
                     sender: relay_tx,
                     sandbox_id: sandbox_id.to_string(),
                     relay_open: relay_open.clone(),
+                    last_sent_session_id: Some(session_id),
                     created_at: Instant::now(),
                 },
             );
@@ -918,16 +925,23 @@ impl SupervisorSessionRegistry {
         self.remove(sandbox_id);
     }
 
-    pub async fn replay_pending_relays(&self, sandbox_id: &str, tx: &mpsc::Sender<GatewayMessage>) {
+    pub async fn replay_pending_relays(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        tx: &mpsc::Sender<GatewayMessage>,
+    ) {
         for channel_id in self.pending_channel_ids(sandbox_id) {
             let relay_open = {
-                let pending = self.pending_relays.lock().unwrap();
-                pending
-                    .get(&channel_id)
-                    .map(|pending| pending.relay_open.clone())
-            };
-            let Some(relay_open) = relay_open else {
-                continue;
+                let mut pending = self.pending_relays.lock().unwrap();
+                let Some(pending) = pending.get_mut(&channel_id) else {
+                    continue;
+                };
+                if pending.last_sent_session_id.as_deref() == Some(session_id) {
+                    continue;
+                }
+                pending.last_sent_session_id = Some(session_id.to_string());
+                pending.relay_open.clone()
             };
             let msg = GatewayMessage {
                 payload: Some(gateway_message::Payload::RelayOpen(relay_open)),
@@ -1964,7 +1978,7 @@ async fn establish_supervisor_session(
     // registers. Pending relay opens still need to reach the new session.
     state
         .supervisor_sessions
-        .replay_pending_relays(&sandbox_id, &tx)
+        .replay_pending_relays(&sandbox_id, &session_id, &tx)
         .await;
 
     // Step 4: Spawn the session loop that reads inbound messages.
@@ -2495,6 +2509,7 @@ mod tests {
                 target: Some(relay_open::Target::Ssh(SshRelayTarget {})),
                 service_id: String::new(),
             },
+            last_sent_session_id: None,
             created_at,
         }
     }
@@ -2950,13 +2965,13 @@ mod tests {
         let superseded = registry.register(
             "sbx".to_string(),
             "s-new".to_string(),
-            tx_new,
+            tx_new.clone(),
             make_shutdown(),
         );
         assert!(superseded);
 
         registry
-            .replay_pending_relays("sbx", &registry.lookup_session("sbx").unwrap())
+            .replay_pending_relays("sbx", "s-new", &tx_new)
             .await;
 
         let replayed = rx_new
@@ -2996,13 +3011,13 @@ mod tests {
         let superseded = registry.register(
             "sbx".to_string(),
             "s-new".to_string(),
-            tx_new,
+            tx_new.clone(),
             make_shutdown(),
         );
         assert!(!superseded, "old session was removed before reconnect");
 
         registry
-            .replay_pending_relays("sbx", &registry.lookup_session("sbx").unwrap())
+            .replay_pending_relays("sbx", "s-new", &tx_new)
             .await;
 
         let replayed = rx_new
@@ -3015,6 +3030,43 @@ mod tests {
             }
             other => panic!("expected RelayOpen, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn replay_pending_relays_skips_open_already_sent_to_session() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel::<GatewayMessage>(4);
+
+        registry.register(
+            "sbx".to_string(),
+            "s-new".to_string(),
+            tx.clone(),
+            make_shutdown(),
+        );
+
+        let (channel_id, _relay_rx) = registry
+            .open_relay("sbx", Duration::from_secs(1))
+            .await
+            .expect("open_relay should succeed");
+        let original = rx
+            .recv()
+            .await
+            .expect("new session should receive RelayOpen");
+        assert!(matches!(
+            original.payload,
+            Some(gateway_message::Payload::RelayOpen(ref open))
+                if open.channel_id == channel_id
+        ));
+
+        // Model establish_supervisor_session reaching its unconditional replay
+        // after open_relay observed the newly registered session.
+        registry.replay_pending_relays("sbx", "s-new", &tx).await;
+
+        let duplicate = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            duplicate.is_err(),
+            "RelayOpen for {channel_id} was delivered twice: {duplicate:?}"
+        );
     }
 
     #[tokio::test]
