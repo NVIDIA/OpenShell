@@ -1746,7 +1746,8 @@ type SandboxTemplate struct {
 	Annotations map[string]string `protobuf:"bytes,5,rep,name=annotations,proto3" json:"annotations,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Additional environment variables injected by the template.
 	Environment map[string]string `protobuf:"bytes,6,rep,name=environment,proto3" json:"environment,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Platform-specific compute resource requirements and limits.
+	// Platform-specific compute resource requirements and limits. Well-known
+	// cpu and memory entries under limits or requests must be non-empty strings.
 	Resources *structpb.Struct `protobuf:"bytes,7,opt,name=resources,proto3" json:"resources,omitempty"`
 	// Enable Kubernetes user namespace isolation (hostUsers: false).
 	// When true, container UID 0 maps to a non-root host UID and capabilities
@@ -9069,8 +9070,8 @@ type UpdateConfigRequest struct {
 	// The new policy to apply.
 	//
 	// Sandbox scope (`global=false`):
-	//   - only network_policies may differ from create-time
-	//     policy; static fields must match version 1.
+	// - only network_policies may differ from create-time
+	//   policy; static fields must match version 1.
 	//
 	// Global scope (`global=true`):
 	// - applies to all sandboxes in full (no merge).
