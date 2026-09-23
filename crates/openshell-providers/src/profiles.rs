@@ -1541,9 +1541,13 @@ fn discovery_to_proto(discovery: &DiscoveryProfile) -> ProviderProfileDiscovery 
     }
 }
 
+#[allow(deprecated)]
 fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
     NetworkEndpoint {
         host: endpoint.host.clone(),
+        legacy_tls: String::new(),
+        legacy_enforcement: String::new(),
+        legacy_access: String::new(),
         port: endpoint.port,
         protocol: endpoint.protocol.clone(),
         tls: network_tls_mode_from_str(&endpoint.tls).map_or(-1, |value| value as i32),

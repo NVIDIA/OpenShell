@@ -828,13 +828,15 @@ type NetworkEndpoint struct {
 	// Endpoint protocol. "tcp" and "" select L4-only handling; "rest",
 	// "websocket", "graphql", "sql", "json-rpc", and "mcp" select L7 inspection.
 	Protocol string `protobuf:"bytes,3,opt,name=protocol,proto3" json:"protocol,omitempty"`
-	// TLS handling. Unspecified enables automatic detection and termination.
-	Tls NetworkTlsMode `protobuf:"varint,4,opt,name=tls,proto3,enum=openshell.sandbox.v1.NetworkTlsMode" json:"tls,omitempty"`
-	// Enforcement mode. Unspecified preserves the audit default.
-	Enforcement NetworkEnforcementMode `protobuf:"varint,5,opt,name=enforcement,proto3,enum=openshell.sandbox.v1.NetworkEnforcementMode" json:"enforcement,omitempty"`
-	// Access preset shorthand. Unspecified means no preset.
-	// Mutually exclusive with rules.
-	Access NetworkAccessPreset `protobuf:"varint,6,opt,name=access,proto3,enum=openshell.sandbox.v1.NetworkAccessPreset" json:"access,omitempty"`
+	// Deprecated string representation retained for supervisors released before
+	// endpoint security modes became typed enums.
+	//
+	// Deprecated: Marked as deprecated in sandbox.proto.
+	LegacyTls string `protobuf:"bytes,4,opt,name=legacy_tls,json=legacyTls,proto3" json:"legacy_tls,omitempty"`
+	// Deprecated: Marked as deprecated in sandbox.proto.
+	LegacyEnforcement string `protobuf:"bytes,5,opt,name=legacy_enforcement,json=legacyEnforcement,proto3" json:"legacy_enforcement,omitempty"`
+	// Deprecated: Marked as deprecated in sandbox.proto.
+	LegacyAccess string `protobuf:"bytes,6,opt,name=legacy_access,json=legacyAccess,proto3" json:"legacy_access,omitempty"`
 	// Explicit L7 rules (mutually exclusive with access).
 	Rules []*L7Rule `protobuf:"bytes,7,rep,name=rules,proto3" json:"rules,omitempty"`
 	// Allowed resolved IP addresses or CIDR ranges for this endpoint.
@@ -911,8 +913,15 @@ type NetworkEndpoint struct {
 	// Internal gateway-derived marker indicating that this endpoint belongs to
 	// an attached credentialed provider. User-authored values are ignored.
 	ProviderCredentialed bool `protobuf:"varint,26,opt,name=provider_credentialed,json=providerCredentialed,proto3" json:"provider_credentialed,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// TLS handling. Unspecified enables automatic detection and termination.
+	Tls NetworkTlsMode `protobuf:"varint,27,opt,name=tls,proto3,enum=openshell.sandbox.v1.NetworkTlsMode" json:"tls,omitempty"`
+	// Enforcement mode. Unspecified preserves the audit default.
+	Enforcement NetworkEnforcementMode `protobuf:"varint,28,opt,name=enforcement,proto3,enum=openshell.sandbox.v1.NetworkEnforcementMode" json:"enforcement,omitempty"`
+	// Access preset shorthand. Unspecified means no preset.
+	// Mutually exclusive with rules.
+	Access        NetworkAccessPreset `protobuf:"varint,29,opt,name=access,proto3,enum=openshell.sandbox.v1.NetworkAccessPreset" json:"access,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *NetworkEndpoint) Reset() {
@@ -966,25 +975,28 @@ func (x *NetworkEndpoint) GetProtocol() string {
 	return ""
 }
 
-func (x *NetworkEndpoint) GetTls() NetworkTlsMode {
+// Deprecated: Marked as deprecated in sandbox.proto.
+func (x *NetworkEndpoint) GetLegacyTls() string {
 	if x != nil {
-		return x.Tls
+		return x.LegacyTls
 	}
-	return NetworkTlsMode_NETWORK_TLS_MODE_UNSPECIFIED
+	return ""
 }
 
-func (x *NetworkEndpoint) GetEnforcement() NetworkEnforcementMode {
+// Deprecated: Marked as deprecated in sandbox.proto.
+func (x *NetworkEndpoint) GetLegacyEnforcement() string {
 	if x != nil {
-		return x.Enforcement
+		return x.LegacyEnforcement
 	}
-	return NetworkEnforcementMode_NETWORK_ENFORCEMENT_MODE_UNSPECIFIED
+	return ""
 }
 
-func (x *NetworkEndpoint) GetAccess() NetworkAccessPreset {
+// Deprecated: Marked as deprecated in sandbox.proto.
+func (x *NetworkEndpoint) GetLegacyAccess() string {
 	if x != nil {
-		return x.Access
+		return x.LegacyAccess
 	}
-	return NetworkAccessPreset_NETWORK_ACCESS_PRESET_UNSPECIFIED
+	return ""
 }
 
 func (x *NetworkEndpoint) GetRules() []*L7Rule {
@@ -1125,6 +1137,27 @@ func (x *NetworkEndpoint) GetProviderCredentialed() bool {
 		return x.ProviderCredentialed
 	}
 	return false
+}
+
+func (x *NetworkEndpoint) GetTls() NetworkTlsMode {
+	if x != nil {
+		return x.Tls
+	}
+	return NetworkTlsMode_NETWORK_TLS_MODE_UNSPECIFIED
+}
+
+func (x *NetworkEndpoint) GetEnforcement() NetworkEnforcementMode {
+	if x != nil {
+		return x.Enforcement
+	}
+	return NetworkEnforcementMode_NETWORK_ENFORCEMENT_MODE_UNSPECIFIED
+}
+
+func (x *NetworkEndpoint) GetAccess() NetworkAccessPreset {
+	if x != nil {
+		return x.Access
+	}
+	return NetworkAccessPreset_NETWORK_ACCESS_PRESET_UNSPECIFIED
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more
@@ -2319,14 +2352,15 @@ const file_sandbox_proto_rawDesc = "" +
 	"\ainclude\x18\x01 \x03(\tR\ainclude\x12\x18\n" +
 	"\aexclude\x18\x02 \x03(\tR\aexclude\"6\n" +
 	"\x18NetworkCredentialBinding\x12\x1a\n" +
-	"\bprovider\x18\x01 \x01(\tR\bprovider\"\xdb\v\n" +
+	"\bprovider\x18\x01 \x01(\tR\bprovider\"\xda\f\n" +
 	"\x0fNetworkEndpoint\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x1a\n" +
-	"\bprotocol\x18\x03 \x01(\tR\bprotocol\x126\n" +
-	"\x03tls\x18\x04 \x01(\x0e2$.openshell.sandbox.v1.NetworkTlsModeR\x03tls\x12N\n" +
-	"\venforcement\x18\x05 \x01(\x0e2,.openshell.sandbox.v1.NetworkEnforcementModeR\venforcement\x12A\n" +
-	"\x06access\x18\x06 \x01(\x0e2).openshell.sandbox.v1.NetworkAccessPresetR\x06access\x122\n" +
+	"\bprotocol\x18\x03 \x01(\tR\bprotocol\x12!\n" +
+	"\n" +
+	"legacy_tls\x18\x04 \x01(\tB\x02\x18\x01R\tlegacyTls\x121\n" +
+	"\x12legacy_enforcement\x18\x05 \x01(\tB\x02\x18\x01R\x11legacyEnforcement\x12'\n" +
+	"\rlegacy_access\x18\x06 \x01(\tB\x02\x18\x01R\flegacyAccess\x122\n" +
 	"\x05rules\x18\a \x03(\v2\x1c.openshell.sandbox.v1.L7RuleR\x05rules\x12\x1f\n" +
 	"\vallowed_ips\x18\b \x03(\tR\n" +
 	"allowedIps\x12\x14\n" +
@@ -2349,7 +2383,10 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x03mcp\x18\x17 \x01(\v2 .openshell.sandbox.v1.McpOptionsR\x03mcp\x12]\n" +
 	"\x12credential_binding\x18\x18 \x01(\v2..openshell.sandbox.v1.NetworkCredentialBindingR\x11credentialBinding\x12B\n" +
 	"\x1dallow_uninspected_credentials\x18\x19 \x01(\bR\x1ballowUninspectedCredentials\x123\n" +
-	"\x15provider_credentialed\x18\x1a \x01(\bR\x14providerCredentialed\x1ar\n" +
+	"\x15provider_credentialed\x18\x1a \x01(\bR\x14providerCredentialed\x126\n" +
+	"\x03tls\x18\x1b \x01(\x0e2$.openshell.sandbox.v1.NetworkTlsModeR\x03tls\x12N\n" +
+	"\venforcement\x18\x1c \x01(\x0e2,.openshell.sandbox.v1.NetworkEnforcementModeR\venforcement\x12A\n" +
+	"\x06access\x18\x1d \x01(\x0e2).openshell.sandbox.v1.NetworkAccessPresetR\x06access\x1ar\n" +
 	"\x1cGraphqlPersistedQueriesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
 	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.GraphqlOperationR\x05value:\x028\x01\"\xd2\x01\n" +
@@ -2544,14 +2581,14 @@ var file_sandbox_proto_depIdxs = []int32{
 	20, // 6: openshell.sandbox.v1.NetworkPolicyRule.binaries:type_name -> openshell.sandbox.v1.NetworkBinary
 	37, // 7: openshell.sandbox.v1.NetworkMiddlewareConfig.config:type_name -> google.protobuf.Struct
 	11, // 8: openshell.sandbox.v1.NetworkMiddlewareConfig.endpoints:type_name -> openshell.sandbox.v1.MiddlewareEndpointSelector
-	0,  // 9: openshell.sandbox.v1.NetworkEndpoint.tls:type_name -> openshell.sandbox.v1.NetworkTlsMode
-	1,  // 10: openshell.sandbox.v1.NetworkEndpoint.enforcement:type_name -> openshell.sandbox.v1.NetworkEnforcementMode
-	2,  // 11: openshell.sandbox.v1.NetworkEndpoint.access:type_name -> openshell.sandbox.v1.NetworkAccessPreset
-	17, // 12: openshell.sandbox.v1.NetworkEndpoint.rules:type_name -> openshell.sandbox.v1.L7Rule
-	16, // 13: openshell.sandbox.v1.NetworkEndpoint.deny_rules:type_name -> openshell.sandbox.v1.L7DenyRule
-	30, // 14: openshell.sandbox.v1.NetworkEndpoint.graphql_persisted_queries:type_name -> openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
-	14, // 15: openshell.sandbox.v1.NetworkEndpoint.mcp:type_name -> openshell.sandbox.v1.McpOptions
-	12, // 16: openshell.sandbox.v1.NetworkEndpoint.credential_binding:type_name -> openshell.sandbox.v1.NetworkCredentialBinding
+	17, // 9: openshell.sandbox.v1.NetworkEndpoint.rules:type_name -> openshell.sandbox.v1.L7Rule
+	16, // 10: openshell.sandbox.v1.NetworkEndpoint.deny_rules:type_name -> openshell.sandbox.v1.L7DenyRule
+	30, // 11: openshell.sandbox.v1.NetworkEndpoint.graphql_persisted_queries:type_name -> openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
+	14, // 12: openshell.sandbox.v1.NetworkEndpoint.mcp:type_name -> openshell.sandbox.v1.McpOptions
+	12, // 13: openshell.sandbox.v1.NetworkEndpoint.credential_binding:type_name -> openshell.sandbox.v1.NetworkCredentialBinding
+	0,  // 14: openshell.sandbox.v1.NetworkEndpoint.tls:type_name -> openshell.sandbox.v1.NetworkTlsMode
+	1,  // 15: openshell.sandbox.v1.NetworkEndpoint.enforcement:type_name -> openshell.sandbox.v1.NetworkEnforcementMode
+	2,  // 16: openshell.sandbox.v1.NetworkEndpoint.access:type_name -> openshell.sandbox.v1.NetworkAccessPreset
 	31, // 17: openshell.sandbox.v1.L7DenyRule.query:type_name -> openshell.sandbox.v1.L7DenyRule.QueryEntry
 	32, // 18: openshell.sandbox.v1.L7DenyRule.params:type_name -> openshell.sandbox.v1.L7DenyRule.ParamsEntry
 	18, // 19: openshell.sandbox.v1.L7Rule.allow:type_name -> openshell.sandbox.v1.L7Allow

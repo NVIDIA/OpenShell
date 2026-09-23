@@ -202,7 +202,11 @@ pub(super) async fn resolve_and_authorize_sandbox_name(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .filter(|sandbox| {
             sandbox.metadata.as_ref().is_some_and(|metadata| {
-                metadata.name == sandbox_name
+                // Supervisors released before sandbox names became the
+                // canonical RPC reference send their authenticated sandbox
+                // UUID in the same protobuf field. The principal is already
+                // bound to that UUID, so accepting it cannot widen scope.
+                (metadata.name == sandbox_name || sandbox_principal.sandbox_id == sandbox_name)
                     && (workspace.is_empty() || workspace == sandbox.object_workspace())
             })
         });
@@ -3832,6 +3836,7 @@ async fn run_exec_with_russh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
     use crate::compute::NoopTestDriver;
     use crate::grpc::test_support::{
         authed_request, test_server_state, test_server_state_with_compute_driver,
@@ -4292,6 +4297,33 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Ready as i32);
         sandbox.set_current_policy_version(7);
         sandbox
+    }
+
+    #[tokio::test]
+    async fn sandbox_principal_accepts_legacy_id_reference_for_its_own_sandbox() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("legacy-reference", Vec::new());
+        let sandbox_id = sandbox.object_id().to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+        let principal = Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: sandbox_id.clone(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+            },
+            trust_domain: Some("openshell".to_string()),
+        });
+
+        let resolved = resolve_and_authorize_sandbox_name(
+            &state,
+            &principal,
+            &sandbox_id,
+            "",
+            MinWorkspaceRole::User,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.object_id(), sandbox_id);
     }
 
     fn test_workload_template(name: &str) -> SandboxWorkloadTemplate {
