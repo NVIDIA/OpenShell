@@ -29,7 +29,6 @@ use openshell_isolation_interface::contract::{
 };
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
@@ -594,7 +593,9 @@ impl RequestEnvelope {
         };
         let payload_digest = request_envelope_digest(&request, exec_admission_deadline_unix_ms)?;
         Ok(Self {
-            request_id: uuid::Uuid::new_v4().to_string(),
+            request_id: uuid::Builder::from_random_bytes(openshell_crypto::random_bytes::<16>()?)
+                .into_uuid()
+                .to_string(),
             payload_digest,
             exec_admission_deadline_unix_ms,
             request,
@@ -625,6 +626,8 @@ pub(crate) fn request_envelope_digest(
     request: &Request,
     exec_admission_deadline_unix_ms: Option<u64>,
 ) -> Result<String, FrameError> {
+    use std::fmt::Write as _;
+
     // Stable local replay fingerprint of decoded protobuf fields. Maps use
     // BTreeMap in generated messages; neither clients nor the wire carry this.
     let envelope = RequestEnvelope {
@@ -634,8 +637,12 @@ pub(crate) fn request_envelope_digest(
         request: request.clone(),
     };
     let payload = crate::protobuf::encode(&envelope)?;
-    let digest = Sha256::digest(payload);
-    Ok(format!("{digest:x}"))
+    let digest = openshell_crypto::sha256(&payload)?;
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(encoded)
 }
 
 impl fmt::Debug for RequestEnvelope {
@@ -1386,6 +1393,8 @@ where
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
+    #[error("control frame cryptography failed: {0}")]
+    Crypto(#[from] openshell_crypto::CryptoError),
     #[error("invalid protobuf message: {0}")]
     Protobuf(String),
     #[error("control frame is truncated")]

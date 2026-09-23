@@ -27,7 +27,6 @@ use openshell_isolation_interface::contract::{
     MediationTiming, PendingDnsQuery, PendingTcpOpen, ProviderEnvironmentInstallation,
     ResolvedWorkloadIdentity, SandboxContext, TcpOpenDecision, TcpOpenDenial,
 };
-use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -1208,7 +1207,8 @@ impl BoundaryCredential {
             })?;
             // Epochs are monotonic; retry if authorization crossed an epoch change.
             if slot.credential_epoch() == Some(epoch) {
-                let fingerprint = Sha256::digest(authorization.as_encoded_bytes()).into();
+                let fingerprint = openshell_crypto::sha256(authorization.as_encoded_bytes())
+                    .map_err(|error| BackendError::Unavailable(error.to_string()))?;
                 return Ok(Self {
                     epoch,
                     authorization,
