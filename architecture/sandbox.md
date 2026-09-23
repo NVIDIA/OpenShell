@@ -669,6 +669,10 @@ sandbox workload directly. The relay supports:
   buffer, and a single stdin lease across client disconnects. Ctrl-C interrupts
   the foreground process. For read-only attachments, Ctrl-C only exits the
   current viewer.
+- Supervised CLI attachment. After an established SSH transport fails, the CLI
+  remains alive, requests a fresh SSH session from the gateway, and reattaches
+  to the same canonical main process within a bounded recovery window. It does
+  not stop or restart the sandbox to recover the client connection.
 - Independent interactive shell sessions.
 - Command execution. Commands run through a login shell (`bash -lc`) by default,
   so the first of the user's `.bash_profile`, `.bash_login`, or `.profile` is

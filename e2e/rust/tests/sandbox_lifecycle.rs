@@ -3,6 +3,8 @@
 
 #![cfg(feature = "e2e")]
 
+#[cfg(target_os = "linux")]
+use std::fs;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -209,6 +211,38 @@ async fn reconnect_with_input_ownership(
         );
         sleep(Duration::from_millis(100)).await;
     }
+}
+
+#[cfg(target_os = "linux")]
+fn find_process_with_args(expected_args: &[&str]) -> Option<u32> {
+    for entry in fs::read_dir("/proc").ok()?.filter_map(Result::ok) {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let cmdline = fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
+        if expected_args
+            .iter()
+            .all(|expected| args.contains(&expected.as_bytes()))
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_process_with_args(expected_args: &[&str]) -> u32 {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(pid) = find_process_with_args(expected_args) {
+                return pid;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("process with arguments {expected_args:?} did not start"))
 }
 
 #[tokio::test]
@@ -719,6 +753,108 @@ async fn canonical_main_disconnect_reconnect_replays_history_for_same_process() 
         .wait()
         .await
         .expect("wait for reconnect disconnect");
+    sandbox.cleanup().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn canonical_main_connect_recovers_its_ssh_transport() {
+    let script = r#"trap 'kill "$writer" 2>/dev/null || true' EXIT; (n=1; while true; do printf 'transport_pid=%s sequence=%04d\n' "$$" "$n"; n=$((n + 1)); sleep 0.2; done) & writer=$!; while IFS= read -r line; do printf 'transport_pid=%s input=%s\n' "$$" "$line"; done"#;
+    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-lc", script])
+        .await
+        .expect("create retained canonical main process");
+
+    let mut connect_cmd = openshell_cmd();
+    connect_cmd
+        .args(["sandbox", "connect", &sandbox.name])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut connect = connect_cmd.spawn().expect("spawn supervised attachment");
+    let mut connect_stdin = connect.stdin.take().expect("connect stdin");
+    let connect_stdout = connect.stdout.take().expect("connect stdout");
+    let mut connect_lines = BufReader::new(connect_stdout).lines();
+    let connect_stderr = connect.stderr.take().expect("connect stderr");
+    let mut connect_errors = BufReader::new(connect_stderr).lines();
+
+    let initial_line = tokio::time::timeout(Duration::from_secs(30), connect_lines.next_line())
+        .await
+        .expect("initial attachment output timeout")
+        .expect("read initial attachment output")
+        .expect("initial attachment output should remain open");
+    assert!(
+        initial_line.contains("transport_pid="),
+        "unexpected initial attachment output: {initial_line}"
+    );
+
+    // Recovery intentionally starts only for an established attachment, so
+    // let the initial SSH process live beyond that setup guard before killing
+    // only its ProxyCommand transport.
+    sleep(Duration::from_secs(3)).await;
+    let proxy_pid = wait_for_process_with_args(&["ssh-proxy", "--sandbox", &sandbox.name]).await;
+    let kill_status = tokio::process::Command::new("kill")
+        .args(["-TERM", &proxy_pid.to_string()])
+        .status()
+        .await
+        .expect("terminate SSH proxy transport");
+    assert!(kill_status.success(), "terminate SSH proxy transport");
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let line = connect_errors
+                .next_line()
+                .await
+                .expect("read supervised attachment diagnostics")
+                .expect("supervised attachment diagnostics should remain open");
+            if normalize_output(&line).contains("Connection to sandbox lost; reconnecting") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("supervised attachment did not enter recovery");
+
+    let input_token = format!("after-transport-recovery-{:x}", rand::random::<u64>());
+    connect_stdin
+        .write_all(format!("{input_token}\n").as_bytes())
+        .await
+        .expect("write input after transport recovery");
+    connect_stdin
+        .flush()
+        .await
+        .expect("flush input after transport recovery");
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let line = connect_lines
+                .next_line()
+                .await
+                .expect("read recovered attachment output")
+                .expect("recovered attachment output should remain open");
+            if line.contains(&format!("input={input_token}")) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("replacement SSH session did not reattach to canonical main");
+    assert!(
+        connect
+            .try_wait()
+            .expect("inspect supervised attachment")
+            .is_none(),
+        "sandbox connect parent should remain alive after recovery"
+    );
+
+    connect
+        .kill()
+        .await
+        .expect("disconnect recovered attachment");
+    connect
+        .wait()
+        .await
+        .expect("wait for recovered attachment disconnect");
     sandbox.cleanup().await;
 }
 

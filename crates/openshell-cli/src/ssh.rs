@@ -24,7 +24,7 @@ use std::io::{IsTerminal, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command as TokioCommand};
@@ -44,6 +44,15 @@ const FORWARD_LISTENER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 /// command has already reported its terminal result.
 const TERMINAL_RELAY_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_RELAY_REGISTRATION_INTERVAL: Duration = Duration::from_millis(50);
+/// An SSH client that remained alive for this long was attached successfully,
+/// rather than failing during initial authentication or setup.
+const CONNECT_ESTABLISHED_DURATION: Duration = Duration::from_secs(2);
+/// Time allowed to restore an established canonical-main attachment after its
+/// transport is lost.
+const CONNECT_RECOVERY_TIMEOUT: Duration = Duration::from_mins(1);
+const CONNECT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+const SSH_TRANSPORT_FAILURE_EXIT_CODE: i32 = 255;
 const SYNC_RETRY_ATTEMPTS: usize = 4;
 const SYNC_RETRY_DELAY: Duration = Duration::from_secs(2);
 
@@ -281,6 +290,141 @@ fn exec_or_wait(mut command: Command, replace_process: bool) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
+fn main_attach_command(session: &SshSessionConfig) -> Command {
+    let mut command = ssh_base_command(&session.proxy_command);
+    if session.main_terminal {
+        command.arg("-tt").arg("-o").arg("RequestTTY=force");
+    } else {
+        command.arg("-T");
+    }
+    command
+        .arg("-o")
+        .arg("SetEnv=TERM=xterm-256color")
+        .arg("-s")
+        .arg("sandbox")
+        .arg("openshell-main")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    command
+}
+
+async fn run_main_attach(session: &SshSessionConfig, replace_process: bool) -> Result<i32> {
+    let command = main_attach_command(session);
+    tokio::task::spawn_blocking(move || exec_or_wait(command, replace_process))
+        .await
+        .into_diagnostic()?
+}
+
+fn should_recover_connect(exit_code: i32, attached_for: Duration, recovery_active: bool) -> bool {
+    exit_code == SSH_TRANSPORT_FAILURE_EXIT_CODE
+        && (recovery_active || attached_for >= CONNECT_ESTABLISHED_DURATION)
+}
+
+fn should_start_connect_recovery_window(attached_for: Duration, recovery_active: bool) -> bool {
+    !recovery_active || attached_for >= CONNECT_RECOVERY_TIMEOUT
+}
+
+fn next_connect_retry_delay(delay: Duration) -> Duration {
+    std::cmp::min(delay.saturating_mul(2), CONNECT_RETRY_MAX_DELAY)
+}
+
+fn connect_error_is_retryable(error: &Report) -> bool {
+    let message = format!("{error:?}").to_ascii_lowercase();
+    [
+        "broken pipe",
+        "connection aborted",
+        "connection closed",
+        "connection refused",
+        "connection reset",
+        "deadline exceeded",
+        "h2 protocol",
+        "http2",
+        "reset before headers",
+        "service is currently unavailable",
+        "timed out",
+        "timeout",
+        "transport error",
+        "unexpected eof",
+        "unavailable",
+        "upstream connect error",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+async fn sandbox_connect_supervised(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<i32> {
+    let mut recovery_deadline = None;
+    let mut retry_delay = CONNECT_RETRY_INITIAL_DELAY;
+
+    loop {
+        if recovery_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            eprintln!(
+                "Unable to restore the sandbox connection within {} seconds.",
+                CONNECT_RECOVERY_TIMEOUT.as_secs()
+            );
+            return Ok(SSH_TRANSPORT_FAILURE_EXIT_CODE);
+        }
+
+        let session = match ssh_session_config(server, name, tls, workspace, None).await {
+            Ok(session) => session,
+            Err(error)
+                if recovery_deadline.is_some_and(|deadline| Instant::now() < deadline)
+                    && connect_error_is_retryable(&error) =>
+            {
+                tracing::warn!(
+                    sandbox = name,
+                    error = %error,
+                    "failed to create replacement SSH session; retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = next_connect_retry_delay(retry_delay);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        let attach_started = Instant::now();
+        let exit_code = run_main_attach(&session, false).await?;
+        let attached_for = attach_started.elapsed();
+        let recovery_active = recovery_deadline.is_some();
+
+        if !should_recover_connect(exit_code, attached_for, recovery_active) {
+            return Ok(exit_code);
+        }
+
+        // Once a replacement attachment survives the full recovery interval,
+        // treat a later failure as a new interruption. Keeping the existing
+        // deadline for shorter attempts prevents SSH connect timeouts from
+        // extending recovery forever.
+        if should_start_connect_recovery_window(attached_for, recovery_active) {
+            recovery_deadline = Some(Instant::now() + CONNECT_RECOVERY_TIMEOUT);
+            retry_delay = CONNECT_RETRY_INITIAL_DELAY;
+            eprintln!("Connection to sandbox lost; reconnecting...");
+        }
+
+        let Some(deadline) = recovery_deadline else {
+            return Ok(exit_code);
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            eprintln!(
+                "Unable to restore the sandbox connection within {} seconds.",
+                CONNECT_RECOVERY_TIMEOUT.as_secs()
+            );
+            return Ok(exit_code);
+        }
+
+        tokio::time::sleep(std::cmp::min(retry_delay, deadline - now)).await;
+        retry_delay = next_connect_retry_delay(retry_delay);
+    }
+}
+
 async fn sandbox_connect_with_mode(
     server: &str,
     name: &str,
@@ -298,27 +442,7 @@ async fn sandbox_connect_with_mode(
     )
     .await?;
 
-    let mut command = ssh_base_command(&session.proxy_command);
-    if session.main_terminal {
-        command.arg("-tt").arg("-o").arg("RequestTTY=force");
-    } else {
-        command.arg("-T");
-    }
-    command
-        .arg("-o")
-        .arg("SetEnv=TERM=xterm-256color")
-        .arg("-s")
-        .arg("sandbox")
-        .arg("openshell-main")
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    let exit_code = tokio::task::spawn_blocking(move || exec_or_wait(command, replace_process))
-        .await
-        .into_diagnostic()??;
-
-    Ok(exit_code)
+    run_main_attach(&session, replace_process).await
 }
 
 /// Connect to a sandbox via SSH.
@@ -328,7 +452,7 @@ pub async fn sandbox_connect(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<i32> {
-    sandbox_connect_with_mode(server, name, tls, true, workspace, None).await
+    sandbox_connect_supervised(server, name, tls, workspace).await
 }
 
 pub(crate) async fn sandbox_connect_without_exec(
@@ -1866,6 +1990,68 @@ mod tests {
     fn sync_error_retry_filter_rejects_validation_failures() {
         let error = miette::miette!("sandbox source path '/etc/passwd' resolves outside /sandbox");
         assert!(!sync_error_is_retryable(&error));
+    }
+
+    #[test]
+    fn connect_recovery_starts_only_for_established_transport_failures() {
+        assert!(should_recover_connect(
+            SSH_TRANSPORT_FAILURE_EXIT_CODE,
+            CONNECT_ESTABLISHED_DURATION,
+            false
+        ));
+        assert!(!should_recover_connect(
+            SSH_TRANSPORT_FAILURE_EXIT_CODE,
+            CONNECT_ESTABLISHED_DURATION
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
+            false
+        ));
+        assert!(!should_recover_connect(
+            0,
+            CONNECT_ESTABLISHED_DURATION,
+            false
+        ));
+    }
+
+    #[test]
+    fn connect_recovery_continues_after_fast_replacement_failure() {
+        assert!(should_recover_connect(
+            SSH_TRANSPORT_FAILURE_EXIT_CODE,
+            Duration::ZERO,
+            true
+        ));
+        assert!(!should_start_connect_recovery_window(
+            CONNECT_ESTABLISHED_DURATION,
+            true
+        ));
+        assert!(should_start_connect_recovery_window(
+            CONNECT_RECOVERY_TIMEOUT,
+            true
+        ));
+    }
+
+    #[test]
+    fn connect_retry_delay_is_capped() {
+        assert_eq!(
+            next_connect_retry_delay(CONNECT_RETRY_INITIAL_DELAY),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            next_connect_retry_delay(CONNECT_RETRY_MAX_DELAY),
+            CONNECT_RETRY_MAX_DELAY
+        );
+    }
+
+    #[test]
+    fn connect_retry_filter_rejects_authentication_failures() {
+        let transient = miette::miette!("transport error: connection reset by peer");
+        assert!(connect_error_is_retryable(&transient));
+
+        let authentication = miette::miette!("status: Unauthenticated");
+        assert!(!connect_error_is_retryable(&authentication));
+
+        let lifecycle = miette::miette!("sandbox is not ready");
+        assert!(!connect_error_is_retryable(&lifecycle));
     }
 
     #[test]
