@@ -660,10 +660,11 @@ fn provisioning_span(
 #[derive(Clone)]
 pub struct VmDriver {
     config: VmDriverConfig,
-    socket_root: PathBuf,
-    socket_root_fd: Arc<OwnedFd>,
     launcher_bin: PathBuf,
     registry: Arc<Mutex<HashMap<String, SandboxRecord>>>,
+    /// Declared after `registry` so `kill_on_drop` children are released
+    /// before the root directory is removed.
+    socket_root: Arc<SocketRoot>,
     image_cache_lock: Arc<Mutex<()>>,
     events: broadcast::Sender<WatchSandboxesEvent>,
     gpu_inventory: Option<Arc<std::sync::Mutex<GpuInventory>>>,
@@ -742,16 +743,15 @@ impl VmDriver {
             None
         };
 
-        let (socket_root, socket_root_fd) = allocate_socket_root()
+        let socket_root = allocate_socket_root()
             .map_err(|err| format!("failed to allocate socket root in /tmp: {err}"))?;
 
         let (events, _) = broadcast::channel(WATCH_BUFFER);
         let driver = Self {
             config,
-            socket_root,
-            socket_root_fd: Arc::new(socket_root_fd),
             launcher_bin,
             registry: Arc::new(Mutex::new(HashMap::new())),
+            socket_root: Arc::new(socket_root),
             image_cache_lock: Arc::new(Mutex::new(())),
             events,
             gpu_inventory,
@@ -936,7 +936,7 @@ impl VmDriver {
             .env(openshell_core::sandbox_env::SANDBOX, &sandbox.name)
             .env(
                 openshell_core::sandbox_env::SSH_SOCKET_PATH,
-                sandbox_socket_dir(&self.socket_root, &sandbox.id).join("ssh.sock"),
+                sandbox_socket_dir(&self.socket_root.path, &sandbox.id).join("ssh.sock"),
             )
             .env(
                 openshell_core::sandbox_env::PROXY_TLS_DIR,
@@ -1147,9 +1147,7 @@ impl VmDriver {
             return Err(Status::internal(format!("create state dir failed: {err}")));
         }
 
-        if let Err(err) =
-            create_sandbox_socket_dir(&self.socket_root_fd, &self.socket_root, &sandbox.id)
-        {
+        if let Err(err) = create_sandbox_socket_dir(&self.socket_root, &sandbox.id) {
             let mut registry = self.registry.lock().await;
             registry.remove(&sandbox.id);
             let _ = tokio::fs::remove_dir_all(&state_dir).await;
@@ -1160,7 +1158,7 @@ impl VmDriver {
             let mut registry = self.registry.lock().await;
             registry.remove(&sandbox.id);
             let _ = tokio::fs::remove_dir_all(&state_dir).await;
-            remove_sandbox_socket_dir(&self.socket_root_fd, &sandbox.id);
+            remove_sandbox_socket_dir(&self.socket_root, &sandbox.id);
             return Err(err);
         }
 
@@ -1168,7 +1166,7 @@ impl VmDriver {
             let mut registry = self.registry.lock().await;
             registry.remove(&sandbox.id);
             let _ = tokio::fs::remove_dir_all(&state_dir).await;
-            remove_sandbox_socket_dir(&self.socket_root_fd, &sandbox.id);
+            remove_sandbox_socket_dir(&self.socket_root, &sandbox.id);
             return Err(Status::internal(format!(
                 "write sandbox start metadata failed: {err}"
             )));
@@ -1244,7 +1242,7 @@ impl VmDriver {
                 if overlay_preparation == OverlayPreparation::Fresh {
                     let _ = tokio::fs::remove_dir_all(&state_dir).await;
                 }
-                remove_sandbox_socket_dir(&self.socket_root_fd, &sandbox_id);
+                remove_sandbox_socket_dir(&self.socket_root, &sandbox_id);
                 return;
             }
 
@@ -1516,10 +1514,10 @@ impl VmDriver {
         }
 
         let console_output = state_dir.join("rootfs-console.log");
-        create_sandbox_socket_dir(&self.socket_root_fd, &self.socket_root, &sandbox.id)
+        create_sandbox_socket_dir(&self.socket_root, &sandbox.id)
             .map_err(|err| Status::internal(format!("create socket dir failed: {err}")))?;
         let control_socket =
-            sandbox_socket_dir(&self.socket_root, &sandbox.id).join(VM_CONTROL_SOCKET);
+            sandbox_socket_dir(&self.socket_root.path, &sandbox.id).join(VM_CONTROL_SOCKET);
         let session_id = launch_authentication.supervisor.session_id;
         let channel_tls = generate_sandbox_tls_material(session_id)
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -2031,7 +2029,7 @@ impl VmDriver {
         }
 
         remove_sandbox_state_dir(&self.config.state_dir, &state_dir).await?;
-        remove_sandbox_socket_dir(&self.socket_root_fd, &record_id);
+        remove_sandbox_socket_dir(&self.socket_root, &record_id);
 
         {
             let mut registry = self.registry.lock().await;
@@ -2359,12 +2357,6 @@ impl VmDriver {
         true
     }
 
-    /// Best-effort removal of the per-driver socket root. VM children are
-    /// `kill_on_drop`, so no socket is live once the server has stopped.
-    pub fn remove_socket_root(&self) {
-        let _ = fs::remove_dir_all(&self.socket_root);
-    }
-
     fn release_gpu(&self, sandbox_id: &str) {
         if let Some(inventory) = self.gpu_inventory.as_ref()
             && let Ok(mut inv) = inventory.lock()
@@ -2657,7 +2649,7 @@ impl VmDriver {
 
         if remove_state {
             let _ = tokio::fs::remove_dir_all(state_dir).await;
-            remove_sandbox_socket_dir(&self.socket_root_fd, sandbox_id);
+            remove_sandbox_socket_dir(&self.socket_root, sandbox_id);
         }
         self.publish_platform_event(
             sandbox_id.to_string(),
@@ -5581,7 +5573,22 @@ fn sandbox_socket_dir(socket_root: &Path, sandbox_id: &str) -> PathBuf {
     socket_root.join(sandbox_id)
 }
 
-fn allocate_socket_root() -> Result<(PathBuf, OwnedFd), std::io::Error> {
+/// Driver-owned `/tmp` socket root. Removed on drop, i.e. when the last
+/// `VmDriver` clone goes away. Socket files outlive their processes, so
+/// removal is safe regardless of VM child state.
+#[derive(Debug)]
+pub(crate) struct SocketRoot {
+    path: PathBuf,
+    fd: OwnedFd,
+}
+
+impl Drop for SocketRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn allocate_socket_root() -> Result<SocketRoot, std::io::Error> {
     let uid = rustix::process::geteuid().as_raw();
     allocate_socket_root_with(Path::new("/tmp"), || {
         let random: u128 = rand::random();
@@ -5592,7 +5599,7 @@ fn allocate_socket_root() -> Result<(PathBuf, OwnedFd), std::io::Error> {
 fn allocate_socket_root_with(
     base: &Path,
     mut gen_name: impl FnMut() -> String,
-) -> Result<(PathBuf, OwnedFd), std::io::Error> {
+) -> Result<SocketRoot, std::io::Error> {
     for _ in 0..SOCKET_ROOT_ALLOC_RETRIES {
         let root = base.join(gen_name());
         match rustix::fs::mkdir(&root, rustix::fs::Mode::from_raw_mode(0o700)) {
@@ -5605,7 +5612,7 @@ fn allocate_socket_root_with(
                     rustix::fs::Mode::empty(),
                 )
                 .map_err(std::io::Error::from)?;
-                return Ok((root, fd));
+                return Ok(SocketRoot { path: root, fd });
             }
             Err(rustix::io::Errno::EXIST) => {}
             Err(e) => return Err(e.into()),
@@ -5621,11 +5628,10 @@ fn allocate_socket_root_with(
 }
 
 fn create_sandbox_socket_dir(
-    root_fd: &OwnedFd,
-    socket_root: &Path,
+    root: &SocketRoot,
     sandbox_id: &str,
 ) -> Result<PathBuf, std::io::Error> {
-    let longest = socket_root.join(sandbox_id).join(VM_CONTROL_SOCKET);
+    let longest = root.path.join(sandbox_id).join(VM_CONTROL_SOCKET);
     if longest.as_os_str().len() > MAX_SUN_PATH_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -5635,16 +5641,16 @@ fn create_sandbox_socket_dir(
             ),
         ));
     }
-    match rustix::fs::mkdirat(root_fd, sandbox_id, rustix::fs::Mode::from_raw_mode(0o700)) {
+    match rustix::fs::mkdirat(&root.fd, sandbox_id, rustix::fs::Mode::from_raw_mode(0o700)) {
         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
         Err(e) => return Err(e.into()),
     }
-    Ok(socket_root.join(sandbox_id))
+    Ok(root.path.join(sandbox_id))
 }
 
-fn remove_sandbox_socket_dir(root_fd: &OwnedFd, sandbox_id: &str) {
+fn remove_sandbox_socket_dir(root: &SocketRoot, sandbox_id: &str) {
     if let Ok(leaf_fd) = rustix::fs::openat(
-        root_fd,
+        &root.fd,
         sandbox_id,
         rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW,
         rustix::fs::Mode::empty(),
@@ -5652,7 +5658,7 @@ fn remove_sandbox_socket_dir(root_fd: &OwnedFd, sandbox_id: &str) {
         let _ = rustix::fs::unlinkat(&leaf_fd, VM_CONTROL_SOCKET, rustix::fs::AtFlags::empty());
         let _ = rustix::fs::unlinkat(&leaf_fd, "ssh.sock", rustix::fs::AtFlags::empty());
     }
-    let _ = rustix::fs::unlinkat(root_fd, sandbox_id, rustix::fs::AtFlags::REMOVEDIR);
+    let _ = rustix::fs::unlinkat(&root.fd, sandbox_id, rustix::fs::AtFlags::REMOVEDIR);
 }
 
 #[allow(clippy::result_large_err)]
@@ -6970,7 +6976,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tonic::Code;
 
-    fn test_socket_root() -> (PathBuf, Arc<OwnedFd>) {
+    fn test_socket_root() -> Arc<SocketRoot> {
         let dir = std::env::temp_dir().join(format!("os-test-{:016x}", rand::random::<u64>()));
         std::fs::create_dir(&dir).expect("create test socket root");
         std::fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
@@ -6983,7 +6989,7 @@ mod tests {
             rustix::fs::Mode::empty(),
         )
         .expect("open test socket root");
-        (dir, Arc::new(fd))
+        Arc::new(SocketRoot { path: dir, fd })
     }
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
@@ -8527,11 +8533,22 @@ mod tests {
 
     #[test]
     fn create_sandbox_socket_dir_rejects_over_long_ids() {
-        let (root, fd) = test_socket_root();
-        let err = create_sandbox_socket_dir(&fd, &root, &"x".repeat(128)).unwrap_err();
+        let root = test_socket_root();
+        let err = create_sandbox_socket_dir(&root, &"x".repeat(128)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(!root.join("x".repeat(128)).exists());
-        let _ = std::fs::remove_dir_all(root);
+        assert!(!root.path.join("x".repeat(128)).exists());
+    }
+
+    #[test]
+    fn socket_root_drop_removes_root_and_leaves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = allocate_socket_root_with(tmp.path(), || "root".to_string()).unwrap();
+        let path = root.path.clone();
+        let leaf = create_sandbox_socket_dir(&root, "sandbox-1").unwrap();
+        std::fs::write(leaf.join(VM_CONTROL_SOCKET), b"").unwrap();
+        assert!(leaf.exists());
+        drop(root);
+        assert!(!path.exists(), "socket root must be removed on drop");
     }
 
     #[test]
@@ -8556,18 +8573,18 @@ mod tests {
     fn allocate_socket_root_returns_distinct_roots() {
         let tmp = tempfile::tempdir().unwrap();
         let mut counter = 0u64;
-        let (root_a, _fd_a) = allocate_socket_root_with(tmp.path(), || {
+        let root_a = allocate_socket_root_with(tmp.path(), || {
             counter += 1;
             format!("root-{counter}")
         })
         .unwrap();
-        let (root_b, _fd_b) = allocate_socket_root_with(tmp.path(), || {
+        let root_b = allocate_socket_root_with(tmp.path(), || {
             counter += 1;
             format!("root-{counter}")
         })
         .unwrap();
         assert_ne!(
-            root_a, root_b,
+            root_a.path, root_b.path,
             "two allocations must produce distinct roots"
         );
     }
@@ -8585,13 +8602,13 @@ mod tests {
         std::fs::create_dir(tmp.path().join("attempt-1")).unwrap();
 
         let call_count = AtomicUsize::new(0);
-        let (root, _fd) = allocate_socket_root_with(tmp.path(), || {
+        let root = allocate_socket_root_with(tmp.path(), || {
             let n = call_count.fetch_add(1, Ordering::SeqCst);
             format!("attempt-{n}")
         })
         .expect("should succeed after retries");
 
-        assert_eq!(root, tmp.path().join("attempt-2"));
+        assert_eq!(root.path, tmp.path().join("attempt-2"));
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
         assert!(
             tmp.path()
@@ -8948,14 +8965,13 @@ mod tests {
 
     #[test]
     fn capabilities_report_configured_default_image() {
-        let (socket_root, socket_root_fd) = test_socket_root();
+        let socket_root = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:dev".to_string(),
                 ..Default::default()
             },
             socket_root,
-            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -8987,14 +9003,13 @@ mod tests {
 
     #[test]
     fn resolved_sandbox_image_prefers_template_image() {
-        let (socket_root, socket_root_fd) = test_socket_root();
+        let socket_root = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:default".to_string(),
                 ..Default::default()
             },
             socket_root,
-            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -9021,14 +9036,13 @@ mod tests {
 
     #[test]
     fn resolved_sandbox_image_falls_back_to_driver_default() {
-        let (socket_root, socket_root_fd) = test_socket_root();
+        let socket_root = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:default".to_string(),
                 ..Default::default()
             },
             socket_root,
-            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -9052,11 +9066,10 @@ mod tests {
 
     #[test]
     fn resolved_sandbox_image_returns_none_without_template_or_default() {
-        let (socket_root, socket_root_fd) = test_socket_root();
+        let socket_root = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig::default(),
             socket_root,
-            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -9077,7 +9090,7 @@ mod tests {
 
     #[test]
     fn bootstrap_image_ref_prefers_explicit_bootstrap_image() {
-        let (socket_root, socket_root_fd) = test_socket_root();
+        let socket_root = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:default".to_string(),
@@ -9085,7 +9098,6 @@ mod tests {
                 ..Default::default()
             },
             socket_root,
-            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -9102,14 +9114,13 @@ mod tests {
 
     #[test]
     fn bootstrap_image_ref_falls_back_to_default_image() {
-        let (socket_root, socket_root_fd) = test_socket_root();
+        let socket_root = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:default".to_string(),
                 ..Default::default()
             },
             socket_root,
-            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -9126,11 +9137,10 @@ mod tests {
 
     #[test]
     fn bootstrap_image_ref_rejects_missing_trusted_image() {
-        let (socket_root, socket_root_fd) = test_socket_root();
+        let socket_root = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig::default(),
             socket_root,
-            socket_root_fd,
             launcher_bin: PathBuf::from("/tmp/openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -9769,14 +9779,13 @@ mod tests {
         let base = unique_temp_dir();
         let driver_state = base.join("driver-state");
         let (events, _) = broadcast::channel(WATCH_BUFFER);
-        let (socket_root, socket_root_fd) = test_socket_root();
+        let socket_root = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 state_dir: driver_state.clone(),
                 ..Default::default()
             },
             socket_root,
-            socket_root_fd,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -9834,14 +9843,13 @@ mod tests {
         let base = unique_temp_dir();
         let driver_state = base.join("driver-state");
         let (events, _) = broadcast::channel(WATCH_BUFFER);
-        let (socket_root, socket_root_fd) = test_socket_root();
+        let socket_root = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 state_dir: driver_state.clone(),
                 ..Default::default()
             },
             socket_root,
-            socket_root_fd,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -9887,7 +9895,7 @@ mod tests {
         let base = unique_temp_dir();
         let driver_state = base.join("driver-state");
         let (events, _) = broadcast::channel(WATCH_BUFFER);
-        let (socket_root, socket_root_fd) = test_socket_root();
+        let socket_root = test_socket_root();
         let driver = VmDriver {
             config: VmDriverConfig {
                 state_dir: driver_state.clone(),
@@ -9895,7 +9903,6 @@ mod tests {
                 ..Default::default()
             },
             socket_root,
-            socket_root_fd,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -10289,7 +10296,7 @@ mod tests {
     /// Driver whose rootfs tar staging root is an isolated temp directory.
     fn rootfs_tar_test_driver(staging_root: &Path, max_bytes: Option<u64>) -> VmDriver {
         let (events, _) = broadcast::channel(WATCH_BUFFER);
-        let (socket_root, socket_root_fd) = test_socket_root();
+        let socket_root = test_socket_root();
         VmDriver {
             config: VmDriverConfig {
                 rootfs_tar_staging_dir: Some(staging_root.to_path_buf()),
@@ -10297,7 +10304,6 @@ mod tests {
                 ..Default::default()
             },
             socket_root,
-            socket_root_fd,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -10629,7 +10635,7 @@ mod tests {
 
     fn test_driver_with_extensions(extensions: LifecycleExtensionRegistry) -> VmDriver {
         let (events, _) = broadcast::channel(WATCH_BUFFER);
-        let (socket_root, socket_root_fd) = test_socket_root();
+        let socket_root = test_socket_root();
         VmDriver {
             config: VmDriverConfig {
                 grpc_endpoint: "http://127.0.0.1:8080".to_string(),
@@ -10640,7 +10646,6 @@ mod tests {
                 ..Default::default()
             },
             socket_root,
-            socket_root_fd,
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
