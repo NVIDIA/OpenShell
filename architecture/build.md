@@ -33,7 +33,9 @@ Cargo lockfile validation, checking, formatting, linting, dependency policy,
 and tests. Branch CI and the corresponding mise tasks invoke those apps, so
 both paths use the same command definitions. The apps intentionally write to
 the checkout's Cargo `target/` directory; they are development commands, not
-hermetic Nix build outputs.
+hermetic Nix build outputs. Each app declares its own runtime inputs and
+toolchain environment, so callers use `nix run` directly rather than wrapping
+the app in the broader `nix develop` shell.
 
 Mise remains the cross-platform task graph and owns non-Rust tools and stateful
 local workflows. Native Windows Rust validation continues through the mise

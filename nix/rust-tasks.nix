@@ -23,6 +23,7 @@ let
       inherit name;
       runtimeInputs = [
         pkgs.git
+        pkgs.pkg-config
         rustToolchain
       ]
       ++ runtimeInputs;
@@ -86,6 +87,7 @@ in
       pkgs.cargo-nextest
       pkgs.e2fsprogs
     ];
+    # Preserve the previous mise task and CI environment for both test profiles.
     runtimeEnv.OPENSHELL_TELEMETRY_ENABLED = "false";
     text = ''
       cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support

@@ -86,6 +86,7 @@ run = "bash tasks/scripts/e2e-gpu-build-images.sh"
 ["test:rust"]
 description = "Run Rust tests"
 depends = ["rust:lockfiles:check"]
+# The Nix app sets OPENSHELL_TELEMETRY_ENABLED=false for the complete test run.
 run = "nix run .#rust-test"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-precommit native"
 hide = true
