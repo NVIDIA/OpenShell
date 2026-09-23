@@ -244,6 +244,12 @@ qualification output (`seccomp_listener_mode`).
 DNS uses an exact sandbox-local resolver at `127.0.0.53:53`. The driver sets the
 nameserver and permits an unprivileged bind to port 53. UDP and TCP DNS requests
 are forwarded through the supervisor, which applies hostname-based DNS policy.
+The Podman driver supplies that resolver configuration as a driver-owned,
+read-only secret mounted at `/etc/resolv.conf`; the workload remains on
+`network=none` and receives no host aliases directly. For
+`host.openshell.internal`, the supervisor returns the trusted concrete host
+destination carried in its runtime descriptor rather than relying on Podman's
+workload-side host-gateway injection.
 DNS sender identity is explicitly unavailable: native writes can come from an
 inheriting process or after exec, and neither the connecting binary nor a later
 descriptor-owner snapshot proves who sent an already queued query. Consumers

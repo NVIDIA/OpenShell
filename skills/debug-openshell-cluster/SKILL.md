@@ -321,6 +321,12 @@ Common findings:
 - On Linux, verify that the host-networked Podman supervisor can reach the
   gateway's primary loopback endpoint. On macOS, verify Podman Machine's
   host-loopback forwarding or configure an explicit `grpc_endpoint`.
+- If `host.openshell.internal` does not resolve inside a workload, verify its
+  `/etc/resolv.conf` contains `nameserver 127.0.0.53`. The Podman driver mounts
+  that file from a per-sandbox secret and supplies the alias destination to the
+  supervisor. Check `host_gateway_ip` only when the platform default
+  (`127.0.0.1` on native Linux or `192.168.127.254` on macOS Podman Machine)
+  does not reach the gateway host.
 
 When `userns` is configured (e.g. `userns = "auto"` or `userns = "keep-id"`):
 

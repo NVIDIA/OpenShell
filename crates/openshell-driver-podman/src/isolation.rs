@@ -195,17 +195,32 @@ pub struct RestartMetadata {
     pub(crate) child_env: HashMap<String, String>,
 }
 
+pub struct BootstrapArchivesInput<'a> {
+    pub sandbox_id: &'a str,
+    pub container_id: &'a str,
+    pub generation: &'a str,
+    pub host_gateway_ip: std::net::IpAddr,
+    pub identity: &'a ResolvedWorkloadIdentity,
+    pub allow_extra_supplementary_groups: bool,
+    pub child_env: HashMap<String, String>,
+    pub launch_authentication: &'a openshell_core::jwt::SandboxLaunchAuthentication,
+}
+
 /// The shared volume contains only sandbox credentials. Supervisor credentials,
 /// gateway authorization, and the restart copy never enter that volume.
 pub fn bootstrap_archives(
-    sandbox_id: &str,
-    container_id: &str,
-    generation: &str,
-    identity: &ResolvedWorkloadIdentity,
-    allow_extra_supplementary_groups: bool,
-    child_env: HashMap<String, String>,
-    launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
+    input: BootstrapArchivesInput<'_>,
 ) -> Result<BootstrapArchives, ComputeDriverError> {
+    let BootstrapArchivesInput {
+        sandbox_id,
+        container_id,
+        generation,
+        host_gateway_ip,
+        identity,
+        allow_extra_supplementary_groups,
+        child_env,
+        launch_authentication,
+    } = input;
     launch_authentication.validate().map_err(invalid)?;
     let session_id = launch_authentication.supervisor.session_id;
     let tls = generate_sandbox_tls_material(session_id).map_err(invalid)?;
@@ -277,7 +292,7 @@ pub fn bootstrap_archives(
             server_name: tls.server_name,
             trust_anchor_pem: tls.trust_anchor_pem,
         },
-        host_gateway_ip: None,
+        host_gateway_ip: Some(host_gateway_ip),
         resource_claims,
         workload_identity: identity.clone(),
         outer_fence,
@@ -505,15 +520,16 @@ mod tests {
         .unwrap();
         let authentication = authentication();
         let child_env = HashMap::from([("PATH".to_string(), "/agent/bin".to_string())]);
-        let archives = bootstrap_archives(
-            "sandbox",
-            "container",
-            "generation-1",
-            &identity,
-            false,
-            child_env.clone(),
-            &authentication,
-        )
+        let archives = bootstrap_archives(BootstrapArchivesInput {
+            sandbox_id: "sandbox",
+            container_id: "container",
+            generation: "generation-1",
+            host_gateway_ip: "127.0.0.1".parse().unwrap(),
+            identity: &identity,
+            allow_extra_supplementary_groups: false,
+            child_env: child_env.clone(),
+            launch_authentication: &authentication,
+        })
         .unwrap();
         let workload = files(&archives.channel);
         let supervisor = files(&archives.supervisor);
@@ -552,6 +568,10 @@ mod tests {
         assert_eq!(config.session_id, runtime_descriptor.session_id);
         assert_eq!(config.outer_fence, runtime_descriptor.outer_fence);
         assert_eq!(config.workload_identity, identity);
+        assert_eq!(
+            runtime_descriptor.host_gateway_ip,
+            Some("127.0.0.1".parse().unwrap())
+        );
         runtime_descriptor
             .outer_fence
             .validate(&runtime_descriptor.generation)

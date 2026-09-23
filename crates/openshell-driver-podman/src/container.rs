@@ -53,6 +53,7 @@ const VOLUME_PREFIX: &str = "openshell-sandbox-";
 /// Secret name prefix for per-sandbox gateway JWTs.
 const TOKEN_SECRET_PREFIX: &str = "openshell-token-";
 const PROXY_AUTH_SECRET_PREFIX: &str = "openshell-proxy-auth-";
+const RESOLVER_SECRET_PREFIX: &str = "openshell-resolver-";
 const TLS_CA_SECRET_PREFIX: &str = "openshell-tls-ca-";
 const TLS_CERT_SECRET_PREFIX: &str = "openshell-tls-cert-";
 const TLS_KEY_SECRET_PREFIX: &str = "openshell-tls-key-";
@@ -64,6 +65,7 @@ const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PAT
 const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
 const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str =
     openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH;
+const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 const PROXY_CA_MOUNT_PATH: &str = openshell_core::driver_utils::PROXY_CA_MOUNT_PATH;
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
     openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
@@ -193,6 +195,12 @@ pub fn proxy_auth_secret_name(sandbox_id: &str) -> String {
     format!("{PROXY_AUTH_SECRET_PREFIX}{sandbox_id}")
 }
 
+/// Build the per-sandbox Podman secret name for the mediated DNS resolver.
+#[must_use]
+pub fn resolver_secret_name(sandbox_id: &str) -> String {
+    format!("{RESOLVER_SECRET_PREFIX}{sandbox_id}")
+}
+
 /// Build per-sandbox Podman secret names for TLS CA, cert, and key.
 #[must_use]
 pub fn tls_secret_names(sandbox_id: &str) -> [String; 3] {
@@ -253,14 +261,17 @@ pub struct ContainerSpec {
     /// File-mounted Podman secrets.
     secrets: Vec<SecretMount>,
     stop_timeout: u32,
-    /// Extra /etc/hosts entries. Used to inject `host.containers.internal`
-    /// via Podman's `host-gateway` magic so sandbox containers can reach
-    /// the gateway server running on the host in rootless mode.
+    /// Extra /etc/hosts entries for the networked supervisor container.
+    /// The isolated workload resolves host aliases through policy DNS.
     hostadd: Vec<String>,
     /// Search domains written to `/etc/resolv.conf` by Podman.
     dns_search: Vec<String>,
     /// Resolver options written to `/etc/resolv.conf` by Podman.
     dns_option: Vec<String>,
+    /// Preserve the image resolver path so a driver-owned read-only resolver
+    /// file can be mounted there without Podman replacing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    use_image_resolve_conf: Option<bool>,
     netns: NetNS,
     // Matches libpod's network spec format, which is `{name: {opts}}` where
     // empty opts is a unit struct rather than `()`. Keep as a map so JSON
@@ -1269,15 +1280,16 @@ fn build_base_spec(
             secrets
         },
         stop_timeout: config.stop_timeout_secs,
-        // Inject stable host aliases into /etc/hosts so sandbox containers can
-        // reach services on the host. `host.openshell.internal` is the driver-
-        // neutral alias used by policies and e2e tests.
+        // Inject stable host aliases into the networked supervisor container.
+        // The workload clears these entries and resolves the driver-neutral
+        // alias through the policy-DNS relay instead.
         hostadd: hostadd_entries(config),
         // Preserve Podman's resolver defaults for both policy-DNS and ordinary
         // sandboxes. Namespace-local capture supports UDP and TCP, so it must
         // not depend on a libc-specific option or alter short-name searches.
         dns_search: Vec::new(),
         dns_option: Vec::new(),
+        use_image_resolve_conf: None,
         netns: NetNS {
             nsmode: "bridge".to_string(),
         },
@@ -1424,6 +1436,7 @@ pub struct IsolationSpecInput<'a> {
     pub sandbox: &'a DriverSandbox,
     pub config: &'a PodmanComputeConfig,
     pub token_secret: Option<&'a str>,
+    pub resolver_secret: &'a str,
     pub gpu_devices: Option<&'a [String]>,
     pub requested_image: &'a str,
     pub image_id: &'a str,
@@ -1539,6 +1552,14 @@ pub fn build_isolation_specs(
     workload.hostadd.clear();
     workload.secret_env.clear();
     workload.secrets.clear();
+    workload.secrets.push(SecretMount {
+        source: input.resolver_secret.to_string(),
+        target: RESOLV_CONF_PATH.into(),
+        uid: 0,
+        gid: 0,
+        mode: 0o444,
+    });
+    workload.use_image_resolve_conf = Some(true);
     workload.healthconfig.test = vec!["NONE".into()];
     workload
         .mounts
@@ -1803,6 +1824,7 @@ mod tests {
             sandbox: &sandbox,
             config: &config,
             token_secret: Some("jwt"),
+            resolver_secret: "resolver",
             gpu_devices: None,
             requested_image: "image:latest",
             image_id: "sha256:image",
@@ -1866,6 +1888,7 @@ mod tests {
             sandbox: &sandbox,
             config: &config,
             token_secret: Some("jwt"),
+            resolver_secret: "resolver",
             gpu_devices: None,
             requested_image: "image:latest",
             image_id: "sha256:image",
@@ -1907,7 +1930,14 @@ mod tests {
         assert!(specs.supervisor.portmappings.is_empty());
         assert!(specs.workload.env.is_empty());
         assert_eq!(specs.workload.unsetenv, vec!["LD_PRELOAD", "HTTP_PROXY"]);
-        assert!(specs.workload.secrets.is_empty());
+        assert_eq!(specs.workload.secrets.len(), 1);
+        assert_eq!(specs.workload.secrets[0].source, "resolver");
+        assert_eq!(specs.workload.secrets[0].target, RESOLV_CONF_PATH);
+        assert_eq!(specs.workload.secrets[0].uid, 0);
+        assert_eq!(specs.workload.secrets[0].gid, 0);
+        assert_eq!(specs.workload.secrets[0].mode, 0o444);
+        assert_eq!(specs.workload.use_image_resolve_conf, Some(true));
+        assert_eq!(specs.supervisor.use_image_resolve_conf, None);
         assert!(
             specs
                 .workload

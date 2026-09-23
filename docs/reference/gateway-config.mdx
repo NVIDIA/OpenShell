@@ -929,8 +929,9 @@ image_pull_policy       = "if_not_present" # always | if_not_present | never | n
 grpc_endpoint           = "https://127.0.0.1:17670"
 # The gateway overwrites gateway_port from bind_address at runtime.
 gateway_port            = 17670
-# Omit for the platform default: empty on Linux, 192.168.127.254 on macOS Podman machine.
-# Set "" to force Podman's host-gateway resolver.
+# Trusted supervisor-side destination returned for host.openshell.internal.
+# Omit for the platform default: 127.0.0.1 on native Linux and
+# 192.168.127.254 on macOS Podman Machine.
 # host_gateway_ip       = "192.168.127.254"
 ssh_socket_path         = "/run/openshell/ssh.sock"
 stop_timeout_secs       = 45

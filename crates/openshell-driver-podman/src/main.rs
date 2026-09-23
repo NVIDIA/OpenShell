@@ -73,9 +73,10 @@ struct Args {
     )]
     gateway_port: u16,
 
-    /// Host gateway IP used for sandbox host aliases.
+    /// Trusted supervisor-side destination used for sandbox host aliases.
     ///
-    /// Empty uses Podman's `host-gateway` resolver.
+    /// Empty uses loopback on native Linux and the gvproxy host address on
+    /// macOS Podman Machine.
     #[arg(long, env = "OPENSHELL_PODMAN_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
