@@ -365,24 +365,44 @@ impl TracingLogBus {
         }
     }
 
-    /// Read both resumable buses for a sandbox under one lock hold.
+    /// Validate a resume cursor's epoch and read both resumable buses, all
+    /// under one lock hold.
     ///
-    /// `tail_after` on each bus independently takes and releases its own
-    /// bus-map lock; a publish landing between two independent calls is
-    /// visible to one and not the other, desyncing their high-water marks
-    /// against a live stream that treats them as being read at the same
-    /// instant. Locking the shared cursor space first — the same lock every
-    /// publish path holds across its own tail insert — makes this read
-    /// atomic against any publish on either bus.
+    /// Folding validation into the same hold as the reads is what makes this
+    /// atomic against a teardown: checking the epoch first and reading after
+    /// -- even via a single call that itself locks once internally -- still
+    /// leaves a window between the two lock acquisitions for a `remove` plus
+    /// a republish to retire the validated space and install a replacement
+    /// numbered from 1. A read landing after that would apply the old
+    /// space's seq to the replacement's buffers and find no gap, since
+    /// `tail_after` only compares numbers. Locking the cursor space before
+    /// checking the epoch -- the same lock every publish path holds across
+    /// its own tail insert -- closes that window entirely, and also makes
+    /// the two bus reads atomic against any publish on either bus, for the
+    /// same reason.
     pub(crate) fn snapshot_after(
         &self,
         sandbox_id: &str,
+        expected_epoch: Uuid,
         log_after: u64,
         platform_after: u64,
         want_log: bool,
         want_platform: bool,
-    ) -> (Option<ReplayResult>, Option<ReplayResult>) {
-        let _spaces = self.seq.lock();
+    ) -> ResumeSnapshot {
+        let spaces = self.seq.lock();
+        let Some(space) = spaces.get(sandbox_id) else {
+            return ResumeSnapshot::SpaceGone;
+        };
+        if space.epoch != expected_epoch {
+            return ResumeSnapshot::SpaceGone;
+        }
+        // Right space, but ahead of anything it has issued: only a
+        // fabricated cursor gets here. Reject rather than accept a cutoff no
+        // event can ever exceed.
+        if log_after.max(platform_after) > space.next.saturating_sub(1) {
+            return ResumeSnapshot::CursorAhead;
+        }
+
         let log = want_log.then(|| {
             let inner = self.inner.lock().expect("tracing bus lock poisoned");
             inner.per_id.get(sandbox_id).map_or_else(
@@ -401,8 +421,21 @@ impl TracingLogBus {
                 |per| tail_after_impl(&per.tail, per.last_trimmed_seq, platform_after),
             )
         });
-        (log, platform)
+        ResumeSnapshot::Read(log, platform)
     }
+}
+
+/// Outcome of [`TracingLogBus::snapshot_after`].
+pub(crate) enum ResumeSnapshot {
+    /// No cursor space exists for this sandbox, or its epoch no longer
+    /// matches the resume cursor's -- the space that issued it is gone.
+    SpaceGone,
+    /// The right space, but the cursor is ahead of anything it has issued.
+    /// Only a fabricated cursor reaches this.
+    CursorAhead,
+    /// Both requested reads succeeded at the lock hold; each is
+    /// independently either the replay or the gap that made it unreplayable.
+    Read(Option<ReplayResult>, Option<ReplayResult>),
 }
 
 #[derive(Debug, Clone)]
@@ -619,13 +652,14 @@ mod tests {
         let bus = TracingLogBus::new();
         let sandbox_id = "sb-lock";
         bus.publish_external(make_log_event(sandbox_id, "line"));
+        let epoch = bus.cursor_space(sandbox_id).expect("space exists").epoch;
 
         let guard = bus.seq.lock();
 
         let bus2 = bus.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
-            bus2.snapshot_after(sandbox_id, 0, 0, true, true);
+            bus2.snapshot_after(sandbox_id, epoch, 0, 0, true, true);
             done_tx.send(()).unwrap();
         });
 
@@ -660,8 +694,13 @@ mod tests {
             },
         ); // seq 2
         bus.publish_external(make_log_event(sandbox_id, "l2")); // seq 3
+        let epoch = bus.cursor_space(sandbox_id).expect("space exists").epoch;
 
-        let (log, platform) = bus.snapshot_after(sandbox_id, 0, 0, true, true);
+        let ResumeSnapshot::Read(log, platform) =
+            bus.snapshot_after(sandbox_id, epoch, 0, 0, true, true)
+        else {
+            panic!("expected a successful read");
+        };
         assert_eq!(
             cursors(&log.expect("followed").expect("no gap")),
             vec![1, 3]
@@ -678,10 +717,61 @@ mod tests {
         let bus = TracingLogBus::new();
         let sandbox_id = "sb-skip";
         bus.publish_external(make_log_event(sandbox_id, "l1"));
+        let epoch = bus.cursor_space(sandbox_id).expect("space exists").epoch;
 
-        let (log, platform) = bus.snapshot_after(sandbox_id, 0, 0, true, false);
+        let ResumeSnapshot::Read(log, platform) =
+            bus.snapshot_after(sandbox_id, epoch, 0, 0, true, false)
+        else {
+            panic!("expected a successful read");
+        };
         assert_eq!(log.expect("followed").expect("no gap").len(), 1);
         assert!(platform.is_none());
+    }
+
+    /// The epoch check and both bus reads happen under one lock hold, so a
+    /// teardown plus republish between them can't apply a stale epoch's
+    /// cursor to the replacement space's buffers.
+    #[test]
+    fn snapshot_after_rejects_a_cursor_from_a_retired_space() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-retired";
+        bus.publish_external(make_log_event(sandbox_id, "l1"));
+        let original_epoch = bus.cursor_space(sandbox_id).expect("space exists").epoch;
+
+        bus.remove(sandbox_id);
+        bus.publish_external(make_log_event(sandbox_id, "l1-again")); // seq 1 again, new epoch
+
+        assert!(matches!(
+            bus.snapshot_after(sandbox_id, original_epoch, 0, 0, true, false),
+            ResumeSnapshot::SpaceGone
+        ));
+    }
+
+    /// No space at all -- an unpublished or never-existent sandbox -- is the
+    /// same outcome as a retired one: there's nothing for the cursor to
+    /// address.
+    #[test]
+    fn snapshot_after_rejects_when_no_space_exists() {
+        let bus = TracingLogBus::new();
+        assert!(matches!(
+            bus.snapshot_after("nope", Uuid::nil(), 0, 0, true, false),
+            ResumeSnapshot::SpaceGone
+        ));
+    }
+
+    /// A cursor ahead of anything the space has issued -- only reachable with
+    /// a fabricated token -- is rejected rather than treated as caught up.
+    #[test]
+    fn snapshot_after_rejects_a_cursor_ahead_of_the_space() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-ahead";
+        bus.publish_external(make_log_event(sandbox_id, "l1"));
+        let epoch = bus.cursor_space(sandbox_id).expect("space exists").epoch;
+
+        assert!(matches!(
+            bus.snapshot_after(sandbox_id, epoch, 99, 0, true, false),
+            ResumeSnapshot::CursorAhead
+        ));
     }
 
     #[test]
@@ -725,17 +815,22 @@ mod tests {
         for _ in 0..3 {
             bus.publish_external(make_log_event(sandbox_id, "line"));
         }
+        let epoch = bus.cursor_space(sandbox_id).expect("space exists").epoch;
+
         // Cursors start at 1, so three publishes are seqs 1,2,3.
-        let (log, _) = bus.snapshot_after(sandbox_id, 0, 0, true, false);
+        let ResumeSnapshot::Read(log, _) = bus.snapshot_after(sandbox_id, epoch, 0, 0, true, false)
+        else {
+            panic!("expected a successful read");
+        };
         assert_eq!(
             cursors(&log.expect("followed").expect("no gap")),
             vec![1, 2, 3]
         );
-        let (log, _) = bus.snapshot_after(sandbox_id, 2, 0, true, false);
+        let ResumeSnapshot::Read(log, _) = bus.snapshot_after(sandbox_id, epoch, 2, 0, true, false)
+        else {
+            panic!("expected a successful read");
+        };
         assert_eq!(cursors(&log.expect("followed").expect("no gap")), vec![3]);
-        // Unknown sandbox: no entry, nothing buffered, no gap.
-        let (log, _) = bus.snapshot_after("nope", 5, 0, true, false);
-        assert!(log.expect("followed").expect("no gap").is_empty());
     }
 
     #[test]
@@ -746,14 +841,24 @@ mod tests {
         for _ in 0..3 {
             platform.publish(sandbox_id, stream_event(0));
         }
+        let epoch = bus.cursor_space(sandbox_id).expect("space exists").epoch;
+
         // Shared allocator, but only the platform bus published here, so its
         // seqs are 1,2,3.
-        let (_, platform_replay) = bus.snapshot_after(sandbox_id, 0, 0, false, true);
+        let ResumeSnapshot::Read(_, platform_replay) =
+            bus.snapshot_after(sandbox_id, epoch, 0, 0, false, true)
+        else {
+            panic!("expected a successful read");
+        };
         assert_eq!(
             cursors(&platform_replay.expect("followed").expect("no gap")),
             vec![1, 2, 3]
         );
-        let (_, platform_replay) = bus.snapshot_after(sandbox_id, 0, 1, false, true);
+        let ResumeSnapshot::Read(_, platform_replay) =
+            bus.snapshot_after(sandbox_id, epoch, 0, 1, false, true)
+        else {
+            panic!("expected a successful read");
+        };
         assert_eq!(
             cursors(&platform_replay.expect("followed").expect("no gap")),
             vec![2, 3]

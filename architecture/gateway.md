@@ -524,15 +524,17 @@ cursor space, so a resume against a torn-down sandbox cannot create the space it
 stale cursor is then checked against. Clients track the highest observed `cursor`
 and pass it as `resume_after_cursor` on reconnect.
 
-On resume, both bus reads happen under one lock — `TracingLogBus::snapshot_after`
-— rather than as two independent calls. A publish landing between two
-independently-locked reads would be visible to whichever ran second and not the
-other, desyncing their high-water marks against a live stream that treats them as
-read at the same instant; holding the cursor-space lock (the same one every
-publish holds across its own tail insert) across both reads closes that window.
-The epoch is validated once before the reads, under this scheme — a second
-post-read check isn't needed once there's no window left for a teardown and
-republish to land in.
+On resume, epoch validation and both bus reads happen inside one call under one
+lock — `TracingLogBus::snapshot_after` — rather than as a validate-then-read
+pair. A publish landing between two independently-locked reads would be visible
+to whichever ran second and not the other, desyncing their high-water marks
+against a live stream that treats them as read at the same instant; a teardown
+plus a republish landing between a *separate* validation and read would apply
+the old space's seq to the replacement's buffers and find no gap, since
+`tail_after` only compares numbers, not epochs. Folding validation into the same
+lock hold as the reads closes both windows at once: nothing can retire or
+recreate the space while it's held, so a second post-read epoch check isn't
+needed.
 
 #### Coverage floor
 
@@ -558,6 +560,19 @@ This can withhold far more than either depth parameter alone implies — even th
 entire batch — whenever a followed sibling has any backlog the request didn't
 ask to replay. That is a deliberate trade-off: an emptier initial batch is
 preferable to a resume that silently and permanently drops events.
+
+Withholding alone would just move the silent loss from resume time to a live
+event delivered moments later: nothing raises `log_cutoff`/`platform_cutoff`
+past what this batch actually sent, so the very next live event past the floor
+would still be delivered and would still let the client's cursor outrun the
+withheld backlog. Refusing that delivery too doesn't help either — the withheld
+events were published before subscribe and will never arrive live to fill the
+gap in, so gating every later event on them would starve the stream
+indefinitely instead of surfacing one bounded gap. The producer instead emits a
+coverage-gap warning ahead of the batch, naming how many events were withheld
+per source, and then proceeds with ordinary cutoffs. The gap is disclosed once,
+up front, rather than silently, which is the bar the whole loss-awareness design
+holds to — not that nothing is ever lost.
 
 ## Persistence
 

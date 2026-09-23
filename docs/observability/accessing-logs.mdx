@@ -58,7 +58,7 @@ On reconnect, a client passes the highest cursor it processed as the resume poin
 
 The gateway merges the log and platform event sources before emitting, so events normally arrive in ascending cursor order. That applies to the buffered tail you receive when the stream opens, to a replay after a resume, and to live delivery. The gateway does not delay an event to wait for a lower cursor that has not been published yet, so a cursor can still arrive late under concurrent publication. Track the highest cursor seen as the resume point rather than the last one received.
 
-A cursor is one position shared by the log and platform sources; you track a single highest value, not one per source. If you request both logs and platform events through the SDK and set how far back each replays independently, an asymmetric depth can reduce how much either source delivers on connect — the gateway withholds events rather than hand out a cursor that one of the two sources cannot fully vouch for. `openshell logs` doesn't expose this dial and isn't affected; it applies to SDK callers who set both replay depths directly.
+A cursor is one position shared by the log and platform sources; you track a single highest value, not one per source. If you request both logs and platform events through the SDK and set how far back each replays independently, an asymmetric depth can reduce how much either source delivers on connect — the gateway withholds events rather than hand out a cursor that one of the two sources cannot fully vouch for, and reports what it withheld with a warning event rather than dropping it silently. `openshell logs` doesn't expose this dial and isn't affected; it applies to SDK callers who set both replay depths directly.
 
 ## Direct Filesystem Access
 

@@ -18,7 +18,7 @@ use crate::pagination::Pagination;
 use crate::persistence::{
     ObjectLabels, ObjectListQuery, ObjectType, WriteCondition, generate_name,
 };
-use crate::tracing_bus::CursoredEvent;
+use crate::tracing_bus::{CursoredEvent, ResumeSnapshot};
 use crate::watch_cursor::WatchCursor;
 use futures::future;
 use openshell_core::net::set_tcp_nodelay_best_effort;
@@ -1908,41 +1908,38 @@ pub(super) async fn handle_watch_sandbox(
                 // and silently swallow every live event beneath it. Comparing
                 // epochs answers "did this cursor come from *this* space?",
                 // which no numeric bound can.
-                match state.tracing_log_bus.cursor_space(&sandbox_id) {
-                    None => {
+                //
+                // Validation and both bus reads happen inside one call, under
+                // one lock hold (see `TracingLogBus::snapshot_after`). A
+                // separate validate-then-read pair -- even with the two reads
+                // themselves atomic against each other -- still leaves a
+                // window between the validation's lock and the reads' lock
+                // for a teardown plus a republish to retire the validated
+                // space and install a replacement in between; the reads would
+                // then apply the old space's seq to the replacement's
+                // buffers and find no gap, since `tail_after` only compares
+                // numbers. Folding validation into the same hold as the reads
+                // closes that window entirely.
+                let (log_replay, platform_replay) = match state.tracing_log_bus.snapshot_after(
+                    &sandbox_id,
+                    resume.epoch,
+                    resume.seq,
+                    resume.seq,
+                    follow_logs,
+                    follow_events,
+                ) {
+                    ResumeSnapshot::SpaceGone => {
                         let _ = tx.send(Err(Status::out_of_range(RESUME_SPACE_GONE))).await;
                         return;
                     }
-                    Some(space) if space.epoch != resume.epoch => {
-                        let _ = tx.send(Err(Status::out_of_range(RESUME_SPACE_GONE))).await;
-                        return;
-                    }
-                    // Right space, but ahead of anything it issued: only a
-                    // fabricated token gets here. Reject rather than accept a
-                    // cutoff no event can ever exceed.
-                    Some(space) if resume.seq > space.highest_seq => {
+                    ResumeSnapshot::CursorAhead => {
                         let _ = tx
                             .send(Err(Status::out_of_range(RESUME_CURSOR_AHEAD)))
                             .await;
                         return;
                     }
-                    Some(_) => {}
-                }
-
-                // Read both buses under one lock hold so a publish landing
-                // between them can't desync their high-water marks (see
-                // `TracingLogBus::snapshot_after`). This also closes the
-                // window the epoch re-check used to guard: a teardown plus
-                // republish can no longer land between the two reads, since
-                // there's only one, so revalidating the epoch afterward is no
-                // longer needed.
-                let (log_replay, platform_replay) = state.tracing_log_bus.snapshot_after(
-                    &sandbox_id,
-                    resume.seq,
-                    resume.seq,
-                    follow_logs,
-                    follow_events,
-                );
+                    ResumeSnapshot::Read(log, platform) => (log, platform),
+                };
 
                 // Gap check FIRST (borrows), before the merge moves the vecs.
                 for replay in [&log_replay, &platform_replay] {
@@ -2075,10 +2072,15 @@ pub(super) async fn handle_watch_sandbox(
                 .filter(|&floor| floor > 0)
                 .min();
 
-                if let Some(cap) = critical_floor {
+                let mut log_withheld = 0;
+                let platform_withheld = critical_floor.map_or(0, |cap| {
+                    let before = logs.len();
                     logs.retain(|cursored| cursored.seq < cap);
+                    log_withheld = before - logs.len();
+                    let before = events.len();
                     events.retain(|cursored| cursored.seq < cap);
-                }
+                    before - events.len()
+                });
 
                 // Cutoffs reflect only what this batch actually delivered.
                 // Withheld backlog was already published before this
@@ -2098,6 +2100,26 @@ pub(super) async fn handle_watch_sandbox(
                 tail.extend(events);
 
                 tail.sort_by_key(|cursored| cursored.seq);
+
+                // Disclose the gap before anything else in this batch. The
+                // cutoffs above are never raised past what was actually
+                // delivered, so a later live event past the floor still
+                // reaches the client -- withholding it too would starve the
+                // stream indefinitely, since the backlog behind the floor
+                // was published before subscribe and will never arrive live
+                // to fill it in. The client has to learn the gap exists from
+                // this warning; a resume from any cursor at or above the
+                // floor cannot recover it, and `tail_after` reports no gap
+                // when asked, since nothing was evicted, only never sent.
+                if log_withheld > 0 || platform_withheld > 0 {
+                    let warning = crate::sandbox_watch::coverage_gap_warning_event(
+                        log_withheld,
+                        platform_withheld,
+                    );
+                    if tx.send(Ok(warning)).await.is_err() {
+                        return;
+                    }
+                }
 
                 for cursored in tail {
                     // Log filters; platform events carry no log fields and pass.
@@ -4655,12 +4677,76 @@ mod tests {
 
         // Platform's floor (1) is the binding constraint: nothing at or
         // above it may be handed out, so both logs are withheld even though
-        // `log_tail_lines` alone would have covered them.
+        // `log_tail_lines` alone would have covered them. The client learns
+        // about it from an explicit warning rather than discovering it
+        // silently on a later reconnect.
+        let warning = stream.next().await.unwrap().unwrap();
+        match warning.payload {
+            Some(openshell_core::proto::sandbox_stream_event::Payload::Warning(w)) => {
+                assert!(w.message.contains('2'), "message: {}", w.message);
+            }
+            other => panic!("expected a coverage-gap warning, got {other:?}"),
+        }
+        assert!(warning.cursor.is_empty());
+
         let next = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await;
         assert!(
             next.is_err(),
-            "expected the coverage floor to withhold every buffered event, got {next:?}"
+            "expected nothing further after the warning, got {next:?}"
         );
+    }
+
+    /// The coverage-gap warning discloses the withheld backlog once, up
+    /// front, rather than gating every later event: a live event published
+    /// after connect still reaches the client, even though its cursor sits
+    /// past the withheld platform backlog. The withheld events were
+    /// published before subscribe and can never arrive live, so refusing to
+    /// deliver anything past them would starve the stream indefinitely
+    /// instead of just disclosing the one, bounded gap.
+    #[tokio::test]
+    async fn live_delivery_proceeds_normally_after_the_coverage_gap_warning() {
+        use openshell_core::proto::sandbox_stream_event::Payload;
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("floorlive", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_platform_event(&state, &id, "e1"); // cursor 1, withheld (event_tail: 0)
+        seed_log_lines(&state, &id, 1); // cursor 2, withheld too (below critical_floor)
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                follow_logs: true,
+                follow_events: true,
+                event_tail: 0,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.cursor.is_empty());
+
+        let warning = stream.next().await.unwrap().unwrap();
+        assert!(matches!(warning.payload, Some(Payload::Warning(_))));
+
+        // Published after connect: a genuinely new live event, not part of
+        // the withheld backlog. It must still be delivered.
+        seed_log_lines(&state, &id, 1); // cursor 3, live
+
+        let live = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("live event should arrive")
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq_of(&live), 3);
     }
 
     /// Symmetric depths (or a source that's fully covered) impose no floor:
