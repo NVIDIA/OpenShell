@@ -648,15 +648,20 @@ Gateway and Sandbox Protocol token responses follow the same convention: a
 present expiration timestamp carries the absolute deadline, while absence means
 the issued token does not expire.
 
-On-disk SQLite databases run in WAL journal mode with `synchronous=NORMAL`.
+On-disk SQLite databases run in WAL journal mode with `synchronous=FULL`.
 The adapter switches the file to WAL on a single connection before the pool
 opens, then applies both settings to every pooled connection. WAL lets readers
-proceed while a writer commits, and `NORMAL` removes the per-commit `fsync`,
+proceed while a writer commits and reduces each commit to one WAL `fsync`,
 which matters because gateway hot paths such as SSH session issuance and
-revocation are many small autocommit writes. The trade-off is that a power
-loss or kernel crash can roll back the most recent transactions; the database
-remains consistent. Deployments that need stronger durability or multiple
-replicas use Postgres. WAL requires a local filesystem with working shared
+revocation are many small autocommit writes. `synchronous` stays at `FULL`
+because some of those writes tighten authorization: under `NORMAL`, a power
+loss could roll back an acknowledged SSH session revocation and make the token
+valid again. Writes that are safe to lose, currently only SSH session issuance
+through `Store::create_relaxed`, use a second single-connection pool with
+`synchronous=NORMAL`. Losing a minted token only invalidates it, and because
+both pools share one WAL, the next `FULL` commit also makes earlier relaxed
+commits durable. Deployments that need multiple replicas use Postgres, where
+`create_relaxed` is an ordinary durable insert. WAL requires a local filesystem with working shared
 memory, so the SQLite file must not live on a network mount, and backups must
 use `sqlite3 .backup` or `VACUUM INTO` rather than copying the main file alone.
 

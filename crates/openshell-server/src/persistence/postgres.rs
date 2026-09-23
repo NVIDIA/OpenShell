@@ -180,6 +180,29 @@ ON CONFLICT (object_type, workspace, name) WHERE name IS NOT NULL DO UPDATE SET
         Ok(())
     }
 
+    /// Create an object; Postgres commits are always durable, so this is
+    /// [`Self::put_if`] with [`WriteCondition::MustCreate`].
+    pub async fn create_relaxed(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<WriteResult> {
+        self.put_if(
+            object_type,
+            id,
+            name,
+            workspace,
+            payload,
+            labels,
+            WriteCondition::MustCreate,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn put_if(
         &self,

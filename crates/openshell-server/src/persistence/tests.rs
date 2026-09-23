@@ -350,7 +350,7 @@ async fn file_journal_mode(db_path: &std::path::Path) -> String {
 }
 
 #[tokio::test]
-async fn sqlite_connect_enables_wal_and_normal_synchronous_on_disk() {
+async fn sqlite_connect_enables_wal_and_full_synchronous_on_disk() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join("openshell.db");
     let url = on_disk_store_url(&db_path);
@@ -361,9 +361,20 @@ async fn sqlite_connect_enables_wal_and_normal_synchronous_on_disk() {
         .await
         .expect("read journal settings through the pool");
     assert_eq!(journal_mode, "wal", "on-disk stores must run in WAL mode");
+    // FULL (2), not NORMAL (1): acknowledged commits such as SSH session
+    // revocations must survive a power loss.
     assert_eq!(
-        synchronous, 1,
-        "on-disk stores must run with synchronous=NORMAL (1), got {synchronous}"
+        synchronous, 2,
+        "on-disk stores must run with synchronous=FULL (2), got {synchronous}"
+    );
+    let (relaxed_journal_mode, relaxed_synchronous) =
+        super::sqlite::relaxed_journal_settings(&store)
+            .await
+            .expect("read journal settings through the relaxed pool");
+    assert_eq!(relaxed_journal_mode, "wal");
+    assert_eq!(
+        relaxed_synchronous, 1,
+        "the relaxed pool must run with synchronous=NORMAL (1), got {relaxed_synchronous}"
     );
 
     // Force a write so the WAL sidecars exist on disk, then confirm they are
@@ -406,6 +417,51 @@ async fn sqlite_connect_enables_wal_and_normal_synchronous_on_disk() {
         "wal",
         "WAL must persist in the database file after the store closes"
     );
+}
+
+#[tokio::test]
+async fn sqlite_create_relaxed_is_must_create_visible_to_durable_writes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let store = Store::connect(&on_disk_store_url(&db_path))
+        .await
+        .expect("connect to sqlite");
+
+    let created = store
+        .create_relaxed("ssh_session", "tok", "tok", "default", b"issued", None)
+        .await
+        .expect("relaxed create");
+    assert_eq!(created.resource_version, 1);
+
+    let duplicate = store
+        .create_relaxed("ssh_session", "tok", "tok", "default", b"again", None)
+        .await
+        .expect_err("relaxed create must reject an existing object");
+    assert!(
+        matches!(duplicate, PersistenceError::UniqueViolation { .. }),
+        "expected UniqueViolation, got {duplicate:?}"
+    );
+
+    // The durable pool sees the relaxed insert and can revoke it with CAS.
+    store
+        .put_if(
+            "ssh_session",
+            "tok",
+            "tok",
+            "default",
+            b"revoked",
+            None,
+            super::WriteCondition::MatchResourceVersion(1),
+        )
+        .await
+        .expect("durable revoke of a relaxed insert");
+    let record = store
+        .get("ssh_session", "tok")
+        .await
+        .expect("get")
+        .expect("record present");
+    assert_eq!(record.payload, b"revoked");
+    assert_eq!(record.resource_version, 2);
 }
 
 #[tokio::test]
@@ -460,8 +516,8 @@ async fn sqlite_file_backed_reads_and_writes_proceed_concurrently() {
         .expect("seed object");
 
     // Mirror the forward-service pattern: many independent autocommit writes
-    // (one insert and one update per "connection") while readers keep
-    // fetching. Every operation must complete; no caller may observe a
+    // (a relaxed insert and a durable update per "connection", so the two
+    // pools contend for the writer lock) while readers keep fetching. Every operation must complete; no caller may observe a
     // "database is locked" error even though the writes contend for the
     // single SQLite writer.
     let writers = (0..8).map(|writer| {
@@ -470,15 +526,7 @@ async fn sqlite_file_backed_reads_and_writes_proceed_concurrently() {
             for index in 0..25 {
                 let id = format!("session-{writer}-{index}");
                 store
-                    .put_if(
-                        "ssh_session",
-                        &id,
-                        &id,
-                        "default",
-                        b"issued",
-                        None,
-                        super::WriteCondition::MustCreate,
-                    )
+                    .create_relaxed("ssh_session", &id, &id, "default", b"issued", None)
                     .await
                     .expect("insert session");
                 store

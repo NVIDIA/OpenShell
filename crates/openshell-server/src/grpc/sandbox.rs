@@ -2597,7 +2597,9 @@ pub(super) async fn handle_create_ssh_session(
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
     super::validation::validate_object_metadata(session.metadata.as_ref(), "ssh_session")?;
 
-    // Use MustCreate to atomically ensure the session token is unique
+    // `create_relaxed` fails if the token already exists, like MustCreate, but
+    // skips the per-commit fsync on SQLite. Losing a freshly minted token in a
+    // crash only makes it invalid; revocation stays on the durable `put_if`.
     let session_labels = session.object_labels();
     let session_labels_json = if session_labels.as_ref().is_none_or(HashMap::is_empty) {
         None
@@ -2609,14 +2611,13 @@ pub(super) async fn handle_create_ssh_session(
     };
     state
         .store
-        .put_if(
+        .create_relaxed(
             SshSession::object_type(),
             &token,
             session.object_name(),
             session.object_workspace(),
             &session.encode_to_vec(),
             session_labels_json.as_deref(),
-            WriteCondition::MustCreate,
         )
         .await
         .map_err(|e| Status::internal(format!("persist ssh session failed: {e}")))?;
