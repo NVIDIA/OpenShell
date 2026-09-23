@@ -121,8 +121,9 @@ fn resolve_linux_process(
             paths
         });
 
-    let (executable_identity, mut pending_cache_entries) =
+    let (executable_identity, pending_cache_entry) =
         resolve_open_executable(&snapshot, &mut executable, cache)?;
+    let mut pending_cache_entries = pending_cache_entry.into_iter().collect::<Vec<_>>();
     let mut ancestors = Vec::with_capacity(ancestor_processes.len());
     for (ancestor, executable) in &mut ancestor_processes {
         let (identity, pending_cache_entry) = resolve_open_executable(ancestor, executable, cache)?;
@@ -385,7 +386,7 @@ fn collect_ancestor_processes(
         return Ok(Vec::new());
     }
 
-    let mut ancestors = Vec::new();
+    let mut ancestors: Vec<(ProcessSnapshot, std::fs::File)> = Vec::new();
     let mut parent = process.parent_pid;
     for _ in 0..MAX_DEPTH {
         if parent == 0 || ancestors.iter().any(|(current, _)| current.pid == parent) {
