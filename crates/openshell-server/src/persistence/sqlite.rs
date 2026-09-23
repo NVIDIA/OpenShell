@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
@@ -83,7 +84,12 @@ impl SqliteStore {
 
         let mut options = SqliteConnectOptions::from_str(url)
             .map_err(|e| map_db_error(&e))?
-            .create_if_missing(true);
+            .create_if_missing(true)
+            // A second gateway request can arrive while a write transaction
+            // is committing. SQLite permits one writer at a time; wait for
+            // the short-lived owner instead of returning SQLITE_BUSY to the
+            // caller after the driver's default five seconds.
+            .busy_timeout(Duration::from_secs(30));
 
         if is_in_memory {
             if options.get_filename().as_os_str().is_empty()

@@ -732,6 +732,9 @@ scope semantics.
 For in-memory SQLite, the adapter retains a dedicated keepalive connection for
 the store lifetime. Operational connection replacement therefore preserves the
 shared in-memory schema and objects instead of creating an empty database.
+SQLite connections wait up to 30 seconds for a concurrent writer to release
+the database lock, so short bursts of gateway writes do not surface as
+`SQLITE_BUSY` errors to callers.
 
 Public protobuf APIs represent absolute times with `google.protobuf.Timestamp`
 and elapsed time with `google.protobuf.Duration`. The integer

@@ -159,6 +159,43 @@ async fn sqlite_connect_runs_embedded_migrations() {
 }
 
 #[tokio::test]
+async fn sqlite_write_waits_for_another_writer_to_finish() {
+    use super::WriteCondition;
+    use sqlx::{Connection, SqliteConnection};
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let url = format!("sqlite:{}?mode=rwc", tmp.path().join("busy.db").display());
+    let store = Store::connect(&url).await.expect("connect store");
+    let mut locker = SqliteConnection::connect(&url)
+        .await
+        .expect("connect competing writer");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut locker)
+        .await
+        .expect("hold write lock");
+
+    let write = store.put_if(
+        "workspace",
+        "concurrent-workspace",
+        "concurrent-workspace",
+        "",
+        b"workspace-payload",
+        None,
+        WriteCondition::MustCreate,
+    );
+    let unlock = async {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        sqlx::query("COMMIT")
+            .execute(&mut locker)
+            .await
+            .expect("release write lock");
+    };
+    let (result, ()) = tokio::join!(write, unlock);
+    result.expect("waiting writer should succeed after the lock is released");
+}
+
+#[tokio::test]
 async fn sqlite_inference_route_removal_migration_deletes_only_managed_routes() {
     use sqlx::{Connection, SqliteConnection};
 
