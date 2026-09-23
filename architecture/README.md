@@ -188,7 +188,6 @@ that crate's `README.md`.
 | [Build](build.md) | Build artifacts, CI/E2E, docs site validation, and release packaging. |
 | [Google Vertex AI Provider](google-vertex-ai-provider.md) | Implementation reference for the `google-vertex-ai` provider, from CLI through gateway to sandbox. |
 | [Windows](windows.md) | Windows/MXC runtime architecture, policy enforcement, networking, relay, audit, and trust boundaries. |
-| [Windows MSVC Build](windows-msvc-build.md) | Build-only native Windows MSVC lane (x64/ARM64) and unsupported-runtime behavior on Windows. |
 
 ## `rfc/` vs `architecture/`
 

@@ -229,10 +229,13 @@ they do not silently fall back to an unisolated runtime. MXC also rejects GPU
 requests and `agent_socket_path` because it has neither GPU integration nor the
 standard in-sandbox supervisor.
 
-The supported Windows artifacts and cross-architecture build boundary are
-documented in [Windows MSVC Build](windows-msvc-build.md). An x64 host can
-cross-check and cross-build ARM64, but native runtime tests and MXC
-qualification must execute on the matching architecture.
+The Windows release-profile build lane produces `openshell-gateway.exe`,
+`openshell.exe`, and `openshell-supervisor-relay.exe` for x64 and ARM64 as
+validation artifacts; the hosted workflow does not publish them. An x64 host
+can cross-check and cross-build ARM64, but native runtime tests and MXC
+qualification must execute on the matching architecture. See
+[Windows build and validation](../CONTRIBUTING.md#windows-build-and-validation)
+for contributor prerequisites and commands.
 
 ## Validation and Qualification
 

@@ -32,7 +32,8 @@ The Windows build lane is implemented by these tracked files:
 | `tasks/rust.toml`, `tasks/test.toml`, and `tasks/markdown.toml` | Windows routing for compiler-bearing checks, explicit Unix-only test skips, and Markdown dependency setup. |
 | `tasks/scripts/windows-msvc.ps1` | PowerShell wrapper that enters the Visual Studio developer environment and invokes Cargo. |
 | `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus advisory main/manual cache seeding and dependent binary builds on native x64 and ARM64 runners. |
-| `architecture/windows-msvc-build.md` | Design notes and validation contract. |
+| `CONTRIBUTING.md` | Human-facing Windows build prerequisites and command summary. |
+| `architecture/windows.md` | Stable Windows/MXC runtime and cross-architecture boundaries. |
 | `.agents/skills/build-openshell-mxc-windows/` | This skill and companion reference material. |
 
 Use the code that is already in the repo. Do not generate a parallel Windows

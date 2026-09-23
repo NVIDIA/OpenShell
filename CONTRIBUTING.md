@@ -361,14 +361,42 @@ just this crate does not require `LIBCLANG_PATH`:
 cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features bundled-z3
 ```
 
-### Windows full build
+### Windows build and validation
 
-To build the full set of Windows binaries, including `openshell-gateway.exe`
-and `openshell.exe`, use the `windows:build:x64` mise task instead of a
-single-crate `cargo build`. It downloads the pinned prebuilt Z3 release by default. A
-full build also compiles crates that use `bindgen` (e.g. the MXC driver on
-Windows), so it requires `libclang.dll`; if LLVM is not on the default search
-path, set `LIBCLANG_PATH` to the directory containing `libclang.dll`:
+Use the platform-native `windows:*` mise tasks for Windows MSVC development.
+The lane supports x64 and ARM64 and builds `openshell-gateway.exe`,
+`openshell.exe`, and `openshell-supervisor-relay.exe`. It does not enable
+Docker, Kubernetes, Podman, or VM-backed execution on Windows.
+
+Install Visual Studio C++ Build Tools, a compatible Windows SDK, Rust through
+rustup, mise, and the Visual Studio LLVM tools used by `bindgen`. Run every task
+with `--skip-tools`; mise orchestrates the commands but does not install the
+Windows compiler toolchain.
+
+| Task | Purpose |
+|---|---|
+| `windows:lint:<x64\|arm64>` | Run Clippy for the Windows-supported workspace on the selected target architecture. |
+| `windows:build:<x64\|arm64>` | Build the three Windows release executables. |
+| `windows:test:<x64\|arm64>` | Run the workspace suite natively; the target must match the host architecture. |
+| `windows:test:unsupported:<x64\|arm64>` | Run the focused unsupported-driver contracts. |
+| `windows:test:mxc-real:<x64\|arm64>` | Run the probe-gated real-`wxc-exec` integration suite on the matching host. |
+| `windows:artifacts` | Report sizes and SHA256 hashes for release artifacts. |
+| `windows:ci` | Run the aggregate x64-host check, build, test, contract, and artifact workflow. |
+
+The task definitions in [`tasks/windows.toml`](tasks/windows.toml), the
+PowerShell implementation in
+[`tasks/scripts/windows-msvc.ps1`](tasks/scripts/windows-msvc.ps1), and the
+hosted workflow in
+[`.github/workflows/windows-msvc.yml`](.github/workflows/windows-msvc.yml) are
+the executable sources of truth. See
+[`architecture/windows.md`](architecture/windows.md) for the stable Windows/MXC
+runtime and enforcement boundaries.
+
+To build x64 locally, use `windows:build:x64` instead of a single-crate Cargo
+build. It downloads the pinned prebuilt Z3 release by default. A full build also
+compiles crates that use `bindgen`, including the MXC driver, so it requires
+`libclang.dll`. If LLVM is not on the default search path, set `LIBCLANG_PATH`
+to the directory containing `libclang.dll`:
 
 ```powershell
 $env:LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Tools\Llvm\x64\bin'
