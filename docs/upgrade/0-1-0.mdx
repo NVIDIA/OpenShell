@@ -55,6 +55,8 @@ If you run OpenShell for a team, start here.
 
 - **Update Kubernetes user-namespace configuration.** Remove `platform_config.host_users`. Use the typed sandbox template `user_namespaces` field or the Kubernetes driver default ([PR #3248](https://github.com/NVIDIA/OpenShell/pull/3248)).
 
+- **Approve caller-selected compute resources.** Compute drivers now disable caller-supplied `driver_config` by default. If you enable it, label each allowed PVC, RuntimeClass, PriorityClass, Docker volume, or Podman volume with `openshell.ai/sandbox-attachable=true` and `openshell.ai/sandbox-attachable-workspace=<workspace>`. Recreate legacy sandboxes without verifiable admission provenance, pass matching admission settings to standalone drivers, and set `gateway.allowDriverConfig=true` on each split Helm workspace release ([PR #3538](https://github.com/NVIDIA/OpenShell/pull/3538), [PR #3571](https://github.com/NVIDIA/OpenShell/pull/3571)).
+
 - **Review Helm PKI and ingress settings.** PKI initialization now fails an install or upgrade after its timeout by default. Increase `pkiInitJob.timeoutSeconds` when needed, and set `server.tls.enableMtls=false` when enabling `grpcRoute.backendTLSPolicy` ([PR #2728](https://github.com/NVIDIA/OpenShell/pull/2728)).
 
 - **Remove orphaned Helm RBAC objects.** After verifying the new namespace-qualified `ClusterRole` and `ClusterRoleBinding`, delete the old fixed-name `openshell-gateway-node-reader` objects if no release still owns them ([PR #2939](https://github.com/NVIDIA/OpenShell/pull/2939)).
@@ -89,7 +91,7 @@ If you use OpenShell through the CLI, policies, APIs, or SDKs, review these chan
 
 - **Fix unknown policy fields.** The authored policy schema rejects misspelled, obsolete, and other unknown fields instead of ignoring them ([PR #3334](https://github.com/NVIDIA/OpenShell/pull/3334)).
 
-- **Update endpoint modes.** Regenerate clients for the typed `tls`, `enforcement`, and `access` enums. Remove `tls: terminate` and `tls: passthrough`; omit `tls` for automatic inspection. Do not use `skip` as a replacement because it disables inspection ([PR #3187](https://github.com/NVIDIA/OpenShell/pull/3187), [open PR #3414](https://github.com/NVIDIA/OpenShell/pull/3414)).
+- **Update endpoint modes.** Regenerate clients for the typed `tls`, `enforcement`, and `access` enums. Remove `tls: terminate` and `tls: passthrough`; omit `tls` for automatic inspection. Do not use `skip` as a replacement because it disables inspection ([PR #3187](https://github.com/NVIDIA/OpenShell/pull/3187), [PR #3414](https://github.com/NVIDIA/OpenShell/pull/3414)).
 
 - **Target L7 policy edits explicitly.** Policy update commands that append allow or deny rules must include `--rule-name` and every `--binary`, or `--any-binary`. Raw API calls must send the complete `L7RuleTarget` ([PR #3380](https://github.com/NVIDIA/OpenShell/pull/3380)).
 
@@ -107,11 +109,11 @@ If you use OpenShell through the CLI, policies, APIs, or SDKs, review these chan
 
 - **Update SDK error handling.** Python clients raise `GatewayError`, which is a `grpc.RpcError` but not a `grpc.Call`. Rust error variants contain additional status fields. SDKs expose retry details but do not automatically retry mutations ([PR #3313](https://github.com/NVIDIA/OpenShell/pull/3313)).
 
-- **Use stable request IDs for retries.** When a mutation includes `request_id`, retry with the same identity, scope, method, and payload. Cancellation does not cancel admitted work. Reconcile the result after `REQUEST_OUTCOME_UNCERTAIN` instead of submitting a new ID ([PR #3321](https://github.com/NVIDIA/OpenShell/pull/3321), [PR #3323](https://github.com/NVIDIA/OpenShell/pull/3323)).
+- **Use stable request IDs for retries.** When a mutation includes `request_id`, retry with the same identity, scope, method, and payload. Cancellation does not cancel admitted work. Reconcile the result after `REQUEST_OUTCOME_UNCERTAIN` instead of submitting a new ID. An admitted exec retry cannot replay output, its exit code, or the stream, so handle `REQUEST_STREAM_UNAVAILABLE` separately ([PR #3321](https://github.com/NVIDIA/OpenShell/pull/3321), [PR #3323](https://github.com/NVIDIA/OpenShell/pull/3323), [PR #3324](https://github.com/NVIDIA/OpenShell/pull/3324)).
 
 - **Drain interactive exec after closing input.** Closing the request stream closes stdin but does not end output. Drain output concurrently and wait for both the exit event and final RPC status. Go clients use `CloseInteractiveInput` or `CancelInteractive`; TypeScript clients use `closeInput()` or `cancel()` ([PR #3359](https://github.com/NVIDIA/OpenShell/pull/3359)).
 
-- **Resume watch streams by cursor.** Treat stream warnings as recoverable gaps, persist the greatest processed opaque cursor, and send it when reconnecting. If the gateway returns `OUT_OF_RANGE`, discard the cursor and restart without resume ([open PR #3209](https://github.com/NVIDIA/OpenShell/pull/3209)).
+- **Resume watch streams by cursor.** Treat stream warnings as recoverable gaps, persist the greatest processed opaque cursor, and send it when reconnecting. If the gateway returns `OUT_OF_RANGE`, discard the cursor and restart without resume ([PR #3209](https://github.com/NVIDIA/OpenShell/pull/3209)).
 
 - **Stop importing persistence messages.** The `StoredProviderProfile`, refresh-state, stored policy revision, and draft-chunk messages move to a private storage package and have no public API replacement ([PR #3169](https://github.com/NVIDIA/OpenShell/pull/3169)).
 

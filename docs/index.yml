@@ -34,5 +34,7 @@ navigation:
   title: "Reference"
 - folder: security
   title: "Security"
+- page: "Release Notes"
+  path: release-notes.mdx
 - folder: resources
   title: "Resources"
