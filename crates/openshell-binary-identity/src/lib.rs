@@ -495,10 +495,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "subprocess fixture for executable identity tests"]
+    fn identity_helper_process() {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    #[test]
     fn resolves_child_and_hashes_ancestor_chain() {
         let parent_pid = std::process::id();
-        let child = std::process::Command::new("sleep")
-            .arg("30")
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "tests::identity_helper_process"])
             .spawn()
             .expect("spawn child");
         let child = ChildGuard(child);
