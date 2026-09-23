@@ -4140,17 +4140,28 @@ async fn remove_docker_channel_volume_by_id(
 }
 
 async fn remove_docker_volume(docker: &Docker, name: &str) -> Result<(), Status> {
-    docker
-        .remove_volume(name, None::<bollard::query_parameters::RemoveVolumeOptions>)
-        .await
-        .or_else(|error| {
-            if is_not_found_error(&error) {
-                Ok(())
-            } else {
-                Err(error)
+    // Docker can acknowledge removal of the last container before releasing
+    // its volume mount. Retry only that transient 409; other conflicts and
+    // daemon errors should still fail the sandbox deletion.
+    const MAX_ATTEMPTS: usize = 12;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match docker
+            .remove_volume(name, None::<bollard::query_parameters::RemoveVolumeOptions>)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) if is_not_found_error(&error) => return Ok(()),
+            Err(error) if is_volume_in_use_error(&error) && attempt < MAX_ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
-        })
-        .map_err(|error| Status::internal(format!("remove Docker sandbox runtime volume: {error}")))
+            Err(error) => {
+                return Err(Status::internal(format!(
+                    "remove Docker sandbox runtime volume: {error}"
+                )));
+            }
+        }
+    }
+    unreachable!("the final volume removal attempt returns a result")
 }
 
 fn sandbox_token_host_path(
@@ -6522,6 +6533,16 @@ fn is_removal_in_progress_error(err: &BollardError) -> bool {
             status_code: 409,
             message,
         } if message.contains("removal of container") && message.contains("is already in progress")
+    )
+}
+
+fn is_volume_in_use_error(err: &BollardError) -> bool {
+    matches!(
+        err,
+        BollardError::DockerResponseServerError {
+            status_code: 409,
+            message,
+        } if message.contains("volume is in use")
     )
 }
 

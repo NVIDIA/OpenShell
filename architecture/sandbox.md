@@ -527,6 +527,8 @@ The Docker driver runs `openshell-supervisor` in a separate companion container.
 Its private named volume contains supervisor bootstrap and channel material.
 The workload container receives only `openshell-sandbox`, public interception
 CA material, and the other sandbox half of the authenticated channel.
+On deletion, the driver waits briefly for Docker to release the removed
+containers' private volume mounts before removing those volumes.
 
 For Kubernetes, the operator configures a Secret name and key rather than a
 gateway-host file path. Kubernetes projects that Secret only into the separate

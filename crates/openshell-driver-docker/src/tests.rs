@@ -3440,6 +3440,20 @@ fn concurrent_container_removal_is_idempotent() {
     assert!(!is_removal_in_progress_error(&other_conflict));
 }
 
+#[test]
+fn volume_removal_retries_only_mount_release_conflicts() {
+    let in_use = BollardError::DockerResponseServerError {
+        status_code: 409,
+        message: "remove sandbox-volume: volume is in use - [container-id]".to_string(),
+    };
+    let other_conflict = BollardError::DockerResponseServerError {
+        status_code: 409,
+        message: "volume has invalid options".to_string(),
+    };
+    assert!(is_volume_in_use_error(&in_use));
+    assert!(!is_volume_in_use_error(&other_conflict));
+}
+
 #[tokio::test]
 async fn missing_start_generation_is_adopted() {
     let directory = TempDir::new().expect("create temporary directory");
