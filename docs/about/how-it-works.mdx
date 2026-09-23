@@ -3,127 +3,203 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "How OpenShell Works"
 sidebar-title: "How It Works"
-description: "Understand the OpenShell architecture, runtime boundaries, gateways, sandboxes, and ecosystem integration points."
-keywords: "Generative AI, Cybersecurity, AI Agents, Architecture, Gateway, Sandbox, Providers"
+description: "Understand the OpenShell architecture, trust boundaries, gateways, sandbox runtimes, supervisors, and integration points."
+keywords: "Generative AI, Cybersecurity, AI Agents, Architecture, Gateway, Sandbox, Supervisor, Isolation"
 position: 2
 ---
 
-OpenShell is built around three stable runtime components: the **CLI**, the **Gateway**, and the **Supervisor**.
+OpenShell separates control-plane management from sandbox execution. Clients
+talk to a gateway, a compute driver provisions the runtime, and two dedicated
+components protect each standard Linux sandbox. `openshell-sandbox` runs inside
+the workload boundary with the agent, while `openshell-supervisor` runs outside
+that boundary and owns policy decisions, credentials, upstream connections, and
+the gateway session.
 
-The CLI, SDK, and TUI provide user-facing access. The gateway is the
-control plane: it owns API access, state, policy and settings delivery, provider configuration, and relay coordination. The supervisor runs inside every sandbox workload and is the local security boundary. It launches the agent as a restricted child process and enforces policy where process identity, filesystem access, network egress, and
-runtime credentials are visible.
-
-Infrastructure-specific work sits behind integration boundaries. Compute,
-credentials, control-plane identity, and sandbox identity each have a driver or
-adapter boundary so OpenShell can integrate with native runtimes, secret stores,
-identity providers, and workload identity systems without moving those concerns
-into the core gateway or sandbox model.
+This split keeps gateway and provider credentials out of the agent workload. It
+also gives the workload two independent network controls: in-process mediation
+for supported DNS and TCP operations, plus an outer fence that blocks direct
+egress if traffic avoids the mediation path.
 
 ```mermaid
 flowchart TB
     subgraph UI["User interfaces"]
         CLI["CLI"]
-        SDK["SDK"]
+        SDK["SDKs"]
         TUI["TUI"]
     end
 
     subgraph CP["Control plane"]
         GW["Gateway"]
-        DB[("Entity persistence")]
-        DRIVERS["Compute, credentials, and identity drivers"]
+        DB[("Durable state")]
+        EXT["Compute and credential drivers, interceptors, and middleware"]
     end
 
     subgraph INFRA["Integrated infrastructure"]
-        RUNTIME["Docker, Podman, Kubernetes, or VM"]
+        RUNTIME["Docker, Podman, Kubernetes, VM, or MXC"]
         SECRETSTORE["Secret stores"]
         IDP["Identity providers"]
-        WORKLOADID["Workload identity"]
     end
 
-    subgraph DP["Sandbox data plane"]
+    subgraph TRUSTED["Trusted sandbox control"]
         SUP["Supervisor"]
-        AGENT["Restricted agent process"]
         PROXY["Policy proxy"]
         POLICY["OPA policy engine"]
+    end
+
+    subgraph WORKLOAD["Capability-free workload boundary"]
+        SBX["Sandbox runtime"]
+        AGENT["Restricted agent process"]
+        FENCE["Outer network fence"]
     end
 
     CLI -->|"gRPC / HTTP"| GW
     SDK -->|"gRPC / HTTP"| GW
     TUI -->|"gRPC / HTTP"| GW
     GW --> DB
-    GW --> DRIVERS
-    DRIVERS --> RUNTIME
-    DRIVERS --> SECRETSTORE
-    DRIVERS --> IDP
-    DRIVERS --> WORKLOADID
-    RUNTIME -->|"provisions workload"| SUP
-    SUP -->|"control, config, logs, relay"| GW
-    SUP -->|"spawn and restrict"| AGENT
-    AGENT -->|"ordinary egress"| PROXY
+    GW --> EXT
+    GW --> IDP
+    EXT --> RUNTIME
+    EXT --> SECRETSTORE
+    RUNTIME -->|"provisions paired runtime"| SUP
+    RUNTIME -->|"provisions paired runtime"| SBX
+    SUP -->|"sandbox-authenticated session"| GW
+    SUP <-->|"authenticated boundary channel"| SBX
+    SBX -->|"launches with restricted identity"| AGENT
+    AGENT -->|"DNS and TCP operations"| SBX
+    FENCE -.->|"blocks unmanaged egress"| AGENT
+    SUP --> PROXY
     PROXY -->|"evaluate"| POLICY
-    PROXY -->|"allowed traffic"| EXT["External services"]
-    PROXY -->|"profile-authorized traffic"| MODEL["Model providers"]
+    PROXY -->|"allowed traffic"| SERVICES["External services and model providers"]
 ```
-
-## Deployment Models
-
-OpenShell can run on a single local machine or in a remote Kubernetes cluster.
-The CLI workflow stays the same: users point the CLI, SDK, or TUI at a gateway,
-and the gateway provisions sandboxes through its configured compute driver.
-
-| Deployment | How it works | Best for |
-|---|---|---|
-| Local machine | The gateway runs on the user's workstation or a nearby development host and creates sandboxes with Docker, Podman, or a VM runtime. The supervisor inside each sandbox connects back to that local gateway. | Individual development, local agent experiments, and private workstation workflows. |
-| Remote Kubernetes cluster | The gateway runs as a cluster service and creates sandbox pods in the configured namespace. Supervisors connect outbound to the gateway endpoint, so clients do not need direct pod access. | Shared teams, centrally managed policy, remote compute, GPUs, and production-like environments. |
-
-This deployment split keeps the runtime model consistent. Local deployments use
-the host's container or VM runtime as the integrated infrastructure. Kubernetes
-deployments use the cluster scheduler, networking, secrets, identity, and GPU
-device plugins without changing the gateway and sandbox contract.
 
 ## Core Components
 
-| Component | Boundary |
+Each component owns a distinct part of the security and lifecycle model.
+
+| Component | Responsibility |
 |---|---|
-| [Sandboxes](/sandboxes/manage-sandboxes) | Data-plane workloads that run the supervisor, launch restricted agent processes, apply local isolation, push logs, and maintain the gateway session. |
-| [Gateways](/sandboxes/manage-gateways) | Authenticated control plane that owns API access, durable state, sandbox lifecycle, settings delivery, authorization, and relay coordination. |
-| [Providers](/sandboxes/manage-providers) | Credential and provider records that map logical agent needs to platform or user-managed secrets without exposing raw credentials to the agent process. |
-| [Policies](/sandboxes/policies) | Declarative controls for filesystem access, process identity, network egress, L7 rules, credential injection, and runtime policy updates. |
-| [Provider-backed Inference](/sandboxes/inference-routing) | Per-sandbox provider attachment, native model endpoints, and endpoint-bound credential injection. |
+| CLI, SDKs, and TUI | Authenticate to the gateway and expose the same management API without depending on the active compute runtime. |
+| [Gateway](/sandboxes/manage-gateways) | Stores desired state, authenticates and authorizes users, resolves policy and provider attachments, coordinates lifecycle operations, and routes live sandbox operations. |
+| [Compute driver](/reference/sandbox-compute-drivers) | Translates the gateway's sandbox specification into runtime-native resources, establishes the outer network fence, and reports platform lifecycle state. |
+| Supervisor | Runs outside the agent workload. It holds gateway credentials, evaluates policy, performs TLS and L7 inspection, resolves provider credential placeholders, opens allowed upstream connections, and owns the live gateway session. |
+| Sandbox runtime | Runs `openshell-sandbox` as the workload entrypoint. It validates the admitted boundary, applies local isolation, launches agent processes, identifies the process behind mediated network operations, and relays approved streams to the supervisor. |
+| Agent process | Runs as an immutable non-root identity with no Linux capabilities, `no_new_privs`, Landlock filesystem restrictions, and the final seccomp filter. |
 
-## Gateways and Sandboxes
+The Windows MXC driver uses a driver-owned readiness and host-proxy model rather
+than the standard supervisor session. The gateway accepts this difference
+through the compute-driver capability contract instead of embedding
+runtime-specific behavior in its core lifecycle logic.
 
-The gateway and sandbox split control-plane authority from runtime enforcement. The gateway owns durable platform state: sandboxes, policy revisions, runtime settings, provider records, session records, and authorization decisions. A sandbox owns the local execution boundary: process identity, filesystem access, network egress, credential injection, local logs, and the agent child process.
+## Sandbox Trust Boundary
 
-The relationship is supervisor initiated. Each sandbox supervisor connects outbound to a known gateway endpoint, authenticates as a sandbox workload, and keeps a live session open for control traffic and relays. This avoids requiring every compute driver to solve gateway-to-sandbox reachability through pod IPs, bridge networks, port mappings, NAT traversal, or custom tunnels.
+The standard sandbox runtime uses three trust levels. The supervisor is trusted
+with policy and credentials but runs outside the workload. The sandbox runtime
+shares the agent's non-root identity inside the workload and owns the isolation
+mechanisms. The agent inherits the final restrictions as a child process.
 
-The gateway delivers desired state. The supervisor applies it locally, keeps last-known-good config when refresh fails, and leaves static isolation controls in place until the sandbox is recreated. Live operations such as config refresh, policy updates, credential delivery, log push, connect, exec, file sync, and relay setup use the same authenticated gateway-supervisor relationship.
+The supervisor and sandbox runtime communicate over a driver-provisioned,
+mutually authenticated channel. Docker and Podman use a private Unix socket,
+Kubernetes uses TLS between separate Pods, and the VM driver uses vsock between
+the host supervisor and the guest. Runtime-specific evidence stays with the
+driver and isolation backend, while the shared contract verifies common
+properties such as default-deny egress, generation binding, revocation, and
+fail-closed behavior.
 
-## Supervisor Protection Layers
+The sandbox becomes ready only after the driver reports a healthy resource, the
+supervisor confirms the workload boundary, and the supervisor registers its
+gateway session. If the boundary channel disconnects, the sandbox freezes the
+workload while the same supervisor process attempts to reconnect. It terminates
+the workload when recovery expires.
 
-The supervisor is the sandbox-local enforcement component. It starts before the
-agent process, prepares the sandbox runtime, fetches gateway configuration, and
-then launches the agent under the active policy.
+## Isolation and Network Flow
 
-| Protection layer | Supervisor responsibility |
+OpenShell combines overlapping controls so no single mechanism carries the
+entire security boundary.
+
+| Layer | Enforcement |
 |---|---|
-| Process | Drops privileges, applies process identity rules, disables privilege escalation paths, and starts the agent as a restricted child process. |
-| Filesystem | Applies filesystem policy before the agent starts so undeclared paths are inaccessible and declared paths are read-only or read-write as configured. |
-| Network | Routes ordinary egress through the policy proxy so destination, port, binary identity, and L7 request rules can be evaluated before traffic leaves the sandbox. |
-| Credentials | Receives credential material from the gateway and injects it only through configured policy paths or request-time proxy rules. |
-| Provider access | Enforces profile-derived policy and substitutes provider credential placeholders only at profile-authorized endpoints. |
-| Observability | Emits local security and lifecycle logs, pushes sandbox logs to the gateway, and keeps relay endpoints available for connect, exec, and file transfer operations. |
+| Process identity | The driver resolves one non-root UID, GID, and supplementary-group set before launch. The sandbox and its children use that identity without an in-workload privilege transition. |
+| Filesystem | The sandbox runtime applies the mandatory Landlock baseline and the authored filesystem policy before it starts the agent. |
+| System calls | A seccomp filter restricts the child process. On standard Linux runtimes, seccomp user notification also mediates supported network socket operations. |
+| Outer network fence | Docker and Podman use a network-less workload container, Kubernetes uses an enforced default-deny NetworkPolicy, and the VM guest has no virtual NIC. |
+| Network policy | The supervisor evaluates destination, port, protocol, binary identity, SSRF, TLS, L7, and middleware rules before opening an upstream connection. |
+| Provider credentials | The supervisor keeps secret values outside the workload and substitutes placeholders only for requests to profile-authorized endpoints. |
 
-Static controls such as filesystem and process isolation are established at
-sandbox start and require sandbox recreation to change. Dynamic controls such as
-network policy and credential delivery can refresh over the
-live gateway-supervisor session.
+For an outbound connection, the sandbox runtime identifies the requesting
+binary and sends the DNS or TCP operation across the authenticated boundary.
+The supervisor evaluates the effective policy, opens an allowed upstream
+connection, and relays the stream. The agent never receives a general-purpose
+network path around this flow. For the complete rule model, refer to [Customize
+Sandbox Policies](/sandboxes/policies).
 
-## Ecosystem Integration
+## Runtime Placement
 
-OpenShell integrates with infrastructure ecosystems instead of replacing them. Runtimes, schedulers, secret stores, identity providers, workload identity systems, image pipelines, storage, and GPU or device exposure remain owned by the platforms that provide them.
+The same gateway and sandbox contracts apply across the built-in compute
+drivers, while each driver maps them to its platform's native resources.
 
-The gateway owns OpenShell control-plane semantics: sandbox state, lifecycle ordering, policy and settings resolution, credential mapping, authorization, and relay coordination. Drivers translate those semantics into platform-native operations.
+| Runtime | Workload placement | Trusted supervisor placement | Boundary and outer fence |
+|---|---|---|---|
+| Docker | Capability-free workload container. | Separate supervisor container with host networking. | Private Unix socket and `network_mode=none` on the workload. |
+| Podman | Capability-free rootless workload container. | Separate supervisor container with host networking. | Private Unix socket and `network=none` on the workload. |
+| Kubernetes | Sandbox workload Pod. | Separately scheduled supervisor Pod. | Mutually authenticated TLS and an enforced workload NetworkPolicy with no egress rules. |
+| VM | NIC-less guest running `openshell-sandbox` as PID 1. | Host supervisor process. | Vsock and no guest virtual NIC. |
+| Windows MXC | AppContainer or isolation-session workload. | Driver-owned host proxy when governed egress is enabled. | MXC isolation and Windows Filtering Platform controls. |
 
-The supervisor owns OpenShell sandbox semantics. Filesystem policy, process privilege reduction, network proxying, provider credential injection, security logging, and gateway relay behavior stay consistent across Docker, Podman, Kubernetes, VM-backed sandboxes, and future integrations.
+This separation lets Kubernetes use cluster scheduling, storage, identity, and
+GPU resources while local deployments use existing container or VM runtimes.
+The client workflow remains the same because the gateway and compute-driver
+contracts hide those placement details.
+
+## Gateway Sessions and High Availability
+
+Each standard supervisor opens an outbound, sandbox-authenticated session to
+one gateway replica. Config refresh, policy delivery, logs, exec, file sync,
+port forwarding, and exposed sandbox services use that session. The gateway
+does not need direct inbound access to the workload.
+
+A single-replica deployment can store state in SQLite. A multi-replica
+Kubernetes deployment uses shared PostgreSQL and records which gateway replica
+owns each live supervisor session. When a client request reaches another
+replica, that replica forwards the session-bound operation to the owner through
+an authenticated peer relay. A supervisor reconnect can move ownership to a
+new replica, but OpenShell does not migrate an established byte stream between
+replicas.
+
+For deployment requirements, refer to [Deploy OpenShell on
+Kubernetes](/kubernetes/setup).
+
+## Desired State and Runtime Updates
+
+The gateway stores desired state for sandboxes, policies, settings, provider
+profiles, provider attachments, and lifecycle intent. The compute driver owns
+platform provisioning, while the supervisor applies sandbox-local state and
+reports the observed result.
+
+Dynamic controls such as network policy and credential delivery can refresh
+over the live supervisor session. Static controls such as process identity and
+filesystem isolation are fixed when the workload starts and require sandbox
+recreation to change. If a refresh fails, the supervisor retains the
+last-known-good configuration instead of partially applying a new boundary.
+
+## Extension Boundaries
+
+OpenShell keeps infrastructure-specific behavior behind typed extension
+contracts. Compute and credential drivers can run out of process over
+operator-protected Unix sockets. Gateway interceptors and supervisor middleware
+can use authenticated network services, while interceptors also support local
+Unix sockets. At startup, both peers negotiate a shared protocol envelope and
+reject incompatible major versions or missing required capabilities before
+accepting work.
+
+The gateway owns OpenShell lifecycle and authorization semantics. Extensions
+translate those semantics into platform-native operations and do not gain
+ownership of unrelated gateway state. This keeps the sandbox security model
+consistent while allowing deployments to integrate their own runtimes, secret
+stores, request governance, and network services.
+
+## Next Steps
+
+- To inspect runtime-specific behavior, refer to [Sandbox Compute Drivers](/reference/sandbox-compute-drivers).
+- To understand Kubernetes workload and supervisor placement, refer to [Kubernetes Sandbox Runtime](/kubernetes/sandbox-runtime).
+- To configure enforcement, refer to [Customize Sandbox Policies](/sandboxes/policies).
+- To integrate an external component, start with [Extension Protocol Negotiation](/extensibility/extension-negotiation).
