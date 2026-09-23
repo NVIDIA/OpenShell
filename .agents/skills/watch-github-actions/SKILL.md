@@ -125,6 +125,19 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
+For `Workflow Policy`, distinguish a rejected reference from an evaluation
+failure. A rejection has a `Disallowed workflow reference` annotation naming
+the exact `uses:` value and source line. An evaluation failure usually means
+`ACTIONS_POLICY_READ_TOKEN` is absent or lacks repository
+Administration(read), `ACTIONS_ENTERPRISE_READ_TOKEN` is absent or lacks
+`read:enterprise`, GitHub's policy endpoint failed, or Marketplace metadata
+could not be bound unambiguously to the referenced repository. The check fails
+closed in all of those cases. `Workflow Policy Request` is the unprivileged
+producer. If it succeeds but no `OpenShell / Workflow Policy` status appears,
+inspect the downstream `workflow_run` consumer. Merge-group evaluation scans
+the complete queued workflow tree against the current policy; truncated or
+oversized trees fail closed.
+
 For `Trivy Changes`, inspect the `Resolve PR baseline` step for the base and head
 SHAs. PR runs compare the tested merge commit with its
 first parent; change detection and scans must use the same pair. On reruns, do

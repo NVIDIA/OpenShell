@@ -1,0 +1,22 @@
+name: Workflow Policy Request
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
+    types: [checks_requested]
+
+permissions: {}
+
+concurrency:
+  group: workflow-policy-request-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  request:
+    name: Request trusted workflow policy evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Record request
+        run: echo "A trusted default-branch workflow will evaluate this revision."
