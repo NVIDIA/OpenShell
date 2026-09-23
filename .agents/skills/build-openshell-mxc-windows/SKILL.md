@@ -30,7 +30,7 @@ The Windows build lane is implemented by these tracked files:
 | `tasks/windows.toml` | Mise task entry points for `windows:*` commands. |
 | `tasks/rust.toml`, `tasks/test.toml`, and `tasks/markdown.toml` | Windows routing for compiler-bearing checks, explicit Unix-only test skips, and Markdown dependency setup. |
 | `tasks/scripts/windows-msvc.ps1` | PowerShell wrapper that enters the Visual Studio developer environment and invokes Cargo. |
-| `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus advisory main/manual cache seeding and dependent binary builds on native x64 and ARM64 runners. |
+| `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus advisory `windows` branch cache seeding and dependent binary builds on native x64 and ARM64 runners. |
 | `architecture/windows-msvc-build.md` | Design notes and validation contract. |
 | `.agents/skills/build-openshell-mxc-windows/` | This skill and companion reference material. |
 
@@ -194,10 +194,12 @@ The GitHub Actions jobs layer architecture-specific `Swatinem/rust-cache`
 entries for Cargo registry and dependency target artifacts with sccache's GHA
 backend for cacheable Rust compiler outputs. Failed runs also save their usable
 dependency artifacts. Pull-request mirrors labeled `test:windows` run Clippy for the
-Windows-supported workspace and e2e crates plus Rust tests. Pushes to `main` and
-manual dispatches run the same lint and test commands in a cache-seed job,
+Windows-supported workspace and e2e crates plus Rust tests. Pushes to `windows` and
+manual dispatches on that branch run the same lint and test commands in a cache-seed job,
 followed by a dependent release-binary build job. The seed and PR jobs use the
-same cache namespaces. Merge queues do not run this workflow. Main/manual seed
+same cache namespaces, but pull-request mirrors cannot restore the
+`windows` branch cache because GitHub scopes caches by branch. Merge queues do
+not run this workflow. Release-branch seed
 and build jobs use job-level `continue-on-error: true`; opt-in PR jobs report
 failures normally. Applying the label alone does not start a run: re-run all
 jobs in the current mirror push run, or push a new mirrored commit. The binaries are not uploaded or published.

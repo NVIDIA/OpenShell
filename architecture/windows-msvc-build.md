@@ -69,16 +69,18 @@ creating misleading Windows driver artifacts.
 The GitHub Actions workflow runs Clippy for the Windows-supported workspace and
 e2e crates plus Rust tests for pull-request mirror branches labeled `test:windows`.
 Merge queues do not run this workflow. On
-pushes to `main`, a cache-seed job runs the same lint and test commands before a
-dependent job builds the release binaries. Manual dispatches exercise the same
+pushes to `windows`, a cache-seed job runs the same lint and test commands before a
+dependent job builds the release binaries. Manual dispatches on `windows` exercise the same
 seed-then-build path. The binaries remain CI validation artifacts and are not
 uploaded or published.
 
 Each job restores and saves a dedicated Rust cache containing the Cargo
 registry and dependency build artifacts, including artifacts from failed runs.
 The seed job and pull-request job use the same Cargo target and sccache
-namespaces. The release build waits for the seed job, then restores its newly
-warmed cache rather than compiling concurrently from a cold cache.
+namespaces, but GitHub scopes caches by branch. Pull-request mirror branches
+cannot restore the `windows` branch cache. The release build waits for the seed
+job, then restores its newly warmed cache rather than compiling concurrently
+from a cold cache.
 
 Windows validation is exposed through `tasks/windows.toml`:
 
@@ -173,9 +175,9 @@ mise run --skip-tools windows:lint:<x64|arm64>
 mise run --skip-tools windows:test:<x64|arm64>
 ```
 
-Pushes to `main` and manual dispatches first seed the shared caches with those
+Pushes to `windows` and manual dispatches on that branch first seed the shared caches with those
 same lint and test commands. Both seed and build jobs use job-level
-`continue-on-error: true`, so Windows job failures do not fail the main/manual
+`continue-on-error: true`, so Windows job failures do not fail the release-branch
 workflow. Opt-in PR jobs still report failures normally. After the seed job
 finishes, a separate job executes:
 
