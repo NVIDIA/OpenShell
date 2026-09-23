@@ -2016,26 +2016,86 @@ pub(super) async fn handle_watch_sandbox(
                 // cursors expects.
                 //
                 // The two windows are truncated independently (log_tail vs
-                // event_tail), so this merges whatever each bus retained; it
-                // does not align their depths.
-                let mut tail: Vec<CursoredEvent> = Vec::new();
-                if follow_logs {
-                    let logs = state.tracing_log_bus.tail(&sandbox_id, log_tail as usize);
-                    if let Some(last) = logs.last() {
-                        log_cutoff = log_cutoff.max(last.seq);
-                    }
-                    tail.extend(logs);
-                }
-                if follow_events {
-                    let events = state
+                // event_tail). A client tracks one scalar cursor across both
+                // sources -- whatever the highest one it saw was -- so a
+                // cursor this batch hands out is only safe to resume from if
+                // *every* followed source can vouch it covered everything up
+                // to that point.
+                //
+                // `tail_with_floor` reports each source's own coverage floor:
+                // the newest event its window excluded, i.e. the point below
+                // which that source cannot prove nothing was skipped. The
+                // nearest such point across both followed sources bounds what
+                // this whole batch may hand out -- not only the deeper
+                // source's excess over the shallower one. A log event whose
+                // seq clears the log bus's own floor can still be at or past
+                // the *platform* bus's floor; delivering it would still let
+                // the client's remembered cursor exceed platform's unreplayed
+                // backlog, and a later resume would skip that backlog with no
+                // gap reported, since nothing was evicted, just never sent.
+                //
+                // This can mean far fewer events than `log_tail_lines` /
+                // `event_tail` asked for -- even zero -- whenever a followed
+                // sibling has any unreplayed backlog (e.g. `event_tail`
+                // unset, its default, on a sandbox with platform history).
+                // That's the deliberate trade-off of a single shared scalar
+                // cursor: silent loss is worse than an emptier initial batch.
+                let mut logs = Vec::new();
+                let log_floor = if follow_logs {
+                    let (l, floor) = state
+                        .tracing_log_bus
+                        .tail_with_floor(&sandbox_id, log_tail as usize);
+                    logs = l;
+                    floor
+                } else {
+                    0_u64
+                };
+
+                let mut events = Vec::new();
+                let platform_floor = if follow_events {
+                    let (e, floor) = state
                         .tracing_log_bus
                         .platform_event_bus
-                        .tail(&sandbox_id, event_tail as usize);
-                    if let Some(last) = events.last() {
-                        platform_cutoff = platform_cutoff.max(last.seq);
-                    }
-                    tail.extend(events);
+                        .tail_with_floor(&sandbox_id, event_tail as usize);
+                    events = e;
+                    floor
+                } else {
+                    0_u64
+                };
+
+                // 0 means "nothing excluded" for a source, not "excluded up
+                // to 0" -- exclude it from the minimum so a fully-covered
+                // source never becomes the binding constraint.
+                let critical_floor = [
+                    follow_logs.then_some(log_floor),
+                    follow_events.then_some(platform_floor),
+                ]
+                .into_iter()
+                .flatten()
+                .filter(|&floor| floor > 0)
+                .min();
+
+                if let Some(cap) = critical_floor {
+                    logs.retain(|cursored| cursored.seq < cap);
+                    events.retain(|cursored| cursored.seq < cap);
                 }
+
+                // Cutoffs reflect only what this batch actually delivered.
+                // Withheld backlog was already published before this
+                // connect, so it can never arrive again via the live
+                // broadcast -- there's nothing to suppress a duplicate of,
+                // and raising a cutoff past what was sent would risk
+                // swallowing a genuinely new live event with a seq in the
+                // withheld range instead.
+                let mut tail: Vec<CursoredEvent> = Vec::new();
+                if let Some(last) = logs.last() {
+                    log_cutoff = log_cutoff.max(last.seq);
+                }
+                tail.extend(logs);
+                if let Some(last) = events.last() {
+                    platform_cutoff = platform_cutoff.max(last.seq);
+                }
+                tail.extend(events);
 
                 tail.sort_by_key(|cursored| cursored.seq);
 
@@ -4551,6 +4611,96 @@ mod tests {
             got.push(seq_of(&stream.next().await.unwrap().unwrap()));
         }
         assert_eq!(got, vec![1, 2, 3, 4]);
+    }
+
+    /// The A2 repro: a platform event exists (seq 1) that `event_tail: 0`
+    /// deliberately withholds from the initial batch, while `follow_logs`
+    /// delivers two later logs (seq 2, 3). Without the cross-source
+    /// coverage floor, the client would see cursors 2 and 3, remember 3 as
+    /// its high-water mark, and a future resume from 3 would exclude the
+    /// platform event forever -- `tail_after` reports no gap, since nothing
+    /// was evicted, it was just never sent. The floor must instead withhold
+    /// the logs too, since platform's own floor (1) is the nearest point
+    /// neither source can vouch past.
+    #[tokio::test]
+    async fn initial_tail_withholds_logs_behind_a_sibling_sources_unreplayed_backlog() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("floor", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_platform_event(&state, &id, "e1"); // cursor 1, never replayed (event_tail: 0)
+        seed_log_lines(&state, &id, 2); // cursors 2, 3
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                follow_logs: true,
+                follow_events: true,
+                // Default: no backlog requested from the platform bus.
+                event_tail: 0,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.cursor.is_empty());
+
+        // Platform's floor (1) is the binding constraint: nothing at or
+        // above it may be handed out, so both logs are withheld even though
+        // `log_tail_lines` alone would have covered them.
+        let next = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await;
+        assert!(
+            next.is_err(),
+            "expected the coverage floor to withhold every buffered event, got {next:?}"
+        );
+    }
+
+    /// Symmetric depths (or a source that's fully covered) impose no floor:
+    /// this is the common case and must behave exactly as before A2.
+    #[tokio::test]
+    async fn initial_tail_unclamped_when_no_source_has_unreplayed_backlog() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("nofloor", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_platform_event(&state, &id, "e1"); // cursor 1
+        seed_log_lines(&state, &id, 2); // cursors 2, 3
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                follow_logs: true,
+                follow_events: true,
+                // Deep enough to cover the one platform event: no floor.
+                event_tail: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.cursor.is_empty());
+
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            got.push(seq_of(&stream.next().await.unwrap().unwrap()));
+        }
+        assert_eq!(got, vec![1, 2, 3]);
     }
 
     #[tokio::test]

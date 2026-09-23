@@ -186,6 +186,31 @@ fn tail_after_impl(
     Ok(res)
 }
 
+/// Split a tail into what a bounded request returns and the coverage floor
+/// that bound leaves behind.
+///
+/// `max` may return fewer events than the tail currently retains; the ones
+/// excluded are the oldest, at the front. The floor is the newest excluded
+/// event's seq -- the point below which this call cannot vouch that nothing
+/// was skipped, because it was skipped on request, not on eviction. `0`
+/// means `max` covered everything currently retained, so there's nothing
+/// this call withheld.
+///
+/// This is what lets a caller answer "is a cursor from this batch safe to
+/// resume from," which `tail_after`'s eviction-only gap check can't: a
+/// shallow request and a bus eviction both withhold events, but only the
+/// eviction leaves a trace in `last_trimmed_seq`.
+fn tail_with_floor_impl(tail: &VecDeque<CursoredEvent>, max: usize) -> (Vec<CursoredEvent>, u64) {
+    let total = tail.len();
+    let events: Vec<CursoredEvent> = tail.iter().rev().take(max).cloned().collect();
+    let floor = if events.len() >= total {
+        0
+    } else {
+        tail[total - events.len() - 1].seq
+    };
+    (events.into_iter().rev().collect(), floor)
+}
+
 impl Default for TracingLogBus {
     fn default() -> Self {
         Self::new()
@@ -267,6 +292,24 @@ impl TracingLogBus {
             .into_iter()
             .rev()
             .collect::<Vec<CursoredEvent>>()
+    }
+
+    /// Like `tail`, but also reports the coverage floor `max` leaves behind.
+    ///
+    /// See `tail_with_floor_impl`: a cursor at or below the returned floor
+    /// isn't safe to advertise as a resume point, because `max` -- not
+    /// eviction -- is why anything at or below it is missing from this
+    /// batch.
+    pub(crate) fn tail_with_floor(
+        &self,
+        sandbox_id: &str,
+        max: usize,
+    ) -> (Vec<CursoredEvent>, u64) {
+        let inner = self.inner.lock().expect("tracing bus lock poisoned");
+        inner.per_id.get(sandbox_id).map_or_else(
+            || (Vec::new(), 0),
+            |per| tail_with_floor_impl(&per.tail, max),
+        )
     }
 
     /// Identity and extent of this sandbox's current cursor space.
@@ -524,6 +567,47 @@ mod tests {
         assert!(tail_after_impl(&tail, 0, 99).expect("ok").is_empty());
     }
 
+    #[test]
+    fn tail_with_floor_impl_empty_tail_returns_zero_floor() {
+        let tail = VecDeque::new();
+        let (events, floor) = tail_with_floor_impl(&tail, 10);
+        assert!(events.is_empty());
+        assert_eq!(floor, 0);
+    }
+
+    #[test]
+    fn tail_with_floor_impl_max_covers_everything_returns_zero_floor() {
+        let tail = tail_of(1, 5);
+        let (events, floor) = tail_with_floor_impl(&tail, 5);
+        assert_eq!(cursors(&events), vec![1, 2, 3, 4, 5]);
+        assert_eq!(floor, 0);
+
+        // Asking for more than exists is the same as asking for everything.
+        let (events, floor) = tail_with_floor_impl(&tail, 99);
+        assert_eq!(cursors(&events), vec![1, 2, 3, 4, 5]);
+        assert_eq!(floor, 0);
+    }
+
+    #[test]
+    fn tail_with_floor_impl_truncated_reports_newest_excluded_seq() {
+        let tail = tail_of(1, 5);
+        // Newest 2 returned (4, 5); 1..=3 excluded, newest of those is 3.
+        let (events, floor) = tail_with_floor_impl(&tail, 2);
+        assert_eq!(cursors(&events), vec![4, 5]);
+        assert_eq!(floor, 3);
+    }
+
+    #[test]
+    fn tail_with_floor_impl_zero_max_excludes_everything() {
+        let tail = tail_of(1, 5);
+        // Nothing returned; the floor must cover every event that exists,
+        // not just the oldest one -- otherwise a sibling source could still
+        // treat seq 4 or 5 as safely skippable.
+        let (events, floor) = tail_with_floor_impl(&tail, 0);
+        assert!(events.is_empty());
+        assert_eq!(floor, 5);
+    }
+
     /// `snapshot_after` must take the same lock `publish` holds across its own
     /// tail insert, so a publish can never land between the log read and the
     /// platform read. Proving this directly (rather than racing threads and
@@ -677,6 +761,42 @@ mod tests {
     }
 
     #[test]
+    fn tracing_log_bus_tail_with_floor_reports_truncation() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-floor";
+        for _ in 0..5 {
+            bus.publish_external(make_log_event(sandbox_id, "line"));
+        }
+        let (events, floor) = bus.tail_with_floor(sandbox_id, 2);
+        assert_eq!(cursors(&events), vec![4, 5]);
+        assert_eq!(floor, 3);
+
+        // Wide enough to cover everything: no floor.
+        let (events, floor) = bus.tail_with_floor(sandbox_id, 10);
+        assert_eq!(cursors(&events), vec![1, 2, 3, 4, 5]);
+        assert_eq!(floor, 0);
+
+        // Unknown sandbox: nothing buffered, no floor.
+        let (events, floor) = bus.tail_with_floor("nope", 10);
+        assert!(events.is_empty());
+        assert_eq!(floor, 0);
+    }
+
+    #[test]
+    fn platform_event_bus_tail_with_floor_reports_truncation() {
+        let bus = TracingLogBus::new();
+        let platform = &bus.platform_event_bus;
+        let sandbox_id = "sb-pe-floor";
+        for _ in 0..5 {
+            platform.publish(sandbox_id, stream_event(0));
+        }
+        let (events, floor) = platform.tail_with_floor(sandbox_id, 0);
+        assert!(events.is_empty());
+        // Nothing returned: floor must cover every event published so far.
+        assert_eq!(floor, 5);
+    }
+
+    #[test]
     fn tracing_log_bus_remove_cleans_up_all_maps() {
         let bus = TracingLogBus::new();
         let sandbox_id = "sb-1";
@@ -757,7 +877,9 @@ mod tests {
         assert_eq!(after_platform.highest_seq, 2);
 
         let log_cursor = &bus.tail(sandbox_id, 10)[0].event.cursor;
-        let platform_cursor = &bus.platform_event_bus.tail(sandbox_id, 10)[0].event.cursor;
+        let platform_cursor = &bus.platform_event_bus.tail_with_floor(sandbox_id, 10).0[0]
+            .event
+            .cursor;
         assert_eq!(
             WatchCursor::parse(log_cursor).expect("valid").epoch,
             WatchCursor::parse(platform_cursor).expect("valid").epoch,
@@ -944,8 +1066,9 @@ mod tests {
         }
 
         // Tail should return all events in order
-        let events = bus.tail(sandbox_id, 10);
+        let (events, floor) = bus.tail_with_floor(sandbox_id, 10);
         assert_eq!(events.len(), 5);
+        assert_eq!(floor, 0, "max covered everything retained");
 
         // Verify order (oldest first)
         for (i, cursored) in events.iter().enumerate() {
@@ -957,8 +1080,9 @@ mod tests {
         }
 
         // Tail with smaller max should return most recent events
-        let events = bus.tail(sandbox_id, 2);
+        let (events, floor) = bus.tail_with_floor(sandbox_id, 2);
         assert_eq!(events.len(), 2);
+        assert_eq!(floor, 3, "newest excluded event is Event2 (seq 3)");
         if let Some(sandbox_stream_event::Payload::Event(ref e)) = events[0].event.payload {
             assert_eq!(e.reason, "Event3");
         }
@@ -970,8 +1094,9 @@ mod tests {
     #[test]
     fn platform_event_bus_tail_empty_sandbox() {
         let bus = PlatformEventBus::new(SeqAllocator::default());
-        let events = bus.tail("nonexistent", 10);
+        let (events, floor) = bus.tail_with_floor("nonexistent", 10);
         assert!(events.is_empty());
+        assert_eq!(floor, 0);
     }
 
     #[test]
@@ -984,10 +1109,10 @@ mod tests {
             cursor: String::new(),
         };
         bus.publish(sandbox_id, evt);
-        assert_eq!(bus.tail(sandbox_id, 10).len(), 1);
+        assert_eq!(bus.tail_with_floor(sandbox_id, 10).0.len(), 1);
 
         bus.remove(sandbox_id);
-        assert!(bus.tail(sandbox_id, 10).is_empty());
+        assert!(bus.tail_with_floor(sandbox_id, 10).0.is_empty());
     }
 }
 
@@ -1054,17 +1179,18 @@ impl PlatformEventBus {
         }
     }
 
-    /// Return buffered platform events for replay to late subscribers.
-    pub(crate) fn tail(&self, sandbox_id: &str, max: usize) -> Vec<CursoredEvent> {
+    /// Return buffered platform events and the coverage floor `max` leaves
+    /// behind. See `TracingLogBus::tail_with_floor`.
+    pub(crate) fn tail_with_floor(
+        &self,
+        sandbox_id: &str,
+        max: usize,
+    ) -> (Vec<CursoredEvent>, u64) {
         let inner = self.inner.lock().expect("platform event bus lock poisoned");
-        inner
-            .per_id
-            .get(sandbox_id)
-            .map(|d| d.tail.iter().rev().take(max).cloned().collect::<Vec<_>>())
-            .unwrap_or_default()
-            .into_iter()
-            .rev()
-            .collect()
+        inner.per_id.get(sandbox_id).map_or_else(
+            || (Vec::new(), 0),
+            |per| tail_with_floor_impl(&per.tail, max),
+        )
     }
 
     /// Remove the bus entry for the given sandbox id.
