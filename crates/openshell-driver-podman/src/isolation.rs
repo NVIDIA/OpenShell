@@ -30,6 +30,22 @@ pub const AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
 pub const RESTART_METADATA_PATH: &str = "/.openshell/supervisor/restart-metadata.json";
 const SOCKET_PATH: &str = "/.openshell/channel/sandbox/control.sock";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapFenceWireFormat {
+    LegacyDriverFence,
+    OuterFence,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "backend", rename_all = "kebab-case")]
+enum LegacyDriverFenceEvidence {
+    Podman {
+        container_id: String,
+        network_mode: String,
+        unexpected_networks: Vec<String>,
+    },
+}
+
 #[derive(Serialize)]
 struct PodmanOuterFenceEvidence<'a> {
     container_id: &'a str,
@@ -62,6 +78,51 @@ impl PodmanOuterFenceEvidence<'_> {
         projection.validate(generation).map_err(invalid)?;
         Ok(projection)
     }
+}
+
+pub fn fence_wire_format_from_slice(
+    encoded: &[u8],
+) -> Result<BootstrapFenceWireFormat, ComputeDriverError> {
+    let value: serde_json::Value = serde_json::from_slice(encoded).map_err(invalid)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("bootstrap payload must be a JSON object"))?;
+    match (
+        object.contains_key("driver_fence"),
+        object.contains_key("outer_fence"),
+    ) {
+        (true, false) => Ok(BootstrapFenceWireFormat::LegacyDriverFence),
+        (false, true) => Ok(BootstrapFenceWireFormat::OuterFence),
+        _ => Err(invalid(
+            "bootstrap payload must contain exactly one of driver_fence or outer_fence",
+        )),
+    }
+}
+
+fn encode_fence_compatible<T: Serialize>(
+    value: &T,
+    format: BootstrapFenceWireFormat,
+    container_id: &str,
+) -> Result<Vec<u8>, ComputeDriverError> {
+    let mut value = serde_json::to_value(value).map_err(invalid)?;
+    if format == BootstrapFenceWireFormat::LegacyDriverFence {
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| invalid("bootstrap payload must be a JSON object"))?;
+        if object.remove("outer_fence").is_none() {
+            return Err(invalid("bootstrap outer fence projection is missing"));
+        }
+        object.insert(
+            "driver_fence".to_string(),
+            serde_json::to_value(LegacyDriverFenceEvidence::Podman {
+                container_id: container_id.to_string(),
+                network_mode: "none".to_string(),
+                unexpected_networks: Vec::new(),
+            })
+            .map_err(invalid)?,
+        );
+    }
+    serde_json::to_vec(&value).map_err(invalid)
 }
 
 pub fn supervisor_name(id: &str) -> String {
@@ -204,6 +265,7 @@ pub struct BootstrapArchivesInput<'a> {
     pub allow_extra_supplementary_groups: bool,
     pub child_env: HashMap<String, String>,
     pub launch_authentication: &'a openshell_core::jwt::SandboxLaunchAuthentication,
+    pub fence_wire_format: BootstrapFenceWireFormat,
 }
 
 /// The shared volume contains only sandbox credentials. Supervisor credentials,
@@ -220,6 +282,7 @@ pub fn bootstrap_archives(
         allow_extra_supplementary_groups,
         child_env,
         launch_authentication,
+        fence_wire_format,
     } = input;
     launch_authentication.validate().map_err(invalid)?;
     let session_id = launch_authentication.supervisor.session_id;
@@ -305,7 +368,7 @@ pub fn bootstrap_archives(
     channel.directory("sandbox", 0o711, true)?;
     channel.file(
         "sandbox/bootstrap.json",
-        &serde_json::to_vec(&config).map_err(invalid)?,
+        &encode_fence_compatible(&config, fence_wire_format, container_id)?,
     )?;
     channel.file("sandbox/server.crt", tls.certificate_chain_pem.as_bytes())?;
     channel.file("sandbox/server.key", tls.private_key_pem.as_bytes())?;
@@ -317,7 +380,7 @@ pub fn bootstrap_archives(
     supervisor.directory(".openshell/supervisor", 0o700, true)?;
     supervisor.file(
         RUNTIME_DESCRIPTOR_PATH,
-        &serde_json::to_vec(&runtime_descriptor).map_err(invalid)?,
+        &encode_fence_compatible(&runtime_descriptor, fence_wire_format, container_id)?,
     )?;
     supervisor.file(
         AUTH_BUNDLE_PATH,
@@ -529,6 +592,7 @@ mod tests {
             allow_extra_supplementary_groups: false,
             child_env: child_env.clone(),
             launch_authentication: &authentication,
+            fence_wire_format: BootstrapFenceWireFormat::OuterFence,
         })
         .unwrap();
         let workload = files(&archives.channel);
@@ -608,5 +672,52 @@ mod tests {
         assert!(!userns_preserves_host_groups(Some("auto")));
         assert!(!userns_preserves_host_groups(Some("private")));
         assert!(!userns_preserves_host_groups(None));
+    }
+
+    #[test]
+    fn legacy_archives_preserve_driver_fence_wire_format() {
+        let identity = ResolvedWorkloadIdentity::new(
+            1000,
+            1001,
+            vec![],
+            "image".into(),
+            "sha256:image".into(),
+        )
+        .unwrap();
+        let authentication = authentication();
+        let archives = bootstrap_archives(BootstrapArchivesInput {
+            sandbox_id: "sandbox",
+            container_id: "container",
+            generation: "generation-1",
+            host_gateway_ip: "127.0.0.1".parse().unwrap(),
+            identity: &identity,
+            allow_extra_supplementary_groups: false,
+            child_env: HashMap::new(),
+            launch_authentication: &authentication,
+            fence_wire_format: BootstrapFenceWireFormat::LegacyDriverFence,
+        })
+        .unwrap();
+        let workload = files(&archives.channel);
+        let supervisor = files(&archives.supervisor);
+        for encoded in [
+            workload
+                .get(&PathBuf::from("sandbox/bootstrap.json"))
+                .unwrap(),
+            supervisor
+                .get(&PathBuf::from(
+                    RUNTIME_DESCRIPTOR_PATH.trim_start_matches('/'),
+                ))
+                .unwrap(),
+        ] {
+            assert_eq!(
+                fence_wire_format_from_slice(encoded).unwrap(),
+                BootstrapFenceWireFormat::LegacyDriverFence
+            );
+            let value: serde_json::Value = serde_json::from_slice(encoded).unwrap();
+            assert!(value.get("outer_fence").is_none());
+            assert_eq!(value["driver_fence"]["backend"], "podman");
+            assert_eq!(value["driver_fence"]["container_id"], "container");
+            assert_eq!(value["driver_fence"]["network_mode"], "none");
+        }
     }
 }
