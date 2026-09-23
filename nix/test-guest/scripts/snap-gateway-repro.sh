@@ -4,7 +4,8 @@
 
 # Reproduce the Release Canary Snap lifecycle: install the OpenShell Snap,
 # connect its interfaces after the daemon is started, then immediately use the
-# local gateway. Run this as root inside an Ubuntu guest prepared with --with snapd.
+# local gateway. Run this as root inside an Ubuntu guest prepared with
+# --with docker --with snapd.
 
 set -uo pipefail
 
@@ -70,9 +71,9 @@ wait_for_gateway() {
 	gateway_is_ready
 }
 
-if ! snap list docker >/dev/null 2>&1; then
-	echo "==> Installing Docker Snap"
-	snap install docker
+if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+	echo "A running Docker daemon is required" >&2
+	exit 2
 fi
 
 failures=0
@@ -82,9 +83,9 @@ for attempt in $(seq 1 "${attempts}"); do
 	rm -rf /home/openshell/snap/openshell
 
 	if ! snap install "${snap_file}" --dangerous ||
-		! snap connect openshell:docker docker:docker-daemon ||
 		! snap connect openshell:log-observe ||
-		! snap connect openshell:system-observe; then
+		! snap connect openshell:system-observe ||
+		! snap connect openshell:docker :docker; then
 		echo "OpenShell installation or interface connection failed" >&2
 		diagnostics "${attempt}"
 		failures=$((failures + 1))
