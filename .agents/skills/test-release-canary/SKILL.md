@@ -37,6 +37,8 @@ validation lives in the `TypeScript SDK` branch check, including a publish
 dry-run. The tagged release workflow publishes the package to GitHub Packages;
 verify that job directly when diagnosing SDK publication failures.
 
+Release Dev also publishes an attested `openshell-release-manifest.json` for standalone core runtime archives and container images. The canary does not download or verify that manifest and continues to consume the rolling dev packages, chart and image tags. A passing canary proves only the install and runtime paths it exercises; it does not prove manifest attestation or digest selection. For manifest failures, inspect the producing Release Dev run's image identity, assembly and attestation steps with `watch-github-actions`.
+
 ## Trigger paths
 
 The workflow has two triggers:
