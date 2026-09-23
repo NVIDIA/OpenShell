@@ -26,6 +26,33 @@ image:
   # -- Gateway image tag. Defaults to the chart appVersion when empty.
   tag: ""
 
+# Deprecated compatibility inputs retained for 0.1.x. Prefer gatewayConfig.
+# When both are set, gatewayConfig takes precedence.
+sandboxRuntime:
+  image:
+    repository: ghcr.io/nvidia/openshell/sandbox
+    pullPolicy: ""
+    tag: ""
+supervisor:
+  image:
+    repository: ghcr.io/nvidia/openshell/supervisor
+    pullPolicy: null
+    tag: ""
+  sandboxRuntime:
+    networkPolicyEnforced: false
+    boundaryPort: 5500
+upstreamProxy:
+  url: ""
+  noProxy: ""
+  authSecret:
+    name: ""
+    key: ""
+  authAllowInsecure: false
+  connectByHostname: false
+  caBundle:
+    configMapName: ""
+    key: ca.crt
+
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []
 # -- Override the chart name used in generated resource names.
@@ -172,15 +199,9 @@ gatewayConfig:
     namespace: '{{ include "openshell.sandboxNamespace" . }}'
     default_image: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
     client_tls_secret_name: '{{ .Values.server.tls.clientTlsSecretName }}'
-    workspace_mode: shared
     gateway_id: '{{ include "openshell.fullname" . }}'
     grpc_endpoint: '{{ include "openshell.grpcEndpoint" . }}'
     service_account_name: '{{ include "openshell.sandboxServiceAccountName" . }}'
-    sandbox_runtime_image: ghcr.io/nvidia/openshell/sandbox:{{ .Chart.AppVersion }}
-    supervisor_image: ghcr.io/nvidia/openshell/supervisor:{{ .Chart.AppVersion }}
-    sandbox_runtime:
-      network_policy_enforced: false
-      boundary_port: 5500
     sa_token_ttl_secs: 3600
   openshell.drivers.kubernetes.managed_ssh_ingress:
     enabled: true
@@ -193,6 +214,17 @@ gatewayConfig:
 
 # Server configuration
 server:
+  # Deprecated chart-owned Kubernetes packaging inputs. Prefer gatewayConfig
+  # for runtime settings; these remain for 0.1.x compatibility.
+  drivers:
+    kubernetes:
+      allowDriverConfig: false
+      workspaceMode: shared
+      operatorNamespaceLabel: ""
+      operatorNamespaceFile: ""
+      resourceAdmission:
+        enabled: true
+        requiredLabels: null
   # -- Enable anonymous OpenShell telemetry from the gateway and the sandbox
   # supervisors it launches.
   telemetryEnabled: true

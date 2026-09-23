@@ -1,5 +1,4 @@
-{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
-{{- $kubernetesConfig := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
+{{- $kubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
 {{- if and (eq $workspaceMode "shared") (include "openshell.workspaceResourcesEnabled" .) }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.

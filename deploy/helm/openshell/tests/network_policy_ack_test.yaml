@@ -24,3 +24,10 @@ tests:
     asserts:
       - hasDocuments:
           count: 0
+
+  - it: accepts the deprecated supervisor runtime acknowledgement
+    set:
+      supervisor.sandboxRuntime.networkPolicyEnforced: true
+    asserts:
+      - hasDocuments:
+          count: 0

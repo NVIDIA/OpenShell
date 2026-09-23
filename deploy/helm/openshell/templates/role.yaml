@@ -1,6 +1,6 @@
-{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
-{{- $kubernetesConfig := get $gatewayConfig "openshell.drivers.kubernetes" | default dict -}}
+{{- $kubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
+{{- $allowDriverConfig := get $kubernetesConfig "allow_driver_config" | default false -}}
 {{- if and (eq $workspaceMode "shared") (include "openshell.workspaceResourcesEnabled" .) }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
@@ -12,7 +12,7 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
-  {{- if .Values.server.drivers.kubernetes.allowDriverConfig }}
+  {{- if $allowDriverConfig }}
   # Metadata-only admission of caller-selected PVCs requires get permission.
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]

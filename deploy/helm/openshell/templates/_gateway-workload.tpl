@@ -134,6 +134,11 @@ spec:
           mountPath: /etc/openshell-tls/vault
           readOnly: true
         {{- end }}
+        {{- if .Values.upstreamProxy.caBundle.configMapName }}
+        - name: upstream-proxy-ca
+          mountPath: /etc/openshell-tls/proxy-ca
+          readOnly: true
+        {{- end }}
         {{- if $spiffeSocketPath }}
         - name: spiffe-workload-api
           mountPath: {{ dir $spiffeSocketPath | quote }}
@@ -217,6 +222,14 @@ spec:
         name: {{ $vaultCaConfigMapName }}
         items:
           - key: ca.crt
+            path: ca.crt
+    {{- end }}
+    {{- if .Values.upstreamProxy.caBundle.configMapName }}
+    - name: upstream-proxy-ca
+      configMap:
+        name: {{ .Values.upstreamProxy.caBundle.configMapName | quote }}
+        items:
+          - key: {{ .Values.upstreamProxy.caBundle.key | default "ca.crt" | quote }}
             path: ca.crt
     {{- end }}
     {{- if $spiffeSocketPath }}
