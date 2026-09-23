@@ -19,12 +19,29 @@ use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
-use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerFenceWireFormat {
+    LegacyDriverFence,
+    OuterFence,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "backend", rename_all = "kebab-case", deny_unknown_fields)]
+enum LegacyDriverFenceEvidence {
+    Docker {
+        container_id: String,
+        network_mode: String,
+        unexpected_networks: Vec<String>,
+    },
+}
 
 #[derive(Serialize)]
 struct DockerOuterFenceEvidence<'a> {
     container_id: &'a str,
-    network_mode: &'static str,
+    network_mode: &'a str,
     unexpected_networks: &'a [String],
 }
 
@@ -56,6 +73,139 @@ impl DockerOuterFenceEvidence<'_> {
         projection.validate(generation)?;
         Ok(projection)
     }
+}
+
+fn decode_fence_compatible<T: DeserializeOwned>(
+    encoded: &[u8],
+    description: &str,
+) -> Result<(T, DockerFenceWireFormat), BackendError> {
+    let mut value: serde_json::Value = serde_json::from_slice(encoded)
+        .map_err(|error| BackendError::Descriptor(format!("decode {description}: {error}")))?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        BackendError::Descriptor(format!("decode {description}: expected a JSON object"))
+    })?;
+    let format = match (
+        object.contains_key("driver_fence"),
+        object.contains_key("outer_fence"),
+    ) {
+        (false, true) => DockerFenceWireFormat::OuterFence,
+        (true, false) => {
+            let generation = object
+                .get("generation")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    BackendError::Descriptor(format!(
+                        "decode {description}: legacy bootstrap generation is missing"
+                    ))
+                })?
+                .to_string();
+            let legacy: LegacyDriverFenceEvidence =
+                serde_json::from_value(object.remove("driver_fence").expect("checked above"))
+                    .map_err(|error| {
+                        BackendError::Descriptor(format!(
+                            "decode {description} legacy driver fence: {error}"
+                        ))
+                    })?;
+            let LegacyDriverFenceEvidence::Docker {
+                container_id,
+                network_mode,
+                unexpected_networks,
+            } = legacy;
+            let projection = DockerOuterFenceEvidence {
+                container_id: &container_id,
+                network_mode: &network_mode,
+                unexpected_networks: &unexpected_networks,
+            }
+            .project(&generation)?;
+            object.insert(
+                "outer_fence".to_string(),
+                serde_json::to_value(projection).map_err(|error| {
+                    BackendError::Descriptor(format!("encode migrated Docker outer fence: {error}"))
+                })?,
+            );
+            DockerFenceWireFormat::LegacyDriverFence
+        }
+        _ => {
+            return Err(BackendError::Descriptor(format!(
+                "decode {description}: expected exactly one of driver_fence or outer_fence"
+            )));
+        }
+    };
+    serde_json::from_value(value)
+        .map(|decoded| (decoded, format))
+        .map_err(|error| BackendError::Descriptor(format!("decode {description}: {error}")))
+}
+
+pub fn decode_boundary_config_compatible(
+    encoded: &[u8],
+) -> Result<(BoundaryConfig, DockerFenceWireFormat), BackendError> {
+    decode_fence_compatible(encoded, "Docker boundary config")
+}
+
+pub fn decode_runtime_descriptor_compatible(
+    encoded: &[u8],
+) -> Result<(SandboxRuntimeDescriptor, DockerFenceWireFormat), BackendError> {
+    decode_fence_compatible(encoded, "Docker runtime descriptor")
+}
+
+fn encode_fence_compatible<T: Serialize>(
+    value: &T,
+    format: DockerFenceWireFormat,
+    description: &str,
+) -> Result<Vec<u8>, BackendError> {
+    let mut value = serde_json::to_value(value)
+        .map_err(|error| BackendError::Descriptor(format!("encode {description}: {error}")))?;
+    if format == DockerFenceWireFormat::LegacyDriverFence {
+        let object = value.as_object_mut().ok_or_else(|| {
+            BackendError::Descriptor(format!("encode {description}: expected a JSON object"))
+        })?;
+        let container_id = object
+            .get("resource_claims")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|claims| claims.get("docker.container_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|container_id| !container_id.is_empty())
+            .ok_or_else(|| {
+                BackendError::Descriptor(format!(
+                    "encode {description}: Docker container resource claim is missing"
+                ))
+            })?
+            .to_string();
+        if object.remove("outer_fence").is_none() {
+            return Err(BackendError::Descriptor(format!(
+                "encode {description}: outer fence projection is missing"
+            )));
+        }
+        object.insert(
+            "driver_fence".to_string(),
+            serde_json::to_value(LegacyDriverFenceEvidence::Docker {
+                container_id,
+                network_mode: "none".to_string(),
+                unexpected_networks: Vec::new(),
+            })
+            .map_err(|error| {
+                BackendError::Descriptor(format!(
+                    "encode {description} legacy driver fence: {error}"
+                ))
+            })?,
+        );
+    }
+    serde_json::to_vec(&value)
+        .map_err(|error| BackendError::Descriptor(format!("encode {description}: {error}")))
+}
+
+pub fn encode_boundary_config_compatible(
+    config: &BoundaryConfig,
+    format: DockerFenceWireFormat,
+) -> Result<Vec<u8>, BackendError> {
+    encode_fence_compatible(config, format, "Docker boundary config")
+}
+
+pub fn encode_runtime_descriptor_compatible(
+    descriptor: &SandboxRuntimeDescriptor,
+    format: DockerFenceWireFormat,
+) -> Result<Vec<u8>, BackendError> {
+    encode_fence_compatible(descriptor, format, "Docker runtime descriptor")
 }
 
 /// Driver-owned inputs that bind one Docker container to one boundary.
@@ -143,37 +293,12 @@ impl DockerBoundarySpec {
 mod tests {
     use super::*;
 
-    #[test]
-    fn outer_fence_projection_rejects_each_missing_native_fact() {
-        let unexpected_networks = vec!["bridge".to_string()];
-        for evidence in [
-            DockerOuterFenceEvidence {
-                container_id: "",
-                network_mode: "none",
-                unexpected_networks: &[],
-            },
-            DockerOuterFenceEvidence {
-                container_id: "container",
-                network_mode: "bridge",
-                unexpected_networks: &[],
-            },
-            DockerOuterFenceEvidence {
-                container_id: "container",
-                network_mode: "none",
-                unexpected_networks: &unexpected_networks,
-            },
-        ] {
-            assert!(evidence.project("generation-1").is_err());
-        }
-    }
-
-    #[test]
-    fn provisioning_binds_container_and_image_claims() {
+    fn provisioning() -> DockerBoundaryProvisioning {
         let session_id = openshell_core::SandboxSessionId::new();
         let tls =
             openshell_sandbox_backend::boundary_protocol::generate_sandbox_tls_material(session_id)
                 .unwrap();
-        let provisioned = DockerBoundarySpec {
+        DockerBoundarySpec {
             boundary_id: "sandbox-1".to_string(),
             generation: "generation-1".to_string(),
             session_id,
@@ -209,7 +334,36 @@ mod tests {
             child_env: HashMap::new(),
         }
         .provision()
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn outer_fence_projection_rejects_each_missing_native_fact() {
+        let unexpected_networks = vec!["bridge".to_string()];
+        for evidence in [
+            DockerOuterFenceEvidence {
+                container_id: "",
+                network_mode: "none",
+                unexpected_networks: &[],
+            },
+            DockerOuterFenceEvidence {
+                container_id: "container",
+                network_mode: "bridge",
+                unexpected_networks: &[],
+            },
+            DockerOuterFenceEvidence {
+                container_id: "container",
+                network_mode: "none",
+                unexpected_networks: &unexpected_networks,
+            },
+        ] {
+            assert!(evidence.project("generation-1").is_err());
+        }
+    }
+
+    #[test]
+    fn provisioning_binds_container_and_image_claims() {
+        let provisioned = provisioning();
 
         assert_eq!(
             provisioned.boundary_config.resource_claims,
@@ -233,6 +387,38 @@ mod tests {
                 .outer_fence
                 .validate("generation-1")
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn legacy_driver_fence_round_trips_through_current_projection() {
+        let provisioned = provisioning();
+        let boundary = encode_boundary_config_compatible(
+            &provisioned.boundary_config,
+            DockerFenceWireFormat::LegacyDriverFence,
+        )
+        .unwrap();
+        let descriptor = encode_runtime_descriptor_compatible(
+            &provisioned.runtime_descriptor,
+            DockerFenceWireFormat::LegacyDriverFence,
+        )
+        .unwrap();
+        for encoded in [&boundary, &descriptor] {
+            let value: serde_json::Value = serde_json::from_slice(encoded).unwrap();
+            assert!(value.get("outer_fence").is_none());
+            assert_eq!(value["driver_fence"]["backend"], "docker");
+            assert_eq!(value["driver_fence"]["container_id"], "sha256:container");
+        }
+        let (decoded_boundary, boundary_format) =
+            decode_boundary_config_compatible(&boundary).unwrap();
+        let (decoded_descriptor, descriptor_format) =
+            decode_runtime_descriptor_compatible(&descriptor).unwrap();
+        assert_eq!(boundary_format, DockerFenceWireFormat::LegacyDriverFence);
+        assert_eq!(descriptor_format, DockerFenceWireFormat::LegacyDriverFence);
+        assert_eq!(decoded_boundary.outer_fence, decoded_descriptor.outer_fence);
+        assert_eq!(
+            decoded_boundary.outer_fence,
+            provisioned.boundary_config.outer_fence
         );
     }
 }
