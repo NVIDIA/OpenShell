@@ -29,6 +29,10 @@ struct Inner {
     per_id: HashMap<String, PerSandbox>,
 }
 
+/// Result of a resumable-source replay read: the events after the requested
+/// cursor, or the gap that made them unreplayable.
+pub(crate) type ReplayResult = Result<Vec<CursoredEvent>, ResumeGap>;
+
 /// A buffered or broadcast stream event paired with its raw sequence number.
 ///
 /// The wire `SandboxStreamEvent.cursor` is an opaque token; ordering decisions
@@ -274,18 +278,6 @@ impl TracingLogBus {
         self.seq.space(sandbox_id)
     }
 
-    pub(crate) fn tail_after(
-        &self,
-        sandbox_id: &str,
-        after_seq: u64,
-    ) -> Result<Vec<CursoredEvent>, ResumeGap> {
-        let inner = self.inner.lock().expect("tracing bus lock poisoned");
-        inner.per_id.get(sandbox_id).map_or_else(
-            || Ok(Vec::new()),
-            |per| tail_after_impl(&per.tail, per.last_trimmed_seq, after_seq),
-        )
-    }
-
     /// Publish a log line from an external source (e.g., sandbox push).
     ///
     /// Injects the line into the same broadcast channel and tail buffer
@@ -328,6 +320,45 @@ impl TracingLogBus {
                 per.last_trimmed_seq = trimmed.seq;
             }
         }
+    }
+
+    /// Read both resumable buses for a sandbox under one lock hold.
+    ///
+    /// `tail_after` on each bus independently takes and releases its own
+    /// bus-map lock; a publish landing between two independent calls is
+    /// visible to one and not the other, desyncing their high-water marks
+    /// against a live stream that treats them as being read at the same
+    /// instant. Locking the shared cursor space first — the same lock every
+    /// publish path holds across its own tail insert — makes this read
+    /// atomic against any publish on either bus.
+    pub(crate) fn snapshot_after(
+        &self,
+        sandbox_id: &str,
+        log_after: u64,
+        platform_after: u64,
+        want_log: bool,
+        want_platform: bool,
+    ) -> (Option<ReplayResult>, Option<ReplayResult>) {
+        let _spaces = self.seq.lock();
+        let log = want_log.then(|| {
+            let inner = self.inner.lock().expect("tracing bus lock poisoned");
+            inner.per_id.get(sandbox_id).map_or_else(
+                || Ok(Vec::new()),
+                |per| tail_after_impl(&per.tail, per.last_trimmed_seq, log_after),
+            )
+        });
+        let platform = want_platform.then(|| {
+            let inner = self
+                .platform_event_bus
+                .inner
+                .lock()
+                .expect("platform event bus lock poisoned");
+            inner.per_id.get(sandbox_id).map_or_else(
+                || Ok(Vec::new()),
+                |per| tail_after_impl(&per.tail, per.last_trimmed_seq, platform_after),
+            )
+        });
+        (log, platform)
     }
 }
 
@@ -493,6 +524,82 @@ mod tests {
         assert!(tail_after_impl(&tail, 0, 99).expect("ok").is_empty());
     }
 
+    /// `snapshot_after` must take the same lock `publish` holds across its own
+    /// tail insert, so a publish can never land between the log read and the
+    /// platform read. Proving this directly (rather than racing threads and
+    /// hoping to catch a bad interleaving) is what makes this test reliable:
+    /// hold the lock ourselves and show `snapshot_after` cannot proceed until
+    /// it is released.
+    #[test]
+    fn snapshot_after_blocks_while_cursor_space_is_locked() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-lock";
+        bus.publish_external(make_log_event(sandbox_id, "line"));
+
+        let guard = bus.seq.lock();
+
+        let bus2 = bus.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            bus2.snapshot_after(sandbox_id, 0, 0, true, true);
+            done_tx.send(()).unwrap();
+        });
+
+        // Give the worker time to reach (and block on) the lock.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "snapshot_after returned without waiting for the cursor-space lock"
+        );
+
+        drop(guard);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("snapshot_after should complete once the lock is released");
+        handle.join().unwrap();
+    }
+
+    /// Baseline correctness: interleaved log/platform publishes draw from the
+    /// same cursor space, and `snapshot_after` returns each source's own
+    /// events under its own key, not merged or cross-contaminated.
+    #[test]
+    fn snapshot_after_matches_independent_tail_after_calls() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-snap";
+        bus.publish_external(make_log_event(sandbox_id, "l1")); // seq 1
+        bus.platform_event_bus.publish(
+            sandbox_id,
+            SandboxStreamEvent {
+                payload: None,
+                cursor: String::new(),
+            },
+        ); // seq 2
+        bus.publish_external(make_log_event(sandbox_id, "l2")); // seq 3
+
+        let (log, platform) = bus.snapshot_after(sandbox_id, 0, 0, true, true);
+        assert_eq!(
+            cursors(&log.expect("followed").expect("no gap")),
+            vec![1, 3]
+        );
+        assert_eq!(
+            cursors(&platform.expect("followed").expect("no gap")),
+            vec![2]
+        );
+    }
+
+    /// A source that isn't followed isn't read at all.
+    #[test]
+    fn snapshot_after_skips_unfollowed_sources() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-skip";
+        bus.publish_external(make_log_event(sandbox_id, "l1"));
+
+        let (log, platform) = bus.snapshot_after(sandbox_id, 0, 0, true, false);
+        assert_eq!(log.expect("followed").expect("no gap").len(), 1);
+        assert!(platform.is_none());
+    }
+
     #[test]
     fn tail_after_impl_boundary_at_last_trimmed_is_serviceable() {
         // Bus trimmed up to seq 2, retains 3..=5. Client saw exactly 2, so
@@ -528,24 +635,27 @@ mod tests {
     }
 
     #[test]
-    fn tracing_log_bus_tail_after_serviceable_and_missing() {
+    fn tracing_log_bus_resume_replay_serviceable_and_missing() {
         let bus = TracingLogBus::new();
         let sandbox_id = "sb-ta";
         for _ in 0..3 {
             bus.publish_external(make_log_event(sandbox_id, "line"));
         }
         // Cursors start at 1, so three publishes are seqs 1,2,3.
+        let (log, _) = bus.snapshot_after(sandbox_id, 0, 0, true, false);
         assert_eq!(
-            cursors(&bus.tail_after(sandbox_id, 0).unwrap()),
+            cursors(&log.expect("followed").expect("no gap")),
             vec![1, 2, 3]
         );
-        assert_eq!(cursors(&bus.tail_after(sandbox_id, 2).unwrap()), vec![3]);
+        let (log, _) = bus.snapshot_after(sandbox_id, 2, 0, true, false);
+        assert_eq!(cursors(&log.expect("followed").expect("no gap")), vec![3]);
         // Unknown sandbox: no entry, nothing buffered, no gap.
-        assert!(bus.tail_after("nope", 5).unwrap().is_empty());
+        let (log, _) = bus.snapshot_after("nope", 5, 0, true, false);
+        assert!(log.expect("followed").expect("no gap").is_empty());
     }
 
     #[test]
-    fn platform_event_bus_tail_after_serviceable() {
+    fn platform_event_bus_resume_replay_serviceable() {
         let bus = TracingLogBus::new();
         let platform = &bus.platform_event_bus;
         let sandbox_id = "sb-pe";
@@ -554,30 +664,16 @@ mod tests {
         }
         // Shared allocator, but only the platform bus published here, so its
         // seqs are 1,2,3.
+        let (_, platform_replay) = bus.snapshot_after(sandbox_id, 0, 0, false, true);
         assert_eq!(
-            cursors(&platform.tail_after(sandbox_id, 0).unwrap()),
+            cursors(&platform_replay.expect("followed").expect("no gap")),
             vec![1, 2, 3]
         );
+        let (_, platform_replay) = bus.snapshot_after(sandbox_id, 0, 1, false, true);
         assert_eq!(
-            cursors(&platform.tail_after(sandbox_id, 1).unwrap()),
+            cursors(&platform_replay.expect("followed").expect("no gap")),
             vec![2, 3]
         );
-    }
-
-    #[test]
-    fn shared_allocator_interleaves_cursors_across_buses() {
-        let bus = TracingLogBus::new();
-        let sandbox_id = "sb-mix";
-        // Interleave log and platform publishes; the shared allocator gives
-        // each a unique, increasing cursor in one merged space.
-        bus.publish_external(make_log_event(sandbox_id, "a")); // seq 1
-        bus.platform_event_bus.publish(sandbox_id, stream_event(0)); // seq 2
-        bus.publish_external(make_log_event(sandbox_id, "b")); // seq 3
-
-        let logs = cursors(&bus.tail_after(sandbox_id, 0).unwrap());
-        let events = cursors(&bus.platform_event_bus.tail_after(sandbox_id, 0).unwrap());
-        assert_eq!(logs, vec![1, 3]);
-        assert_eq!(events, vec![2]);
     }
 
     #[test]
@@ -969,18 +1065,6 @@ impl PlatformEventBus {
             .into_iter()
             .rev()
             .collect()
-    }
-
-    pub(crate) fn tail_after(
-        &self,
-        sandbox_id: &str,
-        after_seq: u64,
-    ) -> Result<Vec<CursoredEvent>, ResumeGap> {
-        let inner = self.inner.lock().expect("platform event bus lock poisoned");
-        inner.per_id.get(sandbox_id).map_or_else(
-            || Ok(Vec::new()),
-            |per| tail_after_impl(&per.tail, per.last_trimmed_seq, after_seq),
-        )
     }
 
     /// Remove the bus entry for the given sandbox id.
