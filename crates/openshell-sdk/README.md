@@ -135,6 +135,17 @@ let _sandbox = client
 # }
 ```
 
+Enable the `extension` Cargo feature when building an OpenShell extension
+service:
+
+```toml
+openshell-sdk = { version = "...", features = ["extension"] }
+```
+
+The `extension` module provides common SDK building blocks for extension
+services. It currently handles caller verification; shared service interfaces
+and observability support will follow.
+
 ## Wait for a provider change
 
 Provider attach, detach, and update responses include a `ProviderMutationReceipt`: a saved record identifying the exact change requested for one sandbox. Pass that record to `provider_readiness::wait_for_provider` to wait until the current sandbox runtime confirms it applied the change. Detach completes with `Revoked`; attach and update complete with `Ready`.
@@ -180,6 +191,7 @@ These helpers use the raw client's authentication slot. They do not perform OIDC
 | `oidc` | OIDC token handling at the transport layer. |
 | `refresh` | `Refresh` trait and single-flight refresh coalescing. |
 | `edge_tunnel` | Cloudflare Access tunnel dialer. |
+| `extension` | Opt-in SDK building blocks for extension services. |
 | `error` | `SdkError` taxonomy. |
 | `pagination` | Lazy `Pager<T>` and response `Page<T>`. |
 | `types` | Curated request/response types and proto conversions. |
