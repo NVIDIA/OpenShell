@@ -170,10 +170,11 @@ Namespace where sandbox pods are created. An explicit
 {{- end }}
 
 {{/*
-Secrets the Kubernetes driver copies from the sandbox namespace into
-workspace namespaces, as a JSON array. Empty in shared workspace mode.
+Secrets in the sandbox namespace whose contents the Kubernetes driver stages
+into per-generation Secrets in workspace namespaces, as a JSON array. Empty in
+shared workspace mode.
 */}}
-{{- define "openshell.copiedWorkspaceSecretNames" -}}
+{{- define "openshell.workspaceSecretSourceNames" -}}
 {{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
 {{- $names := list -}}
 {{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) -}}

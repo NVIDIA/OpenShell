@@ -458,10 +458,10 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the Kubernetes driver's TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
 | `default_image` | `server.sandboxImage` | Set the default sandbox image. |
 | `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
-| `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image-pull Secrets to sandbox pods. Managed mode copies these explicitly named Secrets from the configured source namespace into each workspace namespace. In shared and operator modes, the Secrets must already exist in the sandbox namespace. |
+| `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image-pull Secrets to sandbox pods. Managed mode creates an immutable copy of each Secret from the configured source namespace for every sandbox runtime generation. In shared and operator modes, the Secrets must already exist in the sandbox namespace. |
 | `[managed_ssh_ingress]` | `networkPolicy.enabled` | In managed mode, create an SSH ingress policy in every workspace namespace. Helm configures the gateway namespace and pod selector automatically. Operator mode leaves namespace policy management to the platform operator. |
 | `grpc_endpoint` | `server.grpcEndpoint` | Set the gateway endpoint reachable from sandbox pods. |
-| `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
+| `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Name the Kubernetes Secret holding sandbox client TLS materials. Shared mode mounts it directly; managed and operator modes stage its contents into each supervisor bootstrap Secret. |
 | `sandbox_runtime_image` | `sandboxRuntime.image.repository` / `sandboxRuntime.image.tag` | Override the image that provides `openshell-sandbox`. The default repository with an empty tag uses the version pinned into the gateway. |
 | `sandbox_runtime_image_pull_policy` | `sandboxRuntime.image.pullPolicy` | Set the Kubernetes image pull policy for the sandbox runtime image. |
 | `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Override the image that provides `openshell-supervisor`. The default repository with an empty tag uses the version pinned into the gateway. |
@@ -499,12 +499,12 @@ oc -n openshell create configmap corporate-proxy-ca --from-file=ca.crt=corp-ca.p
 Then set `upstreamProxy.caBundle.configMapName` to `corporate-proxy-ca` and
 leave `upstreamProxy.caBundle.key` at its `ca.crt` default.
 
-Managed-mode Secret copying requires the gateway ServiceAccount to create
-Secrets. Kubernetes RBAC cannot restrict Secret `create` by resource name, so
-the Helm chart grants cluster-wide Secret `create`; Secret `get` and `patch`
-remain limited to the explicitly configured TLS and image-pull Secret names.
-The driver creates copies only in gateway-owned managed namespaces. Do not
-reuse the gateway ServiceAccount for unrelated workloads.
+Managed-mode sandbox runtime generations require the gateway ServiceAccount to
+create and delete Secrets in workspace namespaces. Kubernetes RBAC cannot
+restrict Secret `create` by resource name, so the Helm chart grants cluster-wide
+Secret `create` and `delete`. Secret `get` is limited to the configured TLS and
+image-pull source Secrets in the sandbox namespace. Do not reuse the gateway
+ServiceAccount for unrelated workloads.
 
 The Kubernetes driver always places the sandbox runtime in the workload Pod and
 the supervisor in a separate, directly managed Pod. The

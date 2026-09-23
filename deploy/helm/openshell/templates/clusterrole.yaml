@@ -95,40 +95,12 @@ rules:
     verbs: ["create", "get"]
   - apiGroups: [""]
     resources: ["secrets"]
-    # Bootstrap Secrets are generation-scoped. Recovery deletes them by exact
-    # name.
+    # Bootstrap and image-pull Secrets are generation-scoped. Recovery deletes
+    # them by exact name.
     verbs: ["create", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get"]
-  {{- end }}
-  {{- $copiedSecretNames := include "openshell.copiedWorkspaceSecretNames" . | fromJsonArray }}
-  {{- if $copiedSecretNames }}
-  # Copy only explicitly configured TLS and image-pull Secrets into workspace
-  # namespaces. Server-side apply authorizes these requests as patch operations.
-  # Reading the source Secrets is granted by a Role in the sandbox namespace.
-  - apiGroups:
-      - ""
-    resources:
-      - secrets
-    resourceNames:
-      {{- range $copiedSecretNames }}
-      - {{ . | quote }}
-      {{- end }}
-    verbs:
-      - patch
-  # Server-side apply uses PATCH for an existing Secret, but the API server
-  # additionally authorizes CREATE when the named Secret does not exist yet.
-  # Kubernetes RBAC cannot restrict CREATE by resourceNames because create
-  # authorization happens before the object name is available to RBAC. Keep
-  # reads and mutations name-restricted above; this broader grant is required
-  # only to create the initial copy in a gateway-owned managed namespace.
-  - apiGroups:
-      - ""
-    resources:
-      - secrets
-    verbs:
-      - create
   {{- end }}
   {{- if eq $workspaceMode "managed" }}
   # ServiceAccount creation in managed namespaces.

@@ -587,10 +587,10 @@ authorization inputs.
 
 Image-pull Secrets are selected by gateway configuration, not by sandbox
 callers, and do not participate in resource admission. In managed mode OpenShell
-copies each explicitly configured Secret into the workspace namespace with
-gateway ownership metadata. An existing target Secret is updated only when its
-ownership metadata matches the gateway and workspace. In shared and operator
-modes, the configured Secret must already exist in the sandbox namespace. The
+creates an immutable copy of each configured Secret for every sandbox runtime
+generation and deletes it with that generation. Sandbox creation fails if a
+Secret with the generation name already exists. In shared and operator modes,
+the configured Secret must already exist in the sandbox namespace. The
 typed Kubernetes driver config does not support caller-selected Secret or
 ConfigMap volumes or environment references. Automatic service-account tokens
 and projected token volumes are prohibited.
