@@ -1120,6 +1120,7 @@ fn network_rule_from_json(
     })
 }
 
+#[allow(deprecated)]
 fn network_endpoint_from_json(
     endpoint: NetworkEndpointJson,
 ) -> std::result::Result<NetworkEndpoint, String> {
@@ -1192,6 +1193,9 @@ fn network_endpoint_from_json(
 
     Ok(NetworkEndpoint {
         host: endpoint.host,
+        legacy_tls: String::new(),
+        legacy_enforcement: String::new(),
+        legacy_access: String::new(),
         port,
         protocol: endpoint.protocol,
         tls: openshell_policy::network_tls_mode_from_str(&endpoint.tls)

@@ -134,6 +134,7 @@ mod tests {
     // Driver-operation ownership adds pending and a retained operation ID to
     // SandboxProvisioning in both closures. Old rows decode false and empty;
     // decoding or deadline updates cannot claim an existing attempt.
+    // NetworkEndpoint retains pre.4 string fields and uses new tags for enums.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
         "18206c52e68fdb0af60f8bb8dfaf47d9bc8021222cb49cacffab6352d3ad5549";
     const DURABLE_SCHEMA_SHA256: &str =
