@@ -61,6 +61,7 @@ const MAX_NETWORK_STREAMS: usize = 96;
 const _: () = assert!(
     MAX_NETWORK_STREAMS < crate::boundary_protocol::BOUNDARY_MAX_CONCURRENT_STREAMS as usize
 );
+const NETWORK_STREAM_WAIT_WARNING: Duration = Duration::from_secs(5);
 
 fn begin_recovery_window(
     deadline: &mut Option<tokio::time::Instant>,
@@ -1225,22 +1226,25 @@ impl BoundaryClient {
     }
 
     async fn acquire_network_stream(&self) -> tokio::sync::OwnedSemaphorePermit {
-        if let Ok(permit) = self.network_streams.clone().try_acquire_owned() {
+        let acquire = self.network_streams.clone().acquire_owned();
+        tokio::pin!(acquire);
+        // Bursty clients briefly exceed the budget; only report sustained waits.
+        let permit = if let Ok(permit) =
+            tokio::time::timeout(NETWORK_STREAM_WAIT_WARNING, &mut acquire).await
+        {
             self.network_streams_exhausted
                 .store(false, Ordering::Relaxed);
-            return permit;
-        }
-        if !self.network_streams_exhausted.swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                limit = MAX_NETWORK_STREAMS,
-                "Sandbox network relay stream budget in use; new sandbox TCP connections may wait for a relay to close"
-            );
-        }
-        self.network_streams
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("network stream semaphore is never closed")
+            permit
+        } else {
+            if !self.network_streams_exhausted.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    limit = MAX_NETWORK_STREAMS,
+                    "Sandbox network relay streams exhausted; new sandbox TCP connections are waiting for a relay to close"
+                );
+            }
+            acquire.await
+        };
+        permit.expect("network stream semaphore is never closed")
     }
 
     async fn call_idempotent(&self, request: Request) -> Result<Response, BackendError> {
