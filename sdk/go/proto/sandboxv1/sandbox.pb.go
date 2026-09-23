@@ -806,6 +806,7 @@ type NetworkEndpoint struct {
 	// When non-empty, the SSRF internal-IP check is replaced by an allowlist check:
 	//   - If host is also set: domain must resolve to an IP in this list.
 	//   - If host is empty: any domain is allowed as long as it resolves to an IP in this list.
+	//
 	// Supports exact IPs ("10.0.5.20") and CIDR notation ("10.0.5.0/24").
 	// Loopback (127.0.0.0/8) and link-local (169.254.0.0/16) are always blocked
 	// regardless of this field.
