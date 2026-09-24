@@ -56,7 +56,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 oci-client = { version = "0.16", optional = true }
 libc = "0.2"
-rustix = { workspace = true, optional = true }
+rustix = { workspace = true, features = ["fs"], optional = true }
 libloading = { version = "0.8", optional = true }
 tar = { version = "0.4", optional = true }
 flate2 = { version = "1", optional = true }

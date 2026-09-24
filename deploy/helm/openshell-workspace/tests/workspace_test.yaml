@@ -20,6 +20,48 @@ tests:
       - equal:
           path: metadata.namespace
           value: app-a
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
+            verbs: ["get"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get"]
+
+  - it: grants PVC admission reads only when caller driver config is enabled
+    template: templates/role.yaml
+    set:
+      gateway.allowDriverConfig: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
+            verbs: ["get"]
+
+  - it: grants generation Secret lifecycle and names no Secrets
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "delete"]
+      - notExists:
+          path: rules[*].resourceNames
 
   - it: binds the shared gateway service account
     template: templates/rolebinding.yaml

@@ -18,6 +18,7 @@ message PageToken {
     ObjectCursor object = 4;
     PolicyCursor policy = 5;
     ProfileCursor profile = 6;
+    ProviderCursor provider = 7;
   }
 }
 
@@ -37,4 +38,9 @@ message PolicyCursor {
 // Cursor for a deterministically ordered provider-profile catalog.
 message ProfileCursor {
   string key = 1;
+}
+
+// Cursor for providers attached to one sandbox, ordered by provider name.
+message ProviderCursor {
+  string name = 1;
 }

@@ -141,11 +141,8 @@ jobs:
     uses: ./.github/workflows/security-scan.yml
     with:
       candidate_ref: ${{ inputs.tag || github.ref_name }}
-      # Temporary observation mode for the pre-existing CodeQL, Trivy, and
-      # Zizmor backlog. Remove after baseline/delta enforcement is implemented.
-      # Cargo Deny, Codex Security, and scanner execution errors remain fatal.
       fail-on-codex-findings: true
-      fail-on-static-findings: false
+      fail-on-static-findings: true
       images: |
         ghcr.io/nvidia/openshell/gateway:${{ needs.compute-versions.outputs.source_sha }}
         ghcr.io/nvidia/openshell/sandbox:${{ needs.compute-versions.outputs.source_sha }}
@@ -217,39 +214,80 @@ jobs:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
       conformance-artifact-prefix: openshell-conformance
 
-  tag-ghcr-release:
-    name: Tag GHCR Images
-    needs: [compute-versions, build-images, release]
-    runs-on: linux-amd64-cpu8
-    timeout-minutes: 10
+  qualification-result:
+    name: Release Qualification
+    if: always()
+    needs:
+      - compute-versions
+      - security
+      - conformance-integration
+      - feature-specific-integration
+      - docker-e2e
+      - vm-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
-      packages: write
+      contents: read
+    outputs:
+      artifact-name: ${{ steps.summary.outputs.artifact-name }}
+      current-profile-passed: ${{ steps.summary.outputs.current-profile-passed }}
     steps:
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.compute-versions.outputs.source_sha || github.sha }}
 
-      - name: Tag images with release version
+      - name: Record qualification result
+        id: summary
         env:
+          CONFORMANCE_RESULT: ${{ needs.conformance-integration.result }}
+          DOCKER_E2E_RESULT: ${{ needs.docker-e2e.result }}
+          FEATURE_INTEGRATION_RESULT: ${{ needs.feature-specific-integration.result }}
           IS_PRERELEASE: ${{ needs.compute-versions.outputs.is_prerelease }}
-          SOURCE_TAG: ${{ needs.compute-versions.outputs.source_sha }}
-          VERSION: ${{ needs.compute-versions.outputs.semver }}
+          SECURITY_RESULT: ${{ needs.security.result }}
+          SOURCE_SHA: ${{ needs.compute-versions.outputs.source_sha }}
+          VM_E2E_RESULT: ${{ needs.vm-e2e.result }}
         run: |
           set -euo pipefail
-          REGISTRY="ghcr.io/nvidia/openshell"
-          for component in gateway sandbox supervisor; do
-            echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION}..."
-            docker buildx imagetools create \
-              --prefer-index=false \
-              -t "${REGISTRY}/${component}:${VERSION}" \
-              "${REGISTRY}/${component}:${SOURCE_TAG}"
-            if [[ "${IS_PRERELEASE}" != "true" ]]; then
-              echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as latest..."
-              docker buildx imagetools create \
-                --prefer-index=false \
-                -t "${REGISTRY}/${component}:latest" \
-                "${REGISTRY}/${component}:${SOURCE_TAG}"
-            fi
-          done
+          current_profile_passed=$(tasks/scripts/generate-qualification-summary.sh qualification-summary.json)
+          artifact_name="qualification-${RELEASE_TAG}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          run_url=$(jq -r '.run.url' qualification-summary.json)
+
+          {
+            echo "artifact-name=${artifact_name}"
+            echo "current-profile-passed=${current_profile_passed}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "## Release qualification"
+            echo
+            echo "- Candidate: \`${RELEASE_TAG}\` (\`${SOURCE_SHA}\`)"
+            echo "- Current qualification profile passed: **${current_profile_passed}**"
+            echo "- RFC-0014 qualification coverage complete: **false**"
+            echo "- Run: [${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT}](${run_url})"
+            echo
+            echo "| Suite | Result |"
+            echo "| --- | --- |"
+            echo "| Security | ${SECURITY_RESULT} |"
+            echo "| Conformance integration | ${CONFORMANCE_RESULT} |"
+            echo "| Feature integration | ${FEATURE_INTEGRATION_RESULT} |"
+            echo "| Docker E2E | ${DOCKER_E2E_RESULT} |"
+            echo "| VM E2E | ${VM_E2E_RESULT} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload qualification result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.summary.outputs.artifact-name }}
+          path: qualification-summary.json
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Require current qualification profile for stable releases
+        if: needs.compute-versions.outputs.is_prerelease != 'true' && steps.summary.outputs.current-profile-passed != 'true'
+        run: |
+          echo "Stable release ${RELEASE_TAG} did not pass the current release-tag-v1 qualification profile." >&2
+          exit 1
 
   build-python-wheel:
     name: Build Python Wheel
@@ -321,7 +359,7 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
 
   # ---------------------------------------------------------------------------
-  # Create a tagged GitHub Release with CLI, gateway, driver, and wheels
+  # Assemble release artifacts. Stable publication remains qualification-gated.
   # ---------------------------------------------------------------------------
   release:
     name: Release
@@ -329,11 +367,7 @@ jobs:
       - compute-versions
       - package-binaries
       - build-python-wheel
-      - conformance-integration
-      - feature-specific-integration
-      - docker-e2e
-      - vm-e2e
-      - security
+      - qualification-result
       - build-deb
       - build-rpm
       - build-snap
@@ -478,7 +512,8 @@ jobs:
             --output release/openshell.rb
           cat release/openshell.rb
 
-      - name: Attest VM driver artifacts
+      - name: Attest release artifacts
+        id: attest
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: |
@@ -616,6 +651,104 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # Publish OCI artifacts. build-images creates the commit-addressed candidate
+  # images; these jobs add versioned image tags and charts, and publish the
+  # qualification summary independently from the release artifacts.
+  # ---------------------------------------------------------------------------
+  tag-ghcr-release:
+    name: Tag GHCR Images
+    needs: [compute-versions, build-images, release]
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Tag images with release version
+        env:
+          IS_PRERELEASE: ${{ needs.compute-versions.outputs.is_prerelease }}
+          SOURCE_TAG: ${{ needs.compute-versions.outputs.source_sha }}
+          VERSION: ${{ needs.compute-versions.outputs.semver }}
+        run: |
+          set -euo pipefail
+          REGISTRY="ghcr.io/nvidia/openshell"
+          for component in gateway sandbox supervisor; do
+            echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION}..."
+            docker buildx imagetools create \
+              --prefer-index=false \
+              -t "${REGISTRY}/${component}:${VERSION}" \
+              "${REGISTRY}/${component}:${SOURCE_TAG}"
+            if [[ "${IS_PRERELEASE}" != "true" ]]; then
+              echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as latest..."
+              docker buildx imagetools create \
+                --prefer-index=false \
+                -t "${REGISTRY}/${component}:latest" \
+                "${REGISTRY}/${component}:${SOURCE_TAG}"
+            fi
+          done
+
+  release-helm:
+    name: Release Helm Chart (OCI)
+    needs: [compute-versions, release, tag-ghcr-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.compute-versions.outputs.source_sha }}
+
+      - uses: ./.github/actions/release-helm-oci
+        with:
+          chart-version: ${{ needs.compute-versions.outputs.semver }}
+          app-version: ${{ needs.compute-versions.outputs.semver }}
+          release-kind: public
+
+  publish-qualification:
+    name: Publish Qualification Summary (OCI)
+    if: >-
+      always()
+      && needs.release.result == 'success'
+      && needs.qualification-result.result == 'success'
+    needs: [compute-versions, qualification-result, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    steps:
+      - name: Download qualification result
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.qualification-result.outputs.artifact-name }}
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.0
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Publish qualification summary
+        env:
+          SOURCE_SHA: ${{ needs.compute-versions.outputs.source_sha }}
+          VERSION: ${{ needs.compute-versions.outputs.semver }}
+        run: |
+          set -euo pipefail
+          ref="ghcr.io/nvidia/openshell/qualification:${VERSION}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          oras push "${ref}" \
+            --artifact-type application/vnd.nvidia.openshell.qualification.v1 \
+            --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \
+            --annotation "org.opencontainers.image.version=${VERSION}" \
+            qualification-summary.json:application/vnd.nvidia.openshell.qualification.summary.v1+json
+
+          echo "Published qualification summary to \`${ref}\`." >> "${GITHUB_STEP_SUMMARY}"
+
   publish-fern-docs:
     name: Sync and Publish Fern Docs
     needs: [compute-versions, release, publish-sdk-typescript, release-helm, trigger-wheel-publish]
@@ -674,25 +807,6 @@ jobs:
           OPENSHELL_NPM_VERSION: ${{ needs.compute-versions.outputs.npm_version }}
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: mise run sdk:ts:publish
-
-  release-helm:
-    name: Release Helm Chart (OCI)
-    needs: [compute-versions, release, tag-ghcr-release]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      packages: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ needs.compute-versions.outputs.source_sha }}
-
-      - uses: ./.github/actions/release-helm-oci
-        with:
-          chart-version: ${{ needs.compute-versions.outputs.semver }}
-          app-version: ${{ needs.compute-versions.outputs.semver }}
-          release-kind: public
 
   trigger-wheel-publish:
     name: Trigger Wheel Publish

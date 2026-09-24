@@ -743,6 +743,7 @@ impl OpenShell for TestOpenShell {
             let _ = tx
                 .send(Ok(SandboxStreamEvent {
                     payload: Some(sandbox_stream_event::Payload::Sandbox(provisioning)),
+                    cursor: String::new(),
                 }))
                 .await;
             if terminal_after_provisional_container_exit
@@ -753,6 +754,7 @@ impl OpenShell for TestOpenShell {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(
                             provisional_container_exit,
                         )),
+                        cursor: String::new(),
                     }))
                     .await;
                 provisional_container_exit_sent.notify_waiters();
@@ -764,6 +766,7 @@ impl OpenShell for TestOpenShell {
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(completed)),
+                        cursor: String::new(),
                     }))
                     .await;
                 return;
@@ -777,11 +780,13 @@ impl OpenShell for TestOpenShell {
                             message: "Started VM launcher".to_string(),
                             ..PlatformEvent::default()
                         })),
+                        cursor: String::new(),
                     }))
                     .await;
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(error)),
+                        cursor: String::new(),
                     }))
                     .await;
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -801,12 +806,14 @@ impl OpenShell for TestOpenShell {
                                 source: "gateway".to_string(),
                                 fields: HashMap::new(),
                             })),
+                            cursor: String::new(),
                         }))
                         .await;
                 }
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                        cursor: String::new(),
                     }))
                     .await;
                 return;
@@ -815,6 +822,7 @@ impl OpenShell for TestOpenShell {
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(completed)),
+                        cursor: String::new(),
                     }))
                     .await;
                 return;
@@ -829,6 +837,7 @@ impl OpenShell for TestOpenShell {
                             message: "Preparing rootfs".to_string(),
                             ..PlatformEvent::default()
                         })),
+                        cursor: String::new(),
                     }))
                     .await;
                 tokio::time::sleep(Duration::from_millis(600)).await;
@@ -840,12 +849,14 @@ impl OpenShell for TestOpenShell {
                             message: "Formatting root disk".to_string(),
                             ..PlatformEvent::default()
                         })),
+                        cursor: String::new(),
                     }))
                     .await;
                 tokio::time::sleep(Duration::from_millis(600)).await;
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                        cursor: String::new(),
                     }))
                     .await;
                 return;
@@ -857,11 +868,13 @@ impl OpenShell for TestOpenShell {
                         message: "Sandbox scheduled".to_string(),
                         ..PlatformEvent::default()
                     })),
+                    cursor: String::new(),
                 }))
                 .await;
             let _ = tx
                 .send(Ok(SandboxStreamEvent {
                     payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                    cursor: String::new(),
                 }))
                 .await;
         });

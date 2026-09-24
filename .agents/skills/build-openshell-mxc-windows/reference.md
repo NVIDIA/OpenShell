@@ -9,7 +9,7 @@ maintaining the existing build-only Windows MSVC lane.
 |---|---|
 | `tasks/windows.toml` | Mise task definitions for `windows:*`. |
 | `tasks/scripts/windows-msvc.ps1` | Visual Studio environment discovery, rustup target setup, Cargo invocation, logs, artifact report. |
-| `.github/workflows/windows-msvc.yml` | PR/merge-queue lint and test plus main/manual cache seeding and dependent binary builds on native x64 and ARM64 runners. |
+| `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus `windows` branch cache seeding and dependent binary builds on native x64 and ARM64 runners. |
 | `architecture/windows-msvc-build.md` | Human-readable design contract. |
 
 ## Commands
@@ -69,7 +69,7 @@ For ARM64, verify the Visual Studio instance contains the ARM64 MSVC tools,
 ARM64 Spectre-mitigated libraries, Clang tools, CMake tools, and a Windows SDK.
 Clang supplies host-native `libclang.dll` for `bindgen` and `clang-cl.exe` for
 ARM64 crypto dependencies such as `aws-lc-sys`. Native and
-x64-to-ARM64 builds use the official prebuilt Z3 4.16.0 static library for the
+x64-to-ARM64 builds use the official prebuilt Z3 5.1.0 static library for the
 target architecture. An x64-to-ARM64 check/build discovers and adds host-native
 Ninja to `PATH`, while the crypto crates select `clang-cl`. Use a short
 `CARGO_TARGET_DIR` if Windows path-length limits are reached.

@@ -24,8 +24,8 @@ use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::Sha256Digest;
 use openshell_isolation_interface::contract::{
     BackendDescriptor, BackendError, BinaryIdentity, BoundaryConfirmation, BoundaryExitStatus,
-    BoundaryProperties, BoundarySignal, EnforcedProperty, ExecSpec, OuterFenceGuarantees,
-    ResolveError, ShellSpec,
+    BoundaryProperties, BoundarySignal, EnforcedProperty, ExecSpec, ExecutableIdentity,
+    OuterFenceGuarantees, ResolveError, ShellSpec,
 };
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 use serde::de::DeserializeOwned;
@@ -42,6 +42,20 @@ pub const STREAM_STDIN_CLOSED: u8 = 4;
 /// Supervisor decision for a staged seccomp-mediated TCP open.
 pub const STREAM_NETWORK_DECISION: u8 = 5;
 pub const MAX_STREAM_FRAME_BYTES: usize = 64 * 1024;
+
+// Every relay, exec, and control exchange shares one HTTP/2 connection. The
+// connection window must exceed what all streams can hold unread, otherwise
+// stalled relays starve DNS and control traffic of connection-level credit.
+// h2 keeps at least two thirds of `connection - in-flight` advertised, so the
+// reserve stays usable even with every stream stalled at its window.
+pub const BOUNDARY_MAX_CONCURRENT_STREAMS: u32 = 128;
+pub const BOUNDARY_STREAM_WINDOW_BYTES: u32 = 256 * 1024;
+pub const BOUNDARY_CONNECTION_WINDOW_RESERVE_BYTES: u32 = 16 * 1024 * 1024;
+pub const BOUNDARY_CONNECTION_WINDOW_BYTES: u32 = BOUNDARY_MAX_CONCURRENT_STREAMS
+    * BOUNDARY_STREAM_WINDOW_BYTES
+    + BOUNDARY_CONNECTION_WINDOW_RESERVE_BYTES;
+// HTTP/2 caps any flow-control window at 2^31 - 1.
+const _: () = assert!(BOUNDARY_CONNECTION_WINDOW_BYTES <= i32::MAX as u32);
 
 /// Capability masks measured from `/proc/<pid>/status` by the `OpenShell`
 /// co-located runtime.
@@ -82,6 +96,7 @@ pub struct SeccompEvidence {
     pub task_memory_read: bool,
     pub task_memory_write: bool,
     pub cancellation: bool,
+    pub task_memory_writes_disabled: bool,
 }
 
 /// Mechanism-specific audit evidence for the native Linux sandbox adapter.
@@ -129,7 +144,7 @@ impl NativeLinuxSandboxAuditEvidence {
             && self.seccomp.proc_fd_identity
             && self.seccomp.task_memory_read
             && self.seccomp.task_memory_write
-            && self.seccomp.cancellation
+            && (self.seccomp.cancellation || self.seccomp.task_memory_writes_disabled)
             && self.landlock_abi >= 3
             && self.landlock_allow_deny
             && self.udp_dns_round_trip
@@ -672,8 +687,8 @@ pub enum Request {
         sandbox_id: String,
         spec: AgentSpecWire,
         policy: Box<SandboxPolicyWire>,
-        ca_cert: Option<Vec<u8>>,
-        ca_bundle: Option<Vec<u8>>,
+        ca_cert: Option<String>,
+        ca_bundle: Option<String>,
         provider_env_revision: u64,
         provider_env: std::collections::HashMap<String, String>,
     },
@@ -954,12 +969,36 @@ pub enum BoundaryErrorKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutableIdentityWire {
+    pub path: PathBuf,
+    pub digest: Option<Sha256Digest>,
+}
+
+impl From<ExecutableIdentity> for ExecutableIdentityWire {
+    fn from(identity: ExecutableIdentity) -> Self {
+        Self {
+            path: identity.path,
+            digest: identity.digest,
+        }
+    }
+}
+
+impl From<ExecutableIdentityWire> for ExecutableIdentity {
+    fn from(identity: ExecutableIdentityWire) -> Self {
+        Self {
+            path: identity.path,
+            digest: identity.digest,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BinaryIdentityWire {
     Resolved {
-        binary_path: PathBuf,
-        binary_digest: Option<Sha256Digest>,
-        ancestors: Vec<PathBuf>,
+        executable: ExecutableIdentityWire,
+        ancestors: Vec<ExecutableIdentityWire>,
         cmdline_paths: Vec<PathBuf>,
     },
     Failed {
@@ -971,9 +1010,8 @@ impl From<Result<BinaryIdentity, ResolveError>> for BinaryIdentityWire {
     fn from(identity: Result<BinaryIdentity, ResolveError>) -> Self {
         match identity {
             Ok(identity) => Self::Resolved {
-                binary_path: identity.binary_path,
-                binary_digest: identity.binary_digest,
-                ancestors: identity.ancestors,
+                executable: identity.executable.into(),
+                ancestors: identity.ancestors.into_iter().map(Into::into).collect(),
                 cmdline_paths: identity.cmdline_paths,
             },
             Err(error) => Self::Failed {
@@ -987,14 +1025,12 @@ impl BinaryIdentityWire {
     pub fn into_result(self) -> Result<BinaryIdentity, ResolveError> {
         match self {
             Self::Resolved {
-                binary_path,
-                binary_digest,
+                executable,
                 ancestors,
                 cmdline_paths,
             } => Ok(BinaryIdentity {
-                binary_path,
-                binary_digest,
-                ancestors,
+                executable: executable.into(),
+                ancestors: ancestors.into_iter().map(Into::into).collect(),
                 cmdline_paths,
             }),
             Self::Failed { message } => Err(ResolveError::Failed(message)),
@@ -1408,6 +1444,7 @@ mod tests {
                 task_memory_read: true,
                 task_memory_write: true,
                 cancellation: true,
+                task_memory_writes_disabled: false,
             },
             landlock_abi: 6,
             landlock_allow_deny: true,
@@ -1439,18 +1476,40 @@ mod tests {
     }
 
     #[test]
+    fn audit_evidence_accepts_legacy_read_only_listener() {
+        let mut audit = complete_audit_evidence();
+        audit.seccomp.cancellation = false;
+        audit.seccomp.task_memory_writes_disabled = true;
+        assert!(audit.validate().is_ok());
+    }
+
+    #[test]
+    fn audit_evidence_rejects_plain_listener_with_writes_enabled() {
+        let mut audit = complete_audit_evidence();
+        audit.seccomp.cancellation = false;
+        audit.seccomp.task_memory_writes_disabled = false;
+        assert!(audit.validate().is_err());
+    }
+
+    #[test]
     fn binary_identity_wire_rejects_ambiguous_or_invalid_shapes() {
         for encoded in [
             r#"{"result":"resolved","ancestors":[],"cmdline_paths":[]}"#,
-            r#"{"result":"resolved","binary_path":"/bin/tool","binary_digest":"invalid","ancestors":[],"cmdline_paths":[]}"#,
+            r#"{"result":"resolved","executable":{"path":"/bin/tool","digest":"invalid"},"ancestors":[],"cmdline_paths":[]}"#,
+            r#"{"result":"resolved","binary_path":"/bin/tool","binary_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ancestors":[],"cmdline_paths":[]}"#,
             r#"{"result":"failed","message":"unavailable","binary_path":"/bin/tool"}"#,
         ] {
             assert!(serde_json::from_str::<BinaryIdentityWire>(encoded).is_err());
         }
         let identity = BinaryIdentityWire::from(Ok(BinaryIdentity {
-            binary_path: PathBuf::from("/bin/tool"),
-            binary_digest: Some("a".repeat(64).parse().unwrap()),
-            ancestors: Vec::new(),
+            executable: ExecutableIdentity {
+                path: PathBuf::from("/bin/tool"),
+                digest: Some("a".repeat(64).parse().unwrap()),
+            },
+            ancestors: vec![ExecutableIdentity {
+                path: PathBuf::from("/bin/launcher"),
+                digest: Some("b".repeat(64).parse().unwrap()),
+            }],
             cmdline_paths: Vec::new(),
         }));
         let encoded = serde_json::to_vec(&identity).unwrap();
@@ -1518,8 +1577,8 @@ mod tests {
                     landlock: LandlockPolicy::default(),
                     process: ProcessPolicy::default(),
                 })),
-                ca_cert: Some(b"test certificate".to_vec()),
-                ca_bundle: Some(b"test bundle".to_vec()),
+                ca_cert: Some("test certificate".to_string()),
+                ca_bundle: Some("test bundle".to_string()),
                 provider_env_revision: 7,
                 provider_env: std::collections::HashMap::from([(
                     "OPENAI_API_KEY".to_string(),
@@ -1570,6 +1629,35 @@ mod tests {
             envelope.validate_payload_digest(),
             Err(FrameError::PayloadDigestMismatch)
         ));
+    }
+
+    #[test]
+    fn start_agent_with_large_ca_bundle_fits_in_frame_limit() {
+        let request = RequestEnvelope::new(Request::StartAgent {
+            sandbox_id: "sandbox-1".to_string(),
+            spec: AgentSpecWire {
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                workdir: None,
+                timeout_secs: 5,
+                interactive: false,
+            },
+            policy: Box::new(SandboxPolicyWire::from(SandboxPolicy {
+                version: 1,
+                filesystem: FilesystemPolicy::default(),
+                network: NetworkPolicy::default(),
+                landlock: LandlockPolicy::default(),
+                process: ProcessPolicy::default(),
+            })),
+            ca_cert: Some("A".repeat(16 * 1024)),
+            ca_bundle: Some("B".repeat(400 * 1024)),
+            provider_env_revision: 0,
+            provider_env: std::collections::HashMap::new(),
+        })
+        .expect("request envelope");
+        let frame = encode_frame(&request).expect("large CA bundle must fit in frame limit");
+        let decoded: RequestEnvelope = decode_frame(&frame).expect("round-trip");
+        assert_eq!(decoded, request);
     }
 
     #[test]

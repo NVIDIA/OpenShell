@@ -809,6 +809,7 @@ pub async fn sandbox_create(
             since_time: None,
             log_sources: vec!["gateway".to_string()],
             log_min_level: String::new(),
+            resume_after_cursor: String::new(),
         })
         .await
         .into_diagnostic()?
@@ -1896,6 +1897,7 @@ pub async fn sandbox_exec_grpc(
     // Make the streaming gRPC call.
     let mut stream = client
         .exec_sandbox(ExecSandboxRequest {
+            request_id: String::new(),
             sandbox: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
@@ -2258,6 +2260,7 @@ async fn sandbox_exec_interactive_grpc(
     input_tx
         .send(ExecSandboxInput {
             payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
+                request_id: String::new(),
                 sandbox: sandbox.object_name().to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     (sandbox.object_workspace()).to_string(),
@@ -3572,6 +3575,7 @@ async fn wait_for_lifecycle_phase(
             since_time: None,
             log_sources: Vec::new(),
             log_min_level: String::new(),
+            resume_after_cursor: String::new(),
         })
         .await
         .into_diagnostic()?
@@ -5806,6 +5810,7 @@ pub async fn sandbox_logs(
                     .into_diagnostic()?,
                 log_sources: source_filter,
                 log_min_level: level.to_uppercase(),
+                resume_after_cursor: String::new(),
             })
             .await
             .into_diagnostic()?

@@ -540,7 +540,7 @@ describe('create', () => {
     await sandbox.createSshSession('ssh', { workspace: 'staging' });
     const attached = await sandbox.attachProvider('lookup', 'github', { workspace: 'staging' });
     const detached = await sandbox.detachProvider('lookup', 'github', { workspace: 'staging' });
-    await sandbox.listProviders('lookup', { workspace: 'staging' });
+    await sandbox.listProviders('lookup', { workspace: 'staging' }).nextPage();
     await sandbox.getConfig('config', { workspace: 'staging' });
     await sandbox.setPolicy('lookup', { version: 1, networkPolicies: {} }, { workspace: 'staging' });
     await sandbox.setSetting(
@@ -615,6 +615,44 @@ describe('create', () => {
     await expect(pager.nextPage()).rejects.toThrow('temporary failure');
     await expect(pager.nextPage()).resolves.toEqual({ items: [1], nextPageToken: '' });
     expect(tokens).toEqual(['resume', 'resume']);
+  });
+
+  it('rejects a repeated continuation token', async () => {
+    const pager = new Pager<number>(async (token) => ({ items: [1], nextPageToken: token }), 'resume');
+
+    await expect(pager.nextPage()).rejects.toThrow('pager received a repeated continuation token');
+  });
+
+  it('prevents a request when the token-count budget is exhausted', async () => {
+    const requests: string[] = [];
+    const pager = new Pager<number>(
+      async (token) => {
+        requests.push(token);
+        return { items: [1], nextPageToken: 'next' };
+      },
+      'first',
+      1,
+    );
+
+    await expect(pager.nextPage()).resolves.toEqual({ items: [1], nextPageToken: 'next' });
+    await expect(pager.nextPage()).rejects.toThrow('pager continuation token history limit exceeded');
+    expect(requests).toEqual(['first']);
+  });
+
+  it('prevents a request when the token-byte budget is exhausted', async () => {
+    const requests: string[] = [];
+    const pager = new Pager<number>(
+      async (token) => {
+        requests.push(token);
+        return { items: [1], nextPageToken: '' };
+      },
+      'too-large',
+      10,
+      1,
+    );
+
+    await expect(pager.nextPage()).rejects.toThrow('pager continuation token history limit exceeded');
+    expect(requests).toEqual([]);
   });
 
   it('createFromTemplate rejects an empty template name locally', async () => {
@@ -1308,23 +1346,66 @@ describe('providers', () => {
     expect(detach.changed).toBe(false);
   });
 
-  it('lists providers with u64 resourceVersion rendered as a string', async () => {
+  it('lists one provider page with its continuation token', async () => {
+    const pageTokens: string[] = [];
     const sandbox = client({
-      listSandboxProviders: () => ({
-        providers: [
-          {
-            metadata: {
-              id: 'p1',
-              name: 'claude',
-              labels: { a: 'b' },
-              resourceVersion: 99n,
+      listSandboxProviders: ({ pageToken, pageSize }) => {
+        pageTokens.push(pageToken);
+        expect(pageSize).toBe(1);
+        return {
+          providers: [
+            {
+              metadata: { id: 'p1', name: 'claude', resourceVersion: 99n },
+              type: 'claude',
             },
-            type: 'claude',
-          },
-        ],
-      }),
+          ],
+          nextPageToken: 'page-2',
+        };
+      },
     });
-    const providers = await sandbox.listProviders('sb');
+
+    const page = await sandbox.listProviders('sb', { pageSize: 1 }).nextPage();
+    expect(page).toMatchObject({ nextPageToken: 'page-2' });
+    expect(page?.items.map((provider) => provider.name)).toEqual(['claude']);
+    expect(pageTokens).toEqual(['']);
+  });
+
+  it('lists all providers with u64 resourceVersion rendered as a string', async () => {
+    const pageTokens: string[] = [];
+    const sandbox = client({
+      listSandboxProviders: ({ pageToken }) => {
+        pageTokens.push(pageToken);
+        return pageToken === ''
+          ? {
+              providers: [
+                {
+                  metadata: {
+                    id: 'p1',
+                    name: 'claude',
+                    labels: { a: 'b' },
+                    resourceVersion: 99n,
+                  },
+                  type: 'claude',
+                },
+              ],
+              nextPageToken: 'page-2',
+            }
+          : {
+              providers: [
+                {
+                  metadata: {
+                    id: 'p2',
+                    name: 'github',
+                    resourceVersion: 100n,
+                  },
+                  type: 'github',
+                },
+              ],
+              nextPageToken: '',
+            };
+      },
+    });
+    const providers = await sandbox.listAllProviders('sb');
     expect(providers).toEqual([
       {
         id: 'p1',
@@ -1333,7 +1414,15 @@ describe('providers', () => {
         labels: { a: 'b' },
         resourceVersion: '99',
       },
+      {
+        id: 'p2',
+        name: 'github',
+        type: 'github',
+        labels: {},
+        resourceVersion: '100',
+      },
     ]);
+    expect(pageTokens).toEqual(['', 'page-2']);
   });
 });
 

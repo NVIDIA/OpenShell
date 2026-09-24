@@ -166,6 +166,10 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
+    /// Permit caller-supplied driver JSON. Does not waive resource admission.
+    pub allow_driver_config: bool,
+    /// Operator-owned external attachment approval policy.
+    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     /// How workspaces map to Kubernetes namespaces. `"shared"` (default)
     /// renders all sandboxes into `namespace`; `"managed"` creates per-workspace
     /// namespaces on demand; `"operator"` uses pre-provisioned namespaces.
@@ -326,6 +330,9 @@ impl Default for KubernetesComputeConfig {
     fn default() -> Self {
         Self {
             workspace_mode: WorkspaceMode::default(),
+            allow_driver_config: false,
+            resource_admission:
+                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
             gateway_id: DEFAULT_GATEWAY_ID.to_string(),
             namespace: DEFAULT_K8S_NAMESPACE.to_string(),
             operator_namespace_label: None,
@@ -625,6 +632,20 @@ impl KubernetesComputeConfig {
     #[must_use]
     pub fn is_multi_namespace(&self) -> bool {
         !matches!(self.workspace_mode, WorkspaceMode::Shared)
+    }
+
+    /// Where supervisor Pods read the gateway client TLS material. Outside
+    /// shared mode it is staged into each generation's bootstrap Secret.
+    #[must_use]
+    pub fn supervisor_client_tls(&self) -> crate::sandbox_runtime::SupervisorClientTls<'_> {
+        use crate::sandbox_runtime::SupervisorClientTls;
+        if self.client_tls_secret_name.is_empty() {
+            SupervisorClientTls::Disabled
+        } else if self.is_multi_namespace() {
+            SupervisorClientTls::Bootstrap
+        } else {
+            SupervisorClientTls::Secret(&self.client_tls_secret_name)
+        }
     }
 
     /// Compute the K8s resource name for a sandbox.

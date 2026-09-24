@@ -1,0 +1,129 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Rust SDK"
+sidebar-title: "Rust"
+description: "Install the OpenShell Rust SDK, connect to a gateway, and manage a sandbox asynchronously."
+keywords: "OpenShell, SDK, Rust, Cargo, Tonic, gRPC, Sandbox"
+position: 2
+---
+
+The Rust SDK is the asynchronous gateway client used by the OpenShell CLI and
+TUI. Its curated API covers common sandbox operations, while `raw` exposes the
+generated Tonic clients for the complete RPC surface. Use the SDK and gateway
+from the same OpenShell release when possible.
+
+## Install the SDK
+
+The Rust SDK is currently consumed from source. Pin the dependency to the same
+release tag as your gateway:
+
+```shell
+cargo add openshell-sdk \
+  --git https://github.com/NVIDIA/OpenShell \
+  --tag <release-tag>
+cargo add tokio --features macros,rt-multi-thread
+```
+
+## Connect to a Gateway
+
+`ClientConfig` accepts a full gateway URL. This local example uses plaintext
+transport and no authentication:
+
+```rust
+use openshell_sdk::{ClientConfig, OpenShellClient};
+
+let client = OpenShellClient::connect(
+    ClientConfig::new("http://127.0.0.1:8080"),
+)
+.await?;
+
+let health = client.health().await?;
+println!("gateway status: {:?}", health.status);
+```
+
+For an OIDC gateway, attach a bearer token and use HTTPS:
+
+```rust
+use openshell_sdk::{AuthConfig, ClientConfig, OpenShellClient};
+
+let client = OpenShellClient::connect(ClientConfig {
+    gateway: "https://gateway.example.com".to_string(),
+    auth: Some(AuthConfig::oidc(std::env::var("OPENSHELL_TOKEN")?)),
+    ..Default::default()
+})
+.await?;
+```
+
+Set `ca_cert` when the gateway uses a private CA. The Rust SDK supports
+server-authenticated TLS and OIDC bearer authentication. It does not support
+mTLS client certificates or read the CLI gateway configuration from disk.
+
+## Create and Use a Sandbox
+
+Curated operations use the `default` workspace. Use
+`client.workspace("name")` when your application targets another
+workspace.
+
+```rust
+use std::time::Duration;
+
+use openshell_sdk::{
+    ClientConfig, DeleteOptions, ExecOptions, OpenShellClient, SandboxSpec,
+};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = OpenShellClient::connect(
+        ClientConfig::new("http://127.0.0.1:8080"),
+    )
+    .await?;
+
+    let sandbox = client
+        .create_sandbox(SandboxSpec {
+            name: Some("sdk-example".to_string()),
+            image: Some(
+                "registry.example.com/team/python-agent:1.0"
+                    .to_string(),
+            ),
+            ..Default::default()
+        })
+        .await?;
+
+    client
+        .wait_ready(&sandbox.name, Duration::from_secs(120))
+        .await?;
+
+    let result = client
+        .exec(
+            &sandbox.name,
+            &["python".into(), "-c".into(), "print('hello from OpenShell')".into()],
+            ExecOptions::default(),
+        )
+        .await?;
+    print!("{}", String::from_utf8_lossy(&result.stdout));
+
+    let deletion = client
+        .delete_sandbox(&sandbox.name, DeleteOptions::default())
+        .await?;
+    client
+        .wait_deleted(
+            &sandbox.name,
+            Duration::from_secs(60),
+            deletion.sandbox_id.as_deref(),
+        )
+        .await?;
+
+    Ok(())
+}
+```
+
+Use `raw_grpc_fresh()` for RPCs that the curated API does not yet wrap. The raw
+client returns generated protobuf types and requires callers to assemble full
+requests.
+
+## Next Steps
+
+- Review [Gateway Authentication](/reference/gateway-auth) for transport and identity choices.
+- Review [API Errors](/reference/api-errors) for the gateway error model.
+- See the [Rust SDK source documentation](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-sdk) for modules and advanced transport behavior.

@@ -859,7 +859,7 @@ message RefreshSandboxTokenResponse {
   repeated ExtensionServiceCredential extension_credentials = 3;
   // Fresh Sandbox Protocol bearer token from the same atomic refresh.
   string sandbox_token = 4 [(openshell.options.v1.secret) = true];
-  // Absolute Sandbox Protocol token expiry. Required when sandbox_token is set.
+  // Absolute Sandbox Protocol token expiry. Absence means the token is non-expiring.
   google.protobuf.Timestamp sandbox_expiration_time = 105;
   // Launch generation to which both refreshed credentials are bound.
   string session_id = 6;
@@ -1373,6 +1373,12 @@ message ListSandboxProvidersRequest {
   // Workspace scope. Only a named workspace selection is accepted.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
   string sandbox = 1;
+  // The maximum number of providers to return. Zero uses 100. Values above
+  // 1000 are coerced to 1000; negative values are invalid.
+  int32 page_size = 3;
+  // Token from a previous ListSandboxProviders response. All other request
+  // parameters except page_size must match the request that produced it.
+  string page_token = 4;
 }
 
 // Attach provider to sandbox request.
@@ -1461,6 +1467,8 @@ message ListSandboxesResponse {
 // List providers attached to a sandbox response.
 message ListSandboxProvidersResponse {
   repeated openshell.datamodel.v1.Provider providers = 1;
+  // Token for the next page. Empty when there are no subsequent pages.
+  string next_page_token = 2;
 }
 
 // Attach provider to sandbox response.
@@ -1884,6 +1892,12 @@ message ExecSandboxRequest {
   // sourced by them) are applied. When true, the command runs without those
   // files (`bash -c`), for automation that needs predictable startup behavior.
   bool no_login_shell = 10;
+
+  // Optional nonzero UUID for durable launch admission. Also applies to the
+  // initial ExecSandboxInteractive start message. Duplicates never relaunch,
+  // reattach, or replay output/stdin. Unconfirmed executions remain fenced;
+  // confirmed terminal executions retain the fence for 24 hours.
+  string request_id = 11;
 }
 
 // One stdout chunk from a sandbox exec.
@@ -2020,6 +2034,25 @@ message WatchSandboxRequest {
 
   // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
   string log_min_level = 10;
+
+  // Resume streaming after this cursor. Empty means no cursor resume: the
+  // server falls back to tail-limited replay controlled by log_tail_lines and
+  // event_tail. Otherwise set it to the highest `SandboxStreamEvent.cursor`
+  // already processed; the server replays only log and platform events after
+  // it, merged in cursor order, before resuming live delivery. If the requested
+  // cursor has already been trimmed from the server's buffer, the resume is
+  // unrecoverable and the stream terminates with OUT_OF_RANGE (see
+  // SandboxStreamWarning for the recoverable case).
+  //
+  // A cursor is bound to the cursor space that issued it. A gateway restart,
+  // teardown of the sandbox's buffers, or a reconnect to a different gateway
+  // replica starts a new space, and cursors from the previous one are rejected
+  // with OUT_OF_RANGE rather than silently suppressing live events beneath
+  // them. OUT_OF_RANGE is terminal for that cursor: restart the watch with an
+  // empty resume_after_cursor, because retrying the same token fails
+  // identically. A cursor this server could not have issued is rejected with
+  // INVALID_ARGUMENT.
+  string resume_after_cursor = 12;
 }
 
 // One event in a sandbox watch stream.
@@ -2031,11 +2064,25 @@ message SandboxStreamEvent {
     SandboxLogLine log = 2;
     // One platform event.
     PlatformEvent event = 3;
-    // Warning from the server (e.g. missed messages due to lag).
+    // Recoverable warning from the server, e.g. messages dropped because a
+    // broadcast receiver lagged. The stream continues after this warning; the
+    // client can detect the gap from the warning itself.
     SandboxStreamWarning warning = 4;
     // Draft policy update notification.
     DraftPolicyUpdate draft_policy_update = 5;
   }
+  // Opaque position in this sandbox's cursor space, shared across the resumable
+  // log and platform event sources. Empty for non-resumable events (status
+  // snapshots, warnings).
+  //
+  // Do not parse this token; its encoding is not part of the contract. The only
+  // supported operation is comparing two non-empty cursors observed on the same
+  // stream and keeping the greater one, then passing it as
+  // WatchSandboxRequest.resume_after_cursor to resume without loss or
+  // duplication. That comparison is a plain byte-wise string comparison. It is
+  // well defined only within one stream: a stream never spans two cursor
+  // spaces, because a reset ends it.
+  string cursor = 6;
 }
 
 // Log line correlated to a sandbox.
@@ -2054,6 +2101,11 @@ message SandboxLogLine {
   map<string, string> fields = 7;
 }
 
+// Recoverable loss notification on a watch stream. Emitted when the server
+// skips ahead after a broadcast lag instead of terminating; the stream keeps
+// running. Cursors are opaque, so this message is the only signal that events
+// were skipped. Unrecoverable loss (a trimmed or foreign resume cursor) is
+// reported as an OUT_OF_RANGE stream status, not this message.
 message SandboxStreamWarning {
   string message = 1;
 }

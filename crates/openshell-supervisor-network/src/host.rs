@@ -21,7 +21,7 @@ use openshell_core::policy::ProxyPolicy;
 use openshell_core::proposals::AgentProposals;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
-use openshell_isolation_interface::contract::{BinaryIdentity, Sha256Digest};
+use openshell_isolation_interface::contract::{BinaryIdentity, ExecutableIdentity, Sha256Digest};
 use openshell_ocsf::{
     ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ctx::ctx as ocsf_ctx, ocsf_emit,
 };
@@ -197,8 +197,10 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         .parse()
         .map_err(|error| miette::miette!("hash host proxy binary identity: {error}"))?;
     let direct_listener_identity = BinaryIdentity {
-        binary_path: config.binary_path,
-        binary_digest: Some(binary_digest),
+        executable: ExecutableIdentity {
+            path: config.binary_path,
+            digest: Some(binary_digest),
+        },
         ancestors: Vec::new(),
         cmdline_paths: Vec::new(),
     };

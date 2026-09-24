@@ -27,7 +27,10 @@ helm install openshell-workspace ./deploy/helm/openshell-workspace \
 
 Keep `sandboxServiceAccount.name` aligned with the gateway chart's
 `sandboxServiceAccount.name`. The defaults for both charts are
-`openshell-sandbox`.
+`openshell-sandbox`. If the gateway enables
+`server.drivers.kubernetes.allowDriverConfig`, also set
+`gateway.allowDriverConfig=true` in every workspace release so caller-selected
+PVCs can be admitted.
 
 {{ template "chart.valuesSection" . }}
 {{ template "helm-docs.versionFooter" . }}

@@ -16,6 +16,22 @@ the common protocol owns process, identity, TCP, DNS, and forwarding semantics.
 
 ## Driver Contract
 
+External resource admission is an operator-owned boundary shared by drivers.
+The gateway gates caller driver JSON independently from attachment approval.
+Drivers resolve the complete effective attachment inventory against authoritative
+resource labels before launch and on reuse. Missing labels or an unsupported
+resolver deny access; GPU attachments are an explicit temporary exception.
+Fresh sandbox-private resources instead require verified provisioning ownership.
+Workload metadata must not grant approval or override admission evidence.
+
+The shared evaluator lives in `openshell-core`; native resolution remains in
+each driver. External drivers acknowledge the effective versioned policy through
+capabilities, and policy mismatch prevents activation or new launch operations.
+Trusted deployment configuration can explicitly disable label admission, but
+that opt-out does not waive other ownership and isolation checks. This boundary
+assumes operators control approval metadata and runtime resource replacement;
+it does not provide atomic mount authorization or instantaneous revocation.
+
 Each runtime receives a sandbox spec and canonical policy from the gateway and
 is responsible for:
 
@@ -340,7 +356,16 @@ VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
 private `run/` directory plus Unix peer UID/PID checks. Standalone
 unauthenticated TCP mode is disabled unless explicitly enabled for local
-development.
+development. The VM image cache is owner-only. When the host assembles a
+bootstrap rootfs from OCI layers, cross-layer symlinks may resolve only within
+that rootfs; absolute or escaping targets reject the image before a later layer
+can write through them. Rootfs traversal and mutation use opened directory
+handles with no-follow file creation, so later copies, permission changes, and
+whiteouts cannot be redirected by replacing a validated pathname component.
+The bootstrap rootfs comes only from the operator-configured `bootstrap_image`
+or `default_image`; a sandbox-requested image never becomes the VM bootstrap
+image. The gateway rejects configurations without either trusted source, and
+the standalone driver independently fails startup for the same condition.
 
 Runtime-specific implementation notes belong in the driver crate README:
 
@@ -392,6 +417,30 @@ and explicit `/sandbox` values select `/sandbox`; other paths must already
 exist without symlink or reserved-mount collisions and must be usable by the
 resolved identity. Kubernetes and VM use `/sandbox`.
 
+### Executable Identity Binding
+
+Every mediated network open carries a connection-bound `BinaryIdentity` from
+the isolation backend. The identity contains the socket-owning executable and
+each executable ancestor, nearest first, as an absolute workload path plus a
+SHA-256 digest. The backend resolves these values for the accepted connection
+and hashes already-open live executable objects rather than reopening their
+paths. Command-line paths remain diagnostic context and cannot authorize a
+request.
+
+Before policy evaluation, the supervisor validates and pins the complete leaf
+and ancestor chain in one runtime-scoped trust-on-first-use cache. It rejects
+missing digests, invalid paths, conflicting evidence within a chain, or a
+digest that differs from an existing path pin. Validation and insertion are
+atomic, so a rejected chain cannot leave partial pins.
+
+The cache is shared across authorization paths for the lifetime of the
+supervisor network runtime. Policy reloads replace policy state without
+clearing executable pins; restarting the runtime creates a new cache. OPA
+receives executable and ancestor paths plus endpoint policy context. Digests
+remain supervisor-side integrity evidence and are not policy inputs. Any
+unavailable, incomplete, or conflicting executable evidence fails closed
+before OPA can authorize the connection.
+
 The Kubernetes driver creates the namespace-wide empty-egress workload fence
 before a suspended Sandbox CR, then provisions split immutable bootstrap
 Secrets, the private runtime Service, and a gated supervisor Pod. A
@@ -423,7 +472,9 @@ database-backed installs can render a Deployment with `workload.kind=deployment`
 HA deployments must point `server.externalDbSecret` at an operator-managed
 PostgreSQL database. Agent Sandbox CRDs and controller lifecycle remain
 operator-owned; the chart can optionally preflight for a served supported API
-but does not install the cluster-scoped dependency.
+but does not install the cluster-scoped dependency. OpenShell's Kubernetes test
+clusters install the upstream core manifest; Agent Sandbox extensions are not
+required by the gateway.
 Standalone local deployments start the gateway with a selected runtime such as
 Docker, Podman, or VM. The CLI can register multiple gateways and switch between
 them without changing the sandbox architecture.
@@ -447,27 +498,32 @@ management. RBAC uses a namespace-scoped Role.
 
 **Managed** auto-creates a K8s namespace per workspace on first sandbox create.
 Each new namespace receives a ServiceAccount and the configured gateway-only
-SSH ingress NetworkPolicy. Configured image-pull Secrets are copied from the
-driver's source namespace on every sandbox create so registry credential
-rotations propagate. The namespace also copies OpenShift SCC UID-range and
-supplemental-group annotations from the gateway namespace when present. The
-driver deletes the namespace during workspace deletion. The workspace remains
-durably `Terminating` until the Kubernetes API accepts namespace cleanup, so a
-transient failure can be retried. Namespace deletion uses the fetched UID as a
+SSH ingress NetworkPolicy. Each sandbox runtime generation gets immutable copies
+of the configured image-pull Secrets, read from the driver's source namespace and
+named after the generation, so a sandbox picks up rotated registry credentials
+on its next start. Their sources are operator-selected gateway configuration,
+not caller attachments. An existing Secret with a generation name fails the
+create and is never adopted. The namespace also copies
+OpenShift SCC UID-range and supplemental-group annotations from the gateway
+namespace when present. The driver deletes the namespace during workspace
+deletion. The workspace remains durably `Terminating` until the Kubernetes API
+accepts namespace cleanup, so a transient failure can be retried. Namespace
+deletion uses the fetched UID as a
 precondition to avoid deleting a replacement namespace. Requires a non-empty
 `gateway_id` (validated as a
 DNS-1123 label at startup) so the namespace prefix fits within the K8s 63-character
 limit. RBAC promotes sandbox CRD permissions to a ClusterRole and adds namespace
 `create`/`delete` and ServiceAccount `create`/`get` permissions.
 
-Secret copies use server-side apply. Kubernetes authorizes an apply to an
-existing Secret as `patch`, but also requires `create` authorization when the
-target does not exist. RBAC cannot constrain `create` by `resourceNames`, so
-managed mode grants cluster-wide Secret `create`, `list`, and `delete` for
-generation-scoped bootstrap Secret creation and rollback recovery while keeping
-source reads and subsequent patches restricted to the explicitly configured TLS
-and image-pull Secret names. Recovery lists bootstrap Secrets by sandbox and
-component labels, then deletes stale generations with UID preconditions. The
+Outside shared mode, the gateway client TLS material is staged into each
+generation's supervisor bootstrap Secret rather than mounted from a Secret in
+the workspace namespace. Every Secret the driver writes into a workspace
+namespace is therefore generation-scoped, immutable, and created with `create`
+only. RBAC cannot constrain `create` by `resourceNames`, so managed mode grants
+cluster-wide Secret `create` and `delete`; source reads use a Role in the
+driver's source namespace. Recovery deletes the Secrets of the recorded and
+target runtime generations by exact name; Pod owner references let garbage
+collection remove any other generation. The
 driver exercises these broad permissions only in gateway-owned managed
 namespaces. This depends on the managed-mode ownership invariant described below;
 the gateway ServiceAccount must not be shared with unrelated workloads.
@@ -475,6 +531,9 @@ the gateway ServiceAccount must not be shared with unrelated workloads.
 Operator mode does not create NetworkPolicies or copy image-pull Secrets.
 Platform teams must apply the gateway ingress boundary and provision configured
 image-pull Secrets in every operator-managed namespace.
+The gateway ClusterRole grants no Secret permissions in operator mode. The
+`openshell-workspace` chart Role installed in each operator-managed namespace
+grants bootstrap Secret `create` and `delete`.
 
 **Operator** uses pre-provisioned namespaces discovered through two optional
 sources: a K8s label selector (`operator_namespace_label`) and a drop-in
@@ -534,9 +593,10 @@ isolation boundary.
 ### Credential Driver Integration
 
 The Kubernetes Secrets credential driver (`openshell-driver-kubernetes-secrets`)
-stores secrets in workspace-specific namespaces when `workspace_mode` is managed
-or operator. In shared mode, all secrets render into the single configured
-namespace.
+stores every provider credential in its single configured namespace, in every
+workspace mode, and rejects handles that reference another namespace. The
+gateway reaches those Secrets through a namespaced Role; the gateway
+ClusterRole grants no credential Secret permissions.
 
 When runtime infrastructure changes, validate the relevant sandbox e2e path and
 update the matching driver README if a maintainer-facing constraint changes.

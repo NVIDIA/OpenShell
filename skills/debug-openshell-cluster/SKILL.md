@@ -92,6 +92,22 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 
+For resource-admission failures, distinguish disabled caller driver config from
+missing resource approval. Helm defaults `server.drivers.kubernetes.allowDriverConfig`
+to false and `resourceAdmission.enabled` to true. Existing PVCs, RuntimeClasses,
+and PriorityClasses need matching administrator-owned labels; namespace
+membership and read-only access do not grant approval. GPU devices and
+operator-selected image-pull Secrets do not need admission labels. In managed
+mode, inspect the configured source image-pull Secret in the gateway namespace
+and the generation copies (`openshell.ai/component=image-pull`) in the workspace
+namespace. Legacy workloads without
+admission provenance need recreation. Do not
+automatically label control-plane resources or disable enforcement as a repair.
+
+For out-of-tree compute drivers, also check that their versioned admission-policy
+acknowledgement matches the gateway's policy. Configure standalone driver policy
+through its administrator-owned `--admission-config-json` option.
+
 For out-of-tree compute drivers, confirm the selected driver name and socket agree across CLI flags or `gateway.toml`, and that the operator-owned driver is running before the gateway starts:
 
 ```bash
@@ -118,6 +134,19 @@ VM drivers fail startup when neither those paths nor the package-managed local
 bundle is available; Kubernetes projects its bundle through a Secret.
 
 Custom names use `[openshell.drivers.<name>].socket_path`. A launch-time `--compute-driver-socket` override may also use `docker`, `podman`, `kubernetes`, or `vm`; the endpoint then takes precedence over built-in construction. First-party standalone drivers require the socket parent directory to be owned by the driver's effective UID, force its mode to `0700`, create the socket with mode `0600`, and accept only peers with that same UID. Check the parent and socket separately with `stat`; a gateway running under a different UID cannot connect even when filesystem permissions or group membership would otherwise allow it. Operator-supplied drivers must provide equivalent access control appropriate to their implementation. Check gateway logs for connection errors, `GetCapabilities` failures, missing peer metadata, protocol-major mismatch, unmet required capabilities, or an unexpected advertised driver name. `openshell gateway info` reports successful startup negotiations. The advertised name is diagnostic metadata; negotiated features control optional behavior. The gateway does not create or supervise operator-supplied driver processes or sockets.
+
+For the Kubernetes Secrets credential driver, every provider credential lives in
+the configured `namespace`, in every workspace mode. A `PermissionDenied` error
+naming another namespace means the provider's credential handle points outside
+the configured namespace; recreate the provider. An `unknown field` startup
+error for `[openshell.credential_drivers.kubernetes-secrets]` means the table
+sets a key the driver does not accept. Confirm the gateway can reach the
+credential namespace:
+
+```bash
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -A3 '^\[openshell\.credential_drivers\.kubernetes-secrets\]'
+kubectl auth can-i get secrets -n <credential-namespace> --as system:serviceaccount:openshell:openshell
+```
 
 For a configured Vault credential driver, inspect its endpoint and trust bundle
 before debugging provider resolution. Non-loopback addresses must use HTTPS,
@@ -261,7 +290,7 @@ Common findings:
 - Sandbox runtime image exits before printing `openshell-sandbox --version`: verify the configured image contains a static executable at `/openshell-sandbox`.
 - A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: confirm the selected isolation backend advertises TCP mediation, then inspect the sandbox and supervisor logs for protected-channel setup or listener failures. A driver that cannot supply the required outer egress fence and authenticated runtime channel must reject the policy before starting the agent.
 - Supervisor runtime validation fails: verify `supervisor_image` contains an `/openshell-supervisor` executable from the same release as the sandbox runtime, and that the dynamic loader and shared libraries it links against are available inside that image. `docker run --rm --network none --entrypoint /openshell-supervisor <supervisor_image> --version` should print that release; a `no such file or directory` error for a binary that exists means the loader or a library is missing. The supervisor runs from its own image and does not need to be static; only `/openshell-sandbox` must be.
-- The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
+- The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. A runtime may return `ENOSYS` for `process_vm_readv` and `process_vm_writev` while satisfying the production parent-to-workload-child task-memory probe through `/proc/<pid>/mem`; only failure of both backends is fatal. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
 - A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
 
 During a graceful gateway restart, Docker, Podman, and VM sandboxes with
@@ -272,6 +301,12 @@ through the CLI remains stopped. Kubernetes sandboxes are cluster-owned and do
 not follow this local gateway lifecycle. Internal and external drivers follow
 the same rule: `GetCapabilities.gateway_manages_lifecycle` must be true for the
 gateway to run shutdown and startup sweeps.
+
+The gateway also drains supervisor-session ownership cleanup before exiting.
+If shutdown reports `Gateway supervisor session cleanup incomplete`, inspect
+the associated persistence errors: a stopped supervisor's owner record may
+remain until its lease expires and temporarily block reconnection. Successful
+compute stop alone does not confirm that session cleanup finished.
 
 ### Step 5: Check Podman-Backed Gateways
 
@@ -300,6 +335,12 @@ Common findings:
 - On Linux, verify that the host-networked Podman supervisor can reach the
   gateway's primary loopback endpoint. On macOS, verify Podman Machine's
   host-loopback forwarding or configure an explicit `grpc_endpoint`.
+- If `host.openshell.internal` does not resolve inside a workload, verify its
+  `/etc/resolv.conf` contains `nameserver 127.0.0.53`. The Podman driver mounts
+  that file from a per-sandbox secret and supplies the alias destination to the
+  supervisor. Check `host_gateway_ip` only when the platform default
+  (`127.0.0.1` on native Linux or `192.168.127.254` on macOS Podman Machine)
+  does not reach the gateway host.
 
 When `userns` is configured (e.g. `userns = "auto"` or `userns = "keep-id"`):
 
@@ -731,13 +772,14 @@ Do not suspend or delete the workload Pod manually. The driver advances to
 workload.
 
 If a Sandbox remains in the `suspending` bootstrap phase, verify that the
-gateway ServiceAccount can create, list, and delete Secrets in the sandbox
-namespace. Recovery lists generation Secrets by sandbox and component labels
-even when none remain, then deletes stale entries with UID preconditions before
-clearing the suspension annotations:
+gateway ServiceAccount can create and delete Secrets in the sandbox
+namespace. In operator mode, those permissions come only from the
+`openshell-workspace` chart installed in the namespace. Recovery deletes the
+recorded generation's bootstrap Secrets by name before clearing the suspension
+annotations:
 
 ```bash
-for verb in create list delete; do
+for verb in create delete; do
   kubectl auth can-i "$verb" secrets \
     --namespace <sandbox-namespace> \
     --as system:serviceaccount:openshell:openshell
@@ -863,6 +905,7 @@ credential failures.
 | `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with OTLP configured but the collector forwarding task later stopped, or the config was created manually | Restart `gateway:docker`, `gateway:podman`, or `gateway:vm` so it re-detects the listener; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Docker or Podman sandbox never registers | Wrong gateway endpoint, unavailable host networking, or supervisor startup failure | Gateway logs and supervisor container logs |
+| CPU-only VM startup reports that read-only `/proc` cannot be removed | Older supervisors can infer GPU requirements from host devices | Check gateway, VM driver, and bundled supervisor versions; use matching updated artifacts. CPU-only VMs do not require read-write `/proc`. |
 | Docker GPU sandbox fails before startup | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |

@@ -1428,139 +1428,17 @@ const PROXY_BASELINE_READ_ONLY: &[&str] = &[
 // policy.
 const PROXY_BASELINE_READ_WRITE: &[&str] = &["/tmp", "/dev/null"];
 
-/// GPU read-only paths.
-///
-/// `/run/nvidia-persistenced`: NVML tries to connect to the persistenced
-/// socket at init time.  If the directory exists but Landlock denies traversal
-/// (EACCES vs ECONNREFUSED), NVML returns `NVML_ERROR_INSUFFICIENT_PERMISSIONS`
-/// even though the daemon is optional.  Only read/traversal access is needed.
-///
-/// `/usr/lib/wsl`: On WSL2, CDI bind-mounts GPU libraries (libdxcore.so,
-/// libcuda.so.1.1, etc.) into paths under `/usr/lib/wsl/`.  Although `/usr`
-/// is already in `PROXY_BASELINE_READ_ONLY`, individual file bind-mounts may
-/// not be covered by the parent-directory Landlock rule when the mount crosses
-/// a filesystem boundary.  Listing `/usr/lib/wsl` explicitly ensures traversal
-/// is permitted regardless of Landlock's cross-mount behaviour.
-const GPU_BASELINE_READ_ONLY: &[&str] = &[
-    "/run/nvidia-persistenced",
-    "/usr/lib/wsl", // WSL2: CDI-injected GPU library directory
-];
-
-/// GPU read-write paths (static).
-///
-/// `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`,
-/// `/dev/nvidia-modeset`: control and UVM devices injected by CDI on native
-/// Linux.  Landlock restricts `open(2)` on device files even when DAC allows
-/// it; these need read-write because NVML/CUDA opens them with `O_RDWR`.
-/// These devices do not exist on WSL2 and will be skipped by the existence
-/// check in `enrich_proto_baseline_paths()`.
-///
-/// `/dev/dxg`: On WSL2, NVIDIA GPUs are exposed through the DXG kernel driver
-/// (DirectX Graphics) rather than the native nvidia* devices.  CDI injects
-/// `/dev/dxg` as the sole GPU device node; it does not exist on native Linux
-/// and will be skipped there by the existence check.
-///
-/// `/proc`: CUDA writes to `/proc/<pid>/task/<tid>/comm` during `cuInit()`
-/// to set thread names.  Without write access, `cuInit()` returns error 304.
-/// Must use `/proc` (not `/proc/self/task`) because Landlock rules bind to
-/// inodes and child processes have different procfs inodes than the parent.
-///
-/// Per-GPU device files (`/dev/nvidia0`, …) are enumerated at runtime by
-/// `enumerate_gpu_device_nodes()` since the count varies.
-const GPU_BASELINE_READ_WRITE: &[&str] = &[
-    "/dev/nvidiactl",
-    "/dev/nvidia-uvm",
-    "/dev/nvidia-uvm-tools",
-    "/dev/nvidia-modeset",
-    "/dev/dxg", // WSL2: DXG device (GPU via DirectX kernel driver, injected by CDI)
-    "/proc",
-];
-
-/// Returns true if GPU devices are present in the container.
-///
-/// Checks both the native Linux NVIDIA control device (`/dev/nvidiactl`) and
-/// the WSL2 DXG device (`/dev/dxg`).  CDI injects exactly one of these
-/// depending on the host kernel; the other will not exist.
-fn has_gpu_devices() -> bool {
-    std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/dxg").exists()
-}
-
-/// Enumerate per-GPU device nodes (`/dev/nvidia0`, `/dev/nvidia1`, …).
-fn enumerate_gpu_device_nodes() -> Vec<String> {
-    let mut paths = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/dev") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if let Some(suffix) = name.strip_prefix("nvidia") {
-                if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
-                    continue;
-                }
-                paths.push(entry.path().to_string_lossy().into_owned());
-            }
-        }
-    }
-    paths
-}
-
-fn push_unique(paths: &mut Vec<String>, path: String) {
-    if !paths.iter().any(|p| p == &path) {
-        paths.push(path);
-    }
-}
-
-fn collect_baseline_enrichment_paths(
-    include_proxy: bool,
-    include_gpu: bool,
-    gpu_device_nodes: Vec<String>,
-) -> (Vec<String>, Vec<String>) {
-    let mut ro = Vec::new();
-    let mut rw = Vec::new();
-
-    if include_proxy {
-        for &path in PROXY_BASELINE_READ_ONLY {
-            push_unique(&mut ro, path.to_string());
-        }
-        for &path in PROXY_BASELINE_READ_WRITE {
-            push_unique(&mut rw, path.to_string());
-        }
-    }
-
-    if include_gpu {
-        for &path in GPU_BASELINE_READ_ONLY {
-            push_unique(&mut ro, path.to_string());
-        }
-        for &path in GPU_BASELINE_READ_WRITE {
-            push_unique(&mut rw, path.to_string());
-        }
-        for path in gpu_device_nodes {
-            push_unique(&mut rw, path);
-        }
-    }
-
-    // A path promoted to read_write (e.g. /proc for GPU) should not also
-    // appear in read_only — Landlock handles the overlap correctly but the
-    // duplicate is confusing when inspecting the effective policy.
-    ro.retain(|p| !rw.contains(p));
-
-    (ro, rw)
-}
-
-fn active_baseline_enrichment_paths(include_proxy: bool) -> (Vec<String>, Vec<String>) {
-    let include_gpu = has_gpu_devices();
-    let gpu_device_nodes = if include_gpu {
-        enumerate_gpu_device_nodes()
-    } else {
-        Vec::new()
-    };
-    collect_baseline_enrichment_paths(include_proxy, include_gpu, gpu_device_nodes)
-}
-
-/// Collect all active baseline paths for tests and diagnostics.
-/// Returns `(read_only, read_write)` as owned `String` vecs.
-#[cfg(test)]
-fn baseline_enrichment_paths() -> (Vec<String>, Vec<String>) {
-    active_baseline_enrichment_paths(true)
+fn proxy_baseline_paths() -> (Vec<String>, Vec<String>) {
+    (
+        PROXY_BASELINE_READ_ONLY
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect(),
+        PROXY_BASELINE_READ_WRITE
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect(),
+    )
 }
 
 fn enrich_proto_baseline_paths_with<F>(
@@ -1609,15 +1487,6 @@ where
             continue;
         }
         if fs.read_only.iter().any(|p| p == path) {
-            if path == "/proc" {
-                info!(
-                    path,
-                    "Promoting /proc from read-only to read-write for GPU runtime compatibility"
-                );
-                fs.read_only.retain(|p| p != path);
-                fs.read_write.push(path.clone());
-                modified = true;
-            }
             continue;
         }
         fs.read_write.push(path.clone());
@@ -1628,12 +1497,15 @@ where
 }
 
 /// Ensure a proto `SandboxPolicy` includes the baseline filesystem paths
-/// required by proxy-mode sandboxes and GPU runtimes. Paths are only added if
+/// required by proxy-mode sandboxes. Paths are only added if
 /// missing; user-specified paths are never removed.
 ///
 /// Returns `true` if the policy was modified (caller may want to sync back).
 fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
-    let (ro, rw) = active_baseline_enrichment_paths(!proto.network_policies.is_empty());
+    if proto.network_policies.is_empty() {
+        return false;
+    }
+    let (ro, rw) = proxy_baseline_paths();
 
     // Baseline paths are system-injected, not user-specified.  Skip paths
     // that do not exist in this container image to avoid noisy warnings from
@@ -1676,14 +1548,13 @@ fn proto_sync_payload_for_enriched_policy(
 }
 
 /// Ensure a `SandboxPolicy` (Rust type) includes the baseline filesystem
-/// paths required by proxy-mode sandboxes and GPU runtimes. Used for the
+/// paths required by proxy-mode sandboxes. Used for the
 /// local-file code path where no proto is available.
 fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
-    let (ro, rw) =
-        active_baseline_enrichment_paths(matches!(policy.network.mode, NetworkMode::Proxy));
-    if ro.is_empty() && rw.is_empty() {
+    if !matches!(policy.network.mode, NetworkMode::Proxy) {
         return;
     }
+    let (ro, rw) = proxy_baseline_paths();
 
     let mut modified = false;
     for path in &ro {
@@ -1743,61 +1614,23 @@ mod baseline_tests {
     use std::path::PathBuf;
 
     #[test]
-    fn proc_not_in_both_read_only_and_read_write_when_gpu_present() {
-        // When GPU devices are present, /proc is promoted to read_write
-        // (CUDA needs to write /proc/<pid>/task/<tid>/comm). It should
-        // NOT also appear in read_only.
-        if !has_gpu_devices() {
-            // Can't test GPU dedup without GPU devices; skip silently.
-            return;
-        }
-        let (ro, rw) = baseline_enrichment_paths();
-        assert!(
-            rw.contains(&"/proc".to_string()),
-            "/proc should be in read_write when GPU is present"
-        );
-        assert!(
-            !ro.contains(&"/proc".to_string()),
-            "/proc should NOT be in read_only when it is already in read_write"
-        );
-    }
-
-    #[test]
-    fn proc_in_read_only_without_gpu() {
-        if has_gpu_devices() {
-            // On a GPU host we can't test the non-GPU path; skip silently.
-            return;
-        }
-        let (ro, _rw) = baseline_enrichment_paths();
-        assert!(
-            ro.contains(&"/proc".to_string()),
-            "/proc should be in read_only when GPU is not present"
-        );
+    fn proxy_baseline_keeps_proc_read_only_on_every_host() {
+        let (ro, rw) = proxy_baseline_paths();
+        assert!(ro.contains(&"/proc".to_string()));
+        assert!(!rw.contains(&"/proc".to_string()));
     }
 
     #[test]
     fn baseline_read_write_does_not_hardcode_sandbox() {
-        let (_ro, rw) = baseline_enrichment_paths();
+        let (_ro, rw) = proxy_baseline_paths();
         assert!(rw.contains(&"/tmp".to_string()));
         assert!(rw.contains(&"/dev/null".to_string()));
         assert!(!rw.contains(&"/sandbox".to_string()));
     }
 
     #[test]
-    fn enumerate_gpu_device_nodes_skips_bare_nvidia() {
-        // "nvidia" (without a trailing digit) is a valid /dev entry on some
-        // systems but is not a per-GPU device node.  The enumerator must
-        // not match it.
-        let nodes = enumerate_gpu_device_nodes();
-        assert!(
-            !nodes.contains(&"/dev/nvidia".to_string()),
-            "bare /dev/nvidia should not be enumerated: {nodes:?}"
-        );
-    }
-
-    #[test]
     fn no_duplicate_paths_in_baseline() {
-        let (ro, rw) = baseline_enrichment_paths();
+        let (ro, rw) = proxy_baseline_paths();
         // No path should appear in both lists.
         for path in &ro {
             assert!(
@@ -1811,7 +1644,7 @@ mod baseline_tests {
     fn proto_enrichment_preserves_explicit_read_only_for_baseline_read_write_paths() {
         let mut policy = openshell_policy::restrictive_default_policy();
         policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
-            read_only: vec!["/tmp".to_string()],
+            read_only: vec!["/tmp".to_string(), "/proc".to_string()],
             read_write: vec![],
             include_workdir: false,
         });
@@ -1831,6 +1664,8 @@ mod baseline_tests {
         enrich_proto_baseline_paths(&mut policy);
 
         let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(filesystem.read_only.contains(&"/proc".to_string()));
+        assert!(!filesystem.read_write.contains(&"/proc".to_string()));
         assert!(
             filesystem.read_only.contains(&"/tmp".to_string()),
             "explicit read_only baseline path should be preserved"
@@ -1925,47 +1760,26 @@ mod baseline_tests {
     }
 
     #[test]
-    fn proto_gpu_enrichment_promotes_proc_without_network_policy() {
+    fn no_network_policy_is_unchanged_by_supervisor_baseline() {
+        // A CPU-only workload must start with this policy even when the
+        // supervisor's host has GPUs. No GPU hardware is needed by this test.
         let mut policy = openshell_policy::restrictive_default_policy();
+        assert!(policy.network_policies.is_empty());
         assert!(
-            policy.network_policies.is_empty(),
-            "regression setup must exercise the no-network default path"
+            policy
+                .filesystem
+                .as_ref()
+                .unwrap()
+                .read_only
+                .contains(&"/proc".to_string())
         );
-        let (ro, rw) =
-            collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
+        let original = policy.clone();
 
-        let enriched = enrich_proto_baseline_paths_with(&mut policy, &ro, &rw, |path| {
-            matches!(path, "/proc" | "/dev/nvidia0")
-        });
+        let enriched = enrich_proto_baseline_paths(&mut policy);
 
-        let filesystem = policy.filesystem.expect("filesystem policy");
-        assert!(
-            enriched,
-            "GPU enrichment should not require network policies"
-        );
-        assert!(
-            filesystem.read_write.contains(&"/dev/nvidia0".to_string()),
-            "GPU enrichment should add enumerated device nodes without network policies"
-        );
-        assert!(
-            !filesystem.read_only.contains(&"/proc".to_string()),
-            "GPU enrichment should remove /proc from read_only"
-        );
-        assert!(
-            filesystem.read_write.contains(&"/proc".to_string()),
-            "GPU enrichment should promote /proc to read_write"
-        );
-    }
-
-    #[test]
-    fn gpu_baseline_read_write_contains_dxg() {
-        // /dev/dxg must be present so WSL2 sandboxes get the Landlock
-        // read-write rule for the CDI-injected DXG device.  The existence
-        // check in enrich_proto_baseline_paths() skips it on native Linux.
-        assert!(
-            GPU_BASELINE_READ_WRITE.contains(&"/dev/dxg"),
-            "/dev/dxg must be in GPU_BASELINE_READ_WRITE for WSL2 support"
-        );
+        assert!(!enriched);
+        assert_eq!(policy, original);
+        assert!(proto_sync_payload_for_enriched_policy(&policy, enriched).is_none());
     }
 
     #[test]
@@ -1997,29 +1811,6 @@ mod baseline_tests {
                 .read_write
                 .contains(&PathBuf::from("/tmp")),
             "baseline enrichment must not promote explicit read_only /tmp to read_write"
-        );
-    }
-
-    #[test]
-    fn gpu_baseline_read_only_contains_usr_lib_wsl() {
-        // /usr/lib/wsl must be present so CDI-injected WSL2 GPU library
-        // bind-mounts are accessible under Landlock.  Skipped on native Linux.
-        assert!(
-            GPU_BASELINE_READ_ONLY.contains(&"/usr/lib/wsl"),
-            "/usr/lib/wsl must be in GPU_BASELINE_READ_ONLY for WSL2 CDI library paths"
-        );
-    }
-
-    #[test]
-    fn has_gpu_devices_reflects_dxg_or_nvidiactl() {
-        // Verify the OR logic: result must match the manual disjunction of
-        // the two path checks.  Passes in all environments.
-        let nvidiactl = std::path::Path::new("/dev/nvidiactl").exists();
-        let dxg = std::path::Path::new("/dev/dxg").exists();
-        assert_eq!(
-            has_gpu_devices(),
-            nvidiactl || dxg,
-            "has_gpu_devices() should be true iff /dev/nvidiactl or /dev/dxg exists"
         );
     }
 }

@@ -79,6 +79,58 @@ fn test_sandbox() -> DriverSandbox {
     }
 }
 
+#[test]
+fn admission_defaults_reject_even_gpu_driver_json_but_not_public_gpu_requests() {
+    let mut config = runtime_config();
+    config.allow_driver_config = false;
+    config.resource_admission =
+        openshell_core::resource_admission::ResourceAdmissionConfig::default();
+    config.gpu.cdi_supported = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(Some(1)));
+    assert!(DockerComputeDriver::validate_sandbox(&sandbox, &config).is_ok());
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
+    let error = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    config.allow_driver_config = true;
+    assert!(DockerComputeDriver::validate_sandbox(&sandbox, &config).is_ok());
+}
+
+#[test]
+fn admission_blocks_unlabelable_bind_mount_even_when_bind_mounts_enabled() {
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+    config.resource_admission =
+        openshell_core::resource_admission::ResourceAdmissionConfig::default();
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(
+        openshell_core::proto_struct::json_object_to_struct(
+            serde_json::json!({"mounts":[{"type":"bind","source":"/srv/data","target":"/data"}]})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap(),
+    );
+    let error = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+    assert!(error.message().contains("no trusted label resolver"));
+}
+
 fn cdi_devices_config(device_ids: &[&str]) -> prost_types::Struct {
     list_string_driver_config("cdi_devices", device_ids)
 }
@@ -118,6 +170,12 @@ fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
 
 fn runtime_config() -> DockerDriverRuntimeConfig {
     DockerDriverRuntimeConfig {
+        // Existing lifecycle fixtures exercise the explicitly opted-out contract.
+        allow_driver_config: true,
+        resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig {
+            enabled: false,
+            ..Default::default()
+        },
         default_image: "image:latest".to_string(),
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         sandbox_namespace: "default".to_string(),
@@ -235,6 +293,76 @@ async fn capabilities_reject_missing_gateway_metadata() {
             .message()
             .contains("gateway did not provide protocol metadata")
     );
+}
+
+#[tokio::test]
+#[ignore = "requires a local Docker daemon; creates and removes only isolated test volumes"]
+async fn live_docker_resource_admission_checks_native_volume_labels() {
+    let temporary = TempDir::new().unwrap();
+    let suffix = temporary.path().file_name().unwrap().to_str().unwrap();
+    let mut config = runtime_config();
+    config.resource_admission =
+        openshell_core::resource_admission::ResourceAdmissionConfig::default();
+    let mut driver = test_driver_with_config(config);
+    driver.docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+    for (index, (workspace, approved)) in [
+        (None, false),
+        (Some("other"), false),
+        (Some("team-a"), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("openshell-admission-{suffix}-{index}");
+        assert!(driver.docker.inspect_volume(&name).await.is_err());
+        let labels = workspace.map(|workspace| {
+            HashMap::from([
+                ("openshell.ai/sandbox-attachable".into(), "true".into()),
+                (
+                    "openshell.ai/sandbox-attachable-workspace".into(),
+                    workspace.into(),
+                ),
+            ])
+        });
+        driver
+            .docker
+            .create_volume(VolumeCreateRequest {
+                name: Some(name.clone()),
+                labels,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut results = Vec::new();
+        for read_only in [true, false] {
+            let mounts = serde_json::from_value(serde_json::json!({"mounts":[{
+                "type":"volume", "source":name, "target":"/external", "read_only":read_only
+            }]}))
+            .unwrap();
+            let result = driver
+                .validate_user_volume_mounts_available(&mounts, "team-a")
+                .await;
+            if !approved {
+                assert!(
+                    result
+                        .as_ref()
+                        .unwrap_err()
+                        .message()
+                        .contains(&format!("docker volume '{name}'"))
+                );
+            }
+            results.push(result.is_ok());
+        }
+        driver
+            .docker
+            .remove_volume(
+                &name,
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results, vec![approved; 2]);
+    }
 }
 
 type TestDriverClient =
@@ -3350,4 +3478,19 @@ async fn different_start_generation_is_rejected() {
 
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert!(error.message().contains("generation-one"));
+}
+
+#[test]
+fn admission_provisioning_failure_distinguishes_denials_from_lookup_failures() {
+    let denied = DockerProvisioningFailure::from_admission_status(Status::failed_precondition(
+        "volume is not admitted",
+    ));
+    assert_eq!(denied.reason, "ResourceAdmissionDenied");
+    assert_eq!(denied.message, "volume is not admitted");
+
+    let lookup = DockerProvisioningFailure::from_admission_status(Status::internal(
+        "inspect docker volume failed",
+    ));
+    assert_eq!(lookup.reason, "ResourceAdmissionLookupFailed");
+    assert_eq!(lookup.message, "inspect docker volume failed");
 }

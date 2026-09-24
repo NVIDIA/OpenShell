@@ -14,9 +14,10 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 | Job | Runner | Verifies |
 |---|---|---|
 | `macos` | `macos-latest-xlarge` | Installs the dev Homebrew artifacts, reaches the VM gateway, and creates, executes in, and deletes a sandbox. |
-| `ubuntu` | `ubuntu-latest` | Installs the dev Debian package, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
+| `ubuntu-deb` | `ubuntu-latest` | Installs the dev Debian package, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
 | `fedora` | `fedora:latest` container | Installs the dev RPM packages, reaches the Podman gateway, and creates, executes in, and deletes a sandbox. |
-| `ubuntu-snap` | `ubuntu-latest` | Installs the Release Dev Snap, connects its interfaces, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
+| `ubuntu-snap-system-docker` | `ubuntu-latest` | Uses `install.sh` to install the snap from `latest/edge`, reuses system Docker, reaches the Docker gateway, and creates, executes in, and deletes a sandbox, and verifies that the Docker snap is not installed. |
+| `ubuntu-snap-provisions-docker` | `ubuntu-latest` | Uses `install.sh` to install the Docker and OpenShell snaps, waits for Docker, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
 | `kubernetes` | `ubuntu-latest` + kind | Installs the dev Helm chart, reaches the in-cluster gateway, and creates, executes in, and deletes a sandbox using the published runtime images. |
 
 All canary jobs disable anonymous OpenShell telemetry. Host package jobs inject
@@ -25,8 +26,11 @@ Kubernetes job installs with `server.telemetryEnabled=false`, so smoke traffic
 does not contribute to product usage metrics.
 
 The workflow sets `OPENSHELL_VERSION=dev`, so every `install.sh` job consumes the
-rolling dev release produced by the triggering workflow. Kubernetes pins the
-matching `0.0.0-dev` chart and `:dev` images.
+rolling dev release produced by the triggering workflow. Both snap lanes track
+`latest/edge`; one reuses system Docker while the other verifies automatic
+Docker snap provisioning. The Debian and Kubernetes CLI lanes remove snapd so
+they continue to exercise the dev Debian package. Kubernetes pins the matching
+`0.0.0-dev` chart and `:dev` images.
 
 The host-package jobs exercise fresh installs, not upgrades from a persisted
 schema-v1 gateway config. Validate Homebrew and RPM exact-default migration with
@@ -50,7 +54,7 @@ on:
 ```
 
 - **Automatic.** Every successful `Release Dev` run (on `main` or a manual dispatch of Release Dev) fires the canary. Each job gates on `github.event.workflow_run.conclusion == 'success'` so a failed Release Dev does not run the canary.
-- **Manual.** `workflow_dispatch` lets you run the canary on demand against any branch's workflow definition. To include `ubuntu-snap`, supply `release-dev-run-id` for a successful Release Dev run whose Snap artifact should be tested; without it, that job is skipped because no artifact is available.
+- **Manual.** `workflow_dispatch` lets you run the canary on demand against any branch's workflow definition.
 
 When dispatched manually, `github.event.workflow_run.head_sha` is empty and the workflow falls back to `github.sha` (the branch tip) for the `install.sh` URL.
 
@@ -60,13 +64,6 @@ Run the canary as-is on the current branch:
 
 ```shell
 gh workflow run release-canary.yml --ref "$(git branch --show-current)"
-```
-
-To exercise the Ubuntu Snap job, pass the successful Release Dev run ID:
-
-```shell
-gh workflow run release-canary.yml --ref "$(git branch --show-current)" \
-  -f release-dev-run-id=<release-dev-run-id>
 ```
 
 Watch the run that starts:
@@ -87,7 +84,7 @@ gh run view <run-id> --log-failed
 
 When you change `release-canary.yml` on a branch, a manual dispatch on that branch tests *your branch's workflow logic* against *main's published dev artifacts* (`0.0.0-dev` chart, `:dev` images, and the `dev` GitHub release). This is what you want for iterating on the canary — you're validating that the canary still works against known-good artifacts.
 
-Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${head_sha}/install.sh`, so changes to `install.sh` on your branch *are* exercised even though the binaries it downloads are from the latest public tag.
+Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${head_sha}/install.sh`, so changes to `install.sh` on your branch *are* exercised even though packages come from the latest public dev release and the snap comes from `latest/edge`.
 
 ## Testing artifacts from a specific SHA
 
@@ -137,10 +134,11 @@ Loopback registration auto-derives the gateway name to `openshell` if `--name` i
 
 | Symptom | Likely cause | Where to look |
 |---|---|---|
-| `macos`/`ubuntu`/`fedora` job fails on `install.sh` | Dev release missing an asset, checksum mismatch, or `install.sh` regression on this branch. | Job log around the `curl … install.sh \| sh` step. |
+| `macos`/`ubuntu-deb`/`fedora` job fails on `install.sh` | Dev release missing an asset, checksum mismatch, or `install.sh` regression on this branch. | Job log around the `curl … install.sh \| sh` step. |
 | Sandbox create or exec fails | Published sandbox and supervisor artifacts are missing, incompatible, or cannot establish the protected runtime channel. | Gateway logs plus Docker, Podman, VM, Snap, or Kubernetes runtime diagnostics for the job. |
-| `macos`/`ubuntu`/`fedora` job fails on `openshell status` | Local gateway service did not start (systemd/brew/podman). Often a driver issue. | Service logs in the job log; `OPENSHELL_COMPUTE_DRIVER` env in the "Ensure …" step. |
-| `ubuntu-snap` fails after interface connection | The gateway did not recover after Docker became available, or did not become reachable within the 30-second bound. | Failure diagnostics dump Snap service/connection/change state, gateway and snapd journals, Snap logs, and port 17670 listeners. |
+| `macos`/`ubuntu-deb`/`fedora` job fails on `openshell status` | Local gateway service did not start (systemd/brew/podman). Often a driver issue. | Service logs in the job log; `OPENSHELL_COMPUTE_DRIVER` env in the "Ensure …" step. |
+| `ubuntu-snap-system-docker` fails during `install.sh` | System Docker was unavailable, the edge revision or automatic interfaces were unavailable, or the gateway did not become reachable. | Failure diagnostics dump system Docker, snap service/connection/change state, gateway and snapd journals, snap logs, and port 17670 listeners. |
+| `ubuntu-snap-provisions-docker` fails during `install.sh` | The Docker snap was not installed or did not become ready before OpenShell installation, or the gateway did not become reachable. | Failure diagnostics also dump the Docker snap service and journal. |
 | `kubernetes` job fails on `helm install --wait` | Chart did not deploy in 5 min — usually image pull failure or readiness probe failing. | "Diagnostics on failure" step dumps `helm status`, manifest, pod describe, pod logs. |
 | `kubernetes` job fails on `kubectl wait` | Gateway pod stuck `CrashLoopBackOff` or `ImagePullBackOff`. | Diagnostics dump; check `:dev` image existence at `ghcr.io/nvidia/openshell/gateway`. |
 | `kubernetes` job fails on `openshell gateway add` or `status` | Port-forward not reachable, or CLI/gateway proto mismatch. | `port-forward.log` and `openshell gateway list` in the diagnostics dump. |

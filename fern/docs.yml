@@ -61,9 +61,21 @@ versions:
     slug: dev
     availability: beta
     announcement:
-      message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>OpenShell 0.1.0 is coming soon.</strong> <a href="https://github.com/NVIDIA/OpenShell/milestone/10" target="_blank" rel="noreferrer">Track progress in the 0.1.0 milestone</a>, <a href="https://docs.nvidia.com/openshell/dev/index.html" target="_blank" rel="noreferrer">read the prerelease documentation</a>, or <a href="https://docs.nvidia.com/openshell/dev/about/installation#install-a-prerelease" target="_blank" rel="noreferrer">install a prerelease</a>.</span>'
+      message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>New in OpenShell 0.1.0:</strong> a stable release cadence, an improved security model, an expanded extension surface, and new APIs. <a href="https://docs.nvidia.com/openshell/dev/upgrade/0-1-0" target="_blank" rel="noreferrer">Read the 0.1.0 upgrade guide</a>.</span>'
 
 redirects:
+  - source: "/openshell/latest/providers/google-vertex-ai"
+    destination: "/openshell/latest/providers/google-cloud#vertex-ai"
+  - source: "/openshell/dev/providers/google-vertex-ai"
+    destination: "/openshell/dev/providers/google-cloud#vertex-ai"
+  - source: "/openshell/latest/about/supported-agents"
+    destination: "/openshell/latest/about/run-an-agent"
+  - source: "/openshell/dev/about/supported-agents"
+    destination: "/openshell/dev/about/run-an-agent"
+  - source: "/openshell/latest/get-started/quickstart"
+    destination: "/openshell/latest/about/run-an-agent"
+  - source: "/openshell/dev/get-started/quickstart"
+    destination: "/openshell/dev/about/run-an-agent"
   - source: "/openshell/latest/sandboxes/providers-v2"
     destination: "/openshell/latest/providers/profiles"
   # Paths are relative to the site root; subpath prefix matches instances + custom-domain.

@@ -95,6 +95,7 @@ streaming HTTP middleware to use the same process-wide budget.
 |---|---:|---|
 | Initial CONNECT request headers | 8 KiB | Reject the proxy request. |
 | Inspected HTTP/1 request headers | 16 KiB | Reject the request. |
+| Streamed HTTP/1 chunk framing | 16 KiB per chunk-size line; 16 KiB and 128 fields for the complete trailer block | End the relay. Chunk payloads pass through a fixed 8 KiB buffer and do not accumulate to the declared chunk size. |
 | Credential-rewritten HTTP body | 256 KiB | Reject when rewriting requires a larger buffered body. |
 | SigV4 body signing | 10 MiB | Reject when signing requires a larger buffered body. |
 | GraphQL request body | 64 KiB default | Policy can set a positive `graphql_max_body_bytes`; there is no shared platform ceiling yet. |
@@ -125,6 +126,7 @@ can contain a valid sequence gap.
 
 | Path | Current bound | Terminal behavior |
 |---|---:|---|
+| Executable identity pins | 4,096 unique paths per supervisor lifetime | Reject an entire identity chain before insertion when its new paths would exceed the bound. Existing pins remain usable and are never evicted. Staged TCP reports resource exhaustion. |
 | Corporate proxy CONNECT response headers | 8 KiB | Fail the tunnel. |
 | Corporate proxy CONNECT handshake | 30 s total | Fail the tunnel; validated-address attempts share the aggregate budget. |
 | Token-grant HTTP request | 30 s request and connect | Fail credential resolution. |

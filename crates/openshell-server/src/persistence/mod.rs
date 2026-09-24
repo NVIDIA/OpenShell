@@ -384,6 +384,38 @@ impl Store {
         ))
     }
 
+    /// Create an object that is safe to lose in a crash.
+    ///
+    /// Behaves like [`Self::put_if`] with [`WriteCondition::MustCreate`], but
+    /// the file-backed `SQLite` store commits it with `synchronous=NORMAL`, so
+    /// a power loss or kernel crash shortly after the call returns may roll
+    /// the insert back. Use it only for objects whose absence denies access,
+    /// such as newly minted SSH session tokens. Writes that revoke or tighten
+    /// anything must use [`Self::put_if`], which is always durable.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.create_relaxed", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace)
+    )]
+    pub async fn create_relaxed(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<WriteResult> {
+        store_dispatch_traced!(self.create_relaxed(
+            object_type,
+            id,
+            name,
+            workspace,
+            payload,
+            labels
+        ))
+    }
+
     /// Delete an object by id with compare-and-swap support.
     ///
     /// # Arguments

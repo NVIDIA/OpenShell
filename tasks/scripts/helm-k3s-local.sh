@@ -32,11 +32,11 @@ HOST_LB_PORT="${HELM_K3S_LB_HOST_PORT:-8080}"
 DEFAULT_SANDBOX_PRELOAD_IMAGE="nvcr.io/nvidia/base/ubuntu:24.04"
 PRELOAD_SANDBOX_IMAGE="${HELM_K3S_PRELOAD_SANDBOX_IMAGE-${DEFAULT_SANDBOX_PRELOAD_IMAGE}}"
 
-# Upstream agent-sandbox release pinned for both CRDs/controller and extensions.
+# Upstream agent-sandbox release pinned for the core CRDs and controller.
 # The Kubernetes driver supports the v1beta1 Sandbox API introduced in v0.5.0
 # and falls back to v1alpha1 for v0.4.6 clusters. Override this env var to
 # exercise the v1alpha1 controller release.
-AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.5.0}"
+AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v1.0.3}"
 
 # Local OTLP receiver and trace UI. The current Aspire implementation accepts
 # OTLP/gRPC directly, so the development cluster needs only one deployment.
@@ -164,9 +164,9 @@ merge_kubeconfig() {
 
 apply_base_manifests() {
   require_kubectl
-  local base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}"
-  echo "Applying agent-sandbox manifest (${AGENT_SANDBOX_VERSION})..."
-  kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f "${base}/manifest.yaml"
+  AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION}" \
+    bash "${ROOT}/e2e/support/install-agent-sandbox.sh" \
+      --kubeconfig="${KUBECONFIG_TARGET}"
 }
 
 install_trace_collector() {

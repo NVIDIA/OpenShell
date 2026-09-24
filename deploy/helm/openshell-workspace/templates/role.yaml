@@ -10,6 +10,12 @@ metadata:
   labels:
     {{- include "openshell-workspace.labels" . | nindent 4 }}
 rules:
+  {{- if .Values.gateway.allowDriverConfig }}
+  # Metadata-only admission of caller-selected PVCs requires get permission.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get"]
+  {{- end }}
   - apiGroups:
       - agents.x-k8s.io
     resources:
@@ -37,3 +43,11 @@ rules:
       - pods
     verbs:
       - get
+  # Generation-scoped sandbox bootstrap Secrets.
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - create
+      - delete

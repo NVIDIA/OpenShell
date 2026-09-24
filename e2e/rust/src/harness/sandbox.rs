@@ -21,12 +21,14 @@ use super::output::{extract_field, strip_ansi};
 ///
 /// Product defaults remain on the minimal NVIDIA Ubuntu image. Tests that
 /// explicitly pass `--from` or `--template` retain their requested workload.
-/// Docker setup builds this Noble-based fixture before running the tests.
-#[cfg(feature = "e2e-docker")]
+/// Docker and Podman setup build this Noble-based fixture before running the
+/// tests.
+#[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
 pub const E2E_WORKLOAD_IMAGE: &str = "openshell/e2e-python:dev";
 
-/// Preserve the existing pullable fixture for non-Docker E2E lanes.
-#[cfg(not(feature = "e2e-docker"))]
+/// Preserve the existing pullable fixture for E2E lanes that cannot build the
+/// local container-engine fixture.
+#[cfg(not(any(feature = "e2e-docker", feature = "e2e-podman")))]
 pub const E2E_WORKLOAD_IMAGE: &str = "ghcr.io/astral-sh/uv:0.12.17-python3.12-trixie-slim@sha256:9a59bb7206905ccaae4f7dab222fbac47c125a21e5fc16f43f427cd6c940ade3";
 
 /// Extract the sandbox name from CLI create output.

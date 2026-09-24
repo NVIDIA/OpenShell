@@ -318,6 +318,18 @@ configure the gateway to use them. The Ubuntu `deb` installer consumes
 for direct executable installation on every environment. Release Dev and
 Release Tag run Ubuntu conformance through the Debian package, while Fedora
 continues using direct executable installation until RPM coverage is available.
+The release canary separately exercises the public installer on Ubuntu. Its Snap
+lanes install the rolling development release from the Snap Store with both an
+existing system Docker daemon and a host where the installer must provision and
+wait for the Docker snap. Its Debian lane removes snapd before running the
+installer so Snap precedence cannot change the package under test.
+Snapd runs the gateway as a root-owned system service. Its generated client
+certificates reside in root-owned snap state and are unavailable to ordinary CLI
+users, so the Snap uses plaintext loopback transport and enables unauthenticated
+local users by default. Debian and RPM packages instead run systemd user services
+and use user-owned mTLS material. Bootstrap creates the default configuration
+only when it is missing. Sandbox-to-gateway sessions remain authenticated with
+gateway-minted JWTs.
 The Debian qualification profile keeps candidate-image overrides outside the
 operator-owned gateway configuration: it writes a harness-owned file under
 `/var/lib/openshell-qualification` and selects it through the packaged systemd
@@ -503,21 +515,32 @@ job republishes the analysis job's outcome as the
 `OpenShell / Codex Security (informational)` status. None of these checks are
 required statuses, so they do not gate merges.
 
-Codex Security findings are informational during the observation phase, and the
-workflow only reports on candidates that already exist. Gating stable promotion
-on qualification results remains proposed in
-[RFC 0014](../rfc/0014-release-stability/release-qualification.md).
+The workflow only reports on candidates that already exist. It incrementally
+implements the qualification model from
+[RFC 0014](../rfc/0014-release-stability/release-qualification.md): failed
+checks do not prevent publication of an immutable pre-release candidate. The
+summary explicitly records that the current profile does not yet provide the
+RFC's complete qualification coverage.
 
 The tagged release workflow calls the aggregate Security Scan after publishing
 the candidate's commit-addressed gateway, sandbox, and supervisor images. CodeQL,
 Trivy, Cargo Deny, and Actionlint/Zizmor run for every release tag; Codex Security
-also runs for pre-release tags. The release job depends on the aggregate result,
-which fails on scanner errors, Cargo Deny advisories, and Codex Security
-findings. CodeQL, Trivy, and Zizmor findings temporarily remain informational
-while their existing backlog is triaged. Remove the release workflow's
-`fail-on-static-findings: false` override when baseline/delta enforcement is
-implemented so new High or Critical findings become blocking without requiring
-the historical backlog to reach zero first.
+also runs for pre-release tags. High or Critical findings and scanner failures
+fail qualification.
+
+The `Release Qualification` job aggregates security, conformance, feature,
+Docker E2E, and VM E2E results. The currently implemented profile gates stable
+publication, but it does not represent complete RFC 0014 qualification. For a
+pre-release it records a failed result without blocking artifact assembly,
+image tagging, or Helm publication; the failing underlying suite keeps the
+workflow visibly red. Every attempt writes a summary to the Actions run summary
+and a 90-day Actions artifact. After release assembly succeeds, the workflow
+publishes the same result to
+`ghcr.io/nvidia/openshell/qualification:<version>-run-<run-id>-attempt-<run-attempt>`.
+`tasks/scripts/generate-qualification-summary.sh` generates qualification
+metadata only. Artifact identity remains the responsibility of the separate
+release manifest. Including both the run ID and attempt preserves the result of
+each rerun.
 
 `release-auto-tag.yml` runs at 14:00 Europe/Zurich on weekdays (including daylight
 saving time changes) and supports manual dispatch. Maintainers start weekday

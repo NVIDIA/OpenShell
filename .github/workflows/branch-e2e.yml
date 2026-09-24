@@ -47,8 +47,8 @@ jobs:
             push)
               run_core_e2e="$(jq -r 'index("test:e2e") != null' <<< "$LABELS_JSON")"
               run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
-              run_kubernetes_ha_e2e=false
-              run_kubernetes_credential_drivers_e2e=false
+              run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
+              run_kubernetes_credential_drivers_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
               ;;
             merge_group)
               # Merge groups have no PR labels. When GPU E2E is required as documented
@@ -247,21 +247,21 @@ jobs:
         ]
 
   # Run driver-specific integration tests:
-  # TODO: This should be added as soon as we have driver-specific tests enabled in tmachine.
-  # driver-specific:
-  #   needs: prepare-integration
-  #   permissions:
-  #     actions: read
-  #     contents: read
-  #     packages: read
-  #   uses: ./.github/workflows/integration-runner.yml
-  #   with:
-  #     category: driver-specific
-  #     source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
-  #     integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
-  #     test-matrix: >-
-  #       [
-  #       ]
+  driver-specific-integration:
+    needs: prepare-integration
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/integration-runner.yml
+    with:
+      category: driver-specific
+      source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+      test-matrix: >-
+        [
+          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"driver-podman"}
+        ]
 
   docker-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -275,6 +275,20 @@ jobs:
       image-tag: ${{ github.sha }}
       runner: linux-arm64-cpu8
       conformance-artifact-prefix: openshell-conformance
+
+  podman-e2e:
+    needs: [pr_metadata, build-binaries, build-images]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-podman-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      conformance-artifact-prefix: openshell-conformance
+      suite-matrix: >-
+        [{"suite":"ci","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:ci"}]
 
   vm-e2e:
     needs: [pr_metadata, build-binaries, build-vm-driver]
@@ -354,7 +368,7 @@ jobs:
       matrix:
         include:
           - agent_sandbox_api: v1beta1
-            agent_sandbox_version: v0.5.0
+            agent_sandbox_version: v1.0.3
           - agent_sandbox_api: v1alpha1
             agent_sandbox_version: v0.4.6
     permissions:
@@ -451,7 +465,9 @@ jobs:
       - pr_metadata
       - conformance-integration
       - feature-specific-integration
+      - driver-specific-integration
       - docker-e2e
+      - podman-e2e
       - vm-e2e
       - docker-external-driver-e2e
       - podman-external-driver-e2e

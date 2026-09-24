@@ -73,7 +73,37 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
+            verbs: ["create", "delete"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
+            verbs: ["get"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get"]
+
+  - it: grants PVC admission reads only when caller driver config is enabled
+    template: templates/role.yaml
+    set:
+      server.drivers.kubernetes.allowDriverConfig: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
+            verbs: ["get"]
 
   - it: uses explicit sandboxNamespace for sandbox RoleBinding
     template: templates/rolebinding.yaml

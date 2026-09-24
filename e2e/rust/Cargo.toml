@@ -89,6 +89,11 @@ path = "tests/podman_gateway_start.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
+name = "podman_host_gateway"
+path = "tests/podman_host_gateway.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
 name = "podman_corporate_proxy"
 path = "tests/podman_corporate_proxy.rs"
 required-features = ["e2e-podman"]
@@ -232,7 +237,7 @@ tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
 tower = "0.5"
 url = "2"
-nix = { version = "0.29", features = ["user"] }
+nix = { version = "0.29", features = ["process", "signal", "term", "user"] }
 
 [dev-dependencies]
 serial_test = "3"

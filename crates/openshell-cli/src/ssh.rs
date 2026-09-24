@@ -14,8 +14,8 @@ use openshell_core::forward::{
     validate_ssh_session_response, write_forward_pid,
 };
 use openshell_core::proto::{
-    CreateSshSessionRequest, GetSandboxRequest, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
-    tcp_forward_init,
+    CreateSshSessionRequest, GetSandboxRequest, SandboxPhase, SshRelayTarget, TcpForwardFrame,
+    TcpForwardInit, tcp_forward_init,
 };
 use std::fs;
 use std::future::Future;
@@ -23,8 +23,8 @@ use std::io::{IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio_stream::wrappers::ReceiverStream;
@@ -43,6 +43,20 @@ const FORWARD_LISTENER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 /// command has already reported its terminal result.
 const TERMINAL_RELAY_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_RELAY_REGISTRATION_INTERVAL: Duration = Duration::from_millis(50);
+/// An SSH client that remained alive for this long was attached successfully,
+/// rather than failing during initial authentication or setup.
+const CONNECT_ESTABLISHED_DURATION: Duration = Duration::from_secs(2);
+/// Briefly wait for the gateway lifecycle projection to catch up with an SSH
+/// exit status before treating status 255 as a transport failure.
+const CONNECT_TERMINAL_STATUS_TIMEOUT: Duration = Duration::from_millis(500);
+const CONNECT_TERMINAL_STATUS_INTERVAL: Duration = Duration::from_millis(50);
+/// Time allowed to restore an established canonical-main attachment after its
+/// transport is lost.
+const CONNECT_RECOVERY_TIMEOUT: Duration = Duration::from_mins(1);
+const CONNECT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+const CONNECT_CHILD_TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
+const SSH_TRANSPORT_FAILURE_EXIT_CODE: i32 = 255;
 const SYNC_RETRY_ATTEMPTS: usize = 4;
 const SYNC_RETRY_DELAY: Duration = Duration::from_secs(2);
 
@@ -280,6 +294,377 @@ fn exec_or_wait(mut command: Command, replace_process: bool) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
+fn main_attach_command(session: &SshSessionConfig) -> Command {
+    let mut command = ssh_base_command(&session.proxy_command);
+    if session.main_terminal {
+        command.arg("-tt").arg("-o").arg("RequestTTY=force");
+    } else {
+        command.arg("-T");
+    }
+    command
+        .arg("-o")
+        .arg("SetEnv=TERM=xterm-256color")
+        .arg("-s")
+        .arg("sandbox")
+        .arg("openshell-main")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    command
+}
+
+async fn run_main_attach(session: &SshSessionConfig, replace_process: bool) -> Result<i32> {
+    let command = main_attach_command(session);
+    tokio::task::spawn_blocking(move || exec_or_wait(command, replace_process))
+        .await
+        .into_diagnostic()?
+}
+
+fn process_exit_code(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
+}
+
+#[cfg(unix)]
+struct TerminationSignals {
+    interrupt: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl TerminationSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).into_diagnostic()?,
+            quit: signal(SignalKind::quit()).into_diagnostic()?,
+            terminate: signal(SignalKind::terminate()).into_diagnostic()?,
+        })
+    }
+
+    async fn recv(&mut self) -> Signal {
+        tokio::select! {
+            _ = self.interrupt.recv() => Signal::SIGINT,
+            _ = self.quit.recv() => Signal::SIGQUIT,
+            _ = self.terminate.recv() => Signal::SIGTERM,
+        }
+    }
+}
+
+struct ConnectCancellation {
+    #[cfg(unix)]
+    signals: TerminationSignals,
+}
+
+impl ConnectCancellation {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            #[cfg(unix)]
+            signals: TerminationSignals::new()?,
+        })
+    }
+
+    async fn wait<F, T>(&mut self, future: F) -> std::result::Result<T, i32>
+    where
+        F: Future<Output = T>,
+    {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                biased;
+                result = future => Ok(result),
+                signal = self.signals.recv() => Err(128 + signal as i32),
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(future.await)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn forward_signal_to_child(child: &Child, signal: Signal) -> Result<()> {
+    let Some(pid) = child.id() else {
+        return Ok(());
+    };
+    let pid = i32::try_from(pid).into_diagnostic()?;
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(error) => Err(error).into_diagnostic(),
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_and_reap_child(child: &mut Child, signal: Signal) -> Result<i32> {
+    forward_signal_to_child(child, signal)?;
+    if let Ok(status) = tokio::time::timeout(CONNECT_CHILD_TERMINATION_TIMEOUT, child.wait()).await
+    {
+        status.into_diagnostic()?;
+    } else {
+        child.kill().await.into_diagnostic()?;
+        child.wait().await.into_diagnostic()?;
+    }
+    Ok(128 + signal as i32)
+}
+
+async fn run_main_attach_supervised(
+    session: &SshSessionConfig,
+    cancellation: &mut ConnectCancellation,
+) -> Result<i32> {
+    #[cfg(not(unix))]
+    let _ = cancellation;
+
+    let mut command = TokioCommand::from(main_attach_command(session));
+    command.kill_on_drop(true);
+
+    let mut child = command.spawn().into_diagnostic()?;
+
+    #[cfg(unix)]
+    {
+        tokio::select! {
+            biased;
+            status = child.wait() => Ok(process_exit_code(status.into_diagnostic()?)),
+            signal = cancellation.signals.recv() => terminate_and_reap_child(&mut child, signal).await,
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(process_exit_code(child.wait().await.into_diagnostic()?))
+    }
+}
+
+async fn await_before_recovery_deadline<F, T>(
+    deadline: Option<Instant>,
+    future: F,
+) -> std::result::Result<T, ()>
+where
+    F: Future<Output = T>,
+{
+    let Some(deadline) = deadline else {
+        return Ok(future.await);
+    };
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future)
+        .await
+        .map_err(|_| ())
+}
+
+fn print_connect_recovery_timeout() {
+    eprintln!(
+        "Unable to restore the sandbox connection within {} seconds.",
+        CONNECT_RECOVERY_TIMEOUT.as_secs()
+    );
+}
+
+fn should_recover_connect(
+    exit_code: i32,
+    attached_for: Duration,
+    recovery_active: bool,
+    main_has_terminal_result: bool,
+) -> bool {
+    !main_has_terminal_result
+        && exit_code == SSH_TRANSPORT_FAILURE_EXIT_CODE
+        && (recovery_active || attached_for >= CONNECT_ESTABLISHED_DURATION)
+}
+
+async fn canonical_main_has_terminal_result(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> bool {
+    let probe = async {
+        let Ok(mut client) = grpc_client(server, tls).await else {
+            return false;
+        };
+        loop {
+            let Ok(response) = client
+                .get_sandbox(GetSandboxRequest {
+                    name: name.to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        workspace.to_string(),
+                    )),
+                })
+                .await
+            else {
+                return false;
+            };
+            let Some(sandbox) = response.into_inner().sandbox else {
+                return false;
+            };
+            let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+            if sandbox
+                .status
+                .as_ref()
+                .is_some_and(|status| status.exit_code.is_some())
+                || matches!(
+                    phase,
+                    SandboxPhase::Completed
+                        | SandboxPhase::Error
+                        | SandboxPhase::Stopping
+                        | SandboxPhase::Stopped
+                        | SandboxPhase::Deleting
+                )
+            {
+                return true;
+            }
+            tokio::time::sleep(CONNECT_TERMINAL_STATUS_INTERVAL).await;
+        }
+    };
+
+    tokio::time::timeout(CONNECT_TERMINAL_STATUS_TIMEOUT, probe)
+        .await
+        .unwrap_or(false)
+}
+
+fn should_start_connect_recovery_window(attached_for: Duration, recovery_active: bool) -> bool {
+    !recovery_active || attached_for >= CONNECT_RECOVERY_TIMEOUT
+}
+
+fn next_connect_retry_delay(delay: Duration) -> Duration {
+    std::cmp::min(delay.saturating_mul(2), CONNECT_RETRY_MAX_DELAY)
+}
+
+fn connect_error_is_retryable(error: &Report) -> bool {
+    let message = format!("{error:?}").to_ascii_lowercase();
+    [
+        "broken pipe",
+        "connection aborted",
+        "connection closed",
+        "connection refused",
+        "connection reset",
+        "deadline exceeded",
+        "h2 protocol",
+        "http2",
+        "reset before headers",
+        "service is currently unavailable",
+        "timed out",
+        "timeout",
+        "transport error",
+        "unexpected eof",
+        "unavailable",
+        "upstream connect error",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+async fn sandbox_connect_supervised(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<i32> {
+    let mut recovery_deadline = None;
+    let mut retry_delay = CONNECT_RETRY_INITIAL_DELAY;
+    let mut cancellation = ConnectCancellation::new()?;
+
+    loop {
+        if recovery_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            print_connect_recovery_timeout();
+            return Ok(SSH_TRANSPORT_FAILURE_EXIT_CODE);
+        }
+
+        let session_attempt = match Box::pin(cancellation.wait(await_before_recovery_deadline(
+            recovery_deadline,
+            ssh_session_config(server, name, tls, workspace, None),
+        )))
+        .await
+        {
+            Ok(attempt) => attempt,
+            Err(exit_code) => return Ok(exit_code),
+        };
+        let session = match session_attempt {
+            Err(()) => {
+                print_connect_recovery_timeout();
+                return Ok(SSH_TRANSPORT_FAILURE_EXIT_CODE);
+            }
+            Ok(Ok(session)) => session,
+            Ok(Err(error))
+                if recovery_deadline.is_some_and(|deadline| Instant::now() < deadline)
+                    && connect_error_is_retryable(&error) =>
+            {
+                tracing::warn!(
+                    sandbox = name,
+                    error = %error,
+                    "failed to create replacement SSH session; retrying"
+                );
+                let now = Instant::now();
+                let delay = recovery_deadline
+                    .map_or(retry_delay, |deadline| retry_delay.min(deadline - now));
+                if let Err(exit_code) = cancellation.wait(tokio::time::sleep(delay)).await {
+                    return Ok(exit_code);
+                }
+                retry_delay = next_connect_retry_delay(retry_delay);
+                continue;
+            }
+            Ok(Err(error)) => return Err(error),
+        };
+
+        let attach_started = Instant::now();
+        let exit_code = run_main_attach_supervised(&session, &mut cancellation).await?;
+        let attached_for = attach_started.elapsed();
+        let recovery_active = recovery_deadline.is_some();
+        let main_has_terminal_result = if exit_code == SSH_TRANSPORT_FAILURE_EXIT_CODE {
+            match cancellation
+                .wait(canonical_main_has_terminal_result(
+                    server, name, tls, workspace,
+                ))
+                .await
+            {
+                Ok(has_result) => has_result,
+                Err(exit_code) => return Ok(exit_code),
+            }
+        } else {
+            false
+        };
+
+        if !should_recover_connect(
+            exit_code,
+            attached_for,
+            recovery_active,
+            main_has_terminal_result,
+        ) {
+            return Ok(exit_code);
+        }
+
+        // Once a replacement attachment survives the full recovery interval,
+        // treat a later failure as a new interruption. Keeping the existing
+        // deadline for shorter attempts prevents SSH connect timeouts from
+        // extending recovery forever.
+        if should_start_connect_recovery_window(attached_for, recovery_active) {
+            recovery_deadline = Some(Instant::now() + CONNECT_RECOVERY_TIMEOUT);
+            retry_delay = CONNECT_RETRY_INITIAL_DELAY;
+            eprintln!(
+                "Connection to sandbox lost; reconnecting. To disconnect, press Ctrl-P then Ctrl-Q after reattachment; press Ctrl-C while retrying to cancel."
+            );
+        }
+
+        let Some(deadline) = recovery_deadline else {
+            return Ok(exit_code);
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            print_connect_recovery_timeout();
+            return Ok(exit_code);
+        }
+
+        if let Err(exit_code) = cancellation
+            .wait(tokio::time::sleep(std::cmp::min(
+                retry_delay,
+                deadline - now,
+            )))
+            .await
+        {
+            return Ok(exit_code);
+        }
+        retry_delay = next_connect_retry_delay(retry_delay);
+    }
+}
+
 async fn sandbox_connect_with_mode(
     server: &str,
     name: &str,
@@ -297,27 +682,7 @@ async fn sandbox_connect_with_mode(
     )
     .await?;
 
-    let mut command = ssh_base_command(&session.proxy_command);
-    if session.main_terminal {
-        command.arg("-tt").arg("-o").arg("RequestTTY=force");
-    } else {
-        command.arg("-T");
-    }
-    command
-        .arg("-o")
-        .arg("SetEnv=TERM=xterm-256color")
-        .arg("-s")
-        .arg("sandbox")
-        .arg("openshell-main")
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    let exit_code = tokio::task::spawn_blocking(move || exec_or_wait(command, replace_process))
-        .await
-        .into_diagnostic()??;
-
-    Ok(exit_code)
+    run_main_attach(&session, replace_process).await
 }
 
 /// Connect to a sandbox via SSH.
@@ -327,7 +692,7 @@ pub async fn sandbox_connect(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<i32> {
-    sandbox_connect_with_mode(server, name, tls, true, workspace, None).await
+    sandbox_connect_supervised(server, name, tls, workspace).await
 }
 
 pub(crate) async fn sandbox_connect_without_exec(
@@ -1829,6 +2194,91 @@ mod tests {
     fn sync_error_retry_filter_rejects_validation_failures() {
         let error = miette::miette!("sandbox source path '/etc/passwd' resolves outside /sandbox");
         assert!(!sync_error_is_retryable(&error));
+    }
+
+    #[test]
+    fn connect_recovery_starts_only_for_established_transport_failures() {
+        assert!(should_recover_connect(
+            SSH_TRANSPORT_FAILURE_EXIT_CODE,
+            CONNECT_ESTABLISHED_DURATION,
+            false,
+            false
+        ));
+        assert!(!should_recover_connect(
+            SSH_TRANSPORT_FAILURE_EXIT_CODE,
+            CONNECT_ESTABLISHED_DURATION
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
+            false,
+            false
+        ));
+        assert!(!should_recover_connect(
+            0,
+            CONNECT_ESTABLISHED_DURATION,
+            false,
+            false
+        ));
+        assert!(!should_recover_connect(
+            SSH_TRANSPORT_FAILURE_EXIT_CODE,
+            CONNECT_ESTABLISHED_DURATION,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn connect_recovery_continues_after_fast_replacement_failure() {
+        assert!(should_recover_connect(
+            SSH_TRANSPORT_FAILURE_EXIT_CODE,
+            Duration::ZERO,
+            true,
+            false
+        ));
+        assert!(!should_start_connect_recovery_window(
+            CONNECT_ESTABLISHED_DURATION,
+            true
+        ));
+        assert!(should_start_connect_recovery_window(
+            CONNECT_RECOVERY_TIMEOUT,
+            true
+        ));
+    }
+
+    #[test]
+    fn connect_retry_delay_is_capped() {
+        assert_eq!(
+            next_connect_retry_delay(CONNECT_RETRY_INITIAL_DELAY),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            next_connect_retry_delay(CONNECT_RETRY_MAX_DELAY),
+            CONNECT_RETRY_MAX_DELAY
+        );
+    }
+
+    #[test]
+    fn connect_retry_filter_rejects_authentication_failures() {
+        let transient = miette::miette!("transport error: connection reset by peer");
+        assert!(connect_error_is_retryable(&transient));
+
+        let authentication = miette::miette!("status: Unauthenticated");
+        assert!(!connect_error_is_retryable(&authentication));
+
+        let lifecycle = miette::miette!("sandbox is not ready");
+        assert!(!connect_error_is_retryable(&lifecycle));
+    }
+
+    #[tokio::test]
+    async fn connect_recovery_deadline_bounds_stalled_session_creation() {
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let result = await_before_recovery_deadline(
+            Some(deadline),
+            std::future::pending::<std::result::Result<(), Report>>(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(Instant::now() >= deadline);
     }
 
     #[test]

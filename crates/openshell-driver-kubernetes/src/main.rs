@@ -21,6 +21,13 @@ use openshell_driver_kubernetes::{
 #[command(version = VERSION)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
+    /// Operator-owned JSON policy; omitted means driver config disabled and labels required.
+    #[arg(
+        long,
+        env = "OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON",
+        default_value = "{}"
+    )]
+    admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
     /// Public compute-driver Unix socket used by an external gateway.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: Option<PathBuf>,
@@ -238,6 +245,8 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let driver = KubernetesComputeDriver::new(
         KubernetesComputeConfig {
+            allow_driver_config: args.admission_config_json.allow_driver_config,
+            resource_admission: args.admission_config_json.resource_admission.clone(),
             workspace_mode: args.workspace_mode,
             gateway_id: args.gateway_id,
             namespace: args.sandbox_namespace,

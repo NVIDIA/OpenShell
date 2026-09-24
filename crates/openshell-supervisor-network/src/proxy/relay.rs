@@ -374,6 +374,101 @@ mod tests {
         }
     }
 
+    async fn assert_response_lifecycle<C, P>(mut caller: C, mut client: P)
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+        P: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut upstream, mut server) = tokio::io::duplex(1024);
+        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let decision = decision(engine.current_generation());
+        let request = request_context();
+        let context = prepare_http_relay(None, &engine, &decision, &request).unwrap();
+        let persistent = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        // Larger than either transport buffer: closing must drain the body.
+        let body = vec![b'x'; 64 * 1024];
+        let mut closing = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        closing.extend_from_slice(&body);
+        let relay = Box::pin(relay_http_stream(&mut client, &mut upstream, context));
+        let serve = async {
+            for response in [persistent.as_slice(), closing.as_slice()] {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(server.read_u8().await.unwrap());
+                    assert!(request.len() < 4096);
+                }
+                assert!(request.starts_with(b"GET / HTTP/1.1\r\n"));
+                server.write_all(response).await.unwrap();
+                server.flush().await.unwrap();
+            }
+            // Retain the upstream socket: response headers decide persistence.
+        };
+        let receive = async {
+            let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+            caller.write_all(request).await.unwrap();
+            caller.flush().await.unwrap();
+            let mut first = vec![0; persistent.len()];
+            caller.read_exact(&mut first).await.unwrap();
+            assert_eq!(first, persistent);
+            // A real second exchange verifies reuse, without a timing assertion.
+            caller.write_all(request).await.unwrap();
+            caller.flush().await.unwrap();
+            let mut second = Vec::new();
+            // TLS must return clean EOF, not UnexpectedEof from a dropped socket.
+            caller.read_to_end(&mut second).await.unwrap();
+            assert_eq!(second, closing);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (result, (), ()) = tokio::join!(relay, serve, receive);
+            result.unwrap();
+        })
+        .await
+        .expect("response delivery and EOF must not await another request");
+    }
+
+    #[tokio::test]
+    async fn http_relay_reuses_then_closes_after_complete_response() {
+        let (caller, client) = tokio::io::duplex(1024);
+        assert_response_lifecycle(caller, client).await;
+    }
+
+    #[tokio::test]
+    async fn tls_http_relay_reuses_then_sends_close_notify_after_complete_response() {
+        use crate::l7::tls::{CertCache, ProxyTlsState, SandboxCa, tls_terminate_client};
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ca = SandboxCa::generate().unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut ca.cert_pem().as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let state = ProxyTlsState::new(CertCache::new(ca), config.clone());
+        let connector = tokio_rustls::TlsConnector::from(config);
+        let (caller, client) = tokio::io::duplex(1024);
+        let (caller, client) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                connector.connect(
+                    rustls::pki_types::ServerName::try_from("example.com").unwrap(),
+                    caller
+                ),
+                tls_terminate_client(client, &state, "example.com"),
+            )
+        })
+        .await
+        .expect("TLS handshake must complete");
+        assert_response_lifecycle(caller.unwrap(), client.unwrap()).await;
+    }
+
     #[test]
     fn relay_without_route_pins_l4_decision_generation() {
         let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();

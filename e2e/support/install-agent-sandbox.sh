@@ -6,7 +6,14 @@
 # context arguments (for example, --context kind-e2e) as script arguments.
 set -euo pipefail
 
-agent_sandbox_version="${AGENT_SANDBOX_VERSION:-v0.5.0}"
+agent_sandbox_version="${AGENT_SANDBOX_VERSION:-v1.0.3}"
+
+# Agent Sandbox renamed its core release manifest after v0.5.1. Keep the
+# v1alpha1 compatibility lane on the asset published with that release.
+case "${agent_sandbox_version}" in
+  v0.[0-4].*|v0.5.[01]) agent_sandbox_manifest="manifest.yaml" ;;
+  *) agent_sandbox_manifest="sandbox.yaml" ;;
+esac
 
 wait_for_agent_sandbox_crd() {
   local deadline
@@ -32,7 +39,7 @@ wait_for_agent_sandbox_crd() {
 
 echo "Installing agent-sandbox CRDs and controller (${agent_sandbox_version})..."
 agent_sandbox_base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${agent_sandbox_version}"
-kubectl "$@" apply -f "${agent_sandbox_base}/manifest.yaml"
+kubectl "$@" apply -f "${agent_sandbox_base}/${agent_sandbox_manifest}"
 wait_for_agent_sandbox_crd "$@"
 kubectl "$@" -n agent-sandbox-system rollout status \
   deployment/agent-sandbox-controller --timeout=300s

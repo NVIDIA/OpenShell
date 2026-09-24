@@ -88,8 +88,37 @@ async fn provision_operator_namespace(name: &str) {
     let (ok, out) = kubectl(&["label", "namespace", name, OPERATOR_LABEL]).await;
     assert!(ok, "failed to label namespace {name}: {out}");
 
-    let (ok, out) = kubectl(&["create", "serviceaccount", SA_NAME, "-n", name]).await;
-    assert!(ok, "failed to create SA in {name}: {out}");
+    let (ok, out) = install_workspace_chart(name).await;
+    assert!(ok, "failed to install workspace chart in {name}: {out}");
+}
+
+async fn install_workspace_chart(namespace: &str) -> (bool, String) {
+    let chart = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/helm/openshell-workspace"
+    );
+    let output = tokio::process::Command::new("helm")
+        .args([
+            "--kube-context",
+            &kube_context(),
+            "install",
+            "openshell-workspace",
+            chart,
+            "--namespace",
+            namespace,
+            "--wait",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("failed to spawn helm");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    (output.status.success(), combined)
 }
 
 async fn delete_namespace(name: &str) {
@@ -141,6 +170,43 @@ impl Drop for OperatorCleanup {
                 .status();
         }
     }
+}
+
+const GATEWAY_SERVICE_ACCOUNT: &str = "system:serviceaccount:openshell:openshell";
+
+async fn gateway_can(verb: &str, resource: &str, namespace: &str) -> bool {
+    let (_, out) = kubectl(&[
+        "auth",
+        "can-i",
+        verb,
+        resource,
+        "-n",
+        namespace,
+        "--as",
+        GATEWAY_SERVICE_ACCOUNT,
+    ])
+    .await;
+    match out.trim() {
+        "yes" => true,
+        "no" => false,
+        other => panic!("unexpected kubectl auth can-i output for {verb} {resource}: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn operator_gateway_has_no_secret_access_without_workspace_chart() {
+    let ns = unique_namespace("oprbac");
+
+    for verb in ["get", "list", "create", "patch", "delete"] {
+        assert!(
+            !gateway_can(verb, "secrets", &ns).await,
+            "gateway must not {verb} Secrets in namespace {ns} without the workspace chart"
+        );
+    }
+    assert!(
+        !gateway_can("patch", "secrets/openshell-client-tls", &ns).await,
+        "gateway must not patch the client TLS Secret in namespace {ns} without the workspace chart"
+    );
 }
 
 #[tokio::test]

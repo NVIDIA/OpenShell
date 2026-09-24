@@ -55,7 +55,7 @@ $WindowsClippyPackageExcludes = $UnsupportedDriverPackageExcludes
 $WindowsClippyLintArgs = "-D warnings -A dead-code -A unused-imports -A clippy::unused-async"
 $PrebuiltZ3WorkspaceFeatures = "--features openshell-prover/prebuilt-z3"
 $PrebuiltZ3ServerFeatures = "--features openshell-server/prebuilt-z3,openshell-prover/prebuilt-z3"
-$PrebuiltZ3Version = "4.16.0"
+$PrebuiltZ3Version = "5.1.0"
 $Z3WorkspaceFeatures = $PrebuiltZ3WorkspaceFeatures
 $Z3ServerFeatures = $PrebuiltZ3ServerFeatures
 

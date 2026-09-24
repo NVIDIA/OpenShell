@@ -178,7 +178,11 @@ where
         ))
         .await?
     {
-        return Ok(outcome);
+        return if matches!(outcome, RelayOutcome::Consumed) {
+            finish_response(client, true).await
+        } else {
+            Ok(outcome)
+        };
     }
 
     // Bodiless responses (HEAD, 1xx, 204, 304): forward headers only, skip body
@@ -187,12 +191,7 @@ where
             .write_all(&buf[..header_end])
             .await
             .into_diagnostic()?;
-        client.flush().await.into_diagnostic()?;
-        return if server_wants_close {
-            Ok(RelayOutcome::Consumed)
-        } else {
-            Ok(RelayOutcome::Reusable)
-        };
+        return finish_response(client, server_wants_close || http_10_closes_by_default).await;
     }
 
     // No explicit framing (no Content-Length, no Transfer-Encoding).
@@ -261,13 +260,24 @@ where
         "relay_response complete (explicit framing)"
     );
 
-    // When body framing is explicit (Content-Length / Chunked), always report
-    // the connection as reusable so the relay loop continues.  If the server
-    // sent `Connection: close`, the *next* upstream write will fail and the
-    // loop will exit via the normal error path.  Exiting early here would
-    // tear down the CONNECT tunnel before the client can detect the close,
-    // causing ~30 s retry delays in clients like `gh`.
-    Ok(RelayOutcome::Reusable)
+    finish_response(client, server_wants_close || http_10_closes_by_default).await
+}
+
+/// Body framing determines when delivery finishes, not whether another
+/// request is permitted. Signal EOF (including TLS `close_notify`) before the
+/// caller tears down a closing CONNECT tunnel; waiting for another request
+/// deadlocks clients that are themselves waiting for EOF.
+async fn finish_response<C>(client: &mut C, close: bool) -> Result<RelayOutcome>
+where
+    C: AsyncWrite + Unpin,
+{
+    client.flush().await.into_diagnostic()?;
+    if close {
+        client.shutdown().await.into_diagnostic()?;
+        Ok(RelayOutcome::Consumed)
+    } else {
+        Ok(RelayOutcome::Reusable)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -758,8 +768,9 @@ where
     }
     client.flush().await.into_diagnostic()?;
     Ok(Some(
-        if (committed && close_delimited_output)
-            || (matches!(body_length, BodyLength::None) && (server_wants_close || event_stream))
+        if server_wants_close
+            || (committed && close_delimited_output)
+            || (matches!(body_length, BodyLength::None) && event_stream)
         {
             RelayOutcome::Consumed
         } else {
@@ -827,7 +838,11 @@ where
         BodyLength::None => {}
     }
     client.flush().await.into_diagnostic()?;
-    Ok(RelayOutcome::Reusable)
+    Ok(if server_wants_close {
+        RelayOutcome::Consumed
+    } else {
+        RelayOutcome::Reusable
+    })
 }
 
 fn emit_http_response_middleware_invocations(

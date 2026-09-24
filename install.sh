@@ -60,14 +60,20 @@ ENVIRONMENT VARIABLES:
                         Prereleases require an authenticated GitHub CLI session.
     OPENSHELL_ACK_BREAKING_UPGRADE
                         Set to 1 only after backing up and cleaning up a
-                        pre-v0.0.37 installation.
+                        pre-v0.0.37 or non-snap installation.
 
 NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
     from ${GITHUB_URL}/releases/latest.
 
-    Linux installs the Debian package on amd64/arm64 or the RPM packages on
-    x86_64/aarch64, depending on the host package manager.
+    On Linux, the installer uses the OpenShell snap whenever the snap command
+    is available. It installs from latest/edge when OPENSHELL_VERSION=dev and
+    from latest/stable otherwise. If Docker is not installed, the installer
+    installs the Docker snap and waits for its daemon before installing
+    OpenShell.
+
+    Without snap, Linux installs the Debian package on amd64/arm64 or the RPM
+    packages on x86_64/aarch64, depending on the host package manager.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF
@@ -244,12 +250,17 @@ installed_version_needs_breaking_upgrade_notice() {
   ! semver_at_least "$_version" "$BREAKING_RELEASE_VERSION"
 }
 
-find_existing_openshell_bin() {
+find_existing_native_openshell_bin() {
   _path="$(command -v openshell 2>/dev/null || true)"
-  if [ -n "$_path" ] && [ -x "$_path" ]; then
-    printf '%s\n' "$_path"
-    return 0
-  fi
+  case "$_path" in
+    /snap/*) ;;
+    *)
+      if [ -n "$_path" ] && [ -x "$_path" ]; then
+        printf '%s\n' "$_path"
+        return 0
+      fi
+      ;;
+  esac
 
   for _candidate in \
     "${TARGET_HOME:-}/.local/bin/openshell" \
@@ -293,7 +304,7 @@ print_breaking_upgrade_notice() {
   cat >&2 <<EOF
 
 OpenShell ${BREAKING_RELEASE_VERSION} and later are incompatible with gateway
-state created by earlier releases. Before installing ${RELEASE_TAG}, back up
+state created by earlier releases. Before installing OpenShell ${RELEASE_TAG}, back up
 any files, artifacts, and configuration you need from existing sandboxes.
 
 Then clean up the old runtime with the currently installed CLI:
@@ -318,7 +329,7 @@ EOF
 guard_breaking_upgrade() {
   target_uses_breaking_gateway_model || return 0
 
-  _bin="$(find_existing_openshell_bin || true)"
+  _bin="$(find_existing_native_openshell_bin || true)"
   [ -n "$_bin" ] || return 0
 
   _version="$(existing_openshell_version "$_bin")"
@@ -332,6 +343,55 @@ guard_breaking_upgrade() {
   fi
 
   error "manual cleanup is required before upgrading from this OpenShell installation"
+}
+
+print_native_to_snap_notice() {
+  _bin="$1"
+  _version="$2"
+
+  if [ -n "$_version" ]; then
+    warn "detected existing non-snap OpenShell ${_version} at ${_bin}"
+  else
+    warn "detected an existing non-snap OpenShell installation at ${_bin}"
+  fi
+
+  cat >&2 <<EOF
+
+The OpenShell snap keeps gateway and CLI state in snap-specific directories and
+does not import state from a non-snap installation. Before installing the snap,
+back up anything you need and clean up sandboxes and runtime resources managed
+by the existing installation.
+
+For older installations that provide these commands, run:
+
+    ${_bin} sandbox delete --all
+    ${_bin} gateway destroy
+
+Stop the non-snap gateway service and remove the native package or manual
+installation before continuing. For package and service instructions, see:
+
+    https://docs.nvidia.com/openshell/latest/about/installation
+
+If you have already backed up and cleaned up the non-snap installation, rerun with:
+
+    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_ACK_BREAKING_UPGRADE=1 sh
+
+EOF
+}
+
+guard_native_to_snap_transition() {
+  _bin="$(find_existing_native_openshell_bin || true)"
+  [ -n "$_bin" ] || return 0
+
+  _version="$(existing_openshell_version "$_bin")"
+  print_native_to_snap_notice "$_bin" "$_version"
+
+  if [ "$UPGRADE_NOTICE_ACK" = "1" ]; then
+    warn "continuing because OPENSHELL_ACK_BREAKING_UPGRADE=1 is set"
+    return 0
+  fi
+
+  error "manual cleanup is required before replacing this non-snap OpenShell installation"
 }
 
 resolve_release_tag() {
@@ -618,7 +678,9 @@ local_gateway_endpoint() {
 }
 
 linux_package_method() {
-  if has_cmd dpkg; then
+  if has_cmd snap; then
+    echo "snap"
+  elif has_cmd dpkg; then
     echo "deb"
   elif has_cmd rpm; then
     echo "rpm"
@@ -892,12 +954,30 @@ dump_local_gateway_diagnostics() {
       dump_homebrew_gateway_diagnostics "$_lines"
       ;;
     linux)
-      dump_user_service_gateway_diagnostics "$_lines"
+      if [ "${LINUX_INSTALL_METHOD:-}" = "snap" ]; then
+        dump_snap_gateway_diagnostics "$_lines"
+      else
+        dump_user_service_gateway_diagnostics "$_lines"
+      fi
       ;;
     *)
       info "no gateway log collector is available for platform: ${PLATFORM:-unknown}"
       ;;
   esac
+}
+
+dump_snap_gateway_diagnostics() {
+  _lines="$1"
+
+  info "OpenShell snap service status:"
+  as_root snap services openshell >&2 || true
+  info "OpenShell snap connections:"
+  as_root snap connections openshell >&2 || true
+  if has_cmd journalctl; then
+    info "last ${_lines} lines from the OpenShell snap gateway journal:"
+    as_root journalctl -b -u snap.openshell.gateway.service --no-pager -n "$_lines" >&2 || true
+  fi
+  as_root snap logs openshell.gateway -n="$_lines" >&2 || true
 }
 
 dump_homebrew_gateway_diagnostics() {
@@ -985,12 +1065,12 @@ wait_for_local_gateway_status() {
   error "openshell status did not report connected within ${_timeout}s"
 }
 
-remove_local_gateway_registration() {
+remove_local_gateway_registration_from() {
+  _config_dir="$1"
   [ -n "$TARGET_HOME" ] || error "cannot resolve home directory for ${TARGET_USER}"
-  _config_dir="${TARGET_HOME}/.config/openshell"
 
-  # The install-dev gateway is a user service. Replace the CLI registration
-  # directly instead of asking `gateway destroy` to tear down Docker resources.
+  # Replace the CLI registration directly instead of asking `gateway destroy`
+  # to tear down package-managed resources.
   # shellcheck disable=SC2016
   as_target_user sh -c '
     config_dir=$1
@@ -1007,6 +1087,15 @@ remove_local_gateway_registration() {
       rm -f "$active"
     fi
   ' sh "$_config_dir"
+}
+
+remove_local_gateway_registration() {
+  remove_local_gateway_registration_from "${TARGET_HOME}/.config/openshell"
+}
+
+remove_snap_gateway_registration() {
+  remove_local_gateway_registration_from \
+    "${TARGET_HOME}/snap/openshell/common/.config/openshell"
 }
 
 register_local_gateway() {
@@ -1136,6 +1225,155 @@ install_linux_rpm() {
   start_user_gateway
 }
 
+openshell_snap_channel() {
+  if [ "${OPENSHELL_VERSION:-}" = "dev" ]; then
+    printf '%s\n' "latest/edge"
+  else
+    if [ -n "${OPENSHELL_VERSION:-}" ]; then
+      warn "OPENSHELL_VERSION=${OPENSHELL_VERSION} is ignored for Snap installs; using latest/stable"
+    fi
+    printf '%s\n' "latest/stable"
+  fi
+}
+
+ensure_snap_gateway_config() {
+  _config_file="${1:-/var/snap/openshell/common/gateway.toml}"
+
+  as_root sh -c '
+    set -eu
+    config_file=$1
+    if [ -e "$config_file" ] || [ -L "$config_file" ]; then
+      exit 0
+    fi
+
+    config_dir=${config_file%/*}
+    mkdir -p "$config_dir"
+    umask 077
+    temporary_file=$(mktemp "${config_file}.tmp.XXXXXX")
+    trap '\''rm -f "$temporary_file"'\'' 0 HUP INT TERM
+
+    cat >"$temporary_file" <<'\''EOF'\''
+[openshell]
+version = 2
+
+[openshell.gateway]
+
+[openshell.gateway.auth]
+allow_unauthenticated_users = true
+EOF
+
+    if ! ln "$temporary_file" "$config_file"; then
+      if [ -e "$config_file" ] || [ -L "$config_file" ]; then
+        exit 0
+      fi
+      exit 1
+    fi
+    rm -f "$temporary_file"
+    trap - 0 HUP INT TERM
+  ' sh "$_config_file"
+}
+
+wait_for_docker_daemon() {
+  _timeout="${OPENSHELL_INSTALL_DOCKER_TIMEOUT:-30}"
+  _elapsed=0
+  _last_output=""
+
+  info "waiting for Docker daemon to become reachable..."
+  while [ "$_elapsed" -lt "$_timeout" ]; do
+    if _last_output="$(as_root docker info 2>&1)"; then
+      info "Docker daemon is reachable"
+      return 0
+    fi
+    sleep 1
+    _elapsed=$((_elapsed + 1))
+  done
+
+  [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
+  if snap list docker >/dev/null 2>&1; then
+    as_root snap services docker >&2 || true
+    as_root snap changes >&2 || true
+  fi
+  error "Docker daemon did not become reachable within ${_timeout}s"
+}
+
+register_snap_gateway() {
+  _register_bin="${OPENSHELL_REGISTER_BIN:-/snap/bin/openshell}"
+  _endpoint="http://127.0.0.1:${LOCAL_GATEWAY_PORT}"
+
+  if _add_output="$(as_target_user "$_register_bin" gateway add "$_endpoint" --local --name openshell 2>&1)"; then
+    [ -z "$_add_output" ] || print_gateway_add_output "$_add_output"
+    return 0
+  else
+    _add_status=$?
+  fi
+
+  case "$_add_output" in
+    *"already exists"*)
+      info "local gateway already exists; removing and re-adding it..."
+      remove_snap_gateway_registration
+      as_target_user "$_register_bin" gateway add "$_endpoint" --local --name openshell
+      ;;
+    *)
+      printf '%s\n' "$_add_output" >&2
+      return "$_add_status"
+      ;;
+  esac
+}
+
+wait_for_snap_gateway_listener() {
+  _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
+  _elapsed=0
+  _last_output=""
+  _probe_url="http://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+
+  info "waiting for local gateway listener to become reachable..."
+  while [ "$_elapsed" -lt "$_timeout" ]; do
+    if _last_output="$(curl -sS --max-time 2 -o /dev/null "$_probe_url" 2>&1)"; then
+      info "local gateway listener is reachable"
+      return 0
+    fi
+    sleep 1
+    _elapsed=$((_elapsed + 1))
+  done
+
+  [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
+  dump_local_gateway_diagnostics
+  error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
+}
+
+install_linux_snap() {
+  require_cmd snap
+  set_linux_target_runtime_dir
+
+  if ! has_cmd docker; then
+    info "Docker not found; installing the Docker snap..."
+    as_root snap install docker
+  else
+    info "using existing Docker installation"
+  fi
+  wait_for_docker_daemon
+
+  _channel="$(openshell_snap_channel)"
+  if snap list openshell >/dev/null 2>&1; then
+    info "refreshing OpenShell snap from ${_channel}..."
+    as_root snap refresh openshell --channel="$_channel"
+    warn "restarting the OpenShell gateway to use the refreshed snap; active sandbox sessions will be interrupted"
+  else
+    info "installing OpenShell snap from ${_channel}..."
+    as_root snap install openshell --channel="$_channel"
+  fi
+
+  ensure_snap_gateway_config
+  as_root snap restart openshell.gateway
+
+  info "installed OpenShell snap from ${_channel}"
+  info "registering local gateway as ${TARGET_USER}..."
+  register_snap_gateway
+  wait_for_snap_gateway_listener
+  OPENSHELL_REGISTER_BIN="/snap/bin/openshell"
+  wait_for_local_gateway_status
+}
+
 install_macos_homebrew() {
   check_macos_platform
 
@@ -1206,23 +1444,34 @@ main() {
 
   require_cmd curl
   PLATFORM="$(detect_platform)"
-  RELEASE_TAG="$(resolve_release_tag)"
+  if [ "$PLATFORM" = "linux" ]; then
+    LINUX_INSTALL_METHOD="$(linux_package_method)"
+  fi
 
   TARGET_USER="$(target_user)"
   TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || true)"
   [ -n "$TARGET_UID" ] || error "cannot resolve uid for ${TARGET_USER}"
   TARGET_HOME="$(user_home "$TARGET_USER")"
 
-  guard_breaking_upgrade
+  if [ "${LINUX_INSTALL_METHOD:-}" = "snap" ]; then
+    guard_native_to_snap_transition
+  else
+    RELEASE_TAG="$(resolve_release_tag)"
+    guard_breaking_upgrade
+  fi
 
   case "$PLATFORM" in
     linux)
-      require_linux_package_glibc
-      case "$(linux_package_method)" in
+      case "$LINUX_INSTALL_METHOD" in
+        snap)
+          install_linux_snap
+          ;;
         deb)
+          require_linux_package_glibc
           install_linux_deb
           ;;
         rpm)
+          require_linux_package_glibc
           install_linux_rpm
           ;;
         *)

@@ -1359,7 +1359,7 @@ type RefreshSandboxTokenResponse struct {
 	ExtensionCredentials []*ExtensionServiceCredential `protobuf:"bytes,3,rep,name=extension_credentials,json=extensionCredentials,proto3" json:"extension_credentials,omitempty"`
 	// Fresh Sandbox Protocol bearer token from the same atomic refresh.
 	SandboxToken string `protobuf:"bytes,4,opt,name=sandbox_token,json=sandboxToken,proto3" json:"sandbox_token,omitempty"`
-	// Absolute Sandbox Protocol token expiry. Required when sandbox_token is set.
+	// Absolute Sandbox Protocol token expiry. Absence means the token is non-expiring.
 	SandboxExpirationTime *timestamppb.Timestamp `protobuf:"bytes,105,opt,name=sandbox_expiration_time,json=sandboxExpirationTime,proto3" json:"sandbox_expiration_time,omitempty"`
 	// Launch generation to which both refreshed credentials are bound.
 	SessionId string `protobuf:"bytes,6,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
@@ -4150,8 +4150,14 @@ type ListSandboxProvidersRequest struct {
 	// Workspace scope. Only a named workspace selection is accepted.
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,2,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	Sandbox        string                         `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// The maximum number of providers to return. Zero uses 100. Values above
+	// 1000 are coerced to 1000; negative values are invalid.
+	PageSize int32 `protobuf:"varint,3,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	// Token from a previous ListSandboxProviders response. All other request
+	// parameters except page_size must match the request that produced it.
+	PageToken     string `protobuf:"bytes,4,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ListSandboxProvidersRequest) Reset() {
@@ -4194,6 +4200,20 @@ func (x *ListSandboxProvidersRequest) GetWorkspaceScope() *datamodelv1.Workspace
 func (x *ListSandboxProvidersRequest) GetSandbox() string {
 	if x != nil {
 		return x.Sandbox
+	}
+	return ""
+}
+
+func (x *ListSandboxProvidersRequest) GetPageSize() int32 {
+	if x != nil {
+		return x.PageSize
+	}
+	return 0
+}
+
+func (x *ListSandboxProvidersRequest) GetPageToken() string {
+	if x != nil {
+		return x.PageToken
 	}
 	return ""
 }
@@ -4682,8 +4702,10 @@ func (x *ListSandboxesResponse) GetNextPageToken() string {
 
 // List providers attached to a sandbox response.
 type ListSandboxProvidersResponse struct {
-	state         protoimpl.MessageState  `protogen:"open.v1"`
-	Providers     []*datamodelv1.Provider `protobuf:"bytes,1,rep,name=providers,proto3" json:"providers,omitempty"`
+	state     protoimpl.MessageState  `protogen:"open.v1"`
+	Providers []*datamodelv1.Provider `protobuf:"bytes,1,rep,name=providers,proto3" json:"providers,omitempty"`
+	// Token for the next page. Empty when there are no subsequent pages.
+	NextPageToken string `protobuf:"bytes,2,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4723,6 +4745,13 @@ func (x *ListSandboxProvidersResponse) GetProviders() []*datamodelv1.Provider {
 		return x.Providers
 	}
 	return nil
+}
+
+func (x *ListSandboxProvidersResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
 }
 
 // Attach provider to sandbox response.
@@ -6711,7 +6740,12 @@ type ExecSandboxRequest struct {
 	// (`bash -lc`) so user startup files (.bash_profile/.profile, and .bashrc if
 	// sourced by them) are applied. When true, the command runs without those
 	// files (`bash -c`), for automation that needs predictable startup behavior.
-	NoLoginShell  bool `protobuf:"varint,10,opt,name=no_login_shell,json=noLoginShell,proto3" json:"no_login_shell,omitempty"`
+	NoLoginShell bool `protobuf:"varint,10,opt,name=no_login_shell,json=noLoginShell,proto3" json:"no_login_shell,omitempty"`
+	// Optional nonzero UUID for durable launch admission. Also applies to the
+	// initial ExecSandboxInteractive start message. Duplicates never relaunch,
+	// reattach, or replay output/stdin. Unconfirmed executions remain fenced;
+	// confirmed terminal executions retain the fence for 24 hours.
+	RequestId     string `protobuf:"bytes,11,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6821,6 +6855,13 @@ func (x *ExecSandboxRequest) GetNoLoginShell() bool {
 		return x.NoLoginShell
 	}
 	return false
+}
+
+func (x *ExecSandboxRequest) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
 }
 
 // One stdout chunk from a sandbox exec.
@@ -7589,9 +7630,27 @@ type WatchSandboxRequest struct {
 	// Filter by log source (e.g. "gateway", "sandbox"). Empty means all sources.
 	LogSources []string `protobuf:"bytes,9,rep,name=log_sources,json=logSources,proto3" json:"log_sources,omitempty"`
 	// Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
-	LogMinLevel   string `protobuf:"bytes,10,opt,name=log_min_level,json=logMinLevel,proto3" json:"log_min_level,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	LogMinLevel string `protobuf:"bytes,10,opt,name=log_min_level,json=logMinLevel,proto3" json:"log_min_level,omitempty"`
+	// Resume streaming after this cursor. Empty means no cursor resume: the
+	// server falls back to tail-limited replay controlled by log_tail_lines and
+	// event_tail. Otherwise set it to the highest `SandboxStreamEvent.cursor`
+	// already processed; the server replays only log and platform events after
+	// it, merged in cursor order, before resuming live delivery. If the requested
+	// cursor has already been trimmed from the server's buffer, the resume is
+	// unrecoverable and the stream terminates with OUT_OF_RANGE (see
+	// SandboxStreamWarning for the recoverable case).
+	//
+	// A cursor is bound to the cursor space that issued it. A gateway restart,
+	// teardown of the sandbox's buffers, or a reconnect to a different gateway
+	// replica starts a new space, and cursors from the previous one are rejected
+	// with OUT_OF_RANGE rather than silently suppressing live events beneath
+	// them. OUT_OF_RANGE is terminal for that cursor: restart the watch with an
+	// empty resume_after_cursor, because retrying the same token fails
+	// identically. A cursor this server could not have issued is rejected with
+	// INVALID_ARGUMENT.
+	ResumeAfterCursor string `protobuf:"bytes,12,opt,name=resume_after_cursor,json=resumeAfterCursor,proto3" json:"resume_after_cursor,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *WatchSandboxRequest) Reset() {
@@ -7701,6 +7760,13 @@ func (x *WatchSandboxRequest) GetLogMinLevel() string {
 	return ""
 }
 
+func (x *WatchSandboxRequest) GetResumeAfterCursor() string {
+	if x != nil {
+		return x.ResumeAfterCursor
+	}
+	return ""
+}
+
 // One event in a sandbox watch stream.
 type SandboxStreamEvent struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -7711,7 +7777,19 @@ type SandboxStreamEvent struct {
 	//	*SandboxStreamEvent_Event
 	//	*SandboxStreamEvent_Warning
 	//	*SandboxStreamEvent_DraftPolicyUpdate
-	Payload       isSandboxStreamEvent_Payload `protobuf_oneof:"payload"`
+	Payload isSandboxStreamEvent_Payload `protobuf_oneof:"payload"`
+	// Opaque position in this sandbox's cursor space, shared across the resumable
+	// log and platform event sources. Empty for non-resumable events (status
+	// snapshots, warnings).
+	//
+	// Do not parse this token; its encoding is not part of the contract. The only
+	// supported operation is comparing two non-empty cursors observed on the same
+	// stream and keeping the greater one, then passing it as
+	// WatchSandboxRequest.resume_after_cursor to resume without loss or
+	// duplication. That comparison is a plain byte-wise string comparison. It is
+	// well defined only within one stream: a stream never spans two cursor
+	// spaces, because a reset ends it.
+	Cursor        string `protobuf:"bytes,6,opt,name=cursor,proto3" json:"cursor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -7798,6 +7876,13 @@ func (x *SandboxStreamEvent) GetDraftPolicyUpdate() *DraftPolicyUpdate {
 	return nil
 }
 
+func (x *SandboxStreamEvent) GetCursor() string {
+	if x != nil {
+		return x.Cursor
+	}
+	return ""
+}
+
 type isSandboxStreamEvent_Payload interface {
 	isSandboxStreamEvent_Payload()
 }
@@ -7818,7 +7903,9 @@ type SandboxStreamEvent_Event struct {
 }
 
 type SandboxStreamEvent_Warning struct {
-	// Warning from the server (e.g. missed messages due to lag).
+	// Recoverable warning from the server, e.g. messages dropped because a
+	// broadcast receiver lagged. The stream continues after this warning; the
+	// client can detect the gap from the warning itself.
 	Warning *SandboxStreamWarning `protobuf:"bytes,4,opt,name=warning,proto3,oneof"`
 }
 
@@ -7933,6 +8020,11 @@ func (x *SandboxLogLine) GetFields() map[string]string {
 	return nil
 }
 
+// Recoverable loss notification on a watch stream. Emitted when the server
+// skips ahead after a broadcast lag instead of terminating; the stream keeps
+// running. Cursors are opaque, so this message is the only signal that events
+// were skipped. Unrecoverable loss (a trimmed or foreign resume cursor) is
+// reported as an OUT_OF_RANGE stream status, not this message.
 type SandboxStreamWarning struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Message       string                 `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
@@ -17929,10 +18021,13 @@ const file_openshell_proto_rawDesc = "" +
 	"\tpage_size\x18\x01 \x01(\x05R\bpageSize\x12\x1d\n" +
 	"\n" +
 	"page_token\x18\x02 \x01(\tR\tpageToken\x12%\n" +
-	"\x0elabel_selector\x18\x03 \x01(\tR\rlabelSelector\"\x8b\x01\n" +
+	"\x0elabel_selector\x18\x03 \x01(\tR\rlabelSelector\"\xc7\x01\n" +
 	"\x1bListSandboxProvidersRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\x02 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x18\n" +
-	"\asandbox\x18\x01 \x01(\tR\asandbox\"\x83\x02\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1b\n" +
+	"\tpage_size\x18\x03 \x01(\x05R\bpageSize\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\x04 \x01(\tR\tpageToken\"\x83\x02\n" +
 	"\x1cAttachSandboxProviderRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x18\n" +
 	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1a\n" +
@@ -17971,9 +18066,10 @@ const file_openshell_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"t\n" +
 	"\x15ListSandboxesResponse\x123\n" +
 	"\tsandboxes\x18\x01 \x03(\v2\x15.openshell.v1.SandboxR\tsandboxes\x12&\n" +
-	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"^\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\x86\x01\n" +
 	"\x1cListSandboxProvidersResponse\x12>\n" +
-	"\tproviders\x18\x01 \x03(\v2 .openshell.datamodel.v1.ProviderR\tproviders\"\xad\x01\n" +
+	"\tproviders\x18\x01 \x03(\v2 .openshell.datamodel.v1.ProviderR\tproviders\x12&\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xad\x01\n" +
 	"\x1dAttachSandboxProviderResponse\x12/\n" +
 	"\asandbox\x18\x01 \x01(\v2\x15.openshell.v1.SandboxR\asandbox\x12\x1a\n" +
 	"\battached\x18\x02 \x01(\bR\battached\x12?\n" +
@@ -18132,7 +18228,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\x05token\x18\x01 \x01(\tB\x04\x88\xb5\x18\x01R\x05token\x12#\n" +
 	"\rallow_missing\x18\x02 \x01(\bR\fallowMissing\"b\n" +
 	"\x18RevokeSshSessionResponse\x127\n" +
-	"\aoutcome\x18\x02 \x01(\x0e2\x1d.openshell.v1.DeletionOutcomeR\aoutcomeJ\x04\b\x01\x10\x02R\arevoked\"\xa0\x04\n" +
+	"\aoutcome\x18\x02 \x01(\x0e2\x1d.openshell.v1.DeletionOutcomeR\aoutcomeJ\x04\b\x01\x10\x02R\arevoked\"\xbf\x04\n" +
 	"\x12ExecSandboxRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\f \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x18\n" +
 	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x18\n" +
@@ -18145,7 +18241,9 @@ const file_openshell_proto_rawDesc = "" +
 	"\x04cols\x18\b \x01(\rR\x04cols\x12\x12\n" +
 	"\x04rows\x18\t \x01(\rR\x04rows\x12$\n" +
 	"\x0eno_login_shell\x18\n" +
-	" \x01(\bR\fnoLoginShell\x1a>\n" +
+	" \x01(\bR\fnoLoginShell\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\v \x01(\tR\trequestId\x1a>\n" +
 	"\x10EnvironmentEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x05\x10\x06R\x0ftimeout_seconds\"'\n" +
@@ -18192,7 +18290,7 @@ const file_openshell_proto_rawDesc = "" +
 	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12\x1a\n" +
 	"\x05token\x18\x03 \x01(\tB\x04\x88\xb5\x18\x01R\x05token\x12C\n" +
 	"\x0fexpiration_time\x18h \x01(\v2\x1a.google.protobuf.TimestampR\x0eexpirationTime\x12\x18\n" +
-	"\arevoked\x18\x05 \x01(\bR\arevokedJ\x04\b\x04\x10\x05R\rexpires_at_ms\"\xf1\x03\n" +
+	"\arevoked\x18\x05 \x01(\bR\arevokedJ\x04\b\x04\x10\x05R\rexpires_at_ms\"\xa1\x04\n" +
 	"\x13WatchSandboxRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\v \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x18\n" +
 	"\asandbox\x18\x01 \x01(\tR\asandbox\x12#\n" +
@@ -18209,13 +18307,15 @@ const file_openshell_proto_rawDesc = "" +
 	"\vlog_sources\x18\t \x03(\tR\n" +
 	"logSources\x12\"\n" +
 	"\rlog_min_level\x18\n" +
-	" \x01(\tR\vlogMinLevelJ\x04\b\b\x10\tR\flog_since_ms\"\xcc\x02\n" +
+	" \x01(\tR\vlogMinLevel\x12.\n" +
+	"\x13resume_after_cursor\x18\f \x01(\tR\x11resumeAfterCursorJ\x04\b\b\x10\tR\flog_since_ms\"\xe4\x02\n" +
 	"\x12SandboxStreamEvent\x121\n" +
 	"\asandbox\x18\x01 \x01(\v2\x15.openshell.v1.SandboxH\x00R\asandbox\x120\n" +
 	"\x03log\x18\x02 \x01(\v2\x1c.openshell.v1.SandboxLogLineH\x00R\x03log\x123\n" +
 	"\x05event\x18\x03 \x01(\v2\x1b.openshell.v1.PlatformEventH\x00R\x05event\x12>\n" +
 	"\awarning\x18\x04 \x01(\v2\".openshell.v1.SandboxStreamWarningH\x00R\awarning\x12Q\n" +
-	"\x13draft_policy_update\x18\x05 \x01(\v2\x1f.openshell.v1.DraftPolicyUpdateH\x00R\x11draftPolicyUpdateB\t\n" +
+	"\x13draft_policy_update\x18\x05 \x01(\v2\x1f.openshell.v1.DraftPolicyUpdateH\x00R\x11draftPolicyUpdate\x12\x16\n" +
+	"\x06cursor\x18\x06 \x01(\tR\x06cursorB\t\n" +
 	"\apayload\"\xdb\x02\n" +
 	"\x0eSandboxLogLine\x12\x1d\n" +
 	"\n" +

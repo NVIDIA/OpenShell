@@ -211,8 +211,13 @@ impl MainSession {
     const REMOTE_OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     #[cfg(test)]
     pub fn inert() -> Arc<Self> {
-        let (input, _input_rx) = tokio::sync::mpsc::channel(64);
-        Arc::new(Self {
+        Self::inert_with_input().0
+    }
+
+    #[cfg(test)]
+    pub fn inert_with_input() -> (Arc<Self>, tokio::sync::mpsc::Receiver<Vec<u8>>) {
+        let (input, input_rx) = tokio::sync::mpsc::channel(64);
+        let session = Arc::new(Self {
             pid: 1,
             terminal: false,
             input,
@@ -231,7 +236,8 @@ impl MainSession {
                 expectation: AttachmentExpectation::None,
             }),
             terminal_attachments_done: Notify::new(),
-        })
+        });
+        (session, input_rx)
     }
 
     #[cfg(test)]

@@ -1,0 +1,114 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Python SDK"
+sidebar-title: "Python"
+description: "Install the OpenShell Python SDK, reuse a registered gateway, and manage a sandbox."
+keywords: "OpenShell, SDK, Python, PyPI, gRPC, Sandbox"
+position: 3
+---
+
+Use the Python SDK to manage sandboxes from applications, notebooks, and
+automation. It can reuse gateway registration and authentication state created
+by the OpenShell CLI. Use the SDK and gateway from the same OpenShell release
+when possible.
+
+## Install the SDK
+
+The package requires Python 3.11 or later. Add it to your project with `uv`:
+
+```shell
+uv add openshell
+```
+
+The `openshell` package contains the SDK. It does not install the OpenShell CLI.
+
+## Connect to a Registered Gateway
+
+Register and select a gateway with the CLI first. Then construct the client from
+the active gateway:
+
+```python
+from openshell import SandboxClient
+
+with SandboxClient.from_active_cluster() as client:
+    health = client.health()
+    print(health.version)
+```
+
+`from_active_cluster()` reads the selected gateway endpoint, TLS files, and
+OIDC token state. It refreshes an expiring OIDC token by default and writes the
+rotated bundle back for other OpenShell processes.
+
+For a direct local plaintext connection, pass a `host:port` endpoint:
+
+```python
+from openshell import SandboxClient
+
+with SandboxClient("127.0.0.1:8080") as client:
+    print(client.health().version)
+```
+
+For service automation against an OIDC gateway, use
+`ClientCredentialsAuth`. Non-loopback endpoints require TLS:
+
+```python
+import os
+
+from openshell import ClientCredentialsAuth, SandboxClient
+
+auth = ClientCredentialsAuth(
+    issuer="https://idp.example.com/realms/openshell",
+    client_id="openshell-service",
+    client_secret=lambda: os.environ["OPENSHELL_OIDC_CLIENT_SECRET"],
+    audience="openshell-gateway",
+)
+
+with SandboxClient.from_active_cluster(client_credentials=auth) as client:
+    print(client.health().version)
+```
+
+## Create and Use a Sandbox
+
+Python SDK methods take an explicit workspace. This example creates a sandbox,
+waits for readiness, runs a command, and waits for deletion:
+
+```python
+from openshell import SandboxClient
+
+with SandboxClient.from_active_cluster() as client:
+    sandbox = client.create(
+        workspace="default",
+        name="sdk-example",
+    )
+    client.wait_ready(
+        sandbox.name,
+        workspace="default",
+        timeout_seconds=120,
+    )
+
+    result = client.exec(
+        sandbox.name,
+        ["python", "-c", "print('hello from OpenShell')"],
+        workspace="default",
+    )
+    print(result.stdout, end="")
+
+    deletion = client.delete(sandbox.name, workspace="default")
+    client.wait_deleted(
+        sandbox.name,
+        workspace="default",
+        expected_sandbox_id=deletion.sandbox_id,
+    )
+```
+
+Use `create_session()` when you want an object that retains the sandbox name and
+workspace for repeated exec, stop, start, and delete operations. List methods
+return lazy `Pager` instances; use `list_all()` only when you want to fetch the
+complete collection.
+
+## Next Steps
+
+- Review [Manage Sandboxes](/sandboxes/manage-sandboxes) for labels, templates, services, and Python SDK examples.
+- Review [Gateway Authentication](/reference/gateway-auth) for OIDC and client credentials.
+- Review [API Errors](/reference/api-errors) for structured error handling.

@@ -7,6 +7,7 @@ use std::io::Write;
 use std::process::Stdio;
 
 use openshell_e2e::harness::binary::openshell_cmd;
+use openshell_e2e::harness::container::is_e2e_driver;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::io::AsyncReadExt;
@@ -341,6 +342,78 @@ async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
 }
 
 #[tokio::test]
+async fn sandbox_receives_eof_after_closing_http_response() {
+    for response in [
+        "HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nOK\n",
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 3\r\n\r\nOK\n",
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nOK\n\r\n0\r\n\r\n",
+    ] {
+        let listener = TcpListener::bind(("0.0.0.0", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = HostServer {
+            port,
+            task: tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.set_nodelay(true).expect("disable Nagle on fixture");
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                    assert!(request.len() < 4096);
+                }
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }),
+        };
+        let policy = write_policy(server.port).unwrap();
+        let command = format!(
+            r#"set -eu
+exec 3<>/dev/tcp/host.openshell.internal/{port}
+printf 'GET / HTTP/1.1\r\nHost: host.openshell.internal:{port}\r\n\r\n' >&3
+while true; do
+  line=
+  if IFS= read -r -t 5 line <&3; then
+    printf '%s\n' "$line"
+  else
+    status=$?
+    [ "$status" -eq 1 ] || {{ echo EOF_TIMEOUT; exit 1; }}
+    [ -z "$line" ] || printf '%s\n' "$line"
+    break
+  fi
+done
+printf 'RESPONSE_EOF\n'
+"#,
+        );
+        let mut sandbox = SandboxGuard::create(&[
+            "--policy",
+            policy.path().to_str().unwrap(),
+            "--no-auto-providers",
+            "--",
+            "/usr/bin/bash",
+            "-c",
+            &command,
+        ])
+        .await
+        .expect("closing response must finish without a client timeout");
+        assert!(
+            sandbox.create_output.lines().any(|line| line == "OK"),
+            "{}",
+            sandbox.create_output
+        );
+        assert!(
+            sandbox.create_output.contains("RESPONSE_EOF"),
+            "{}",
+            sandbox.create_output
+        );
+        assert!(
+            !sandbox.create_output.contains("EOF_TIMEOUT"),
+            "{}",
+            sandbox.create_output
+        );
+        sandbox.cleanup().await;
+    }
+}
+
+#[tokio::test]
 async fn static_provider_credentials_are_bound_to_profile_endpoints() {
     let server = HostServer::start_with_auth_check("", Some("Bearer e2e-bound-secret"))
         .await
@@ -406,8 +479,11 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
 http_request() {{
   local host="$1" path="$2" status_line line
   HTTP_STATUS= HTTP_BODY=
-  exec 3<>"/dev/tcp/$host/{0}" || return 1
-  printf 'GET %s HTTP/1.1\r\nHost: %s:{0}\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n' "$path" "$host" "$BOUND_TOKEN_A" >&3
+  if ! exec 3<>"/dev/tcp/$host/{port}"; then
+    HTTP_STATUS=connect-denied
+    return 1
+  fi
+  printf 'GET %s HTTP/1.1\r\nHost: %s:{port}\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n' "$path" "$host" "$BOUND_TOKEN_A" >&3
   IFS= read -r status_line <&3 || return 1
   status_line="${{status_line%$'\r'}}"
   HTTP_STATUS="${{status_line#* }}"
@@ -420,11 +496,11 @@ http_request() {{
   exec 3>&- 3<&-
 }}
 http_request host.openshell.internal /allowed/check; allowed="$HTTP_BODY"
-http_request host.docker.internal /allowed/check; host_denied="$HTTP_STATUS"
+http_request host.docker.internal /allowed/check || true; host_denied="$HTTP_STATUS"
 http_request host.openshell.internal /other/check; path_denied="$HTTP_STATUS"
 printf 'ALLOWED=%s HOST_DENIED=%s PATH_DENIED=%s\n' "$allowed" "$host_denied" "$path_denied"
 "#,
-        server.port
+        port = server.port,
     );
     let mut guard = SandboxGuard::create(&[
         "--policy",
@@ -455,8 +531,13 @@ printf 'ALLOWED=%s HOST_DENIED=%s PATH_DENIED=%s\n' "$allowed" "$host_denied" "$
         "credential should resolve at the bound endpoint:\n{}\nlogs:\n{logs}",
         guard.create_output,
     );
+    let expected_host_denial = if is_e2e_driver("podman") {
+        "HOST_DENIED=connect-denied"
+    } else {
+        "HOST_DENIED=403"
+    };
     assert!(
-        guard.create_output.contains("HOST_DENIED=403"),
+        guard.create_output.contains(expected_host_denial),
         "same placeholder must be denied at an unbound host:\n{}",
         guard.create_output
     );

@@ -1,0 +1,26 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Isolation Backends"
+description: "Understand the runtime boundary used to launch and supervise sandboxed workloads."
+keywords: "OpenShell Extensions, Isolation Backends, Sandbox Runtime, Extensibility"
+---
+
+An isolation backend connects the OpenShell supervisor to the runtime that
+launches and controls a sandboxed workload. It defines how the supervisor
+starts processes, attaches terminal streams, forwards signals, reports exit
+status, and applies runtime-specific isolation.
+
+OpenShell separates this interface from compute drivers. A compute driver
+provisions the workload environment, while the isolation backend controls
+process execution inside that environment. This boundary lets runtimes evolve
+without changing the gateway API or policy model.
+
+The OpenShell runtime backend implements the authenticated OpenShell Sandbox
+Protocol used by the supervisor and `openshell-sandbox`. Backend selection and
+capabilities remain internal to the workload runtime; users create and manage
+sandboxes through the same gateway API.
+
+For the deployment-level runtime architecture, refer to
+[Sandbox Runtime](/kubernetes/sandbox-runtime). For driver-specific workload
+behavior, refer to [Runtimes](/reference/sandbox-compute-drivers).

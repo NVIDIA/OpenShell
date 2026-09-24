@@ -1465,8 +1465,9 @@ enum SandboxCommands {
         #[arg(long)]
         memory: Option<String>,
 
-        /// Experimental driver-keyed JSON object for driver-specific sandbox settings.
-        /// Validation behavior is not yet finalized.
+        /// Driver-keyed JSON object for driver-specific sandbox settings.
+        /// Disabled unless the gateway administrator enables `allow_driver_config`.
+        /// External resource attachments still require approval labels.
         ///
         /// For Kubernetes, pass a value such as
         /// `{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}`.
@@ -1798,6 +1799,14 @@ enum SandboxProviderCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
+        /// Maximum number of attached providers to return in this page.
+        #[arg(long, default_value_t = 100)]
+        page_size: i32,
+
+        /// Opaque continuation token from a previous page.
+        #[arg(long, default_value = "")]
+        page_token: String,
+
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
@@ -1885,7 +1894,8 @@ enum SandboxTemplateCommands {
         #[arg(long, num_args = 0..=1, value_name = "COUNT", default_missing_value = "", value_parser = parse_gpu_request)]
         gpu: Option<GpuCliRequest>,
 
-        /// Experimental driver-keyed JSON object for driver-specific sandbox settings.
+        /// Driver-keyed JSON object for driver-specific sandbox settings.
+        /// Requires administrator opt-in; resource admission still applies.
         #[arg(long, value_name = "JSON")]
         driver_config_json: Option<String>,
 
@@ -3571,11 +3581,18 @@ async fn run_async() -> Result<()> {
                             run::print_ssh_config(&ctx.name, &name, &cli.workspace);
                         }
                         SandboxCommands::Provider(command) => match command {
-                            SandboxProviderCommands::List { name, output } => {
+                            SandboxProviderCommands::List {
+                                name,
+                                page_size,
+                                page_token,
+                                output,
+                            } => {
                                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                                 run::sandbox_provider_list(
                                     endpoint,
                                     &name,
+                                    page_size,
+                                    &page_token,
                                     output.as_str(),
                                     &cli.workspace,
                                     &tls,

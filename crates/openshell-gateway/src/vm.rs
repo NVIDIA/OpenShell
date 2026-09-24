@@ -63,6 +63,8 @@ const COMPUTE_DRIVER_SOCKET_NAME: &str = "compute-driver.sock";
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VmComputeConfig {
+    pub allow_driver_config: bool,
+    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     /// Working directory for VM driver sandbox state.
     pub state_dir: PathBuf,
 
@@ -165,9 +167,15 @@ impl VmComputeConfig {
     /// Validate startup configuration without resolving binaries, creating
     /// state directories, spawning a process, or connecting a socket.
     pub fn validate_configuration(&self) -> Result<()> {
+        self.resource_admission.validate().map_err(Error::config)?;
         if self.grpc_endpoint.trim().is_empty() {
             return Err(Error::config(
                 "grpc_endpoint is required when using the vm compute driver",
+            ));
+        }
+        if self.bootstrap_image.trim().is_empty() && self.default_image.trim().is_empty() {
+            return Err(Error::config(
+                "bootstrap_image or default_image is required when using the vm compute driver; sandbox images cannot be used as VM bootstrap images",
             ));
         }
         validate_vm_sandbox_identity(self)?;
@@ -232,6 +240,9 @@ impl Default for VmComputeConfig {
     fn default() -> Self {
         Self {
             state_dir: Self::default_state_dir(),
+            allow_driver_config: false,
+            resource_admission:
+                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
             driver_dir: None,
             default_image: openshell_core::image::default_sandbox_image(),
             grpc_endpoint: String::new(),
@@ -554,6 +565,13 @@ pub async fn spawn(
     command.stdout(Stdio::inherit());
     command.stderr(Stdio::inherit());
     command.arg("--bind-socket").arg(&socket_path);
+    command.arg("--admission-config-json").arg(
+        serde_json::to_string(&openshell_core::resource_admission::DriverAdmissionConfig {
+            allow_driver_config: vm_config.allow_driver_config,
+            resource_admission: vm_config.resource_admission.clone(),
+        })
+        .map_err(|error| Error::config(error.to_string()))?,
+    );
     command
         .arg("--expected-peer-pid")
         .arg(std::process::id().to_string());
@@ -782,6 +800,34 @@ mod tests {
             VmComputeConfig::default().default_image,
             openshell_core::image::DEFAULT_SANDBOX_BASE_IMAGE
         );
+    }
+
+    #[test]
+    fn vm_gateway_requires_a_trusted_bootstrap_image_source() {
+        let config = VmComputeConfig {
+            grpc_endpoint: "http://127.0.0.1:50051".to_string(),
+            default_image: String::new(),
+            bootstrap_image: String::new(),
+            ..Default::default()
+        };
+        let error = config
+            .validate_configuration()
+            .expect_err("the gateway must reject an empty bootstrap configuration");
+        assert!(error.to_string().contains("sandbox images cannot be used"));
+
+        VmComputeConfig {
+            default_image: "openshell/sandbox:default".to_string(),
+            ..config.clone()
+        }
+        .validate_configuration()
+        .expect("the operator-controlled default image is a valid fallback");
+
+        VmComputeConfig {
+            bootstrap_image: "openshell/sandbox-bootstrap:latest".to_string(),
+            ..config
+        }
+        .validate_configuration()
+        .expect("an explicit bootstrap image is valid");
     }
 
     #[test]

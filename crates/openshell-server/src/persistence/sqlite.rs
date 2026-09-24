@@ -15,7 +15,9 @@ use openshell_core::SetResourceVersion;
 use openshell_core::paths::set_file_owner_only;
 use openshell_core::proto::Sandbox;
 use prost::Message;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+};
 use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqlitePool};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -39,6 +41,10 @@ use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE}
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
+    /// Pool for writes whose loss after a crash is harmless; see
+    /// [`SqliteStore::create_relaxed`]. On-disk stores open it with
+    /// `synchronous=NORMAL`; in-memory stores share `pool`.
+    relaxed_pool: SqlitePool,
     #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     in_memory_keepalive: Option<Arc<Mutex<Option<SqliteConnection>>>>,
 }
@@ -68,6 +74,124 @@ fn push_label_selector(
 pub(super) async fn replace_pool_connection(store: &SqliteStore) -> PersistenceResult<()> {
     let connection = store.pool.acquire().await.map_err(|e| map_db_error(&e))?;
     connection.close().await.map_err(|e| map_db_error(&e))
+}
+
+/// Apply the on-disk journal settings and switch the database file to WAL
+/// once, before the pool opens its connections.
+///
+/// The gateway's hot paths (SSH-session tokens minted and revoked around every
+/// forwarded connection, sandbox status updates) are many small autocommit
+/// writes. `SQLite`'s default rollback journal makes each of those commits pay
+/// several `fsync` calls and blocks readers while a writer holds the lock, so
+/// under a burst of forwarded connections the whole store serializes on disk
+/// latency. WAL mode removes the reader/writer exclusion and cuts each commit
+/// to a single `fsync` of the WAL file.
+///
+/// The main pool keeps `synchronous=FULL` rather than the usual WAL pairing
+/// of `NORMAL`. Under `NORMAL` a power loss or kernel crash can roll back
+/// transactions that were already acknowledged, and several of those writes
+/// tighten authorization: an SSH session revoked just before the crash would
+/// come back valid for the rest of its lifetime. `FULL` keeps every
+/// acknowledged commit durable. Writes whose loss only ever denies access,
+/// such as minting a new SSH session token, go through a separate
+/// `synchronous=NORMAL` pool instead ([`SqliteStore::create_relaxed`]). Both
+/// pools append to the same WAL file, so the next `FULL` commit's `fsync` also
+/// makes every earlier relaxed commit durable, and a crash can never roll back
+/// a `FULL` commit.
+///
+/// `journal_mode=WAL` is persistent in the database file, but switching into
+/// it needs exclusive access: if another connection holds the file open, the
+/// switch waits out `busy_timeout` and then fails. Doing it up front on one
+/// connection means the pool connections only ever re-apply the pragma to a
+/// file that is already in WAL mode, which never blocks, and a failure
+/// surfaces as a single clear connect error instead of a pool error later.
+/// The first start after upgrading a rollback-journal database therefore needs
+/// the file to be otherwise unopened. `synchronous` is a per-connection
+/// setting and is applied through the options on every connection.
+///
+/// In-memory databases are left on their defaults: WAL is meaningless there
+/// and the shared-cache keepalive connection already provides their lifetime
+/// guarantees.
+async fn configure_on_disk_durability(
+    options: SqliteConnectOptions,
+) -> PersistenceResult<SqliteConnectOptions> {
+    let options = options
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Full);
+    let wal_error = |e: &sqlx::Error| {
+        PersistenceError::Database(format!(
+            "failed to switch SQLite database {} to WAL journal mode (the switch needs \
+             exclusive access; close other connections to the file and retry): {}",
+            options.get_filename().display(),
+            map_db_error(e)
+        ))
+    };
+    let connection = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|e| wal_error(&e))?;
+    connection.close().await.map_err(|e| wal_error(&e))?;
+    Ok(options)
+}
+
+/// Insert a new object at resource version 1, failing if it already exists.
+async fn insert_new_object(
+    pool: &SqlitePool,
+    object_type: &str,
+    id: &str,
+    name: &str,
+    workspace: &str,
+    payload: &[u8],
+    labels: Option<&str>,
+) -> PersistenceResult<WriteResult> {
+    let now_ms = current_time_ms();
+    sqlx::query(
+        r#"
+INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)
+"#,
+    )
+    .bind(object_type)
+    .bind(id)
+    .bind(name)
+    .bind(workspace)
+    .bind(payload)
+    .bind(now_ms)
+    .bind(labels.unwrap_or("{}"))
+    .execute(pool)
+    .await
+    .map_err(|e| map_db_error(&e))?;
+
+    Ok(WriteResult {
+        resource_version: 1,
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+    })
+}
+
+#[cfg(test)]
+pub(super) async fn journal_settings(store: &SqliteStore) -> PersistenceResult<(String, i64)> {
+    pool_journal_settings(&store.pool).await
+}
+
+#[cfg(test)]
+pub(super) async fn relaxed_journal_settings(
+    store: &SqliteStore,
+) -> PersistenceResult<(String, i64)> {
+    pool_journal_settings(&store.relaxed_pool).await
+}
+
+#[cfg(test)]
+async fn pool_journal_settings(pool: &SqlitePool) -> PersistenceResult<(String, i64)> {
+    let mut connection = pool.acquire().await.map_err(|e| map_db_error(&e))?;
+    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+    let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+    Ok((journal_mode, synchronous))
 }
 
 impl SqliteStore {
@@ -107,6 +231,10 @@ impl SqliteStore {
         // so we can restrict the permissions after the database is connected.
         let db_path = (!is_in_memory).then(|| options.get_filename().to_path_buf());
 
+        if !is_in_memory {
+            options = configure_on_disk_durability(options).await?;
+        }
+
         let in_memory_keepalive = if is_in_memory {
             let connection = SqliteConnection::connect_with(&options)
                 .await
@@ -116,10 +244,24 @@ impl SqliteStore {
             None
         };
 
+        let relaxed_options =
+            (!is_in_memory).then(|| options.clone().synchronous(SqliteSynchronous::Normal));
+
         let pool = pool_options
             .connect_with(options)
             .await
             .map_err(|e| map_db_error(&e))?;
+
+        // SQLite serializes writers, so one connection is enough for the
+        // relaxed pool.
+        let relaxed_pool = match relaxed_options {
+            Some(relaxed_options) => SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(relaxed_options)
+                .await
+                .map_err(|e| map_db_error(&e))?,
+            None => pool.clone(),
+        };
 
         // Tighten the permissions of the database file to owner-only access (0o600).
         if let Some(path) = db_path {
@@ -128,6 +270,7 @@ impl SqliteStore {
 
         Ok(Self {
             pool,
+            relaxed_pool,
             in_memory_keepalive,
         })
     }
@@ -182,6 +325,7 @@ impl SqliteStore {
     /// Do not call from runtime code; this tears down the active pool.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn close(&self) {
+        self.relaxed_pool.close().await;
         self.pool.close().await;
         if let Some(keepalive) = &self.in_memory_keepalive {
             let connection = keepalive.lock().await.take();
@@ -225,6 +369,33 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         Ok(())
     }
 
+    /// Create an object with `synchronous=NORMAL` durability.
+    ///
+    /// Same semantics as [`Self::put_if`] with [`WriteCondition::MustCreate`],
+    /// except that a power loss or kernel crash shortly after the call returns
+    /// may roll the insert back. Use it only for objects whose absence denies
+    /// access, never for writes that revoke or tighten anything.
+    pub async fn create_relaxed(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<WriteResult> {
+        insert_new_object(
+            &self.relaxed_pool,
+            object_type,
+            id,
+            name,
+            workspace,
+            payload,
+            labels,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn put_if(
         &self,
@@ -240,29 +411,16 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
 
         match condition {
             WriteCondition::MustCreate => {
-                // Insert only - fail if object exists
-                sqlx::query(
-                    r#"
-INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)
-"#,
+                insert_new_object(
+                    &self.pool,
+                    object_type,
+                    id,
+                    name,
+                    workspace,
+                    payload,
+                    labels,
                 )
-                .bind(object_type)
-                .bind(id)
-                .bind(name)
-                .bind(workspace)
-                .bind(payload)
-                .bind(now_ms)
-                .bind(labels.unwrap_or("{}"))
-                .execute(&self.pool)
                 .await
-                .map_err(|e| map_db_error(&e))?;
-
-                Ok(WriteResult {
-                    resource_version: 1,
-                    created_at_ms: now_ms,
-                    updated_at_ms: now_ms,
-                })
             }
             WriteCondition::MatchResourceVersion(expected_version) => {
                 // Update with version check

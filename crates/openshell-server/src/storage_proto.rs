@@ -118,8 +118,10 @@ mod tests {
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
+    // Public relay lifecycle additions do not change persisted types. The
+    // durable and overlap fingerprints below remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "2209ae329ea5cd1f6dbb69dfc769e19a4b0d0c62509cfd6b91142f9081c9b276";
+        "6edd71598f22b1e99a85d63067e3b574da823d7f16f2841b092152476858f66b";
     const DURABLE_SCHEMA_SHA256: &str =
         "9eeaa29dfba187bff69fb7bc4f9a13a0f1d7be3f7049a38c8f0e20ce77ec7d8b";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =

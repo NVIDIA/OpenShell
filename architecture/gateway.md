@@ -95,7 +95,25 @@ in-memory extension. Replay reauthorizes original and current effective scopes,
 requires the same effective payload, and reruns current interceptor validation.
 Interceptors cannot mutate the request UUID. Server-marked replay suppresses
 post-commit observation, which remains best-effort rather than an outbox.
-Credential capabilities and streaming execution require separate contracts.
+Credential capabilities require separate contracts.
+
+Both exec RPCs share keyed admission but defer completion to the SSH producer.
+The initial interactive Start uses the exec request schema under a distinct RPC
+namespace; later stdin and resize frames are not replayable inputs. Admission
+resolves the public sandbox name and workspace, durably binds both original and
+effective sandbox UUIDs, and rejects same-name replacements. When the original
+and effective selectors match, both authorization lookups must resolve the same
+workspace and sandbox identities before admission. A different effective target
+is allowed only when the selector changes. The owner checks the effective UUID
+again before relay opening, then hands its CAS-only finalizer to the owned producer,
+releasing the shared admission-worker permit after handoff. Only a confirmed
+remote exit records a terminal marker and starts 24-hour retention. Synthetic
+timeouts, disconnects without exit confirmation, and persistence failures leave
+permanent unresolved claims. Duplicates never launch, attach, or replay output:
+pending records report uncertainty, and terminal records report stream
+unavailability. Existing transport cancellation behavior remains unchanged.
+Exec timeouts retain the public duration's precision and presence: an absent
+timeout is unbounded, while an explicit zero is a finite timeout.
 
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
 The default local single-user deployment mode is mTLS user authentication:
@@ -324,6 +342,8 @@ driver/runtime identity recorded at provisioning before returning the current
 generation-bound session JWT. Session authentication checks the durable runtime
 generation and token lineage for every sandbox RPC, so a replaced runtime and
 legacy unbound tokens cannot retain provider or control-plane access. The
+gateway admits only explicitly typed, generation-bound session JWTs for sandbox
+RPCs. It does not accept the pre-session untyped JWT format. The
 Kubernetes driver uses its own named configuration to run TokenReview and
 verify the live pod and controlling Sandbox CR. Its runtime identity binds the
 namespace, immutable Sandbox CR UID, and supervisor Pod UID. Restart preserves
@@ -338,11 +358,12 @@ can recover that same successor for 30 seconds when the request matches, but it
 cannot authorize ordinary RPCs or choose another successor. Advancing the
 successor removes that retry path across every gateway replica. Short
 `gateway_jwt.ttl_secs` lifetimes still bound the exposure of a current bearer
-that has not yet been refreshed.
-Omitting `gateway_jwt.ttl_secs` selects non-expiring tokens for local
-single-player Docker, Podman, and VM gateways; those tokens carry `exp = 0`.
-Kubernetes and other shared deployments should set a positive TTL. Explicit
-zero is rejected.
+that has not yet been refreshed. Omitting `gateway_jwt.ttl_secs` selects
+non-expiring launch-scoped gateway and Sandbox Protocol tokens for local
+single-player Docker, Podman, and VM gateways; both token profiles carry
+`exp = 0`. Typed extension JWTs retain a 900-second default when the field is
+omitted. Kubernetes and other shared deployments should set a positive TTL.
+Explicit zero is rejected.
 
 Gateway JWT signing-key rotation is currently an offline operator action. The
 runtime loads one active signing key and one matching public verification key
@@ -439,6 +460,82 @@ The gateway API is organized around platform objects and operational streams:
 Domain objects use shared metadata: stable server-generated IDs, human-readable
 names, creation timestamps, and labels. Crate-level details live in
 `crates/openshell-core/README.md`.
+
+### Watch streams
+
+`WatchSandbox` merges three per-sandbox sources into one client stream: status
+snapshots, server/sandbox logs, and platform events. Logs and platform events
+are resumable; a shared per-sandbox allocator stamps each with a `cursor`.
+Cursor-ordered delivery is guaranteed for the replay phase: on resume the
+buffered events from both sources are sorted before emission. Live events are
+monotonic within each source, but the two sources are read independently, so a
+client should order across sources by `cursor` rather than by arrival. Status
+snapshots and warnings are re-read on demand and carry an empty cursor.
+
+#### Cursor spaces
+
+A sandbox's cursors live in a **cursor space**: a `{epoch, seq}` pair, where the
+epoch is a UUID minted on the first publish and `seq` counts from 1. The epoch
+is dropped by `TracingLogBus::remove`, so a teardown — or a gateway restart —
+retires the space, and the next publish mints a new one. A sequence number alone
+cannot distinguish a caught-up client from one holding a cursor out of a space
+that no longer exists, because the replacement space reuses the same numbers;
+the epoch answers *which counter issued this*, which is the question resume
+validation actually has to ask. Behind multiple replicas the same rule makes a
+reconnect to a different replica fail loudly rather than return the wrong
+events.
+
+On the wire a cursor is an opaque, fixed-width token. Clients may only compare
+two cursors from one stream and keep the greater; the encoding zero-pads `seq`
+so that byte-wise comparison matches sequence order, which is what lets every
+SDK track a high-water mark without parsing. A stream only ever observes one
+epoch — a reset closes both resumable broadcast receivers, ending the stream
+rather than switching spaces mid-flight — so that comparison is always well
+defined where clients are allowed to use it. The gateway does not rely on it:
+server-side ordering runs on the raw `u64` seq carried alongside each event in
+`CursoredEvent`, never on the token.
+
+The gateway holds a bounded in-memory tail per sandbox. Loss is reported with
+two distinct, documented behaviors:
+
+- **Recoverable lag** — a broadcast receiver falls behind and the server skips
+  ahead. The stream emits a `SandboxStreamWarning` event and continues. Since
+  cursors are opaque, the warning is the client's only signal.
+- **Unrecoverable gap** — the server sends a snapshot, then terminates with
+  `OUT_OF_RANGE`. Three cases reach it: the tail was trimmed past the requested
+  cursor, the cursor's epoch does not match the sandbox's current space, or no
+  space exists because nothing has been published since teardown. The status
+  tells the client to restart with an empty cursor; retrying the same token
+  fails identically. A token the gateway could not have issued is rejected
+  earlier, as `INVALID_ARGUMENT` on the call itself.
+
+Both resumable sources draw from one cursor space, so the server merges them by
+seq before emitting rather than draining each in turn: on resume it replays only
+events after the client's cursor, and without one it replays each bus's retained
+tail. Either way the batch leaves in ascending cursor order. The two tails are
+bounded independently (`log_tail_lines` and `event_tail`), so merging orders
+whatever each bus kept; it does not align their depths.
+
+The broadcast receivers are subscribed before replay, so an event buffered during
+initialization could appear in both replay and the live receiver; the producer
+tracks the highest replayed seq and suppresses live events at or below it, so
+each event is delivered once. That mark is per source. The two tails are read at
+different instants and bounded independently, so one shared mark would let the
+deeper source censor the shallower one — with `event_tail` unset the mark rises
+to the newest buffered log while no platform event is replayed at all, and
+platform events published during initialization are discarded as duplicates of a
+replay that never ran. Subscribing never mints a cursor space, so a
+resume against a torn-down sandbox cannot create the space its stale cursor is
+then checked against. Clients track the highest observed `cursor` and pass it as
+`resume_after_cursor` on reconnect.
+
+The epoch is validated twice on resume: once before reading the tails and again
+once both are in hand, before anything is emitted. The check and each read take
+their locks separately, so a teardown plus a republish can retire the validated
+space and install a replacement in between; the reads would then apply the old
+space's seq to the replacement's buffers, and a trimmed-range check that only
+compares numbers would report no gap while skipping the replacement's lower
+events. The second look ends the stream with `OUT_OF_RANGE` instead.
 
 ## Persistence
 
@@ -648,11 +745,28 @@ Gateway and Sandbox Protocol token responses follow the same convention: a
 present expiration timestamp carries the absolute deadline, while absence means
 the issued token does not expire.
 
+On-disk SQLite databases run in WAL journal mode with `synchronous=FULL`.
+The adapter switches the file to WAL on a single connection before the pool
+opens, then applies both settings to every pooled connection. WAL lets readers
+proceed while a writer commits and reduces each commit to one WAL `fsync`,
+which matters because gateway hot paths such as SSH session issuance and
+revocation are many small autocommit writes. `synchronous` stays at `FULL`
+because some of those writes tighten authorization: under `NORMAL`, a power
+loss could roll back an acknowledged SSH session revocation and make the token
+valid again. Writes that are safe to lose, currently only SSH session issuance
+through `Store::create_relaxed`, use a second single-connection pool with
+`synchronous=NORMAL`. Losing a minted token only invalidates it, and because
+both pools share one WAL, the next `FULL` commit also makes earlier relaxed
+commits durable. Deployments that need multiple replicas use Postgres, where
+`create_relaxed` is an ordinary durable insert. WAL requires a local filesystem with working shared
+memory, so the SQLite file must not live on a network mount, and backups must
+use `sqlite3 .backup` or `VACUUM INTO` rather than copying the main file alone.
+
 The SQLite adapter tightens the on-disk database file to mode `0o600` on every
 connect so that provider API keys, SSH session tokens, and sandbox metadata are
 not readable by other local users on shared hosts. The same restriction is
-reapplied to the `<db>-wal` and `<db>-shm` sidecars (created by SQLite's
-default WAL journal mode), which mirror the same sensitive contents.
+reapplied to the `<db>-wal` and `<db>-shm` sidecars that WAL mode creates,
+which mirror the same sensitive contents.
 
 Persisted state includes sandboxes, providers, provider profiles, provider
 credential refresh state, SSH sessions, policy revisions, settings, deployment
@@ -764,10 +878,16 @@ modes:
 and `page_token` fields, and responses carry `next_page_token`. The gateway
 clamps page sizes to 1,000 and returns opaque base64url continuation tokens.
 Tokens bind the RPC and every request parameter except `page_size`, contain no
-authorization grant, and use immutable keyset cursors rather than database
-offsets. Each page repeats normal authentication and authorization. Pagination
-is weakly consistent under concurrent writes and deletes; it does not provide a
-historical snapshot.
+authorization grant, and use immutable keyset cursors. Each page repeats normal
+authentication and authorization. Pagination is resumable and keyset-based; it
+does not provide a historical snapshot while the collection is mutated
+concurrently.
+
+Object-backed lists (`ListSandboxTemplates`, `ListSandboxes`, `ListServices`,
+`ListProviders`, `ListWorkspaces`, and `ListWorkspaceMembers`) sort ascending
+by `(created_at_ms, name, workspace, id)`. `ListProviderProfiles` sorts
+ascending by `(id, scope)`, and `ListSandboxPolicies` sorts by descending policy
+version. Provider attachments sort ascending by provider name.
 
 The token wire format is a private shared protobuf used only by the gateway.
 Public request and response messages repeat the standard AIP fields directly
@@ -783,6 +903,16 @@ change.
 Curated Rust, Python, Go, and TypeScript SDK list methods return lazy pagers.
 Advancing a pager issues one list RPC and exposes its continuation token;
 explicit `list_all` helpers are the only curated APIs that exhaust a collection.
+
+**Migration.** This pagination contract is a breaking replacement for the
+former `limit`/`offset` list APIs. Protocol clients must send `page_size` and
+resume only with the returned `next_page_token`; an empty token is the sole
+completion signal. SDK callers that need every item must use the explicit
+full-iteration helper (for example, Rust's `list_all_sandboxes`) rather than
+awaiting `list_sandboxes`, which now returns one-page `Pager` state. Callers
+that need one page should advance that pager once and retain its token. Internal
+full scans use the reusable iteration helpers from the persistence pagination
+audit rather than manually advancing offsets.
 
 Persistence distinguishes one-page operations from exhaustive scans.
 `list_object_page` and `list_message_page` return one keyset page and its next
@@ -949,6 +1079,15 @@ sequenceDiagram
 The same relay pattern backs interactive SSH, command execution, file sync, and
 local service forwarding. The gateway tracks live sessions in memory and
 persists session records so tokens can expire or be revoked.
+
+Graceful gateway shutdown closes supervisor-session admission before stopping
+local compute. It then signals the remaining control sessions to exit and waits
+up to ten seconds for their cleanup, including conditional deletion of persisted
+ownership. Pending connection setup and sessions already removed from the live
+registry remain tracked until cleanup finishes. This lets a replacement
+supervisor claim ownership immediately after restart without deleting a newer
+replica's claim. An incomplete drain is reported as a shutdown error. Closing
+these control sessions does not stop Kubernetes-owned workloads.
 
 Relay liveness has two backstops so a reset supervisor session cannot leave a
 request parked forever. The gateway runs server-side HTTP/2 keepalive on

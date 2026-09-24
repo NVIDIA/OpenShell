@@ -25,6 +25,13 @@ use tracing::info;
 #[command(version = VERSION)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
+    /// Operator-owned JSON policy; omitted means driver config disabled and labels required.
+    #[arg(
+        long,
+        env = "OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON",
+        default_value = "{}"
+    )]
+    admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
     #[arg(long, hide = true, default_value_t = false)]
     internal_run_vm: bool,
 
@@ -274,6 +281,8 @@ async fn main() -> Result<()> {
     }
 
     let driver = VmDriver::new(VmDriverConfig {
+        allow_driver_config: args.admission_config_json.allow_driver_config,
+        resource_admission: args.admission_config_json.resource_admission.clone(),
         grpc_endpoint: args
             .grpc_endpoint
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
@@ -312,7 +321,8 @@ async fn main() -> Result<()> {
     .await
     .map_err(|err| miette::miette!("{err}"))?;
 
-    match listen_mode {
+    let socket_cleanup = driver.clone();
+    let result = match listen_mode {
         ComputeDriverListenMode::Unix {
             socket_path,
             expected_peer_pid,
@@ -343,7 +353,9 @@ async fn main() -> Result<()> {
                 .await
                 .into_diagnostic()
         }
-    }
+    };
+    socket_cleanup.remove_socket_root();
+    result
 }
 
 async fn shutdown_signal() {

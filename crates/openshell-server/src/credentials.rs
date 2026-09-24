@@ -2671,7 +2671,6 @@ socket_path = {socket_path_toml}
                 r#"
 transport = "in_tree"
 namespace = "openshell"
-allow_reference_namespace = true
 "#,
             ),
         )
@@ -2683,13 +2682,6 @@ allow_reference_namespace = true
                 .get("namespace")
                 .and_then(toml::Value::as_str),
             Some("openshell")
-        );
-        assert_eq!(
-            parsed
-                .backend_config
-                .get("allow_reference_namespace")
-                .and_then(toml::Value::as_bool),
-            Some(true)
         );
         assert!(!parsed.backend_config.contains_key("transport"));
     }

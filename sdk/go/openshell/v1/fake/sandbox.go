@@ -814,11 +814,10 @@ func (c *fakeSandboxClient) GetLogs(_ context.Context, _, _ string, _ ...v1.LogO
 	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "GetLogs not implemented in fake client"}
 }
 
-// ListProviders returns stub Provider objects for each provider name
-// attached to the sandbox. The returned providers contain only the Name
-// field, since the fake client does not maintain a full provider registry
-// per sandbox.
-func (c *fakeSandboxClient) ListProviders(_ context.Context, workspace, sandboxName string) ([]*types.Provider, error) {
+// ListProviders returns a pager over stub Provider objects attached to the
+// sandbox. The returned providers contain only the Name field, since the fake
+// client does not maintain a full provider registry per sandbox.
+func (c *fakeSandboxClient) ListProviders(workspace, sandboxName string, opts ...v1.ListOptions) (*v1.Pager[*types.Provider], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
@@ -832,5 +831,17 @@ func (c *fakeSandboxClient) ListProviders(_ context.Context, workspace, sandboxN
 	for i, name := range sb.Spec.Providers {
 		result[i] = &types.Provider{Name: name}
 	}
-	return result, nil
+	var options v1.ListOptions
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	return newSlicePager(result, options.PageSize, options.PageToken)
+}
+
+func (c *fakeSandboxClient) ListAllProviders(ctx context.Context, workspace, sandboxName string, opts ...v1.ListOptions) ([]*types.Provider, error) {
+	pager, err := c.ListProviders(workspace, sandboxName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return pager.All(ctx)
 }

@@ -39,7 +39,6 @@ mod linux {
         BoundaryConfirmation, BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess,
         BoundaryTerminal, ExecSession, LoopbackTarget, ResolvedWorkloadIdentity,
     };
-    use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
     use openshell_sandbox_backend::mediation::{
         self, DnsQueryWire, MediationFrame, MediationFrameKind,
     };
@@ -50,14 +49,18 @@ mod linux {
         isolation_boundary_server::{IsolationBoundary, IsolationBoundaryServer},
     };
     use openshell_sandbox_backend::sandbox_auth::{
-        SandboxConnectionId, SandboxConnectionRegistry, SandboxProtocolAuthenticator,
-        SandboxProtocolPrincipal,
+        SandboxAuthError, SandboxConnectionId, SandboxConnectionRegistry,
+        SandboxProtocolAuthenticator, SandboxProtocolPrincipal,
+    };
+    use openshell_sandbox_backend::{
+        ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM, GPU_RESOURCE_CLAIM,
     };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_stream::wrappers::ReceiverStream;
 
     use openshell_sandbox_backend::boundary_protocol::{
-        AgentSpecWire, BinaryIdentityWire, BoundaryConfig, BoundaryErrorKind,
+        AgentSpecWire, BOUNDARY_CONNECTION_WINDOW_BYTES, BOUNDARY_MAX_CONCURRENT_STREAMS,
+        BOUNDARY_STREAM_WINDOW_BYTES, BinaryIdentityWire, BoundaryConfig, BoundaryErrorKind,
         BoundaryListener as BoundaryListenerConfig, DnsQueryResultWire, ExecSpecWire,
         ExitStatusWire, MediationTimingWire, NativeLinuxSandboxAuditEvidence, OutputWindowWire,
         ProcessKindWire, ProcessSnapshotWire, Request, RequestEnvelope, Response, ResponseEnvelope,
@@ -80,7 +83,12 @@ mod linux {
     const MAX_REPLAY_LEDGER_ENTRIES: usize = 4096;
     const MAX_RETAINED_EXEC_PROCESSES: usize = 64;
 
+    // NVML may traverse the persistenced socket directory during initialization;
+    // WSL2 supplies GPU libraries under /usr/lib/wsl and the /dev/dxg device.
     const GPU_BASELINE_READ_ONLY: &[&str] = &["/run/nvidia-persistenced", "/usr/lib/wsl"];
+    // CUDA opens device nodes read-write and writes thread names through
+    // /proc/<pid>/task/<tid>/comm during cuInit(). A /proc/self rule would bind
+    // to the launcher's inodes, not those of its workload children.
     const GPU_BASELINE_READ_WRITE: &[&str] = &[
         "/dev/nvidiactl",
         "/dev/nvidia-uvm",
@@ -95,8 +103,8 @@ mod linux {
     }
 
     /// Add the filesystem paths required by GPU devices visible inside the
-    /// workload container. The companion supervisor intentionally has no GPU
-    /// devices, so it cannot discover these paths on the sandbox's behalf.
+    /// workload. The supervisor's device namespace can differ from the
+    /// workload's, so discovery must happen here, gated by the resource claim.
     fn enrich_gpu_filesystem_paths(
         policy: &mut openshell_core::policy::SandboxPolicy,
         gpu_requested: bool,
@@ -389,6 +397,10 @@ mod linux {
             .resource_claims
             .get(GPU_RESOURCE_CLAIM)
             .is_some_and(|value| value == "true")
+            || config
+                .resource_claims
+                .get(ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM)
+                .is_some_and(|value| value == "true")
     }
 
     fn supplementary_groups_match(actual: &[u32], expected: &[u32], allow_extra: bool) -> bool {
@@ -587,12 +599,9 @@ mod linux {
         let result = tonic::transport::Server::builder()
             .http2_keepalive_interval(Some(CONTROL_KEEPALIVE_INTERVAL))
             .http2_keepalive_timeout(Some(CONTROL_KEEPALIVE_TIMEOUT))
-            .max_concurrent_streams(
-                u32::try_from(MAX_CONTROL_CONNECTIONS)
-                    .map_err(|error| format!("invalid control connection limit: {error}"))?,
-            )
-            .initial_stream_window_size(16 * 1024 * 1024)
-            .initial_connection_window_size(16 * 1024 * 1024)
+            .max_concurrent_streams(BOUNDARY_MAX_CONCURRENT_STREAMS)
+            .initial_stream_window_size(BOUNDARY_STREAM_WINDOW_BYTES)
+            .initial_connection_window_size(BOUNDARY_CONNECTION_WINDOW_BYTES)
             .add_service(
                 IsolationBoundaryServer::new(GrpcBoundaryService {
                     runtime: runtime.clone(),
@@ -691,6 +700,10 @@ mod linux {
         }
 
         fn update(&self, expires_at: i64) {
+            if expires_at == 0 {
+                self.set_deadline(None);
+                return;
+            }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_secs());
@@ -701,11 +714,15 @@ mod linux {
         }
 
         fn update_deadline(&self, deadline: tokio::time::Instant) {
+            self.set_deadline(Some(deadline));
+        }
+
+        fn set_deadline(&self, deadline: Option<tokio::time::Instant>) {
             let _ = self.deadline.send_if_modified(|current| {
-                if *current == Some(deadline) {
+                if *current == deadline {
                     false
                 } else {
-                    *current = Some(deadline);
+                    *current = deadline;
                     true
                 }
             });
@@ -1266,17 +1283,24 @@ mod linux {
         };
         let is_attach = supervisor_instance_id.is_some();
         let is_confirm = matches!(&request.request, Request::Confirm);
-        let response = ResponseEnvelope {
+        let mut response = ResponseEnvelope {
             request_id: request.request_id.clone(),
             response: runtime.dispatch(request),
         };
+        // Report commit failures to the supervisor: a silently closed stream
+        // is indistinguishable from transport loss.
         if is_attach && matches!(&response.response, Response::Attached { .. }) {
             let supervisor_instance_id = supervisor_instance_id
                 .ok_or_else(|| "attach request lost supervisor instance identity".to_string())?;
-            runtime.commit_attach(principal, supervisor_instance_id)?;
+            if let Err((kind, message)) = runtime.commit_attach(principal, supervisor_instance_id) {
+                response.response = guest_error(kind, message);
+            }
         }
-        if is_confirm && matches!(&response.response, Response::Confirmed { .. }) {
-            runtime.commit_confirm(principal)?;
+        if is_confirm
+            && matches!(&response.response, Response::Confirmed { .. })
+            && let Err((kind, message)) = runtime.commit_confirm(principal)
+        {
+            response.response = guest_error(kind, message);
         }
         write_frame(&mut stream, &response)
             .map_err(|error| format!("write control frame: {error}"))?;
@@ -1392,8 +1416,8 @@ mod linux {
         sandbox_id: String,
         spec: AgentSpecWire,
         policy: SandboxPolicyWire,
-        ca_cert: Option<Vec<u8>>,
-        ca_bundle: Option<Vec<u8>>,
+        ca_cert: Option<String>,
+        ca_bundle: Option<String>,
         provider_env_revision: u64,
         provider_env: std::collections::HashMap<String, String>,
     }
@@ -1626,22 +1650,22 @@ mod linux {
             &self,
             principal: &SandboxProtocolPrincipal,
             supervisor_instance_id: openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId,
-        ) -> Result<(), String> {
+        ) -> Result<(), CommitError> {
             if let Some(replaced) = self
                 .connections
                 .attach(principal, supervisor_instance_id)
-                .map_err(|error| error.to_string())?
+                .map_err(connection_auth_error)?
             {
                 self.close_connection(replaced);
             }
             Ok(())
         }
 
-        fn commit_confirm(&self, principal: &SandboxProtocolPrincipal) -> Result<(), String> {
+        fn commit_confirm(&self, principal: &SandboxProtocolPrincipal) -> Result<(), CommitError> {
             let replaced = self
                 .connections
                 .confirm(principal)
-                .map_err(|error| error.to_string())?;
+                .map_err(connection_auth_error)?;
             let process = {
                 let state = lock(&self.state);
                 match &*state {
@@ -1658,13 +1682,19 @@ mod linux {
                     SupervisorConnectionState::Terminating | SupervisorConnectionState::Terminal
                 ) {
                     self.connections.mark_terminal();
-                    return Err("sandbox session is terminating".to_string());
+                    return Err((
+                        BoundaryErrorKind::Terminated,
+                        "sandbox session is terminating".to_string(),
+                    ));
                 }
                 if matches!(*connection, SupervisorConnectionState::Frozen { .. })
                     && let Some(process) = process
                 {
                     if !process.boundary_runtime.resume() {
-                        return Err("frozen workload could not be resumed".to_string());
+                        return Err((
+                            BoundaryErrorKind::Process,
+                            "frozen workload could not be resumed".to_string(),
+                        ));
                     }
                     tracing::info!(
                         connection_id = ?principal.connection_id(),
@@ -2387,8 +2417,8 @@ mod linux {
             sandbox_id: String,
             spec: AgentSpecWire,
             policy: SandboxPolicyWire,
-            ca_cert: Option<Vec<u8>>,
-            ca_bundle: Option<Vec<u8>>,
+            ca_cert: Option<String>,
+            ca_bundle: Option<String>,
             provider_env_revision: u64,
             provider_env: std::collections::HashMap<String, String>,
         ) -> Response {
@@ -2667,8 +2697,8 @@ mod linux {
     }
 
     fn install_ca_material(
-        ca_cert: Option<Vec<u8>>,
-        ca_bundle: Option<Vec<u8>>,
+        ca_cert: Option<String>,
+        ca_bundle: Option<String>,
     ) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>, String> {
         let (ca_cert, ca_bundle) = match (ca_cert, ca_bundle) {
             (Some(ca_cert), Some(ca_bundle)) => (ca_cert, ca_bundle),
@@ -2681,8 +2711,8 @@ mod linux {
         };
         install_ca_material_at(
             Path::new(openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR),
-            &ca_cert,
-            &ca_bundle,
+            ca_cert.as_bytes(),
+            ca_bundle.as_bytes(),
         )
     }
 
@@ -3053,6 +3083,17 @@ mod linux {
             || ExitStatusWire::Exited(status.code()),
             ExitStatusWire::Signaled,
         )
+    }
+
+    type CommitError = (BoundaryErrorKind, String);
+
+    fn connection_auth_error(error: SandboxAuthError) -> CommitError {
+        let kind = match error {
+            SandboxAuthError::ConnectionStillActive => BoundaryErrorKind::Unavailable,
+            SandboxAuthError::TerminalSession => BoundaryErrorKind::Terminated,
+            _ => BoundaryErrorKind::Denied,
+        };
+        (kind, error.to_string())
     }
 
     fn guest_error(kind: BoundaryErrorKind, message: impl Into<String>) -> Response {
@@ -3645,7 +3686,7 @@ mod linux {
                 key.serialize_pem().as_bytes(),
                 "test-key",
                 "test-gateway",
-                DEFAULT_SESSION_TOKEN_TTL,
+                Some(DEFAULT_SESSION_TOKEN_TTL),
                 Arc::new(SystemJwtClock),
             )
             .expect("test session issuer");
@@ -3835,6 +3876,33 @@ mod linux {
         }
 
         #[test]
+        fn generic_identity_claim_allows_runtime_supplementary_groups() {
+            let config = BoundaryConfig {
+                boundary_id: "sandbox-1".to_string(),
+                generation: "generation-1".to_string(),
+                session_id: test_session_id(),
+                session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                    .expect("session rotation"),
+                auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+                gateway_id: "test-gateway".to_string(),
+                verification_keys: vec![],
+                listener: BoundaryListenerConfig::Vsock {
+                    control_port: 5500,
+                    tls: placeholder_server_tls(),
+                },
+                resource_claims: std::collections::BTreeMap::from([(
+                    ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM.to_string(),
+                    "true".to_string(),
+                )]),
+                resource_claim_files: std::collections::BTreeMap::new(),
+                workload_identity: test_workload_identity(),
+                outer_fence: test_outer_fence(),
+                child_env: std::collections::HashMap::new(),
+            };
+            assert!(allows_runtime_supplementary_groups(&config));
+        }
+
+        #[test]
         fn control_connection_slots_bound_authenticated_sessions() {
             let active = Arc::new(AtomicUsize::new(MAX_CONTROL_CONNECTIONS - 1));
             let slot = acquire_control_connection_slot(&active).expect("last available slot");
@@ -3931,6 +3999,26 @@ mod linux {
                 .expect("expiry worker must keep the shutdown channel open");
         }
 
+        #[tokio::test]
+        async fn non_expiring_connection_has_no_deadline() {
+            let (shutdown, mut closed) = tokio::sync::watch::channel(());
+            let expiry = ConnectionExpiry::new(shutdown);
+            expiry.update_deadline(tokio::time::Instant::now() + Duration::from_millis(20));
+            expiry.update(0);
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(80), closed.changed())
+                    .await
+                    .is_err(),
+                "non-expiring credentials must clear the connection deadline"
+            );
+            expiry.update_deadline(tokio::time::Instant::now() + Duration::from_millis(20));
+            tokio::time::timeout(Duration::from_millis(80), closed.changed())
+                .await
+                .expect("replacement connection deadline must fire")
+                .expect("expiry worker must keep the shutdown channel open");
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn idle_uds_and_tcp_handshakes_do_not_consume_authenticated_slots() {
             let directory = tempfile::tempdir().unwrap();
@@ -3994,6 +4082,19 @@ mod linux {
                 *lock(&runtime.supervisor_connection),
                 SupervisorConnectionState::Connected(first_id)
             );
+            let early = runtime
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &token).metadata(),
+                )
+                .expect("early replacement principal");
+            assert!(
+                matches!(
+                    runtime.commit_attach(&early, supervisor_instance_id),
+                    Err((BoundaryErrorKind::Unavailable, _))
+                ),
+                "reattach before the old transport is retired must be retryable"
+            );
 
             runtime.transport_disconnected(first_id);
             let connection_state = *lock(&runtime.supervisor_connection);
@@ -4016,7 +4117,7 @@ mod linux {
                 .expect("reattach replacement");
             assert_eq!(
                 runtime.connections.require_active(&replacement),
-                Err(openshell_sandbox_backend::sandbox_auth::SandboxAuthError::ConnectionNotAttached)
+                Err(SandboxAuthError::ConnectionNotAttached)
             );
             runtime
                 .commit_confirm(&replacement)
@@ -4092,7 +4193,7 @@ mod linux {
             );
             assert_eq!(
                 runtime.connections.require_active(&principal),
-                Err(openshell_sandbox_backend::sandbox_auth::SandboxAuthError::TerminalSession)
+                Err(SandboxAuthError::TerminalSession)
             );
         }
 
@@ -4329,6 +4430,7 @@ mod linux {
                     task_memory_read: true,
                     task_memory_write: true,
                     cancellation: true,
+                    task_memory_writes_disabled: false,
                 },
                 landlock_abi: 6,
                 landlock_allow_deny: true,

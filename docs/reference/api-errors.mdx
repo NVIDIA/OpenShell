@@ -34,6 +34,7 @@ Recognized gateway reasons include the following.
 | `REQUEST_ID_PAYLOAD_MISMATCH` | `FAILED_PRECONDITION` | Keep the original payload for that request ID. Inspect the original operation before submitting a different one. |
 | `REQUEST_OUTCOME_UNCERTAIN` | `FAILED_PRECONDITION` | An attempt is admitted but has no confirmed replayable success. Observe resource state and reconcile effects. Do not switch to a new ID to bypass the admission. |
 | `REQUEST_REPLAY_UNAVAILABLE` | `FAILED_PRECONDITION` | The original scope, resource, interceptor transformation, or fingerprint key is no longer replayable. Reconcile effects; the gateway does not execute the request again. Missing private-key material can also reject admission before work starts. |
+| `REQUEST_STREAM_UNAVAILABLE` | `FAILED_PRECONDITION` | The exec attempt terminated, but its output was not stored. Reconcile command effects; the gateway does not launch it again or recreate its stream. |
 
 ## Status and retry guidance
 
@@ -184,11 +185,54 @@ The gateway also limits detached admission workers to 64 per process and these
 request messages to 4 MiB.
 
 Supply IDs through generated/raw RPC clients. Curated SDK request-ID helpers and
-automatic retry policies are not part of this contract yet. Exec, SSH sessions,
+automatic retry policies are not part of this contract yet. SSH sessions,
 rootfs staging, and supervisor-authenticated mutations do not gain deduplication
 from this feature. Sandbox principals cannot opt into `UpdateConfig` admission.
 Check gateway compatibility
 before relying on IDs; older protobuf servers can silently ignore unknown fields.
+
+## Exec launch admission
+
+`ExecSandbox` and `ExecSandboxInteractive` accept an optional `request_id` in
+`ExecSandboxRequest`. For interactive exec, supply it in the initial `start`
+message. The UUID rules, keyed fingerprints, current authorization checks,
+per-caller quota, and request-size limit above also apply to exec.
+
+The gateway admits one owner before opening the supervisor relay. Both RPCs
+fingerprint the command, sandbox name, workspace selector, environment, initial
+stdin, and other start fields, excluding the request ID. Admission also binds the
+resolved sandbox UUID, so a replacement with the same name cannot receive the
+original launch. If the sandbox is replaced between authorization lookups for an
+unchanged name and workspace selector, the gateway returns
+`REQUEST_REPLAY_UNAVAILABLE` before admitting or launching the command.
+The RPCs use separate method namespaces.
+Later interactive stdin and resize messages are not part of the fingerprint and
+cannot be submitted through a duplicate stream.
+
+| Admitted attempt | Duplicate response |
+|---|---|
+| Still running, interrupted, timed out, or missing confirmed exit status | `REQUEST_OUTCOME_UNCERTAIN`. The record does not expire or permit another launch. |
+| Confirmed remote exit, including a nonzero exit code | `REQUEST_STREAM_UNAVAILABLE` for 24 hours after durable completion. No output, exit code, stream attachment, or stdin is replayed. |
+| Changed start payload | `REQUEST_ID_PAYLOAD_MISMATCH`. The changed command does not run. |
+| Sandbox replaced under the same name | `REQUEST_REPLAY_UNAVAILABLE`. The replacement does not receive the command. |
+
+The terminal receipt contains only a marker and completion time, not commands,
+environment values, stdin, stdout, or stderr. Receiving a stream handle is not
+completion. A gateway-generated timeout exit code of `124` does not prove the
+remote process stopped, so it leaves the admission unresolved. A confirmed remote
+exit code of `124` is a terminal result.
+
+Cancellation does not undo admission. Existing transport behavior still applies
+to the original execution, including interactive SSH closure on disconnect; the
+gateway does not promise that a disconnected command continues. When it loses
+exit confirmation, the record remains unresolved even after restart. Current
+authorization is checked before duplicate lookup, and the resolved sandbox UUID
+must match the original admission before the gateway returns its recorded outcome.
+
+After confirmed terminal retention expires, the same ID can start a new command.
+Do not reuse an old ID without reconciling its effects. Empty IDs keep the existing
+streaming behavior without launch deduplication. Use generated/raw RPC clients
+for this opt-in contract; curated SDK helpers and automatic retries are separate.
 
 ## Deletion outcomes
 

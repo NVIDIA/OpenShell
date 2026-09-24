@@ -2,6 +2,14 @@
 
 Kubernetes-backed compute driver for OpenShell cluster deployments.
 
+Caller driver config is disabled by default. External resource references need
+administrator-controlled approval labels in every workspace mode, including
+before restart and scheduling-gate release. GPU devices are temporarily exempt.
+Image-pull Secrets are operator-selected gateway configuration rather than caller
+attachments. Managed mode stages an immutable copy for each sandbox runtime
+generation.
+See [resource admission configuration](../../docs/reference/gateway-config.mdx#external-resource-admission).
+
 The driver uses the Kubernetes API to create, delete, fetch, and watch sandbox
 custom resources. It runs in-process with the gateway server and supports three
 workspace namespace modes via `workspace_mode`:

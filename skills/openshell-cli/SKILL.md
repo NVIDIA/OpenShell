@@ -301,8 +301,15 @@ openshell sandbox template create gpu-kata \
 openshell sandbox create --name my-sandbox --template gpu-kata --provider my-github -- claude
 ```
 
-Direct `sandbox create --driver-config-json` remains valid for one-off
-creates. Put driver config on a template only when it should be reused.
+Driver config is disabled by default. These template and one-off
+`sandbox create --driver-config-json` examples require the administrator to set
+`allow_driver_config = true` for the selected driver. This does not waive
+resource admission: external attachments need administrator-controlled approval
+labels on the actual resources, not sandbox labels. GPU device attachments
+are temporarily exempt from labels; the public `--gpu` flag needs no driver
+config opt-in. Consult the published gateway configuration reference before
+changing admission settings; do not recommend disabling admission to bypass a
+denial. Put driver config on a template only when it should be reused.
 
 ### Manage sandbox workload templates
 
@@ -345,14 +352,25 @@ openshell sandbox connect my-sandbox --editor vscode
 
 Attaches to the sandbox's existing canonical main process. Disconnecting leaves
 that process running; reconnecting targets the same process instance and replays
-recent output. Use `sandbox exec --tty -- /bin/bash -l` for a new shell. Press
-`Ctrl-P`, then `Ctrl-Q` to disconnect without terminating main. `Ctrl-C` retains
-its normal terminal behavior and interrupts the foreground process. Configure
-VS Code Remote-SSH with:
+recent output. If an established SSH transport is interrupted, such as when a
+laptop sleeps and wakes, the CLI retries transient failures for up to 60 seconds
+and reattaches to that same process. Use `sandbox exec --tty -- /bin/bash -l`
+for a new shell. Press `Ctrl-P`, then `Ctrl-Q` to disconnect without terminating
+main. OpenSSH's `~.` escape looks like transport loss and therefore starts
+automatic recovery; after it reattaches, use `Ctrl-P`, then `Ctrl-Q` to exit, or
+press `Ctrl-C` between retry attempts to cancel recovery. When you own stdin,
+`Ctrl-C` interrupts the foreground process. In a read-only attachment, `Ctrl-C`
+exits the viewer and leaves main and other attachments running. Configure VS
+Code Remote-SSH with:
 
 ```bash
 openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
+
+If `connect` reports `canonical main process already finished`, inspect the
+result with `sandbox get`. A pending
+foreground attachment can still retrieve retained output in `Completed` or
+`Error`; phase alone does not determine whether attachment is available.
 
 ### Upload and download files
 

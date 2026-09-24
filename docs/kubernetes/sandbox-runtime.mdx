@@ -87,6 +87,22 @@ cluster CNI enforces both ingress and egress policies for these namespaces.
 
 ## Bootstrap a Sandbox
 
+Resource admission checks external references selected through the OpenShell-owned
+Pod template before provisioning and again before releasing the workload's
+scheduling gate. Kubernetes API-server and admission-webhook mutations of the
+live Pod are trusted cluster-operator behavior and are not used as Workspace User
+authorization inputs. PVCs and other supported external references require
+operator approval labels, including same-namespace and read-only mounts.
+Unexpected references, changed resource UIDs, and unsupported volume sources fail
+closed. GPU device attachments are temporarily exempt. The driver rechecks
+persisted references on restart and every 30 seconds during reconciliation;
+confirmed revocation suspends compute, while transient lookup failures block new
+launches and recovery.
+
+See [External Resource Admission](../reference/gateway-config#external-resource-admission)
+for label configuration and upgrade requirements. Admission cannot repair data
+or credentials compromised before upgrade.
+
 The driver creates each sandbox generation in a fail-closed order:
 
 1. Create and validate the workload egress fence.
@@ -94,7 +110,10 @@ The driver creates each sandbox generation in a fail-closed order:
 3. Inspect the admitted Pod identity, security context, DNS settings, and
    generation-specific Secret reference.
 4. Create a gated supervisor Pod and separate immutable Secrets for sandbox and
-   supervisor trust material.
+   supervisor trust material. Outside shared mode, the supervisor Secret also
+   carries the gateway client TLS material. In managed mode, the driver also
+   creates immutable copies of the configured image-pull Secrets for the
+   generation.
 5. Remove both scheduling gates.
 6. Publish readiness only after the supervisor attaches, confirms enforcement,
    and registers the gateway relay.
@@ -111,11 +130,11 @@ while preserving the workspace PVC. The namespace-wide workload fence remains
 in place across sandbox generations.
 
 If provisioning is interrupted, recovery first confirms that the old workload
-Pod is gone. It then lists generation Secrets by sandbox and component labels,
-deletes each stale Secret with a UID precondition, and clears the rollback state
-so the next generation can be created. The Helm chart grants the gateway
-`create`, `list`, and `delete` access to Secrets for this lifecycle. Listing is
-required even when no generation Secrets remain.
+Pod is gone. It then deletes the recorded generation's Secrets by name and
+clears the rollback state so the next generation can be created. Each
+generation Secret is owned by its Pod, so Kubernetes garbage collection removes
+any other generation. The Helm chart grants the gateway `create` and `delete`
+access to Secrets for this lifecycle.
 
 ## Check Cluster Requirements
 

@@ -13,6 +13,7 @@ use openshell_core::proto::compute::v1::DriverSandbox;
 use openshell_isolation_interface::contract::{
     OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
 };
+use openshell_sandbox_backend::ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
@@ -20,8 +21,8 @@ use openshell_sandbox_backend::boundary_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-pub const LABEL_ROLE: &str = "openshell.io/isolation-role";
-pub const WORKLOAD_FILTER: &str = "openshell.io/isolation-role=sandbox";
+pub const LABEL_ROLE: &str = "openshell.ai/isolation-role";
+pub const WORKLOAD_FILTER: &str = "openshell.ai/isolation-role=sandbox";
 pub const CHANNEL_ROOT: &str = "/.openshell/channel";
 pub const BOOTSTRAP_PATH: &str = "/.openshell/channel/sandbox/bootstrap.json";
 pub const RUNTIME_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descriptor.json";
@@ -68,6 +69,12 @@ pub fn supervisor_name(id: &str) -> String {
 }
 pub fn channel_volume_name(id: &str) -> String {
     format!("openshell-channel-{id}")
+}
+
+/// `keep-id` may retain the gateway user's supplementary groups in the
+/// container. Other user-namespace modes, including `auto`, do not.
+pub fn userns_preserves_host_groups(userns: Option<&str>) -> bool {
+    userns.is_some_and(|mode| mode.split(':').next() == Some("keep-id"))
 }
 
 fn invalid(error: impl std::fmt::Display) -> ComputeDriverError {
@@ -188,26 +195,48 @@ pub struct RestartMetadata {
     pub(crate) child_env: HashMap<String, String>,
 }
 
+pub struct BootstrapArchivesInput<'a> {
+    pub sandbox_id: &'a str,
+    pub container_id: &'a str,
+    pub generation: &'a str,
+    pub host_gateway_ip: std::net::IpAddr,
+    pub identity: &'a ResolvedWorkloadIdentity,
+    pub allow_extra_supplementary_groups: bool,
+    pub child_env: HashMap<String, String>,
+    pub launch_authentication: &'a openshell_core::jwt::SandboxLaunchAuthentication,
+}
+
 /// The shared volume contains only sandbox credentials. Supervisor credentials,
 /// gateway authorization, and the restart copy never enter that volume.
 pub fn bootstrap_archives(
-    sandbox_id: &str,
-    container_id: &str,
-    generation: &str,
-    identity: &ResolvedWorkloadIdentity,
-    child_env: HashMap<String, String>,
-    launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
+    input: BootstrapArchivesInput<'_>,
 ) -> Result<BootstrapArchives, ComputeDriverError> {
+    let BootstrapArchivesInput {
+        sandbox_id,
+        container_id,
+        generation,
+        host_gateway_ip,
+        identity,
+        allow_extra_supplementary_groups,
+        child_env,
+        launch_authentication,
+    } = input;
     launch_authentication.validate().map_err(invalid)?;
     let session_id = launch_authentication.supervisor.session_id;
     let tls = generate_sandbox_tls_material(session_id).map_err(invalid)?;
-    let resource_claims = BTreeMap::from([
+    let mut resource_claims = BTreeMap::from([
         ("podman.container_id".into(), container_id.into()),
         (
             "podman.image_identity".into(),
             identity.resource_digest.clone(),
         ),
     ]);
+    if allow_extra_supplementary_groups {
+        resource_claims.insert(
+            ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM.into(),
+            "true".into(),
+        );
+    }
     let runtime_generation = launch_authentication
         .supervisor
         .runtime_generation
@@ -263,7 +292,7 @@ pub fn bootstrap_archives(
             server_name: tls.server_name,
             trust_anchor_pem: tls.trust_anchor_pem,
         },
-        host_gateway_ip: None,
+        host_gateway_ip: Some(host_gateway_ip),
         resource_claims,
         workload_identity: identity.clone(),
         outer_fence,
@@ -491,14 +520,16 @@ mod tests {
         .unwrap();
         let authentication = authentication();
         let child_env = HashMap::from([("PATH".to_string(), "/agent/bin".to_string())]);
-        let archives = bootstrap_archives(
-            "sandbox",
-            "container",
-            "generation-1",
-            &identity,
-            child_env.clone(),
-            &authentication,
-        )
+        let archives = bootstrap_archives(BootstrapArchivesInput {
+            sandbox_id: "sandbox",
+            container_id: "container",
+            generation: "generation-1",
+            host_gateway_ip: "127.0.0.1".parse().unwrap(),
+            identity: &identity,
+            allow_extra_supplementary_groups: false,
+            child_env: child_env.clone(),
+            launch_authentication: &authentication,
+        })
         .unwrap();
         let workload = files(&archives.channel);
         let supervisor = files(&archives.supervisor);
@@ -537,10 +568,19 @@ mod tests {
         assert_eq!(config.session_id, runtime_descriptor.session_id);
         assert_eq!(config.outer_fence, runtime_descriptor.outer_fence);
         assert_eq!(config.workload_identity, identity);
+        assert_eq!(
+            runtime_descriptor.host_gateway_ip,
+            Some("127.0.0.1".parse().unwrap())
+        );
         runtime_descriptor
             .outer_fence
             .validate(&runtime_descriptor.generation)
             .unwrap();
+        assert!(
+            !config
+                .resource_claims
+                .contains_key(ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM)
+        );
         let restart_metadata: RestartMetadata = serde_json::from_slice(
             supervisor
                 .get(&PathBuf::from(
@@ -557,5 +597,16 @@ mod tests {
                 .windows(b"PRIVATE KEY".len())
                 .any(|window| window == b"PRIVATE KEY")
         );
+    }
+
+    #[test]
+    fn keep_id_is_the_only_userns_mode_that_preserves_host_groups() {
+        assert!(userns_preserves_host_groups(Some("keep-id")));
+        assert!(userns_preserves_host_groups(Some(
+            "keep-id:uid=1000,gid=1000"
+        )));
+        assert!(!userns_preserves_host_groups(Some("auto")));
+        assert!(!userns_preserves_host_groups(Some("private")));
+        assert!(!userns_preserves_host_groups(None));
     }
 }

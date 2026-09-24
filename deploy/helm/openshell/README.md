@@ -22,7 +22,7 @@ multiple pre-provisioned workspace namespaces.
 The Kubernetes Agent Sandbox CRDs and controller must be installed on the cluster before deploying OpenShell. Install them with:
 
 ```shell
-kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/manifest.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/sandbox.yaml
 ```
 
 The chart does not install this cluster-scoped dependency. By default, it
@@ -209,6 +209,14 @@ discovery endpoint or its TLS CA.
 | certManager.serverIpAddresses | list | `["127.0.0.1"]` | IP SANs on the cert-manager-issued server certificate. |
 | certManager.serverIssuerRef | object | `{"group":"","kind":"","name":""}` | Override the issuerRef for the external server Certificate (e.g. a real LetsEncrypt/ACME ClusterIssuer for a publicly-trusted cert on an external hostname). When set, the chart creates a second server certificate from this issuer with only the hostnames in serverDnsNames; the internal server certificate is always signed by the chart's own CA. Leave name empty to use the chart CA for all server certificates (default). Requires certManager.enabled=true. |
 | fullnameOverride | string | `""` | Override the full generated resource name. |
+| gateway.image.digest | string | `""` | Gateway image digest. When set, this takes precedence over tag. |
+| gateway.image.pullPolicy | string | `nil` | Gateway image pull policy. Empty uses global.image.pullPolicy. |
+| gateway.image.registry | string | `""` | Gateway image registry. Empty uses global.image.registry. |
+| gateway.image.repository | string | `"openshell/gateway"` | Gateway image repository. |
+| gateway.image.tag | string | `""` | Gateway image tag. Defaults to the chart appVersion when empty. |
+| global.image.pullPolicy | string | `"IfNotPresent"` | Shared OpenShell image pull policy. Individual image pull policies take precedence. |
+| global.image.registry | string | `"ghcr.io/nvidia"` | Shared OpenShell image registry. Individual image registries take precedence. |
+| global.image.tag | string | `""` | Shared OpenShell image tag. Defaults to the chart appVersion when empty. |
 | grpcRoute.backendTLSPolicy.caCertificateConfigMapName | string | `""` | Name of the ConfigMap containing the CA certificate (key: ca.crt) used to validate the gateway pod's TLS certificate. Defaults to `<fullname>-backend-ca` when empty. The certgen hook auto-creates this: with pkiInitJob (default), immediately on install/upgrade; with cert-manager, the hook polls for pkiInitJob.timeoutSeconds seconds waiting for cert-manager to issue the server certificate, then creates the ConfigMap. A single install usually succeeds; if cert-manager takes longer, increase pkiInitJob.timeoutSeconds. By default (pkiInitJob.failOnTimeout=true), the install fails if the timeout is reached; set failOnTimeout=false to allow the install to succeed and run `helm upgrade` after the certificate is issued. |
 | grpcRoute.backendTLSPolicy.enabled | bool | `false` | Create a BackendTLSPolicy resource for end-to-end TLS between the Gateway proxy and the OpenShell gateway pod. The traffic flow is: client → HTTPS → Gateway (terminate) → TLS (re-encrypt) → gateway pod. Requires server.disableTls=false and server.tls.enableMtls=false. The certgen hook auto-creates the backend CA ConfigMap. |
 | grpcRoute.backendTLSPolicy.hostname | string | `""` | Hostname the Gateway proxy validates against the backend's TLS certificate SAN. Defaults to the service FQDN (`<fullname>.<namespace>.svc.cluster.local`) when empty, which matches the SAN included by both cert-manager and the pkiInitJob. |
@@ -222,9 +230,6 @@ discovery endpoint or its TLS CA.
 | grpcRoute.gateway.name | string | `""` | Name of the Gateway resource. Defaults to the chart fullname. |
 | grpcRoute.gateway.namespace | string | `""` | Namespace of the Gateway referenced by the GRPCRoute parentRef. Defaults to the release namespace. |
 | grpcRoute.hostnames | list | `[]` | Hostnames the GRPCRoute matches on. Leave empty to match all hosts. |
-| image.pullPolicy | string | `"IfNotPresent"` | Gateway image pull policy. |
-| image.repository | string | `"ghcr.io/nvidia/openshell/gateway"` | Gateway image repository. |
-| image.tag | string | `""` | Gateway image tag. Defaults to the chart appVersion when empty. |
 | imagePullSecrets | list | `[]` | Image pull secrets attached to gateway and helper pods. |
 | nameOverride | string | `"openshell"` | Override the chart name used in generated resource names. |
 | networkPolicy.enabled | bool | `true` | Restrict SSH ingress on sandbox pods to the gateway. In managed mode, the driver applies the equivalent policy to each workspace namespace. |
@@ -254,9 +259,15 @@ discovery endpoint or its TLS CA.
 | probes.startup.timeoutSeconds | int | `1` | Startup probe timeout, in seconds. |
 | replicaCount | int | `1` | Number of OpenShell gateway replicas. Values greater than 1 require server.externalDbSecret because the default SQLite backend is per pod. |
 | resources | object | `{}` | Gateway pod resource requests and limits. |
-| sandboxRuntime.image.pullPolicy | string | `""` | Sandbox runtime image pull policy. Defaults to the gateway image pull policy when empty. |
-| sandboxRuntime.image.repository | string | `"ghcr.io/nvidia/openshell/sandbox"` | Sandbox runtime image repository. Changing it uses the effective gateway image tag unless tag is also set. |
-| sandboxRuntime.image.tag | string | `""` | Sandbox runtime image tag override. Empty uses the version pinned into the gateway unless repository is changed. |
+| sandbox.image.digest | string | `""` | Sandbox image digest. When set, this takes precedence over tag. |
+| sandbox.image.pullPolicy | string | `nil` | Sandbox image pull policy. Leave unset to use the Kubernetes image default. |
+| sandbox.image.repository | string | `"nvcr.io/nvidia/base/ubuntu"` | Default standalone sandbox image repository. |
+| sandbox.image.tag | string | `"24.04"` | Sandbox image tag. Defaults to latest when empty. |
+| sandboxRuntime.image.digest | string | `""` | Sandbox runtime image digest. When set, this takes precedence over tag. |
+| sandboxRuntime.image.pullPolicy | string | `nil` | Sandbox runtime image pull policy. Empty uses global.image.pullPolicy. |
+| sandboxRuntime.image.registry | string | `""` | Sandbox runtime image registry. Empty uses global.image.registry. |
+| sandboxRuntime.image.repository | string | `"openshell/sandbox"` | Sandbox runtime image repository. |
+| sandboxRuntime.image.tag | string | `""` | Sandbox runtime image tag. Defaults to the chart appVersion when empty. |
 | sandboxServiceAccount.annotations | object | `{}` | Annotations to add to the generated sandbox service account. |
 | sandboxServiceAccount.create | bool | `true` | Create a service account for sandbox pods. |
 | sandboxServiceAccount.name | string | `""` | Existing service account name for sandbox pods when sandboxServiceAccount.create is false. |
@@ -265,7 +276,7 @@ discovery endpoint or its TLS CA.
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
 | securityContext.runAsUser | int | `1000` | UID assigned to the gateway container. |
 | server.auth.allowUnauthenticatedUsers | bool | `false` | UNSAFE: accept unauthenticated CLI/user requests as a local developer principal. Intended only for trusted local Skaffold/k3d development or a fully trusted fronting proxy. Leave false for shared or production clusters. |
-| server.credentialDrivers.kubernetesSecrets.allowReferenceNamespace | bool | `false` | Deprecated compatibility field. Credential storage no longer supports user-authored namespace references. |
+| server.credentialDrivers.kubernetesSecrets.createNamespace | bool | `false` | Create the credential namespace. Requires a namespace other than the release namespace. The Namespace is retained on uninstall so stored credentials survive; an existing Namespace not owned by this release is left untouched. |
 | server.credentialDrivers.kubernetesSecrets.enabled | bool | `false` | Enable the in-tree Kubernetes Secret credential driver. WARNING: The RBAC Role grants read/write access to ALL Secrets in the configured namespace. Use a dedicated namespace to limit blast radius. |
 | server.credentialDrivers.kubernetesSecrets.namespace | string | `""` | Namespace where OpenShell-managed provider Secret objects are stored. Empty = Helm release namespace. A dedicated namespace is RECOMMENDED to isolate OpenShell-managed Secrets from other workloads. |
 | server.credentialDrivers.kubernetesSecrets.rbac.create | bool | `true` | Create a Role/RoleBinding granting the gateway ServiceAccount read/write access to managed provider Secrets. |
@@ -281,11 +292,14 @@ discovery endpoint or its TLS CA.
 | server.credentialDrivers.vault.timeoutSecs | string | `""` | HTTP request timeout in seconds. Empty = driver default. |
 | server.credentialDrivers.vault.tokenPath | string | `""` | Mounted token file path when authMethod is token_file. |
 | server.credentialStorage.existingSecret | string | `""` | Name of a pre-existing Secret containing the key-encryption key. When set, the chart does NOT generate a new Secret; it references this one instead. The Secret must contain a key named "key-encryption-key" with a base64-encoded 32-byte value. Required for GitOps workflows that render manifests with `helm template` (where `lookup` is unavailable). |
-| server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL (used for the default SQLite backend). |
+| server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL (used for the default SQLite backend). SQLite runs in WAL mode and needs a local block-backed volume, not NFS or other network filesystems. |
 | server.defaultRuntimeClassName | string | `""` | Default Kubernetes runtimeClassName for sandbox pods. Applied when a CreateSandbox request does not specify one. Empty (default) = omit the field, using the cluster's default RuntimeClass. Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it to all sandboxes that don't explicitly override it. |
 | server.disableTls | bool | `false` | Disable TLS entirely - the server listens on plaintext HTTP. Set to true when a reverse proxy / tunnel terminates TLS at the edge. |
+| server.drivers.kubernetes.allowDriverConfig | bool | `false` | Allow caller driver JSON; external resources still require approval. |
 | server.drivers.kubernetes.operatorNamespaceFile | string | `""` | Path to a JSON file containing an array of namespace names allowed in operator mode. Hot-reloaded on change. |
 | server.drivers.kubernetes.operatorNamespaceLabel | string | `""` | K8s label selector for namespace discovery in operator mode. The driver watches namespaces matching this label. |
+| server.drivers.kubernetes.resourceAdmission.enabled | bool | `true` | Require operator approval labels on external sandbox attachments (GPU attachments exempt). |
+| server.drivers.kubernetes.resourceAdmission.requiredLabels | string | `nil` | Replacement label map; null uses the built-in admission labels. Empty map is invalid when enabled. |
 | server.drivers.kubernetes.workspaceMode | string | `"shared"` | How workspaces map to Kubernetes namespaces. "shared" (default): all sandboxes in a single namespace. "managed": auto-creates per-workspace namespaces. "operator": uses pre-provisioned namespaces. |
 | server.enableLoopbackServiceHttp | bool | `true` | Enable plaintext HTTP routing for loopback sandbox service URLs on TLS-enabled gateways. |
 | server.enableUserNamespaces | bool | `false` | Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox pods. Requires Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), plus a supporting container runtime and Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host UID and capabilities become namespaced. |
@@ -311,8 +325,6 @@ discovery endpoint or its TLS CA.
 | server.policyValidationFailureMode | string | `"fail_closed"` | Posture when a candidate sandbox policy fails validation. `fail_closed` deactivates the previous policy; `retain_last_valid` keeps it active. |
 | server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into gateway and sandbox pods for dynamic provider token grants. |
 | server.providerTokenGrants.spiffe.workloadApiSocketPath | string | `"/spiffe-workload-api/spire-agent.sock"` | Path to the SPIFFE Workload API socket mounted into gateway and sandbox pods. |
-| server.sandboxImage | string | `"nvcr.io/nvidia/base/ubuntu:24.04"` | Default sandbox image used when requests do not specify one. |
-| server.sandboxImagePullPolicy | string | `nil` | Pull policy for sandbox pods. Leave unset to use the Kubernetes image default (Always for :latest, IfNotPresent otherwise). Prefer always, if_not_present, or never; the chart also accepts legacy Kubernetes spellings Always, IfNotPresent, and Never. |
 | server.sandboxImagePullSecrets | list | `[]` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
 | server.sandboxJwt.gatewayId | string | `""` | Stable gateway identity embedded in iss/aud of every minted token. Defaults to the release name so HA replicas share identity. |
 | server.sandboxJwt.k8sSaTokenTtlSecs | int | `3600` | Lifetime (seconds) of the projected ServiceAccount token kubelet writes into each sandbox pod for the IssueSandboxToken bootstrap exchange. Kubelet enforces a minimum of 600s; the driver clamps values outside [600, 86400]. Default 3600 — generous, since the supervisor consumes the token within seconds of pod start. |
@@ -334,9 +346,11 @@ discovery endpoint or its TLS CA.
 | serviceAccount.annotations | object | `{}` | Annotations to add to the generated service account. |
 | serviceAccount.create | bool | `true` | Create a service account for the gateway. |
 | serviceAccount.name | string | `""` | Existing service account name to use when serviceAccount.create is false. |
-| supervisor.image.pullPolicy | string | `nil` | Sandbox supervisor pull policy. Leave unset to use the Kubernetes image default. Prefer always, if_not_present, or never; the chart also accepts legacy Kubernetes spellings Always, IfNotPresent, and Never. |
-| supervisor.image.repository | string | `"ghcr.io/nvidia/openshell/supervisor"` | Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set. |
-| supervisor.image.tag | string | `""` | Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed. |
+| supervisor.image.digest | string | `""` | Supervisor image digest. When set, this takes precedence over tag. |
+| supervisor.image.pullPolicy | string | `nil` | Supervisor image pull policy. Empty uses global.image.pullPolicy. Prefer always, if_not_present, or never; the chart also accepts legacy Kubernetes spellings Always, IfNotPresent, and Never. |
+| supervisor.image.registry | string | `""` | Supervisor image registry. Empty uses global.image.registry. |
+| supervisor.image.repository | string | `"openshell/supervisor"` | Supervisor image repository. |
+| supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
 | supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
 | supervisor.sandboxRuntime.networkPolicyEnforced | bool | `false` | Required operator acknowledgement that the cluster CNI enforces NetworkPolicy. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |

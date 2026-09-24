@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: "Manage Gateways"
-sidebar-title: "Gateways"
+sidebar-title: "Overview"
 description: "Register OpenShell gateways, switch between environments, inspect gateway status, and troubleshoot gateway access."
 keywords: "Generative AI, Cybersecurity, Gateway, Docker, Podman, Kubernetes, MicroVM, CLI"
 position: 2
@@ -20,11 +20,11 @@ The gateway is responsible for:
 
 OpenShell separates gateway access from the compute driver that runs sandboxes. Use [Installation](/about/installation) to install OpenShell, choose a compute driver, and start a gateway. This page covers working with gateway entries after a gateway exists.
 
-## Gateway Compute Drivers
+## Gateway Runtimes
 
 A gateway provisions sandboxes through the compute driver configured for that gateway.
 
-| Compute Driver | Where sandboxes run | Best for |
+| Runtime | Where sandboxes run | Best for |
 |---|---|---|
 | Docker | Containers on the gateway host. | Solo development, quick iteration, and single-machine gateways. |
 | Podman | Rootless containers on the gateway host. | Workstations that avoid a rootful Docker daemon. |
@@ -195,5 +195,5 @@ For sandbox startup failures, inspect the selected compute driver:
 ## Next Steps
 
 - To install OpenShell and choose a compute driver, refer to [Installation](/about/installation).
-- To configure workspace membership and roles, refer to [Manage Workspaces and Access](/sandboxes/manage-workspaces).
+- To configure workspace membership and roles, refer to [Workspaces](/sandboxes/manage-workspaces).
 - To create a sandbox using the gateway, refer to [Manage Sandboxes](/sandboxes/manage-sandboxes).

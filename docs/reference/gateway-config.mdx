@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: "Gateway Configuration File"
-sidebar-title: "Gateway Config"
+sidebar-title: "Configuration"
 description: "Reference for the OpenShell gateway TOML configuration file (RFC 0003)."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Gateway, Configuration, TOML, Reference"
 position: 5
@@ -17,6 +17,8 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 ```
 
 `database_url` is env-only. The loader rejects it when it appears in the file. When `OPENSHELL_DB_URL` is unset, the gateway stores its SQLite database under `$XDG_STATE_HOME/openshell/gateway/openshell.db`.
+
+On-disk SQLite databases run in WAL mode with `synchronous=FULL`: the gateway keeps `openshell.db-wal` and `openshell.db-shm` next to the database file, the file must live on a local filesystem, and a backup must use `sqlite3 openshell.db ".backup <copy>"` rather than copying `openshell.db` on its own. Every acknowledged write, including SSH session revocations, survives a power loss. The one exception is SSH session issuance, which skips the per-commit sync; a power loss can drop a just-issued session token, and the client must request a new one.
 
 `name` assigns an operator-facing identity to the gateway installation. Set it with `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`. It defaults to `openshell`; the Helm chart defaults it to the chart fullname so all replicas in one installation share a name. Chart fullnames are only unique within their Kubernetes namespace, so set `server.name` explicitly when one collector receives telemetry from multiple namespaces or clusters. This identity is independent of client-side gateway aliases, TLS names, and `gateway_jwt.gateway_id`.
 
@@ -90,7 +92,8 @@ future version. To migrate an existing file:
 5. Use canonical image pull policies: `always`, `if_not_present`, `never`, or
    Podman-only `newer`. Kubernetes-style capitalization and Podman's `missing`
    spelling are rejected.
-6. Remove zero sentinels. Omit `gateway_jwt.ttl_secs` for a non-expiring token,
+6. Remove zero sentinels. Omit `gateway_jwt.ttl_secs` to use non-expiring local
+   sandbox session credentials and the 900-second typed extension-token default,
    omit Docker or Podman `sandbox_pids_limit` to use OpenShell's default limit
    of 2048, and omit Podman `health_check_interval_secs` to disable health
    checks. Explicit zero values are invalid.
@@ -197,7 +200,7 @@ signing_key_path = "/etc/openshell/jwt/signing.pem"
 public_key_path  = "/etc/openshell/jwt/public.pem"
 kid_path         = "/etc/openshell/jwt/kid"
 gateway_id       = "openshell"
-# Omit only for local single-player Docker, Podman, or VM gateways.
+# Optional; defaults to 900 seconds.
 ttl_secs         = 3600
 
 [openshell.gateway.auth]
@@ -257,7 +260,6 @@ sa_token_ttl_secs      = 3600
 
 [openshell.credential_drivers.kubernetes-secrets]
 namespace = "openshell"
-allow_reference_namespace = false
 ```
 
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to map a verified client certificate to a CLI user identity. This application-layer identity switch does not control the TLS handshake. When `client_ca_path` is set without OIDC, the listener requires a valid client certificate. When OIDC is configured, bearer-only clients may connect; the listener still validates any client certificate they present against the configured CA. Kubernetes deployments must leave `mtls_auth.enabled` unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
@@ -268,7 +270,7 @@ The client-certificate handshake policy is derived and has no `require_client_au
 
 `[openshell.gateway] policy_validation_failure_mode` controls what sandbox supervisors do when a complete candidate policy fails runtime validation. The default, `fail_closed`, deactivates the previous network policy, closes relays pinned to it, and denies new egress until a valid generation loads. `retain_last_valid` leaves the previous valid generation active. Both modes reject the candidate atomically; startup keeps the workload unstarted until the effective policy and matching provider configuration pass admission. A rejected startup exposes `ConfigurationInvalid` and remains available for policy/provider repair in either mode. Gateway mutation paths that can preflight a known effective scope reject invalid candidates before persistence and leave the active policy unchanged regardless of this setting. Changing the value requires restarting the gateway so it can reload `gateway.toml` and distribute the new posture to sandbox supervisors.
 
-`[openshell.gateway.gateway_jwt] ttl_secs` controls gateway-minted sandbox JWT lifetime. Omit it for a non-expiring token: the token has no `exp` claim and the response omits `expiration_time`. Use this only for local single-player Docker, Podman, or VM gateways. Explicit `0` is invalid. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway omits the field.
+`[openshell.gateway.gateway_jwt] ttl_secs` controls generation-bound gateway-facing and Sandbox Protocol credentials minted for a sandbox session, plus typed extension JWTs. Omit it for non-expiring local sandbox session credentials: both session tokens carry `exp = 0`, and refresh responses omit their expiration timestamps. Typed extension JWTs retain a 900-second default when the field is omitted. Use omission only for local single-player Docker, Podman, or VM gateways. Explicit `0` is invalid. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway omits the field.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
@@ -467,7 +469,7 @@ server:
     existingSecret: my-preprovisioned-kek-secret
 ```
 
-For `kubernetes-secrets`, `namespace` sets where OpenShell-managed provider Secret objects are stored. When omitted, the driver uses the in-cluster ServiceAccount namespace when available, otherwise `default`. The Helm chart creates a Role granting the gateway access to all Secrets in the credential namespace because OpenShell-managed Secret names are dynamic SHA-256 hashes that cannot be restricted with `resourceNames`. Deploy credential Secrets in a dedicated namespace (`server.credentialDrivers.kubernetesSecrets.namespace`) to limit the RBAC blast radius.
+For `kubernetes-secrets`, `namespace` sets where OpenShell-managed provider Secret objects are stored in every workspace mode. When omitted, the driver uses the in-cluster ServiceAccount namespace when available, otherwise `default`. The driver rejects credential handles that reference any other namespace. The Helm chart creates a Role granting the gateway access to all Secrets in the credential namespace because OpenShell-managed Secret names are dynamic SHA-256 hashes that cannot be restricted with `resourceNames`; the gateway ClusterRole grants no credential Secret permissions. Deploy credential Secrets in a dedicated namespace (`server.credentialDrivers.kubernetesSecrets.namespace`) to limit the RBAC blast radius. When the credential namespace is the release namespace, the Role also covers the gateway's own TLS and database Secrets. Set `server.credentialDrivers.kubernetesSecrets.createNamespace=true` to have the chart create the dedicated namespace. The chart retains it on uninstall so stored credentials survive, and leaves an existing namespace it does not own untouched.
 
 For `vault`, `address` points at the Vault service. Non-loopback endpoints must use HTTPS; plaintext HTTP is accepted only for `localhost` or an IP loopback address during local development. Vault requests do not follow redirects, preventing credentials from being replayed to a downgraded or substituted endpoint. HTTPS uses platform trust roots by default. Set `ca_bundle` to a certificate-only PEM bundle for a private Vault CA; the bundle augments platform roots and normal hostname verification remains enabled. `mount` and `kv_version` describe the KV engine where OpenShell-managed provider secrets are stored, and `auth_method = "kubernetes"` logs in with the gateway Pod's ServiceAccount token. For local or development validation, use `auth_method = "token_file"` with `token_path = "/path/to/token"`. Do not put literal Vault tokens in TOML.
 
@@ -530,6 +532,131 @@ Multi-replica gateways relay session-bound traffic to the replica that owns a sa
 The gateway refuses to start when a peer endpoint is configured on a multi-replica backend and peer authentication is unavailable, because the replica could not serve relays from its peers. That happens when the pod identity variables are missing, when the in-cluster Kubernetes client cannot be built, or when the gateway is not running in a cluster. A plaintext `http://` peer endpoint is also rejected when the gateway serves TLS; use it only when the gateway itself serves plaintext.
 
 ## Driver References
+
+### External Resource Admission
+
+Every compute driver disables caller-supplied `template.driver_config` by
+default. An operator can enable it without disabling resource approval:
+
+```toml
+[openshell.drivers.kubernetes]
+allow_driver_config = true
+
+[openshell.drivers.kubernetes.resource_admission]
+enabled = true
+
+[openshell.drivers.kubernetes.resource_admission.required_labels]
+"openshell.ai/sandbox-attachable" = "true"
+"openshell.ai/sandbox-attachable-workspace" = "${workspace}"
+```
+
+Use the same fields under the selected Docker, Podman, VM, MXC, or external
+driver table. Omitted admission settings use the labels above. A supplied map
+replaces the defaults, and every entry must match. An explicitly empty map is
+invalid while enforcement is enabled. `${workspace}` is the entire label value
+and resolves to the authorized OpenShell workspace name, not a Kubernetes
+namespace or caller label. Other substitutions and expressions are unsupported.
+At least one fixed label is required so intentionally shared resources still
+need explicit operator approval.
+
+The following label keys are reserved for driver-owned metadata and cannot be
+used in `required_labels`: `openshell.ai/managed-by`, `openshell.ai/gateway-id`,
+and `openshell.ai/sandbox-workspace`. The default admission key
+`openshell.ai/sandbox-attachable-workspace` is distinct from the reserved
+sandbox metadata key.
+
+The operator must label the referenced resource before use. Labels on a sandbox
+do not approve its attachments. For example, a PVC used by workspace `team-a`
+needs this metadata:
+
+```yaml
+metadata:
+  labels:
+    openshell.ai/sandbox-attachable: "true"
+    openshell.ai/sandbox-attachable-workspace: "team-a"
+```
+
+Kubernetes checks caller-selected PVCs, RuntimeClasses, and PriorityClasses
+through the OpenShell-owned Pod template. Docker and Podman check engine volume
+labels. Read-only mounts still require approval. Namespaces do not grant
+approval. Newly provisioned private storage and bootstrap material use driver
+ownership checks instead.
+
+RuntimeClasses and PriorityClasses are shared operator infrastructure. They must
+match every fixed required label, but `${workspace}` entries do not apply to
+them. Kubernetes API-server and admission-webhook mutations of the live Pod are
+trusted cluster-operator behavior and are not used as Workspace User
+authorization inputs.
+
+Image-pull Secrets are selected by gateway configuration, not by sandbox
+callers, and do not participate in resource admission. In managed mode OpenShell
+creates an immutable copy of each configured Secret for every sandbox runtime
+generation and deletes it with that generation. Sandbox creation fails if a
+Secret with the generation name already exists. In shared and operator modes,
+the configured Secret must already exist in the sandbox namespace. The
+typed Kubernetes driver config does not support caller-selected Secret or
+ConfigMap volumes or environment references. Automatic service-account tokens
+and projected token volumes are prohibited.
+
+GPU device attachments are temporarily exempt from label admission. Existing
+GPU validation still applies. Explicit GPU device settings inside driver JSON
+still require `allow_driver_config = true`; public GPU-count requests do not.
+The exception does not approve unrelated host mounts or non-GPU devices.
+
+Raw host bind mounts and supplemental image mounts have no trusted label
+resolver and are rejected while admission is enabled. Publisher image labels
+cannot grant operator approval. Docker's existing unsupported image-mount
+restriction remains. MXC host filesystem grants likewise require disabling
+admission until a resolver exists. MXC's command config and VM upload workflows
+encoded in driver JSON require explicit driver-config opt-in.
+
+`allow_driver_config` applies to nonempty caller config, including saved
+templates and non-storage overrides. An absent config or `{}` does not require
+opt-in. Drivers recheck admitted OpenShell input attachments before launch and
+on restart; running Docker, Podman, and Kubernetes workloads are periodically
+revalidated.
+Confirmed revocation stops or suspends the workload. Metadata lookup outages
+block new launches but do not alone stop existing workloads. Revalidation uses
+the Docker observation loop (normally two seconds) or a 30-second Podman /
+Kubernetes interval, plus lookup and retry time. These are not instantaneous
+revocation guarantees.
+
+To explicitly opt out of label authorization:
+
+```toml
+[openshell.drivers.kubernetes.resource_admission]
+enabled = false
+```
+
+This does not enable driver JSON or bypass existing path, ownership, namespace,
+or isolation validation. It relinquishes external-resource label protection
+for that driver. Restart the gateway and driver after policy changes. Only
+trusted operators should control approval labels, runtime APIs, and resource
+replacement; application admission is not atomic mount authorization.
+
+Before upgrading, inventory and approve legitimate external resources. Legacy
+sandbox state without verifiable admission provenance requires recreation;
+OpenShell does not automatically approve old attachments. Remove stale labels
+before reusing a deleted workspace name. A custom approval-only map permits
+cross-workspace sharing and should be an intentional operator decision.
+
+Standalone Kubernetes, Podman, and VM drivers accept the common policy as
+`--admission-config-json` or `OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON`; `{}` uses
+secure defaults. Docker also accepts the fields in its driver TOML file. The
+gateway-managed VM process receives the selected gateway policy automatically.
+Operator-managed external processes must be configured separately. Their
+versioned `GetCapabilities.resource_admission_policy` acknowledgement must
+match the gateway policy; legacy drivers require an explicit admission opt-out.
+A changed acknowledgement blocks subsequent remote validation/create/start
+calls until gateway and driver configuration agree again.
+
+Helm exposes `server.drivers.kubernetes.allowDriverConfig`,
+`resourceAdmission.enabled`, and `resourceAdmission.requiredLabels`. The label
+map defaults to `null`, which uses code defaults without merging those keys
+into a custom map. The Helm chart grants PVC metadata reads only when
+`allowDriverConfig` is enabled. Split workspace releases must set the matching
+`gateway.allowDriverConfig=true` workspace-chart value. Never mark gateway
+database storage as attachable.
 
 Each example is a complete TOML file for one compute driver. The examples repeat `[openshell]` and `[openshell.gateway]` so they stay copyable, and the driver tables list the accepted driver-specific keys. Drivers receive only their own tables, and the gateway rejects unknown gateway and driver fields.
 
@@ -804,8 +931,9 @@ image_pull_policy       = "if_not_present" # always | if_not_present | never | n
 grpc_endpoint           = "https://127.0.0.1:17670"
 # The gateway overwrites gateway_port from bind_address at runtime.
 gateway_port            = 17670
-# Omit for the platform default: empty on Linux, 192.168.127.254 on macOS Podman machine.
-# Set "" to force Podman's host-gateway resolver.
+# Trusted supervisor-side destination returned for host.openshell.internal.
+# Omit for the platform default: 127.0.0.1 on native Linux and
+# 192.168.127.254 on macOS Podman Machine.
 # host_gateway_ip       = "192.168.127.254"
 ssh_socket_path         = "/run/openshell/ssh.sock"
 stop_timeout_secs       = 45
@@ -952,7 +1080,9 @@ default_image    = "nvcr.io/nvidia/base/ubuntu:24.04"
 # Optional override. When omitted, the gateway derives
 # https://host.openshell.internal:<gateway-port> for the VM driver.
 grpc_endpoint    = "https://host.openshell.internal:17670"
-# Empty falls back to default_image.
+# Empty falls back only to default_image. The gateway rejects the VM
+# configuration when both fields are empty; sandbox-requested images are never
+# bootstrap images.
 bootstrap_image  = "nvcr.io/nvidia/base/ubuntu:24.04"
 krun_log_level   = 1
 vcpus            = 2

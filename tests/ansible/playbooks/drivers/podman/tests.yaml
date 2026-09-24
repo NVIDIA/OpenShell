@@ -1,0 +1,160 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Run Podman archive tests
+  hosts: all
+  gather_facts: false
+  vars:
+    podman_test_root: /var/lib/openshell-driver-tests/podman
+    podman_test_input_dir: /var/lib/openshell-test-inputs/podman
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Create Podman test directory
+      become: true
+      ansible.builtin.file:
+        path: "{{ podman_test_root }}"
+        state: directory
+        owner: tmachine
+        group: tmachine
+        mode: "0700"
+
+    - name: Install Podman test bundle
+      become: true
+      ansible.builtin.unarchive:
+        src: "{{ openshell_podman_test_bundle }}"
+        dest: "{{ podman_test_root }}"
+        owner: tmachine
+        group: tmachine
+
+    - name: Remove any previous OpenShell gateway registration
+      ansible.builtin.command:
+        argv: [/usr/local/bin/openshell, gateway, remove, tmachine]
+      changed_when: false
+      failed_when: false
+
+    - name: Register the configured OpenShell gateway
+      ansible.builtin.command:
+        argv: [/usr/local/bin/openshell, gateway, add, http://127.0.0.1:17670, --local, --name, tmachine]
+
+    - name: Run Podman archive tests
+      ansible.builtin.command:
+        argv: [cargo-nextest, nextest, run, --archive-file, "{{ podman_test_root }}/tests.tar.zst", --workspace-remap, "{{ podman_test_root }}", --no-capture]
+      environment:
+        OPENSHELL_BIN: /usr/local/bin/openshell
+        OPENSHELL_TEST_INPUT_DIR: "{{ podman_test_input_dir }}"
+        OPENSHELL_PODMAN_TEST_IMAGE: "{{ openshell_podman_test_image | default('') }}"
+      register: podman_test_result
+      changed_when: false
+      failed_when: false
+
+    - name: Show Podman test diagnostics
+      ansible.builtin.debug:
+        var: podman_test_result.stderr_lines
+
+    - name: Show Podman test result
+      ansible.builtin.debug:
+        var: podman_test_result.stdout_lines
+
+    - name: Capture OpenShell gateway journal after Podman test failure
+      become: true
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - --unit
+          - openshell-gateway.service
+          - --no-pager
+          - --lines
+          - "200"
+      changed_when: false
+      failed_when: false
+      when: podman_test_result.rc != 0
+      register: podman_gateway_journal
+
+    - name: Show OpenShell gateway journal after Podman test failure
+      ansible.builtin.debug:
+        var: podman_gateway_journal.stdout_lines
+      when: podman_test_result.rc != 0
+
+    - name: Resolve tmachine UID after Podman test failure
+      ansible.builtin.command:
+        argv: [id, --user, tmachine]
+      changed_when: false
+      when: podman_test_result.rc != 0
+      register: podman_tmachine_uid
+
+    - name: Discover Podman containers after test failure
+      become: true
+      become_user: tmachine
+      ansible.builtin.command:
+        argv: [timeout, "15", podman, ps, --all, --quiet, --no-trunc]
+      environment:
+        HOME: /home/tmachine
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_tmachine_uid.stdout }}"
+      changed_when: false
+      failed_when: false
+      when: podman_test_result.rc != 0
+      register: podman_failed_containers
+
+    - name: Capture rootless Podman journal after test failure
+      become: true
+      become_user: tmachine
+      ansible.builtin.command:
+        argv: [journalctl, --user, --unit, podman.service, --no-pager, --lines, "200"]
+      environment:
+        HOME: /home/tmachine
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_tmachine_uid.stdout }}"
+      changed_when: false
+      failed_when: false
+      when: podman_test_result.rc != 0
+      register: podman_service_journal
+
+    - name: Show rootless Podman journal after test failure
+      ansible.builtin.debug:
+        var: podman_service_journal.stdout_lines
+      when: podman_test_result.rc != 0
+
+    - name: Capture Podman container inspection after test failure
+      become: true
+      become_user: tmachine
+      ansible.builtin.command:
+        argv: [timeout, "15", podman, inspect, "{{ item }}"]
+      environment:
+        HOME: /home/tmachine
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_tmachine_uid.stdout }}"
+      changed_when: false
+      failed_when: false
+      when: podman_test_result.rc != 0
+      loop: "{{ podman_failed_containers.stdout_lines | default([]) }}"
+      register: podman_failed_container_inspection
+
+    - name: Show Podman container inspection after test failure
+      ansible.builtin.debug:
+        var: podman_failed_container_inspection.results
+      when: podman_test_result.rc != 0
+
+    - name: Capture Podman container logs after test failure
+      become: true
+      become_user: tmachine
+      ansible.builtin.command:
+        argv: [timeout, "15", podman, logs, "{{ item }}"]
+      environment:
+        HOME: /home/tmachine
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_tmachine_uid.stdout }}"
+      changed_when: false
+      failed_when: false
+      when: podman_test_result.rc != 0
+      loop: "{{ podman_failed_containers.stdout_lines | default([]) }}"
+      register: podman_failed_container_logs
+
+    - name: Show Podman container logs after test failure
+      ansible.builtin.debug:
+        var: podman_failed_container_logs.results
+      when: podman_test_result.rc != 0
+
+    - name: Require Podman archive success
+      ansible.builtin.assert:
+        that: [podman_test_result.rc == 0]
+        fail_msg: Podman archive tests failed
