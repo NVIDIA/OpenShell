@@ -62,12 +62,16 @@ print(path.read_text())
         assert ready.exit_code == 0, ready.stderr
         port = int(ready.stdout.strip())
         response_fin = threading.Event()
+        session_request = openshell_pb2.CreateSshSessionRequest(sandbox=sb.sandbox.name)
+        session_request.workspace_scope.workspace = "default"
+        session = sandbox_client._stub.CreateSshSession(session_request, timeout=15)
 
         def requests():
             yield openshell_pb2.TcpForwardFrame(
                 init=openshell_pb2.TcpForwardInit(
                     sandbox=sb.sandbox.name,
                     workspace="default",
+                    authorization_token=session.token,
                     tcp=openshell_pb2.TcpRelayTarget(host="127.0.0.1", port=port),
                     capabilities=["stream-half-close-v1"],
                 )

@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::{Stream, StreamExt};
 use tonic::Status;
 
@@ -154,6 +154,35 @@ pub struct RelayIo {
     stream: DuplexStream,
     abort: AbortHandle,
     half_close: bool,
+    completion: watch::Sender<Option<Result<(), Status>>>,
+}
+
+/// Records RPC completion independently of directional byte EOF. Dropping an
+/// unfinished producer must not leave an upstream caller waiting forever.
+pub struct RelayCompletion {
+    result: watch::Sender<Option<Result<(), Status>>>,
+    abort: AbortHandle,
+}
+impl RelayCompletion {
+    pub fn finish(self, result: Result<(), Status>) {
+        let result = result.map_err(|error| self.abort.abort(error));
+        self.result.send_replace(Some(result));
+    }
+}
+impl Drop for RelayCompletion {
+    fn drop(&mut self) {
+        let error = Status::unavailable("relay ended before final status");
+        let unfinished = self.result.send_if_modified(|result| {
+            if result.is_some() {
+                return false;
+            }
+            *result = Some(Err(error.clone()));
+            true
+        });
+        if unfinished {
+            self.abort.abort(error);
+        }
+    }
 }
 impl RelayIo {
     pub fn pair() -> (Self, Self) {
@@ -164,16 +193,19 @@ impl RelayIo {
     pub fn pair_with_half_close(half_close: bool) -> (Self, Self) {
         let (a, b) = tokio::io::duplex(CHUNK_SIZE);
         let abort = AbortHandle::default();
+        let (completion, _) = watch::channel(None);
         (
             Self {
                 stream: a,
                 abort: abort.clone(),
                 half_close,
+                completion: completion.clone(),
             },
             Self {
                 stream: b,
                 abort,
                 half_close,
+                completion,
             },
         )
     }
@@ -183,6 +215,29 @@ impl RelayIo {
 
     pub fn supports_half_close(&self) -> bool {
         self.half_close
+    }
+
+    /// The downstream bridge owns exactly one completion guard.
+    pub fn completion_guard(&self) -> RelayCompletion {
+        RelayCompletion {
+            result: self.completion.clone(),
+            abort: self.abort.clone(),
+        }
+    }
+
+    /// Wait after forwarding FIN, before reporting successful RPC completion.
+    pub async fn completed(&self) -> Result<(), Status> {
+        let mut completion = self.completion.subscribe();
+        loop {
+            let result = completion.borrow_and_update().clone();
+            if let Some(result) = result {
+                return result;
+            }
+            completion
+                .changed()
+                .await
+                .map_err(|_| Status::unavailable("relay completion lost"))?;
+        }
     }
 }
 impl AsyncRead for RelayIo {
@@ -230,10 +285,125 @@ pub fn io_status(error: io::Error) -> Status {
         .unwrap_or_else(|| Status::unavailable(error.to_string()))
 }
 
+async fn receive_requests<F, S, W>(mut inbound: S, mut write: W) -> Result<(), Status>
+where
+    F: Frame,
+    S: Stream<Item = Result<F, Status>> + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    while let Some(frame) = inbound.next().await {
+        tokio::task::consume_budget().await;
+        let Payload::Data(data) = frame?.payload() else {
+            return Err(Status::invalid_argument(
+                "only data is allowed after init; close requests with EOF",
+            ));
+        };
+        write.write_all(&data).await.map_err(io_status)?;
+    }
+    write.shutdown().await.map_err(io_status)
+}
+
+async fn send_responses<F: Frame, R: AsyncRead + Unpin>(
+    mut read: R,
+    tx: &mpsc::Sender<Result<F, Status>>,
+    half_close: bool,
+) -> Result<(), Status> {
+    let mut buf = vec![0; CHUNK_SIZE];
+    loop {
+        let n = read.read(&mut buf).await.map_err(io_status)?;
+        if n == 0 {
+            break;
+        }
+        tx.send(Ok(F::data(buf[..n].to_vec())))
+            .await
+            .map_err(|_| Status::cancelled("response dropped"))?;
+    }
+    if half_close {
+        tx.send(Ok(F::half_close()))
+            .await
+            .map_err(|_| Status::cancelled("response dropped"))?;
+    }
+    Ok(())
+}
+
+/// Reverse `RelayStream` carries target replies in the request direction.
+///
+/// Legacy response EOF must reach the supervisor before its delayed reply can arrive.
+/// Release the sole response sender at EOF, but keep draining requests.
+pub async fn serve_relay<F, S, T>(
+    inbound: S,
+    socket: T,
+    tx: &mut Option<mpsc::Sender<Result<F, Status>>>,
+    half_close: bool,
+) -> Result<(), Status>
+where
+    F: Frame,
+    S: Stream<Item = Result<F, Status>> + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let sender = tx.as_ref().expect("relay response sender");
+    if half_close {
+        return serve(inbound, socket, sender, true).await;
+    }
+    let (read, write) = tokio::io::split(socket);
+    let input = receive_requests(inbound, write);
+    tokio::pin!(input);
+    let input_finished = {
+        let output = send_responses(read, sender, false);
+        tokio::pin!(output);
+        let exchange = async {
+            tokio::select! {
+                result = &mut input => { result?; output.await?; Ok::<_, Status>(true) }
+                result = &mut output => { result?; Ok(false) }
+            }
+        };
+        tokio::select! {
+            biased;
+            () = sender.closed() => return Err(Status::cancelled("response dropped")),
+            result = exchange => result?,
+        }
+    };
+    tx.take();
+    if !input_finished {
+        input.await?;
+    }
+    Ok(())
+}
+
+/// Forward-facing RPCs must retain downstream trailers after forwarding FIN.
+pub async fn serve_forward<F, S>(
+    inbound: S,
+    socket: &mut RelayIo,
+    tx: &mpsc::Sender<Result<F, Status>>,
+    half_close: bool,
+) -> Result<(), Status>
+where
+    F: Frame,
+    S: Stream<Item = Result<F, Status>> + Unpin,
+{
+    let abort = socket.abort_handle();
+    abort
+        .run(async {
+            serve(inbound, &mut *socket, tx, half_close).await?;
+            // Legacy EOF may terminate a forward-facing RPC before request EOF.
+            // Waiting for its peer to drain those requests would deadlock.
+            if half_close {
+                tokio::select! {
+                    biased;
+                    () = tx.closed() => Err(Status::cancelled("response dropped")),
+                    result = socket.completed() => result,
+                }
+            } else {
+                Ok(())
+            }
+        })
+        .await
+}
+
 /// Run a server-side bridge after consuming init. Both futures stay owned by
 /// this call, so dropping/cancelling it cannot leave a detached input pump.
 pub async fn serve<F, S, T>(
-    mut inbound: S,
+    inbound: S,
     socket: T,
     tx: &mpsc::Sender<Result<F, Status>>,
     half_close: bool,
@@ -243,37 +413,9 @@ where
     S: Stream<Item = Result<F, Status>> + Unpin,
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut read, mut write) = tokio::io::split(socket);
-    let input = async {
-        while let Some(frame) = inbound.next().await {
-            tokio::task::consume_budget().await;
-            let Payload::Data(data) = frame?.payload() else {
-                return Err(Status::invalid_argument(
-                    "only data is allowed after init; close requests with EOF",
-                ));
-            };
-            write.write_all(&data).await.map_err(io_status)?;
-        }
-        write.shutdown().await.map_err(io_status)
-    };
-    let output = async {
-        let mut buf = vec![0; CHUNK_SIZE];
-        loop {
-            let n = read.read(&mut buf).await.map_err(io_status)?;
-            if n == 0 {
-                break;
-            }
-            tx.send(Ok(F::data(buf[..n].to_vec())))
-                .await
-                .map_err(|_| Status::cancelled("response dropped"))?;
-        }
-        if half_close {
-            tx.send(Ok(F::half_close()))
-                .await
-                .map_err(|_| Status::cancelled("response dropped"))?;
-        }
-        Ok::<_, Status>(())
-    };
+    let (read, write) = tokio::io::split(socket);
+    let input = receive_requests(inbound, write);
+    let output = send_responses(read, tx, half_close);
     tokio::pin!(input, output);
     let exchange = async {
         tokio::select! {
@@ -291,11 +433,46 @@ where
 /// Client-side bridge. Sending EOF does not cancel receiving. A negotiated
 /// response FIN shuts down only the destination writer; trailers remain read.
 pub async fn client<F, S, R, W>(
+    inbound: S,
+    read: R,
+    write: W,
+    tx: mpsc::Sender<F>,
+    half_close: bool,
+) -> Result<(), Status>
+where
+    F: Frame,
+    S: Stream<Item = Result<F, Status>> + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    client_impl(inbound, read, write, tx, half_close, false).await
+}
+
+/// Internal relays retain their opposite pump on normal legacy response EOF.
+/// In reverse `RelayStream` that pump carries the target's delayed reply.
+pub async fn client_relay<F, S, R, W>(
+    inbound: S,
+    read: R,
+    write: W,
+    tx: mpsc::Sender<F>,
+    half_close: bool,
+) -> Result<(), Status>
+where
+    F: Frame,
+    S: Stream<Item = Result<F, Status>> + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    client_impl(inbound, read, write, tx, half_close, true).await
+}
+
+async fn client_impl<F, S, R, W>(
     mut inbound: S,
     mut read: R,
     mut write: W,
     tx: mpsc::Sender<F>,
     half_close: bool,
+    drain_input: bool,
 ) -> Result<(), Status>
 where
     F: Frame,
@@ -343,7 +520,7 @@ where
     tokio::pin!(input, output);
     tokio::select! {
         biased;
-        result = &mut output => result,
+        result = &mut output => { result?; if drain_input { input.await } else { Ok(()) } },
         result = &mut input => { result?; output.await }
     }
 }
@@ -397,7 +574,7 @@ mod tests {
         bounded(async {
             let (client_socket, mut application) = tcp_pair().await;
             let (supervisor_socket, mut target) = tcp_pair().await;
-            let (front, mut peer_client) = RelayIo::pair();
+            let (mut front, mut peer_client) = RelayIo::pair();
             let (mut peer_owner, mut relay_server) = RelayIo::pair();
             let (forward_tx, forward_rx) = mpsc::channel(4);
             let (forward_out, forward_in) = mpsc::channel(4);
@@ -414,21 +591,30 @@ mod tests {
                 true,
             ));
             let gateway = tokio::spawn(async move {
-                serve::<TcpForwardFrame, _, _>(
+                serve_forward::<TcpForwardFrame, _>(
                     ReceiverStream::new(forward_rx).map(Ok),
-                    front,
+                    &mut front,
                     &forward_out,
                     true,
                 )
                 .await
             });
             let peer = tokio::spawn(async move {
+                let completion = peer_client.completion_guard();
                 let (r, w) = tokio::io::split(&mut peer_client);
-                client::<PeerRelayFrame, _, _, _>(ReceiverStream::new(peer_in), r, w, peer_tx, true)
-                    .await
+                let result = client_relay::<PeerRelayFrame, _, _, _>(
+                    ReceiverStream::new(peer_in),
+                    r,
+                    w,
+                    peer_tx,
+                    true,
+                )
+                .await;
+                completion.finish(result.clone());
+                result
             });
             let owner = tokio::spawn(async move {
-                serve::<PeerRelayFrame, _, _>(
+                serve_forward::<PeerRelayFrame, _>(
                     ReceiverStream::new(peer_rx).map(Ok),
                     &mut peer_owner,
                     &peer_out,
@@ -437,16 +623,19 @@ mod tests {
                 .await
             });
             let relay = tokio::spawn(async move {
-                serve::<RelayFrame, _, _>(
+                let completion = relay_server.completion_guard();
+                let result = serve_relay::<RelayFrame, _, _>(
                     ReceiverStream::new(relay_rx).map(Ok),
                     &mut relay_server,
-                    &relay_out,
+                    &mut Some(relay_out),
                     true,
                 )
-                .await
+                .await;
+                completion.finish(result.clone());
+                result
             });
             let (target_r, target_w) = tokio::io::split(supervisor_socket);
-            let supervisor = tokio::spawn(client::<RelayFrame, _, _, _>(
+            let supervisor = tokio::spawn(client_relay::<RelayFrame, _, _, _>(
                 ReceiverStream::new(relay_in),
                 target_r,
                 target_w,
@@ -476,6 +665,168 @@ mod tests {
             ] {
                 result.unwrap().unwrap();
             }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn legacy_gateway_eof_preserves_supervisor_delayed_reply() {
+        bounded(async {
+            let (socket, mut target) = tcp_pair().await;
+            let (read, write) = tokio::io::split(socket);
+            let (requests, mut replies) = mpsc::channel(4);
+            // An old gateway ends RelayStream responses to signal input EOF.
+            let supervisor = tokio::spawn(client_relay::<RelayFrame, _, _, _>(
+                tokio_stream::iter([Ok(RelayFrame::data(b"request".to_vec()))]),
+                read, write, requests, false,
+            ));
+            let mut input = Vec::new();
+            target.read_to_end(&mut input).await.unwrap();
+            assert_eq!(input, b"request");
+            assert!(!supervisor.is_finished());
+            target.write_all(b"delayed reply").await.unwrap();
+            target.shutdown().await.unwrap();
+            assert!(matches!(replies.recv().await.unwrap().payload(), Payload::Data(data) if data == b"delayed reply"));
+            assert!(replies.recv().await.is_none());
+            supervisor.await.unwrap().unwrap();
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_supervisor_can_reply_after_gateway_response_eof() {
+        bounded(async {
+            let (mut caller, mut bridge) = RelayIo::pair_with_half_close(false);
+            let (requests, input) = mpsc::channel(4);
+            let (output, mut responses) = mpsc::channel(4);
+            let gateway = tokio::spawn(async move {
+                let completion = bridge.completion_guard();
+                let result = serve_relay::<RelayFrame, _, _>(ReceiverStream::new(input), &mut bridge, &mut Some(output), false).await;
+                completion.finish(result.clone());
+                result
+            });
+            caller.write_all(b"request").await.unwrap();
+            caller.shutdown().await.unwrap();
+            assert!(matches!(responses.recv().await.unwrap().unwrap().payload(), Payload::Data(data) if data == b"request"));
+            assert!(responses.recv().await.is_none());
+            // Old supervisors wait for response EOF before the target replies.
+            assert!(!gateway.is_finished());
+            requests.send(Ok(RelayFrame::data(b"delayed reply".to_vec()))).await.unwrap();
+            drop(requests);
+            let mut reply = Vec::new();
+            caller.read_to_end(&mut reply).await.unwrap();
+            assert_eq!(reply, b"delayed reply");
+            caller.completed().await.unwrap();
+            gateway.await.unwrap().unwrap();
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn forward_waits_for_peer_trailers_after_fin() {
+        for terminal in [Ok(()), Err(Status::deadline_exceeded("late deadline"))] {
+            bounded(async {
+                let (mut front, mut bridge) = RelayIo::pair();
+                let (output, mut responses) = mpsc::channel(4);
+                let gateway = tokio::spawn(async move {
+                    serve_forward::<TcpForwardFrame, _>(
+                        tokio_stream::empty(),
+                        &mut front,
+                        &output,
+                        true,
+                    )
+                    .await
+                });
+                let (peer_output, peer_responses) = mpsc::channel(4);
+                let (requests, mut peer_requests) = mpsc::channel(4);
+                let peer = tokio::spawn(async move {
+                    let completion = bridge.completion_guard();
+                    let abort = bridge.abort_handle();
+                    let (read, write) = tokio::io::split(&mut bridge);
+                    let result = abort
+                        .run(client_relay::<PeerRelayFrame, _, _, _>(
+                            ReceiverStream::new(peer_responses),
+                            read,
+                            write,
+                            requests,
+                            true,
+                        ))
+                        .await;
+                    completion.finish(result.clone());
+                    result
+                });
+                assert!(peer_requests.recv().await.is_none());
+                peer_output
+                    .send(Ok(PeerRelayFrame::half_close()))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    responses.recv().await.unwrap().unwrap().payload(),
+                    Payload::HalfClose
+                ));
+                // Poll through the point where the old bridge returned success.
+                let mut gateway = gateway;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), &mut gateway)
+                        .await
+                        .is_err()
+                );
+                if let Err(error) = &terminal {
+                    peer_output.send(Err(error.clone())).await.unwrap();
+                }
+                drop(peer_output);
+                assert_eq!(
+                    gateway.await.unwrap().map_err(|e| e.code()),
+                    terminal.clone().map_err(|e| e.code())
+                );
+                assert_eq!(
+                    peer.await.unwrap().map_err(|e| e.code()),
+                    terminal.map_err(|e| e.code())
+                );
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_final_status_does_not_hang_or_report_success() {
+        let (upstream, downstream) = RelayIo::pair();
+        drop(downstream.completion_guard());
+        assert_eq!(
+            bounded(upstream.abort_handle().aborted()).await.code(),
+            tonic::Code::Unavailable
+        );
+        assert_eq!(
+            bounded(upstream.completed()).await.unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn response_drop_cancels_wait_for_final_status() {
+        bounded(async {
+            let (mut upstream, mut downstream) = RelayIo::pair();
+            let _completion = downstream.completion_guard();
+            let abort = downstream.abort_handle();
+            let (output, mut responses) = mpsc::channel(1);
+            let gateway = tokio::spawn(async move {
+                serve_forward::<TcpForwardFrame, _>(
+                    tokio_stream::empty(),
+                    &mut upstream,
+                    &output,
+                    true,
+                )
+                .await
+            });
+            downstream.shutdown().await.unwrap();
+            assert!(matches!(
+                responses.recv().await.unwrap().unwrap().payload(),
+                Payload::HalfClose
+            ));
+            drop(responses);
+            assert_eq!(
+                gateway.await.unwrap().unwrap_err().code(),
+                tonic::Code::Cancelled
+            );
+            assert_eq!(abort.aborted().await.code(), tonic::Code::Cancelled);
         })
         .await;
     }
