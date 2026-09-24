@@ -7,9 +7,21 @@ description: "How to enable full OCSF JSON logging for SIEM integration, complia
 keywords: "Generative AI, Cybersecurity, OCSF, JSON, SIEM, Compliance, Observability"
 ---
 
-The [shorthand log format](/observability/logging) is optimized for humans and agents reading logs in real time. For machine consumption, compliance archival, or SIEM integration, you can enable full OCSF JSON export. This writes every OCSF event as a complete JSON record in JSONL format, one JSON object per line.
+The [shorthand log format](/observability/logging) is optimized for humans and agents reading logs in real time. For machine consumption or SIEM integration, enable OCSF JSON output: one native JSON object per line. Collection is best-effort, not a guarantee of complete audit history.
 
-## Enable JSON Export
+## Gateway Output
+
+Configure `[openshell.gateway.ocsf_log]` in `gateway.toml` to collect gateway-origin OCSF events into one JSONL file. This includes gateway-wide events such as TLS certificate reloads, even when no sandbox log stream applies. Collection preserves native OCSF fields and event IDs and does not depend on `RUST_LOG`.
+
+The gateway writes OCSF events to a local JSONL file. Give each replica its own path and configure the shipper to follow renamed rotation segments. See [OCSF JSONL configuration](/reference/gateway-config#ocsf-jsonl-output) for queue bounds, retention, loss metrics, and best-effort delivery limits.
+
+This output is separate from the sandbox-local file described below. Enabling one does not enable the other.
+
+Gateway records use the configured gateway name for both `device.uid` and `device.name`. Replicas of one installation share that identity; `device.hostname` identifies the emitting replica. Assign distinct gateway names to installations whose events are collected together. Reusing a name, including the default name, groups those installations under the same identity. Renaming a gateway changes its audit identity.
+
+Without JSONL enabled, gateway OCSF events still appear as shorthand in console output, subject to the diagnostic log filter. Events associated with a sandbox also appear in its gateway log stream; gateway-wide events have no sandbox association.
+
+## Enable Sandbox JSON Export
 
 Use the `ocsf_json_enabled` setting to toggle JSON export. The setting can be applied globally, for all sandboxes, or per-sandbox.
 
@@ -63,6 +75,10 @@ records use `%PROGRAMDATA%\OpenShell\logs` or `OPENSHELL_OCSF_LOG_DIR`. Both
 sinks rotate daily and retain the three most recent files.
 
 ## JSON Record Structure
+
+Gateway-produced records use the `OpenShell Gateway` product identity; supervisor records use `OpenShell Sandbox Supervisor`. The producing device and the affected sandbox are separate identities, so a gateway event can still identify an affected sandbox through its container fields.
+
+For gateway-produced records, `device.os.name` identifies the OS running the gateway process: Linux, Windows, or macOS. Linux supervisor records continue to report Linux, regardless of the gateway's OS. A native macOS gateway therefore reports macOS while its Linux sandboxes report Linux; a gateway running inside a Linux container reports Linux, even on a Mac host.
 
 `metadata.uid` uniquely identifies an event and stays unchanged when that record is serialized again. Use `container.uid` to associate the event with its sandbox, not `metadata.uid`. Records without a sandbox association omit the container; unknown images are omitted rather than represented by an empty image name.
 
@@ -185,6 +201,16 @@ records that previously appeared as `NET:*` now appear as `EVENT`.
 ## SIEM Schema Version Compatibility
 
 OpenShell emits OCSF v1.8.0 events internally, but many SIEMs only support older schema versions. The `ocsf_schema_version` setting tells the JSONL layer to downgrade events before writing, stripping fields and profiles that don't exist in the target version.
+
+For gateway JSONL, set `schema_version` on the output destination. The target applies uniformly to every record written to that file and requires a gateway restart:
+
+```toml
+[openshell.gateway.ocsf_log]
+path = "/var/log/openshell/gateway-ocsf.jsonl"
+schema_version = "1.3"
+```
+
+The sandbox-scoped setting below controls the legacy supervisor-local JSONL file only.
 
 Set the target version globally:
 

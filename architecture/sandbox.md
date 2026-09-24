@@ -720,6 +720,9 @@ failures retain their known peer or listening endpoint.
 Configuration diagnostics use Config State Change.
 Unix socket relay and relay-control notifications, plus proxy and mediation
 failures without an observed network endpoint, use Base Event.
+Gateway-origin events describe the gateway process's OS, independently of any
+associated sandbox. Linux supervisor events retain Linux as their device OS,
+including when a native macOS or Windows gateway manages the sandbox.
 
 ## Policy Proposals
 

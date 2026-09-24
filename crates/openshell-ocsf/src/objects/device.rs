@@ -87,6 +87,28 @@ impl Device {
             Self::linux(hostname)
         }
     }
+
+    /// Create the device for a gateway replica.
+    #[must_use]
+    pub fn gateway(hostname: &str, name: &str) -> Self {
+        Self {
+            hostname: hostname.to_string(),
+            type_id: DeviceTypeId::Server,
+            type_label: DeviceTypeId::Server.to_string(),
+            name: Some(name.to_string()),
+            // Operators assign a unique name per installation; replicas share this UID.
+            uid: Some(name.to_string()),
+            os: Some(OsInfo {
+                name: match std::env::consts::OS {
+                    "linux" => "Linux",
+                    "windows" => "Windows",
+                    "macos" => "macOS",
+                    other => other,
+                }
+                .to_string(),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +161,34 @@ mod tests {
         let decoded: Device = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(decoded, device);
         assert_eq!(serde_json::to_value(&decoded).unwrap(), json);
+    }
+
+    #[test]
+    fn gateway_device_does_not_inherit_the_sandbox_type() {
+        let json = serde_json::to_value(Device::gateway("gateway-0", "production")).unwrap();
+
+        assert_eq!(json["type_id"], 1);
+        assert_eq!(json["type"], "Server");
+    }
+
+    #[test]
+    fn gateway_installations_with_identical_hostnames_have_distinct_uids() {
+        let first = Device::gateway("openshell-gateway-0", "production");
+        let second = Device::gateway("openshell-gateway-0", "staging");
+
+        assert_eq!(first.uid.as_deref(), Some("production"));
+        assert_eq!(second.uid.as_deref(), Some("staging"));
+        assert_ne!(first.uid, second.uid);
+        assert_eq!(first.hostname, second.hostname);
+    }
+
+    #[test]
+    fn gateway_replicas_share_the_installation_uid() {
+        let first = Device::gateway("openshell-gateway-0", "production");
+        let second = Device::gateway("openshell-gateway-1", "production");
+
+        assert_eq!(first.uid.as_deref(), Some("production"));
+        assert_eq!(first.uid, second.uid);
+        assert_ne!(first.hostname, second.hostname);
     }
 }

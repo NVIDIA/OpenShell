@@ -1885,6 +1885,7 @@ fn etw_ctx(sandbox_id: &str, sandbox_name: &str) -> EventContext {
         sandbox_id: sandbox_id.to_string(),
         sandbox_name: sandbox_name.to_string(),
         container_image: "mxc/appcontainer".to_string(),
+        origin: openshell_ocsf::EventOrigin::Supervisor,
         hostname: gateway_hostname().to_string(),
         product_version: env!("CARGO_PKG_VERSION").to_string(),
         proxy_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),

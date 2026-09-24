@@ -6,7 +6,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use openshell_ocsf::{
-    ActivityId, Endpoint, EventContext, NetworkActivityBuilder, OcsfEvent, SeverityId,
+    ActivityId, Endpoint, EventContext, EventOrigin, NetworkActivityBuilder, OcsfEvent, SeverityId,
 };
 
 fn sandbox_ctx(container_image: &str) -> EventContext {
@@ -18,6 +18,7 @@ fn sandbox_ctx(container_image: &str) -> EventContext {
         product_version: "0.42.1".to_string(),
         proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
         proxy_port: 8888,
+        origin: EventOrigin::Supervisor,
     }
 }
 

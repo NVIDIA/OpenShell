@@ -164,6 +164,8 @@ pub struct GatewayFileSection {
     pub gateway_jwt: Option<GatewayJwtConfig>,
     #[serde(default)]
     pub otlp: Option<OtlpConfig>,
+    #[serde(default)]
+    pub ocsf_log: Option<OcsfLogConfig>,
 
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
@@ -195,6 +197,83 @@ pub struct GatewayTlsFileConfig {
     pub external_server_names: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OcsfLogRotation {
+    Never,
+    #[default]
+    Daily,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OcsfSchemaVersion {
+    #[serde(rename = "1.1")]
+    V1_1,
+    #[serde(rename = "1.3")]
+    V1_3,
+}
+
+impl OcsfSchemaVersion {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V1_1 => "1.1",
+            Self::V1_3 => "1.3",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "RawOcsfLogConfig")]
+pub struct OcsfLogConfig {
+    pub path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<OcsfSchemaVersion>,
+    pub rotation: OcsfLogRotation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_files: Option<std::num::NonZeroUsize>,
+    pub queue_capacity: std::num::NonZeroUsize,
+    pub queue_max_bytes: std::num::NonZeroUsize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOcsfLogConfig {
+    path: PathBuf,
+    schema_version: Option<OcsfSchemaVersion>,
+    #[serde(default)]
+    rotation: OcsfLogRotation,
+    max_files: Option<std::num::NonZeroUsize>,
+    queue_capacity: Option<std::num::NonZeroUsize>,
+    queue_max_bytes: Option<std::num::NonZeroUsize>,
+}
+
+impl TryFrom<RawOcsfLogConfig> for OcsfLogConfig {
+    type Error = &'static str;
+
+    fn try_from(raw: RawOcsfLogConfig) -> Result<Self, Self::Error> {
+        if raw.path.as_os_str().is_empty() {
+            return Err("ocsf_log.path must not be empty");
+        }
+        if raw.rotation == OcsfLogRotation::Never && raw.max_files.is_some() {
+            return Err("ocsf_log.max_files requires daily rotation");
+        }
+        Ok(Self {
+            path: raw.path,
+            schema_version: raw.schema_version,
+            rotation: raw.rotation,
+            max_files: (raw.rotation == OcsfLogRotation::Daily).then(|| {
+                raw.max_files
+                    .unwrap_or(std::num::NonZeroUsize::new(7).unwrap())
+            }),
+            queue_capacity: raw
+                .queue_capacity
+                .unwrap_or(std::num::NonZeroUsize::new(10_000).unwrap()),
+            queue_max_bytes: raw
+                .queue_max_bytes
+                .unwrap_or(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap()),
+        })
+    }
+}
 /// `[openshell.gateway.otlp]` section.
 ///
 /// Presence of this table enables OTLP export; there is no `enabled` flag.
@@ -844,6 +923,60 @@ service_name = "openshell-gateway-dev"
             "http://otel-collector.observability.svc:4317"
         );
         assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
+    }
+
+    #[test]
+    fn gateway_accepts_a_single_ocsf_log_destination() {
+        let tmp = write_tmp("[openshell.gateway.ocsf_log]\npath = 'events.jsonl'\n");
+        let config = load(tmp.path())
+            .unwrap()
+            .openshell
+            .gateway
+            .ocsf_log
+            .unwrap();
+        assert_eq!(config.rotation, OcsfLogRotation::Daily);
+        assert_eq!(config.schema_version, None);
+        assert_eq!(config.max_files.unwrap().get(), 7);
+        assert_eq!(config.queue_capacity.get(), 10_000);
+        assert_eq!(config.queue_max_bytes.get(), 16 * 1024 * 1024);
+        assert!(ConfigFile::default().openshell.gateway.ocsf_log.is_none());
+
+        let tmp = write_tmp(
+            "[openshell.gateway.ocsf_log]\npath = 'events.jsonl'\nschema_version = '1.3'\n",
+        );
+        assert_eq!(
+            load(tmp.path())
+                .unwrap()
+                .openshell
+                .gateway
+                .ocsf_log
+                .unwrap()
+                .schema_version,
+            Some(OcsfSchemaVersion::V1_3)
+        );
+    }
+
+    #[test]
+    fn ocsf_log_rejects_invalid_and_unshipped_options() {
+        for settings in [
+            "",
+            "path = ''",
+            "path = 'log'\nqueue_capacity = 0",
+            "path = 'log'\nqueue_max_bytes = 0",
+            "path = 'log'\nmax_files = 0",
+            "path = 'log'\nrotation = 'hourly'",
+            "path = 'log'\nschema_version = ''",
+            "path = 'log'\nschema_version = '1.8'",
+            "path = 'log'\nkind = 'jsonl'",
+            "path = 'log'\nrotation = 'never'\nmax_files = 7",
+        ] {
+            let tmp = write_tmp(&format!("[openshell.gateway.ocsf_log]\n{settings}\n"));
+            assert!(load(tmp.path()).is_err(), "accepted {settings}");
+        }
+        let tmp = write_tmp("[openshell.gateway.ocsf_log]\npath = 'log'\nrotation = 'never'\n");
+        let config = load(tmp.path()).unwrap();
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(toml::from_str::<ConfigFile>(&encoded).is_ok());
     }
 
     #[test]

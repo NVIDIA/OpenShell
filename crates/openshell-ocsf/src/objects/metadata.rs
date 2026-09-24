@@ -51,6 +51,16 @@ impl Product {
             version: Some(version.to_string()),
         }
     }
+
+    /// Create the `OpenShell` Gateway product, for control-plane events.
+    #[must_use]
+    pub fn openshell_gateway(version: &str) -> Self {
+        Self {
+            name: "OpenShell Gateway".to_string(),
+            vendor_name: "OpenShell".to_string(),
+            version: Some(version.to_string()),
+        }
+    }
 }
 
 #[cfg(test)]

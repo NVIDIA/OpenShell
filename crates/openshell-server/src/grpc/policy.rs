@@ -73,7 +73,8 @@ use openshell_core::{
     settings::{self, SettingValueKind},
 };
 use openshell_ocsf::{
-    ConfigStateChangeBuilder, EventContext, OCSF_TARGET, OcsfEvent, SeverityId, StateId, StatusId,
+    ConfigStateChangeBuilder, EventContext, EventOrigin, OCSF_TARGET, OcsfEvent, SeverityId,
+    StateId, StatusId,
 };
 use openshell_policy::{
     L7BinaryScope, L7RuleTarget, PolicyMergeOp, ProviderPolicyLayer, canonicalize_advisor_add_rule,
@@ -340,6 +341,9 @@ fn build_gateway_policy_audit_message(
         product_version: VERSION.to_string(),
         proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
         proxy_port: 0,
+        origin: EventOrigin::Gateway {
+            name: "openshell-gateway".to_string(),
+        },
     };
     let mut builder = ConfigStateChangeBuilder::new(&ctx)
         .state(StateId::Other, state_label)
