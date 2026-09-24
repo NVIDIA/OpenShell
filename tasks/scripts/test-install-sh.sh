@@ -371,7 +371,7 @@ if ! grep -Fq 'allow_unauthenticated_users = true' "$snap_config"; then
   echo "FAIL: Snap gateway config must permit the plaintext local CLI" >&2
   exit 1
 fi
-if [[ $(stat -c '%a' "$snap_config") != 600 ]]; then
+if [[ -z $(find "$snap_config" -perm 600) ]]; then
   echo "FAIL: Snap gateway config must be mode 0600" >&2
   exit 1
 fi

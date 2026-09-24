@@ -24,7 +24,7 @@ EOF
 common="${work}/fresh"
 SNAP_COMMON="$common" "$hook"
 cmp -s "$expected" "$common/gateway.toml"
-if [[ $(stat -c '%a' "$common/gateway.toml") != 600 ]]; then
+if [[ -z $(find "$common/gateway.toml" -perm 600) ]]; then
   echo "FAIL: install hook config must be mode 0600" >&2
   exit 1
 fi
