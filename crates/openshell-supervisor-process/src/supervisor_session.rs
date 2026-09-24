@@ -546,13 +546,9 @@ pub async fn finalize_main_process_exit(
 
 #[derive(Default)]
 struct SessionRelays(Arc<Mutex<HashMap<String, AbortHandle>>>);
-impl Drop for SessionRelays {
-    fn drop(&mut self) {
-        for abort in self.0.lock().unwrap().values() {
-            abort.abort(tonic::Status::unavailable("supervisor session ended"));
-        }
-    }
-}
+// The map belongs to one control session, but established data RPCs retain it
+// until completion. Losing the control stream alone must not abort those RPCs;
+// a new session gets its own map and cannot cancel an older session's channels.
 
 struct GatewayMessageContext<'a> {
     half_close: bool,
@@ -737,7 +733,7 @@ async fn handle_relay_open(
         Err(e) => return Err(e.into()),
     };
     let (read, write) = tokio::io::split(target);
-    stream_lifecycle::client(
+    stream_lifecycle::client_relay(
         response.into_inner(),
         read,
         write,
@@ -895,6 +891,34 @@ mod target_tests {
 #[cfg(test)]
 mod ocsf_event_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn control_session_loss_preserves_existing_data_relay() {
+        let session = SessionRelays::default();
+        let abort = AbortHandle::default();
+        session
+            .0
+            .lock()
+            .unwrap()
+            .insert("channel".into(), abort.clone());
+        let relay_map = Arc::clone(&session.0);
+        drop(session);
+        let replacement = SessionRelays::default();
+        assert!(!replacement.0.lock().unwrap().contains_key("channel"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), abort.aborted())
+                .await
+                .is_err()
+        );
+        // Data-plane cancellation still works through the original owner.
+        relay_map
+            .lock()
+            .unwrap()
+            .get("channel")
+            .unwrap()
+            .abort(tonic::Status::cancelled("data stream cancelled"));
+        assert_eq!(abort.aborted().await.code(), tonic::Code::Cancelled);
+    }
 
     #[cfg(target_os = "linux")]
     struct UnusedLoopbackConnector;

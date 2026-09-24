@@ -1085,17 +1085,20 @@ async fn handle_relay_stream_inner(
         half_close,
     )?;
     let (out_tx, out_rx) = mpsc::channel(16);
+    let completion = claimed.stream.completion_guard();
     tokio::spawn(async move {
+        let mut out_tx = Some(out_tx);
         let _guard = claimed.guard;
         let abort = claimed.stream.abort_handle();
         let result = abort
-            .run(stream_lifecycle::serve(
+            .run(stream_lifecycle::serve_relay(
                 inbound,
                 &mut claimed.stream,
-                &out_tx,
+                &mut out_tx,
                 half_close,
             ))
             .await;
+        completion.finish(result.clone());
         if let Err(status) = result {
             abort.abort(status.clone());
             let expected_close = if let Some(state) = &state {
@@ -1129,7 +1132,9 @@ async fn handle_relay_stream_inner(
                     });
                 }
             }
-            let _ = out_tx.send(Err(status)).await;
+            if let Some(out_tx) = out_tx {
+                let _ = out_tx.send(Err(status)).await;
+            }
         }
     });
     Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
@@ -1638,18 +1643,17 @@ fn spawn_peer_bridge(
     out_tx: mpsc::Sender<PeerRelayFrame>,
     _sandbox_id: String,
 ) {
+    let completion = bridge_stream.completion_guard();
     tokio::spawn(async move {
         let abort = bridge_stream.abort_handle();
         let half_close = bridge_stream.supports_half_close();
         let (read, write) = tokio::io::split(&mut bridge_stream);
-        if let Err(error) = abort
-            .run(stream_lifecycle::client(
+        let result = abort
+            .run(stream_lifecycle::client_relay(
                 inbound, read, write, out_tx, half_close,
             ))
-            .await
-        {
-            abort.abort(error);
-        }
+            .await;
+        completion.finish(result);
     });
 }
 
@@ -1664,7 +1668,7 @@ fn spawn_peer_owner_bridge(
     tokio::spawn(async move {
         let abort = supervisor_stream.abort_handle();
         if let Err(error) = abort
-            .run(stream_lifecycle::serve(
+            .run(stream_lifecycle::serve_forward(
                 inbound,
                 &mut supervisor_stream,
                 &out_tx,

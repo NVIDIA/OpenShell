@@ -733,6 +733,40 @@ async fn relay_round_trips_bytes() {
 }
 
 #[tokio::test]
+async fn legacy_relay_drains_reply_after_response_eof() {
+    use openshell_core::stream_lifecycle::{Frame, Payload};
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let registry = Arc::new(SupervisorSessionRegistry::new());
+        let channel = spawn_gateway(Arc::clone(&registry)).await;
+        let mut session_rx = register_session(&registry, "sbx");
+        let (channel_id, relay_rx) = registry.open_relay("sbx", Duration::from_secs(2)).await.unwrap();
+        session_rx.recv().await.unwrap();
+        let (input, rx) = mpsc::channel(4);
+        input.send(RelayFrame {
+            payload: Some(openshell_core::proto::relay_frame::Payload::Init(RelayInit {
+                channel_id,
+                ..Default::default()
+            })),
+        }).await.unwrap();
+        let mut client = OpenShellClient::new(channel);
+        let mut response = client.relay_stream(ReceiverStream::new(rx)).await.unwrap().into_inner();
+        let mut pipe = relay_rx.await.unwrap().unwrap();
+        pipe.write_all(b"request").await.unwrap();
+        pipe.shutdown().await.unwrap();
+        assert!(matches!(response.message().await.unwrap().unwrap().payload(), Payload::Data(data) if data == b"request"));
+        assert!(response.message().await.unwrap().is_none());
+        // A legacy supervisor drains target output after response EOF, sending
+        // the reply on the still-open HTTP/2 request stream.
+        input.send(RelayFrame::data(b"delayed reply".to_vec())).await.unwrap();
+        drop(input);
+        let mut reply = Vec::new();
+        pipe.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(reply, b"delayed reply");
+        pipe.completed().await.unwrap();
+    }).await.expect("legacy relay drain hung");
+}
+
+#[tokio::test]
 async fn relay_closes_cleanly_when_gateway_drops() {
     let registry = Arc::new(SupervisorSessionRegistry::new());
     let channel = spawn_gateway(Arc::clone(&registry)).await;

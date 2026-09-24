@@ -998,14 +998,18 @@ Supervisor capabilities are exchanged through Hello/Accepted and
 carried with the owning session ID in RelayInit. The SSH stdio proxy uses legacy
 response EOF because stdout cannot represent an independent socket FIN.
 
-Bridge tasks own both directional pumps. Internal relay pipes retain typed
-abort status and wake blocked readers, writers, and frame senders, so failure
+Bridge tasks own both directional pumps. Internal relay pipes retain downstream
+RPC completion separately from byte EOF, so forwarding FIN does not hide later
+error trailers. They retain typed abort status and wake blocked readers,
+writers, and frame senders, so failure
 cannot become a successful byte EOF. `RelayClose` is an abort, scoped to its
 sandbox and supervisor session; stale or unrelated sessions cannot cancel an
 active channel. The first observed abort wins, with transport failure as fallback
-when a typed reason cannot be delivered. Session teardown cancels its owned
-relay tasks without changing reconnect/backoff policy. No new application-idle
-or half-closed timeout is imposed.
+when a typed reason cannot be delivered. Control-session loss alone does not
+cancel established data relays. Those retain their original session ownership;
+replacement sessions cannot cancel them. Legacy reverse relays close their
+response stream on input EOF while still draining delayed target replies.
+No new application-idle or half-closed timeout is imposed.
 
 Browser service URLs use the same supervisor relay path after host-based
 routing resolves `sandbox--service.<service-routing-domain>` to a stored

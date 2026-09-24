@@ -30,9 +30,11 @@ Gateways also require downstream support before emitting response FIN. A `PeerRe
 
 An abort interrupts blocked I/O and can discard buffered bytes. The first observed abort wins. The data stream's final status remains authoritative; a control message that arrives after completion cannot revise it. If a transport disconnect prevents delivery of the typed reason, the transport error remains the fallback.
 
+Losing the control stream alone does not cancel established data relays. They continue until their data stream finishes or fails. A replacement control session cannot cancel channels owned by the previous session. This does not guarantee survival of a shared transport failure or gateway restart.
+
 ## Compatibility and behavior changes
 
-The protobuf additions preserve existing field numbers. Servers send response FIN frames only to peers advertising support. Old peers retain response EOF fallback, so a mixed-version path may finish when the response direction closes instead of preserving the opposite direction. Upgrade the CLI, gateways, and supervisor runtime to use independent directional closure throughout a routed connection.
+The protobuf additions preserve existing field numbers. Servers send response FIN frames only to peers advertising support. Legacy internal relays keep draining target replies after input EOF. Forward-facing RPCs still use legacy response EOF to finish the operation, so a mixed-version path cannot preserve further requests after response EOF. Upgrade the CLI, gateways, and supervisor runtime to use independent directional closure throughout a routed connection.
 
 The following behavior changes need release review even though the wire additions are compatible:
 

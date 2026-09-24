@@ -2367,7 +2367,7 @@ async fn bridge_forward_tcp_stream(
     let half_close = half_close && relay_stream.supports_half_close();
     let abort = relay_stream.abort_handle();
     let result = abort
-        .run(openshell_core::stream_lifecycle::serve(
+        .run(openshell_core::stream_lifecycle::serve_forward(
             inbound,
             &mut relay_stream,
             &tx,
