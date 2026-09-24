@@ -3,32 +3,81 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Default Policy Reference"
 sidebar-title: "Default Policy"
-description: "Breakdown of the built-in default policy applied when you create an OpenShell sandbox without a custom policy."
+description: "Policy source selection and the restrictive fallback used when a sandbox has no explicit or embedded policy."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Security, Policy"
 position: 2
 ---
 
-When you create a sandbox without `--policy`, OpenShell applies a restrictive built-in fallback. The policy comes from the OpenShell runtime and does not depend on the selected workload image.
+OpenShell uses the restrictive fallback only when a sandbox has no stored policy
+and image policy discovery finds no policy. Creating a sandbox without
+`--policy` does not by itself prove that the fallback is active.
 
-## Filesystem Access
+## Policy Selection
 
-The fallback includes the sandbox working directory and grants read-only access to standard runtime paths:
+At creation, an explicit `--policy` file takes precedence over the
+`OPENSHELL_SANDBOX_POLICY` environment variable. Either source supplies the
+sandbox-authored policy stored by the gateway.
 
-- `/usr`
-- `/lib`
-- `/proc`
-- `/dev/urandom`
-- `/etc`
-- `/var/log`
+When the gateway has no stored sandbox policy, the supervisor checks the image's
+current embedded path, `/etc/openshell/policy.yaml`, and then the legacy path,
+`/etc/navigator/policy.yaml`. A valid embedded policy initializes the missing
+stored policy. A missing embedded policy selects the restrictive fallback. An
+invalid embedded policy keeps the first workload unstarted for configuration
+repair; it does not silently select the fallback.
 
-It grants read-write access to `/tmp` and `/dev/null`. Landlock enforcement uses `best_effort` compatibility so OpenShell can use the strongest ABI available on the host while retaining its mandatory baseline protections.
+An active gateway-global policy replaces sandbox policy selection and suppresses
+provider-added network grants. Otherwise, attached providers can add their
+network rules to the selected sandbox policy. Refer to
+[How OpenShell Selects a Policy](/sandboxes/policies#how-openshell-selects-a-policy) for
+the selection order.
 
-## Network Access
+## Fallback Filesystem Access
 
-The fallback defines no network policies or provider-derived endpoints, so outbound network access is denied. Attach a provider or apply a custom policy that names the required endpoints and executable paths before running a networked agent.
+The restrictive fallback includes the sandbox working directory and grants
+read-only access to these paths:
 
-## Process Identity
+- `/bin`.
+- `/usr`.
+- `/lib`.
+- `/proc`.
+- `/dev/urandom`.
+- `/etc`.
+- `/var/log`.
 
-The fallback leaves process identity selection to the compute driver. Docker and Podman honor a non-root OCI `USER`; when an image declares no user, they use numeric UID and GID `1000`. Kubernetes and MicroVM drivers apply their configured non-root identities.
+It grants read-write access to `/tmp` and `/dev/null`. Landlock user-policy
+compatibility defaults to `best_effort`.
 
-Use `openshell policy get <sandbox> --full` to inspect the effective policy. Refer to [Customize Sandbox Policies](/how-it-works/policies/overview) to replace the fallback.
+The runtime can enrich filesystem paths required for operation before applying
+the user ruleset. On current Linux isolation paths, a separate mandatory
+Landlock baseline protects the private `/.openshell` hierarchy and requires the
+supported baseline ABI. The user-policy `best_effort` setting does not disable
+that mandatory protection or promise support on a kernel that cannot install it.
+
+## Fallback Network Access
+
+The fallback defines no network policies or middleware. Outbound network access
+is denied until sandbox-authored or provider-composed rules permit a destination
+and executable.
+
+Provider additions are runtime composition, not fields in the fallback policy.
+Inspect the base and effective views separately when you need to identify a
+provider-derived grant.
+
+## Fallback Process Identity
+
+The fallback leaves process identity selection to the compute driver. Docker
+and Podman honor a non-root OCI `USER`; when an image declares no user, they use
+numeric UID and GID 1000. Other drivers apply their configured non-root identity.
+
+## Inspect the Selected Policy
+
+Inspect the sandbox-authored base and the gateway's effective representation:
+
+```shell
+openshell policy get <sandbox> --base
+openshell policy get <sandbox> --full
+```
+
+`--full` shows gateway composition, not an attestation of the restrictions
+already installed in a running kernel process. Use sandbox readiness, revision
+status, request checks, and runtime logs to verify activation.

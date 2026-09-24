@@ -8,7 +8,9 @@ keywords: "Generative AI, Cybersecurity, Policy, Schema, YAML, Reference, Securi
 position: 3
 ---
 
-Complete field reference for the sandbox policy YAML. Each field is documented with its type, whether it is required, and whether it is static (locked at sandbox creation) or dynamic (hot-reloadable on a running sandbox).
+This reference defines the canonical authored YAML and JSON policy fields. It
+distinguishes startup-time controls from dynamically activated controls and
+documents defaults, matcher behavior, and validation constraints.
 
 ## Top-Level Structure
 
@@ -32,13 +34,26 @@ network_middlewares: { ... }
 | `network_policies` | map | No | Dynamic | Declares which binaries can reach which network endpoints. |
 | `network_middlewares` | map | No | Dynamic | Attaches ordered middleware by destination host; each implementation's manifest selects its supported HTTP and WebSocket operations. |
 
-The YAML root and each present top-level section listed as an object or map must be mappings. Each named network policy or middleware entry must also be a mapping. The OPA loader rejects the first malformed container before normalization or access preset expansion, with a structural error that excludes authored keys and values.
+The YAML root and each present top-level section listed as an object or map must
+be a mapping. Each named network policy or middleware entry must also be a
+mapping.
 
-Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
+Startup-time fields are installed before the workload process starts. After
+activation, OpenShell rejects removals from the filesystem baseline and changes
+to workdir inclusion, Landlock mode, and process identity. Additive filesystem
+paths may be accepted into stored configuration but do not change the current
+child. Recreate the sandbox for an assured new startup configuration. A sandbox
+that has never activated can repair startup fields while configuration admission
+is pending or rejected.
 
-For query parameters and MCP tool names, the OPA loader normalizes nonempty string matchers to explicit `glob` objects after validation. For example, `query: { status: "active*" }` becomes `query: { status: { glob: "active*" } }` in runtime endpoint data. The same normalization applies to allow and deny rules and to MCP `tool` aliases. Matchers supported by both YAML and protobuf use the same runtime representation; `any` matchers retain their listed values. Raw OPA data also accepts empty scalar query matchers, which match empty query values and remain unchanged during loading. An empty protobuf glob cannot represent that OPA-only matcher.
+Dynamic fields can activate on a running sandbox after the complete effective
+candidate validates. `policy update` edits only `network_policies`; use an
+editable base with `policy set` for middleware or complete replacement.
+Middleware policy changes can select built-ins or external services already
+registered with the gateway. Adding or changing an external service registration
+requires a gateway restart.
 
-## Parsing and representation
+## Parsing and Representation
 
 OpenShell uses one canonical authored-policy representation for YAML and JSON.
 Runtime policy loading and the policy prover both decode through the same
@@ -108,7 +123,10 @@ Controls filesystem access inside the sandbox. Paths not listed in either `read_
 - Each individual path must not exceed 4096 characters.
 - The combined total of `read_only` and `read_write` paths must not exceed 256.
 
-Policies that violate these constraints are rejected with `INVALID_ARGUMENT` at creation or update time. Disk-loaded YAML policies that fail validation fall back to a restrictive default.
+Policies that violate these constraints are rejected with `INVALID_ARGUMENT` at
+creation or update time. An invalid embedded image policy blocks initial
+workload activation for configuration repair; only a missing image policy
+selects the restrictive fallback.
 
 Example:
 
@@ -136,18 +154,25 @@ Configures [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforc
 |---|---|---|---|---|
 | `compatibility` | string | No | `best_effort`, `hard_requirement` | How OpenShell handles Landlock failures. Refer to the behavior table below. |
 
-**Compatibility modes:**
+These compatibility modes describe the optional user filesystem ruleset:
 
 | Value | No paths configured | Kernel ABI unavailable | Individual path inaccessible | All paths inaccessible |
 |---|---|---|---|---|
-| `best_effort` | Landlock skipped (no-op). | Warns and continues without Landlock. | Skips the path, applies remaining rules. | Warns and continues without Landlock (refuses to apply an empty ruleset). |
-| `hard_requirement` | Aborts sandbox startup. | Aborts sandbox startup. | Aborts sandbox startup, except in Kubernetes sidecar (current-user) mode where the inaccessible path is skipped. | Aborts sandbox startup. |
+| `best_effort` | User ruleset skipped. | User ruleset warns and continues. | Skips the path and applies remaining user rules. | Warns and skips the empty user ruleset. |
+| `hard_requirement` | Aborts sandbox startup. | Aborts sandbox startup. | Aborts when prepared with privileged path access; current-user preparation skips individually inaccessible paths and applies the remainder. | Aborts sandbox startup. |
 
-`best_effort` (the default) is appropriate for most deployments. It handles missing paths gracefully. For example, `/app` might not exist in every container image but is included in the baseline path set for containers that do have it. Individual missing paths are skipped while the remaining filesystem rules are still enforced.
+`best_effort` is the default for the user ruleset and handles missing paths
+without discarding paths that can be enforced. On current Linux isolation paths,
+OpenShell also installs a mandatory capability-free Landlock baseline that
+protects `/.openshell` and requires ABI v3. The user `best_effort` value does not
+disable that baseline or make an unsupported kernel compatible.
 
 `hard_requirement` is for environments where any gap in filesystem isolation is unacceptable. If a listed path cannot be opened for any reason (missing, permission denied, symlink loop), sandbox startup fails immediately rather than running with reduced protection. Configuring `hard_requirement` with no filesystem paths is also a startup error.
 
-In Kubernetes sidecar (current-user) mode the sandbox cannot distinguish an intentionally denied path from a misconfigured one, so an individual inaccessible path is skipped and the remaining rules are applied instead of aborting. The other `hard_requirement` failures (kernel ABI unavailable, no paths configured, all paths inaccessible) still abort startup.
+When the runtime prepares user rules as the current workload identity, it cannot
+distinguish an intentionally inaccessible path from a misconfigured one. It
+skips individual inaccessible paths and applies the remainder. Other
+`hard_requirement` failures still abort startup.
 
 When a path is skipped under `best_effort`, the sandbox logs a warning that includes the path, the specific error, and a human-readable reason (for example, "path does not exist" or "permission denied").
 
@@ -199,8 +224,8 @@ Each entry in the `network_policies` map has the following fields:
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `name` | string | No | Display name for the policy entry. Used in log output. Defaults to the map key. |
-| `endpoints` | list of endpoint objects | Yes | Hosts and ports this entry permits. |
-| `binaries` | list of binary objects | Yes | Executables allowed to connect to these endpoints. |
+| `endpoints` | list of endpoint objects | No | Hosts and ports this entry permits. An omitted or empty list grants no destination. |
+| `binaries` | list of binary objects | No | Executable selectors associated with the endpoints. Prefer explicit paths. Empty-scope runtime behavior depends on the trusted process-identity mode, so do not use an empty list as a portable any-process grant. |
 
 ### Endpoint Object
 
@@ -209,11 +234,12 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `host` | string | Conditional | Hostname or IP address. Required for `protocol: tcp`; transparent TCP requires a valid DNS hostname and rejects literal IPs. A non-TCP proxy endpoint may omit `host` only when `allowed_ips` supplies the destination constraint. Supports a `*` wildcard inside the first DNS label only: `*.example.com`, `**.example.com`, and intra-label patterns like `*-aiplatform.googleapis.com` are accepted; bare `*`/`**`, TLD wildcards (`*.com`), and wildcards outside the first label are rejected at load time. Prefer exact hosts for `protocol: tcp`: a wildcard authorizes DNS queries for all matching names and can provide a DNS-label exfiltration channel. |
-| `port` | integer | Yes | TCP port number. |
+| `port` | integer | Conditional | One TCP port. Use either `port` or `ports` for clarity. When both are authored and `ports` is nonempty, `ports` takes precedence. |
+| `ports` | list of integers | Conditional | One or more TCP ports. Takes precedence over scalar `port` when nonempty. At least one effective port is required for every protocol endpoint. |
 | `path` | string | No | Optional HTTP path glob used to select between L7 endpoints that share the same host and port. Empty means all paths. Use this when REST and GraphQL live under the same host, such as `/repos/**` and `/graphql`. |
-| `protocol` | string | No | Set to `tcp` with a valid DNS hostname to allow native TCP clients through policy DNS and transparent capture without payload inspection. Omit the field for L4 passthrough through an explicit proxy, including legacy hostless `allowed_ips` endpoints. Set to `rest` for HTTP method/path inspection, `websocket` for RFC 6455 upgrade and client text-message inspection, `graphql` for GraphQL-over-HTTP operation inspection, `mcp` for MCP Streamable HTTP request inspection, or `json-rpc` for generic JSON-RPC-over-HTTP method inspection. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket traffic. Provider-credentialed endpoints require an inspected protocol unless `allow_uninspected_credentials` is explicitly set. |
-| `tls` | string | No | TLS handling mode. The proxy auto-detects TLS by peeking the first bytes of each connection and terminates it for inspected HTTPS traffic, so this field is optional in most cases. Set to `skip` to disable auto-detection for edge cases such as client-certificate mTLS or non-standard protocols. Provider-credentialed endpoints reject `tls: skip` unless `allow_uninspected_credentials` is explicitly set. `skip` is the only accepted non-empty value; every other value, including the removed `terminate` and `passthrough` spellings, is rejected before persistence or activation. |
-| `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. Other values are rejected before activation rather than interpreted as audit mode. |
+| `protocol` | string | No | Set to `tcp` with a valid DNS hostname for native TCP through policy DNS and transparent capture. Omit the field to define no protocol-specific request rules on the explicit proxy; default TLS detection and HTTP destination checks still apply. Use `tls: skip` for a deliberately raw proxy stream. Set to `rest`, `websocket`, `graphql`, `mcp`, or `json-rpc` for the corresponding request inspection. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket traffic. Provider-credentialed endpoints require an inspected protocol unless `allow_uninspected_credentials` is explicitly set. |
+| `tls` | string | No | TLS handling mode. The proxy auto-detects TLS by peeking the first bytes of each connection and terminates it for inspected HTTPS traffic, so this field is optional in most cases. Set to `skip` to disable auto-detection for edge cases such as client-certificate mTLS or non-standard protocols. Provider-credentialed endpoints reject `tls: skip` unless `allow_uninspected_credentials` is explicitly set. `skip` is the only accepted non-empty value; every other value, including the removed `terminate` and `passthrough` spellings, is rejected before persistence or activation. Remove those values and omit `tls` to use automatic handling. |
+| `enforcement` | string | No | Defaults to `audit`. `enforce` actively blocks disallowed application requests. `audit` logs applicable request-rule violations but forwards the request; it does not bypass other parsing, destination, credential, or middleware checks. Other values are rejected before activation. Not valid with `protocol: tcp`. |
 | `access` | string | No | Access preset. One of `read-only`, `read-write`, or `full`; other values are rejected before activation. Mutually exclusive with `rules`. Not valid on `protocol: mcp` or `protocol: json-rpc`; MCP uses explicit rules unless `mcp.allow_all_known_mcp_methods: true` enables the endpoint method profile, and JSON-RPC always uses explicit rules. |
 | `rules` | list of allow rule objects | No | Fine-grained protocol-specific allow rules. Mutually exclusive with `access`. |
 | `deny_rules` | list of deny rule objects | No | L7 deny rules that block specific requests even when allowed by `access` or `rules`. Deny rules take precedence over allow rules. |
@@ -221,8 +247,8 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `allow_encoded_slash` | bool | No | When `true`, L7 request parsing preserves `%2F` inside path segments instead of rejecting it. Use this for registries and APIs such as npm scoped packages (`/@scope%2Fname`). Defaults to `false`. |
 | `websocket_credential_rewrite` | bool | No | When `true` on a `protocol: rest` or `protocol: websocket` endpoint, OpenShell rewrites credential placeholders in client-to-server WebSocket text messages after an allowed HTTP `101` upgrade. On provider-credentialed endpoints without `allow_uninspected_credentials`, OpenShell uses the parsed relay and rejects binary frames; text frames containing placeholders fail closed when rewrite is disabled. Defaults to `false`. |
 | `request_body_credential_rewrite` | bool | No | When `true` on a `protocol: rest` endpoint, OpenShell rewrites credential placeholders in UTF-8 `application/json`, `application/x-www-form-urlencoded`, and `text/*` request bodies before forwarding upstream. The proxy buffers at most 256 KiB and updates `Content-Length` after rewriting. For chunked requests, the limit counts framing, extensions, and trailers. When rewrite is disabled and the sandbox has provider credentials, bodies continue to stream. Authoritatively unknown placeholder keys and valid issued credentials pass unchanged, including credentials bound to the destination. Invalid or unavailable credentials, and unavailable classification metadata fail closed with `credential_placeholder_in_request_body` (HTTP 403). Candidates are limited to 4096 wire bytes. No secret is substituted. Defaults to `false`. Mutually exclusive with `credential_signing`. |
-| `allow_uninspected_credentials` | bool | No | Explicit security-sensitive opt-in that permits a provider-credentialed endpoint to use traffic paths OpenShell cannot inspect or rewrite, including L4-only and `tls: skip` tunnels. Defaults to `false`. Policy proposals that set it require explicit security-flagged approval. |
-| `credential_signing` | string | No | Proxy-side credential signing mode. When set, the proxy strips the sandbox client's `Authorization` header and re-signs with real provider credentials. Values: `sigv4` (auto-detect payload mode from client headers), `sigv4:body` (buffer and hash body, max 10 MiB), `sigv4:no_body` (unsigned payload, stream body). Mutually exclusive with `request_body_credential_rewrite`. See [AWS SigV4](/how-it-works/providers/aws). |
+| `allow_uninspected_credentials` | bool | No | Explicit security-sensitive opt-in that permits a provider-credentialed endpoint to omit a protocol-specific request policy or use a `tls: skip` tunnel. Defaults to `false`. Policy proposals that set it require explicit security-flagged approval. |
+| `credential_signing` | string | No | Proxy-side credential signing mode. When set, the proxy strips the sandbox client's `Authorization` header and re-signs with real provider credentials. Values: `sigv4` (auto-detect payload mode from client headers), `sigv4:body` (buffer and hash body, max 10 MiB), `sigv4:no_body` (unsigned payload, stream body). Mutually exclusive with `request_body_credential_rewrite`. See [AWS SigV4](/providers/aws-sigv4). |
 | `signing_service` | string | No | AWS service name for SigV4 signing (e.g. `bedrock`, `s3`, `sts`). Required when `credential_signing` is set. |
 | `signing_region` | string | No | AWS region override for SigV4 signing (e.g. `us-east-1`). When omitted, the region is extracted from the endpoint hostname. Required for non-standard AWS endpoints where the region cannot be inferred. |
 | `credential_binding` | object | No | Binds static credentials from an attached provider to this endpoint when that provider's profile defines no endpoints. This field is valid only in a sandbox-scoped policy. |
@@ -231,11 +257,35 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `graphql_persisted_queries` | map | No | Trusted GraphQL persisted-query registry keyed by hash or saved-query ID. Values contain `operation_type`, optional `operation_name`, and optional root `fields`. |
 | `graphql_max_body_bytes` | integer | No | Maximum GraphQL-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
 | `mcp` | object | No | MCP endpoint options for `protocol: mcp`. Omit this key to use all MCP endpoint defaults, including the exact `2025-11-25` revision; `mcp: null` is invalid. The object is rejected on other protocols. Every MCP endpoint must still set a concrete `host` and `port` or `ports`; an entry containing only `protocol: mcp` is invalid and is not treated as a wildcard endpoint. |
-| `mcp.versions` | list of string | No | Nonempty allowlist of exact supported MCP core revisions: `2025-03-26`, `2025-06-18`, and `2025-11-25`. Omission resolves to the exact allowlist `["2025-11-25"]`; it never means latest or all known revisions. The key must be absent to use this default; `versions: null` and `versions: []` are invalid. Values must be unique, contain no extra whitespace, and name a revision in the closed supported set. For every request except a valid standalone `initialize`, OpenShell selects the revision from one `MCP-Protocol-Version` header or, when the header is absent, the MCP specification's `2025-03-26` compatibility fallback. The selected revision must appear in this allowlist. Duplicate, empty, or unsupported header values receive `400 Bad Request`; a supported revision outside the allowlist receives `403 Forbidden`. The sessionless `2026-07-28` revision is not yet supported. For an unsupported revision, omit `protocol` and `mcp` only when deliberate uninspected L4 passthrough is an acceptable weaker boundary. |
+| `mcp.versions` | list of string | No | Nonempty allowlist of supported MCP core revisions. Omission allows only `2025-11-25`. See [MCP Version Selection](#mcp-version-selection). |
 | `mcp.max_body_bytes` | integer | No | Maximum MCP JSON-RPC-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
 | `mcp.strict_tool_names` | bool | No | Defaults to `true`. Requires `tools/call` `params.name` values to match `^[A-Za-z0-9_.-]{1,128}$` before policy evaluation. Set to `false` only for compatibility with MCP servers that intentionally use non-recommended tool names. Wildcard `tool` matchers require this to remain enabled. |
 | `mcp.allow_all_known_mcp_methods` | bool | No | Defaults to `false`. When `true`, enables the endpoint MCP method profile: omitted `rules` allow all MCP-family methods and all tools before `deny_rules`, and omitted rule `method` uses that profile. When unset or `false`, explicit MCP method rules are required; rules with `tool` or `params.name` must set `method: tools/call`. |
 | `json_rpc` | object | No | JSON-RPC endpoint options. For `protocol: json-rpc`, `json_rpc.max_body_bytes` sets the maximum JSON-RPC-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
+
+### MCP Version Selection
+
+`mcp.versions` accepts exact revisions from the closed supported set:
+`2025-03-26`, `2025-06-18`, and `2025-11-25`. Omit the key to allow only
+`2025-11-25`; omission never means the latest revision or all known revisions.
+`versions: null`, `versions: []`, duplicate values, values with extra
+whitespace, and revisions outside the supported set are invalid.
+
+Except for a valid standalone `initialize` request, OpenShell selects the
+revision from one `MCP-Protocol-Version` header. When the header is absent, it
+uses the MCP compatibility fallback `2025-03-26`. A duplicate, empty, or
+unsupported header value returns `400 Bad Request`. A supported revision that
+is not in the endpoint allowlist returns `403 Forbidden`. This is a stateless
+per-request header check; OpenShell does not negotiate a revision or bind
+revision-specific session state.
+
+The sessionless `2026-07-28` revision is not yet supported. If a client requires
+an unsupported revision, omit both `protocol` and `mcp` to forgo MCP-specific
+request enforcement while retaining the explicit proxy's default TLS handling
+and HTTP destination checks. Use `protocol: tcp` or `tls: skip` only when the
+client actually requires a raw stream and the weaker boundary is acceptable.
+
+### Endpoint Serialization and Validation
 
 The YAML representation keeps the names shown above. Protobuf and generated SDK
 clients use `NetworkTlsMode`, `NetworkEnforcementMode`, and
@@ -253,8 +303,7 @@ access selects no preset. Unknown enum numbers are rejected before activation.
 - `protocol: tcp` requires a valid DNS hostname. Hostless `allowed_ips`, IP-literal hosts, trailing-dot names, and malformed DNS selectors are rejected with a policy-validation error.
 - `protocol: tcp` requires at least one port and rejects L7-only fields, including `path`, `enforcement`, `access`, `rules`, `deny_rules`, request rewriting and credential signing fields, and GraphQL, JSON-RPC, or MCP options.
 - A `protocol: tcp` hostname constrains connection routing, not application authority. OpenShell does not inspect TLS SNI, HTTP `Host`, or another protocol-level destination in the stream. Compatible shared infrastructure can therefore expose other tenants, virtual hosts, or services behind an allowed hostname.
-- A sandbox runtime must support policy DNS and transparent TCP capture before it can activate a policy containing `protocol: tcp`. Docker and Podman provide this runtime support.
-- Adding the first `protocol: tcp` endpoint to a running sandbox that started without one is rejected atomically because its DNS and capture substrate is startup infrastructure. Recreate the sandbox with a TCP endpoint. A sandbox that started with the substrate can remove and re-add TCP endpoints dynamically.
+- A sandbox runtime must support policy DNS and transparent TCP capture before it can activate a policy containing `protocol: tcp`. Docker and Podman provide this runtime support. The standard runtime initializes the substrate unconditionally, so a running sandbox can add its first TCP endpoint through a live update.
 - Policy-advisor agent proposals cannot request `protocol: tcp` or `tls: skip`. Add native TCP or raw TLS access through an administrator-authored policy. Agent proposals may omit `protocol` to use the explicit proxy with its default TLS termination and HTTP authority checks.
 - When `protocol` is set, at least one of `access` or `rules` is required for `rest`, `websocket`, `graphql`, and `sql`.
 - `mcp` and `json-rpc` reject `access` presets; use explicit `rules`.
@@ -271,6 +320,22 @@ For proxied HTTP responses, OpenShell completes delivery and signals EOF when
 the server sends `Connection: close` or an HTTP/1.0 response without keep-alive.
 This also applies to HTTPS and responses processed by middleware. A
 `Content-Length` or chunked body does not override the server's close decision.
+
+### Matcher Semantics
+
+Different policy fields use different wildcard boundaries.
+
+| Matcher | Comparison | Important behavior |
+|---|---|---|
+| Endpoint `host` | Case-insensitive DNS name or IP comparison. | DNS `*` matches one label and `**` matches one or more labels. Host wildcard placement is restricted by validation. |
+| Binary `path` | Canonical executable or trusted ancestor path. | Symlinks resolve to canonical identity. `*` matches within a path segment and `**` crosses directories. Identity enforcement depends on trusted runtime configuration. |
+| REST or WebSocket request `path` | Case-sensitive URL path glob. | Both `*` and `**` can cross `/`; this differs from common shell glob intuition. |
+| Query value | Case-sensitive decoded value glob. | For allow rules, every duplicate value for a configured key must match. |
+
+For a deny rule with query conditions, every configured key must be present and
+each key must have at least one matching value. A duplicate nonmatching value
+does not cancel another value that matches the deny. Deny rules still take
+precedence over allows.
 
 Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token provider-shaped aliases such as `provider-OPENSHELL-RESOLVE-ENV-API_TOKEN` when the referenced environment key exists in the configured provider credentials.
 
@@ -324,7 +389,7 @@ REST allow rules match HTTP requests by method, path, and optional query paramet
 |---|---|---|---|
 | `method` | string | Yes | HTTP method to allow (for example, `GET`, `POST`). `*` matches any method. |
 | `path` | string | Yes | URL path glob. `*` and `**` match zero or more characters and may cross `/`; `?` matches one character; bracket classes such as `[0-9]` and `[!0]` are supported. |
-| `query` | map | No | Query parameter matchers keyed by decoded param name. Matcher value can be a glob string (`tag: "foo-*"`) or an object with `any` (`tag: { any: ["foo-*", "bar-*"] }`). |
+| `query` | map | No | Query parameter matchers keyed by decoded, case-sensitive name. A matcher can be a glob string (`tag: "foo-*"`) or an object with `any` (`tag: { any: ["foo-*", "bar-*"] }`). Every duplicate value for a configured key must match an allow-rule matcher. |
 
 Example REST allow rules:
 
@@ -454,7 +519,8 @@ mcp:
   versions: ["2025-03-26", "2025-11-25"]
 ```
 
-OpenShell canonicalizes an explicit list in semantic order. Later runtime negotiation selects one allowed revision and applies only that profile; it does not combine the profiles.
+OpenShell canonicalizes an explicit list in semantic order. See [MCP Version
+Selection](#mcp-version-selection) for the stateless request-header behavior.
 
 ##### JSON-RPC Allow Rule (`protocol: json-rpc`)
 
@@ -498,7 +564,7 @@ REST deny rules use the same field names as REST allow rules, but they appear di
 |---|---|---|---|
 | `method` | string | Yes | HTTP method to deny (for example, `POST`, `DELETE`). `*` matches any method. |
 | `path` | string | Yes | URL path pattern. Same glob syntax as allow rules. Use `**` to match any path. |
-| `query` | map | No | Query parameter matchers. Same syntax as allow rule `query`. |
+| `query` | map | No | Query parameter matchers. Every configured key must be present with at least one matching value. Additional nonmatching duplicate values do not cancel a match. |
 
 Example REST deny rules:
 
@@ -597,16 +663,33 @@ endpoints:
 ### Binary Object
 
 Identifies an executable that is permitted to use the associated endpoints.
+OpenShell resolves the executable's canonical identity and can match a trusted
+ancestor process. Symlink spelling therefore does not bypass canonical path
+checks. Trusted runtime configuration can disable binary identity enforcement,
+so inspect the active runtime mode when diagnosing an unexpected result.
+
+With identity enforcement enabled, OpenShell pins each executable or ancestor
+path used for authorization to its first observed SHA256 digest. A changed
+digest, missing evidence, or conflicting evidence denies access. Command-line
+paths do not authorize access. Restart the sandbox runtime after intentionally
+replacing an executable at an authorized path so it can establish a new pin.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `path` | string | Yes | Filesystem path to the executable. Supports glob patterns with `*` and `**`. For example, `/sandbox/.vscode-server/**` matches any executable under that directory tree. |
+| `path` | string | Yes | Canonical filesystem path selector. `*` matches within one path segment and `**` crosses directory boundaries. For example, `/sandbox/.vscode-server/**` matches executables below that directory tree. |
 
 ## Network Middleware
 
 **Category:** Dynamic
 
-A map of up to 10 middleware configs selected after network and L7 policy admit an HTTP request or WebSocket upgrade. Each map key is the stable policy-local config identity. Middleware selection is independent of the network policy entry that admitted the traffic. Every matching config runs once by ascending `order` before provider credential injection. WebSocket-capable bindings continue on client text messages after the upgrade. Order values must be unique across the policy, and runtime selection also enforces the 10-stage maximum.
+A map of up to 10 middleware configs selected after network and L7 policy admit
+an HTTP request or WebSocket upgrade. Request middleware runs before provider
+credential injection. Response middleware that advertises
+`HTTP_RESPONSE/PRE_RETURN` runs on the final upstream response before return.
+WebSocket-capable bindings continue on client text messages after the upgrade.
+Selection is independent of the admitting network rule, and host matching alone
+does not select an operation the implementation did not advertise. Each matching
+config runs once by ascending `order`; order values must be unique.
 
 ```yaml showLineNumbers={false}
 network_middlewares:
@@ -637,9 +720,12 @@ See [Supervisor Middleware Configuration](/extensibility/supervisor-middleware/c
 
 ## Full Example
 
-The following policy grants read-only GitHub API access and npm registry access:
+The following complete policy file grants enforced read-only GitHub API and npm
+registry access:
 
 ```yaml showLineNumbers={false}
+version: 1
+
 network_policies:
   github_rest_api:
     name: github-rest-api
@@ -659,6 +745,7 @@ network_policies:
       - host: registry.npmjs.org
         port: 443
         protocol: rest
+        enforcement: enforce
         access: read-only
         allow_encoded_slash: true
     binaries:
