@@ -3,20 +3,26 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Policy Prover"
 sidebar-title: "Prover"
-description: "Use the policy prover to check that a policy grants no more access than a boundary policy you define, and learn how the policy advisor uses the same prover."
-keywords: "Generative AI, Cybersecurity, Policy, Prover, Boundary, CI"
-position: 8
+description: "Understand how OpenShell uses the policy prover, and check that a policy grants no more access than a maximum policy you define."
+keywords: "Generative AI, Cybersecurity, Policy, Prover, Boundary, CI, Subagent"
+position: 4
 ---
 
-The policy prover is OpenShell's policy verification engine. Instead of testing
-individual requests, it uses the Z3 solver to reason about every request that a
-policy could allow. OpenShell uses the prover in two ways, and each answers a
-different question:
+The policy prover is OpenShell's policy verification engine. It translates
+policies into logical formulas and uses the Z3 SMT solver to search for a
+request that answers a specific question, such as whether any request exists
+that one policy allows and another denies. Because the solver searches every
+possible request instead of testing a sample, a result covers all requests, not
+only the ones you thought to try.
+
+OpenShell uses the prover in two ways: the `openshell-prover check` command, and
+the [policy advisor](/sandboxes/policy-advisor), which checks every network rule
+that an agent proposes. Each answers a different question:
 
 | | `openshell-prover check` | Policy advisor |
 |---|---|---|
-| Question | Does this policy stay within a limit that I set? | Does this proposal add risky new access? |
-| When it runs | When you run the command, for example in CI. | Automatically, on every proposal. |
+| Question | Does this policy stay within a maximum policy that I set? | Does this proposed rule add risky new access? |
+| When it runs | When an agent or a person runs the command, for example before applying a policy or in CI. | Automatically, each time an agent in a sandbox proposes a new network rule through the policy advisor. |
 | What it compares | A candidate policy against a boundary policy that you write. | The sandbox's policy with and without the proposed rule. |
 | What it reports | Access that the candidate allows beyond the boundary. | New access to link-local or cloud metadata addresses, uninspected traffic where a provider credential is available, new credentialed destinations, and new HTTP methods. |
 
@@ -34,13 +40,20 @@ Checks](/sandboxes/policy-advisor#what-the-prover-checks).
 `openshell-prover check` determines whether everything allowed by the policy you
 are testing, called the candidate, is also allowed by a boundary policy that you
 write. If the candidate allows something the boundary does not, the prover
-shows an example. Use it to check a policy before you apply it, for example in
-CI, so that no change grants more than your organization allows.
+shows an example.
+
+The boundary is usually the most access that an environment allows. For
+example, an enterprise can define a maximum policy for all of its agents. A
+parent agent that creates a sandbox for a subagent can check that the policy it
+proposes for the subagent does not exceed the parent's own maximum allowed
+policy. Run the check before you apply a policy, or in CI, so that no change
+grants more than the boundary allows.
 
 The check covers filesystem access, process identity, Landlock settings, network
-destinations, and REST methods and paths. If a policy uses anything else, such
-as GraphQL or MCP rules, the prover reports that it cannot check the policy
-instead of ignoring those rules.
+connections, and REST requests. If a policy uses anything else, such as GraphQL
+or MCP rules, the prover reports that it cannot check the policy instead of
+ignoring those rules. [What the Boundary Check
+Covers](#what-the-boundary-check-covers) describes each part and its limits.
 
 The `openshell-prover` command is installed with OpenShell. It is a separate
 command because it reads policy files on your machine and does not need a
@@ -143,40 +156,71 @@ as `unsupported_policy_shape` or `solver_timeout`. Also check that
 `openshell-prover check --help` for all options, including `--timeout`, which
 changes the default 10-second time limit.
 
-## What a Passing Result Means
+## What the Boundary Check Covers
 
 A passing result means that the candidate allows nothing beyond the boundary in
 the parts of the policy that the prover checks. It does not mean that the policy
 is as narrow as it could be, that it is safe for a particular task, or that a
 running sandbox enforces it.
 
-The prover reports `unsupported` instead of guessing when the answer depends on
-something it cannot see or does not check:
+The check covers five parts of a policy. Within each part, some comparisons
+depend on information that the prover does not have, such as the files in the
+sandbox image. For those comparisons, the prover returns `unsupported` instead
+of guessing. Very large policies, for example with more than 1,024 network rules
+or 4,096 endpoints across both files, return `inconclusive` with the
+`reason_code` `resource_limit`.
 
-- Network rules other than connection rules and REST rules, such as WebSocket,
-  GraphQL, MCP, and JSON-RPC rules.
-- Filesystem comparisons between different paths, such as narrowing `/tmp` to
-  `/tmp/cache`. A symlink in the sandbox image could make the paths refer to
-  different locations. Removing a path, or changing it from read-write to
-  read-only, is supported.
-- Binary rules that compare an exact path with a glob, because a symlink in the
-  sandbox image could change which executable the path refers to. Use matching
-  exact paths when you can.
-- Settings that depend on the sandbox image, such as the working directory.
-- Endpoints for the same host and port that set different `allowed_ips`, or
-  that mix connection-only and REST rules.
-- Process identity changes other than changing a non-root user or group to
-  root. The prover reports a change to root as exceeding the boundary.
-- Host, path, method, or binary values that contain non-ASCII characters.
+### Filesystem Access
 
-The prover also handles these cases in specific ways:
+The prover compares read and write access path by path, so both policies must
+list the same paths. The candidate can remove a path that the boundary lists or
+change it from read-write to read-only, and a boundary entry for `/` covers
+every path. If the boundary grants no access of a kind, such as no write access
+at all, any candidate path with that access exceeds the boundary.
 
-- Changing Landlock from `hard_requirement` to `best_effort` exceeds the
-  boundary. The prover compares the settings, not what a kernel enforces.
-- The prover checks network rules both with and without binary identity
-  enforcement, because a sandbox runtime can turn it off.
-- The prover does not resolve hostnames on your machine. It checks
-  `allowed_ips` ranges together with hosts, ports, binaries, and REST rules.
-- Very large policies, for example with more than 1,024 network rules or 4,096
-  endpoints across both files, return `inconclusive` with the `reason_code`
-  `resource_limit`.
+Comparing different paths returns `unsupported`, even when one path is inside
+the other. For example, a candidate that allows writing to `/tmp/cache` under a
+boundary that allows writing to `/tmp` returns `unsupported`, because a symlink
+in the sandbox image could make `/tmp/cache` point outside `/tmp`. A policy
+whose result depends on the sandbox's working directory also returns
+`unsupported`.
+
+### Process Identity
+
+The prover compares `run_as_user` and `run_as_group`. Matching values pass, and
+a change from a non-root identity to root exceeds the boundary. Any other
+change, such as from UID `1500` to `1600`, returns `unsupported`, because the
+prover cannot look up accounts in the sandbox image.
+
+### Landlock
+
+The prover compares the `compatibility` setting. Keeping the setting or changing
+it to `hard_requirement` passes, and changing `hard_requirement` to
+`best_effort` exceeds the boundary. The prover compares the settings, not what
+a kernel enforces.
+
+### Network Connections
+
+The prover compares which binaries can reach which hosts, ports, and destination
+addresses, including `allowed_ips` ranges. It checks each policy both with and
+without binary identity enforcement, because a sandbox runtime can turn
+enforcement off. It does not resolve hostnames.
+
+The prover returns `unsupported` in these cases:
+
+- The candidate lists an exact binary path that the boundary covers only with a
+  glob, such as `/usr/bin/curl` under `/usr/bin/*`. A symlink in the sandbox
+  image could make the exact path refer to an executable outside the glob. Use
+  the same exact paths in both policies when you can.
+- Endpoints that could match the same host and port, including wildcard hosts,
+  set different `allowed_ips`.
+- A host, path, method, or binary contains non-ASCII characters.
+
+### REST Requests
+
+The prover compares method and path allow and deny rules on endpoints with
+`protocol: rest`. These endpoints must use `enforcement: enforce`. An endpoint
+in audit mode returns `unsupported`, because it does not block requests. A host
+and port that has both a REST endpoint and an endpoint without request rules
+also returns `unsupported`. Other request protocols, such as WebSocket, GraphQL,
+MCP, and JSON-RPC, return `unsupported`.
