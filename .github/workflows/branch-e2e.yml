@@ -260,6 +260,7 @@ jobs:
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
+          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"e2e-podman"},
           {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"driver-podman"}
         ]
 
