@@ -153,6 +153,10 @@ sandbox state captured before the disposable VM is removed:
 gh run download <run-id> --name tmachine-diagnostics-ubuntu-k3s-kubernetes-binaries-conformance
 ```
 
+Completed diagnostic sections are saved incrementally. If collection times out,
+the artifact retains the earlier sections; check the job log for the timeout
+and use the last recorded section to identify where collection stopped.
+
 ## Wait for Run Completion (Scripting)
 
 Watch and wait for a run to complete:

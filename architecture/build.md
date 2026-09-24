@@ -286,7 +286,9 @@ Unlike Docker and Podman environments, this environment runs setup and
 installation on a disposable overlay disk, so cluster state and credentials
 cannot enter the reusable setup or install caches. Failed runs collect bounded,
 redacted systemd, k3s, Kubernetes, gateway, and sandbox state before removing
-the guest; CI uploads that diagnostic record as an artifact.
+the guest; CI uploads that diagnostic record as an artifact. Kubernetes
+diagnostic requests have individual timeouts, and completed sections stream
+directly to the artifact so an overall collection timeout retains earlier evidence.
 
 Run the Kubernetes composition locally after staging the candidate inputs:
 
