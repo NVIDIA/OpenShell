@@ -19,7 +19,11 @@ Install OpenShell with a single command:
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
-The script detects your operating system and installs the OpenShell CLI, standalone policy prover, and gateway with your native package manager. It then starts the local gateway server so you can begin creating sandboxes.
+The script detects your operating system and installs the OpenShell CLI, standalone policy prover, and gateway. On Linux, it installs from the Snap Store whenever the `snap` command is available. Otherwise, it uses the native Debian or RPM package. It then starts the local gateway server so you can begin creating sandboxes.
+
+Snap installs use `latest/stable` by default and `latest/edge` when
+`OPENSHELL_VERSION=dev`. Other `OPENSHELL_VERSION` values also use the stable
+Snap channel because Snap Store channels do not select an exact GitHub release.
 
 You can also download release artifacts directly from the [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
 
@@ -70,9 +74,11 @@ brew services restart openshell
 
 ## Linux
 
-On Fedora and RHEL, the install script uses RPM packages. The RPMs install the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, and a systemd user service.
+On Linux systems with the `snap` command, the install script uses the OpenShell snap. If Docker is absent, it installs the Docker snap and waits for the Docker daemon before installing OpenShell.
 
-On Debian and Ubuntu, the install script uses a Debian package. The Debian package installs the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, VM sandbox support, and a systemd user service.
+On Fedora and RHEL without `snap`, the install script uses RPM packages. The RPMs install the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, and a systemd user service.
+
+On Debian and Ubuntu without `snap`, the install script uses a Debian package. The Debian package installs the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, VM sandbox support, and a systemd user service.
 
 Linux packages require glibc 2.28 or newer. The installer checks libc before downloading packages and exits with an error on older glibc versions, Alpine, musl-based distributions, or unknown libc environments.
 
@@ -96,17 +102,53 @@ sudo loginctl enable-linger $USER
 
 ## Snap
 
+The OpenShell snap requires a running Docker daemon. Docker can come from the
+Docker snap, a distribution package, Docker's package repository, or another
+compatible installation method. The install script reuses an existing Docker
+daemon. If Docker is absent, it installs the Docker snap and waits for the
+daemon before installing OpenShell.
+
+The snap keeps gateway and CLI state in snap-specific directories and does not
+import state from a Debian, RPM, Homebrew, or manual installation. If the
+installer detects an existing non-snap OpenShell binary, it stops before
+installing the snap. Back up anything you need, clean up existing sandboxes and
+runtime resources, stop the non-snap gateway, and remove the old installation.
+After completing that cleanup, rerun the installer with
+`OPENSHELL_ACK_BREAKING_UPGRADE=1`.
+
 Install the OpenShell snap from the Snap Store:
 
 ```shell
 sudo snap install openshell
 ```
 
+The install script installs `latest/stable` by default. Set
+`OPENSHELL_VERSION=dev` to install from `latest/edge`:
+
+```shell
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
+  OPENSHELL_VERSION=dev sh
+```
+
 The snap defines two apps: the `openshell` CLI and the `openshell.gateway`
-systemd service. The gateway listens on `https://127.0.0.1:17670` and
-stores its database at `$SNAP_COMMON/gateway.db` (typically
-`/var/snap/openshell/common/gateway.db`). Create `$SNAP_COMMON/gateway.toml`
-when you need to override gateway settings.
+system service. Unlike the Debian and RPM user services, snapd runs this service
+as root. The gateway therefore generates its certificates in root-owned snap
+state, where ordinary users running the CLI cannot read the client certificate.
+For this reason, the snap disables TLS and listens only on
+`http://127.0.0.1:17670`. Its default configuration permits unauthenticated
+local CLI access. Sandbox connections still use gateway-minted credentials.
+
+The gateway stores its database at `$SNAP_COMMON/gateway.db` and its
+configuration at `$SNAP_COMMON/gateway.toml`, typically under
+`/var/snap/openshell/common/`. Initial snap installation creates the default
+configuration only when no configuration already exists.
+The install script applies the same default when it installs or refreshes a snap
+that has no existing gateway configuration, then restarts the gateway.
+
+Edit `$SNAP_COMMON/gateway.toml` when you need to override gateway settings,
+then restart the service. Do not expose the default plaintext gateway beyond
+the local host while unauthenticated user access is enabled. Any process or user
+on the same host that can connect to the loopback port can operate the gateway.
 
 The snap CLI stores per-user config, data, and state under `$SNAP_USER_COMMON`,
 typically `~/snap/openshell/common`. Gateway registrations live under
@@ -115,47 +157,45 @@ typically `~/snap/openshell/common`. Gateway registrations live under
 
 ### Snap store installs
 
-When installing from the Snap Store, snapd automatically connects the `home`,
-`network`, and `network-bind` plugs. The `docker` plug still
-requires manual connection:
-
-```shell
-sudo snap connect openshell:docker docker:docker-daemon
-```
-
-The snap declares `default-provider: docker` on the Docker plug so snapd will
-offer to install the Docker snap, but the connection itself must be made
-manually.
+When installing OpenShell from the Snap Store, snapd automatically connects all
+required interfaces. The `docker` plug connects to the system `:docker` slot,
+which exposes the installed Docker daemon regardless of how Docker was
+packaged. The `log-observe` and `system-observe` plugs are also automatically
+connected through the OpenShell snap's store assertions.
 
 ### Locally built snap packages
 
-When installing a locally built `.snap` file, no plugs are connected by default:
+To install a locally-built snap, one can install directly from a `.snap` file
+with the `--dangerous` flag to acknowledge that it has not been signed by the
+Snap Store. Thus, it lacks the store assertions which tell snapd to auto-
+connect the privileged interfaces, so they must be connected manually.
 
 ```shell
 sudo snap install ./openshell_*.snap --dangerous
-sudo snap connect openshell:home
-sudo snap connect openshell:network
-sudo snap connect openshell:network-bind
-sudo snap connect openshell:docker docker:docker-daemon
 sudo snap connect openshell:log-observe
 sudo snap connect openshell:system-observe
+sudo snap connect openshell:docker :docker
 ```
 
 The `log-observe` and `system-observe` plugs are needed for the gateway service
-to read logs and inspect system processes. The `docker` plug requires the
-`docker:docker-daemon` slot from the Docker snap and does not work with
-system-installed Docker.
+to read logs and inspect system processes. The `docker` plug connects to the
+same system `:docker` slot used by Store installations.
 
 ### Gateway service
 
 The gateway runs as a snap daemon with `refresh-mode: endure`, meaning snapd
 will not restart it during snap refreshes. This prevents the gateway from
-killing active sandbox sessions mid-refresh. Restart the service manually after
-a snap refresh when you need the updated binary:
+killing active sandbox sessions during automatic or direct snap refreshes.
+Restart the service manually after a direct `snap refresh` when you need the
+updated binary:
 
 ```shell
 sudo systemctl restart snap.openshell.gateway
 ```
+
+Rerunning `install.sh` explicitly refreshes the snap and restarts the gateway so
+the refreshed binary is active when installation completes. That restart
+interrupts active sandbox sessions.
 
 ## Kubernetes
 
