@@ -18,6 +18,9 @@ type ListOptions = types.ListOptions
 // WatchOptions configures watch behavior.
 type WatchOptions = types.WatchOptions
 
+// WatchLogsOptions configures a resumable sandbox log and platform event watch.
+type WatchLogsOptions = types.WatchLogsOptions
+
 // WaitOptions configures wait behavior. Use context for timeout control.
 type WaitOptions = types.WaitOptions
 

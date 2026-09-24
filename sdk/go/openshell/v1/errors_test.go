@@ -120,6 +120,8 @@ func TestErrorCode_String(t *testing.T) {
 		{ErrorInternal, "Internal"},
 		{ErrorUnimplemented, "Unimplemented"},
 		{ErrorConflict, "Conflict"},
+		{ErrorUnauthenticated, "Unauthenticated"},
+		{ErrorOutOfRange, "OutOfRange"},
 	}
 	for _, tt := range tests {
 		assert.Equal(t, tt.want, tt.code.String())

@@ -179,6 +179,9 @@ func (m *mockSandboxResolver) WaitReady(_ context.Context, _, _ string, _ ...Wai
 func (m *mockSandboxResolver) Watch(_ context.Context, _, _ string, _ ...WatchOptions) (WatchInterface[*Sandbox], error) {
 	return nil, nil
 }
+func (m *mockSandboxResolver) WatchLogs(_ context.Context, _, _ string, _ ...WatchLogsOptions) (WatchInterface[*WatchLogEvent], error) {
+	return nil, nil
+}
 func (m *mockSandboxResolver) GetLogs(_ context.Context, _, _ string, _ ...LogOption) (*LogResult, error) {
 	return nil, nil
 }

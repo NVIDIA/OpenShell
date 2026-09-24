@@ -61,6 +61,9 @@ func (r *stubSandboxResolver) WaitReady(context.Context, string, string, ...Wait
 func (r *stubSandboxResolver) Watch(context.Context, string, string, ...WatchOptions) (WatchInterface[*Sandbox], error) {
 	panic("not implemented")
 }
+func (r *stubSandboxResolver) WatchLogs(context.Context, string, string, ...WatchLogsOptions) (WatchInterface[*WatchLogEvent], error) {
+	panic("not implemented")
+}
 func (r *stubSandboxResolver) GetLogs(context.Context, string, string, ...LogOption) (*LogResult, error) {
 	panic("not implemented")
 }

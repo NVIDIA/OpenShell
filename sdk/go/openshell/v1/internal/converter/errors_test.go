@@ -135,6 +135,22 @@ func TestFromGRPCError_Aborted(t *testing.T) {
 	assert.Equal(t, "version conflict", se.Message)
 }
 
+func TestFromGRPCError_OutOfRange(t *testing.T) {
+	// A trimmed resume cursor is unrecoverable loss, not a malformed request,
+	// so it must stay distinguishable from InvalidArgument.
+	grpcErr := status.Error(codes.OutOfRange, "resume cursor was trimmed")
+	err := FromGRPCError(grpcErr)
+	require.Error(t, err)
+	assert.True(t, v1.IsOutOfRange(err))
+	assert.False(t, v1.IsInvalidArgument(err))
+
+	var se *v1.StatusError
+	require.ErrorAs(t, err, &se)
+	assert.Equal(t, v1.ErrorOutOfRange, se.Code)
+	assert.Equal(t, "resume cursor was trimmed", se.Message)
+	assert.Equal(t, int32(codes.OutOfRange), se.GRPCCode)
+}
+
 func TestFromGRPCError_UnmappedCode(t *testing.T) {
 	grpcErr := status.Error(codes.DataLoss, "data loss")
 	err := FromGRPCError(grpcErr)

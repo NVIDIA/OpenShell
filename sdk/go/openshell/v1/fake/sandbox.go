@@ -814,6 +814,15 @@ func (c *fakeSandboxClient) GetLogs(_ context.Context, _, _ string, _ ...v1.LogO
 	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "GetLogs not implemented in fake client"}
 }
 
+// WatchLogs returns Unimplemented — the fake client has no log or platform
+// event stream to replay, so it cannot honor the cursor resume contract.
+func (c *fakeSandboxClient) WatchLogs(_ context.Context, _, _ string, _ ...v1.WatchLogsOptions) (types.WatchInterface[*types.WatchLogEvent], error) {
+	if c.closedFunc() {
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
+	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "WatchLogs not implemented in fake client"}
+}
+
 // ListProviders returns stub Provider objects for each provider name
 // attached to the sandbox. The returned providers contain only the Name
 // field, since the fake client does not maintain a full provider registry
