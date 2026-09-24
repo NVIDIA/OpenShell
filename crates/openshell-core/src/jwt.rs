@@ -983,10 +983,11 @@ mod tests {
 
         #[test]
         fn non_expiring_session_tokens_remain_usable() {
-            let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate Ed25519 key");
+            let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519)
+                .expect("generate Ed25519 key");
             let public_key_pem = key.public_key_pem().into_bytes();
             let issuer = SessionJwtIssuer::from_ed25519_pem(
-                key.serialize_pem().as_bytes(),
+                key.serialize_pem().unwrap().as_bytes(),
                 "current",
                 "test",
                 None,
