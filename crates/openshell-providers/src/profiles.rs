@@ -1063,6 +1063,7 @@ pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy)
             | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
             | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
             | ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+            | ProviderCredentialRefreshStrategy::GithubAppInstallation
     )
 }
 
@@ -1313,6 +1314,7 @@ pub fn provider_refresh_strategy_from_yaml(raw: &str) -> Option<ProviderCredenti
             Some(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
         "aws_sts_assume_role" => Some(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
+        "github_app_installation" => Some(ProviderCredentialRefreshStrategy::GithubAppInstallation),
         _ => None,
     }
 }
@@ -1328,6 +1330,7 @@ pub fn provider_refresh_strategy_to_yaml(
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
+        ProviderCredentialRefreshStrategy::GithubAppInstallation => "github_app_installation",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -2198,6 +2201,20 @@ pub fn validate_profile_set(
             }
 
             if let Some(refresh) = credential.refresh.as_ref() {
+                if refresh.strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation
+                    && (!refresh
+                        .token_url
+                        .ends_with("/app/installations/{installation_id}/access_tokens")
+                        || refresh.token_url.matches("{installation_id}").count() != 1
+                        || !refresh.scopes.is_empty())
+                {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.refresh",
+                        "github_app_installation requires a token_url ending in /app/installations/{installation_id}/access_tokens and uses permissions material instead of scopes",
+                    ));
+                }
                 if refresh.strategy == ProviderCredentialRefreshStrategy::Unspecified {
                     diagnostics.push(ProfileValidationDiagnostic::error(
                         source,
@@ -5894,6 +5911,25 @@ binaries:
             matches!(err, ProfileError::ValidationError { ref id, ref message, .. } if id == "bad-l7" && message.contains("mutually exclusive")),
             "expected L7 validation error for access+rules, got: {err}"
         );
+    }
+
+    #[test]
+    fn github_app_profile_roundtrip_and_runtime_credentials() {
+        let profile = example_profile("github-app");
+        assert!(profile.required_static_credentials().is_empty());
+        assert!(validate_profile_set(&[("github-app.yaml".into(), profile.clone())]).is_empty());
+        let proto = profile.to_proto();
+        assert_eq!(
+            proto.credentials[0].refresh.as_ref().unwrap().strategy,
+            openshell_core::proto::ProviderCredentialRefreshStrategy::GithubAppInstallation as i32
+        );
+        let restored = ProviderTypeProfile::from_proto(&proto);
+        let yaml = serde_yml::to_string(&restored).unwrap();
+        assert!(yaml.contains("github_app_installation"));
+        let mut invalid = profile.clone();
+        invalid.credentials[0].refresh.as_mut().unwrap().token_url =
+            "https://api.github.com/token".into();
+        assert!(!validate_profile_set(&[("invalid.yaml".into(), invalid)]).is_empty());
     }
 
     #[test]

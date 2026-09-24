@@ -1180,13 +1180,15 @@ mod tests {
         assert_eq!(prof[0].0, "GITHUB_TOKEN");
 
         let sug = &prof[0].1;
-        assert_eq!(sug.len(), 2_usize);
+        assert_eq!(sug.len(), 3_usize);
 
         assert_eq!(sug[0].provider_type, "copilot");
         assert_eq!(sug[0].credential, "api_token");
 
         assert_eq!(sug[1].provider_type, "github");
         assert_eq!(sug[1].credential, "api_token");
+        assert_eq!(sug[2].provider_type, "github-app");
+        assert_eq!(sug[2].credential, "api_token");
     }
 
     #[test]
@@ -1198,13 +1200,15 @@ mod tests {
         assert_eq!(prof[0].0, "gh_token");
 
         let sug = &prof[0].1;
-        assert_eq!(sug.len(), 2_usize);
+        assert_eq!(sug.len(), 3_usize);
 
         assert_eq!(sug[0].provider_type, "copilot");
         assert_eq!(sug[0].credential, "api_token");
 
         assert_eq!(sug[1].provider_type, "github");
         assert_eq!(sug[1].credential, "api_token");
+        assert_eq!(sug[2].provider_type, "github-app");
+        assert_eq!(sug[2].credential, "api_token");
     }
 
     #[test]

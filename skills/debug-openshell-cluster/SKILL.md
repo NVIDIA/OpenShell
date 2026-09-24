@@ -324,6 +324,10 @@ Common findings:
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Numeric workload identities `1` through `4294967294` are accepted; root, the invalid identity sentinel, and missing identities are rejected.
 - Supervisor cannot connect: check its gateway endpoint and gateway logs.
+- A private-channel handshake failure can indicate mismatched runtime versions.
+  Check the configured `sandbox_runtime_image` and `supervisor_image` against
+  the images reported in gateway provisioning logs; both must belong to the
+  intended build. The workload image is a separate setting.
 - Inspect both Podman containers for the sandbox: the `sandbox` isolation role
   must have network mode `none`; the `supervisor` role owns the gateway session
   and egress. Both run non-root with all capabilities dropped. Check the private

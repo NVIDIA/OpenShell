@@ -118,14 +118,14 @@ mod tests {
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
-    // Carries this branch's exec request IDs together with main's opaque watch
-    // cursor and well-known time types. These unreleased public-only fields add
-    // no messages or enums and touch no stored type, so the durable and overlap
-    // fingerprints below remain unchanged.
+    // GitHub App refresh adds enum value 7 to the public refresh strategy,
+    // also referenced by durable provider profiles. Existing numbers and
+    // fields are unchanged, so prior payloads retain their meaning. The frozen
+    // storage V1 schema and the set of public/durable type names are unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "8fb59b0932ec2f227fdec2d46b6204925e79595695810a247bef731ddd632594";
+        "fd5f72f21e54dcb115e4efed3699b21372dcc960a23fed5849b5e4349747008c";
     const DURABLE_SCHEMA_SHA256: &str =
-        "9eeaa29dfba187bff69fb7bc4f9a13a0f1d7be3f7049a38c8f0e20ce77ec7d8b";
+        "4870d9656aa88f0230bdef85f6c65a48ddc9e1b5c8e54668d19f8e5938805b30";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "a6e97fdde30c439ffaa03c2952a43033f8ea338fed6b1456ebe2d7d8af14e834";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;

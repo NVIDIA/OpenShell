@@ -4647,6 +4647,16 @@ pub(super) async fn handle_configure_provider_refresh(
         &additional_output_keys,
     )?;
     validate_refresh_material(&request.material, refresh_defaults.as_ref())?;
+    if strategy == ProviderCredentialRefreshStrategy::GithubAppInstallation {
+        let defaults = refresh_defaults.as_ref().filter(|defaults| defaults.strategy == strategy)
+            .ok_or_else(|| Status::failed_precondition(
+                "github_app_installation requires a matching provider profile refresh declaration",
+            ))?;
+        crate::provider_refresh::validate_github_app_configuration(
+            &request.material,
+            &defaults.token_url,
+        )?;
+    }
     let mut secret_material_keys: HashSet<String> =
         request.secret_material_keys.iter().cloned().collect();
     for key in &request.secret_material_keys {
@@ -6298,6 +6308,7 @@ mod tests {
                 "cursor",
                 "deepinfra",
                 "github",
+                "github-app",
                 "google-cloud",
                 "google-vertex-ai",
                 "nvidia",
@@ -7289,6 +7300,215 @@ mod tests {
 
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(err.message().contains("default/global-provider"));
+    }
+
+    #[tokio::test]
+    async fn github_app_refresh_stores_key_rotates_token_and_expires_closed() {
+        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let state = test_server_state().await;
+        let server = MockServer::start().await;
+        let mut profile = openshell_providers::example_profiles::load("github-app").to_proto();
+        profile.id = "test-github-app".into();
+        profile.credentials[0].refresh.as_mut().unwrap().token_url = format!(
+            "{}/app/installations/{{installation_id}}/access_tokens",
+            server.uri()
+        );
+        let imported = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "test.yaml".into(),
+                }],
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(imported.imported, "{:?}", imported.diagnostics);
+        let provider = create_provider_record(
+            state.store.as_ref(),
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    name: "github-app-test".into(),
+                    workspace: "default".into(),
+                    ..Default::default()
+                }),
+                r#type: "test-github-app".into(),
+                profile_workspace: "default".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let configure = || ConfigureProviderRefreshRequest {
+            provider: "github-app-test".into(),
+            credential_key: "GITHUB_TOKEN".into(),
+            strategy: ProviderCredentialRefreshStrategy::GithubAppInstallation as i32,
+            material: HashMap::from([
+                ("client_id".into(), "Iv1.test".into()),
+                ("installation_id".into(), "123".into()),
+                (
+                    "private_key".into(),
+                    crate::provider_refresh::TEST_RSA_PRIVATE_KEY.into(),
+                ),
+                ("repository_ids".into(), "[42]".into()),
+                ("permissions".into(), r#"{"contents":"read"}"#.into()),
+            ]),
+            // The strategy itself must classify the signing key as secret.
+            secret_material_keys: Vec::new(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            ..Default::default()
+        };
+        let mut invalid = configure();
+        invalid
+            .material
+            .insert("repository_ids".into(), "[]".into());
+        assert_eq!(
+            handle_configure_provider_refresh(&state, authed_request(invalid))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        handle_configure_provider_refresh(&state, authed_request(configure()))
+            .await
+            .unwrap();
+        let initial = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            "GITHUB_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!initial.material.contains_key("private_key"));
+        assert!(initial.secret_material_handles.contains_key("private_key"));
+
+        for token in ["installation-token-first", "installation-token-second"] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/app/installations/123/access_tokens"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "token": token,
+                    "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339()
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let rotated = crate::provider_refresh::refresh_provider_credential(
+                state.store.as_ref(),
+                "default",
+                &state.credentials,
+                None,
+                "github-app-test",
+                "GITHUB_TOKEN",
+            )
+            .await
+            .unwrap();
+            assert_eq!(rotated.authorization_epoch, initial.authorization_epoch);
+            assert!(rotated.next_refresh_at_ms < rotated.expires_at_ms);
+            let stored = state
+                .store
+                .get_message_by_name::<Provider>("default", "github-app-test")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(stored.credentials.is_empty());
+            assert_eq!(stored.credential_handles.len(), 1);
+            let resolved = state
+                .credentials
+                .resolve_provider_handles(&stored, crate::persistence::current_time_ms())
+                .await
+                .unwrap();
+            assert_eq!(
+                resolved.values.get("GITHUB_TOKEN").map(String::as_str),
+                Some(token)
+            );
+            let expired = state
+                .credentials
+                .resolve_provider_handles(&stored, rotated.expires_at_ms + 1)
+                .await
+                .unwrap();
+            assert!(expired.values.is_empty());
+        }
+        // Replacing a valid signing key starts a new authorization epoch and
+        // stores new secret material; no old key should be reused for the mint.
+        let new_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+        let mut replacement = configure();
+        replacement.material.insert(
+            "private_key".into(),
+            new_key.to_pkcs8_pem(LineEnding::LF).unwrap().to_string(),
+        );
+        handle_configure_provider_refresh(&state, authed_request(replacement))
+            .await
+            .unwrap();
+        let updated = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            "GITHUB_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_ne!(updated.authorization_epoch, initial.authorization_epoch);
+        assert_ne!(
+            updated.secret_material_handles,
+            initial.secret_material_handles
+        );
+        assert!(!updated.material.contains_key("private_key"));
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("secret echoed by issuer"))
+            .mount(&server)
+            .await;
+        assert!(
+            crate::provider_refresh::refresh_provider_credential(
+                state.store.as_ref(),
+                "default",
+                &state.credentials,
+                None,
+                "github-app-test",
+                "GITHUB_TOKEN"
+            )
+            .await
+            .is_err()
+        );
+        let failed = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            "GITHUB_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(failed.failure_code, "github_app_authentication_failed");
+        assert!(!failed.last_error.contains("secret echoed"));
+        let public = new_key
+            .to_public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let jwt = requests[0].headers["authorization"]
+            .to_str()
+            .unwrap()
+            .strip_prefix("Bearer ")
+            .unwrap();
+        jsonwebtoken::decode::<serde_json::Value>(
+            jwt,
+            &jsonwebtoken::DecodingKey::from_rsa_pem(public.as_bytes()).unwrap(),
+            &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256),
+        )
+        .unwrap();
     }
 
     #[tokio::test]
