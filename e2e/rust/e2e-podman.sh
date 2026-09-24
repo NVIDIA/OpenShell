@@ -40,6 +40,7 @@ PODMAN_CI_TESTS=(
   podman_gateway_start
   podman_host_gateway
   podman_oci_identity
+  provider_github_app
   provider_token_exchange
   upload_backpressure
 )

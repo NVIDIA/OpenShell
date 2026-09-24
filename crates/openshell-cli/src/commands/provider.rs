@@ -2087,6 +2087,7 @@ fn provider_refresh_strategy(strategy: &str) -> Result<ProviderCredentialRefresh
             Ok(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
         "aws_sts_assume_role" => Ok(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
+        "github_app_installation" => Ok(ProviderCredentialRefreshStrategy::GithubAppInstallation),
         _ => Err(miette!("unsupported provider refresh strategy: {strategy}")),
     }
 }
@@ -2130,7 +2131,9 @@ pub fn provider_refresh_recovery_action_name(
     }
 }
 
-fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -> &'static str {
+pub(super) fn provider_refresh_strategy_name(
+    strategy: ProviderCredentialRefreshStrategy,
+) -> &'static str {
     match strategy {
         ProviderCredentialRefreshStrategy::Static => "static",
         ProviderCredentialRefreshStrategy::External => "external",
@@ -2138,6 +2141,7 @@ fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
+        ProviderCredentialRefreshStrategy::GithubAppInstallation => "github_app_installation",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }

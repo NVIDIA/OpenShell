@@ -25,6 +25,7 @@ const (
 	RefreshStrategyOAuth2RefreshToken      = types.RefreshStrategyOAuth2RefreshToken
 	RefreshStrategyOAuth2ClientCredentials = types.RefreshStrategyOAuth2ClientCredentials
 	RefreshStrategyGoogleServiceAccountJWT = types.RefreshStrategyGoogleServiceAccountJWT
+	RefreshStrategyGitHubAppInstallation   = types.RefreshStrategyGitHubAppInstallation
 )
 
 // RefreshRecoveryAction describes the action required after a credential failure.
