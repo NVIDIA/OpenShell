@@ -669,7 +669,10 @@ async fn run_echo_supervisor(channel: Channel, channel_id: String) {
     out_tx
         .send(RelayFrame {
             payload: Some(openshell_core::proto::relay_frame::Payload::Init(
-                RelayInit { channel_id },
+                RelayInit {
+                    channel_id,
+                    ..Default::default()
+                },
             )),
         })
         .await
@@ -777,7 +780,10 @@ async fn relay_sees_eof_when_supervisor_closes() {
             out_tx
                 .send(RelayFrame {
                     payload: Some(openshell_core::proto::relay_frame::Payload::Init(
-                        RelayInit { channel_id },
+                        RelayInit {
+                            channel_id,
+                            ..Default::default()
+                        },
                     )),
                 })
                 .await
@@ -912,4 +918,44 @@ async fn test_health_store() -> Arc<Store> {
             .await
             .expect("connect in-memory sqlite store for tests"),
     )
+}
+
+/// A negotiated FIN must not become terminal success before the opposite
+/// direction finishes, including when a typed abort follows the FIN.
+#[tokio::test]
+async fn negotiated_relay_fin_preserves_input_and_terminal_status() {
+    use openshell_core::stream_lifecycle::{self, Frame};
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for abort_after_fin in [false, true] {
+            let registry = Arc::new(SupervisorSessionRegistry::new());
+            let channel = spawn_gateway(Arc::clone(&registry)).await;
+            let mut session_rx = register_session(&registry, "sbx");
+            let (channel_id, relay_rx) = registry.open_relay("sbx", Duration::from_secs(2)).await.unwrap();
+            session_rx.recv().await.unwrap();
+            let (input, rx) = mpsc::channel(4);
+            input.send(RelayFrame { payload: Some(openshell_core::proto::relay_frame::Payload::Init(RelayInit {
+                channel_id,
+                capabilities: stream_lifecycle::capabilities(),
+                session_id: "sess-1".into(),
+            })) }).await.unwrap();
+            let mut client = OpenShellClient::new(channel);
+            let mut response = client.relay_stream(ReceiverStream::new(rx)).await.unwrap().into_inner();
+            let mut pipe = relay_rx.await.unwrap().unwrap();
+            pipe.write_all(b"before FIN").await.unwrap();
+            pipe.shutdown().await.unwrap();
+            assert!(matches!(response.message().await.unwrap().unwrap().payload(), stream_lifecycle::Payload::Data(data) if data == b"before FIN"));
+            assert!(matches!(response.message().await.unwrap().unwrap().payload(), stream_lifecycle::Payload::HalfClose));
+            if abort_after_fin {
+                pipe.abort_handle().abort(Status::deadline_exceeded("after FIN"));
+                assert_eq!(response.message().await.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+            } else {
+                input.send(RelayFrame::data(b"after FIN".to_vec())).await.unwrap();
+                drop(input);
+                let mut data = Vec::new();
+                pipe.read_to_end(&mut data).await.unwrap();
+                assert_eq!(data, b"after FIN");
+                assert!(response.message().await.unwrap().is_none());
+            }
+        }
+    }).await.expect("relay FIN test hung");
 }
