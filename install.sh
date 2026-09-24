@@ -1236,6 +1236,43 @@ openshell_snap_channel() {
   fi
 }
 
+ensure_snap_gateway_config() {
+  _config_file="${1:-/var/snap/openshell/common/gateway.toml}"
+
+  as_root sh -c '
+    set -eu
+    config_file=$1
+    if [ -e "$config_file" ] || [ -L "$config_file" ]; then
+      exit 0
+    fi
+
+    config_dir=${config_file%/*}
+    mkdir -p "$config_dir"
+    umask 077
+    temporary_file=$(mktemp "${config_file}.tmp.XXXXXX")
+    trap '\''rm -f "$temporary_file"'\'' 0 HUP INT TERM
+
+    cat >"$temporary_file" <<'\''EOF'\''
+[openshell]
+version = 2
+
+[openshell.gateway]
+
+[openshell.gateway.auth]
+allow_unauthenticated_users = true
+EOF
+
+    if ! ln "$temporary_file" "$config_file"; then
+      if [ -e "$config_file" ] || [ -L "$config_file" ]; then
+        exit 0
+      fi
+      exit 1
+    fi
+    rm -f "$temporary_file"
+    trap - 0 HUP INT TERM
+  ' sh "$_config_file"
+}
+
 wait_for_docker_daemon() {
   _timeout="${OPENSHELL_INSTALL_DOCKER_TIMEOUT:-30}"
   _elapsed=0
@@ -1321,11 +1358,13 @@ install_linux_snap() {
     info "refreshing OpenShell snap from ${_channel}..."
     as_root snap refresh openshell --channel="$_channel"
     warn "restarting the OpenShell gateway to use the refreshed snap; active sandbox sessions will be interrupted"
-    as_root snap restart openshell.gateway
   else
     info "installing OpenShell snap from ${_channel}..."
     as_root snap install openshell --channel="$_channel"
   fi
+
+  ensure_snap_gateway_config
+  as_root snap restart openshell.gateway
 
   info "installed OpenShell snap from ${_channel}"
   info "registering local gateway as ${TARGET_USER}..."

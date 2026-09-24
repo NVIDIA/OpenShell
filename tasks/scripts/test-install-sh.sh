@@ -267,6 +267,7 @@ assert_snap_install_flow() {
     as_root() { printf 'root:%s\n' "$*"; }
     set_linux_target_runtime_dir() { :; }
     wait_for_docker_daemon() { printf '%s\n' "wait:docker"; }
+    ensure_snap_gateway_config() { printf '%s\n' "ensure:gateway-config"; }
     register_snap_gateway() { printf '%s\n' "register:gateway"; }
     wait_for_snap_gateway_listener() { printf '%s\n' "wait:gateway-listener"; }
     wait_for_local_gateway_status() { printf '%s\n' "wait:gateway-status"; }
@@ -290,6 +291,8 @@ assert_snap_install_flow \
   1 0 "" \
   "wait:docker
 root:snap install openshell --channel=latest/stable
+ensure:gateway-config
+root:snap restart openshell.gateway
 register:gateway
 wait:gateway-listener
 wait:gateway-status"
@@ -300,6 +303,8 @@ assert_snap_install_flow \
   "root:snap install docker
 wait:docker
 root:snap install openshell --channel=latest/edge
+ensure:gateway-config
+root:snap restart openshell.gateway
 register:gateway
 wait:gateway-listener
 wait:gateway-status"
@@ -309,10 +314,39 @@ assert_snap_install_flow \
   1 1 pre \
   "wait:docker
 root:snap refresh openshell --channel=latest/stable
+ensure:gateway-config
 root:snap restart openshell.gateway
 register:gateway
 wait:gateway-listener
 wait:gateway-status"
+
+snap_config_dir="${tmpdir}/snap-config"
+snap_config="${snap_config_dir}/gateway.toml"
+if ! (as_root() { "$@"; }; ensure_snap_gateway_config "$snap_config"); then
+  echo "FAIL: Snap gateway config bootstrap should create a missing config" >&2
+  exit 1
+fi
+if ! grep -Fq 'allow_unauthenticated_users = true' "$snap_config"; then
+  echo "FAIL: Snap gateway config must permit the plaintext local CLI" >&2
+  exit 1
+fi
+if [[ $(stat -c '%a' "$snap_config") != 600 ]]; then
+  echo "FAIL: Snap gateway config must be mode 0600" >&2
+  exit 1
+fi
+
+printf '\noperator setting = true\n' >>"$snap_config"
+cp "$snap_config" "${tmpdir}/snap-config-before"
+(as_root() { "$@"; }; ensure_snap_gateway_config "$snap_config")
+cmp -s "${tmpdir}/snap-config-before" "$snap_config"
+
+broken_config="${tmpdir}/broken-gateway.toml"
+ln -s "${tmpdir}/missing-gateway.toml" "$broken_config"
+(as_root() { "$@"; }; ensure_snap_gateway_config "$broken_config")
+if [[ $(readlink "$broken_config") != "${tmpdir}/missing-gateway.toml" ]]; then
+  echo "FAIL: Snap gateway config bootstrap replaced a broken operator symlink" >&2
+  exit 1
+fi
 
 attempts_file="${tmpdir}/docker-attempts"
 root_probes_file="${tmpdir}/docker-root-probes"

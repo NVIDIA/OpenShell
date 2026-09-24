@@ -142,6 +142,8 @@ The gateway stores its database at `$SNAP_COMMON/gateway.db` and its
 configuration at `$SNAP_COMMON/gateway.toml`, typically under
 `/var/snap/openshell/common/`. Initial snap installation creates the default
 configuration only when no configuration already exists.
+The install script applies the same default when it installs or refreshes a snap
+that has no existing gateway configuration, then restarts the gateway.
 
 Edit `$SNAP_COMMON/gateway.toml` when you need to override gateway settings,
 then restart the service. Do not expose the default plaintext gateway beyond
