@@ -13,8 +13,6 @@ section covers one task, from setting a policy when you create a sandbox to
 changing it while the sandbox runs, confirming that the change took effect, and
 rolling it back. Run `openshell policy --help` for every command and option.
 
-The examples use `my-sandbox` as the sandbox name.
-
 ## Create a Sandbox with a Policy
 
 Pass a policy file when you create a sandbox. Filesystem, Landlock, and process
@@ -23,6 +21,10 @@ settings take effect only when the sandbox starts, so set them here:
 ```shell
 openshell sandbox create --name my-sandbox --policy ./policy.yaml
 ```
+
+The rest of this page refers to this sandbox as `my-sandbox`. If you omit the
+sandbox name from an `openshell policy` command, the CLI uses the sandbox you
+used most recently.
 
 To use the same file for every sandbox you create, set
 `OPENSHELL_SANDBOX_POLICY` instead of passing `--policy`:
@@ -51,24 +53,21 @@ does not fall back to the default policy.
 
 ## Inspect the Current Policy
 
-A sandbox's policy has two views. The base policy is the policy you manage for
-the sandbox. The effective policy is the one the sandbox enforces. It combines
-the base policy with rules from attached providers, or it is the gateway-global
-policy when one is active.
+A sandbox's policy has two views. The base policy is the policy you set for the
+sandbox. The effective policy is the policy the sandbox enforces, which is the
+base policy plus any rules that attached providers add. When an administrator
+sets a gateway-global policy, it replaces both, so the effective policy is the
+global policy. `--base` shows the base policy, and `--full` shows the effective
+policy:
 
 ```shell
 openshell policy get my-sandbox --base
 openshell policy get my-sandbox --full
 ```
 
-Choose the view that fits your task:
-
-- To edit the policy, start from the base view. The effective view also contains
-  rules that attached providers manage. Those rules are not part of the
-  sandbox's own policy, so leave them out of the file you edit.
-- To find out why a request is allowed or denied, use the effective view.
-  Several rules, including provider rules, can allow the same request, and only
-  the effective view shows all of them.
+Edit from the base policy, because provider rules belong to their providers, not
+to the sandbox's own policy. Use the effective policy to see everything the
+sandbox can reach, for example to find out why a request is allowed.
 
 To save the effective policy as a YAML file, for example to review it or to
 check it with the [policy prover](/reference/policy-prover):
@@ -190,13 +189,17 @@ To change these settings, save the base policy as described in [Replace the
 Complete Policy](#replace-the-complete-policy), edit it, and create a new
 sandbox with the file:
 
+<Warning>
+Deleting a sandbox stops its processes and removes its state. Copy out anything
+you need before you delete it.
+</Warning>
+
 ```shell
 openshell sandbox delete my-sandbox
 openshell sandbox create --name my-sandbox --policy ./policy.yaml
 ```
 
-Deleting a sandbox stops its processes and removes its state, so copy out
-anything you need first. When the policy allows network access, OpenShell adds
+When the policy allows network access, OpenShell adds
 the system paths that sandbox processes need, so list only the paths your
 workload requires. [Default Policy](/reference/default-policy) lists those
 paths.
