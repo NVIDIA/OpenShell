@@ -375,6 +375,11 @@ Follow the implementation steps from the plan. Principles:
 
 Read the relevant source files before making changes. Implement step by step per the plan's sequence.
 
+For first-party security-sensitive crypto, use `openshell-crypto` and extend its
+facade/backend contracts when needed. Follow the repository's
+[crypto architecture](../../../architecture/crypto.md) for compatibility,
+failure handling, and explicit coverage exceptions.
+
 ### Step 9: Write Tests
 
 Write tests as specified in the plan's Test Plan section. Follow the project's existing test conventions.

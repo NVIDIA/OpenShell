@@ -286,6 +286,7 @@ When behavior, commands, or development workflows change, review the related age
 
 ## Security
 
+- Route first-party security-sensitive cryptographic operations through `openshell-crypto`. If an operation is missing, extend the facade and backend implementation instead of adding a direct cryptographic implementation in an application crate. Preserve protocol compatibility and propagate backend failures without fallback. Protocol/parsing types and documented non-security or dependency-owned exceptions remain permitted; classify exceptions explicitly. Follow [Cryptography and FIPS](architecture/crypto.md).
 - Never commit secrets, API keys, or credentials. If a file looks like it contains secrets (`.env`, `credentials.json`, etc.), do not stage it.
 - Do not run destructive operations (force push, hard reset, database drops) without explicit human confirmation.
 - Scope changes to the issue at hand. Do not make unrelated changes in the same branch.

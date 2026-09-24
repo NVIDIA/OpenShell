@@ -32,35 +32,11 @@ AWS-LC, including the CLI and standalone examples. Native and cross-build
 environments must provide the C toolchain required by aws-lc-sys; the Nix
 development shells provide static AWS-LC libraries.
 
-First-party crypto selection lives in `openshell-crypto`: backend-neutral
-primitive traits and protocol adapters preserve existing TLS, PKI, JWT, and
-credential-storage behavior. Application crates enable integration features on
-that crate instead of naming a backend. The workspace selects the default AWS-LC
-feature centrally. Backend-owned signing keys support fallible export and import;
-rcgen only adapts certificate encoding. Explicit context selection controls
-first-party TLS configuration even after Rustls global initialization. Without
-explicit selection, builders preserve embedder defaults. Capability reporting
-does not attest globals or dependency-owned crypto. This boundary prepares a
-system-OpenSSL backend; its proof of concept, dynamic-link packaging, and strict
-FIPS operation are separate follow-up work. The crate README defines extension and coverage boundaries.
-Digest operations propagate backend failures through JWT and credential key-ID
-generation rather than requiring infallible provider operations.
-Runtime credential/replay fingerprints, request-integrity digests, and fence and
-staging-token entropy also use the facade and propagate failures. The crypto
-crate README explicitly classifies remaining artifact-integrity, UUID, policy
-cache, namespace, and diagnostic uses; selecting a backend does not attest those
-paths or automatically redirect direct crypto dependencies.
-Persisted CA metadata is parsed by `openshell-crypto` using `x509-parser`
-without verification features. rcgen's parser feature remains disabled because
-it couples parsing to built-in CSR verification backends. Backend keys implement
-rcgen's signing trait directly; the proxy checks certificate/key matching through
-the selected TLS backend and retains the original CA bytes in certificate chains.
-
-SQLx uses AWS-LC with native certificate roots.
- The server enables
-`sqlx-core/rustls-native-certs` directly because SQLx's facade does not expose
-that root selection independently of the crypto provider. Credential storage
-continues to use the same AES-256-GCM envelope format across backend changes.
+The workspace selects AWS-LC through `openshell-crypto`; consumer crates enable
+integration features on the facade. SQLx uses AWS-LC with native certificate
+roots selected through `sqlx-core/rustls-native-certs`. See
+[Cryptography and FIPS](crypto.md) for backend ownership, initialization,
+compatibility constraints, coverage limits, and OpenSSL/FIPS follow-up work.
 
 Anonymous telemetry emission is gated behind a default-on `telemetry` Cargo
 feature. It is defined in `openshell-core` (where the emission code, HTTP

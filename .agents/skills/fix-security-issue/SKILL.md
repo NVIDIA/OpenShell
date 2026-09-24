@@ -106,6 +106,11 @@ gh issue edit <id> --remove-label "agent:implementation-requested" --remove-labe
 
 ## Step 5: Implement the Fix
 
+For fixes involving first-party security-sensitive crypto, use `openshell-crypto`
+and extend its facade/backend contracts when needed. Follow the repository's
+[crypto architecture](../../../architecture/crypto.md) for compatibility,
+failure handling, and explicit coverage exceptions.
+
 Implement the changes described in the remediation plan. Follow these principles:
 
 - **Minimal scope**: Only change what is necessary to address the security concern. Avoid unrelated refactors.

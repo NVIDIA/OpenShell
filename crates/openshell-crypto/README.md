@@ -1,5 +1,8 @@
 # OpenShell crypto backend
 
+See [Cryptography and FIPS](../../architecture/crypto.md) for the architecture,
+contributor rules, and production OpenSSL/FIPS follow-up requirements.
+
 `openshell-crypto` owns first-party crypto backend selection. AWS-LC is the only
 production implementation. This change preserves TLS algorithms, Ed25519 gateway
 JWTs, P-256 certificate keys, native trust roots, and credential envelope formats.
