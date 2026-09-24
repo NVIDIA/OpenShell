@@ -826,50 +826,64 @@ fn lsof_listeners(port: u16) -> Option<String> {
 // SSH utility functions (shared between CLI and TUI)
 // ---------------------------------------------------------------------------
 
-/// Resolve the SSH gateway host and port for a sandbox connection.
+/// Resolve the SSH gateway scheme, host, and port for a sandbox connection.
 ///
 /// If the server-provided gateway host is a loopback address, use the host
 /// and port from the cluster endpoint instead so the client connects to the
-/// right machine. The server returns its internal bind address (e.g. 0.0.0.0:8080)
-/// which may not be reachable from outside — the cluster URL has the actual
-/// Docker-mapped or tunnel port.
+/// right machine. The server returns its internal bind address (e.g.
+/// `http://0.0.0.0:8080`) which may not be reachable from outside — the
+/// cluster URL has the actual scheme and Docker-mapped or tunnel authority.
 pub fn resolve_ssh_gateway(
+    gateway_scheme: &str,
     gateway_host: &str,
     gateway_port: u16,
     cluster_url: &str,
-) -> (String, u16) {
+) -> (String, String, u16) {
     let is_loopback = gateway_host == "127.0.0.1"
         || gateway_host == "0.0.0.0"
         || gateway_host == "localhost"
+        || gateway_host == "::"
         || gateway_host == "::1";
 
     if !is_loopback {
-        return (gateway_host.to_string(), gateway_port);
+        return (
+            gateway_scheme.to_string(),
+            gateway_host.to_string(),
+            gateway_port,
+        );
     }
 
-    // Extract host and port from the cluster URL. The cluster URL represents
-    // the externally reachable endpoint (e.g. Docker port-mapped address).
+    // Extract the scheme, host, and port from the cluster URL. The cluster URL
+    // represents the externally reachable endpoint (e.g. a TLS-terminating
+    // proxy or Docker port-mapped address).
     if let Ok(url) = url::Url::parse(cluster_url)
+        && matches!(url.scheme(), "http" | "https")
         && let Some(host) = url.host_str()
     {
+        let cluster_scheme = url.scheme().to_string();
         let cluster_port = url.port_or_known_default().unwrap_or(gateway_port);
         let cluster_is_loopback =
             host == "127.0.0.1" || host == "0.0.0.0" || host == "localhost" || host == "::1";
         if !cluster_is_loopback {
-            // Remote cluster: use the remote host but keep the cluster URL port.
-            return (host.to_string(), cluster_port);
+            // Remote cluster: use the complete externally reachable endpoint.
+            return (cluster_scheme, host.to_string(), cluster_port);
         }
         // Unspecified addresses are bind-only, and tonic cannot use an IPv6
         // literal as a TLS DNS name. In those cases, keep the cluster URL's
         // already-reachable authority. Other loopback addresses retain the
-        // gateway-reported host.
+        // gateway-reported host, but use the cluster scheme and port because
+        // those describe the externally reachable listener.
         if matches!(gateway_host, "0.0.0.0" | "::" | "::1") {
-            return (host.to_string(), cluster_port);
+            return (cluster_scheme, host.to_string(), cluster_port);
         }
-        return (gateway_host.to_string(), cluster_port);
+        return (cluster_scheme, gateway_host.to_string(), cluster_port);
     }
 
-    (gateway_host.to_string(), gateway_port)
+    (
+        gateway_scheme.to_string(),
+        gateway_host.to_string(),
+        gateway_port,
+    )
 }
 
 /// Bracket a bare IPv6 literal (e.g. `::1` → `[::1]`) so it can be embedded in
@@ -1106,51 +1120,59 @@ mod tests {
 
     #[test]
     fn resolve_ssh_gateway_keeps_non_loopback() {
-        let (host, port) = resolve_ssh_gateway("10.0.0.5", 8080, "https://spark.local");
-        assert_eq!(host, "10.0.0.5");
-        assert_eq!(port, 8080);
+        let resolved = resolve_ssh_gateway("http", "10.0.0.5", 8080, "https://spark.local");
+        assert_eq!(resolved, ("http".to_string(), "10.0.0.5".to_string(), 8080));
     }
 
     #[test]
     fn resolve_ssh_gateway_overrides_loopback_with_cluster_host() {
-        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://spark.local");
-        assert_eq!(host, "spark.local");
-        assert_eq!(port, 443);
+        let resolved = resolve_ssh_gateway("http", "127.0.0.1", 8080, "https://spark.local");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "spark.local".to_string(), 443)
+        );
     }
 
     #[test]
     fn resolve_ssh_gateway_overrides_zeros_with_cluster_host() {
-        let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "https://10.0.0.5:443");
-        assert_eq!(host, "10.0.0.5");
-        assert_eq!(port, 443);
+        let resolved = resolve_ssh_gateway("http", "0.0.0.0", 8080, "https://10.0.0.5:443");
+        assert_eq!(resolved, ("https".to_string(), "10.0.0.5".to_string(), 443));
     }
 
     #[test]
     fn resolve_ssh_gateway_uses_known_default_http_port() {
-        let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "http://gateway.example.test");
-        assert_eq!(host, "gateway.example.test");
-        assert_eq!(port, 80);
+        let resolved = resolve_ssh_gateway("https", "0.0.0.0", 8080, "http://gateway.example.test");
+        assert_eq!(
+            resolved,
+            ("http".to_string(), "gateway.example.test".to_string(), 80)
+        );
     }
 
     #[test]
     fn resolve_ssh_gateway_overrides_localhost() {
-        let (host, port) = resolve_ssh_gateway("localhost", 8080, "https://remote-host:443");
-        assert_eq!(host, "remote-host");
-        assert_eq!(port, 443);
+        let resolved = resolve_ssh_gateway("http", "localhost", 8080, "https://remote-host:443");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "remote-host".to_string(), 443)
+        );
     }
 
     #[test]
     fn resolve_ssh_gateway_no_override_when_cluster_is_also_loopback() {
-        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://127.0.0.1:443");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 443);
+        let resolved = resolve_ssh_gateway("http", "127.0.0.1", 8080, "https://127.0.0.1:443");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "127.0.0.1".to_string(), 443)
+        );
     }
 
     #[test]
     fn resolve_ssh_gateway_preserves_loopback_tls_authority() {
-        let (host, port) = resolve_ssh_gateway("::1", 8080, "https://localhost:8443");
-        assert_eq!(host, "localhost");
-        assert_eq!(port, 8443);
+        let resolved = resolve_ssh_gateway("http", "::1", 8080, "https://localhost:8443");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "localhost".to_string(), 8443)
+        );
     }
 
     #[test]
@@ -1158,16 +1180,38 @@ mod tests {
         // The gateway binds 0.0.0.0 but advertises that bind address via the
         // SSH session response. 0.0.0.0 is not a valid connect target and is
         // not in any TLS cert SAN; fall through to the cluster URL's host.
-        let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "https://127.0.0.1:9000");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 9000);
+        let resolved = resolve_ssh_gateway("http", "0.0.0.0", 8080, "https://127.0.0.1:9000");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "127.0.0.1".to_string(), 9000)
+        );
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_swaps_unspecified_ipv6_for_cluster_host() {
+        let resolved = resolve_ssh_gateway("http", "::", 8080, "https://localhost:18443");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "localhost".to_string(), 18443)
+        );
     }
 
     #[test]
     fn resolve_ssh_gateway_handles_invalid_cluster_url() {
-        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "not-a-url");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 8080);
+        let resolved = resolve_ssh_gateway("https", "127.0.0.1", 8080, "not-a-url");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "127.0.0.1".to_string(), 8080)
+        );
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_ignores_non_http_cluster_url() {
+        let resolved = resolve_ssh_gateway("https", "127.0.0.1", 8080, "ssh://remote-host:22");
+        assert_eq!(
+            resolved,
+            ("https".to_string(), "127.0.0.1".to_string(), 8080)
+        );
     }
 
     #[test]

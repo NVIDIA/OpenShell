@@ -287,16 +287,18 @@ exercises the same relay retry path as interactive sessions.
 
 Use `mise run e2e:kubernetes:agentgateway-shared-tls` to add an OpenShell-owned HTTPS
 `ListenerSet` to the shared agentgateway `Gateway`, provision a short-lived
-certificate, and run CLI conformance through the verified HTTPS listener. The
-conformance scenarios cover status, create, exec, delete, and stop/start
-lifecycle operations without the broad suite's unrelated host fixtures.
-The shared Gateway must allow ListenerSets from the `openshell` namespace;
-`deploy/kube/manifests/agentgateway-openshell.yaml` configures that selector.
+certificate, and run CLI conformance plus the focused Rust `port_forward` test
+through the verified HTTPS listener. This covers status and sandbox lifecycle
+operations as well as SSH relay setup and TCP data transfer without the broad
+suite's unrelated host fixtures. The shared Gateway must allow ListenerSets
+from the `openshell` namespace; `deploy/kube/manifests/agentgateway-openshell.yaml`
+configures that selector.
 
 Use `mise run e2e:kubernetes:agentgateway-dedicated-tls` to have the OpenShell
 chart create a dedicated agentgateway `Gateway` with a direct HTTPS listener in
 the release namespace. The task verifies the Gateway and GRPCRoute conditions,
-then runs the same CLI conformance scenarios without creating a ListenerSet.
+then runs the same CLI conformance and SSH forwarding scenarios without
+creating a ListenerSet.
 
 Use `mise run e2e:kubernetes:agentgateway-backend-tls` to exercise the same
 frontend HTTPS ListenerSet on the shared Gateway while keeping TLS enabled on
