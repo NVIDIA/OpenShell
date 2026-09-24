@@ -54,7 +54,7 @@ The `audience` value must match the client ID configured in your identity provid
 | `server.oidc.issuer` | `""` | OIDC issuer URL. Empty disables OIDC. |
 | `server.oidc.dangerouslyAllowInsecureHttp` | `false` | Development-only acknowledgement for numeric-loopback HTTP. It does not allow cluster-service or remote HTTP issuers. |
 | `server.oidc.jwksAllowedOrigins` | `[]` | Additional trusted HTTPS origins allowed to serve JWKS. |
-| `server.oidc.caConfigMapName` | `""` | ConfigMap containing the private issuer CA in `ca.crt`. |
+| `server.oidc.caConfigMapName` | `""` | ConfigMap containing the private issuer CA in `ca.crt`; it augments platform roots for OIDC requests only. |
 | `server.oidc.audience` | `openshell-cli` | Expected `aud` claim in the JWT. |
 | `server.oidc.jwksTtl` | `3600` | JWKS key cache TTL in seconds. Must be greater than zero. |
 | `server.oidc.rolesClaim` | `""` | Dot-separated path to the roles array in JWT claims. |
@@ -65,7 +65,9 @@ The `audience` value must match the client ID configured in your identity provid
 The issuer must use HTTPS. The gateway rejects discovery and JWKS redirects,
 limits response sizes, requires a JSON media type, and rejects a `jwks_uri` on
 a different origin unless that origin appears in `jwksAllowedOrigins`. Use
-`server.oidc.caConfigMapName` for issuers signed by a private CA.
+`server.oidc.caConfigMapName` for issuers signed by a private CA. The mounted
+CA does not replace the gateway's platform roots, so unrelated HTTPS clients
+such as provider token refresh continue to trust public services.
 
 ### Auth-only mode vs. RBAC mode
 
