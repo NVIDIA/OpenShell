@@ -64,8 +64,10 @@
 # Failure investigation:
 #   Set OPENSHELL_E2E_KUBE_PRESERVE_CLUSTER=1 to preserve a wrapper-created
 #   ephemeral k3d cluster and work directory after success or failure. The
-#   wrapper prints inspection and cleanup commands. This does not change the
-#   lifecycle of a cluster supplied through OPENSHELL_E2E_KUBE_CONTEXT.
+#   wrapper prints inspection and cleanup commands. When
+#   OPENSHELL_E2E_KUBE_CONTEXT selects an existing cluster, the wrapper leaves
+#   the cluster running but still removes the OpenShell release, test fixtures,
+#   and temporary work directory.
 
 set -euo pipefail
 
