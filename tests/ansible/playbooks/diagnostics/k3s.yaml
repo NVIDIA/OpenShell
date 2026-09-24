@@ -48,7 +48,7 @@
     - name: Read effective k3s and Kubernetes versions
       ansible.builtin.command: "{{ item }}"
       loop:
-        - k3s version
+        - k3s --version
         - k3s kubectl version -o json
       register: cluster_versions
       changed_when: false

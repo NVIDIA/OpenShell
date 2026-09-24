@@ -117,7 +117,7 @@
       no_log: true
 
     - name: Read effective k3s version
-      ansible.builtin.command: k3s version
+      ansible.builtin.command: k3s --version
       register: k3s_version_result
       changed_when: false
 
