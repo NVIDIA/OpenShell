@@ -8,12 +8,10 @@ keywords: "Generative AI, Cybersecurity, Policy, Prover, Boundary, Subagent"
 position: 4
 ---
 
-The policy prover is OpenShell's policy verification engine. It translates
-policies into logical formulas and uses the Z3 SMT solver to search for a
-request that answers a specific question, such as whether any request exists
-that one policy allows and another denies. Because the solver searches every
-possible request instead of testing a sample, a result covers all requests, not
-only the ones you thought to try.
+The policy prover is OpenShell's policy verification engine. It uses an SMT
+solver to check whether policies satisfy specified properties, such as staying
+within an allowed access boundary. Its guarantees apply to the policy features
+and behavior represented by its model.
 
 OpenShell uses the prover in two ways: the `openshell-prover check` command, and
 the [policy advisor](/sandboxes/policy-advisor), which checks every network rule
@@ -31,8 +29,9 @@ passing the other. A proposal that adds no risky access can still exceed your
 boundary, and a policy within your boundary can still contain access that the
 policy advisor would flag.
 
-This page covers the `openshell-prover check` command. For the policy advisor's
-check, refer to [What the Prover
+This page covers the `openshell-prover check` command. [What the Boundary Check
+Covers](#what-the-boundary-check-covers) describes what its model includes. For
+the policy advisor's check, refer to [What the Prover
 Checks](/sandboxes/policy-advisor#what-the-prover-checks).
 
 ## Check a Policy Against a Boundary
