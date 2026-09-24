@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Sandbox Policies"
 sidebar-title: "Overview"
-description: "Understand what sandbox policies control, where a sandbox's policy comes from, and how policy changes take effect."
+description: "Understand what sandbox policies control and where a sandbox's policy comes from."
 keywords: "Generative AI, Cybersecurity, Policy, Network Policy, Sandbox, Security, Hot Reload"
 position: 1
 ---
@@ -39,7 +39,9 @@ from an API but not writing to it. [Network Rules](/sandboxes/network-rules)
 explains how OpenShell evaluates rules and gives examples you can adapt.
 
 The startup sections are fixed once the sandbox starts. The network sections
-can change while it runs. The [Policy Schema Reference](/reference/policy-schema)
+can change while it runs, as described in [How Changes Take
+Effect](/sandboxes/manage-policies#how-changes-take-effect). The [Policy Schema
+Reference](/reference/policy-schema)
 describes the complete file format, and [Supervisor
 Middleware](/extensibility/supervisor-middleware) explains how middleware
 processes traffic.
@@ -81,44 +83,6 @@ global policy restores normal policy selection and provider rules. Refer to
 [Apply a Gateway-Wide
 Policy](/sandboxes/manage-policies#apply-a-gateway-wide-policy) for the
 commands.
-
-## How Changes Take Effect
-
-The network sections of a policy can change while a sandbox runs. The startup
-sections cannot:
-
-| Change | Effect on a running sandbox | Required action |
-|---|---|---|
-| Network rules | The sandbox loads the new rules. Connections opened under the previous rules close. | Apply the change, then retry the request. |
-| Middleware in `network_middlewares` | You can add, remove, or reconfigure built-in middleware and external services already registered with the gateway. | Apply the change with `openshell policy set`. |
-| External middleware registration | Policy changes cannot register a service or change its gateway connection settings. | Update the gateway configuration and restart the gateway. |
-| Added filesystem paths | The saved policy can change, but the running workload keeps its existing filesystem permissions. | Recreate the sandbox. |
-| Removed filesystem paths, or changed workdir, Landlock, or process settings | OpenShell rejects the change after the workload starts. | Recreate the sandbox. |
-
-When new network rules take effect, OpenShell closes connections that were
-opened under the previous rules, including HTTP keep-alive connections, tunnels,
-WebSocket connections, and long-lived streams. Clients must reconnect, and their
-next requests are checked against the new rules.
-
-OpenShell validates every change twice before it takes effect:
-
-```mermaid
-flowchart TD
-    A["Submit a policy change"] --> B{"Gateway validates<br/>the change"}
-    B -->|Invalid| C["Change rejected<br/>Current policy stays active"]
-    B -->|Valid| D["Gateway saves a new revision"]
-    D --> E{"Sandbox validates<br/>and loads the revision"}
-    E -->|Loads| F["New rules active<br/>Old connections close"]
-    E -->|Fails| G["Failure mode applies<br/>Block traffic or keep the last valid policy"]
-```
-
-The sandbox validates the revision again because it also accounts for provider
-rules and other changes that arrive at the same time. If the sandbox cannot load
-a revision, the gateway's `policy_validation_failure_mode` setting decides what
-happens. With `fail_closed`, the default, the sandbox blocks network traffic
-until you submit a valid policy. With `retain_last_valid`, the last valid policy
-stays active. [Troubleshoot Sandbox Policies](/sandboxes/troubleshoot-policies)
-explains how to identify and repair each kind of failure.
 
 ## Next Steps
 

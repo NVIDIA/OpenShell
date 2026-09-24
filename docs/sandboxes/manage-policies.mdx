@@ -8,10 +8,10 @@ keywords: "Generative AI, Cybersecurity, Policy, Sandbox, CLI, Hot Reload, Revis
 position: 3
 ---
 
-This page shows how to use the OpenShell CLI to manage a sandbox's policy. Each
-section covers one task, from setting a policy when you create a sandbox to
-changing it while the sandbox runs, confirming that the change took effect, and
-rolling it back. Run `openshell policy --help` for every command and option.
+This page shows how to use the OpenShell CLI to manage a sandbox's policy, from
+setting a policy when you create a sandbox to changing it while the sandbox
+runs, confirming that the change took effect, and rolling it back. Run
+`openshell policy --help` for every command and option.
 
 ## Create a Sandbox with a Policy
 
@@ -174,20 +174,54 @@ openshell policy set my-sandbox --policy base-policy.json --wait
 </Tab>
 </Tabs>
 
-OpenShell validates the new policy before it takes effect. Changes to the
-filesystem, Landlock, and process sections have extra limits, described in the
-next section.
+The next section describes how each part of the new policy takes effect.
+
+## How Changes Take Effect
+
+When you apply a change with `openshell policy update` or `openshell policy set`,
+the network sections of the policy take effect in the running sandbox. The
+startup sections do not:
+
+| Change | Effect on a running sandbox | Required action |
+|---|---|---|
+| Network rules | The sandbox loads the new rules. Connections opened under the previous rules close. | Apply the change, then retry the request. |
+| Middleware in `network_middlewares` | You can add, remove, or reconfigure built-in middleware and external services already registered with the gateway. | Apply the change with `openshell policy set`. |
+| External middleware registration | Policy changes cannot register a service or change its gateway connection settings. | Update the gateway configuration and restart the gateway. |
+| Added filesystem paths | The saved policy can change, but the running workload keeps its existing filesystem permissions. | Recreate the sandbox. |
+| Removed filesystem paths, or changed workdir, Landlock, or process settings | OpenShell rejects the change after the workload starts. | Recreate the sandbox. |
+
+When new network rules take effect, OpenShell closes connections that were
+opened under the previous rules, including HTTP keep-alive connections, tunnels,
+WebSocket connections, and long-lived streams. Clients must reconnect, and their
+next requests are checked against the new rules.
+
+OpenShell validates every change twice before it takes effect:
+
+```mermaid
+flowchart TD
+    A["Submit a policy change"] --> B{"Gateway validates<br/>the change"}
+    B -->|Invalid| C["Change rejected<br/>Current policy stays active"]
+    B -->|Valid| D["Gateway saves a new revision"]
+    D --> E{"Sandbox validates<br/>and loads the revision"}
+    E -->|Loads| F["New rules active<br/>Old connections close"]
+    E -->|Fails| G["Failure mode applies<br/>Block traffic or keep the last valid policy"]
+```
+
+The sandbox validates the revision again because it also accounts for provider
+rules and other changes that arrive at the same time. If the sandbox cannot load
+a revision, the gateway's `policy_validation_failure_mode` setting decides what
+happens. With `fail_closed`, the default, the sandbox blocks network traffic
+until you submit a valid policy. With `retain_last_valid`, the last valid policy
+stays active. [Troubleshoot Sandbox Policies](/sandboxes/troubleshoot-policies)
+explains how to identify and repair each kind of failure.
 
 ## Change Filesystem and Process Settings
 
-Filesystem, Landlock, and process settings take effect only when the sandbox
-starts. After that, OpenShell rejects removed filesystem paths and changes to
-workdir, Landlock, or process settings. It accepts added filesystem paths, but
-the running sandbox keeps its existing permissions.
-
-To change these settings, save the base policy as described in [Replace the
-Complete Policy](#replace-the-complete-policy), edit it, and create a new
-sandbox with the file:
+Filesystem, Landlock, and process settings take effect only when a sandbox
+starts, so changing them requires a new sandbox. To change these settings, save
+the base policy as described in [Replace the Complete
+Policy](#replace-the-complete-policy), edit it, and create a new sandbox with
+the file:
 
 <Warning>
 Deleting a sandbox stops its processes and removes its state. Copy out anything
@@ -199,10 +233,9 @@ openshell sandbox delete my-sandbox
 openshell sandbox create --name my-sandbox --policy ./policy.yaml
 ```
 
-When the policy allows network access, OpenShell adds
-the system paths that sandbox processes need, so list only the paths your
-workload requires. [Default Policy](/reference/default-policy) lists those
-paths.
+When the policy allows network access, OpenShell adds the system paths that
+sandbox processes need, so list only the paths your workload requires. [Default
+Policy](/reference/default-policy) lists those paths.
 
 ## Verify a Change
 
