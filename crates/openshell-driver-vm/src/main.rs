@@ -321,8 +321,7 @@ async fn main() -> Result<()> {
     .await
     .map_err(|err| miette::miette!("{err}"))?;
 
-    let socket_cleanup = driver.clone();
-    let result = match listen_mode {
+    match listen_mode {
         ComputeDriverListenMode::Unix {
             socket_path,
             expected_peer_pid,
@@ -353,9 +352,7 @@ async fn main() -> Result<()> {
                 .await
                 .into_diagnostic()
         }
-    };
-    socket_cleanup.remove_socket_root();
-    result
+    }
 }
 
 async fn shutdown_signal() {
