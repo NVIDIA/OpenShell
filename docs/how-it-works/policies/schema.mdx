@@ -215,8 +215,9 @@ access and narrows only which requests receive provider credentials.
 
 `allowed_ips` controls server-side request forgery (SSRF) protection. Exact
 user-declared hostname endpoints may resolve to RFC 1918 private addresses
-without this field. Wildcard, hostless, and policy-advisor-proposed endpoints
-still require `allowed_ips` for private resolved addresses. When an endpoint
+without this field. Wildcard endpoints, hostless endpoints, and endpoints added
+through the policy advisor still require `allowed_ips` for private resolved
+addresses. When an endpoint
 sets `allowed_ips`, every resolved address must fall within the list, including
 public addresses. A hostless allowlist is valid only on the explicit proxy path,
 matches any hostname on the port, and cannot be combined with `protocol: tcp`.

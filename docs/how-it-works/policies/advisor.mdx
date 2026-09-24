@@ -1,67 +1,68 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Use Policy Advisor"
+title: "Policy Advisor"
 sidebar-title: "Advisor"
-description: "Let sandboxed agents propose narrow policy changes through policy.local while keeping developer approval in the loop."
+description: "Let an agent in a sandbox propose the network rule it needs when OpenShell blocks a request, and review each proposal before it takes effect."
 keywords: "Generative AI, Cybersecurity, Policy Advisor, Policy, Sandbox, policy.local, Agent Policy"
 position: 4
 ---
 
-Policy advisor lets a running sandboxed agent ask for a narrow network policy
-change after OpenShell denies a request. The agent submits a draft through
-`policy.local`, a developer approves or rejects it from outside the sandbox, and
-approved network policy hot-reloads into the same sandbox.
+When OpenShell blocks a network request, an agent working in the sandbox usually
+cannot finish its task until someone changes the policy. The policy advisor lets
+the agent propose the network rule it needs. You review each proposal and
+approve or reject it. An approved rule takes effect in the running sandbox
+without a restart.
 
-Policy advisor preserves OpenShell's default-deny posture. The structured rule
-is the approval contract, and the agent's rationale is supporting context. By
-default, every accepted proposal waits in the draft inbox for human review.
-Opt-in [auto mode](#automatic-approval) approves a proposal without a reviewer
-only when the policy prover finds no new risk and the rule produces no security
-notes.
+The policy advisor is off by default. When you enable it, OpenShell gives the
+agent instructions and a local HTTP API for submitting proposals. A proposal
+never changes the policy on its own. By default, every proposal waits for your
+review. You can opt in to automatic approval, which approves a proposal only
+when OpenShell's checks find that it adds no new risk.
 
-## How It Works
+## How the Policy Advisor Works
 
-When policy advisor is enabled, the sandbox supervisor turns on these
-agent-facing surfaces:
+A proposal goes through these steps:
 
-- It installs `/etc/openshell/skills/policy_advisor.md` inside the sandbox.
-- It installs `/etc/openshell/skills/policy-advisor/SKILL.md` as a short
-  Codex and generic-agent pointer, and writes a root `/AGENTS.md` pointer only
-  when the image does not already provide one.
-- It serves `http://policy.local` from inside the sandbox.
-- It adds `agent_guidance` and `next_steps` to request-level `policy_denied`
-  response bodies so the agent can find the skill and local API.
+1. A process in the sandbox makes a network request that the policy denies. When
+   OpenShell denies an inspected HTTP request, its response explains what was
+   blocked and tells the agent how to request access. The agent can also look up
+   recent denials itself.
+2. The agent reads the policy advisor guide in the sandbox, checks the current
+   policy, and submits a proposal. A proposal is a network rule scoped to the
+   host, port, and binary that need access and, for HTTP APIs, the method and
+   path.
+3. OpenShell validates the proposal, checks it for added risk, and adds it to
+   the sandbox's pending proposals.
+4. You approve or reject the proposal. With automatic approval turned on,
+   OpenShell approves a proposal that passes its risk checks without waiting for
+   you.
+5. The agent waits for the decision. After approval, the sandbox loads the new
+   rule and the agent retries the request. After a rejection, the agent receives
+   your reason and can submit a narrower proposal.
 
-A proposal moves through this loop:
+OpenShell also drafts proposals on its own from the denials it observes in the
+sandbox. These drafts go through the same checks and review as proposals from
+the agent.
 
-1. A sandboxed process attempts a network request that policy denies. For
-   inspected REST traffic, OpenShell returns a structured `403` body with fields
-   such as `layer`, `host`, `port`, `binary`, `method`, `path`, `rule_missing`,
-   `agent_guidance`, and `next_steps`.
-2. The agent reads the policy advisor skill, inspects the current policy, and
-   optionally reads recent denial log lines.
-3. The agent submits one or more `addRule` proposals to
-   `http://policy.local/v1/proposals`.
-4. The gateway turns each proposal into the exact effective-policy candidate it
-   would apply, validates it, and runs the [policy prover](#automatic-approval)
-   against it.
-5. A developer approves or rejects the proposal. In auto mode, the gateway
-   approves an eligible proposal without review.
-6. The agent waits on `/v1/proposals/{chunk_id}/wait` until a decision is
-   available.
+When the policy advisor is enabled, OpenShell adds the following to the sandbox
+so the agent can find and use it:
 
-When a proposal is approved, `/wait` reports `policy_reloaded: true` only after
-the local sandbox policy covers the approved rule. At that point the agent can
-retry the original denied action once. If a proposal is rejected, `/wait`
-returns `rejection_reason` and `validation_result` so the agent can revise or
-stop. `validation_result` carries the categorical prover findings, so the agent
-can narrow the next attempt to the specific concern the prover flagged.
+- A guide at `/etc/openshell/skills/policy_advisor.md` that explains how to
+  write and submit a proposal. OpenShell also adds short pointers to the guide
+  where agent tools look for instructions: an agent skill at
+  `/etc/openshell/skills/policy-advisor/SKILL.md` and, if the image does not
+  already have one, `/AGENTS.md`.
+- The `policy.local` API, which the agent uses to read the current policy and
+  recent denials, submit proposals, and wait for decisions. OpenShell serves it
+  at `http://policy.local`, which is reachable only from inside the sandbox.
+  Refer to [Agent API](#agent-api).
+- Instructions in the response to each denied HTTP request on an inspected
+  endpoint, which point the agent to the guide and the API.
 
-## Enable Policy Advisor
+## Enable the Policy Advisor
 
-Policy advisor is disabled by default. Enable it globally when you want every
-sandbox on the selected gateway to expose the agent proposal surface:
+Enable the policy advisor for every sandbox on the gateway:
 
 ```shell
 openshell settings set --global \
@@ -70,7 +71,8 @@ openshell settings set --global \
   --yes
 ```
 
-You can also enable it for one sandbox, unless the key is managed globally:
+To enable it for one sandbox instead, set the key on that sandbox. This works
+only when the key has no gateway-wide value:
 
 ```shell
 openshell settings set <sandbox-name> \
@@ -78,15 +80,10 @@ openshell settings set <sandbox-name> \
   --value true
 ```
 
-Check the effective setting for a sandbox:
-
-```shell
-openshell settings get <sandbox-name>
-```
-
-The output shows whether `agent_policy_proposals_enabled` is `global`,
-`sandbox`, or `unset`. A global value overrides sandbox-scoped values. To return
-control to sandbox-scoped settings, delete the global key:
+To check the setting for a sandbox, run `openshell settings get <sandbox-name>`.
+The output shows whether the value comes from the gateway, the sandbox, or
+neither. To let individual sandboxes control the setting again, delete the
+gateway-wide value:
 
 ```shell
 openshell settings delete --global \
@@ -94,98 +91,73 @@ openshell settings delete --global \
   --yes
 ```
 
-Set the value before creating a sandbox when you want the first denied request
-to include policy advisor guidance. Running sandboxes poll settings and can
-enable the surface after startup, but startup enablement gives the agent the
-clearest first-denial path.
+Enable the policy advisor before you create a sandbox. A running sandbox picks
+up the change, but the agent learns about the policy advisor from its first
+denied request, so it is most reliable when the setting is on from the start.
 
 ## Review Proposals
 
-Review pending proposals from the host:
+List the sandbox's pending proposals:
 
 ```shell
 openshell rule get <sandbox-name> --status pending
 ```
 
-The output shows the chunk ID, status, rationale, binary, endpoint summary,
-prover result, application error (if any), and candidate hash. For request-level
-proposals, the endpoint summary includes the protocol, method, and path:
+Each proposal shows its ID on the `Chunk` line, the rule it would add, the
+agent's stated reason, and the results of OpenShell's risk checks on the
+`Security` and `Prover` lines. For an HTTP rule, the endpoint summary includes
+the method and path:
 
 ```text
 Endpoints: api.github.com:443 [L7 rest, allow PUT /repos/NVIDIA/OpenShell/contents/docs/**]
 ```
 
-Approve only when the structured rule matches the access you intend to grant:
+Approve a proposal only when the rule matches the access you intend to grant:
 
 ```shell
-openshell rule approve <sandbox-name> --chunk-id <chunk-id>
+openshell rule approve <sandbox-name> --chunk-id <proposal-id>
 ```
 
-Reject with guidance when the rule is too broad or points at the wrong target:
+Reject a proposal that is too broad or targets the wrong service, and explain
+why. OpenShell returns your reason to the agent, which can use it to submit a
+narrower proposal:
 
 ```shell
 openshell rule reject <sandbox-name> \
-  --chunk-id <chunk-id> \
+  --chunk-id <proposal-id> \
   --reason "Scope this to docs/ paths only."
 ```
 
-The rejection reason is returned to the agent through `policy.local`. The agent
-can use it to draft a narrower proposal.
+You can also review proposals in the terminal UI. Run `openshell term`, select
+the sandbox, and open its network rules. A rejected proposal shows your reason
+on its `Guidance` line.
 
-Reviewers see the same guidance in the terminal UI. Run `openshell term`, open
-the sandbox's draft inbox, and select a rejected chunk to open its detail popup.
-The stored reason appears on a `Guidance:` line, and the list row shows a
-shortened copy of it. Rejection reasons have no length limit, so long guidance
-wraps and the popup body scrolls with `j`/`k`, `PageUp`/`PageDown`, and
-`g`/`G`. The approve and close controls stay pinned below the body, and the
-bottom border shows the scroll position.
+### When a Proposal Changes Before Approval
 
-### Review Tokens
+OpenShell checks a proposal against the sandbox's policy, providers, and
+credentials at the time it was submitted. If any of these change before you
+approve the proposal, OpenShell does not apply the outdated version. It
+recalculates the proposal against the current configuration, keeps it pending,
+and asks you to review it again. Run `openshell rule get` to see the updated
+proposal, then approve it.
 
-Each stored proposal records its candidate policy, prover result, any
-application error, and a review token tied to the live base policy, provider
-rules, and non-secret credential metadata. Provider rules remain immutable
-inputs.
+You cannot approve a proposal that fails validation, such as one that conflicts
+with an existing rule. The proposal shows the error on its `Application` line
+instead.
 
-```mermaid
-flowchart TD
-  A["Denied request creates a narrow proposal"] --> B["Gateway builds the exact effective-policy candidate"]
-  B --> C["Validate merge, request contract, providers, and credentials"]
-  C -->|Invalid| D["Keep pending and show application error"]
-  C -->|Valid| E["Run prover once and store candidate plus review token"]
-  E --> F["Reviewer approves using that token"]
-  F --> G["Recompute token from live inputs"]
-  G -->|Unchanged| H["Reuse stored prover result and apply candidate"]
-  G -->|Changed| I["Refresh candidate and token; require fresh review"]
-  I --> F
-```
+## Approve Low-Risk Proposals Automatically
 
-`openshell rule approve` fetches the current review token and submits it with
-the approval. Before applying the proposal, the gateway recomputes the token
-from live inputs. When the token is unchanged, it reuses the stored prover
-result. When policy, provider, or credential inputs changed after the proposal
-was displayed, the gateway evaluates and stores the refreshed candidate, leaves
-the proposal pending, and asks you to review it again. Run `rule get` before
-retrying. Bulk approval binds each selected proposal to its own review token in
-the same way, and edits and deduplicated resubmissions follow the same path.
+By default, every proposal waits for your review. In automatic mode, OpenShell
+approves a proposal without review when both of these are true:
 
-Merge, policy-shape, provider-composition, credential, or prover failures are
-shown as application errors and cannot be approved.
+- The policy prover finds none of the risks described in [What the Prover
+  Checks](#what-the-prover-checks).
+- The proposal has no security notes. Security notes flag private or internal
+  addresses, wildcard hosts, `allowed_ips` entries without a host, ephemeral
+  ports, and well-known database or service ports.
 
-## Automatic Approval
-
-Every proposal, whether mechanistic or agent-authored, is routed through the
-policy prover. The gateway also recalculates security notes from the current
-draft rule. The `proposal_approval_mode` setting decides whether proposals that
-pass both checks still require human review:
-
-| Proposal | `manual` or unset | `auto` |
-|---|---|---|
-| Empty prover delta and no security notes | Waits in the draft inbox for human review. | Approved automatically. The sandbox hot-reloads the new rule and the agent retries. |
-| Any prover finding or security note | Waits in the draft inbox. | Remains pending for human review. |
-
-`manual` is the default. Enable auto mode at gateway scope when you want every
-sandbox on this gateway to auto-approve eligible proposals:
+Every other proposal still waits for your review. Turn on automatic mode for
+every sandbox on the gateway:
 
 ```shell
 openshell settings set --global \
@@ -194,71 +166,40 @@ openshell settings set --global \
   --yes
 ```
 
-Enable it for one sandbox when no global value is set:
-
-```shell
-openshell settings set <sandbox-name> \
-  --key proposal_approval_mode \
-  --value auto
-```
-
-The create-time shorthand writes the sandbox-scoped setting for you:
+To turn it on for one sandbox, set the key on that sandbox, or pass
+`--approval-mode auto` when you create it:
 
 ```shell
 openshell sandbox create --approval-mode auto <name>
 ```
 
-Only `manual` and `auto` are accepted, and typos such as `autom` are rejected
-when you set the value. Stale or unknown values found in storage are treated as
-`manual` at runtime as a defense-in-depth measure. Gateway scope wins over
-sandbox scope, so a reviewer can pin `manual` for a fleet by setting it
-globally. Per-sandbox values apply only when no global value is set.
-
-Under `auto` mode, approved proposals appear under
-`openshell rule get <sandbox-name> --status approved` with auto-approval audit
-fields. Under `manual` mode, every accepted proposal appears as pending
-regardless of the prover verdict or security notes.
+The accepted values are `manual`, the default, and `auto`. A gateway-wide value
+overrides sandbox values, so an administrator can require manual review for
+every sandbox by setting `manual` on the gateway.
 
 ### What the Prover Checks
 
-Auto-approval requires all three conditions: the effective mode is `auto`, the
-prover delta is empty, and recalculating security notes from the current stored
-rule produces none.
+The policy prover compares what the sandbox can reach with and without the
+proposed rule. It reports a finding when the rule would give a binary new access
+of one of these kinds:
 
-The prover asks four formal questions about the proposed change. Each "yes" is
-one categorical finding, and any finding blocks auto-approval:
-
-| Category | Triggered when |
+| Finding | The proposed rule would let a binary |
 |---|---|
-| `link_local_reach` | A rule reaches `169.254.0.0/16`, `fe80::/10`, or a known metadata hostname. |
-| `l7_bypass_credentialed` | A binary using a wire protocol the request proxy cannot inspect (`git-remote-https`, `ssh`, `nc`) gains reach to a host where a credential is in scope. |
-| `credential_reach_expansion` | A binary gains credentialed reach to a `(host, port)` it could not reach before. |
-| `capability_expansion` | On a `(binary, host, port)` that already had credentialed reach, the proposal adds a new HTTP method. The finding cites the specific method. |
+| `link_local_reach` | Reach a link-local address (`169.254.0.0/16` or `fe80::/10`) or a cloud metadata hostname. |
+| `l7_bypass_credentialed` | Send traffic that OpenShell cannot inspect, as `git-remote-https`, `ssh`, or `nc` do, to a host where a provider credential is available. |
+| `credential_reach_expansion` | Use a provider credential at a host and port that it could not reach before. |
+| `capability_expansion` | Use a new HTTP method at a host and port where it already uses a provider credential. |
 
-Findings are categorical, with no severity tier. The reviewer reads the category
-and the structured evidence to decide.
-
-Security notes flag concerns such as internal or private destinations and
-`allowed_ips`, wildcard hosts, hostless `allowed_ips`, ephemeral ports, and
-well-known database or service ports. Any prover finding or security note keeps
-the proposal pending in auto mode.
-
-The full reasoning model is in
+A proposal with any finding or security note needs your review, even in
+automatic mode. When you reject a proposal, the agent receives the findings with
+your reason, so it can narrow its next attempt. For the prover's full reasoning
+model, refer to
 [`crates/openshell-prover/README.md`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-prover/README.md).
-Provider profiles composed in through [Profiles](/providers/profiles) are part
-of the effective policy the prover reasons over.
 
 ## What Agents Can Propose
 
-OpenShell has two proposal paths:
-
-| Path | Source | Typical rule shape |
-|---|---|---|
-| Mechanistic mapper | Aggregated denial summaries from the sandbox. | Groups by host, port, and binary. If request samples are available, it can draft REST method and path rules. Otherwise it drafts an endpoint-only rule. |
-| Agent-authored proposal | The in-sandbox agent, using `policy.local`. | Usually a REST `addRule` with exact host, port, binary, method, and path from the structured denial. It can also omit `protocol` for endpoint-only access through the explicit proxy. |
-
-For REST APIs, prefer request rules over broad endpoint access. A good proposal
-allows one method and the smallest safe path:
+An agent proposes an endpoint and binary, optionally with REST method and path
+rules. A good proposal allows one method on the narrowest path the task needs:
 
 ```json
 {
@@ -297,104 +238,64 @@ allows one method and the smallest safe path:
 }
 ```
 
-The `policy.local` proposal shape covers explicit-proxy endpoints and REST
-method or path rules. Agent-authored proposals cannot set `protocol: tcp` or
-`tls: skip`, because those modes bypass application-authority inspection. When a
-task requires native TCP or a raw TLS tunnel, a developer must add the rule
-through the normal [policy workflow](/sandboxes/manage-policies). Omitting
-`protocol` remains supported and keeps the explicit proxy's default TLS
-termination and HTTP authority checks. Other fields, such as WebSocket
-credential rewrite, GraphQL operation matching, endpoint path scoping, and
-provider-owned policy bundles, are also outside the proposal surface.
+Agents cannot propose `protocol: tcp` or `tls: skip`, because OpenShell cannot
+inspect that traffic. WebSocket, GraphQL, and MCP rules, credential settings,
+and endpoint path selectors are also outside what an agent can propose. Add
+those rules yourself, as described in [Manage Sandbox
+Policies](/sandboxes/manage-policies).
 
-### Private and Blocked Destinations
+Agents also cannot add `allowed_ips`. If a proposed host resolves to a private
+address, OpenShell still blocks the connection after approval until you add an
+`allowed_ips` entry yourself. Loopback, link-local, and cloud metadata addresses
+are always blocked, and you cannot approve a proposal that targets them.
 
-Policy advisor proposals do not add `allowed_ips` automatically. If an
-advisor-proposed hostname resolves to an internal or private address, OpenShell's
-SSRF protections block the connection until a developer explicitly adds the
-required `allowed_ips` entry.
-
-Private RFC 1918, CGNAT, IPv6 ULA, and other special-use destinations classified
-as internal produce advisory security notes when they appear as literal endpoint
-IPs or in `allowed_ips`. CIDR intersections are included, and hostless
-`allowed_ips` rules receive an additional warning because they can match any
-hostname resolving into the configured range.
-
-Always-blocked destinations are not advisory. Loopback, link-local, and
-unspecified IPs or CIDRs, plus `localhost` and known metadata endpoint
-hostnames, are excluded from security notes. Submit and edit can store such a
-draft, but approval fails when merge validation prevents it from entering the
-active policy. Runtime SSRF protections continue to enforce the same boundary.
-
-### Proposal Provenance
-
-OpenShell records internally whether policy advisor introduced an endpoint or a
-binary. Provenance is not a policy YAML field. When an advisor proposal overlaps
-an endpoint that a user or provider declared explicitly, the explicit
-declaration wins and a provider rule stays immutable. For example, a GitHub
-provider can declare read access to `api.github.com:443`, and an approved
-proposal for `PUT /repos/NVIDIA/OpenShell/contents/docs/**` on the same endpoint
-is stored in the sandbox policy layer.
-
-Provenance does not hide a real conflict. Overlapping declarations still fail
-validation if they disagree on settings that must have one value, such as TLS
-mode, `allowed_ips`, an equally specific protocol or parser contract, credential
-binding, or enforcement mode. Compatible allow and deny rules can combine.
-
-Advisor-introduced endpoints and binaries do not establish exact-host SSRF
-trust, which requires an explicit exact endpoint and matching binary in the same
-rule. A proposal cannot extend a provider's binary identity to a different
-binary. For example, if a provider declares `api.github.com:443` for
-`/usr/bin/gh` and the advisor proposes the same endpoint for `/usr/bin/curl`,
-the proposed rule for `curl` remains subject to the normal SSRF checks.
+An approved proposal becomes part of the sandbox's own policy and never changes
+rules that providers contribute. When it overlaps an existing rule, its allow
+rules combine with that rule. It cannot change settings that must have a single
+value, such as TLS handling or `allowed_ips`. A proposed rule also does not
+inherit trust from a provider rule for a different binary.
 
 ## Agent API
 
-`policy.local` is available only inside the sandbox and uses plain HTTP. It
-resolves through sandbox-local DNS and does not need a proxy environment variable
-or a network policy rule:
+The agent uses these endpoints at `http://policy.local`:
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /v1/policy/current` | Returns the current effective sandbox policy as YAML. |
-| `GET /v1/denials?last=10` | Returns recent denied OCSF shorthand log lines, newest first. Query strings are redacted before lines are returned to the agent. |
-| `POST /v1/proposals` | Submits `addRule` operations. The response includes `accepted_chunk_ids` and `rejection_reasons`. |
-| `GET /v1/proposals/{chunk_id}` | Returns one proposal's current `pending`, `approved`, or `rejected` status. |
-| `GET /v1/proposals/{chunk_id}/wait?timeout=300` | Holds one HTTP request open until the proposal is approved, rejected, or the timeout expires. |
+| `GET /v1/policy/current` | Returns the sandbox's effective policy as YAML. |
+| `GET /v1/denials?last=10` | Returns recent denials as log lines, newest first, with query strings removed. |
+| `POST /v1/proposals` | Submits proposals. The response lists the IDs of accepted proposals and the reasons for any that were refused. |
+| `GET /v1/proposals/{chunk_id}` | Returns a proposal's status: `pending`, `approved`, or `rejected`. |
+| `GET /v1/proposals/{chunk_id}/wait?timeout=300` | Waits until the proposal is approved or rejected, or until the timeout expires. |
 
-If policy advisor is disabled, every route returns `404 feature_disabled`, the
-skill is not installed for new sandboxes, and request-level deny bodies do not
-advertise `policy.local` routes or include `agent_guidance`.
+When the policy advisor is disabled, every route returns `404 feature_disabled`,
+new sandboxes do not receive the guide, and denial responses do not mention
+`policy.local`.
 
-## Audit Events
+## Logs
 
-Approved network rules hot-reload without restarting the sandbox. Connections
-attached to the previous policy generation close at the reload boundary, so a
-retry opens against the current generation. Refer to [How Changes Take
-Effect](/sandboxes/policies#how-changes-take-effect) for HTTP, WebSocket,
-tunnel, and long-lived stream behavior.
+An approved rule takes effect in the running sandbox without a restart.
+OpenShell closes connections opened under the previous rules, so the agent's
+retry uses the new rule. The `/wait` endpoint reports `policy_reloaded: true`
+once the sandbox has loaded the approved rule.
 
-Policy advisor emits audit events into the sandbox log. Use these lines to
-trace the full loop:
+To follow a proposal in the sandbox log, run:
 
 ```shell
 openshell logs <sandbox-name> --since 10m
 ```
 
-Look for `HTTP:* DENIED`, `CONFIG:PROPOSED`, `CONFIG:APPROVED` or
-`CONFIG:REJECTED`, `CONFIG:LOADED`, and the final allowed request if the agent
-retries successfully. Every auto-approval emits `CONFIG:APPROVED` with
-`auto=true`, `source=<mechanistic|agent_authored>`, `prover_delta=empty`, and
-`resolved_from=<gateway|sandbox|default>`, so operators can reconstruct why an
-approval ran without human review.
+Look for the denied request (`HTTP:* DENIED`), then `CONFIG:PROPOSED`,
+`CONFIG:APPROVED` or `CONFIG:REJECTED`, `CONFIG:LOADED`, and the retried
+request. An automatic approval logs `CONFIG:APPROVED` with `auto=true`, the
+proposal's source (`agent_authored` or `mechanistic`, for drafts that OpenShell
+created from denials), and where the approval mode setting came from.
 
 ## Next Steps
 
-- Use [Manage Sandbox Policies](/sandboxes/manage-policies) for manual policy
-  changes.
+- Use [Manage Sandbox Policies](/sandboxes/manage-policies) to change policies
+  yourself.
 - Use [Network Rules](/sandboxes/network-rules) and the
-  [Policy Schema Reference](/reference/policy-schema) for rule syntax outside
-  the proposal surface.
-- Use the [Standalone Policy Prover](/reference/policy-prover) for optional
-  boundary checks and its explicit modeled-domain limits.
-- Use [Logging](/observability/logging) to interpret OCSF shorthand log entries.
+  [Policy Schema Reference](/reference/policy-schema) for rules that agents
+  cannot propose.
+- Use the [Standalone Policy Prover](/reference/policy-prover) to check a
+  complete policy against a boundary you define.
