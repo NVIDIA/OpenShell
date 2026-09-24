@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: "Gateway Configuration File"
-sidebar-title: "Gateway Config"
+sidebar-title: "Configuration"
 description: "Reference for the OpenShell gateway TOML configuration file (RFC 0003)."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Gateway, Configuration, TOML, Reference"
 position: 5
@@ -90,7 +90,7 @@ future version. To migrate an existing file:
 5. Use canonical image pull policies: `always`, `if_not_present`, `never`, or
    Podman-only `newer`. Kubernetes-style capitalization and Podman's `missing`
    spelling are rejected.
-6. Remove zero sentinels. Omit `gateway_jwt.ttl_secs` for a non-expiring token,
+6. Remove zero sentinels. Omit `gateway_jwt.ttl_secs` to use the 900-second default,
    omit Docker or Podman `sandbox_pids_limit` to use OpenShell's default limit
    of 2048, and omit Podman `health_check_interval_secs` to disable health
    checks. Explicit zero values are invalid.
@@ -197,7 +197,7 @@ signing_key_path = "/etc/openshell/jwt/signing.pem"
 public_key_path  = "/etc/openshell/jwt/public.pem"
 kid_path         = "/etc/openshell/jwt/kid"
 gateway_id       = "openshell"
-# Omit only for local single-player Docker, Podman, or VM gateways.
+# Optional; defaults to 900 seconds.
 ttl_secs         = 3600
 
 [openshell.gateway.auth]
@@ -257,7 +257,6 @@ sa_token_ttl_secs      = 3600
 
 [openshell.credential_drivers.kubernetes-secrets]
 namespace = "openshell"
-allow_reference_namespace = false
 ```
 
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to map a verified client certificate to a CLI user identity. This application-layer identity switch does not control the TLS handshake. When `client_ca_path` is set without OIDC, the listener requires a valid client certificate. When OIDC is configured, bearer-only clients may connect; the listener still validates any client certificate they present against the configured CA. Kubernetes deployments must leave `mtls_auth.enabled` unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
@@ -268,7 +267,7 @@ The client-certificate handshake policy is derived and has no `require_client_au
 
 `[openshell.gateway] policy_validation_failure_mode` controls what sandbox supervisors do when a complete candidate policy fails runtime validation. The default, `fail_closed`, deactivates the previous network policy, closes relays pinned to it, and denies new egress until a valid generation loads. `retain_last_valid` leaves the previous valid generation active. Both modes reject the candidate atomically; startup keeps the workload unstarted until the effective policy and matching provider configuration pass admission. A rejected startup exposes `ConfigurationInvalid` and remains available for policy/provider repair in either mode. Gateway mutation paths that can preflight a known effective scope reject invalid candidates before persistence and leave the active policy unchanged regardless of this setting. Changing the value requires restarting the gateway so it can reload `gateway.toml` and distribute the new posture to sandbox supervisors.
 
-`[openshell.gateway.gateway_jwt] ttl_secs` controls gateway-minted sandbox JWT lifetime. Omit it for a non-expiring token: the token has no `exp` claim and the response omits `expiration_time`. Use this only for local single-player Docker, Podman, or VM gateways. Explicit `0` is invalid. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway omits the field.
+`[openshell.gateway.gateway_jwt] ttl_secs` controls the lifetime of gateway-minted, generation-bound sandbox session JWTs and typed extension JWTs. Omit it to use the 900-second default. Explicit `0` is invalid. Helm renders `3600` seconds by default.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
@@ -467,7 +466,7 @@ server:
     existingSecret: my-preprovisioned-kek-secret
 ```
 
-For `kubernetes-secrets`, `namespace` sets where OpenShell-managed provider Secret objects are stored. When omitted, the driver uses the in-cluster ServiceAccount namespace when available, otherwise `default`. The Helm chart creates a Role granting the gateway access to all Secrets in the credential namespace because OpenShell-managed Secret names are dynamic SHA-256 hashes that cannot be restricted with `resourceNames`. Deploy credential Secrets in a dedicated namespace (`server.credentialDrivers.kubernetesSecrets.namespace`) to limit the RBAC blast radius.
+For `kubernetes-secrets`, `namespace` sets where OpenShell-managed provider Secret objects are stored in every workspace mode. When omitted, the driver uses the in-cluster ServiceAccount namespace when available, otherwise `default`. The driver rejects credential handles that reference any other namespace. The Helm chart creates a Role granting the gateway access to all Secrets in the credential namespace because OpenShell-managed Secret names are dynamic SHA-256 hashes that cannot be restricted with `resourceNames`; the gateway ClusterRole grants no credential Secret permissions. Deploy credential Secrets in a dedicated namespace (`server.credentialDrivers.kubernetesSecrets.namespace`) to limit the RBAC blast radius. When the credential namespace is the release namespace, the Role also covers the gateway's own TLS and database Secrets. Set `server.credentialDrivers.kubernetesSecrets.createNamespace=true` to have the chart create the dedicated namespace. The chart retains it on uninstall so stored credentials survive, and leaves an existing namespace it does not own untouched.
 
 For `vault`, `address` points at the Vault service. Non-loopback endpoints must use HTTPS; plaintext HTTP is accepted only for `localhost` or an IP loopback address during local development. Vault requests do not follow redirects, preventing credentials from being replayed to a downgraded or substituted endpoint. HTTPS uses platform trust roots by default. Set `ca_bundle` to a certificate-only PEM bundle for a private Vault CA; the bundle augments platform roots and normal hostname verification remains enabled. `mount` and `kv_version` describe the KV engine where OpenShell-managed provider secrets are stored, and `auth_method = "kubernetes"` logs in with the gateway Pod's ServiceAccount token. For local or development validation, use `auth_method = "token_file"` with `token_path = "/path/to/token"`. Do not put literal Vault tokens in TOML.
 
@@ -588,10 +587,10 @@ authorization inputs.
 
 Image-pull Secrets are selected by gateway configuration, not by sandbox
 callers, and do not participate in resource admission. In managed mode OpenShell
-copies each explicitly configured Secret into the workspace namespace with
-gateway ownership metadata. An existing target Secret is updated only when its
-ownership metadata matches the gateway and workspace. In shared and operator
-modes, the configured Secret must already exist in the sandbox namespace. The
+creates an immutable copy of each configured Secret for every sandbox runtime
+generation and deletes it with that generation. Sandbox creation fails if a
+Secret with the generation name already exists. In shared and operator modes,
+the configured Secret must already exist in the sandbox namespace. The
 typed Kubernetes driver config does not support caller-selected Secret or
 ConfigMap volumes or environment references. Automatic service-account tokens
 and projected token volumes are prohibited.

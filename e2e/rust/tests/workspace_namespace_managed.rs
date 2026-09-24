@@ -180,21 +180,27 @@ async fn managed_creates_namespace_with_labels() {
     let (ok, _) = kubectl(&["get", "serviceaccount", "openshell-sandbox", "-n", &ns]).await;
     assert!(ok, "ServiceAccount openshell-sandbox should exist in {ns}");
 
-    // The managed driver copies only explicitly configured image-pull Secrets
-    // from the gateway namespace into the workspace namespace.
-    let (ok, copied_secret) = kubectl(&[
+    // Each runtime generation gets its own immutable copy of the configured
+    // image-pull Secret; the configured name is never created in {ns}.
+    let (ok, staged) = kubectl(&[
         "get",
         "secret",
-        "e2e-regcred",
         "-n",
         &ns,
+        "-l",
+        "openshell.ai/component=image-pull",
         "-o",
-        "jsonpath={.type}",
+        "jsonpath={range .items[*]}{.metadata.name} {.type} {.immutable}{\"\\n\"}{end}",
     ])
     .await;
     assert!(
-        ok && copied_secret.contains("kubernetes.io/dockerconfigjson"),
-        "configured image-pull Secret should be copied into {ns}: {copied_secret}"
+        ok && staged.contains("os-pull-") && staged.contains("kubernetes.io/dockerconfigjson true"),
+        "a generation image-pull Secret should exist in {ns}: {staged}"
+    );
+    let (ok, _) = kubectl(&["get", "secret", "e2e-regcred", "-n", &ns]).await;
+    assert!(
+        !ok,
+        "configured image-pull Secret name must not exist in {ns}"
     );
 
     // Verify SSH ingress is restricted to the gateway peer. Because Kubernetes
@@ -484,7 +490,7 @@ async fn managed_workspace_delete_removes_namespace() {
 }
 
 #[tokio::test]
-async fn managed_tls_secret_copied_to_namespace() {
+async fn managed_supervisor_reads_client_tls_from_its_bootstrap_secret() {
     let (ok, config_out) = kubectl(&[
         "get",
         "configmap",
@@ -496,7 +502,7 @@ async fn managed_tls_secret_copied_to_namespace() {
     ])
     .await;
     if !ok || !config_out.contains("client_tls_secret_name") {
-        eprintln!("SKIP: client_tls_secret_name not configured; TLS secret copying disabled");
+        eprintln!("SKIP: client_tls_secret_name not configured");
         return;
     }
 
@@ -528,26 +534,77 @@ async fn managed_tls_secret_copied_to_namespace() {
         "sandbox output missing expected string: {out}"
     );
 
-    let (ok, out) = kubectl(&["get", "secret", "openshell-client-tls", "-n", &ns]).await;
+    let (ok, _) = kubectl(&["get", "secret", "openshell-client-tls", "-n", &ns]).await;
     assert!(
-        ok,
-        "TLS secret openshell-client-tls should be copied to managed namespace {ns}: {out}"
+        !ok,
+        "client TLS Secret must not be copied into managed namespace {ns}"
     );
 
-    let (ok, label_out) = kubectl(&[
+    let (ok, keys) = kubectl(&[
         "get",
         "secret",
-        "openshell-client-tls",
         "-n",
         &ns,
+        "-l",
+        "openshell.ai/component=supervisor-bootstrap",
         "-o",
-        "jsonpath={.metadata.labels}",
+        "jsonpath={.items[*].data}",
     ])
     .await;
-    assert!(ok, "failed to read TLS secret labels: {label_out}");
     assert!(
-        label_out.contains("openshell.ai/managed-by"),
-        "copied TLS secret missing managed-by label: {label_out}"
+        ok && keys.contains("client-tls.crt") && keys.contains("client-ca.crt"),
+        "supervisor bootstrap Secret should carry client TLS material: {keys}"
+    );
+}
+
+const GATEWAY_SERVICE_ACCOUNT: &str = "system:serviceaccount:openshell:openshell";
+
+async fn gateway_can(verb: &str, resource: &str, namespace: &str) -> bool {
+    let (_, out) = kubectl(&[
+        "auth",
+        "can-i",
+        verb,
+        resource,
+        "-n",
+        namespace,
+        "--as",
+        GATEWAY_SERVICE_ACCOUNT,
+    ])
+    .await;
+    match out.trim() {
+        "yes" => true,
+        "no" => false,
+        other => panic!("unexpected kubectl auth can-i output for {verb} {resource}: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn managed_gateway_cannot_read_or_modify_workspace_secrets() {
+    let ns = managed_namespace(&unique_workspace("mgdrbac"));
+
+    for verb in ["get", "patch"] {
+        assert!(
+            !gateway_can(verb, "secrets", &ns).await,
+            "gateway must not {verb} arbitrary Secrets in workspace namespace {ns}"
+        );
+        assert!(
+            !gateway_can(verb, "secrets/unrelated-secret", &ns).await,
+            "gateway must not {verb} an unrelated Secret in workspace namespace {ns}"
+        );
+    }
+    assert!(
+        !gateway_can("list", "secrets", &ns).await,
+        "gateway must not list Secrets in workspace namespace {ns}"
+    );
+    for copied in ["secrets/openshell-client-tls", "secrets/e2e-regcred"] {
+        assert!(
+            !gateway_can("get", copied, &ns).await,
+            "gateway must not read {copied} outside its sandbox namespace"
+        );
+    }
+    assert!(
+        gateway_can("get", "secrets", "openshell").await,
+        "gateway must still reach provider credential Secrets in its configured namespace"
     );
 }
 

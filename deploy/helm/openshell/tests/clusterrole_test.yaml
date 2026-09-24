@@ -79,42 +79,11 @@ tests:
             resources: ["networkpolicies"]
             verbs: ["get", "create", "patch", "update"]
 
-  - it: grants broad secret access when credential driver is enabled (operator)
+  - it: omits credential Secret access in managed mode
     set:
-      server.drivers.kubernetes.workspaceMode: operator
+      server.drivers.kubernetes.workspaceMode: managed
       server.credentialDrivers.kubernetesSecrets.enabled: true
     asserts:
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            verbs: ["get", "create", "patch", "delete"]
-
-  - it: restricts operator TLS sync to the configured secret
-    set:
-      server.drivers.kubernetes.workspaceMode: operator
-      server.tls.clientTlsSecretName: custom-client-tls
-    asserts:
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            resourceNames: ["custom-client-tls"]
-            verbs: ["get", "patch"]
-
-  - it: grants operator bootstrap secret lifecycle permissions when TLS and credential storage are disabled
-    set:
-      server.drivers.kubernetes.workspaceMode: operator
-      server.disableTls: true
-    asserts:
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
       - notContains:
           path: rules
           content:
@@ -122,7 +91,16 @@ tests:
             resources: ["secrets"]
             verbs: ["get", "create", "patch", "delete"]
 
-  - it: restricts managed copies to TLS and configured image-pull secrets
+  - it: omits all Secret rules in operator mode
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+      server.tls.clientTlsSecretName: custom-client-tls
+      server.credentialDrivers.kubernetesSecrets.enabled: true
+    asserts:
+      - notExists:
+          path: rules[*].resources[?(@ == "secrets")]
+
+  - it: names no Secrets in managed mode
     set:
       server.drivers.kubernetes.workspaceMode: managed
       server.tls.clientTlsSecretName: custom-client-tls
@@ -130,51 +108,21 @@ tests:
         - name: registry-one
         - name: registry-two
     asserts:
+      - notExists:
+          path: rules[*].resourceNames
       - contains:
           path: rules
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            resourceNames: ["custom-client-tls", "registry-one", "registry-two"]
-            verbs: ["get", "patch"]
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
-
-  - it: restricts managed copies to image-pull secrets when TLS is disabled
-    set:
-      server.drivers.kubernetes.workspaceMode: managed
-      server.disableTls: true
-      server.sandboxImagePullSecrets:
-        - name: registry-one
-    asserts:
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            resourceNames: ["registry-one"]
-            verbs: ["get", "patch"]
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
+            verbs: ["create", "delete"]
 
   - it: omits secrets rule entirely in shared mode
     set:
       server.drivers.kubernetes.workspaceMode: shared
     asserts:
-      - notContains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-          any: true
+      - notExists:
+          path: rules[*].resources[?(@ == "secrets")]
 
   - it: grants managed sandbox-runtime companion permissions
     set:
@@ -197,7 +145,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["create", "list", "delete"]
+            verbs: ["create", "delete"]
 
   - it: grants operator sandbox-runtime companion permissions
     set:
@@ -215,9 +163,3 @@ tests:
             apiGroups: [""]
             resources: ["services"]
             verbs: ["create", "get"]
-      - contains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["secrets"]
-            verbs: ["create", "list", "delete"]

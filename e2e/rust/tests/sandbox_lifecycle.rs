@@ -652,10 +652,43 @@ async fn canonical_main_disconnect_reconnect_replays_history_for_same_process() 
         "read-only attachment should observe output: {observer_output_line}"
     );
 
+    observer
+        .stdin
+        .as_mut()
+        .expect("observer stdin")
+        .write_all(b"\x03")
+        .await
+        .expect("send Ctrl-C to viewer");
+    let observer_status = tokio::time::timeout(Duration::from_secs(30), observer.wait())
+        .await
+        .expect("Ctrl-C should exit viewer")
+        .expect("wait for viewer");
+    assert!(observer_status.success(), "viewer should exit successfully");
+
+    owner
+        .stdin
+        .as_mut()
+        .expect("owner stdin")
+        .write_all(b"owner-after-viewer-exit\n")
+        .await
+        .expect("send input after viewer exits");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let line = owner_lines
+                .next_line()
+                .await
+                .expect("read owner output after viewer exits")
+                .expect("main process should remain running");
+            if line.contains("input=owner-after-viewer-exit") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("owner should retain working stdin after viewer exits");
+
     owner.kill().await.expect("disconnect input owner");
     owner.wait().await.expect("wait for input owner disconnect");
-    observer.kill().await.expect("disconnect observer");
-    observer.wait().await.expect("wait for observer disconnect");
 
     let (mut reconnect, replay) = reconnect_with_input_ownership(&sandbox.name).await;
 

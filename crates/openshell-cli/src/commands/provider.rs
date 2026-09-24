@@ -87,6 +87,8 @@ fn aggregate_delete_failures(resource: &str, failures: &[String]) -> Result<()> 
 pub async fn sandbox_provider_list(
     server: &str,
     name: &str,
+    page_size: i32,
+    page_token: &str,
     output: &str,
     workspace: &str,
     tls: &TlsOptions,
@@ -98,14 +100,25 @@ pub async fn sandbox_provider_list(
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 (workspace).to_string(),
             )),
+            page_size,
+            page_token: page_token.to_string(),
         })
         .await
         .into_diagnostic()?;
-    let providers = response.into_inner().providers;
+    let response = response.into_inner();
+    let next_page_token = response.next_page_token;
+    let providers = response.providers;
 
-    if crate::output::print_output_collection(output, &providers, attached_provider_to_json)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "providers",
+        &providers,
+        &next_page_token,
+        attached_provider_to_json,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if providers.is_empty() {
         println!("No providers attached to sandbox {name}.");

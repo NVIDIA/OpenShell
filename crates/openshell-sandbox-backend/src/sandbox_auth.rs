@@ -190,7 +190,10 @@ impl SandboxConnectionRegistry {
             if active.id == principal.connection_id && active.epoch == epoch {
                 return Ok(None);
             }
-            if epoch <= active.epoch {
+            if epoch == active.epoch {
+                return Err(SandboxAuthError::ConnectionStillActive);
+            }
+            if epoch < active.epoch {
                 return Err(SandboxAuthError::StaleCredentialEpoch);
             }
         }
@@ -337,8 +340,11 @@ pub enum SandboxAuthError {
     WrongSandbox,
     #[error("authenticated runtime generation does not match this sandbox runtime")]
     WrongRuntimeGeneration,
-    #[error("Sandbox Protocol credential epoch is stale or already active")]
+    #[error("Sandbox Protocol credential epoch is stale")]
     StaleCredentialEpoch,
+    /// Retryable: the previous connection's disconnect has not been observed yet.
+    #[error("another Sandbox Protocol connection with this credential epoch is still active")]
+    ConnectionStillActive,
     #[error("sandbox runtime is already bound to another supervisor process")]
     WrongSupervisorInstance,
     #[error("Sandbox Protocol connection has not completed attach")]
@@ -467,7 +473,19 @@ mod tests {
         assert_eq!(registry.confirm(&first), Ok(None));
         assert_eq!(registry.confirm(&first), Ok(None));
 
+        let second_id = SandboxConnectionId::new();
+        let second = first_authenticator
+            .authenticate(second_id, &metadata(first_token.token.expose_secret()))
+            .expect("second principal");
+        assert_eq!(
+            registry.attach(&second, instance),
+            Err(SandboxAuthError::ConnectionStillActive)
+        );
+
         assert!(registry.disconnect(first_id));
+        assert_eq!(registry.attach(&second, instance), Ok(None));
+        assert_eq!(registry.confirm(&second), Ok(None));
+        assert!(registry.disconnect(second_id));
         assert_eq!(registry.attach(&first, instance), Ok(None));
         assert_eq!(registry.confirm(&first), Ok(None));
         registry.mark_terminal();

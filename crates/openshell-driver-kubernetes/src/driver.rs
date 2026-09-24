@@ -12,10 +12,9 @@ use crate::isolation::{
     BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeBoundarySpec,
 };
 use crate::sandbox_runtime::{
-    BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH,
-    SANDBOX_SECRET_COMPONENT, SUPERVISOR_SECRET_COMPONENT,
-    SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames, boundary_service,
-    generate_proxy_ca_material, sandbox_bootstrap_secret,
+    BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ClientTlsMaterial,
+    SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames, SupervisorClientTls,
+    boundary_service, generate_proxy_ca_material, image_pull_secret_copy, sandbox_bootstrap_secret,
     sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
     supervisor_bootstrap_secret, supervisor_pod, workload_fence,
 };
@@ -1197,165 +1196,85 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
-    /// Ensure the client TLS Secret exists in `namespace` by copying it from
-    /// the gateway's Helm release namespace. Idempotent: creates the Secret on
-    /// first call, updates it on subsequent calls to pick up cert rotations.
-    /// No-op when `client_tls_secret_name` is empty (TLS disabled).
-    async fn ensure_tls_secret(&self, namespace: &str) -> Result<(), KubernetesDriverError> {
-        if self.config.client_tls_secret_name.is_empty() {
+    /// Names the workload and supervisor Pods of a runtime generation use in
+    /// `imagePullSecrets`.
+    fn generation_image_pull_secret_names(&self, names: &SandboxRuntimeNames) -> Vec<String> {
+        if self.config.workspace_mode == WorkspaceMode::Managed {
+            names.image_pull_secrets(self.config.image_pull_secrets.len())
+        } else {
+            self.config.image_pull_secrets.clone()
+        }
+    }
+
+    async fn read_source_secret(&self, name: &str) -> Result<Secret, KubernetesDriverError> {
+        let source_api: Api<Secret> = Api::namespaced(self.client.clone(), &self.config.namespace);
+        match tokio::time::timeout(KUBE_API_TIMEOUT, source_api.get(name)).await {
+            Ok(Ok(secret)) => Ok(secret),
+            Ok(Err(KubeError::Api(error))) if error.code == 404 => {
+                Err(KubernetesDriverError::Precondition(format!(
+                    "Secret {name} does not exist in source namespace {}",
+                    self.config.namespace
+                )))
+            }
+            Ok(Err(error)) => Err(KubernetesDriverError::from_kube(error)),
+            Err(_) => Err(KubernetesDriverError::Message(format!(
+                "timeout reading Secret {name} from {}",
+                self.config.namespace
+            ))),
+        }
+    }
+
+    /// Create immutable copies of the configured image-pull Secrets for one
+    /// managed-mode runtime generation. An existing Secret with a generation
+    /// name fails the create rather than being adopted.
+    async fn create_generation_image_pull_secrets(
+        &self,
+        namespace: &str,
+        names: &SandboxRuntimeNames,
+        sandbox_id: &str,
+        owners: Vec<OwnerReference>,
+    ) -> Result<(), KubernetesDriverError> {
+        if self.config.workspace_mode != WorkspaceMode::Managed {
             return Ok(());
         }
-
-        let source_api: Api<Secret> = Api::namespaced(self.client.clone(), &self.config.namespace);
-        let source = match tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            source_api.get(&self.config.client_tls_secret_name),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                warn!(
-                    secret = %self.config.client_tls_secret_name,
-                    source_namespace = %self.config.namespace,
-                    error = %e,
-                    "failed to read source TLS secret"
-                );
-                return Err(KubernetesDriverError::from_kube(e));
-            }
-            Err(_) => {
-                return Err(KubernetesDriverError::Message(format!(
-                    "timeout reading TLS secret {} from {}",
-                    self.config.client_tls_secret_name, self.config.namespace
-                )));
-            }
-        };
-
-        let target_api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
-        let copy = Secret {
-            metadata: ObjectMeta {
-                name: Some(self.config.client_tls_secret_name.clone()),
-                namespace: Some(namespace.to_string()),
-                labels: Some(BTreeMap::from([(
-                    LABEL_MANAGED_BY.to_string(),
-                    LABEL_MANAGED_BY_VALUE.to_string(),
-                )])),
-                ..Default::default()
-            },
-            data: source.data,
-            type_: source.type_,
-            ..Default::default()
-        };
-
-        match tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            target_api.patch(
-                &self.config.client_tls_secret_name,
-                &PatchParams::apply("openshell"),
-                &Patch::Apply(&copy),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(_)) => {
-                info!(
-                    namespace = %namespace,
-                    secret = %self.config.client_tls_secret_name,
-                    "applied TLS secret copy"
-                );
-            }
-            Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
-            Err(_) => {
-                return Err(KubernetesDriverError::Message(format!(
-                    "timeout applying TLS secret in {namespace}"
-                )));
-            }
+        let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
+        let targets = names.image_pull_secrets(self.config.image_pull_secrets.len());
+        for (source_name, target_name) in self.config.image_pull_secrets.iter().zip(&targets) {
+            let source = self.read_source_secret(source_name).await?;
+            let copy =
+                image_pull_secret_copy(namespace, target_name, sandbox_id, &source, owners.clone());
+            secrets
+                .create(&PostParams::default(), &copy)
+                .await
+                .map_err(KubernetesDriverError::from_kube)?;
         }
-
         Ok(())
     }
 
-    /// Copy the explicitly configured image-pull Secrets into a managed
-    /// workspace namespace. Server-side apply refreshes rotated credentials
-    /// without forcibly taking fields owned by another manager.
-    async fn ensure_image_pull_secrets(
+    /// Read the gateway client TLS material staged into supervisor bootstrap
+    /// Secrets outside the sandbox namespace.
+    async fn read_client_tls_material(
         &self,
-        namespace: &str,
-        workspace: &str,
-    ) -> Result<(), KubernetesDriverError> {
-        let source_api: Api<Secret> = Api::namespaced(self.client.clone(), &self.config.namespace);
-        let target_api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
-
-        for secret_name in &self.config.image_pull_secrets {
-            let source = match tokio::time::timeout(KUBE_API_TIMEOUT, source_api.get(secret_name))
-                .await
-            {
-                Ok(Ok(secret)) => secret,
-                Ok(Err(KubeError::Api(error))) if error.code == 404 => {
-                    return Err(KubernetesDriverError::Precondition(format!(
-                        "configured image-pull Secret {secret_name} does not exist in source namespace {}",
-                        self.config.namespace
-                    )));
-                }
-                Ok(Err(error)) => return Err(KubernetesDriverError::from_kube(error)),
-                Err(_) => {
-                    return Err(KubernetesDriverError::Message(format!(
-                        "timeout reading image-pull Secret {secret_name} from {}",
-                        self.config.namespace
-                    )));
-                }
-            };
-
-            let existing = tokio::time::timeout(KUBE_API_TIMEOUT, target_api.get_opt(secret_name))
-                .await
-                .map_err(|_| {
-                    KubernetesDriverError::Message(format!(
-                        "timeout checking image-pull Secret {secret_name} in {namespace}"
-                    ))
-                })?
-                .map_err(KubernetesDriverError::from_kube)?;
-            if existing.as_ref().is_some_and(|existing| {
-                !image_pull_secret_owned_by_gateway(
-                    existing.metadata.labels.as_ref(),
-                    &self.config.gateway_id,
-                    workspace,
-                )
-            }) {
-                return Err(KubernetesDriverError::Precondition(format!(
-                    "image-pull Secret {secret_name} in {namespace} is not owned by this gateway"
-                )));
-            }
-
-            let copy = image_pull_secret_copy(
-                secret_name,
-                namespace,
-                workspace,
-                &self.config.gateway_id,
-                source,
-            );
-            match tokio::time::timeout(
-                KUBE_API_TIMEOUT,
-                target_api.patch(
-                    secret_name,
-                    &PatchParams::apply("openshell"),
-                    &Patch::Apply(&copy),
-                ),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
-                    info!(namespace, secret = %secret_name, "applied image-pull Secret copy");
-                }
-                Ok(Err(error)) => return Err(KubernetesDriverError::from_kube(error)),
-                Err(_) => {
-                    return Err(KubernetesDriverError::Message(format!(
-                        "timeout applying image-pull Secret {secret_name} in {namespace}"
-                    )));
-                }
-            }
+    ) -> Result<Option<ClientTlsMaterial>, KubernetesDriverError> {
+        if self.config.supervisor_client_tls() != SupervisorClientTls::Bootstrap {
+            return Ok(None);
         }
-
-        Ok(())
+        let name = &self.config.client_tls_secret_name;
+        let source = self.read_source_secret(name).await?;
+        let mut data = source.data.unwrap_or_default();
+        let mut take = |key: &str| {
+            data.remove(key).map(|value| value.0).ok_or_else(|| {
+                KubernetesDriverError::Precondition(format!(
+                    "Secret {name} in {} has no {key}",
+                    self.config.namespace
+                ))
+            })
+        };
+        Ok(Some(ClientTlsMaterial {
+            ca_certificate: take("ca.crt")?,
+            certificate: take("tls.crt")?,
+            private_key: take("tls.key")?,
+        }))
     }
 
     /// Delete the managed namespace and all its contents (managed mode only).
@@ -1847,7 +1766,7 @@ impl KubernetesComputeDriver {
     )]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<String, KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let result = self.create_sandbox_inner(sandbox).await;
+        let result = Box::pin(self.create_sandbox_inner(sandbox)).await;
         span_status.finish(result)
     }
 
@@ -1879,12 +1798,7 @@ impl KubernetesComputeDriver {
 
         let target_namespace = match self.config.workspace_mode {
             WorkspaceMode::Shared => self.config.namespace.clone(),
-            WorkspaceMode::Managed => {
-                let namespace = self.ensure_namespace(workspace).await?;
-                self.ensure_image_pull_secrets(&namespace, workspace)
-                    .await?;
-                namespace
-            }
+            WorkspaceMode::Managed => self.ensure_namespace(workspace).await?,
             WorkspaceMode::Operator => {
                 if let Some(ref allowlist) = self.operator_allowlist
                     && !allowlist.contains(workspace)
@@ -1897,9 +1811,6 @@ impl KubernetesComputeDriver {
             }
         };
 
-        if self.config.is_multi_namespace() {
-            self.ensure_tls_secret(&target_namespace).await?;
-        }
         let resource_identities = self
             .admit_requested_resources(sandbox)
             .await
@@ -1926,6 +1837,7 @@ impl KubernetesComputeDriver {
 
         let generation = random_sandbox_runtime_token();
         let proxy_names = SandboxRuntimeNames::for_generation(&sandbox.id, &generation);
+        let image_pull_secrets = self.generation_image_pull_secret_names(&proxy_names);
         let main_process_spec = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(
             sandbox.spec.as_ref(),
         )
@@ -1936,7 +1848,7 @@ impl KubernetesComputeDriver {
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
             image_pull_policy: self.config.image_pull_policy,
-            image_pull_secrets: &self.config.image_pull_secrets,
+            image_pull_secrets: &image_pull_secrets,
             sandbox_runtime_image: &self.config.sandbox_runtime_image,
             sandbox_runtime_image_pull_policy: self.config.sandbox_runtime_image_pull_policy,
             service_account_name: &self.config.service_account_name,
@@ -2381,6 +2293,7 @@ impl KubernetesComputeDriver {
         // fails before any Service, Pod, or Secret is created.
         let upstream_proxy_ca_bundle =
             read_staged_upstream_proxy_ca_bundle(self.config.proxy_ca_bundle.as_deref()).await?;
+        let client_tls = self.read_client_tls_material().await?;
         let cr_uid = sandbox_cr.metadata.uid.as_deref().ok_or_else(|| {
             KubernetesDriverError::Message("created Sandbox CR has no UID".to_string())
         })?;
@@ -2442,9 +2355,9 @@ impl KubernetesComputeDriver {
                     &self.config.service_account_name,
                     agent_uid,
                     agent_gid,
-                    &self.config.image_pull_secrets,
+                    &self.generation_image_pull_secret_names(names),
                     &self.config.grpc_endpoint,
-                    &self.config.client_tls_secret_name,
+                    self.config.supervisor_client_tls(),
                     main_process_spec,
                     log_level,
                     self.config.effective_sa_token_ttl_secs(),
@@ -2628,6 +2541,8 @@ impl KubernetesComputeDriver {
             .runtime_descriptor
             .backend_descriptor()
             .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
+        let workload_owner = runtime_pod_owner(&workload_pod_name, &workload_pod_uid);
+        let supervisor_owner = runtime_pod_owner(&names.supervisor_pod, &supervisor_uid);
         let sandbox_secret = sandbox_bootstrap_secret(
             namespace,
             names,
@@ -2638,14 +2553,7 @@ impl KubernetesComputeDriver {
                 .map_err(|error| KubernetesDriverError::Message(error.to_string()))?,
             tls.certificate_chain_pem.into_bytes(),
             tls.private_key_pem.into_bytes(),
-            OwnerReference {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                name: workload_pod_name.clone(),
-                uid: workload_pod_uid,
-                controller: Some(false),
-                block_owner_deletion: Some(false),
-            },
+            workload_owner.clone(),
         );
         let supervisor_secret = supervisor_bootstrap_secret(
             namespace,
@@ -2658,14 +2566,8 @@ impl KubernetesComputeDriver {
             proxy_ca.certificate_pem.into_bytes(),
             proxy_ca.private_key_pem.into_bytes(),
             upstream_proxy_ca_bundle.clone(),
-            OwnerReference {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                name: names.supervisor_pod.clone(),
-                uid: supervisor_uid.clone(),
-                controller: Some(false),
-                block_owner_deletion: Some(false),
-            },
+            client_tls,
+            supervisor_owner.clone(),
         );
         let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
         secrets
@@ -2676,6 +2578,13 @@ impl KubernetesComputeDriver {
             .create(&PostParams::default(), &supervisor_secret)
             .await
             .map_err(KubernetesDriverError::from_kube)?;
+        self.create_generation_image_pull_secrets(
+            namespace,
+            names,
+            &sandbox.id,
+            vec![workload_owner, supervisor_owner],
+        )
+        .await?;
 
         pods.patch(
             &names.supervisor_pod,
@@ -2736,6 +2645,7 @@ impl KubernetesComputeDriver {
         // fails before any Service, Pod, or Secret is created.
         let upstream_proxy_ca_bundle =
             read_staged_upstream_proxy_ca_bundle(self.config.proxy_ca_bundle.as_deref()).await?;
+        let client_tls = self.read_client_tls_material().await?;
         let namespace_uid = Api::<Namespace>::all(self.client.clone())
             .get(namespace)
             .await
@@ -2888,6 +2798,8 @@ impl KubernetesComputeDriver {
             .runtime_descriptor
             .backend_descriptor()
             .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
+        let workload_owner = runtime_pod_owner(&workload_pod_name, &workload_pod_uid);
+        let supervisor_owner = runtime_pod_owner(&names.supervisor_pod, supervisor_uid);
         let sandbox_secret = sandbox_bootstrap_secret(
             namespace,
             names,
@@ -2898,14 +2810,7 @@ impl KubernetesComputeDriver {
                 .map_err(|error| KubernetesDriverError::Message(error.to_string()))?,
             tls.certificate_chain_pem.into_bytes(),
             tls.private_key_pem.into_bytes(),
-            OwnerReference {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                name: workload_pod_name.clone(),
-                uid: workload_pod_uid,
-                controller: Some(false),
-                block_owner_deletion: Some(false),
-            },
+            workload_owner.clone(),
         );
         let supervisor_secret = supervisor_bootstrap_secret(
             namespace,
@@ -2918,14 +2823,8 @@ impl KubernetesComputeDriver {
             proxy_ca.certificate_pem.into_bytes(),
             proxy_ca.private_key_pem.into_bytes(),
             upstream_proxy_ca_bundle.clone(),
-            OwnerReference {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                name: names.supervisor_pod.clone(),
-                uid: supervisor_uid.to_string(),
-                controller: Some(false),
-                block_owner_deletion: Some(false),
-            },
+            client_tls,
+            supervisor_owner.clone(),
         );
         let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
         secrets
@@ -2936,6 +2835,13 @@ impl KubernetesComputeDriver {
             .create(&PostParams::default(), &supervisor_secret)
             .await
             .map_err(KubernetesDriverError::from_kube)?;
+        self.create_generation_image_pull_secrets(
+            namespace,
+            names,
+            sandbox_id,
+            vec![workload_owner, supervisor_owner],
+        )
+        .await?;
 
         pods.patch(
             &names.supervisor_pod,
@@ -3032,8 +2938,12 @@ impl KubernetesComputeDriver {
                 pod_is_gone,
             );
             if stop_is_complete {
-                self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace)
-                    .await?;
+                self.delete_sandbox_runtime_supervisor(
+                    sandbox_id,
+                    &namespace,
+                    sandbox_runtime_generation(&object).as_slice(),
+                )
+                .await?;
                 patch_dynamic_object_with_resource_version_retry(
                     &agent_sandbox_api.api,
                     &kube_name,
@@ -3216,7 +3126,9 @@ impl KubernetesComputeDriver {
         let names = SandboxRuntimeNames::for_generation(sandbox_id, generation.as_str());
         self.create_sandbox_runtime_fence(&namespace, &names)
             .await?;
-        self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace)
+        let mut stale_generations = sandbox_runtime_generation(&object).as_slice().to_vec();
+        stale_generations.push(generation.as_str());
+        self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace, &stale_generations)
             .await?;
         let main_process_spec =
             required_sandbox_annotation(&object, ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC)?;
@@ -3242,9 +3154,9 @@ impl KubernetesComputeDriver {
                     &self.config.service_account_name,
                     agent_uid,
                     agent_gid,
-                    &self.config.image_pull_secrets,
+                    &self.generation_image_pull_secret_names(&names),
                     &self.config.grpc_endpoint,
-                    &self.config.client_tls_secret_name,
+                    self.config.supervisor_client_tls(),
                     &main_process_spec,
                     &log_level,
                     self.config.effective_sa_token_ttl_secs(),
@@ -3300,6 +3212,7 @@ impl KubernetesComputeDriver {
                 )
             })?;
         sandbox_secret["secretName"] = serde_json::json!(names.sandbox_secret);
+        let image_pull_secrets = self.generation_image_pull_secret_names(&names);
         let restart = async {
             patch_dynamic_object_with_resource_version_retry(
                 &sandbox_api.api,
@@ -3316,8 +3229,8 @@ impl KubernetesComputeDriver {
                         ANNOTATION_SANDBOX_RUNTIME_GENERATION: generation.as_str(),
                         ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
                     });
-                    running_patch["spec"]["podTemplate"]["spec"]["volumes"] =
-                        serde_json::Value::Array(volumes.clone());
+                    running_patch["spec"]["podTemplate"]["spec"] =
+                        restart_pod_template_spec(&volumes, &image_pull_secrets);
                     running_patch
                 },
             )
@@ -3499,40 +3412,34 @@ impl KubernetesComputeDriver {
         &self,
         sandbox_id: &str,
         namespace: &str,
+        generations: &[&str],
     ) -> Result<(), KubernetesDriverError> {
         self.delete_sandbox_runtime_supervisor_pod(sandbox_id, namespace)
             .await?;
-        self.delete_sandbox_runtime_generation_secrets(sandbox_id, namespace)
+        self.delete_sandbox_runtime_generation_secrets(sandbox_id, namespace, generations)
             .await
     }
 
+    /// Delete the bootstrap Secrets of the given runtime generations by exact
+    /// name. Garbage collection through their owner Pods removes older
+    /// generations.
     async fn delete_sandbox_runtime_generation_secrets(
         &self,
         sandbox_id: &str,
         namespace: &str,
+        generations: &[&str],
     ) -> Result<(), KubernetesDriverError> {
         let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
-        for component in [SANDBOX_SECRET_COMPONENT, SUPERVISOR_SECRET_COMPONENT] {
-            let selector =
-                format!("openshell.ai/sandbox-id={sandbox_id},openshell.ai/component={component}");
-            let items = secrets
-                .list(&ListParams::default().labels(&selector))
-                .await
-                .map_err(KubernetesDriverError::from_kube)?;
-            for secret in items {
-                let Some(name) = secret.metadata.name else {
-                    continue;
-                };
-                match secrets
-                    .delete(
-                        &name,
-                        &DeleteParams::default().preconditions(Preconditions {
-                            uid: secret.metadata.uid,
-                            resource_version: None,
-                        }),
-                    )
-                    .await
-                {
+        for generation in generations {
+            let names = SandboxRuntimeNames::for_generation(sandbox_id, generation);
+            let mut generation_secrets = if self.config.workspace_mode == WorkspaceMode::Managed {
+                names.image_pull_secrets(self.config.image_pull_secrets.len())
+            } else {
+                Vec::new()
+            };
+            generation_secrets.splice(0..0, [names.sandbox_secret, names.supervisor_secret]);
+            for name in &generation_secrets {
+                match secrets.delete(name, &DeleteParams::default()).await {
                     Ok(_) | Err(KubeError::Api(kube::core::ErrorResponse { code: 404, .. })) => {}
                     Err(error) => return Err(KubernetesDriverError::from_kube(error)),
                 }
@@ -3884,7 +3791,12 @@ impl KubernetesComputeDriver {
                 }
             }
             match self
-                .reconcile_sandbox_runtime_supervisor(&sandbox_id, namespace, desired_running)
+                .reconcile_sandbox_runtime_supervisor(
+                    &sandbox_id,
+                    namespace,
+                    desired_running,
+                    sandbox_runtime_generation(&object).as_slice(),
+                )
                 .await
             {
                 Ok(()) => {}
@@ -3938,7 +3850,11 @@ impl KubernetesComputeDriver {
             }
         }
         if let Err(error) = self
-            .delete_sandbox_runtime_supervisor(sandbox_id, namespace)
+            .delete_sandbox_runtime_supervisor(
+                sandbox_id,
+                namespace,
+                sandbox_runtime_generation(object).as_slice(),
+            )
             .await
         {
             warn!(sandbox_id, %error, "could not finish sandbox-runtime suspension cleanup");
@@ -4208,10 +4124,11 @@ impl KubernetesComputeDriver {
         sandbox_id: &str,
         namespace: &str,
         desired_running: bool,
+        generations: &[&str],
     ) -> Result<(), KubernetesDriverError> {
         if !desired_running {
             return self
-                .delete_sandbox_runtime_supervisor(sandbox_id, namespace)
+                .delete_sandbox_runtime_supervisor(sandbox_id, namespace, generations)
                 .await;
         }
         let names = SandboxRuntimeNames::new(sandbox_id);
@@ -4866,46 +4783,26 @@ fn managed_ssh_network_policy(namespace: &str, config: &KubernetesComputeConfig)
     }
 }
 
-fn image_pull_secret_copy(
-    secret_name: &str,
-    namespace: &str,
-    workspace: &str,
-    gateway_id: &str,
-    source: Secret,
-) -> Secret {
-    let mut labels = source.metadata.labels.unwrap_or_default();
-    labels.insert(
-        LABEL_MANAGED_BY.to_string(),
-        LABEL_MANAGED_BY_VALUE.to_string(),
-    );
-    labels.insert(LABEL_GATEWAY_ID.to_string(), gateway_id.to_string());
-    labels.insert(LABEL_SANDBOX_WORKSPACE.to_string(), workspace.to_string());
-    Secret {
-        metadata: ObjectMeta {
-            name: Some(secret_name.to_string()),
-            namespace: Some(namespace.to_string()),
-            labels: Some(labels),
-            ..Default::default()
-        },
-        data: source.data,
-        type_: source.type_,
-        ..Default::default()
+fn runtime_pod_owner(name: &str, uid: &str) -> OwnerReference {
+    OwnerReference {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        name: name.to_string(),
+        uid: uid.to_string(),
+        controller: Some(false),
+        block_owner_deletion: Some(false),
     }
 }
 
-fn image_pull_secret_owned_by_gateway(
-    labels: Option<&BTreeMap<String, String>>,
-    gateway_id: &str,
-    workspace: &str,
-) -> bool {
-    labels.is_some_and(|labels| {
-        labels.get(LABEL_MANAGED_BY).map(String::as_str) == Some(LABEL_MANAGED_BY_VALUE)
-            && labels
-                .get(LABEL_GATEWAY_ID)
-                .is_none_or(|value| value == gateway_id)
-            && labels
-                .get(LABEL_SANDBOX_WORKSPACE)
-                .is_none_or(|value| value == workspace)
+/// Pod template fields replaced when a stopped sandbox starts a new runtime
+/// generation.
+fn restart_pod_template_spec(
+    volumes: &[serde_json::Value],
+    image_pull_secrets: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "volumes": volumes,
+        "imagePullSecrets": image_pull_secret_refs(image_pull_secrets),
     })
 }
 
@@ -8440,6 +8337,7 @@ mod tests {
                 "resourceVersion": "42",
                 "annotations": {
                     SANDBOX_POD_NAME_ANNOTATION: "workload-pod",
+                    ANNOTATION_SANDBOX_RUNTIME_GENERATION: "gen-7",
                     ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE:
                         SandboxRuntimeBootstrapPhase::Suspending.as_str()
                 }
@@ -8453,12 +8351,6 @@ mod tests {
             kube_test_response(
                 http::StatusCode::OK,
                 serde_json::json!({"kind": "Status", "status": "Success", "code": 200}),
-            )
-        };
-        let no_secrets = || {
-            kube_test_response(
-                http::StatusCode::OK,
-                serde_json::json!({"apiVersion": "v1", "kind": "SecretList", "items": []}),
             )
         };
         let steps = Arc::new(std::sync::Mutex::new(VecDeque::from([
@@ -8504,14 +8396,14 @@ mod tests {
                 kube_test_not_found("pods", "os-supervisor-sandbox-1"),
             ),
             (
-                http::Method::GET,
-                "/api/v1/namespaces/openshell/secrets",
-                no_secrets(),
+                http::Method::DELETE,
+                "/api/v1/namespaces/openshell/secrets/os-sandbox-sandbox-1-gen7",
+                success(),
             ),
             (
-                http::Method::GET,
-                "/api/v1/namespaces/openshell/secrets",
-                no_secrets(),
+                http::Method::DELETE,
+                "/api/v1/namespaces/openshell/secrets/os-supervisor-sandbox-1-gen7",
+                kube_test_not_found("secrets", "os-supervisor-sandbox-1-gen7"),
             ),
             (
                 http::Method::GET,
@@ -11045,175 +10937,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn image_pull_secret_copy_keeps_portable_fields_and_records_ownership() {
-        let source: Secret = serde_json::from_value(serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {
-                "name": "regcred",
-                "namespace": "gateway",
-                "uid": "source-uid",
-                "resourceVersion": "42",
-                "labels": { "source-only": "true" },
-                "annotations": { "source-only": "true" },
-                "finalizers": ["example.test/finalizer"]
-            },
-            "type": "kubernetes.io/dockerconfigjson",
-            "data": { ".dockerconfigjson": "e30=" }
-        }))
-        .unwrap();
+    type KubeTestStep = (
+        http::Method,
+        &'static str,
+        http::Response<kube::client::Body>,
+    );
 
-        let copy = image_pull_secret_copy("regcred", "workspace", "team-a", "gateway-a", source);
-        assert_eq!(copy.metadata.name.as_deref(), Some("regcred"));
-        assert_eq!(copy.metadata.namespace.as_deref(), Some("workspace"));
-        assert_eq!(
-            copy.type_.as_deref(),
-            Some("kubernetes.io/dockerconfigjson")
-        );
-        assert!(
-            copy.data
-                .as_ref()
-                .unwrap()
-                .contains_key(".dockerconfigjson")
-        );
-        assert_eq!(
-            copy.metadata
-                .labels
-                .as_ref()
-                .unwrap()
-                .get(LABEL_MANAGED_BY)
-                .map(String::as_str),
-            Some(LABEL_MANAGED_BY_VALUE)
-        );
-        assert_eq!(
-            copy.metadata
-                .labels
-                .as_ref()
-                .unwrap()
-                .get(LABEL_GATEWAY_ID)
-                .map(String::as_str),
-            Some("gateway-a")
-        );
-        assert_eq!(
-            copy.metadata
-                .labels
-                .as_ref()
-                .unwrap()
-                .get(LABEL_SANDBOX_WORKSPACE)
-                .map(String::as_str),
-            Some("team-a")
-        );
-        assert_eq!(
-            copy.metadata
-                .labels
-                .as_ref()
-                .unwrap()
-                .get("source-only")
-                .map(String::as_str),
-            Some("true")
-        );
-        assert!(copy.metadata.uid.is_none());
-        assert!(copy.metadata.resource_version.is_none());
-        assert!(copy.metadata.annotations.is_none());
-        assert!(copy.metadata.finalizers.is_none());
-    }
+    type ScriptedDriver = (
+        KubernetesComputeDriver,
+        Arc<std::sync::Mutex<VecDeque<KubeTestStep>>>,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    );
 
-    #[test]
-    fn image_pull_secret_collision_requires_gateway_ownership() {
-        let legacy = BTreeMap::from([(
-            LABEL_MANAGED_BY.to_string(),
-            LABEL_MANAGED_BY_VALUE.to_string(),
-        )]);
-        assert!(image_pull_secret_owned_by_gateway(
-            Some(&legacy),
-            "gateway-a",
-            "team-a"
-        ));
-
-        let owned = BTreeMap::from([
-            (
-                LABEL_MANAGED_BY.to_string(),
-                LABEL_MANAGED_BY_VALUE.to_string(),
-            ),
-            (LABEL_GATEWAY_ID.to_string(), "gateway-a".to_string()),
-            (LABEL_SANDBOX_WORKSPACE.to_string(), "team-a".to_string()),
-        ]);
-        assert!(image_pull_secret_owned_by_gateway(
-            Some(&owned),
-            "gateway-a",
-            "team-a"
-        ));
-        assert!(!image_pull_secret_owned_by_gateway(
-            Some(&owned),
-            "gateway-b",
-            "team-a"
-        ));
-        assert!(!image_pull_secret_owned_by_gateway(
-            Some(&owned),
-            "gateway-a",
-            "team-b"
-        ));
-        assert!(!image_pull_secret_owned_by_gateway(
-            Some(&BTreeMap::new()),
-            "gateway-a",
-            "team-a"
-        ));
-    }
-
-    #[tokio::test]
-    async fn managed_image_pull_secret_copies_operator_selected_source() {
-        let source_path = "/api/v1/namespaces/openshell/secrets/regcred";
-        let target_path = "/api/v1/namespaces/managed-team-a/secrets/regcred";
-        let copied = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {
-                "name": "regcred",
-                "namespace": "managed-team-a",
-                "labels": {
-                    "openshell.ai/sandbox-attachable": "true",
-                    LABEL_MANAGED_BY: LABEL_MANAGED_BY_VALUE,
-                    LABEL_GATEWAY_ID: "gateway-a",
-                    LABEL_SANDBOX_WORKSPACE: "team-a"
-                }
-            },
-            "type": "kubernetes.io/dockerconfigjson",
-            "data": { ".dockerconfigjson": "e30=" }
-        });
-        let steps = Arc::new(std::sync::Mutex::new(VecDeque::from([
-            (
-                http::Method::GET,
-                source_path,
-                kube_test_response(
-                    http::StatusCode::OK,
-                    serde_json::json!({
-                        "apiVersion": "v1",
-                        "kind": "Secret",
-                        "metadata": {
-                            "name": "regcred",
-                            "namespace": "openshell",
-                            "labels": {}
-                        },
-                        "type": "kubernetes.io/dockerconfigjson",
-                        "data": { ".dockerconfigjson": "e30=" }
-                    }),
-                ),
-            ),
-            (
-                http::Method::GET,
-                target_path,
-                kube_test_not_found("secrets", "regcred"),
-            ),
-            (
-                http::Method::PATCH,
-                target_path,
-                kube_test_response(http::StatusCode::OK, copied),
-            ),
-        ])));
+    /// Build a driver whose client answers `steps` in order and records each
+    /// request body.
+    fn scripted_driver(
+        config: KubernetesComputeConfig,
+        steps: Vec<KubeTestStep>,
+    ) -> ScriptedDriver {
+        use http_body_util::BodyExt as _;
+        let steps = Arc::new(std::sync::Mutex::new(VecDeque::from(steps)));
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let service_steps = steps.clone();
+        let service_bodies = bodies.clone();
         let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
             let steps = service_steps.clone();
+            let bodies = service_bodies.clone();
             async move {
                 let (method, path, response) = steps
                     .lock()
@@ -11222,6 +10971,13 @@ mod tests {
                     .expect("unexpected Kubernetes API request");
                 assert_eq!(request.method(), method);
                 assert_eq!(request.uri().path(), path);
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                if !body.is_empty() {
+                    bodies
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap());
+                }
                 Ok::<_, std::convert::Infallible>(response)
             }
         });
@@ -11230,19 +10986,287 @@ mod tests {
             client: client.clone(),
             watch_client: client,
             sandbox_api_version: Arc::new(OnceCell::new()),
-            config: KubernetesComputeConfig {
-                namespace: "openshell".into(),
-                gateway_id: "gateway-a".into(),
-                image_pull_secrets: vec!["regcred".into()],
-                ..Default::default()
-            },
+            config,
             operator_allowlist: None,
         };
+        (driver, steps, bodies)
+    }
 
+    fn pod_owner(name: &str, uid: &str) -> OwnerReference {
+        OwnerReference {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            name: name.to_string(),
+            uid: uid.to_string(),
+            controller: Some(false),
+            block_owner_deletion: Some(false),
+        }
+    }
+
+    fn managed_config(image_pull_secrets: &[&str]) -> KubernetesComputeConfig {
+        KubernetesComputeConfig {
+            namespace: "openshell".into(),
+            gateway_id: "gateway-a".into(),
+            workspace_mode: WorkspaceMode::Managed,
+            image_pull_secrets: image_pull_secrets.iter().map(ToString::to_string).collect(),
+            client_tls_secret_name: "openshell-client-tls".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_pods_reference_generation_image_pull_secrets() {
+        let names = SandboxRuntimeNames::for_generation("sandbox-1", "gen7");
+        let driver = KubernetesComputeDriver::new_for_test(managed_config(&["regcred", "backup"]));
+        assert_eq!(
+            driver.generation_image_pull_secret_names(&names),
+            [
+                "os-pull-sandbox-1-gen7-0".to_string(),
+                "os-pull-sandbox-1-gen7-1".to_string()
+            ]
+        );
+        for workspace_mode in [WorkspaceMode::Shared, WorkspaceMode::Operator] {
+            let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+                workspace_mode,
+                ..managed_config(&["regcred"])
+            });
+            assert_eq!(
+                driver.generation_image_pull_secret_names(&names),
+                ["regcred".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn supervisor_client_tls_is_staged_outside_the_sandbox_namespace() {
+        let assert_tls = |workspace_mode, name: &str, expected: SupervisorClientTls<'_>| {
+            let config = KubernetesComputeConfig {
+                workspace_mode,
+                client_tls_secret_name: name.into(),
+                ..Default::default()
+            };
+            assert_eq!(config.supervisor_client_tls(), expected);
+        };
+        assert_tls(
+            WorkspaceMode::Shared,
+            "client-tls",
+            SupervisorClientTls::Secret("client-tls"),
+        );
+        assert_tls(
+            WorkspaceMode::Managed,
+            "client-tls",
+            SupervisorClientTls::Bootstrap,
+        );
+        assert_tls(
+            WorkspaceMode::Operator,
+            "client-tls",
+            SupervisorClientTls::Bootstrap,
+        );
+        assert_tls(WorkspaceMode::Managed, "", SupervisorClientTls::Disabled);
+    }
+
+    #[test]
+    fn restart_template_references_the_generation_image_pull_secrets() {
+        let volumes = vec![serde_json::json!({"name": "bootstrap"})];
+        let spec = restart_pod_template_spec(&volumes, &["os-pull-sandbox-1-gen7-0".to_string()]);
+        assert_eq!(spec["volumes"], serde_json::json!(volumes));
+        assert_eq!(
+            spec["imagePullSecrets"],
+            serde_json::json!([{"name": "os-pull-sandbox-1-gen7-0"}])
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_generation_image_pull_secrets_are_created_without_reading_targets() {
+        let source = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": "regcred", "namespace": "openshell"},
+            "type": "kubernetes.io/dockerconfigjson",
+            "data": {".dockerconfigjson": "e30="}
+        });
+        let (driver, steps, bodies) = scripted_driver(
+            managed_config(&["regcred"]),
+            vec![
+                (
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell/secrets/regcred",
+                    kube_test_response(http::StatusCode::OK, source),
+                ),
+                (
+                    http::Method::POST,
+                    "/api/v1/namespaces/managed-team-a/secrets",
+                    kube_test_response(
+                        http::StatusCode::CREATED,
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Secret",
+                            "metadata": {"name": "os-pull-sandbox-1-gen7-0", "namespace": "managed-team-a"}
+                        }),
+                    ),
+                ),
+            ],
+        );
+        let names = SandboxRuntimeNames::for_generation("sandbox-1", "gen7");
         driver
-            .ensure_image_pull_secrets("managed-team-a", "team-a")
+            .create_generation_image_pull_secrets(
+                "managed-team-a",
+                &names,
+                "sandbox-1",
+                vec![
+                    pod_owner("workload", "w-uid"),
+                    pod_owner("supervisor", "s-uid"),
+                ],
+            )
             .await
-            .expect("operator-selected source should be copied");
+            .expect("generation image-pull Secret should be created");
+        assert!(steps.lock().unwrap().is_empty());
+        let created = &bodies.lock().unwrap()[0];
+        assert_eq!(created["metadata"]["name"], "os-pull-sandbox-1-gen7-0");
+        assert_eq!(created["immutable"], true);
+        assert_eq!(created["type"], "kubernetes.io/dockerconfigjson");
+        assert_eq!(created["data"][".dockerconfigjson"], "e30=");
+        assert_eq!(
+            created["metadata"]["ownerReferences"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_image_pull_secret_name_collision_fails_closed() {
+        let (driver, steps, _) = scripted_driver(
+            managed_config(&["regcred"]),
+            vec![
+                (
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell/secrets/regcred",
+                    kube_test_response(
+                        http::StatusCode::OK,
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Secret",
+                            "metadata": {"name": "regcred", "namespace": "openshell"},
+                            "type": "kubernetes.io/dockerconfigjson",
+                            "data": {".dockerconfigjson": "e30="}
+                        }),
+                    ),
+                ),
+                (
+                    http::Method::POST,
+                    "/api/v1/namespaces/managed-team-a/secrets",
+                    kube_test_response(
+                        http::StatusCode::CONFLICT,
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "status": "Failure",
+                            "reason": "AlreadyExists",
+                            "message": "secrets \"os-pull-sandbox-1-gen7-0\" already exists",
+                            "code": 409
+                        }),
+                    ),
+                ),
+            ],
+        );
+        let names = SandboxRuntimeNames::for_generation("sandbox-1", "gen7");
+        driver
+            .create_generation_image_pull_secrets("managed-team-a", &names, "sandbox-1", Vec::new())
+            .await
+            .expect_err("an existing Secret must not be adopted");
+        assert!(steps.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unmanaged_modes_create_no_generation_image_pull_secrets() {
+        for workspace_mode in [WorkspaceMode::Shared, WorkspaceMode::Operator] {
+            let (driver, _, _) = scripted_driver(
+                KubernetesComputeConfig {
+                    workspace_mode,
+                    ..managed_config(&["regcred"])
+                },
+                Vec::new(),
+            );
+            driver
+                .create_generation_image_pull_secrets(
+                    "workspace",
+                    &SandboxRuntimeNames::for_generation("sandbox-1", "gen7"),
+                    "sandbox-1",
+                    Vec::new(),
+                )
+                .await
+                .expect("no Secret is staged outside managed mode");
+        }
+    }
+
+    #[tokio::test]
+    async fn client_tls_material_is_read_from_the_source_namespace() {
+        let (driver, steps, _) = scripted_driver(
+            managed_config(&[]),
+            vec![(
+                http::Method::GET,
+                "/api/v1/namespaces/openshell/secrets/openshell-client-tls",
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": {"name": "openshell-client-tls", "namespace": "openshell"},
+                        "type": "kubernetes.io/tls",
+                        "data": {"ca.crt": "Y2E=", "tls.crt": "Y2VydA==", "tls.key": "a2V5"}
+                    }),
+                ),
+            )],
+        );
+        let material = driver
+            .read_client_tls_material()
+            .await
+            .expect("read client TLS")
+            .expect("client TLS is staged in managed mode");
+        assert_eq!(material.ca_certificate, b"ca");
+        assert_eq!(material.certificate, b"cert");
+        assert_eq!(material.private_key, b"key");
+        assert!(steps.lock().unwrap().is_empty());
+
+        let (shared, _, _) = scripted_driver(
+            KubernetesComputeConfig {
+                workspace_mode: WorkspaceMode::Shared,
+                ..managed_config(&[])
+            },
+            Vec::new(),
+        );
+        assert!(shared.read_client_tls_material().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn generation_cleanup_deletes_managed_image_pull_secrets_by_name() {
+        let success = || kube_test_response(http::StatusCode::OK, serde_json::json!({}));
+        let (driver, steps, _) = scripted_driver(
+            managed_config(&["regcred"]),
+            vec![
+                (
+                    http::Method::DELETE,
+                    "/api/v1/namespaces/managed-team-a/secrets/os-sandbox-sandbox-1-gen7",
+                    success(),
+                ),
+                (
+                    http::Method::DELETE,
+                    "/api/v1/namespaces/managed-team-a/secrets/os-supervisor-sandbox-1-gen7",
+                    success(),
+                ),
+                (
+                    http::Method::DELETE,
+                    "/api/v1/namespaces/managed-team-a/secrets/os-pull-sandbox-1-gen7-0",
+                    kube_test_not_found("secrets", "os-pull-sandbox-1-gen7-0"),
+                ),
+            ],
+        );
+        driver
+            .delete_sandbox_runtime_generation_secrets("sandbox-1", "managed-team-a", &["gen7"])
+            .await
+            .expect("generation Secrets are deleted");
         assert!(steps.lock().unwrap().is_empty());
     }
 

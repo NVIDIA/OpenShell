@@ -28,8 +28,9 @@
 # `allowUnauthenticatedUsers` only promotes the already cert-verified caller to a
 # dev principal at the app layer (mtls_auth is unsupported with the Kubernetes
 # driver). Both are required together; the client certificate is the access gate.
-image:
-  pullPolicy: Always
+gateway:
+  image:
+    pullPolicy: Always
 
 supervisor:
   image:

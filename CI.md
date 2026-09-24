@@ -97,12 +97,10 @@ Actions or call it from another workflow. All applicable children analyze the
 candidate snapshot. Cargo Deny uses its existing NVIDIA self-hosted runner and
 CI container.
 
-Tagged releases temporarily run CodeQL, Trivy, and Zizmor findings in
-observation mode while the existing backlog is triaged. Cargo Deny advisories,
-Codex Security findings, and scanner execution errors still block publication.
-The temporary `fail-on-static-findings: false` override must be removed when
-baseline/delta enforcement is implemented; it does not waive Cargo Deny, Codex
-Security, or scanner execution failures.
+Tagged releases treat CodeQL, Trivy, Zizmor, Cargo Deny, and Codex Security
+findings as failures of the currently implemented qualification profile. A
+profile failure does not prevent a pre-release candidate's complete artifact
+set from being published, but it does prevent stable publication.
 
 ```shell
 gh workflow run security-scan.yml --ref main \
@@ -141,8 +139,20 @@ jobs:
 ```
 
 Set `needs: security` on a downstream promotion job to require successful scans.
-The tagged release workflow does this after publishing its commit-addressed OCI
-images, so failed scans or High/Critical findings block release publication.
+The tagged release workflow records security and integration outcomes in a
+qualification job after publishing its commit-addressed OCI images. A failed
+check remains visible in the workflow, but pre-release artifact assembly and
+publication continue. Stable publication currently requires the implemented
+`release-tag-v1` profile to pass; that profile is an incremental subset of RFC
+0014 qualification.
+
+Each qualification attempt writes its result to the Actions run summary and
+uploads `qualification-summary.json` as a 90-day workflow artifact. After the
+candidate release is published, the workflow publishes the same summary to
+`ghcr.io/nvidia/openshell/qualification:<version>-run-<run-id>-attempt-<run-attempt>`.
+The summary contains qualification results and policy coverage only; artifact
+identity belongs in the release manifest. The run ID and attempt distinguish
+reruns without overwriting earlier evidence.
 
 `CODEX_SECURITY_API_KEY` is required; `CACHIX_AUTH_TOKEN` is optional. The parent
 publishes SARIF, including Codex results for manual parent runs. Codex keeps its
@@ -388,7 +398,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Security Scan gates release publication on Cargo Deny advisories, Codex Security findings, and scanner execution errors while the static-analysis backlog remains in temporary observation mode. |
+| `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Security and integration failures do not block pre-release artifact publication. Stable publication requires the currently implemented qualification profile to pass; the summary identifies the remaining RFC 0014 coverage. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts on `macos`, `ubuntu`, `fedora`, and `kubernetes` (kind + Helm) runners. Each job reaches its gateway and creates, exercises, and deletes a sandbox. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts

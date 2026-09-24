@@ -618,7 +618,7 @@ mod tests {
             vec![
                 StubResponse::new(
                     StatusCode::OK,
-                    r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.io/isolation-role":"sandbox"}}}"#,
+                    r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.ai/isolation-role":"sandbox"}}}"#,
                 ),
                 StubResponse::new(StatusCode::NOT_FOUND, "missing companion"),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
@@ -651,7 +651,7 @@ mod tests {
             vec![
                 StubResponse::new(
                     StatusCode::OK,
-                    r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.io/isolation-role":"sandbox"}}}"#,
+                    r#"{"Id":"workload","Name":"workload","State":{"Status":"running","Running":true},"Config":{"Labels":{"openshell.ai/sandbox-id":"test","openshell.ai/isolation-role":"sandbox"}}}"#,
                 ),
                 StubResponse::new(
                     StatusCode::OK,

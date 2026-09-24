@@ -82,6 +82,103 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\][^\[]*?compute_driver\s*=\s*"kubernetes"'
 
+  - it: preserves a complete tagged gateway image reference
+    template: templates/statefulset.yaml
+    set:
+      gateway.image.registry: registry.example
+      gateway.image.repository: gateway
+      gateway.image.tag: branch
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example/gateway:branch
+
+  - it: defaults a repository-only gateway image to the chart appVersion
+    template: templates/statefulset.yaml
+    set:
+      gateway.image.registry: registry.example
+      gateway.image.repository: gateway
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example/gateway:0.0.0
+
+  - it: applies global image values to gateway, supervisor, and sandbox runtime
+    template: templates/gateway-config.yaml
+    set:
+      global.image.registry: registry.example.com
+      global.image.tag: v0.1.0
+      global.image.pullPolicy: IfNotPresent
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_image\s*=\s*"registry\.example\.com/openshell/supervisor:v0\.1\.0"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_runtime_image\s*=\s*"registry\.example\.com/openshell/sandbox:v0\.1\.0"'
+
+  - it: lets an individual registry override the global registry
+    template: templates/statefulset.yaml
+    set:
+      global.image.registry: registry.example.com
+      gateway.image.registry: mirror.example.com
+      gateway.image.repository: custom/gateway
+      global.image.tag: v0.1.0
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: mirror.example.com/custom/gateway:v0.1.0
+
+  - it: applies the global registry to the gateway image
+    template: templates/statefulset.yaml
+    set:
+      global.image.registry: registry.example.com
+      global.image.tag: v0.1.0
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example.com/openshell/gateway:v0.1.0
+
+  - it: defaults a repository-only sandbox image to latest
+    template: templates/gateway-config.yaml
+    set:
+      sandbox.image.repository: registry.example/sandbox
+      sandbox.image.tag: ""
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'default_image\s*=\s*"registry\.example/sandbox:latest"'
+
+  - it: gives a gateway digest precedence over its tag
+    template: templates/statefulset.yaml
+    set:
+      gateway.image.registry: registry.example
+      gateway.image.repository: gateway
+      gateway.image.tag: ignored
+      gateway.image.digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example/gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+  - it: gives supervisor and sandbox digests precedence over their tags
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.image.registry: registry.example
+      supervisor.image.repository: supervisor
+      supervisor.image.tag: ignored
+      supervisor.image.digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      sandbox.image.repository: registry.example/sandbox
+      sandbox.image.tag: ignored
+      sandbox.image.digest: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'registry\.example/supervisor@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'default_image\s*=\s*"registry\.example/sandbox@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"'
+
   # Regression for Drew's P2: a ConfigMap-only mutation in `helm upgrade`
   # must roll the StatefulSet, otherwise pods keep running with stale config.
   - it: annotates the StatefulSet pod template with a ConfigMap checksum
@@ -224,17 +321,17 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\][^\[]*?grpc_endpoint'
 
-  - it: omits pull policies by default so Kubernetes applies its own defaults
+  - it: applies the global pull policy by default
     template: templates/gateway-config.yaml
     asserts:
-      - notMatchRegex:
+      - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?m)^\s*(image_pull_policy|supervisor_image_pull_policy)\s*='
+          pattern: '(?ms)supervisor_image_pull_policy\s*=\s*"if_not_present".*?sandbox_runtime_image_pull_policy\s*=\s*"if_not_present"'
 
   - it: renders canonical image pull policies in the Kubernetes driver table
     template: templates/gateway-config.yaml
     set:
-      server.sandboxImagePullPolicy: if_not_present
+      sandbox.image.pullPolicy: if_not_present
       supervisor.image.pullPolicy: never
     asserts:
       - matchRegex:
@@ -244,7 +341,7 @@ tests:
   - it: translates legacy Kubernetes pull policy values to canonical gateway values
     template: templates/gateway-config.yaml
     set:
-      server.sandboxImagePullPolicy: Always
+      sandbox.image.pullPolicy: Always
       supervisor.image.pullPolicy: IfNotPresent
     asserts:
       - matchRegex:
@@ -254,7 +351,7 @@ tests:
   - it: rejects unsupported sandbox image pull policies
     template: templates/statefulset.yaml
     set:
-      server.sandboxImagePullPolicy: Sometimes
+      sandbox.image.pullPolicy: Sometimes
     asserts:
       - failedTemplate:
           errorMessage: 'image pull policy "Sometimes" must be one of: always, if_not_present, never, Always, IfNotPresent, Never'
@@ -344,12 +441,12 @@ tests:
           path: data["gateway.toml"]
           pattern: 'proxy_ca_bundle\s*='
 
-  - it: uses the gateway built-in supervisor image by default
+  - it: renders the default supervisor image
     template: templates/gateway-config.yaml
     asserts:
-      - notMatchRegex:
+      - matchRegex:
           path: data["gateway.toml"]
-          pattern: 'supervisor_image\s*='
+          pattern: 'supervisor_image\s*=\s*"ghcr\.io/nvidia/openshell/supervisor:0\.0\.0"'
 
   - it: uses the gateway built-in sandbox runtime image by default
     template: templates/gateway-config.yaml
@@ -361,10 +458,12 @@ tests:
   - it: renders independent sandbox runtime and supervisor image overrides
     template: templates/gateway-config.yaml
     set:
-      sandboxRuntime.image.repository: registry.example.com/openshell/sandbox
+      sandboxRuntime.image.registry: registry.example.com
+      sandboxRuntime.image.repository: openshell/sandbox
       sandboxRuntime.image.tag: sandbox-build
       sandboxRuntime.image.pullPolicy: Always
-      supervisor.image.repository: registry.example.com/openshell/supervisor
+      supervisor.image.registry: registry.example.com
+      supervisor.image.repository: openshell/supervisor
       supervisor.image.tag: supervisor-build
     asserts:
       - matchRegex:
@@ -377,6 +476,18 @@ tests:
           path: data["gateway.toml"]
           pattern: 'supervisor_image\s*=\s*"registry\.example\.com/openshell/supervisor:supervisor-build"'
 
+  - it: gives a sandbox runtime digest precedence over its tag
+    template: templates/gateway-config.yaml
+    set:
+      sandboxRuntime.image.registry: registry.example.com
+      sandboxRuntime.image.repository: openshell/sandbox
+      sandboxRuntime.image.tag: ignored
+      sandboxRuntime.image.digest: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_runtime_image\s*=\s*"registry\.example\.com/openshell/sandbox@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"'
+
   - it: renders a supervisor tag override with the official repository
     template: templates/gateway-config.yaml
     set:
@@ -386,20 +497,21 @@ tests:
           path: data["gateway.toml"]
           pattern: 'supervisor_image\s*=\s*"ghcr\.io/nvidia/openshell/supervisor:1\.2\.3"'
 
-  - it: renders a supervisor repository override with the effective gateway tag
+  - it: renders a supervisor repository override with the default chart tag
     template: templates/gateway-config.yaml
     set:
-      image.tag: gateway-build
-      supervisor.image.repository: registry.example.com/openshell/supervisor
+      supervisor.image.registry: registry.example.com
+      supervisor.image.repository: openshell/supervisor
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: 'supervisor_image\s*=\s*"registry\.example\.com/openshell/supervisor:gateway-build"'
+          pattern: 'supervisor_image\s*=\s*"registry\.example\.com/openshell/supervisor:0\.0\.0"'
 
   - it: renders complete supervisor repository and tag overrides
     template: templates/gateway-config.yaml
     set:
-      supervisor.image.repository: registry.example.com/openshell/supervisor
+      supervisor.image.registry: registry.example.com
+      supervisor.image.repository: openshell/supervisor
       supervisor.image.tag: supervisor-build
     asserts:
       - matchRegex:
@@ -1058,7 +1170,7 @@ tests:
   - it: accepts Always pull policy spelling for sandbox and supervisor
     template: templates/gateway-config.yaml
     set:
-      server.sandboxImagePullPolicy: Always
+      sandbox.image.pullPolicy: Always
       supervisor.image.pullPolicy: Always
     asserts:
       - matchRegex:
@@ -1068,7 +1180,7 @@ tests:
   - it: accepts IfNotPresent pull policy spelling for sandbox and supervisor
     template: templates/gateway-config.yaml
     set:
-      server.sandboxImagePullPolicy: IfNotPresent
+      sandbox.image.pullPolicy: IfNotPresent
       supervisor.image.pullPolicy: IfNotPresent
     asserts:
       - matchRegex:
@@ -1078,7 +1190,7 @@ tests:
   - it: accepts Never pull policy spelling for sandbox and supervisor
     template: templates/gateway-config.yaml
     set:
-      server.sandboxImagePullPolicy: Never
+      sandbox.image.pullPolicy: Never
       supervisor.image.pullPolicy: Never
     asserts:
       - matchRegex:
@@ -1088,7 +1200,7 @@ tests:
   - it: accepts canonical lowercase pull policies for sandbox and supervisor
     template: templates/gateway-config.yaml
     set:
-      server.sandboxImagePullPolicy: always
+      sandbox.image.pullPolicy: always
       supervisor.image.pullPolicy: always
     asserts:
       - matchRegex:
@@ -1098,7 +1210,7 @@ tests:
   - it: accepts canonical if_not_present pull policies for sandbox and supervisor
     template: templates/gateway-config.yaml
     set:
-      server.sandboxImagePullPolicy: if_not_present
+      sandbox.image.pullPolicy: if_not_present
       supervisor.image.pullPolicy: if_not_present
     asserts:
       - matchRegex:
@@ -1108,7 +1220,7 @@ tests:
   - it: accepts canonical never pull policies for sandbox and supervisor
     template: templates/gateway-config.yaml
     set:
-      server.sandboxImagePullPolicy: never
+      sandbox.image.pullPolicy: never
       supervisor.image.pullPolicy: never
     asserts:
       - matchRegex:

@@ -3663,7 +3663,7 @@ mod tests {
     const VALID_WS_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
     const TEXT_OPCODE: u8 = 0x1;
 
-    #[derive(Clone, Copy)]
+    #[derive(Debug, Clone, Copy)]
     enum ResponseRelayScript {
         HeadersOnly,
         WholeBody,
@@ -7154,7 +7154,7 @@ mod tests {
             ResponseRelayScript::HeadersOnly,
         )
         .await;
-        assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+        assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
 
         let (outcome, delivered) = run_response_middleware_relay(
             b"HTTP/1.1 200 OK\r\n\r\n",
@@ -7932,6 +7932,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_persistence_is_independent_of_framing_and_middleware() {
+        for script in [
+            None,
+            Some(ResponseRelayScript::HeadersOnly),
+            Some(ResponseRelayScript::Stream),
+            Some(ResponseRelayScript::WholeBody),
+        ] {
+            for (method, response, closes) in [
+                (
+                    "GET",
+                    "HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+                    true,
+                ),
+                (
+                    "GET",
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello",
+                    true,
+                ),
+                (
+                    "GET",
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+                    true,
+                ),
+                ("HEAD", "HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\n", true),
+                ("GET", "HTTP/1.0 204 No Content\r\n\r\n", true),
+                (
+                    "GET",
+                    "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n",
+                    true,
+                ),
+                (
+                    "GET",
+                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+                    false,
+                ),
+                (
+                    "GET",
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+                    false,
+                ),
+                (
+                    "HEAD",
+                    "HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\n",
+                    false,
+                ),
+            ] {
+                // Body-inspecting scripts reject bodiless responses at preflight.
+                if (method == "HEAD"
+                    || response.contains("204 No Content")
+                    || response.contains("304 Not Modified"))
+                    && matches!(
+                        script,
+                        Some(ResponseRelayScript::Stream | ResponseRelayScript::WholeBody)
+                    )
+                {
+                    continue;
+                }
+                let fixture = script.map(response_middleware_fixture);
+                let middleware = fixture
+                    .as_ref()
+                    .map(|(runner, chain)| response_middleware_context(runner, chain, method));
+                let mut upstream = response.as_bytes();
+                let (mut reader, mut writer) = tokio::io::duplex(4096);
+                let outcome = relay_response(
+                    method,
+                    &mut upstream,
+                    &mut writer,
+                    RelayResponseOptions::default(),
+                    middleware,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    matches!(outcome, RelayOutcome::Consumed),
+                    closes,
+                    "{response}"
+                );
+                let mut delivered = Vec::new();
+                if closes {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        reader.read_to_end(&mut delivered),
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{script:?} {method} {response:?}: {error}"))
+                    .unwrap();
+                } else {
+                    // A second write demonstrates that persistent output is still open.
+                    writer.write_all(b"next response").await.unwrap();
+                    writer.shutdown().await.unwrap();
+                    reader.read_to_end(&mut delivered).await.unwrap();
+                    assert!(delivered.ends_with(b"next response"));
+                }
+                if let Some(script) = script {
+                    let expected = match script {
+                        ResponseRelayScript::HeadersOnly => "hello",
+                        ResponseRelayScript::Stream => "HELLO",
+                        ResponseRelayScript::WholeBody => "whole:hello",
+                        _ => unreachable!(),
+                    };
+                    if response.ends_with("hello") {
+                        assert!(String::from_utf8_lossy(&delivered).contains(expected));
+                    }
+                } else {
+                    assert!(delivered.starts_with(response.as_bytes()));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn relay_response_connection_close_with_content_length() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
 
@@ -7956,18 +8067,19 @@ mod tests {
         .expect("relay must not deadlock");
 
         let outcome = result.expect("relay_response should succeed");
-        // With explicit framing, Connection: close is still reported as reusable
-        // so the relay loop continues.  The *next* upstream write will fail and
-        // exit the loop via the normal error path.
-        assert!(
-            matches!(outcome, RelayOutcome::Reusable),
-            "explicit framing keeps loop alive despite Connection: close"
-        );
+        assert!(matches!(outcome, RelayOutcome::Consumed));
 
-        client_write.shutdown().await.unwrap();
+        // Keep the relay-side stream alive: EOF must come from shutdown,
+        // not from dropping the stream or the test closing it manually.
         let mut received = Vec::new();
-        client_read.read_to_end(&mut received).await.unwrap();
-        assert!(String::from_utf8_lossy(&received).contains("hello"));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_read.read_to_end(&mut received),
+        )
+        .await
+        .expect("closing response must deliver EOF")
+        .unwrap();
+        assert_eq!(received, response);
     }
 
     #[tokio::test]

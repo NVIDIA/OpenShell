@@ -137,7 +137,7 @@ fn container_id_for_role(
     role: &str,
 ) -> Result<String, String> {
     let name_filter = format!("label=openshell.ai/sandbox-name={sandbox_name}");
-    let role_filter = format!("label=openshell.io/isolation-role={role}");
+    let role_filter = format!("label=openshell.ai/isolation-role={role}");
     let stdout = run_engine(
         engine,
         &[

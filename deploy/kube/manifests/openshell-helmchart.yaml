@@ -24,14 +24,24 @@ spec:
   createNamespace: true
   valuesContent: |-
     chartChecksum: __CHART_CHECKSUM__
-    image:
-      repository: ghcr.io/nvidia/openshell/gateway
-      tag: latest
-      pullPolicy: __IMAGE_PULL_POLICY__
+    global:
+      image:
+        registry: ghcr.io/nvidia
+    gateway:
+      image:
+        repository: openshell/gateway
+        tag: latest
+        pullPolicy: __IMAGE_PULL_POLICY__
+    supervisor:
+      image:
+        repository: openshell/supervisor
+        tag: latest
+    sandbox:
+      image:
+        repository: nvcr.io/nvidia/base/ubuntu
+        tag: "24.04"
+        pullPolicy: __SANDBOX_IMAGE_PULL_POLICY__
     server:
-      sandboxImage: nvcr.io/nvidia/base/ubuntu:24.04
-      sandboxImagePullPolicy: __SANDBOX_IMAGE_PULL_POLICY__
-      supervisorImage: ghcr.io/nvidia/openshell/supervisor:latest
       dbUrl: __DB_URL__
       hostGatewayIP: __HOST_GATEWAY_IP__
       disableTls: __DISABLE_TLS__

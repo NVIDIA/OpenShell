@@ -18,7 +18,7 @@ use crate::runtime::VmBackend;
 /// gateway), so a guest cannot self-activate an extension. This contract
 /// lives with the lifecycle framework that consumes it rather than in the
 /// shared settings registry.
-pub const SANDBOX_EXTENSION_LABEL_PREFIX: &str = "openshell.io/extension.";
+pub const SANDBOX_EXTENSION_LABEL_PREFIX: &str = "openshell.ai/extension.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchAbortReason {

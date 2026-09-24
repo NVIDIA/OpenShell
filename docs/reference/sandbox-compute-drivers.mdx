@@ -1,9 +1,9 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Sandbox Compute Drivers"
-sidebar-title: "Compute Drivers"
-description: "Reference for Docker, Podman, MicroVM, Kubernetes, and Windows MXC sandbox compute drivers."
+title: "Sandbox Runtimes"
+sidebar-title: "Runtimes"
+description: "Reference for Docker, Podman, MicroVM, Kubernetes, and Windows MXC sandbox runtimes."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, MicroVM, Kubernetes, MXC, Reference"
 position: 4
 ---
@@ -118,6 +118,7 @@ are driver names, such as `kubernetes`, and are not part of the nested schema.
 
 ```shell
 openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
   --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","priority_class_name":"batch-low"}}}' \
   -- claude
 ```
@@ -226,6 +227,7 @@ docker volume create --label openshell.ai/sandbox-attachable=true \
   --label openshell.ai/sandbox-attachable-workspace=default openshell-work
 
 openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
   --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
   -- claude
 ```
@@ -251,6 +253,7 @@ enabled = false
 
 ```shell
 openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
   --driver-config-json '{"docker":{"mounts":[{"type":"bind","source":"/srv/openshell/work","target":"/sandbox/work","read_only":false}]}}' \
   -- claude
 ```
@@ -319,6 +322,7 @@ podman volume create --label openshell.ai/sandbox-attachable=true \
   --label openshell.ai/sandbox-attachable-workspace=default openshell-work
 
 openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
   --driver-config-json '{"podman":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
   -- claude
 ```
@@ -344,6 +348,7 @@ enabled = false
 
 ```shell
 openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
   --driver-config-json '{"podman":{"mounts":[{"type":"bind","source":"/srv/openshell/work","target":"/sandbox/work","read_only":false}]}}' \
   -- claude
 ```
@@ -397,7 +402,7 @@ compute_driver = "vm"
 
 For a launch-time override, set `OPENSHELL_COMPUTE_DRIVER=vm` in the gateway environment and restart the service.
 
-Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `krun_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The default sandbox image is `nvcr.io/nvidia/base/ubuntu:24.04`. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket. The VM socket path is managed by the gateway and is not configurable through remote endpoint settings.
+Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `krun_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The default workload and bootstrap image is `nvcr.io/nvidia/base/ubuntu:24.04`; configure a user-owned image with the agents and tools required by the workload. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket. The VM socket path is managed by the gateway and is not configurable through remote endpoint settings.
 
 The gateway starts `openshell-driver-vm` over a private Unix socket and passes its process ID so the driver can reject unexpected local clients. The driver's standalone TCP listener is disabled unless `--allow-unauthenticated-tcp` is set for local development.
 
@@ -456,16 +461,16 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `compute_driver = "kubernetes"` | Not applicable | Select the Kubernetes compute driver. |
 | `[openshell.drivers.kubernetes].namespace` | `server.sandboxNamespace` | Set the namespace for sandbox resources. The Helm chart defaults to the release namespace when left empty. |
 | `service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the Kubernetes driver's TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
-| `default_image` | `server.sandboxImage` | Set the default sandbox image. |
-| `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
-| `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image-pull Secrets to sandbox pods. Managed mode copies these explicitly named Secrets from the configured source namespace into each workspace namespace. In shared and operator modes, the Secrets must already exist in the sandbox namespace. |
+| `default_image` | `sandbox.image.repository` / `sandbox.image.tag` / `sandbox.image.digest` | Set the default sandbox image. |
+| `image_pull_policy` | `sandbox.image.pullPolicy` | Set the canonical sandbox pull policy: `always`, `if_not_present`, or `never`. `newer` is Podman-only. |
+| `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image-pull Secrets to sandbox pods. Managed mode creates an immutable copy of each Secret from the configured source namespace for every sandbox runtime generation. In shared and operator modes, the Secrets must already exist in the sandbox namespace. |
 | `[managed_ssh_ingress]` | `networkPolicy.enabled` | In managed mode, create an SSH ingress policy in every workspace namespace. Helm configures the gateway namespace and pod selector automatically. Operator mode leaves namespace policy management to the platform operator. |
 | `grpc_endpoint` | `server.grpcEndpoint` | Set the gateway endpoint reachable from sandbox pods. |
-| `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
-| `sandbox_runtime_image` | `sandboxRuntime.image.repository` / `sandboxRuntime.image.tag` | Override the image that provides `openshell-sandbox`. The default repository with an empty tag uses the version pinned into the gateway. |
+| `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Name the Kubernetes Secret holding sandbox client TLS materials. Shared mode mounts it directly; managed and operator modes stage its contents into each supervisor bootstrap Secret. |
+| `sandbox_runtime_image` | `sandboxRuntime.image.registry` / `sandboxRuntime.image.repository` / `sandboxRuntime.image.tag` / `sandboxRuntime.image.digest` | Override the trusted workload-side image that provides `openshell-sandbox`. Individual image values take precedence over `global.image`; a digest takes precedence over the tag. |
 | `sandbox_runtime_image_pull_policy` | `sandboxRuntime.image.pullPolicy` | Set the Kubernetes image pull policy for the sandbox runtime image. |
-| `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Override the image that provides `openshell-supervisor`. The default repository with an empty tag uses the version pinned into the gateway. |
-| `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the Kubernetes image pull policy for the supervisor image. |
+| `supervisor_image` | `supervisor.image.registry` / `supervisor.image.repository` / `supervisor.image.tag` / `supervisor.image.digest` | Override the image that provides `openshell-supervisor`. Individual image values take precedence over `global.image`; a digest takes precedence over the tag. |
+| `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the canonical supervisor pull policy: `always`, `if_not_present`, or `never`. `newer` is Podman-only. |
 | `sandbox_runtime.network_policy_enforced` | `supervisor.sandboxRuntime.networkPolicyEnforced` | Acknowledge that the cluster CNI enforces ingress and egress `NetworkPolicy` in sandbox namespaces. This must be `true`. |
 | `sandbox_runtime.boundary_port` | `supervisor.sandboxRuntime.boundaryPort` | Set the non-privileged TLS port used between the paired supervisor and sandbox Pods. |
 | `https_proxy` | `upstreamProxy.url` | Set the operator-owned `http://host:port` or `https://host:port` corporate forward proxy used for policy-approved TLS CONNECT egress. |
@@ -499,12 +504,12 @@ oc -n openshell create configmap corporate-proxy-ca --from-file=ca.crt=corp-ca.p
 Then set `upstreamProxy.caBundle.configMapName` to `corporate-proxy-ca` and
 leave `upstreamProxy.caBundle.key` at its `ca.crt` default.
 
-Managed-mode Secret copying requires the gateway ServiceAccount to create
-Secrets. Kubernetes RBAC cannot restrict Secret `create` by resource name, so
-the Helm chart grants cluster-wide Secret `create`; Secret `get` and `patch`
-remain limited to the explicitly configured TLS and image-pull Secret names.
-The driver creates copies only in gateway-owned managed namespaces. Do not
-reuse the gateway ServiceAccount for unrelated workloads.
+Managed-mode sandbox runtime generations require the gateway ServiceAccount to
+create and delete Secrets in workspace namespaces. Kubernetes RBAC cannot
+restrict Secret `create` by resource name, so the Helm chart grants cluster-wide
+Secret `create` and `delete`. Secret `get` is limited to the configured TLS and
+image-pull source Secrets in the sandbox namespace. Do not reuse the gateway
+ServiceAccount for unrelated workloads.
 
 The Kubernetes driver always places the sandbox runtime in the workload Pod and
 the supervisor in a separate, directly managed Pod. The
@@ -542,6 +547,7 @@ OpenShell-created `/sandbox` workspace PVC.
 
 ```shell
 openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
   --driver-config-json '{
     "kubernetes": {
       "volumes": [{

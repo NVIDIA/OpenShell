@@ -1,4 +1,4 @@
-# Provider-backed Inference Example
+# Inference Example
 
 This example calls the NVIDIA API Catalog through its native OpenAI-compatible
 endpoint. OpenShell supplies endpoint-bound credentials and network policy from

@@ -224,6 +224,14 @@ export interface SandboxWorkspaceOptions {
   workspace?: string;
 }
 
+/** Pagination and workspace scope for providers attached to one sandbox. */
+export type SandboxProviderListOptions = SandboxWorkspaceOptions & {
+  /** Maximum providers requested per page. */
+  pageSize?: number;
+  /** Opaque token from a previous page. Omit to start at the beginning. */
+  pageToken?: string;
+};
+
 export type SandboxCallOptions = CallOptions & SandboxWorkspaceOptions;
 
 export interface SandboxTemplateWorkspaceOptions {
@@ -781,21 +789,49 @@ export interface Page<T> {
   readonly nextPageToken: string;
 }
 
+const maxConsumedPageTokens = 10_000;
+const maxConsumedPageTokenBytes = 1 << 20;
+
 /** Lazy, single-pass iterator that fetches one RPC page per advance. */
 export class Pager<T> implements AsyncIterable<Page<T>> {
   private nextToken: string | undefined;
+  private readonly consumedTokens = new Set<string>();
+  private consumedTokenBytes = 0;
 
   constructor(
     private readonly fetch: (pageToken: string) => Promise<Page<T>>,
     pageToken = '',
+    private readonly maxConsumedTokens = maxConsumedPageTokens,
+    private readonly maxConsumedTokenBytes = maxConsumedPageTokenBytes,
   ) {
     this.nextToken = pageToken;
+  }
+
+  private validateCurrentTokenBudget(pageToken: string): number {
+    if (pageToken === '') return 0;
+    const tokenBytes = new TextEncoder().encode(pageToken).byteLength;
+    if (
+      this.consumedTokens.size >= this.maxConsumedTokens ||
+      tokenBytes > this.maxConsumedTokenBytes - this.consumedTokenBytes
+    ) {
+      throw new Error('pager continuation token history limit exceeded');
+    }
+    return tokenBytes;
   }
 
   /** Fetch the next page, or return undefined after the final page. */
   async nextPage(): Promise<Page<T> | undefined> {
     if (this.nextToken === undefined) return undefined;
-    const page = await this.fetch(this.nextToken);
+    const pageToken = this.nextToken;
+    const tokenBytes = this.validateCurrentTokenBudget(pageToken);
+    const page = await this.fetch(pageToken);
+    if (pageToken !== '') {
+      this.consumedTokens.add(pageToken);
+      this.consumedTokenBytes += tokenBytes;
+    }
+    if (page.nextPageToken !== '' && this.consumedTokens.has(page.nextPageToken)) {
+      throw new Error('pager received a repeated continuation token');
+    }
     this.nextToken = page.nextPageToken === '' ? undefined : page.nextPageToken;
     return page;
   }
@@ -1606,15 +1642,27 @@ export class SandboxClient {
     }
   }
 
-  async listProviders(name: string, options?: SandboxWorkspaceOptions | null): Promise<ProviderRef[]> {
-    try {
-      const resp = await this.grpc.listSandboxProviders({
-        ...sandboxTarget(name, options),
-      });
-      return resp.providers.map((p) => providerRef(p));
-    } catch (e) {
-      throw fromConnect(e);
-    }
+  listProviders(name: string, options?: SandboxProviderListOptions | null): Pager<ProviderRef> {
+    return new Pager(async (pageToken) => {
+      try {
+        const resp = await this.grpc.listSandboxProviders({
+          ...sandboxTarget(name, options),
+          pageSize: options?.pageSize ?? 0,
+          pageToken,
+        });
+        return {
+          items: resp.providers.map((provider) => providerRef(provider)),
+          nextPageToken: resp.nextPageToken,
+        };
+      } catch (e) {
+        throw fromConnect(e);
+      }
+    }, options?.pageToken ?? '');
+  }
+
+  /** List and collect every provider attached to this sandbox. */
+  async listAllProviders(name: string, options?: SandboxProviderListOptions | null): Promise<ProviderRef[]> {
+    return this.listProviders(name, options).all();
   }
 
   async getConfig(name: string, options?: SandboxCallOptions | null): Promise<SandboxConfig> {

@@ -47,11 +47,11 @@ OpenShell publishes standalone `openshell-prover` release assets for manual down
 
 These artifacts are attached to GitHub releases. The Linux binaries are static and do not require glibc. All prover archives include the required solver linkage.
 
-## Compute Drivers
+## Runtimes
 
-The gateway can manage sandboxes through several compute drivers.
+The gateway can manage sandboxes through several runtimes.
 
-| Compute Driver | Status | Notes |
+| Runtime | Status | Notes |
 |---|---|---|
 | Docker | Supported for local development and single-machine gateways. | Requires Docker Desktop or Docker Engine on the gateway host. |
 | Podman | Supported for rootless local and workstation workflows. | Requires a Podman-compatible socket and rootless networking setup. |
@@ -91,8 +91,10 @@ To override the default image references, use Helm values:
 
 | Helm value | Purpose |
 |---|---|
-| `image.repository` / `image.tag` | Override the gateway image reference. |
-| `server.sandboxImage` | Override the default sandbox image. |
+| `global.image.registry` / `global.image.tag` / `global.image.pullPolicy` | Override shared image settings for the gateway, supervisor, and trusted sandbox runtime. |
+| `gateway.image.registry` / `gateway.image.repository` / `gateway.image.tag` / `gateway.image.digest` | Override the gateway image reference. |
+| `supervisor.image.registry` / `supervisor.image.repository` / `supervisor.image.tag` / `supervisor.image.digest` | Override the supervisor image reference. |
+| `sandbox.image.repository` / `sandbox.image.tag` / `sandbox.image.digest` | Override the default workload sandbox image. |
 
 ## Kernel Requirements
 
@@ -141,6 +143,9 @@ qualification output as `seccomp_listener_mode` (`killable` or
 
 On macOS, these kernel modules run inside the Docker Desktop Linux VM, not on the host kernel.
 
-## Agent Compatibility
+## Agent Workloads
 
-For the full list of supported agents and their default policy coverage, refer to the [Supported Agents](/about/supported-agents) page.
+OpenShell runs agents and tools that you install in a user-owned OCI image. The
+image must satisfy the selected compute driver's platform requirements. Refer to
+[Run Your First Agent](/about/run-an-agent) for the image, provider, and policy
+workflow.

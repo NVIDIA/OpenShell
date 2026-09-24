@@ -1128,21 +1128,14 @@ impl ComputeRuntime {
                         .await);
                 }
                 if self.supports_sandbox_authentication() {
-                    let driver_name = self.configured_driver_name().to_string();
                     let persisted = self
-                        .store
-                        .update_message_cas::<Sandbox, _>(&sandbox_id, 0, move |sandbox| {
-                            if let Some(metadata) = sandbox.metadata.as_mut() {
-                                metadata.annotations.insert(
-                                    COMPUTE_DRIVER_ANNOTATION.to_string(),
-                                    driver_name.clone(),
-                                );
-                                metadata.annotations.insert(
-                                    COMPUTE_RUNTIME_IDENTITY_ANNOTATION.to_string(),
-                                    runtime_identity.clone(),
-                                );
-                            }
-                        })
+                        .persist_runtime_binding(
+                            &sandbox_id,
+                            &sandbox,
+                            self.configured_driver_name(),
+                            &runtime_identity,
+                            &[SandboxPhase::Provisioning, SandboxPhase::Ready],
+                        )
                         .await;
                     sandbox = match persisted {
                         Ok(sandbox) => sandbox,
@@ -1790,7 +1783,7 @@ impl ComputeRuntime {
                 let latest = if self.supports_sandbox_authentication() {
                     let driver_name = self.configured_driver_name().to_string();
                     let persisted = self
-                        .persist_start_runtime_binding(
+                        .persist_runtime_binding(
                             &sandbox_id,
                             &starting,
                             &driver_name,
@@ -1841,7 +1834,7 @@ impl ComputeRuntime {
         }
     }
 
-    async fn persist_start_runtime_binding(
+    async fn persist_runtime_binding(
         &self,
         sandbox_id: &str,
         starting: &Sandbox,
@@ -1900,7 +1893,7 @@ impl ComputeRuntime {
                         sandbox_id,
                         attempt,
                         expected_resource_version,
-                        "Retrying runtime identity persistence after concurrent start progress"
+                        "Retrying runtime identity persistence after a concurrent sandbox update"
                     );
                 }
                 Err(error) => return Err(error.to_string()),
@@ -3072,7 +3065,7 @@ impl ComputeRuntime {
                             continue;
                         }
                         match self
-                            .persist_start_runtime_binding(
+                            .persist_runtime_binding(
                                 &sandbox_id,
                                 &sandbox,
                                 self.configured_driver_name(),
@@ -7514,6 +7507,66 @@ mod tests {
 
         driver.release_create();
         create.await.unwrap().unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.metadata.unwrap().annotations[COMPUTE_RUNTIME_IDENTITY_ANNOTATION],
+            "new-runtime-identity"
+        );
+        assert_eq!(driver.delete_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_retries_runtime_binding_after_concurrent_replica_write() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database_url = format!("sqlite://{}", directory.path().join("gateway.db").display());
+        let store = Arc::new(Store::connect(&database_url).await.expect("connect store"));
+        let pool = sqlx::SqlitePool::connect(&database_url)
+            .await
+            .expect("connect conflict injector");
+        sqlx::query("CREATE TABLE injected_conflicts (id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .expect("create conflict marker table");
+        // Another replica writes the record between the binding read and its
+        // CAS write, once.
+        sqlx::query(
+            "CREATE TRIGGER inject_replica_write \
+             BEFORE UPDATE OF payload ON objects \
+             WHEN instr(NEW.payload, CAST('new-runtime-identity' AS BLOB)) > 0 \
+               AND NOT EXISTS (SELECT 1 FROM injected_conflicts WHERE id = OLD.id) \
+             BEGIN \
+               INSERT INTO injected_conflicts (id) VALUES (OLD.id); \
+               UPDATE objects SET resource_version = resource_version + 1 \
+                 WHERE object_type = OLD.object_type AND id = OLD.id; \
+               SELECT RAISE(IGNORE); \
+             END",
+        )
+        .execute(&pool)
+        .await
+        .expect("install conflict trigger");
+        pool.close().await;
+
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity("new-runtime-identity");
+        let mut runtime = test_runtime(driver.clone()).await;
+        runtime.store = store;
+        enable_runtime_identity_binding(&mut runtime);
+        let sandbox = sandbox_record(
+            "sb-create-replica-race",
+            "create-replica-race",
+            SandboxPhase::Provisioning,
+        );
+
+        runtime
+            .create_sandbox(sandbox.clone(), None, false)
+            .await
+            .expect("create must retry the runtime binding after a concurrent write");
 
         let stored = runtime
             .store

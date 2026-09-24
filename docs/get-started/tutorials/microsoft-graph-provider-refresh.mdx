@@ -22,7 +22,7 @@ This tutorial starts after your OAuth client has already completed the initial M
 
 ## Prerequisites
 
-- A working OpenShell installation with an active gateway. Complete the [Quickstart](/get-started/quickstart) before proceeding.
+- A working OpenShell installation with an active gateway. Refer to [Installation](/about/installation) before proceeding.
 - A Microsoft Entra app registration that can acquire delegated Microsoft Graph mail access.
 - Delegated Microsoft Graph mail permission for the signed-in user. `Mail.Read` allows reading the signed-in user's mailbox; see the [Microsoft Graph permissions reference](https://learn.microsoft.com/en-us/graph/permissions-reference).
 OAuth material from your initial Microsoft sign-in flow:
@@ -152,6 +152,7 @@ Launch a sandbox with the Microsoft Graph provider attached:
 ```shell
 openshell sandbox create \
   --name microsoft-graph-mail \
+  --from registry.example.com/team/agent-tools:1.0 \
   --provider microsoft-mail \
   --no-auto-providers \
   -- /bin/sh

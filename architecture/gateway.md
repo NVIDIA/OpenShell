@@ -342,6 +342,8 @@ driver/runtime identity recorded at provisioning before returning the current
 generation-bound session JWT. Session authentication checks the durable runtime
 generation and token lineage for every sandbox RPC, so a replaced runtime and
 legacy unbound tokens cannot retain provider or control-plane access. The
+gateway admits only explicitly typed, generation-bound session JWTs for sandbox
+RPCs. It does not accept the pre-session untyped JWT format. The
 Kubernetes driver uses its own named configuration to run TokenReview and
 verify the live pod and controlling Sandbox CR. Its runtime identity binds the
 namespace, immutable Sandbox CR UID, and supervisor Pod UID. Restart preserves
@@ -356,11 +358,8 @@ can recover that same successor for 30 seconds when the request matches, but it
 cannot authorize ordinary RPCs or choose another successor. Advancing the
 successor removes that retry path across every gateway replica. Short
 `gateway_jwt.ttl_secs` lifetimes still bound the exposure of a current bearer
-that has not yet been refreshed.
-Omitting `gateway_jwt.ttl_secs` selects non-expiring tokens for local
-single-player Docker, Podman, and VM gateways; those tokens carry `exp = 0`.
-Kubernetes and other shared deployments should set a positive TTL. Explicit
-zero is rejected.
+that has not yet been refreshed. Omitting `gateway_jwt.ttl_secs` uses a
+900-second lifetime. Explicit zero is rejected.
 
 Gateway JWT signing-key rotation is currently an offline operator action. The
 runtime loads one active signing key and one matching public verification key
@@ -858,10 +857,16 @@ modes:
 and `page_token` fields, and responses carry `next_page_token`. The gateway
 clamps page sizes to 1,000 and returns opaque base64url continuation tokens.
 Tokens bind the RPC and every request parameter except `page_size`, contain no
-authorization grant, and use immutable keyset cursors rather than database
-offsets. Each page repeats normal authentication and authorization. Pagination
-is weakly consistent under concurrent writes and deletes; it does not provide a
-historical snapshot.
+authorization grant, and use immutable keyset cursors. Each page repeats normal
+authentication and authorization. Pagination is resumable and keyset-based; it
+does not provide a historical snapshot while the collection is mutated
+concurrently.
+
+Object-backed lists (`ListSandboxTemplates`, `ListSandboxes`, `ListServices`,
+`ListProviders`, `ListWorkspaces`, and `ListWorkspaceMembers`) sort ascending
+by `(created_at_ms, name, workspace, id)`. `ListProviderProfiles` sorts
+ascending by `(id, scope)`, and `ListSandboxPolicies` sorts by descending policy
+version. Provider attachments sort ascending by provider name.
 
 The token wire format is a private shared protobuf used only by the gateway.
 Public request and response messages repeat the standard AIP fields directly
@@ -877,6 +882,16 @@ change.
 Curated Rust, Python, Go, and TypeScript SDK list methods return lazy pagers.
 Advancing a pager issues one list RPC and exposes its continuation token;
 explicit `list_all` helpers are the only curated APIs that exhaust a collection.
+
+**Migration.** This pagination contract is a breaking replacement for the
+former `limit`/`offset` list APIs. Protocol clients must send `page_size` and
+resume only with the returned `next_page_token`; an empty token is the sole
+completion signal. SDK callers that need every item must use the explicit
+full-iteration helper (for example, Rust's `list_all_sandboxes`) rather than
+awaiting `list_sandboxes`, which now returns one-page `Pager` state. Callers
+that need one page should advance that pager once and retain its token. Internal
+full scans use the reusable iteration helpers from the persistence pagination
+audit rather than manually advancing offsets.
 
 Persistence distinguishes one-page operations from exhaustive scans.
 `list_object_page` and `list_message_page` return one keyset page and its next

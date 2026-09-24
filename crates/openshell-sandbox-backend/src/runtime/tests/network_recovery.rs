@@ -13,7 +13,18 @@ use tokio_stream::StreamExt as _;
 
 #[derive(Clone, Copy)]
 enum Reply {
-    Disconnect { pending_accepts: usize },
+    Disconnect {
+        pending_accepts: usize,
+    },
+    /// Like `Disconnect`, but the boundary retires the connection after the
+    /// transport closes, as the real disconnect callback can.
+    DisconnectLate,
+    /// Like `DisconnectLate`, but retirement waits for `PeerState::retire`.
+    DisconnectGated,
+    /// Close the first accept stream without a response on a live connection.
+    DropFirstAccept,
+    /// Stop answering on the first connection once it is confirmed.
+    Blackhole,
     Leaf(BoundaryErrorKind),
     Idle,
 }
@@ -27,6 +38,8 @@ struct PeerState {
     events: Mutex<Vec<(usize, &'static str)>>,
     accepting: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    retire: tokio::sync::Notify,
+    rejected_attaches: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -84,6 +97,12 @@ impl NetworkPeer {
             frame.extend_from_slice(&inbound.message().await?.expect("control request").data);
         }
         let envelope: RequestEnvelope = decode_frame(&frame).unwrap();
+        if matches!(self.state.reply, Reply::Blackhole)
+            && self.connection == 1
+            && *self.state.active.lock().unwrap() == Some(1)
+        {
+            return std::future::pending().await;
+        }
         let kind = match envelope.request {
             Request::Attach { .. } => "attach",
             Request::Confirm => "confirm",
@@ -101,9 +120,10 @@ impl NetworkPeer {
                 // This rejects reconnect storms that a stateless mock permits.
                 let active = *self.state.active.lock().unwrap();
                 if active.is_some_and(|active| active != self.connection) {
+                    self.state.rejected_attaches.fetch_add(1, Ordering::AcqRel);
                     Response::Error {
-                        kind: BoundaryErrorKind::Denied,
-                        message: "credential epoch is already active".into(),
+                        kind: BoundaryErrorKind::Unavailable,
+                        message: "another connection with this epoch is still active".into(),
                     }
                 } else {
                     self.attached.store(true, Ordering::Release);
@@ -130,6 +150,15 @@ impl NetworkPeer {
                 );
                 self.state.accepting.notify_one();
                 match self.state.reply {
+                    Reply::DisconnectLate | Reply::DisconnectGated if self.connection == 1 => {
+                        self.disconnect.notify_one();
+                        return std::future::pending().await;
+                    }
+                    Reply::DropFirstAccept
+                        if self.state.first_accepts.fetch_add(1, Ordering::AcqRel) == 0 =>
+                    {
+                        return Ok(());
+                    }
                     Reply::Disconnect { pending_accepts } if self.connection == 1 => {
                         if self.state.first_accepts.fetch_add(1, Ordering::AcqRel) + 1
                             == pending_accepts
@@ -147,7 +176,11 @@ impl NetworkPeer {
                         self.state.release.notified().await;
                         network_response()
                     }
-                    Reply::Disconnect { .. } => network_response(),
+                    Reply::Disconnect { .. }
+                    | Reply::DisconnectLate
+                    | Reply::DisconnectGated
+                    | Reply::DropFirstAccept
+                    | Reply::Blackhole => network_response(),
                 }
             }
             _ => unreachable!(),
@@ -197,8 +230,10 @@ impl NetworkPeer {
 fn network_response() -> Response {
     Response::NetworkConnected {
         identity: BinaryIdentityWire::Resolved {
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_digest: None,
+            executable: crate::boundary_protocol::ExecutableIdentityWire {
+                path: PathBuf::from("/usr/bin/curl"),
+                digest: None,
+            },
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
         },
@@ -236,6 +271,8 @@ impl Fixture {
             events: Mutex::new(Vec::new()),
             accepting: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            retire: tokio::sync::Notify::new(),
+            rejected_attaches: AtomicUsize::new(0),
         });
         let server_state = state.clone();
         let server = tokio::spawn(async move {
@@ -271,6 +308,17 @@ impl Fixture {
                         result = serving => result.unwrap(),
                         _ = tokio::io::copy_bidirectional(&mut tls, &mut bridge) => {},
                         () = disconnect.notified() => {},
+                    }
+                    match state.reply {
+                        Reply::DisconnectLate => {
+                            drop(tls);
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                        Reply::DisconnectGated if connection == 1 => {
+                            drop(tls);
+                            state.retire.notified().await;
+                        }
+                        _ => {}
                     }
                     let mut active = state.active.lock().unwrap();
                     if *active == Some(connection) {
@@ -315,7 +363,7 @@ impl Drop for Fixture {
 async fn verify_connection(mut pending: PendingTcpOpen) {
     assert_eq!(pending.destination, "203.0.113.1:443".parse().unwrap());
     assert_eq!(
-        pending.binary_identity.unwrap().binary_path,
+        pending.binary_identity.unwrap().executable.path,
         PathBuf::from("/usr/bin/curl")
     );
     assert_eq!(
@@ -445,4 +493,114 @@ async fn tcp_accept_has_no_idle_operation_timeout() {
     .await
     .expect("idle acceptance must deliver the next connection");
     assert_eq!(fixture.state.connections.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn tcp_accept_stream_failure_keeps_a_live_connection() {
+    let fixture = Fixture::new(Reply::DropFirstAccept).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        verify_connection(fixture.source.accept_tcp().await.unwrap()).await;
+    })
+    .await
+    .expect("a stream failure on a live connection must retry the accept");
+    assert_eq!(fixture.state.connections.load(Ordering::Acquire), 1);
+    assert_eq!(
+        *fixture.state.events.lock().unwrap(),
+        vec![
+            (1, "attach"),
+            (1, "confirm"),
+            (1, "accept"),
+            (1, "confirm"),
+            (1, "accept")
+        ]
+    );
+}
+
+#[tokio::test]
+async fn tcp_accept_recovery_waits_for_the_boundary_to_retire_the_old_connection() {
+    let fixture = Fixture::new(Reply::DisconnectLate).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        verify_connection(fixture.source.accept_tcp().await.unwrap()).await;
+    })
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "reattach must retry until the old connection is retired: {error}; events: {:?}",
+            fixture.state.events.lock().unwrap()
+        )
+    });
+    let events = fixture.state.events.lock().unwrap().clone();
+    assert!(
+        events
+            .iter()
+            .filter(|(connection, kind)| *connection > 1 && *kind == "attach")
+            .count()
+            > 1,
+        "expected a rejected same-epoch attach before recovery: {events:?}"
+    );
+    assert_eq!(events.last(), Some(&(events.last().unwrap().0, "accept")));
+}
+
+#[tokio::test]
+async fn recovery_closes_an_unresponsive_connection_before_reattaching() {
+    let fixture = Fixture::new(Reply::Blackhole).await;
+    let client = fixture.source.client.clone();
+    let generation = client.connection_generation().await;
+    tokio::time::timeout(
+        CONNECTION_PROBE_TIMEOUT + Duration::from_secs(3),
+        client.recover_after_unavailable(generation),
+    )
+    .await
+    .expect("recovery must not wait on a blackholed connection")
+    .expect("recovery must reattach after closing the old transport");
+    assert_ne!(client.connection_generation().await, generation);
+    assert_eq!(*fixture.state.active.lock().unwrap(), Some(2));
+    assert_eq!(fixture.state.connections.load(Ordering::Acquire), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_during_delayed_retirement_wait_for_the_confirmed_replacement() {
+    let fixture = Fixture::new(Reply::DisconnectGated).await;
+    let first = RemoteNetworkMediation {
+        client: fixture.source.client.clone(),
+    };
+    let first = tokio::spawn(async move { first.accept_tcp().await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture.state.rejected_attaches.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovery must reach a same-epoch attach rejection");
+
+    // Start an ordinary request while recovery waits for retirement.
+    let second = RemoteNetworkMediation {
+        client: fixture.source.client.clone(),
+    };
+    let second = tokio::spawn(async move { second.accept_tcp().await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fixture.state.retire.notify_one();
+
+    for pending in [first, second] {
+        let pending = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("request must finish on the confirmed replacement")
+            .unwrap()
+            .unwrap();
+        verify_connection(pending).await;
+    }
+    let events = fixture.state.events.lock().unwrap().clone();
+    let confirmed: Vec<usize> = events
+        .iter()
+        .filter(|(connection, kind)| *connection > 1 && *kind == "confirm")
+        .map(|(connection, _)| *connection)
+        .collect();
+    assert_eq!(confirmed.len(), 1, "one confirmed replacement: {events:?}");
+    assert!(
+        events
+            .iter()
+            .filter(|(connection, kind)| *connection > 1 && *kind == "accept")
+            .all(|(connection, _)| *connection == confirmed[0]),
+        "no request may run on an unconfirmed connection: {events:?}"
+    );
 }

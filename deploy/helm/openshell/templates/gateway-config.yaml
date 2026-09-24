@@ -140,13 +140,11 @@ data:
     [openshell.drivers.kubernetes]
     allow_driver_config          = {{ .Values.server.drivers.kubernetes.allowDriverConfig }}
     namespace                    = {{ include "openshell.sandboxNamespace" . | quote }}
-    default_image                = {{ .Values.server.sandboxImage | quote }}
+    default_image                = {{ include "openshell.sandboxImage" . | quote }}
     {{- if include "openshell.sandboxRuntimeImageOverrideEnabled" . }}
     sandbox_runtime_image        = {{ include "openshell.sandboxRuntimeImage" . | quote }}
     {{- end }}
-    {{- if include "openshell.supervisorImageOverrideEnabled" . }}
     supervisor_image             = {{ include "openshell.supervisorImage" . | quote }}
-    {{- end }}
     {{- if .Values.server.hostGatewayIP }}
     host_gateway_ip              = {{ .Values.server.hostGatewayIP | quote }}
     {{- end }}
@@ -191,8 +189,8 @@ data:
     {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
     provider_spiffe_workload_api_socket_path = {{ .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
     {{- end }}
-    {{- if .Values.server.sandboxImagePullPolicy }}
-    image_pull_policy            = {{ include "openshell.canonicalImagePullPolicy" .Values.server.sandboxImagePullPolicy | quote }}
+    {{- if .Values.sandbox.image.pullPolicy }}
+    image_pull_policy            = {{ include "openshell.canonicalImagePullPolicy" .Values.sandbox.image.pullPolicy | quote }}
     {{- end }}
     {{- $sandboxImagePullSecretNames := list -}}
     {{- range .Values.server.sandboxImagePullSecrets }}
@@ -212,11 +210,11 @@ data:
     {{- if .Values.server.defaultRuntimeClassName }}
     default_runtime_class_name   = {{ .Values.server.defaultRuntimeClassName | quote }}
     {{- end }}
-    {{- if .Values.supervisor.image.pullPolicy }}
-    supervisor_image_pull_policy = {{ include "openshell.canonicalImagePullPolicy" .Values.supervisor.image.pullPolicy | quote }}
+    {{- if (.Values.supervisor.image.pullPolicy | default .Values.global.image.pullPolicy) }}
+    supervisor_image_pull_policy = {{ include "openshell.canonicalImagePullPolicy" (.Values.supervisor.image.pullPolicy | default .Values.global.image.pullPolicy) | quote }}
     {{- end }}
-    {{- if .Values.sandboxRuntime.image.pullPolicy }}
-    sandbox_runtime_image_pull_policy = {{ include "openshell.canonicalImagePullPolicy" .Values.sandboxRuntime.image.pullPolicy | quote }}
+    {{- if (.Values.sandboxRuntime.image.pullPolicy | default .Values.global.image.pullPolicy) }}
+    sandbox_runtime_image_pull_policy = {{ include "openshell.canonicalImagePullPolicy" (.Values.sandboxRuntime.image.pullPolicy | default .Values.global.image.pullPolicy) | quote }}
     {{- end }}
 
     [openshell.drivers.kubernetes.resource_admission]
@@ -247,9 +245,6 @@ data:
 
     [openshell.credential_drivers.kubernetes-secrets]
     namespace = {{ include "openshell.credentialKubernetesSecretsNamespace" . | quote }}
-    allow_reference_namespace = {{ .Values.server.credentialDrivers.kubernetesSecrets.allowReferenceNamespace }}
-    workspace_mode               = {{ .Values.server.drivers.kubernetes.workspaceMode | default "shared" | quote }}
-    gateway_id                   = {{ .Values.server.sandboxJwt.gatewayId | default (include "openshell.fullname" .) | quote }}
     {{- end }}
 
     {{- if .Values.server.credentialDrivers.vault.enabled }}

@@ -27,6 +27,12 @@ TCP Service, or VM vsock channel. Independent bidirectional `Exchange` RPCs
 carry lifecycle, exec, TCP, and forwarding traffic, while one persistent
 bidirectional `Mediate` RPC carries multiplexed DNS traffic. General application
 UDP is unsupported; UDP DNS remains mediated by the supervisor.
+Both ends size HTTP/2 flow control so the connection window exceeds the
+per-stream window times the concurrent-stream limit plus a reserve. Relays whose
+workload stops reading therefore stall only their own streams and cannot starve
+DNS, exec, or control traffic of connection-level credit. The supervisor caps
+concurrent TCP relay and pending-accept streams below the stream limit, so new
+workload connections queue before control exchanges lose stream slots.
 The sandbox probes HTTP/2 connection liveness every five seconds and closes
 connections that miss a ten-second acknowledgement deadline. Closing a
 connection freezes the owned workload process tree and cancels its stream
@@ -39,6 +45,12 @@ credentials to claim the existing runtime generation. Confirmation resumes the
 workload; expiration terminates it. A credential replacement does not displace
 the active connection until the new connection is confirmed. Idle healthy
 connections remain usable.
+A failed stream alone does not trigger reconnection. The supervisor first
+reconfirms on the current connection and keeps it if the boundary answers.
+Otherwise it closes that transport before replaying attach, and retries while
+the sandbox still reports the equal-epoch connection as active, until the
+boundary observes the disconnect. The sandbox reports attach and confirm
+rejections as typed errors rather than closing the stream.
 TCP mediation accepts use the same authenticated transport recovery as process waits. A healthy idle accept has no timeout. An interrupted pending open fails closed, while a replacement accept waits for new workload traffic; decisions and established byte streams are not replayed. Boundary rejections and failed recovery remain terminal to the proxy.
 
 A renewed Sandbox Protocol bearer is authenticated even when its credential epoch is unchanged. The supervisor confirms that bearer on the active physical connection and records its fingerprint only after confirmation succeeds, preserving pending streams and the mediation session. Changing the credential epoch still requires an authenticated replacement connection.
@@ -280,6 +292,12 @@ the shared raw byte relay after the existing adapter gates. Forward HTTP retains
 its guarded single-request relay while sharing authorization, request context,
 policy-pinning, and destination boundaries.
 Adapter-specific response and OCSF event shapes remain at the protocol boundary.
+HTTP response framing and connection persistence are separate decisions. After
+forwarding a complete closing response (explicit `Connection: close` or HTTP/1.0
+without keep-alive), the relay flushes and shuts down downstream writes before
+ending the exchange, including TLS close notification. Response middleware
+preserves this lifetime rule; persistent responses remain eligible for reuse.
+
 An explicit `protocol: tcp` endpoint with a valid DNS hostname opts into native
 DNS and transparent TCP when the selected runtime advertises that substrate.
 Hostless `allowed_ips` and literal-IP selectors remain available only to the
@@ -648,7 +666,9 @@ sandbox workload directly. The relay supports:
 
 - Attachment to the canonical main process through the `openshell-main` SSH
   subsystem. The supervisor owns its retained PTY or pipes, a 1 MiB replay
-  buffer, and a single stdin lease across client disconnects.
+  buffer, and a single stdin lease across client disconnects. Ctrl-C interrupts
+  the foreground process. For read-only attachments, Ctrl-C only exits the
+  current viewer.
 - Independent interactive shell sessions.
 - Command execution. Commands run through a login shell (`bash -lc`) by default,
   so the first of the user's `.bash_profile`, `.bash_login`, or `.profile` is

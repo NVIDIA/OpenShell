@@ -353,13 +353,19 @@ openshell sandbox connect my-sandbox --editor vscode
 Attaches to the sandbox's existing canonical main process. Disconnecting leaves
 that process running; reconnecting targets the same process instance and replays
 recent output. Use `sandbox exec --tty -- /bin/bash -l` for a new shell. Press
-`Ctrl-P`, then `Ctrl-Q` to disconnect without terminating main. `Ctrl-C` retains
-its normal terminal behavior and interrupts the foreground process. Configure
-VS Code Remote-SSH with:
+`Ctrl-P`, then `Ctrl-Q` to disconnect without terminating main. When you own
+stdin, `Ctrl-C` interrupts the foreground process. In a read-only attachment,
+`Ctrl-C` exits the viewer and leaves main and other attachments running.
+Configure VS Code Remote-SSH with:
 
 ```bash
 openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
+
+If `connect` reports `canonical main process already finished`, inspect the
+result with `sandbox get`. A pending
+foreground attachment can still retrieve retained output in `Completed` or
+`Error`; phase alone does not determine whether attachment is available.
 
 ### Upload and download files
 

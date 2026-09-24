@@ -12,16 +12,16 @@
 [![PyPI](https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi)](https://pypi.org/project/openshell/)
 [![Security Policy](https://img.shields.io/badge/Security-Report%20a%20Vulnerability-red)](SECURITY.md)
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen)](https://docs.nvidia.com/openshell/latest/index.html)
-[![Project Status](https://img.shields.io/badge/status-alpha-orange)](https://docs.nvidia.com/openshell/latest/about/release-notes.html)
+[![Project Status](https://img.shields.io/badge/status-alpha-orange)](https://github.com/NVIDIA/OpenShell/releases)
 
 > [!IMPORTANT]
-> **OpenShell 0.1.0 is coming soon.** [Track progress in the 0.1.0 milestone](https://github.com/NVIDIA/OpenShell/milestone/10), [read the prerelease documentation](https://docs.nvidia.com/openshell/dev/index.html), or [install a prerelease](#prerelease-and-development-builds).
+> **New in OpenShell 0.1.0:** a stable release cadence, an improved security model, an expanded extension surface, and new APIs. [Read the 0.1.0 upgrade guide](https://docs.nvidia.com/openshell/latest/upgrade/0-1-0).
 
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure — governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
 
 OpenShell is built agent-first. It ships public agent skills for using and operating OpenShell, plus separate repository-aware workflows for contributors and maintainers.
 
-## Quickstart
+## Install OpenShell
 
 ### Prerequisites
 
@@ -190,20 +190,13 @@ Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall ba
 
 **Requirements:** NVIDIA drivers and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) must be installed on the host. The sandbox image itself must include the appropriate GPU drivers and libraries for your workload — the default Ubuntu image does not. See the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for building a custom sandbox image with GPU support.
 
-## Supported Agents
+## Running Agents
 
 OpenShell can run Linux agents packaged in OCI images. The default Ubuntu
 workload does not bundle agent CLIs. Build or select an image containing your
-agent, then authorize its binary paths, service endpoints, and credentials.
-
-| Agent | Integration |
-| ----- | ----------- |
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Package Claude Code in a workload image and attach a `claude-code` provider or another endpoint-bearing model profile. |
-| [OpenCode](https://opencode.ai/) | Package OpenCode in a workload image and attach its model provider and policy. |
-| [Codex](https://developers.openai.com/codex) | Package Codex in a workload image and attach an OpenAI provider and policy. |
-| [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) | Package the CLI in a workload image and attach GitHub credentials and policy. |
-| [OpenClaw](https://openclaw.ai/) | Use the [NemoClaw](https://github.com/NVIDIA/NemoClaw) blueprint. |
-| [Hermes Agent](https://github.com/NousResearch/hermes-agent) | Use the [NemoClaw](https://github.com/NVIDIA/NemoClaw) blueprint. |
+agent, then authorize its binary paths, service endpoints, and credentials. See
+[Run Your First Agent](https://docs.nvidia.com/openshell/latest/about/run-an-agent)
+for the image, provider, and policy workflow.
 
 ## Key Commands
 
@@ -284,7 +277,7 @@ Agent implementation is human-directed: a user may request a phase directly, or 
 ## Learn More
 
 - [Full Documentation](https://docs.nvidia.com/openshell/latest/index.html) — overview, architecture, tutorials, and reference
-- [Quickstart](https://docs.nvidia.com/openshell/latest/get-started/quickstart) — detailed install and first sandbox walkthrough
+- [Run Your First Agent](https://docs.nvidia.com/openshell/latest/about/run-an-agent) — prepare an image, attach providers, and launch an agent
 - [GitHub Sandbox Tutorial](https://docs.nvidia.com/openshell/latest/get-started/tutorials/github-sandbox) — end-to-end scoped GitHub repo access
 - [Architecture](https://github.com/NVIDIA/OpenShell/tree/main/architecture) — detailed architecture docs and design decisions
 - [Roadmap](https://github.com/orgs/NVIDIA/projects/233) — planned work and project priorities

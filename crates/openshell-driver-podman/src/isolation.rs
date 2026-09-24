@@ -21,8 +21,8 @@ use openshell_sandbox_backend::boundary_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-pub const LABEL_ROLE: &str = "openshell.io/isolation-role";
-pub const WORKLOAD_FILTER: &str = "openshell.io/isolation-role=sandbox";
+pub const LABEL_ROLE: &str = "openshell.ai/isolation-role";
+pub const WORKLOAD_FILTER: &str = "openshell.ai/isolation-role=sandbox";
 pub const CHANNEL_ROOT: &str = "/.openshell/channel";
 pub const BOOTSTRAP_PATH: &str = "/.openshell/channel/sandbox/bootstrap.json";
 pub const RUNTIME_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descriptor.json";

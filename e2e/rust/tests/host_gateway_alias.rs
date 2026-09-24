@@ -341,6 +341,78 @@ async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
 }
 
 #[tokio::test]
+async fn sandbox_receives_eof_after_closing_http_response() {
+    for response in [
+        "HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nOK\n",
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 3\r\n\r\nOK\n",
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nOK\n\r\n0\r\n\r\n",
+    ] {
+        let listener = TcpListener::bind(("0.0.0.0", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = HostServer {
+            port,
+            task: tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.set_nodelay(true).expect("disable Nagle on fixture");
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                    assert!(request.len() < 4096);
+                }
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }),
+        };
+        let policy = write_policy(server.port).unwrap();
+        let command = format!(
+            r#"set -eu
+exec 3<>/dev/tcp/host.openshell.internal/{port}
+printf 'GET / HTTP/1.1\r\nHost: host.openshell.internal:{port}\r\n\r\n' >&3
+while true; do
+  line=
+  if IFS= read -r -t 5 line <&3; then
+    printf '%s\n' "$line"
+  else
+    status=$?
+    [ "$status" -eq 1 ] || {{ echo EOF_TIMEOUT; exit 1; }}
+    [ -z "$line" ] || printf '%s\n' "$line"
+    break
+  fi
+done
+printf 'RESPONSE_EOF\n'
+"#,
+        );
+        let mut sandbox = SandboxGuard::create(&[
+            "--policy",
+            policy.path().to_str().unwrap(),
+            "--no-auto-providers",
+            "--",
+            "/usr/bin/bash",
+            "-c",
+            &command,
+        ])
+        .await
+        .expect("closing response must finish without a client timeout");
+        assert!(
+            sandbox.create_output.lines().any(|line| line == "OK"),
+            "{}",
+            sandbox.create_output
+        );
+        assert!(
+            sandbox.create_output.contains("RESPONSE_EOF"),
+            "{}",
+            sandbox.create_output
+        );
+        assert!(
+            !sandbox.create_output.contains("EOF_TIMEOUT"),
+            "{}",
+            sandbox.create_output
+        );
+        sandbox.cleanup().await;
+    }
+}
+
+#[tokio::test]
 async fn static_provider_credentials_are_bound_to_profile_endpoints() {
     let server = HostServer::start_with_auth_check("", Some("Bearer e2e-bound-secret"))
         .await

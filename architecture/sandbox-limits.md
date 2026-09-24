@@ -126,6 +126,7 @@ can contain a valid sequence gap.
 
 | Path | Current bound | Terminal behavior |
 |---|---:|---|
+| Executable identity pins | 4,096 unique paths per supervisor lifetime | Reject an entire identity chain before insertion when its new paths would exceed the bound. Existing pins remain usable and are never evicted. Staged TCP reports resource exhaustion. |
 | Corporate proxy CONNECT response headers | 8 KiB | Fail the tunnel. |
 | Corporate proxy CONNECT handshake | 30 s total | Fail the tunnel; validated-address attempts share the aggregate budget. |
 | Token-grant HTTP request | 30 s request and connect | Fail credential resolution. |

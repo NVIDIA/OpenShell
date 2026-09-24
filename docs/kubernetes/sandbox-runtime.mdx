@@ -110,7 +110,10 @@ The driver creates each sandbox generation in a fail-closed order:
 3. Inspect the admitted Pod identity, security context, DNS settings, and
    generation-specific Secret reference.
 4. Create a gated supervisor Pod and separate immutable Secrets for sandbox and
-   supervisor trust material.
+   supervisor trust material. Outside shared mode, the supervisor Secret also
+   carries the gateway client TLS material. In managed mode, the driver also
+   creates immutable copies of the configured image-pull Secrets for the
+   generation.
 5. Remove both scheduling gates.
 6. Publish readiness only after the supervisor attaches, confirms enforcement,
    and registers the gateway relay.
@@ -127,11 +130,11 @@ while preserving the workspace PVC. The namespace-wide workload fence remains
 in place across sandbox generations.
 
 If provisioning is interrupted, recovery first confirms that the old workload
-Pod is gone. It then lists generation Secrets by sandbox and component labels,
-deletes each stale Secret with a UID precondition, and clears the rollback state
-so the next generation can be created. The Helm chart grants the gateway
-`create`, `list`, and `delete` access to Secrets for this lifecycle. Listing is
-required even when no generation Secrets remain.
+Pod is gone. It then deletes the recorded generation's Secrets by name and
+clears the rollback state so the next generation can be created. Each
+generation Secret is owned by its Pod, so Kubernetes garbage collection removes
+any other generation. The Helm chart grants the gateway `create` and `delete`
+access to Secrets for this lifecycle.
 
 ## Check Cluster Requirements
 

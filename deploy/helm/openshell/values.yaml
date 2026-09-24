@@ -7,6 +7,15 @@
 # server.externalDbSecret because the default SQLite backend is per pod.
 replicaCount: 1
 
+global:
+  image:
+    # -- Shared OpenShell image registry. Individual image registries take precedence.
+    registry: ghcr.io/nvidia
+    # -- Shared OpenShell image tag. Defaults to the chart appVersion when empty.
+    tag: ""
+    # -- Shared OpenShell image pull policy. Individual image pull policies take precedence.
+    pullPolicy: IfNotPresent
+
 workload:
   # -- Gateway workload controller kind. Use `statefulset` for the default
   # SQLite database, or `deployment` when server.externalDbSecret points at an
@@ -18,40 +27,64 @@ workload:
   # StatefulSet identity or storage semantics.
   allowMultiReplicaStatefulSet: false
 
-image:
-  # -- Gateway image repository.
-  repository: ghcr.io/nvidia/openshell/gateway
-  # -- Gateway image pull policy.
-  pullPolicy: IfNotPresent
-  # -- Gateway image tag. Defaults to the chart appVersion when empty.
-  tag: ""
+gateway:
+  image:
+    # -- Gateway image registry. Empty uses global.image.registry.
+    registry: ""
+    # -- Gateway image repository.
+    repository: openshell/gateway
+    # -- Gateway image pull policy. Empty uses global.image.pullPolicy.
+    pullPolicy: null
+    # -- Gateway image tag. Defaults to the chart appVersion when empty.
+    tag: ""
+    # -- Gateway image digest. When set, this takes precedence over tag.
+    digest: ""
 
 # Trusted workload-side runtime image.
 sandboxRuntime:
   image:
-    # -- Sandbox runtime image repository. Changing it uses the effective gateway image tag unless tag is also set.
-    repository: ghcr.io/nvidia/openshell/sandbox
-    # -- Sandbox runtime image pull policy. Defaults to the gateway image pull policy when empty.
-    pullPolicy: ""
-    # -- Sandbox runtime image tag override. Empty uses the version pinned into the gateway unless repository is changed.
+    # -- Sandbox runtime image registry. Empty uses global.image.registry.
+    registry: ""
+    # -- Sandbox runtime image repository.
+    repository: openshell/sandbox
+    # -- Sandbox runtime image pull policy. Empty uses global.image.pullPolicy.
+    pullPolicy: null
+    # -- Sandbox runtime image tag. Defaults to the chart appVersion when empty.
     tag: ""
+    # -- Sandbox runtime image digest. When set, this takes precedence over tag.
+    digest: ""
 
 # Trusted control-side runtime image.
 supervisor:
   image:
-    # -- Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set.
-    repository: ghcr.io/nvidia/openshell/supervisor
-    # -- Sandbox supervisor pull policy. Leave unset to use the Kubernetes
-    # image default. Prefer always, if_not_present, or never; the chart also
-    # accepts legacy Kubernetes spellings Always, IfNotPresent, and Never.
+    # -- Supervisor image registry. Empty uses global.image.registry.
+    registry: ""
+    # -- Supervisor image repository.
+    repository: openshell/supervisor
+    # -- Supervisor image pull policy. Empty uses global.image.pullPolicy.
+    # Prefer always, if_not_present, or never; the chart also accepts legacy
+    # Kubernetes spellings Always, IfNotPresent, and Never.
     pullPolicy: null
-    # -- Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed.
+    # -- Supervisor image tag. Defaults to the chart appVersion when empty.
     tag: ""
+    # -- Supervisor image digest. When set, this takes precedence over tag.
+    digest: ""
   sandboxRuntime:
     # -- Required operator acknowledgement that the cluster CNI enforces NetworkPolicy.
     networkPolicyEnforced: false
     # -- Workload boundary TLS listener port.
     boundaryPort: 5500
+
+sandbox:
+  image:
+    # -- Default standalone sandbox image repository.
+    repository: nvcr.io/nvidia/base/ubuntu
+    # -- Sandbox image tag. Defaults to latest when empty.
+    tag: "24.04"
+    # -- Sandbox image digest. When set, this takes precedence over tag.
+    digest: ""
+    # -- Sandbox image pull policy. Leave unset to use the Kubernetes image default.
+    pullPolicy: null
 
 # -- Operator-owned corporate forward proxy for policy-approved TLS egress
 # from Kubernetes sandboxes. The workload cannot select or override it.
@@ -230,13 +263,6 @@ server:
   # from this Secret instead of using dbUrl. The Secret must contain a
   # `uri` key, e.g. postgresql://user:pass@host:5432/dbname.
   externalDbSecret: ""
-  # -- Default sandbox image used when requests do not specify one.
-  sandboxImage: "nvcr.io/nvidia/base/ubuntu:24.04"
-  # -- Pull policy for sandbox pods. Leave unset to use the Kubernetes image
-  # default (Always for :latest, IfNotPresent otherwise). Prefer always,
-  # if_not_present, or never; the chart also accepts legacy Kubernetes spellings
-  # Always, IfNotPresent, and Never.
-  sandboxImagePullPolicy: null
   # -- Image pull secrets attached to sandbox pods. Referenced Secrets must exist
   # in the sandbox namespace.
   sandboxImagePullSecrets: []
@@ -342,8 +368,11 @@ server:
       # Empty = Helm release namespace. A dedicated namespace is RECOMMENDED
       # to isolate OpenShell-managed Secrets from other workloads.
       namespace: ""
-      # -- Deprecated compatibility field. Credential storage no longer supports user-authored namespace references.
-      allowReferenceNamespace: false
+      # -- Create the credential namespace. Requires a namespace other than the
+      # release namespace. The Namespace is retained on uninstall so stored
+      # credentials survive; an existing Namespace not owned by this release is
+      # left untouched.
+      createNamespace: false
       rbac:
         # -- Create a Role/RoleBinding granting the gateway ServiceAccount read/write access to managed provider Secrets.
         create: true

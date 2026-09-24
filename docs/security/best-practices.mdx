@@ -13,7 +13,7 @@ OpenShell enforces sandbox security across four layers: network, filesystem, pro
 This page documents every configurable control, its default, what it protects, and the risk of relaxing it.
 
 For the full policy YAML schema, refer to the [Policy Schema](/reference/policy-schema).
-For the architecture of each enforcement layer, refer to [How OpenShell Works](/about/how-it-works).
+For the architecture of each enforcement layer, refer to [Architecture](/about/how-it-works).
 
 <Note>
 If you use [NemoClaw](https://github.com/NVIDIA/NemoClaw), its [Security Best Practices](https://docs.nvidia.com/nemoclaw/latest/security/best-practices.html) guide covers additional entrypoint-level controls, policy presets, provider trust tiers, and posture profiles specific to the NemoClaw blueprint.
@@ -79,16 +79,17 @@ This provides defense-in-depth: even if a container escape vulnerability exists,
 
 ### Binary Identity Binding
 
-The proxy identifies which binary initiated each connection by reading `/proc/<pid>/exe` (the kernel-trusted executable path).
-It walks the process tree for ancestor binaries and parses `/proc/<pid>/cmdline` for script interpreters.
-The proxy SHA256-hashes each binary on first use (trust-on-first-use). If someone replaces a binary mid-session, the hash mismatch triggers an immediate deny.
+OpenShell binds each connection to executable identity observed by the trusted isolation boundary.
+Network policy can authorize either the connection-owning executable or one of its executable ancestors.
+OpenShell pins every authorization-capable path to its first runtime-observed SHA256 digest (trust on first use), and a later digest mismatch triggers an immediate deny.
+Missing or conflicting integrity evidence also fails closed. Command-line paths remain diagnostic context and never authorize access.
 
 | Aspect | Detail |
 |---|---|
 | Default | Every `network_policies` entry requires a `binaries` list. Only listed binaries can reach the associated endpoints. Binary paths support glob patterns (`*` for one path component, `**` for recursive). |
 | What you can change | Add binaries to an endpoint entry. Use glob patterns for directory-scoped access (for example, `/sandbox/.vscode-server/**`). |
-| Risk if relaxed | Broad glob patterns (like `/**`) allow any binary to reach the endpoint, defeating the purpose of binary-scoped enforcement. |
-| Recommendation | Scope binaries to the specific executables that need each endpoint. Use narrow globs when the exact path varies (for example, across Python virtual environments). |
+| Risk if relaxed | Broad glob patterns (like `/**`) allow any leaf or ancestor executable to authorize the endpoint, defeating the purpose of binary-scoped enforcement. |
+| Recommendation | Scope binaries to the specific leaf or launcher executables that need each endpoint. Use narrow globs when the exact path varies (for example, across Python virtual environments). Restart the sandbox runtime after intentionally replacing an executable at an authorized path so a new runtime can establish a new pin. |
 
 ### L4-Only vs L7 Inspection
 
@@ -239,7 +240,7 @@ This ordering is intentional: named network-namespace setup still relies on priv
 6. Landlock filesystem restrictions.
 7. Runtime seccomp socket domain and syscall filters.
 
-## Provider-backed Inference Controls
+## Inference Controls
 
 Inference providers use the same endpoint-bound credential mechanism as other
 providers. Attach a profile-backed provider only to sandboxes that need it.
@@ -299,5 +300,5 @@ The following patterns weaken security without providing meaningful benefit.
 - [Policy Schema](/reference/policy-schema) for the full field-by-field YAML reference.
 - [Default Policy](/reference/default-policy) for the built-in default policy breakdown.
 - [Gateway Auth](/reference/gateway-auth) for gateway authentication details.
-- [How OpenShell Works](/about/how-it-works) for the system architecture.
+- [Architecture](/about/how-it-works) for the system architecture.
 - NemoClaw [Security Best Practices](https://docs.nvidia.com/nemoclaw/latest/security/best-practices.html) for entrypoint-level controls (capability drops, PATH hardening, build toolchain removal), policy presets, provider trust tiers, and posture profiles.

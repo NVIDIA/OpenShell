@@ -800,16 +800,18 @@ pub struct GatewayJwtConfig {
     /// `openshell`.
     #[serde(default = "default_gateway_id")]
     pub gateway_id: String,
-    /// Token lifetime in seconds. Omit the field for a non-expiring token.
+    /// Token lifetime in seconds. Defaults to 15 minutes when omitted.
     /// Explicit zero is invalid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_secs: Option<NonZeroU64>,
 }
 
 impl GatewayJwtConfig {
-    /// Effective token lifetime. `None` represents a non-expiring token.
-    pub fn sandbox_token_ttl(&self) -> Option<Duration> {
-        self.ttl_secs.map(|ttl| Duration::from_secs(ttl.get()))
+    /// Effective token lifetime.
+    pub fn token_ttl(&self) -> Duration {
+        self.ttl_secs.map_or(Duration::from_mins(15), |ttl| {
+            Duration::from_secs(ttl.get())
+        })
     }
 }
 
@@ -1213,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_jwt_ttl_defaults_to_non_expiring() {
+    fn gateway_jwt_ttl_defaults_to_fifteen_minutes() {
         let cfg: GatewayJwtConfig = serde_json::from_value(serde_json::json!({
             "signing_key_path": "/tmp/signing.pem",
             "public_key_path": "/tmp/public.pem",
@@ -1222,7 +1224,7 @@ mod tests {
         .expect("gateway JWT config should deserialize with default ttl");
 
         assert_eq!(cfg.ttl_secs, None);
-        assert_eq!(cfg.sandbox_token_ttl(), None);
+        assert_eq!(cfg.token_ttl(), Duration::from_mins(15));
 
         let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
         assert!(serialized.get("ttl_secs").is_none());
@@ -1238,7 +1240,7 @@ mod tests {
         }))
         .expect("gateway JWT config should deserialize with positive ttl");
 
-        assert_eq!(cfg.sandbox_token_ttl(), Some(Duration::from_hours(1)));
+        assert_eq!(cfg.token_ttl(), Duration::from_hours(1));
         let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
         assert_eq!(serialized["ttl_secs"], 3600);
     }
