@@ -13,7 +13,7 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 
 | Job | Runner | Verifies |
 |---|---|---|
-| `macos` | `macos-latest-xlarge` | Installs the dev Homebrew artifacts and reaches the VM gateway. The hosted runner cannot create a nested Hypervisor.framework sandbox. |
+| `macos` | `macos-latest-xlarge` | Installs the dev Homebrew artifacts, reaches the VM gateway, and creates, executes in, and deletes a sandbox. |
 | `ubuntu-deb` | `ubuntu-latest` | Installs the dev Debian package, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
 | `fedora` | `fedora:latest` container | Installs the dev RPM packages, reaches the Podman gateway, and creates, executes in, and deletes a sandbox. |
 | `ubuntu-snap-system-docker` | `ubuntu-latest` | Uses `install.sh` to install the snap from `latest/edge`, reuses system Docker, reaches the Docker gateway, and creates, executes in, and deletes a sandbox, and verifies that the Docker snap is not installed. |
