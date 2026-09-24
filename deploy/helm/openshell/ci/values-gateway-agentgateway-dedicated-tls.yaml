@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Create a dedicated agentgateway Gateway with an HTTPS listener in the
+# OpenShell release namespace. The TLS Secret must exist in that namespace.
+# For production, configure OIDC because agentgateway terminates TLS and client
+# certificates do not reach the OpenShell gateway.
+grpcRoute:
+  enabled: true
+  gateway:
+    create: true
+    className: agentgateway
+    name: openshell-ingress
+    listener:
+      port: 443
+      protocol: HTTPS
+      allowedRoutes: Same
+      tls:
+        certificateRefs:
+          - name: openshell-ingress-tls
+
+server:
+  # Agentgateway terminates frontend TLS and forwards plaintext HTTP/2.
+  disableTls: true
