@@ -73,19 +73,20 @@ Attach the providers and policy required by that workload.
 
 ### See network policy in action
 
-Every sandbox starts with **minimal outbound access**. You open additional access with a short YAML policy that the proxy enforces at the HTTP method and path level, without restarting anything.
+Every sandbox starts with **minimal outbound access**. You open additional access with a network rule that the proxy enforces at the HTTP method and path level, without restarting anything.
 
 ```bash
 # 1. Create a sandbox (starts with minimal outbound access)
-openshell sandbox create
+openshell sandbox create --name demo
 
 # 2. Inside the sandbox — blocked
 sandbox$ curl -sS https://api.github.com/zen
 curl: (56) Received HTTP code 403 from proxy after CONNECT
 
-# 3. Back on the host — apply a read-only GitHub API policy
+# 3. Back on the host — add a read-only GitHub API rule
 sandbox$ exit
-openshell policy set demo --policy examples/sandbox-policy-quickstart/policy.yaml --wait
+openshell policy update demo --rule-name github_api --binary /usr/bin/curl \
+  --add-endpoint api.github.com:443:read-only:rest:enforce --wait
 
 # 4. Reconnect — GET allowed, POST blocked by L7
 openshell sandbox connect demo

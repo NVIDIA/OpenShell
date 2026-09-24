@@ -14,7 +14,7 @@ while writes are blocked — all without restarting anything.
 
 | File          | Description                                                          |
 | ------------- | -------------------------------------------------------------------- |
-| `policy.yaml` | L7 read-only policy for the GitHub REST API, scoped to `curl`        |
+| `policy.yaml` | Complete policy with the same rule, for `sandbox create --policy`    |
 | `demo.sh`     | Automated script that runs the full walkthrough non-interactively    |
 
 ## Walkthrough
@@ -58,42 +58,42 @@ exit
 ### 3. Check the deny log
 
 ```bash
-openshell logs demo --since 5m
+openshell logs demo --since 5m --source sandbox
 ```
 
 You'll see a line like:
 
 ```text
-action=deny dst_host=api.github.com dst_port=443 binary=/usr/bin/curl deny_reason="no matching network policy"
+[1775014132.690] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(64) -> api.github.com:443 [policy:- engine:opa] [reason:network connections not allowed by policy]
 ```
 
 Every denied connection is logged with the destination, the binary that
 attempted it, and the reason. Nothing gets out silently.
 
-### 4. Apply the read-only GitHub API policy
-
-Review the policy:
+### 4. Add a read-only GitHub API rule
 
 ```bash
-cat examples/sandbox-policy-quickstart/policy.yaml
+openshell policy update demo \
+  --rule-name github_api \
+  --binary /usr/bin/curl \
+  --add-endpoint api.github.com:443:read-only:rest:enforce \
+  --wait
 ```
 
+The endpoint specification lists the host, port, access preset, protocol,
+and enforcement mode. **curl may make GET, HEAD, and OPTIONS requests to
+`api.github.com` over HTTPS. Everything else is denied.** `rest` tells the
+proxy to terminate TLS and inspect each HTTP request, `read-only` permits
+`GET`, `HEAD`, and `OPTIONS`, and `enforce` blocks every other request.
+`policy update` changes only the network rules and keeps the rest of the
+sandbox's policy.
+
+The command adds a rule equivalent to this YAML in the policy's
+`network_policies` section:
+
 ```yaml
-version: 1
-
-# Default sandbox filesystem settings.
-# These filesystem fields are required when using `openshell policy set`
-# because it replaces the entire policy.
-filesystem_policy:
-  include_workdir: true
-  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
-  read_write: [/sandbox, /tmp, /dev/null]
-landlock:
-  compatibility: best_effort
-
 network_policies:
   github_api:
-    name: github-api-readonly
     endpoints:
       - host: api.github.com
         port: 443
@@ -101,29 +101,18 @@ network_policies:
         enforcement: enforce
         access: read-only
     binaries:
-      - { path: /usr/bin/curl }
+      - path: /usr/bin/curl
 ```
 
-The top section preserves the default sandbox filesystem and Landlock
-settings while omitting process identity so the active compute driver can
-select it. These settings are required because `policy set` replaces the
-entire policy.
-The `network_policies` section is the interesting part: **curl may make
-GET, HEAD, and OPTIONS requests to `api.github.com` over HTTPS.
-Everything else is denied.** The proxy auto-detects and terminates TLS
-to inspect each HTTP request and enforce the `read-only` access preset
-at the method level.
+`--wait` blocks until the sandbox reports a result for the new policy
+revision. No restart required — network rules reload while the sandbox runs.
 
-Apply it:
-
-```bash
-openshell policy set demo \
-  --policy examples/sandbox-policy-quickstart/policy.yaml \
-  --wait
-```
-
-`--wait` blocks until the sandbox confirms the new policy is loaded.
-No restart required — policies are hot-reloaded.
+[`policy.yaml`](policy.yaml) contains the same rule in a complete policy. Use
+it to start a new sandbox with the rule in place:
+`openshell sandbox create --name demo --policy examples/sandbox-policy-quickstart/policy.yaml`.
+Do not apply it to a running sandbox with `openshell policy set`, which
+replaces the entire policy and is rejected if the file drops a filesystem path
+the sandbox already has.
 
 ### 5. Connect and verify: GET works
 
@@ -178,8 +167,11 @@ curl -s -X POST https://api.github.com/repos/octocat/hello-world/issues \
   -d '{"title":"oops"}'
 ```
 
-```json
-{"error":"policy_denied","policy":"github-api-readonly","detail":"POST /repos/octocat/hello-world/issues not permitted by policy"}
+The proxy returns a `403` response with a JSON body that includes fields
+like these:
+
+```text
+{...,"error":"policy_denied",...,"policy":"github_api",...,"rule":"POST /repos/octocat/hello-world/issues",...}
 ```
 
 The CONNECT request succeeded (api.github.com is allowed), but the L7
@@ -196,16 +188,17 @@ exit
 ### 7. Check the L7 deny log
 
 ```bash
-openshell logs demo --level warn --since 5m
+openshell logs demo --since 5m --source sandbox
 ```
 
 ```text
-l7_decision=deny dst_host=api.github.com l7_action=POST l7_target=/repos/octocat/hello-world/issues l7_deny_reason="POST /repos/octocat/hello-world/issues not permitted by policy"
+[1775014140.412] [sandbox] [OCSF ] [ocsf] HTTP:POST [MED] DENIED POST http://api.github.com:443/repos/octocat/hello-world/issues [policy:github_api engine:l7] [reason:L7_REQUEST deny POST api.github.com:443/repos/octocat/hello-world/issues reason=POST /repos/octocat/hello-world/issues not permitted by policy]
 ```
 
-The log captures the exact HTTP method, path, and deny reason. In
-production, pipe these logs to your SIEM for a complete audit trail of
-every request your agent makes.
+The log captures the exact HTTP method, path, and matching rule. Policy
+events are INFO-level log records regardless of their severity, so do not
+filter them out with `--level warn`. In production, export these events to
+your SIEM for a complete audit trail of every request your agent makes.
 
 ### 8. Clean up
 
