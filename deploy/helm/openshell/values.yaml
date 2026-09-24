@@ -615,6 +615,36 @@ grpcRoute:
         # or the existing openshell-server-tls Secret (its SANs must include the
         # external hostname).
         certificateRefs: []
+  # Optional Gateway API ListenerSet for adding an OpenShell-owned listener to
+  # a shared, platform-managed Gateway. ListenerSet is an Extended-support
+  # Gateway API feature and is not enabled by default.
+  listenerSet:
+    # -- Attach the GRPCRoute to a ListenerSet instead of directly to the
+    # Gateway configured above.
+    enabled: false
+    # -- Create the ListenerSet in the Helm release namespace. Set to false to
+    # attach to a pre-existing ListenerSet in that namespace.
+    create: true
+    # -- ListenerSet name. When empty, defaults to the chart-generated resource
+    # fullname with a `-listeners` suffix.
+    name: ""
+    listener:
+      # -- Listener name selected by the GRPCRoute parent reference.
+      name: grpc-tls
+      # -- Optional hostname matched by the ListenerSet listener.
+      hostname: ""
+      # -- Listener port.
+      port: 443
+      # -- Listener protocol: HTTP or HTTPS.
+      protocol: HTTPS
+      # -- "Same" restricts attached routes to the ListenerSet namespace;
+      # "All" allows routes from any namespace.
+      allowedRoutes: Same
+      tls:
+        # -- certificateRefs for an HTTPS ListenerSet listener. Each entry
+        # needs a `name` pointing at a kubernetes.io/tls Secret in the Helm
+        # release namespace.
+        certificateRefs: []
   # BackendTLSPolicy for end-to-end TLS between the Gateway proxy and the
   # OpenShell gateway pod. When enabled, the Gateway proxy terminates
   # client-facing TLS at the listener and re-encrypts when connecting to the

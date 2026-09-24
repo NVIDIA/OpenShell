@@ -1,7 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Gateway API overlay — enables a Gateway and GRPCRoute for external access.
+# Gateway API overlay — creates the tested Envoy Gateway and GRPCRoute for
+# external access. The chart can create a Gateway for another controller by
+# changing grpcRoute.gateway.className and any controller-specific settings.
+# For agentgateway, use values-gateway-agentgateway.yaml or
+# values-gateway-agentgateway-shared-tls.yaml.
 #
 # Requires Envoy Gateway in the cluster (installed via skaffold.yaml).
 # Add this file to the openshell release valuesFiles to activate:

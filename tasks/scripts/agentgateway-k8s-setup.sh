@@ -10,8 +10,19 @@ KUBE_CONTEXT="${OPENSHELL_AGENTGATEWAY_KUBE_CONTEXT:-}"
 NAMESPACE="agentgateway-system"
 RELEASE_NAME="agentgateway"
 AGENTGATEWAY_VERSION="${OPENSHELL_AGENTGATEWAY_VERSION:-v1.5.0}"
+AGENTGATEWAY_CHART="${OPENSHELL_AGENTGATEWAY_CHART:-oci://cr.agentgateway.dev/charts/agentgateway}"
+AGENTGATEWAY_CRDS_CHART="${OPENSHELL_AGENTGATEWAY_CRDS_CHART:-oci://cr.agentgateway.dev/charts/agentgateway-crds}"
 GATEWAY_API_VERSION="${OPENSHELL_GATEWAY_API_VERSION:-v1.6.2}"
+APPLY_SHARED_GATEWAY="${OPENSHELL_AGENTGATEWAY_APPLY_SHARED_GATEWAY:-1}"
 MANIFEST="${ROOT}/deploy/kube/manifests/agentgateway-openshell.yaml"
+
+case "${APPLY_SHARED_GATEWAY}" in
+  0 | 1) ;;
+  *)
+    echo "ERROR: OPENSHELL_AGENTGATEWAY_APPLY_SHARED_GATEWAY must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 
 kubectl_args=()
 helm_args=()
@@ -26,17 +37,19 @@ case "${ACTION}" in
       "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
 
     helm "${helm_args[@]}" upgrade --install "${RELEASE_NAME}-crds" \
-      oci://cr.agentgateway.dev/charts/agentgateway-crds \
+      "${AGENTGATEWAY_CRDS_CHART}" \
       --version "${AGENTGATEWAY_VERSION}" \
       --namespace "${NAMESPACE}" --create-namespace \
       --wait --timeout 5m
     helm "${helm_args[@]}" upgrade --install "${RELEASE_NAME}" \
-      oci://cr.agentgateway.dev/charts/agentgateway \
+      "${AGENTGATEWAY_CHART}" \
       --version "${AGENTGATEWAY_VERSION}" \
       --namespace "${NAMESPACE}" \
       --wait --timeout 5m
 
-    kubectl "${kubectl_args[@]}" apply -f "${MANIFEST}"
+    if [ "${APPLY_SHARED_GATEWAY}" = "1" ]; then
+      kubectl "${kubectl_args[@]}" apply -f "${MANIFEST}"
+    fi
     ;;
   delete)
     kubectl "${kubectl_args[@]}" delete -f "${MANIFEST}" \

@@ -461,6 +461,70 @@ jobs:
       gateway-controller: agentgateway
       conformance-artifact-prefix: openshell-conformance
 
+  kubernetes-agentgateway-ha-e2e:
+    needs: [pr_metadata, build-binaries, build-images]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      job-name: Kubernetes agentgateway HA E2E
+      e2e-task: e2e:kubernetes:agentgateway-ha-rebalancing
+      extra-helm-values: deploy/helm/openshell/ci/values-high-availability.yaml
+      external-postgres-secret: openshell-ha-pg
+      test-name: kubernetes_ha_rebalancing
+      kubernetes-features: e2e,e2e-host-gateway,e2e-kubernetes,e2e-kubernetes-ha
+      gateway-controller: agentgateway
+      conformance-artifact-prefix: openshell-conformance
+
+  kubernetes-agentgateway-shared-tls-e2e:
+    needs: [pr_metadata, build-binaries, build-images]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      job-name: Kubernetes agentgateway shared TLS E2E
+      e2e-task: e2e:kubernetes:agentgateway-shared-tls
+      gateway-controller: agentgateway
+      conformance-artifact-prefix: openshell-conformance
+
+  kubernetes-agentgateway-dedicated-tls-e2e:
+    needs: [pr_metadata, build-binaries, build-images]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      job-name: Kubernetes agentgateway dedicated TLS E2E
+      e2e-task: e2e:kubernetes:agentgateway-dedicated-tls
+      gateway-controller: agentgateway
+      conformance-artifact-prefix: openshell-conformance
+
+  kubernetes-agentgateway-backend-tls-e2e:
+    needs: [pr_metadata, build-binaries, build-images]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      job-name: Kubernetes agentgateway shared backend TLS E2E
+      e2e-task: e2e:kubernetes:agentgateway-backend-tls
+      gateway-controller: agentgateway
+      conformance-artifact-prefix: openshell-conformance
+
   kubernetes-credential-drivers-e2e:
     needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
@@ -517,7 +581,7 @@ jobs:
 
   kubernetes-ha-e2e-result:
     name: Kubernetes HA E2E result
-    needs: [pr_metadata, kubernetes-ha-e2e, kubernetes-agentgateway-e2e]
+    needs: [pr_metadata, kubernetes-ha-e2e, kubernetes-agentgateway-e2e, kubernetes-agentgateway-ha-e2e, kubernetes-agentgateway-shared-tls-e2e, kubernetes-agentgateway-dedicated-tls-e2e, kubernetes-agentgateway-backend-tls-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
     runs-on: ubuntu-latest
     steps:

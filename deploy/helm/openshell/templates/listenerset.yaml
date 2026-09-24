@@ -1,0 +1,53 @@
+{{- if and .Values.grpcRoute.enabled .Values.grpcRoute.listenerSet.enabled .Values.grpcRoute.listenerSet.create }}
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+{{- if .Values.grpcRoute.gateway.create }}
+{{- fail "grpcRoute.listenerSet cannot be used with grpcRoute.gateway.create=true; attach it to a shared Gateway" }}
+{{- end }}
+{{- if not .Values.grpcRoute.gateway.name }}
+{{- fail "grpcRoute.gateway.name is required when grpcRoute.listenerSet.enabled=true" }}
+{{- end }}
+{{- if not .Values.grpcRoute.gateway.namespace }}
+{{- fail "grpcRoute.gateway.namespace is required when grpcRoute.listenerSet.enabled=true" }}
+{{- end }}
+{{- if not .Values.grpcRoute.listenerSet.listener.name }}
+{{- fail "grpcRoute.listenerSet.listener.name is required when grpcRoute.listenerSet.enabled=true" }}
+{{- end }}
+{{- if eq .Values.grpcRoute.listenerSet.listener.protocol "HTTPS" }}
+{{- if not .Values.grpcRoute.listenerSet.listener.tls.certificateRefs }}
+{{- fail "grpcRoute.listenerSet.listener.tls.certificateRefs is required when grpcRoute.listenerSet.listener.protocol is HTTPS" }}
+{{- end }}
+{{- if and (not .Values.server.disableTls) (not .Values.grpcRoute.backendTLSPolicy.enabled) }}
+{{- fail "grpcRoute.listenerSet.listener.protocol=HTTPS terminates TLS at the ListenerSet listener. Either set server.disableTls=true so the pod listens plaintext, or enable grpcRoute.backendTLSPolicy for end-to-end TLS re-encryption to the gateway pod." }}
+{{- end }}
+{{- end }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata:
+  name: {{ default (printf "%s-listeners" (include "openshell.fullname" .)) .Values.grpcRoute.listenerSet.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+spec:
+  parentRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: {{ .Values.grpcRoute.gateway.name }}
+    namespace: {{ .Values.grpcRoute.gateway.namespace }}
+  listeners:
+    - name: {{ .Values.grpcRoute.listenerSet.listener.name }}
+      {{- with .Values.grpcRoute.listenerSet.listener.hostname }}
+      hostname: {{ . | quote }}
+      {{- end }}
+      port: {{ .Values.grpcRoute.listenerSet.listener.port }}
+      protocol: {{ .Values.grpcRoute.listenerSet.listener.protocol }}
+      {{- if eq .Values.grpcRoute.listenerSet.listener.protocol "HTTPS" }}
+      tls:
+        mode: Terminate
+        certificateRefs:
+          {{- toYaml .Values.grpcRoute.listenerSet.listener.tls.certificateRefs | nindent 10 }}
+      {{- end }}
+      allowedRoutes:
+        namespaces:
+          from: {{ .Values.grpcRoute.listenerSet.listener.allowedRoutes }}
+{{- end }}

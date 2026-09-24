@@ -10,11 +10,22 @@ metadata:
     {{- include "openshell.labels" . | nindent 4 }}
 spec:
   parentRefs:
+    {{- if .Values.grpcRoute.listenerSet.enabled }}
+    {{- if .Values.grpcRoute.gateway.create }}
+    {{- fail "grpcRoute.listenerSet cannot be used with grpcRoute.gateway.create=true; attach it to a shared Gateway" }}
+    {{- end }}
+    - name: {{ default (printf "%s-listeners" (include "openshell.fullname" .)) .Values.grpcRoute.listenerSet.name }}
+      group: gateway.networking.k8s.io
+      kind: ListenerSet
+      namespace: {{ .Release.Namespace }}
+      sectionName: {{ required "grpcRoute.listenerSet.listener.name is required when grpcRoute.listenerSet.enabled=true" .Values.grpcRoute.listenerSet.listener.name }}
+    {{- else }}
     - name: {{ default (include "openshell.fullname" .) .Values.grpcRoute.gateway.name }}
       namespace: {{ default .Release.Namespace .Values.grpcRoute.gateway.namespace }}
       {{- with .Values.grpcRoute.gateway.sectionName }}
       sectionName: {{ . }}
       {{- end }}
+    {{- end }}
   {{- if .Values.grpcRoute.hostnames }}
   hostnames:
     {{- toYaml .Values.grpcRoute.hostnames | nindent 4 }}

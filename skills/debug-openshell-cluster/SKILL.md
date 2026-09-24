@@ -593,6 +593,25 @@ Gateway proxy reports `TLS error: Secret is not supplied by SDS` or similar
 backend TLS errors, the ConfigMap CA likely does not match the server
 certificate CA — verify both are from the same issuer.
 
+For agentgateway HTTPS through a ListenerSet, inspect the shared Gateway's
+`allowedListeners`, the namespace-local certificate Secret, and both attachment
+statuses. The ListenerSet should be `Accepted` and `Programmed`; its GRPCRoute
+parent should be `Accepted` with resolved references:
+
+```bash
+kubectl -n agentgateway-system get gateway openshell-ingress -o yaml
+kubectl -n openshell get listenerset openshell-tls -o yaml
+kubectl -n openshell get grpcroute openshell -o yaml
+kubectl -n openshell get secret openshell-ingress-tls
+kubectl -n agentgateway-system get service openshell-ingress -o yaml
+```
+
+A rejected ListenerSet usually means the shared Gateway does not authorize its
+namespace. An unresolved certificate reference means the TLS Secret is absent
+from the ListenerSet namespace or has the wrong type. With frontend termination,
+`server.disableTls` must be true; when `BackendTLSPolicy` is enabled for backend
+re-encryption, keep gateway-pod TLS enabled and disable client mTLS.
+
 Check the image references currently used by the gateway deployment:
 
 ```bash
