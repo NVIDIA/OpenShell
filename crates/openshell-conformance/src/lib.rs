@@ -23,7 +23,12 @@ use tokio::time::sleep;
 
 use self::executor::{CliExecutionError, CliExecutor, ProcessCli};
 
-pub use scenarios::{SANDBOX_LIFECYCLE_SCENARIO, SMOKE_SCENARIO};
+pub use scenarios::{
+    FILE_TRANSFER_GIT_FILTERING_SCENARIO, FILE_TRANSFER_PATH_SAFETY_SCENARIO,
+    FILE_TRANSFER_ROUND_TRIP_SCENARIO, FILE_TRANSFER_SCENARIO,
+    SANDBOX_LIFECYCLE_RELAY_READINESS_SCENARIO, SANDBOX_LIFECYCLE_RELAY_RECONNECT_SCENARIO,
+    SANDBOX_LIFECYCLE_SCENARIO, SANDBOX_LIFECYCLE_STATE_TRANSITIONS_SCENARIO, SMOKE_SCENARIO,
+};
 
 /// An installed conformance scenario.
 #[derive(Debug)]
@@ -41,7 +46,11 @@ impl Scenario {
     }
 }
 
-const SCENARIOS: &[Scenario] = &[SMOKE_SCENARIO, SANDBOX_LIFECYCLE_SCENARIO];
+const SCENARIOS: &[Scenario] = &[
+    SMOKE_SCENARIO,
+    SANDBOX_LIFECYCLE_SCENARIO,
+    FILE_TRANSFER_SCENARIO,
+];
 
 /// Returns every scenario compiled into this distribution.
 pub fn scenarios() -> &'static [Scenario] {

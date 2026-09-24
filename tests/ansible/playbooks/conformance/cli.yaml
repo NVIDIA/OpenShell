@@ -9,6 +9,44 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
+    - name: Gather package platform facts
+      ansible.builtin.setup:
+        filter:
+          - ansible_os_family
+
+    - name: Detect container runtime
+      ansible.builtin.include_role:
+        name: tmachine_container_runtime
+
+    - name: Install conformance test dependencies
+      become: true
+      ansible.builtin.package:
+        name:
+          - git
+          - iptables
+          - "{{ 'iproute' if ansible_facts.os_family == 'RedHat' else 'iproute2' }}"
+        state: present
+
+    - name: Install Docker supervisor reconnect helper
+      become: true
+      ansible.builtin.copy:
+        src: ../../files/disconnect-docker-supervisor-session
+        dest: /usr/local/bin/disconnect-docker-supervisor-session
+        owner: root
+        group: root
+        mode: "0755"
+      when: tmachine_container_runtime_name == 'docker'
+
+    - name: Install Podman supervisor reconnect helper
+      become: true
+      ansible.builtin.copy:
+        src: ../../files/disconnect-podman-supervisor-session
+        dest: /usr/local/bin/disconnect-podman-supervisor-session
+        owner: root
+        group: root
+        mode: "0755"
+      when: tmachine_container_runtime_name == 'podman'
+
     - name: Create OpenShell conformance test directory
       become: true
       ansible.builtin.file:
@@ -58,9 +96,18 @@
           - /var/lib/openshell-conformance/tests/tests.tar.zst
           - --workspace-remap
           - /var/lib/openshell-conformance/tests
-          - --no-capture
+          - --test-threads
+          - "2"
+          - --no-fail-fast
       environment:
         OPENSHELL_BIN: "{{ openshell_cli.stdout }}"
+        OPENSHELL_PODMAN_ROOTLESS: >-
+          {{ tmachine_container_runtime_is_rootless | ternary('true', 'false') }}
+        OPENSHELL_RELAY_RECONNECT_HELPER: >-
+          {{ '/usr/local/bin/disconnect-docker-supervisor-session'
+             if tmachine_container_runtime_name == 'docker'
+             else '/usr/local/bin/disconnect-podman-supervisor-session'
+             if tmachine_container_runtime_name == 'podman' else '' }}
       register: conformance_result
       changed_when: false
       failed_when: false

@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+action=${1:?usage: disconnect-podman-supervisor-session <pause|disconnect-resume> <sandbox-name>}
+sandbox_name=${2:?usage: disconnect-podman-supervisor-session <pause|disconnect-resume> <sandbox-name>}
+if [[ ! ${sandbox_name} =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "invalid sandbox name: ${sandbox_name}" >&2
+  exit 2
+fi
+
+state_file="/tmp/openshell-relay-reconnect-${sandbox_name}"
+if [[ ${OPENSHELL_PODMAN_ROOTLESS:-false} == true ]]; then
+  podman=(podman)
+else
+  podman=(sudo -n podman)
+fi
+
+container_id=$("${podman[@]}" ps \
+  --filter "label=openshell.ai/sandbox-name=${sandbox_name}" \
+  --filter "label=openshell.io/isolation-role=supervisor" \
+  --format '{{.ID}}')
+if [[ -z ${container_id} || ${container_id} == *$'\n'* ]]; then
+  echo "expected exactly one Podman supervisor for sandbox ${sandbox_name}" >&2
+  exit 1
+fi
+
+case ${action} in
+  pause)
+    supervisor_pid=$("${podman[@]}" inspect --format '{{.State.Pid}}' "${container_id}")
+    mapfile -t connections < <(
+      sudo -n ss -Htnp state established '( dport = :17670 )' \
+        | awk -v pid="${supervisor_pid}" 'index($0, "pid=" pid ",") { print }'
+    )
+    if (( ${#connections[@]} == 0 )); then
+      echo "could not find the supervisor TCP session for PID ${supervisor_pid}" >&2
+      exit 1
+    fi
+
+    ports=()
+    cleanup_prepare() {
+      for port in "${ports[@]}"; do
+        sudo -n iptables -w 5 -D OUTPUT -p tcp -s 127.0.0.1 --sport 17670 \
+          -d 127.0.0.1 --dport "${port}" -j DROP >/dev/null 2>&1 || true
+      done
+    }
+    trap cleanup_prepare EXIT
+    for connection in "${connections[@]}"; do
+      read -r _ _ local_address _ _ <<<"${connection}"
+      local_port=${local_address##*:}
+      ports+=("${local_port}")
+      # Prevent RelayOpen from reaching the supervisor while leaving
+      # its client-to-gateway direction available for the later TCP reset.
+      sudo -n iptables -w 5 -I OUTPUT -p tcp -s 127.0.0.1 --sport 17670 \
+        -d 127.0.0.1 --dport "${local_port}" -j DROP
+    done
+    {
+      echo "${container_id}"
+      printf '%s\n' "${ports[@]}"
+    } >"${state_file}"
+    trap - EXIT
+    ;;
+  disconnect-resume)
+    if [[ ! -f ${state_file} ]]; then
+      echo "missing reconnect state for sandbox ${sandbox_name}" >&2
+      exit 1
+    fi
+    mapfile -t state <"${state_file}"
+    container_id=${state[0]:-}
+    ports=("${state[@]:1}")
+    if [[ -z ${container_id} ]] || (( ${#ports[@]} == 0 )); then
+      echo "invalid reconnect state for sandbox ${sandbox_name}" >&2
+      exit 1
+    fi
+    cleanup() {
+      for port in "${ports[@]}"; do
+        sudo -n iptables -w 5 -D OUTPUT -p tcp -s 127.0.0.1 --sport 17670 \
+          -d 127.0.0.1 --dport "${port}" -j DROP >/dev/null 2>&1 || true
+      done
+      rm -f "${state_file}"
+    }
+    trap cleanup EXIT
+
+    for local_port in "${ports[@]}"; do
+      sudo -n ss -K \
+        src 127.0.0.1 sport = ":${local_port}" \
+        dst 127.0.0.1 dport = :17670 >/dev/null
+    done
+    # Give the gateway time to observe EOF and update the old registry entry.
+    sleep 0.5
+    ;;
+  *)
+    echo "unsupported action: ${action}" >&2
+    exit 2
+    ;;
+esac
