@@ -1,0 +1,319 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Incremental Policy Update Reference"
+sidebar-title: "Policy Updates"
+description: "Command grammar, scope requirements, merge behavior, previews, and revision status for incremental sandbox policy updates."
+keywords: "Generative AI, Cybersecurity, Policy, CLI, Incremental Update, Hot Reload"
+position: 4
+---
+
+`openshell policy update` merges explicit operations into a sandbox's current
+`network_policies` map. It does not edit filesystem, Landlock, process, or
+middleware sections. Use `policy set` with an exported base policy for those
+broader changes.
+
+This reference describes the command's flags, input formats, and update
+behavior. For the policy lifecycle and editing workflow, see
+[Configure Sandbox Policies](/sandboxes/policies). Examples use `my-sandbox`
+for an existing sandbox; adapt rule names, executable paths, and destinations
+to its current base policy.
+
+## Command Flags
+
+One command can contain several compatible operations. The gateway applies the
+batch atomically and persists at most one new revision.
+
+| Flag | Purpose |
+|---|---|
+| `--add-endpoint <SPEC>` | Add or merge one endpoint and its declared binary scope. Repeat for multiple endpoints. |
+| `--remove-endpoint <HOST:PORT>` | Remove the host and port match from every authored network rule. A multi-port endpoint keeps its other ports. |
+| `--remove-rule <NAME>` | Remove a complete named `network_policies` entry. |
+| `--add-allow <SPEC>` | Append a REST or WebSocket method and path allow rule. |
+| `--add-deny <SPEC>` | Append a REST or WebSocket method and path deny rule. |
+| `--binary <PATH>` | Add binaries with endpoints, or declare the complete stored binary scope for an L7 append. Repeat as needed. |
+| `--rule-name <NAME>` | Name one new endpoint rule or select the existing rule for an L7 append. Required for `--add-allow` and `--add-deny`. |
+| `--any-binary` | Declare that the existing L7 target stores an empty binary scope. Cannot be combined with `--binary`. |
+| `--endpoint-path <PATH>` | Select one existing endpoint by its exact stored path. Pass `''` to select no path. |
+| `--dry-run` | Fetch the current policy and preview the local merge without saving a revision. |
+| `--wait` | Poll for the submitted revision's result. Cannot be combined with `--dry-run`. |
+| `--timeout <SECONDS>` | Set the `--wait` timeout. Defaults to 60 seconds. |
+
+`--any-binary` describes the target rule's stored merge scope. It is not an
+independent claim that every runtime identity mode admits every process. Prefer
+explicit binary paths in authored rules and introductory workflows.
+
+## Endpoint Specification
+
+`--add-endpoint` uses this grammar:
+
+```text
+host:port[:access[:protocol[:enforcement[:options]]]]
+```
+
+| Segment | Accepted values and behavior |
+|---|---|
+| `host` | Required destination hostname. |
+| `port` | Required integer from 1 through 65535. |
+| `access` | `read-only`, `read-write`, or `full` for inspected endpoints. |
+| `protocol` | `tcp`, `rest`, `websocket`, or `sql`. Use full policy YAML for GraphQL, MCP, and JSON-RPC. |
+| `enforcement` | `enforce` or `audit`. Omission selects audit for inspected requests. |
+| `options` | Comma-separated options listed below. |
+
+Endpoint options are:
+
+| Option | Effect |
+|---|---|
+| `allowed-ip=<CIDR-or-IP>` | Add a destination IP allowance. Repeat the option in the comma-separated list for multiple values. |
+| `request-body-credential-rewrite` | Rewrite supported credential placeholders in inspected REST text bodies. |
+| `websocket-credential-rewrite` | Rewrite supported placeholders in client WebSocket text messages on REST compatibility or WebSocket endpoints. |
+| `allow-uninspected-credentials` | Accept the security-sensitive exposure of provider credentials on an uninspected traffic path. |
+
+Read-only HTTP access for curl:
+
+```shell
+openshell policy update my-sandbox \
+  --rule-name github_readonly \
+  --binary /usr/bin/curl \
+  --add-endpoint api.github.com:443:read-only:rest:enforce \
+  --wait
+```
+
+Native PostgreSQL access for psql:
+
+```shell
+openshell policy update my-sandbox \
+  --rule-name postgres \
+  --binary /usr/bin/psql \
+  --add-endpoint db.internal.example:5432::tcp \
+  --wait
+```
+
+Read-only access to an internal HTTP API with an explicit destination IP allowance:
+
+```shell
+openshell policy update my-sandbox \
+  --rule-name private_api \
+  --binary /usr/bin/curl \
+  --add-endpoint 'api.internal.example:443:read-only:rest:enforce:allowed-ip=10.20.0.0/16' \
+  --wait
+```
+
+The empty access segment before `tcp` is required by the positional grammar.
+`protocol: tcp` rejects access, enforcement, and application-inspection options.
+The standard runtime initializes policy DNS and transparent capture before the
+workload starts, so a live update can add the first TCP endpoint. An alternate
+backend must advertise the required capability and a ready substrate.
+
+An inspected REST or WebSocket endpoint needs an allow shape. For incremental
+creation, supply an access preset. Create the endpoint in one command, then add
+explicit allow or deny rules in a separate command.
+
+## L7 Rule Specification
+
+`--add-allow` and `--add-deny` use this grammar:
+
+```text
+host:port[,port...]:METHOD:path_glob
+```
+
+The host, complete port set, rule name, complete binary set, and optional
+endpoint path identify one existing REST or WebSocket endpoint. These flags do
+not create an endpoint or change its scope.
+
+Quote specifications that contain `*`, `**`, `?`, or bracket classes. Request
+path globs are not shell path globs. Both `*` and `**` can cross `/` boundaries,
+`?` matches one character, and bracket classes are supported.
+
+The following examples target an existing `github_api` rule whose only binary
+is `/usr/bin/gh` and whose REST endpoint is `api.github.com:443`. An allow append
+permits POST requests to issue-creation paths:
+
+```shell
+openshell policy update my-sandbox \
+  --rule-name github_api \
+  --binary /usr/bin/gh \
+  --add-allow 'api.github.com:443:POST:/repos/*/issues' \
+  --wait
+```
+
+A deny append blocks POST requests to administration paths on that endpoint:
+
+```shell
+openshell policy update my-sandbox \
+  --rule-name github_api \
+  --binary /usr/bin/gh \
+  --add-deny 'api.github.com:443:POST:/admin/**' \
+  --wait
+```
+
+For an existing `realtime` rule with only `/usr/bin/node` and a WebSocket
+endpoint at `realtime.example.com:443`, a text-message deny uses the
+`WEBSOCKET_TEXT` method. The path matches the stored upgrade request path, not
+message content:
+
+```shell
+openshell policy update my-sandbox \
+  --rule-name realtime \
+  --binary /usr/bin/node \
+  --add-deny 'realtime.example.com:443:WEBSOCKET_TEXT:/v1/admin/**' \
+  --wait
+```
+
+Use `--endpoint-path` when a rule contains multiple endpoints with the same host
+and ports. This selector identifies the endpoint. It is separate from the
+request path appended by `--add-allow` or `--add-deny`.
+
+## Complete Scope Requirements
+
+A network rule grants each listed binary access to each listed endpoint and
+port, subject to application rules and other checks. A rule with two binaries
+and two endpoints therefore includes four connection pairs:
+
+| Binary | Endpoint |
+|---|---|
+| `/usr/bin/curl` | `api.example.com:443` |
+| `/usr/bin/curl` | `uploads.example.com:443` |
+| `/usr/bin/python3` | `api.example.com:443` |
+| `/usr/bin/python3` | `uploads.example.com:443` |
+
+If Python should reach only `api.example.com`, put that binary and endpoint in a
+separate rule. Adding Python to the original rule would also authorize the
+uploads endpoint.
+
+The CLI requires complete affected scope for L7 appends and for endpoint merges
+that could create new pairs. For example, an endpoint that stores ports 443 and
+8443 must be targeted with `443,8443`, even if the new method was observed only
+on 443. Likewise, repeat every stored binary path or use `--any-binary` only
+when the stored rule actually has an empty binary list.
+
+Inspect the stored base before composing an append:
+
+```shell
+openshell policy get my-sandbox --base
+```
+
+Copy the rule name, binary paths, endpoint path, and complete port set from that
+view. Do not derive merge scope from `--full` when provider-owned rules are
+present; those rules are not part of the sandbox base you can incrementally
+edit.
+
+The gateway rejects incomplete or ambiguous declarations before revision
+persistence. Read the reported expected scope and correct the command. Do not
+fill scope mechanically without confirming that the broader effect matches your
+intent.
+
+## Remove Permissions
+
+Preview endpoint removal before applying it because `--remove-endpoint` is not
+scoped by `--rule-name`. It removes the matching host and port from every
+authored network rule:
+
+```shell
+openshell policy update my-sandbox \
+  --remove-endpoint api.example.com:443 \
+  --dry-run
+
+openshell policy update my-sandbox \
+  --remove-endpoint api.example.com:443 \
+  --wait
+```
+
+To remove one named rule instead:
+
+```shell
+openshell policy update my-sandbox \
+  --remove-rule github_readonly \
+  --wait
+```
+
+Removing an endpoint from a multi-port endpoint removes only the named port.
+When removal leaves an endpoint with no ports, OpenShell removes that endpoint.
+When a rule loses its final endpoint, OpenShell removes the rule instead of
+retaining an empty entry. Use `--remove-rule` when you intend to remove one
+specific map entry, and inspect the resulting base policy after either command.
+
+## Preview a Merge
+
+`--dry-run` shows the proposed policy without saving it. For example, this
+command previews a request-rule change to an existing `github_api` rule with
+only `/usr/bin/gh` and a REST endpoint at `api.github.com:443`:
+
+```shell
+openshell policy update my-sandbox \
+  --rule-name github_api \
+  --binary /usr/bin/gh \
+  --add-allow 'api.github.com:443:GET:/repos/**' \
+  --dry-run
+```
+
+The command validates argument shapes, connects to the gateway, fetches the
+current sandbox configuration, and applies the merge locally. It creates no
+revision. An unavailable gateway therefore causes a connection failure. The
+preview does not establish that a later submission will pass every effective
+policy, provider, credential, or runtime validation.
+
+## Merge and Concurrency Behavior
+
+All compatible flags in one command form one atomic batch. They succeed or fail
+together and persist at most one revision. `--add-endpoint` cannot share a batch
+with `--add-allow` or `--add-deny` because their scope flags have different
+meanings.
+
+Concurrent writers use optimistic retry. The gateway reapplies the complete
+operation batch to the latest revision and validates the result again. A no-op
+merge reports an unchanged version and creates no revision.
+
+Rule names identify stored map entries for update and removal. The optional
+human-readable `name` inside a YAML rule is not the `--rule-name` selector when
+the two differ. Use the map key shown by `policy get --base`.
+
+Incremental updates are unavailable while a gateway-global policy is active.
+Delete the global override through the operator workflow before changing a
+sandbox policy.
+
+## Wait and Status Semantics
+
+Without `--wait`, success means the gateway accepted the submission. It does not
+mean the supervisor activated it.
+
+With `--wait`, the CLI polls until it observes a terminal outcome or timeout. A
+zero exit can represent a loaded revision, a no-op, or a revision superseded by
+another update. Always inspect current state before relying on the change:
+
+```shell
+openshell policy list my-sandbox
+openshell policy get my-sandbox --full
+```
+
+A wait timeout means the CLI stopped polling. It does not establish whether the
+revision later loaded or failed. Inspect revision status and sandbox readiness
+before resubmitting, because an automatic retry can race with a late result.
+
+## Full Replacement
+
+`openshell policy set` handles middleware changes, advanced protocol shapes, and complete
+replacement. Start from the current base and preserve sections you do not intend
+to change. Follow [Replace the
+Policy](/sandboxes/policies#replace-the-policy) to prepare an editable
+YAML file using the CLI's readable output.
+
+For automation, the following alternative uses `jq` on the host to extract the
+base policy without display metadata or provider-owned rules:
+
+```shell
+set -o pipefail
+openshell policy get my-sandbox --base --output json \
+  | jq -e '.policy' > base-policy.json
+```
+
+Edit `base-policy.json`, then submit the complete policy:
+
+```shell
+openshell policy set my-sandbox --policy base-policy.json --wait
+```
+
+Refer to [Inspect the Current Policy](/sandboxes/policies#inspect-the-current-policy)
+for effective export, and use
+[Troubleshoot Sandbox Policies](/sandboxes/troubleshoot-policies) when submission
+and activation results differ.
