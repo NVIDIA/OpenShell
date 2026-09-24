@@ -65,7 +65,7 @@ openshell sandbox exec -n my-sandbox --no-login-shell -- \
 OpenShell identifies the process by the executable the kernel reports, so a
 script such as `pip` or `npm` appears as its interpreter, such as
 `/usr/bin/python3.12` or `/usr/bin/node`. Binary matching can also admit a
-trusted ancestor. An empty binary list matches no program unless trusted runtime
+trusted ancestor. An empty binary list matches no binary unless trusted runtime
 configuration disables identity enforcement. Compare the logged binary with the
 policy's selectors before widening a rule.
 

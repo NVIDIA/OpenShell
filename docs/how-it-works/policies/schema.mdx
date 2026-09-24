@@ -9,8 +9,7 @@ position: 6
 ---
 
 This reference defines every field in the authored YAML and JSON policy format,
-with defaults, matcher behavior, and validation constraints. For how policies
-are evaluated and applied, refer to [Sandbox Policies](/sandboxes/policies).
+with defaults, matcher behavior, and validation constraints.
 
 ## Top-Level Structure
 
@@ -170,7 +169,8 @@ process:
 A map of named network rules. Each entry declares a set of endpoints and a set
 of binaries, and allows each listed binary to reach each listed endpoint. The
 map key is the rule's stable identifier and the selector for
-`openshell policy update --rule-name`.
+`openshell policy update --rule-name`. For how OpenShell evaluates these rules,
+with examples, refer to [Network Rules](/sandboxes/network-rules).
 
 ### Network Policy Entry
 
@@ -180,7 +180,7 @@ Each entry in the `network_policies` map has the following fields:
 |---|---|---|---|
 | `name` | string | No | Display name used in log output. Defaults to the map key. |
 | `endpoints` | list of endpoint objects | No | Destinations this entry permits. An omitted or empty list grants no destination. |
-| `binaries` | list of binary objects | No | Executable selectors associated with the endpoints. In a sandbox, an omitted or empty list matches no program, so the entry allows nothing. Binaries are ignored only when trusted runtime configuration disables binary identity enforcement. |
+| `binaries` | list of binary objects | No | Executable selectors associated with the endpoints. In a sandbox, an omitted or empty list matches no binary, so the entry allows nothing. Binaries are ignored only when trusted runtime configuration disables binary identity enforcement. |
 
 When present, `endpoints` and `binaries` must be lists of objects, even when
 they contain only one entry. `null` cannot replace a list or an object entry.
@@ -727,7 +727,7 @@ symlink spelling does not bypass canonical path checks. Glob selectors are not
 symlink-resolved and must match the canonical path.
 
 A binary selector also matches when it names an ancestor of the calling process,
-so programs launched by a listed binary can use the rule. Trusted runtime
+so processes that a listed binary starts can use the rule. Trusted runtime
 configuration can disable binary identity enforcement, so inspect the active
 runtime mode when diagnosing an unexpected result.
 

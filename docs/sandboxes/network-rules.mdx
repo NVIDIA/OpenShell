@@ -1,40 +1,164 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Network Policy Recipes"
-sidebar-title: "Network Recipes"
-description: "Adapt network rules for REST APIs, package registries, internal services, WebSocket, GraphQL, MCP, JSON-RPC, native TCP, raw TLS, and provider credentials."
+title: "Network Rules"
+sidebar-title: "Network Rules"
+description: "Understand how OpenShell evaluates network rules, and adapt examples for REST APIs, package registries, internal services, WebSocket, GraphQL, MCP, JSON-RPC, native TCP, raw TLS, and provider credentials."
 keywords: "Generative AI, Cybersecurity, Policy, Network, REST, TCP, WebSocket, GraphQL, MCP, JSON-RPC, PyPI, npm"
-position: 3
+position: 2
 ---
 
-Each recipe on this page is a network rule for a common service or protocol,
-with commands to verify it. For how OpenShell evaluates these rules, refer to
-[How Network Rules Work](/sandboxes/policies#how-network-rules-work).
+Network rules control which destinations each binary in a sandbox can reach, and
+which requests it can send. They make up most of a typical policy. This page
+explains how OpenShell evaluates network rules, then gives example rules for
+common services and protocols that you can adapt.
 
-## Use a Recipe
+## How Network Rules Work
 
-Each recipe states when to use it, gives the rule, shows how to verify it, and
-lists its limits. Replace the example hosts, paths, and binaries with your own
-values, and confirm that the sandbox contains the client executable. The
-commands use `my-sandbox` as the sandbox name.
+OpenShell checks every outbound connection from a sandbox against the
+`network_policies` section of its policy, and denies any connection that no rule
+allows.
 
-When `openshell policy update` can express a rule, the recipe shows the command.
-Otherwise, add the YAML entry under the `network_policies` section of a complete
-policy file and apply it with `openshell policy set`, as described in [Replace
-the Complete Policy](/sandboxes/manage-policies#replace-the-complete-policy).
-Keep unrelated rules, and replace an existing rule with the same key only when
-that is your intent. After you apply a rule, [verify the
+### Rule Structure
+
+Each entry in `network_policies` is a named rule with two lists. `endpoints`
+lists the destinations the rule allows, and `binaries` lists the executables
+that can connect to them. A rule allows every listed binary to reach every
+listed endpoint.
+
+For example, this rule lists two binaries and two endpoints:
+
+```yaml
+network_policies:
+  example_api:
+    endpoints:
+      - host: api.example.com
+        port: 443
+      - host: uploads.example.com
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+      - path: /usr/bin/python3
+```
+
+The rule allows these four combinations:
+
+| Binary | Endpoint |
+|---|---|
+| `/usr/bin/curl` | `api.example.com:443` |
+| `/usr/bin/curl` | `uploads.example.com:443` |
+| `/usr/bin/python3` | `api.example.com:443` |
+| `/usr/bin/python3` | `uploads.example.com:443` |
+
+If `python3` should reach only `api.example.com`, put that binary and endpoint in
+a separate rule.
+
+### Choose Which Binaries to List
+
+When you write a network rule, list the path of the executable that opens the
+connection. This is not always the command you run. For example, `pip` is a
+Python script, so the process that connects to PyPI is the Python interpreter. A
+rule for `pip install` must list `/usr/bin/python3`, not `/usr/bin/pip`. When
+OpenShell denies a connection, the sandbox log shows the binary it identified.
+[Package Registries](#package-registries) shows rules for `pip`, `uv`, and
+`npm`.
+
+A rule also applies to processes that a listed binary starts. For example, if a
+rule lists an agent's executable, tools that the agent launches can use the rule
+too. A rule with an empty `binaries` list matches no binary and allows nothing.
+
+OpenShell resolves symlinks to the real executable path, so a symlink cannot
+select a different rule. It also records a checksum of each executable the
+first time a rule allows it, and denies later connections if the file at that
+path changes.
+
+### Connection and Request Checks
+
+OpenShell checks network traffic in two stages:
+
+1. When a binary opens a connection, OpenShell checks the destination host and
+   port and the binary against your rules. If no rule matches, OpenShell denies
+   the connection.
+2. If the matching endpoint sets `protocol`, OpenShell also reads each request
+   sent over the connection and checks it against the endpoint's request rules.
+   For example, with `protocol: rest`, a rule can allow `GET` requests to an API
+   while blocking `POST` and `DELETE` requests.
+
+The second stage is called request inspection, and an endpoint that uses it is
+an inspected endpoint. The `protocol` field selects what OpenShell inspects:
+
+| `protocol` | What OpenShell checks in each request | Example |
+|---|---|---|
+| `rest` | HTTP method, path, and query parameters. | [HTTP APIs](#http-apis) |
+| `websocket` | The WebSocket upgrade request and each text message the client sends. | [WebSocket](#allow-websocket-messages) |
+| `graphql` | GraphQL operation type, operation name, and top-level fields. | [GraphQL](#allow-graphql-operations) |
+| `mcp` | MCP method and tool name. | [MCP](#allow-mcp-tools) |
+| `json-rpc` | JSON-RPC method name. | [JSON-RPC](#allow-json-rpc-methods) |
+| `tcp` | Nothing. The binary gets a native TCP connection, which suits clients such as databases. | [Native TCP](#allow-native-tcp) |
+| Omitted | No request rules apply. OpenShell still terminates TLS and checks that each HTTP request is addressed to the allowed host, but it allows any method or path. | -- |
+
+Use an inspected endpoint when the request, not only the destination,
+determines the risk, such as allowing reads but not writes on an API.
+
+### Enforce and Audit
+
+The `enforcement` field on an inspected endpoint decides what happens when a
+request breaks the endpoint's request rules:
+
+- `enforce` blocks the request with an OpenShell `policy_denied` response.
+- `audit` allows the request and logs the violation. This is the default.
+
+Use `audit` to see what a new rule would block, then switch the endpoint to
+`enforce`. An endpoint in audit mode blocks no requests. [Observe a Rule Before
+Enforcing It](#observe-a-rule-before-enforcing-it) shows this workflow.
+
+### Overlapping Rules
+
+Network rules are not an ordered firewall list. Several rules can match the same
+connection or request, and every matching rule adds the access it allows. A
+matching deny rule takes precedence over any allow, regardless of where either
+appears in the file.
+
+For example, suppose one rule allows `GET /repos/**` on a host and another rule
+for the same host, port, and binary denies `GET /repos/private/**`. OpenShell
+denies requests under `/repos/private/`. When you restrict access, review every
+rule that could allow the request, including rules that providers contribute.
+[Block Specific Requests](#block-specific-requests) shows a deny rule.
+
+### Network Access and Credentials
+
+A network rule that allows traffic to a destination does not allow OpenShell to
+send provider credentials there. OpenShell supplies a provider's credentials
+only to the destinations that the provider's profile or an explicit credential
+binding allows. When a request fails a credential check, correct the provider
+binding instead of widening the network rule. [Provider
+Credentials](#provider-credentials) shows an explicit binding, and [Provider
+Profiles](/providers/profiles) explains profile endpoints.
+
+## Use the Examples
+
+Each example states when to use the rule, gives the rule, shows how to verify
+it, and lists its limits. Replace the example hosts, paths, and binaries with
+your own values, and confirm that the sandbox contains the client executable.
+The commands use `my-sandbox` as the sandbox name.
+
+When `openshell policy update` can express a rule, the example shows the
+command. Otherwise, add the YAML entry under the `network_policies` section of a
+complete policy file and apply it with `openshell policy set`, as described in
+[Replace the Complete
+Policy](/sandboxes/manage-policies#replace-the-complete-policy). Keep unrelated
+rules, and replace an existing rule with the same key only when that is your
+intent. After you apply a rule, [verify the
 change](/sandboxes/manage-policies#verify-a-change) before testing traffic.
 
 ## HTTP APIs
 
-These recipes use `protocol: rest`, which lets OpenShell check each HTTP
+These examples use `protocol: rest`, which lets OpenShell check each HTTP
 request's method, path, and query values.
 
 ### Allow Read-Only Access
 
-Use this rule when a program needs to read from an HTTP API but must not change
+Use this rule when a binary needs to read from an HTTP API but must not change
 anything. The `read-only` preset permits `GET`, `HEAD`, and `OPTIONS`.
 
 <Tabs>
@@ -252,8 +376,8 @@ you expect, change the endpoint to `enforcement: enforce`.
 Package managers download packages with `GET` requests, so a read-only REST rule
 allows installs while blocking uploads. List the executable that opens the
 connection. `pip` and `npm` are scripts, so their rules list the Python or Node
-interpreter. Because a rule also matches programs that a listed binary launches,
-listing an interpreter lets any program running under it reach the registry.
+interpreter. Because a rule also applies to processes that a listed binary
+starts, listing an interpreter lets any script it runs reach the registry.
 
 ### Allow PyPI Downloads
 
@@ -381,7 +505,7 @@ instead of broadening the range when an address changes.
 
 ## Other Application Protocols
 
-These recipes inspect protocols carried over HTTP. Each one requires explicit
+These examples inspect protocols carried over HTTP. Each one requires explicit
 rules for the protocol's operations.
 
 ### Allow WebSocket Messages
@@ -422,7 +546,9 @@ frames or upstream-to-client messages. Provider-credentialed endpoints remain
 on the parsed relay and reject binary frames unless
 `allow_uninspected_credentials: true` explicitly accepts the weaker boundary.
 Set `websocket_credential_rewrite: true` only when client text messages contain
-OpenShell credential placeholders that must be resolved.
+OpenShell credential placeholders that must be resolved. When new network rules
+take effect, OpenShell closes the upgraded connection with close code `1012`, so
+the client must reconnect.
 
 ### Allow GraphQL Operations
 
@@ -588,7 +714,7 @@ Server-to-client messages are not parsed for policy enforcement.
 
 ## Uninspected Connections
 
-These recipes allow a connection without inspecting its application payload.
+These examples allow a connection without inspecting its application payload.
 OpenShell still checks the destination, port, and executable. Prefer an
 inspected protocol whenever the client supports it.
 
@@ -689,11 +815,10 @@ openshell sandbox exec -n my-sandbox --no-login-shell -- \
   https://secure.example.com/
 ```
 
-## Credentials on Endpoints
+## Provider Credentials
 
-A network rule that allows traffic does not authorize every provider credential
-at that destination. These recipes control where OpenShell supplies provider
-credentials.
+These examples control where OpenShell supplies provider credentials, as
+described in [Network Access and Credentials](#network-access-and-credentials).
 
 ### Bind a Provider Credential to an Endpoint
 
@@ -730,6 +855,8 @@ signing, refer to [AWS SigV4](/providers/aws-sigv4).
 
 ## Next Steps
 
+- Use [Manage Sandbox Policies](/sandboxes/manage-policies) to apply, verify,
+  and roll back policy changes.
 - Use the [Policy Schema Reference](/reference/policy-schema) for protocol
   defaults, field constraints, and matcher semantics.
 - Use [Troubleshoot Sandbox Policies](/sandboxes/troubleshoot-policies) to

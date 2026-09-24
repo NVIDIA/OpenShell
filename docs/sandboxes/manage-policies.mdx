@@ -5,7 +5,7 @@ title: "Manage Sandbox Policies"
 sidebar-title: "Manage Policies"
 description: "Create sandboxes with a policy, inspect and change sandbox policies, verify changes, roll back, and apply a gateway-wide policy."
 keywords: "Generative AI, Cybersecurity, Policy, Sandbox, CLI, Hot Reload, Revision"
-position: 2
+position: 3
 ---
 
 This page covers the tasks for working with sandbox policies: setting a policy
@@ -36,7 +36,7 @@ openshell sandbox create --name my-sandbox
 
 Without either, the sandbox uses a policy from its image or the restrictive
 [default policy](/reference/default-policy). Write the file from the
-[Network Policy Recipes](/sandboxes/network-policy-recipes) and the
+[Network Rules](/sandboxes/network-rules) examples and the
 [Policy Schema Reference](/reference/policy-schema).
 
 ## Ship a Policy in an Image
@@ -104,8 +104,8 @@ To view an earlier revision, add `--rev` with its version number, for example
 complete policy file. It edits only `network_policies` and preserves every
 other section.
 
-To give a program access to a service, add an endpoint that names the
-executable, the destination, and the permitted request types. For a sandbox
+To give a binary in the sandbox access to a service, add an endpoint that names
+the executable, the destination, and the permitted request types. For a sandbox
 containing `/usr/bin/curl`, this command adds read-only access to the GitHub
 API:
 
@@ -304,8 +304,8 @@ affected sandboxes before and after the change.
 
 ## Next Steps
 
-- Use [Network Policy Recipes](/sandboxes/network-policy-recipes) for rules you
-  can adapt to common services and protocols.
+- Use [Network Rules](/sandboxes/network-rules) for example rules you can
+  adapt to common services and protocols.
 - Use [Troubleshoot Sandbox Policies](/sandboxes/troubleshoot-policies) when a
   change fails to load or a request is denied unexpectedly.
 - Use the [Policy Command Reference](/reference/policy-updates) for every

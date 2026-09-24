@@ -9,8 +9,7 @@ position: 7
 ---
 
 This reference describes the `openshell policy` commands and the related
-sandbox commands that read or set a policy. For step-by-step workflows, refer to
-[Manage Sandbox Policies](/sandboxes/manage-policies).
+sandbox commands that read or set a policy.
 
 Every sandbox-scoped command accepts an optional sandbox name. When you omit it,
 the CLI uses the last sandbox you used on the current gateway and workspace, and
@@ -234,8 +233,7 @@ request path appended by `--add-allow` or `--add-deny`.
 ### Complete Scope Requirements
 
 A network rule allows each listed binary to reach each listed endpoint, as
-described in [Rules Pair Programs with
-Destinations](/sandboxes/policies#rules-pair-programs-with-destinations). An
+described in [Rule Structure](/sandboxes/network-rules#rule-structure). An
 append that silently widened that scope could authorize new binary and endpoint
 pairs, so the CLI requires complete affected scope for request-rule appends and
 for endpoint merges that could create new pairs.
