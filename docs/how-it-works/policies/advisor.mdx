@@ -5,7 +5,7 @@ title: "Use Policy Advisor"
 sidebar-title: "Advisor"
 description: "Let sandboxed agents propose narrow policy changes through policy.local while keeping developer approval in the loop."
 keywords: "Generative AI, Cybersecurity, Policy Advisor, Policy, Sandbox, policy.local, Agent Policy"
-position: 7
+position: 9
 ---
 
 Policy advisor lets a running sandboxed agent ask for a narrow network policy change after OpenShell denies a request. The agent submits a draft through `policy.local`, a developer approves or rejects it from outside the sandbox, and approved network policy hot-reloads into the same sandbox.
@@ -96,7 +96,7 @@ When policy advisor is enabled, the sandbox supervisor turns on three agent-faci
 - It serves `http://policy.local` from inside the sandbox.
 - It adds `agent_guidance` and `next_steps` to L7 `policy_denied` response bodies so the agent can find the skill and local API.
 
-The loop has seven steps:
+The loop has eight steps:
 
 1. A sandboxed process attempts a network request that policy denies.
 2. For inspected REST traffic, OpenShell returns a structured `403` body with fields such as `layer`, `host`, `port`, `binary`, `method`, `path`, `rule_missing`, `agent_guidance`, and `next_steps`.
@@ -191,7 +191,7 @@ For REST APIs, prefer L7 rules over broad L4 access. A good proposal allows one 
 }
 ```
 
-The current `policy.local` JSON shape covers explicit-proxy endpoints and REST method or path rules. Agent-authored proposals cannot set `protocol: tcp` or `tls: skip`, because those modes bypass application-authority inspection. When a task requires native TCP or a raw TLS tunnel, a developer must add the rule through the normal policy-authoring workflow. Omitting `protocol` remains supported and retains the explicit proxy's default TLS termination and HTTP authority checks. Use [Customize Sandbox Policies](/how-it-works/policies/overview) or [Policy Schema Reference](/how-it-works/policies/schema) for policy fields that are not part of the agent-authored proposal surface, such as WebSocket credential rewrite, GraphQL operation matching, endpoint path scoping, and provider-owned policy bundles.
+The current `policy.local` JSON shape covers explicit-proxy endpoints and REST method or path rules. Agent-authored proposals cannot set `protocol: tcp` or `tls: skip`, because those modes bypass application-authority inspection. When a task requires native TCP or a raw TLS tunnel, a developer must add the rule through the normal policy-authoring workflow. Omitting `protocol` remains supported and retains the explicit proxy's default TLS termination and HTTP authority checks. Use [Configure Sandbox Policies](/sandboxes/policies) or [Policy Schema Reference](/reference/policy-schema) for policy fields that are not part of the agent-authored proposal surface, such as WebSocket credential rewrite, GraphQL operation matching, endpoint path scoping, and provider-owned policy bundles.
 
 Policy advisor proposals do not add `allowed_ips` automatically. If an advisor-proposed hostname resolves to an internal or private address, OpenShell's SSRF protections still block the connection until a developer explicitly adds the required `allowed_ips` entry.
 
@@ -272,7 +272,11 @@ If policy advisor is disabled, every route returns `404 feature_disabled`, the s
 
 ## What to Expect
 
-Approved network rules hot-reload without restarting the sandbox. HTTP L7 keep-alive connections are closed at the reload boundary so the next parsed request uses the new policy. Raw streams remain connection-scoped, as described in [Customize Sandbox Policies](/how-it-works/policies/overview#policy-structure).
+Approved network rules hot-reload without restarting the sandbox. Connections
+attached to the previous policy generation close at the reload boundary, so a
+retry opens against the current generation. Refer to
+[Understand Reloads](/sandboxes/policies#understand-reloads) for HTTP,
+WebSocket, tunnel, and long-lived stream behavior.
 
 Policy advisor emits audit events into the sandbox log. Use these lines to trace the full loop:
 
@@ -284,6 +288,8 @@ Look for `HTTP:* DENIED`, `CONFIG:PROPOSED`, `CONFIG:APPROVED` or `CONFIG:REJECT
 
 ## Next Steps
 
-- Use [Customize Sandbox Policies](/how-it-works/policies/overview) for manual policy updates and L7 rule syntax.
-- Use [Policy Schema Reference](/how-it-works/policies/schema) for full YAML field details.
+- Use [Configure Sandbox Policies](/sandboxes/policies) for manual policy updates and L7 rule syntax.
+- Use [Policy Schema Reference](/reference/policy-schema) for full YAML field details.
+- Use the [Standalone Policy Prover](/reference/policy-prover) for optional
+  boundary checks and its explicit modeled-domain limits.
 - Use [Logging](/observability/logging) to interpret OCSF shorthand log entries.
