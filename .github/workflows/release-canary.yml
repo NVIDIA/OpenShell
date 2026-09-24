@@ -359,7 +359,6 @@ jobs:
             --set server.disableTls=true \
             --set server.auth.allowUnauthenticatedUsers=true \
             --set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}" \
-            --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
             --wait --timeout 5m
 
       - name: Verify gateway pod is Ready

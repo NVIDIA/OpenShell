@@ -791,12 +791,14 @@ gateway_namespace = "openshell"
 gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes.io/instance" = "openshell" }
 
 [openshell.drivers.kubernetes.sandbox_runtime]
-# Required acknowledgement that the cluster CNI enforces NetworkPolicy and the
-# sandbox namespaces prevent untrusted policy, pod, label, and Secret changes.
-network_policy_enforced = true
 # TLS-protected boundary listener reached only by the paired control pod.
 boundary_port = 5500
 ```
+
+The Kubernetes driver always creates the workload `NetworkPolicy` before
+releasing a sandbox Pod. Your cluster CNI must enforce ingress and egress
+`NetworkPolicy` in every sandbox namespace; the Kubernetes API does not verify
+enforcement.
 
 In managed workspace mode, the Kubernetes driver copies each explicitly named
 `image_pull_secrets` Secret from `namespace` into the managed workspace

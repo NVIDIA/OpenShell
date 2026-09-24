@@ -20,4 +20,3 @@ supervisor:
   # The local k3s cluster created by `mise run helm:k3s:create` enables its
   # built-in NetworkPolicy controller for sandbox namespaces.
   sandboxRuntime:
-    networkPolicyEnforced: true

@@ -11,7 +11,6 @@ trap 'rm -rf "${work_dir}"' EXIT
 helm template openshell "${repo_root}/deploy/helm/openshell" \
   --namespace openshell \
   --set agentSandbox.preflight.enabled=false \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set workspaceResources.enabled=false \
   >"${work_dir}/gateway.yaml"
 
@@ -41,7 +40,6 @@ fi
 helm template openshell "${repo_root}/deploy/helm/openshell" \
   --namespace openshell \
   --set agentSandbox.preflight.enabled=false \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set-json workspaceResources=null \
   >"${work_dir}/legacy-reuse-values.yaml"
 

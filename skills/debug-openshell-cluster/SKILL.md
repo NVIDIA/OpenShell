@@ -708,9 +708,8 @@ kubectl -n <sandbox-namespace> get sandbox <sandbox-name> -o jsonpath='{.spec.te
 ```
 
 The Kubernetes driver creates a sandbox workload Pod and a separate, directly
-managed supervisor Pod. Helm must render
-`network_policy_enforced = true`. This is an explicit operator assertion that
-the cluster CNI enforces Kubernetes NetworkPolicy; the Kubernetes API cannot
+managed supervisor Pod. The cluster CNI must enforce ingress and egress
+Kubernetes NetworkPolicy in every sandbox namespace; the Kubernetes API cannot
 attest enforcement. Run sandboxes only in a trusted namespace
 where tenants cannot create Pods, copy OpenShell role labels, or read the
 bootstrap Secret.

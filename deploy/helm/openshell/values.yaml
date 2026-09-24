@@ -70,8 +70,6 @@ supervisor:
     # -- Supervisor image digest. When set, this takes precedence over tag.
     digest: ""
   sandboxRuntime:
-    # -- Required operator acknowledgement that the cluster CNI enforces NetworkPolicy.
-    networkPolicyEnforced: false
     # -- Workload boundary TLS listener port.
     boundaryPort: 5500
 

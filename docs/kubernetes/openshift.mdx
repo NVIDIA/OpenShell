@@ -41,17 +41,23 @@ in the sandbox qualification output.
 - [Agent Sandbox](/kubernetes/setup#install-agent-sandbox) controller and CRDs.
 - A CNI that enforces ingress and egress `NetworkPolicy` in sandbox namespaces.
 
+<Warning>
+Your cluster MUST enforce ingress and egress `NetworkPolicy` in every sandbox
+namespace. OpenShell creates the policies, but Kubernetes does not verify that
+the CNI applies them. Without enforcement, sandbox workloads may bypass
+supervisor network policy through direct connections.
+</Warning>
+
 ## Install OpenShell
 
 Pre-create the namespace, then install the chart. Keep the default restricted
-security posture and acknowledge NetworkPolicy only after validating the CNI.
+security posture.
 
 ```shell
 oc create ns openshell
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
-  --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
+  --namespace openshell
 ```
 
 The driver reads the namespace's `openshift.io/sa.scc.uid-range` annotation and

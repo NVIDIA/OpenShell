@@ -81,9 +81,9 @@ and permits OpenShell supervisor Pods to reach the sandbox TLS port. The
 authenticated Sandbox Protocol binds each connection to the exact sandbox and
 supervisor Pod identities. Supervisors have normal egress for gateway, DNS,
 and policy-approved upstream connections unless an operator policy restricts
-them. Set
-`sandbox_runtime.network_policy_enforced = true` only after verifying that the cluster
-CNI enforces ingress and egress `NetworkPolicy` for sandbox namespaces.
+them. The cluster CNI must enforce ingress and egress `NetworkPolicy` for every
+sandbox namespace. Kubernetes accepts policy objects without confirming
+enforcement, so operators must verify CNI support before running sandboxes.
 
 Each sandbox generation uses two immutable bootstrap Secrets. A trusted init
 container stages the sandbox bootstrap into memory, and the sandbox removes it

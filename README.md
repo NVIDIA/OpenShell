@@ -41,12 +41,14 @@ The installer installs the latest stable release by default. See [Prerelease and
 **Kubernetes installation:**
 
 > **Experimental** — the Kubernetes deployment path is under active development. Expect rough edges and breaking changes.
+> **Required:** Your cluster CNI MUST enforce Kubernetes `NetworkPolicy` for
+> ingress and egress in every sandbox namespace. OpenShell creates the policies,
+> but Kubernetes does not verify that the CNI applies them.
 
 Deploy the OpenShell gateway into a Kubernetes cluster from the OCI chart published to GHCR:
 
 ```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart
 ```
 
 See [`deploy/helm/openshell/README.md`](deploy/helm/openshell/README.md) for available versions, dev tag conventions, and configuration.

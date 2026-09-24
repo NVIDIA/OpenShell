@@ -130,13 +130,6 @@ struct Args {
 
     #[arg(
         long,
-        env = "OPENSHELL_K8S_SANDBOX_RUNTIME_NETWORK_POLICY_ENFORCED",
-        default_value_t = false
-    )]
-    sandbox_runtime_network_policy_enforced: bool,
-
-    #[arg(
-        long,
         env = "OPENSHELL_K8S_SANDBOX_RUNTIME_BOUNDARY_PORT",
         default_value_t = 5500
     )]
@@ -270,7 +263,6 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(openshell_core::config::default_supervisor_image),
             supervisor_image_pull_policy: args.supervisor_image_pull_policy,
             sandbox_runtime: KubernetesSandboxRuntimeConfig {
-                network_policy_enforced: args.sandbox_runtime_network_policy_enforced,
                 boundary_port: args.sandbox_runtime_boundary_port,
             },
             https_proxy: args.https_proxy,

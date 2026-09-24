@@ -78,9 +78,6 @@ pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSandboxRuntimeConfig {
-    /// Explicit operator assertion that the cluster CNI enforces
-    /// `networking.k8s.io/v1` `NetworkPolicy` for the sandbox namespaces.
-    pub network_policy_enforced: bool,
     /// TCP port exposed by the workload boundary to its paired control pod.
     pub boundary_port: u16,
 }
@@ -88,7 +85,6 @@ pub struct KubernetesSandboxRuntimeConfig {
 impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
-            network_policy_enforced: false,
             boundary_port: 5500,
         }
     }
@@ -96,12 +92,6 @@ impl Default for KubernetesSandboxRuntimeConfig {
 
 impl KubernetesSandboxRuntimeConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if !self.network_policy_enforced {
-            return Err(
-                "sandbox_runtime.network_policy_enforced must be true after the operator has verified CNI NetworkPolicy enforcement"
-                    .to_string(),
-            );
-        }
         if self.boundary_port < 1024 {
             return Err("sandbox_runtime.boundary_port must be at least 1024".to_string());
         }
@@ -885,19 +875,6 @@ mod tests {
     fn default_workspace_storage_class_is_empty() {
         let cfg = KubernetesComputeConfig::default();
         assert!(cfg.workspace_storage_class.is_empty());
-    }
-
-    #[test]
-    fn sandbox_runtime_requires_network_policy_enforcement_acknowledgement() {
-        let mut cfg = KubernetesComputeConfig::default();
-        assert!(
-            cfg.validate_proxy_uid()
-                .unwrap_err()
-                .contains("network_policy_enforced")
-        );
-
-        cfg.sandbox_runtime.network_policy_enforced = true;
-        cfg.validate_proxy_uid().unwrap();
     }
 
     #[test]

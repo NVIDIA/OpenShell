@@ -109,7 +109,6 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --namespace openshell --create-namespace \
   --set server.disableTls=true \
   --set server.telemetryEnabled=false \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --wait --timeout 5m
 
 kubectl wait --namespace openshell \

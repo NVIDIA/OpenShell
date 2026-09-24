@@ -12,6 +12,14 @@ position: 1
 The OpenShell Helm chart is experimental and under active development. Templates, values, and defaults can change between releases. Do not use it in production.
 </Warning>
 
+<Warning>
+Your cluster MUST use a CNI that enforces Kubernetes `NetworkPolicy` for both
+ingress and egress in every sandbox namespace. OpenShell creates the policies,
+but Kubernetes accepts them even when no CNI enforces them. Without enforcement,
+sandbox workloads may reach the network directly and bypass supervisor policy.
+Verify CNI support before installing OpenShell.
+</Warning>
+
 Use the Kubernetes deployment when the gateway should run on a shared cluster, in a cloud environment, or as part of team infrastructure. The Helm chart handles PKI bootstrap, RBAC, sandbox namespace setup, and the gateway workload. It uses a StatefulSet by default for the SQLite database, and can render a Deployment when `server.externalDbSecret` points at an external database.
 
 ## Prerequisites
@@ -21,6 +29,7 @@ Make sure the following are in place before you install.
 | Prerequisite | Required | Notes |
 |---|---|---|
 | Kubernetes 1.29+ with RBAC enabled | Yes | No additional notes. |
+| CNI that enforces ingress and egress `NetworkPolicy` in sandbox namespaces | Yes | Verify enforcement on your cluster. |
 | Helm 3.x | Yes | No additional notes. |
 | Agent Sandbox controller and CRDs | Yes | Install before the OpenShell chart. Refer to [Install Agent Sandbox](#install-agent-sandbox). |
 | cert-manager | No | Refer to [Managing Certificates](/kubernetes/managing-certificates). Use cert-manager only if you prefer it over the built-in PKI job. |
@@ -85,8 +94,7 @@ Install from the OCI registry on GHCR. Replace `<version>` with the chart versio
 helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
-  --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
+  --namespace openshell
 ```
 
 To use the latest development build instead of a stable release:
@@ -95,8 +103,7 @@ To use the latest development build instead of a stable release:
 helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version 0.0.0-dev \
-  --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true
+  --namespace openshell
 ```
 
 The chart automatically generates PKI secrets on first install using pre-install Helm hooks. No manual secret creation is required.
@@ -111,7 +118,6 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set workspaceResources.enabled=false \
   --set server.sandboxNamespace=app-a
 
@@ -149,7 +155,6 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set server.credentialDrivers.kubernetesSecrets.enabled=true \
   --set server.credentialDrivers.kubernetesSecrets.namespace=openshell-credentials \
   --set server.credentialDrivers.kubernetesSecrets.createNamespace=true
@@ -237,7 +242,6 @@ The most commonly changed values are:
 | `server.auth.allowUnauthenticatedUsers` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |
 | `server.enableLoopbackServiceHttp` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
 | `pkiInitJob.serverDnsNames` / `certManager.serverDnsNames` | Additional gateway server DNS SANs. Wildcard SANs also enable sandbox service URLs under that domain. |
-| `supervisor.sandboxRuntime.networkPolicyEnforced` | Required acknowledgement that the cluster CNI enforces ingress and egress `NetworkPolicy` in sandbox namespaces. |
 | `supervisor.sandboxRuntime.boundaryPort` | Non-privileged TLS port used between paired supervisor and sandbox Pods. |
 | `upstreamProxy` | Operator-owned corporate HTTP forward proxy for policy-approved TLS egress. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
 
@@ -254,7 +258,6 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --values my-values.yaml
 ```
 
@@ -350,7 +353,6 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set serviceAccount.create=false \
   --set serviceAccount.name=my-existing-sa
 ```

@@ -232,7 +232,6 @@ data:
     gateway_pod_selector          = { "app.kubernetes.io/name" = {{ include "openshell.name" . | quote }}, "app.kubernetes.io/instance" = {{ .Release.Name | quote }} }
 
     [openshell.drivers.kubernetes.sandbox_runtime]
-    network_policy_enforced      = {{ .Values.supervisor.sandboxRuntime.networkPolicyEnforced }}
     boundary_port                = {{ .Values.supervisor.sandboxRuntime.boundaryPort | default 5500 }}
 
     {{- if not $credentialDrivers }}
