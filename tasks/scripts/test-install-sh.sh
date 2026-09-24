@@ -132,9 +132,51 @@ assert_linux_package_method "dev uses snap" dev 1 1 1 snap
 assert_linux_package_method "pre uses deb despite snap" pre 1 1 1 deb
 assert_linux_package_method "numbered prerelease uses deb despite snap" v0.1.0-pre.3 1 1 1 deb
 assert_linux_package_method "pre uses rpm despite snap" pre 1 0 1 rpm
-assert_linux_package_method "stable uses snap" v1.2.3 1 1 1 snap
+assert_linux_package_method "pinned stable uses deb despite snap" v1.2.3 1 1 1 deb
+assert_linux_package_method "pinned stable uses rpm despite snap" v1.2.3 1 0 1 rpm
 assert_linux_package_method "deb is selected without snap" "" 0 1 1 deb
+assert_linux_package_method "dev uses deb without snap" dev 0 1 1 deb
 assert_linux_package_method "rpm is selected without snap or deb" "" 0 0 1 rpm
+
+assert_native_install_blocked_by_snap() {
+  local name=$1
+  local requested_version=$2
+  local method=$3
+  local marker="${tmpdir}/native-install-called"
+  rm -f "$marker"
+
+  if (
+    export OPENSHELL_VERSION="$requested_version"
+    detect_platform() { printf 'linux\n'; }
+    linux_package_method() { printf '%s\n' "$method"; }
+    has_cmd() {
+      [ "$1" = snap ] || command -v "$1" >/dev/null 2>&1
+    }
+    snap() { [ "$1" = list ] && [ "$2" = openshell ]; }
+    resolve_release_tag() { touch "$marker"; }
+    install_linux_deb() { touch "$marker"; }
+    install_linux_rpm() { touch "$marker"; }
+    main
+  ) >"$out" 2>"$err"; then
+    echo "FAIL: ${name}: existing Snap must block native installation" >&2
+    exit 1
+  fi
+  if [ -e "$marker" ]; then
+    echo "FAIL: ${name}: release lookup or native installation ran before the Snap guard" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'remove the OpenShell Snap before installing a native package' "$err" ||
+    ! grep -Fq 'back up' "$err" ||
+    ! grep -Fq 'sudo snap remove openshell' "$err"; then
+    echo "FAIL: ${name}: missing Snap-to-native cleanup instructions" >&2
+    cat "$err" >&2
+    exit 1
+  fi
+}
+
+assert_native_install_blocked_by_snap "pre alias" pre deb
+assert_native_install_blocked_by_snap "exact prerelease" v0.1.0-pre.3 deb
+assert_native_install_blocked_by_snap "pinned stable release" v1.2.3 rpm
 
 if ! (
   find_existing_native_openshell_bin() { return 1; }
@@ -230,22 +272,15 @@ if [ -s "$err" ]; then
   exit 1
 fi
 
-for requested_version in v1.2.3; do
-  if ! OPENSHELL_VERSION="$requested_version" openshell_snap_channel >"$out" 2>"$err"; then
-    echo "FAIL: '${requested_version}' must select the latest/stable Snap channel" >&2
-    cat "$err" >&2 || true
-    exit 1
-  fi
-  if [ "$(cat "$out")" != "latest/stable" ]; then
-    echo "FAIL: '${requested_version}' must select the latest/stable Snap channel" >&2
-    exit 1
-  fi
-  if ! grep -Fq "OPENSHELL_VERSION=${requested_version} is ignored for Snap installs" "$err"; then
-    echo "FAIL: '${requested_version}' must warn that the requested version is ignored" >&2
-    cat "$err" >&2 || true
-    exit 1
-  fi
-done
+if (OPENSHELL_VERSION=v1.2.3 openshell_snap_channel) >"$out" 2>"$err"; then
+  echo "FAIL: pinned release must not select a Snap channel" >&2
+  exit 1
+fi
+if ! grep -Fq "Snap installs do not support OPENSHELL_VERSION=v1.2.3" "$err"; then
+  echo "FAIL: pinned release Snap rejection was not explained" >&2
+  cat "$err" >&2
+  exit 1
+fi
 rm -f "$out" "$err"
 
 assert_snap_install_flow() {
@@ -306,7 +341,7 @@ wait:gateway-status"
 
 assert_snap_install_flow \
   "existing OpenShell snap is refreshed" \
-  1 1 v1.2.3 \
+  1 1 "" \
   "wait:docker
 root:snap refresh openshell --channel=latest/stable
 ensure:gateway-config

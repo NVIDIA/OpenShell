@@ -66,16 +66,17 @@ NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
     from ${GITHUB_URL}/releases/latest.
 
-    On Linux, the installer uses the OpenShell snap whenever the snap command
-    is available, except for prereleases, which use Debian or RPM packages.
-    Snap installs use latest/edge when OPENSHELL_VERSION=dev and latest/stable
-    otherwise. The OpenShell snap requires a running Docker Engine installed
-    from a system package or Docker's package repository. The Docker snap is
-    not currently compatible with OpenShell.
+    On Linux, the installer uses the OpenShell snap when the snap command is
+    available and OPENSHELL_VERSION is unset or dev. Snap installs use
+    latest/stable by default and latest/edge for dev. Explicit release tags
+    and prereleases use Debian or RPM packages. The OpenShell snap requires a
+    running Docker Engine installed from a system package or Docker's package
+    repository. The Docker snap is not currently compatible with OpenShell.
 
-    For prereleases or without snap, Linux installs the Debian package on
-    amd64/arm64 or the RPM packages on x86_64/aarch64, depending on the host
-    package manager.
+    For explicit versions or without snap, Linux installs the Debian package
+    on amd64/arm64 or the RPM packages on x86_64/aarch64, depending on the
+    host package manager. Remove an existing OpenShell snap after backing up
+    and cleaning up its sandboxes before switching to a native package.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF
@@ -396,6 +397,28 @@ guard_native_to_snap_transition() {
   error "manual cleanup is required before replacing this non-snap OpenShell installation"
 }
 
+guard_snap_to_native_transition() {
+  has_cmd snap || return 0
+  snap list openshell >/dev/null 2>&1 || return 0
+
+  warn "detected an existing OpenShell Snap installation"
+  cat >&2 <<'EOF'
+
+The Snap gateway may already use port 17670, and native packages do not import
+Snap gateway or CLI state. Before installing a Debian or RPM package, back up
+any sandbox data and Snap state you need, then clean up existing sandboxes.
+
+Stop and remove the OpenShell Snap:
+
+    sudo snap stop openshell.gateway
+    sudo snap remove openshell
+
+Rerun the installer with the same OPENSHELL_VERSION after cleanup.
+
+EOF
+  error "remove the OpenShell Snap before installing a native package"
+}
+
 resolve_release_tag() {
   if [ "${OPENSHELL_VERSION:-}" = "pre" ]; then
     resolve_latest_prerelease_tag
@@ -658,10 +681,16 @@ local_gateway_endpoint() {
 }
 
 linux_package_method() {
-  if [ "${OPENSHELL_VERSION:-}" != "pre" ] &&
-    ! is_prerelease_tag "${OPENSHELL_VERSION:-}" && has_cmd snap; then
-    echo "snap"
-  elif has_cmd dpkg; then
+  case "${OPENSHELL_VERSION:-}" in
+    '' | dev)
+      if has_cmd snap; then
+        echo "snap"
+        return 0
+      fi
+      ;;
+  esac
+
+  if has_cmd dpkg; then
     echo "deb"
   elif has_cmd rpm; then
     echo "rpm"
@@ -1207,14 +1236,11 @@ install_linux_rpm() {
 }
 
 openshell_snap_channel() {
-  if [ "${OPENSHELL_VERSION:-}" = "dev" ]; then
-    printf '%s\n' "latest/edge"
-  else
-    if [ -n "${OPENSHELL_VERSION:-}" ]; then
-      warn "OPENSHELL_VERSION=${OPENSHELL_VERSION} is ignored for Snap installs; using latest/stable"
-    fi
-    printf '%s\n' "latest/stable"
-  fi
+  case "${OPENSHELL_VERSION:-}" in
+    dev) printf '%s\n' "latest/edge" ;;
+    '') printf '%s\n' "latest/stable" ;;
+    *) error "Snap installs do not support OPENSHELL_VERSION=${OPENSHELL_VERSION}; use a native package" ;;
+  esac
 }
 
 ensure_snap_gateway_config() {
@@ -1440,6 +1466,9 @@ main() {
   if [ "${LINUX_INSTALL_METHOD:-}" = "snap" ]; then
     guard_native_to_snap_transition
   else
+    if [ "$PLATFORM" = "linux" ]; then
+      guard_snap_to_native_transition
+    fi
     RELEASE_TAG="$(resolve_release_tag)"
     guard_breaking_upgrade
   fi
