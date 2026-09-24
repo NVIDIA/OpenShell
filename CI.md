@@ -191,6 +191,56 @@ association. Without artifact inputs, Trivy scans only the candidate's deploymen
 configuration.
 Dependency Review and Trivy Changes keep their separate comparison workflows.
 
+## Security finding dispositions
+
+CodeQL, Trivy, and Zizmor fail release qualification on HIGH/CRITICAL findings.
+`security-dispositions.toml` records findings that maintainers have reviewed and
+decided to defer or reject. A finding covered by a current entry does not fail
+the gate. The gate summary still lists it, with the entry's approver and expiry.
+The gate fails on a finding with no entry, a finding whose deferral has expired,
+or more findings at a path than the entry lists alerts for.
+
+The gate reads the file and its evaluator from the workflow revision, not from
+the scanned tag. Release Auto-Tag dispatches from `main`, so a disposition merged
+to `main` applies to the next pre-release and to re-runs of existing tags.
+
+Deferrals expire within these windows from first detection, keyed on the
+maintainers' assessed severity:
+
+| Assessed severity | Fix within |
+|---|---|
+| Critical | 7 days |
+| High | 14 days |
+| Medium | 30 days |
+| Low | 90 days |
+
+An entry can expire later only with an `sla_exception` explaining why. Scanner
+ratings map to the gate as follows: CodeQL security-severity 9.0 and above is
+critical and 7.0 to 8.9 is high; Trivy HIGH and CRITICAL are used as reported;
+Zizmor's highest level is High. `rejected` entries record findings that are not
+exploitable or not relevant, and they do not expire.
+
+To add an entry:
+
+1. List the alert numbers for the rule:
+
+   ```shell
+   gh api --paginate 'repos/NVIDIA/OpenShell/code-scanning/alerts?state=open&per_page=100' \
+     --jq '.[] | select(.rule.id == "zizmor/template-injection")
+       | [.number, .most_recent_instance.location.path, .created_at] | @tsv'
+   ```
+
+2. Add a `[[disposition]]` block. The header of `security-dispositions.toml`
+   describes each field. The `id` is the rule plus the lowest alert number, and
+   `first_seen` is the earliest alert's creation date.
+3. Check the file with `mise run test:security-dispositions`. Evaluate a
+   downloaded report with
+   `python3 tasks/scripts/security_dispositions.py gate --scanner zizmor --dispositions security-dispositions.toml zizmor-high.json`.
+
+Changes to the file require code-owner review. Remove an entry when the gate
+reports it as matching no findings. To extend an expired deferral, change
+`expires` in a pull request that explains the new date.
+
 ## Artifact scanning
 
 `Trivy Scan` is a self-contained `workflow_dispatch`/`workflow_call` step. It
