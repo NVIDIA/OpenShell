@@ -598,35 +598,6 @@ struct SandboxRecord {
     deleting: bool,
 }
 
-/// Resolve a lifecycle request to a registry key.
-///
-/// A non-empty `sandbox_id` is authoritative: resolution uses that id alone and
-/// never falls back to the name, so a request for an already-removed sandbox
-/// reports absence instead of matching a same-named sandbox in another
-/// workspace. Only a caller that supplies no id resolves by name, and because
-/// sandbox names are unique per workspace rather than globally, a name matching
-/// more than one record is rejected instead of decided by iteration order.
-fn resolve_record_id(
-    registry: &HashMap<String, SandboxRecord>,
-    sandbox_id: &str,
-    sandbox_name: &str,
-) -> Result<Option<String>, Status> {
-    if !sandbox_id.is_empty() {
-        return Ok(registry.get_key_value(sandbox_id).map(|(id, _)| id.clone()));
-    }
-
-    let mut matches = registry
-        .iter()
-        .filter(|(_, record)| record.snapshot.name == sandbox_name);
-    let first = matches.next().map(|(id, _)| id.clone());
-    if matches.next().is_some() {
-        return Err(Status::failed_precondition(format!(
-            "sandbox_name {sandbox_name} matched more than one sandbox; supply sandbox_id"
-        )));
-    }
-    Ok(first)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OverlayPreparation {
     Fresh,
@@ -1787,13 +1758,11 @@ impl VmDriver {
         Ok(())
     }
 
-    pub async fn stop_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
-        if !sandbox_id.is_empty() {
-            validate_sandbox_id(sandbox_id)?;
-        }
+    pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), Status> {
+        validate_sandbox_id(sandbox_id)?;
         let record_id = {
             let registry = self.registry.lock().await;
-            resolve_record_id(&registry, sandbox_id, sandbox_name)?
+            registry.get_key_value(sandbox_id).map(|(id, _)| id.clone())
         }
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
@@ -1865,26 +1834,21 @@ impl VmDriver {
     pub async fn start_sandbox(
         &self,
         sandbox_id: &str,
-        sandbox_name: &str,
         generation_id: &str,
         launch_authentication: Vec<u8>,
     ) -> Result<(), Status> {
-        if !sandbox_id.is_empty() {
-            validate_sandbox_id(sandbox_id)?;
-        }
+        validate_sandbox_id(sandbox_id)?;
         let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
             generation_id.to_string(),
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let (record_id, state_dir, already_running) = {
             let registry = self.registry.lock().await;
-            let id = resolve_record_id(&registry, sandbox_id, sandbox_name)?
-                .ok_or_else(|| Status::not_found("sandbox not found"))?;
-            let record = registry
-                .get(&id)
+            let (id, record) = registry
+                .get_key_value(sandbox_id)
                 .ok_or_else(|| Status::not_found("sandbox not found"))?;
             (
-                id,
+                id.clone(),
                 record.state_dir.clone(),
                 record.process.is_some() || record.provisioning_task.is_some(),
             )
@@ -1919,7 +1883,7 @@ impl VmDriver {
             // during startup recovery represents a new gateway session, so
             // restart the VM before installing it rather than leaving the old
             // supervisor connected with invalid credentials.
-            self.stop_sandbox(&record_id, sandbox_name).await?;
+            self.stop_sandbox(&record_id).await?;
         }
 
         remove_runtime_generation_material(&state_dir)
@@ -1985,22 +1949,15 @@ impl VmDriver {
             otel.name = "vm.teardown",
             otel.status_code = tracing::field::Empty,
             sandbox.id = %sandbox_id,
-            sandbox.name = %sandbox_name,
         )
     )]
-    pub async fn delete_sandbox(
-        &self,
-        sandbox_id: &str,
-        sandbox_name: &str,
-    ) -> Result<DeleteSandboxResponse, Status> {
+    pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<DeleteSandboxResponse, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        if !sandbox_id.is_empty() {
-            validate_sandbox_id(sandbox_id)?;
-        }
+        validate_sandbox_id(sandbox_id)?;
 
         let record_id = {
             let registry = self.registry.lock().await;
-            resolve_record_id(&registry, sandbox_id, sandbox_name)?
+            registry.get_key_value(sandbox_id).map(|(id, _)| id.clone())
         };
 
         let Some(record_id) = record_id else {
@@ -2061,26 +2018,13 @@ impl VmDriver {
         span_status.finish(Ok(DeleteSandboxResponse { deleted: true }))
     }
 
-    pub async fn get_sandbox(
-        &self,
-        sandbox_id: &str,
-        sandbox_name: &str,
-    ) -> Result<Option<Sandbox>, Status> {
-        if !sandbox_id.is_empty() {
-            validate_sandbox_id(sandbox_id)?;
-        }
+    pub async fn get_sandbox(&self, sandbox_id: &str) -> Result<Option<Sandbox>, Status> {
+        validate_sandbox_id(sandbox_id)?;
 
         let registry = self.registry.lock().await;
-        let sandbox = if sandbox_id.is_empty() {
-            registry
-                .values()
-                .find(|record| record.snapshot.name == sandbox_name)
-                .map(|record| record.snapshot.clone())
-        } else {
-            registry
-                .get(sandbox_id)
-                .map(|record| record.snapshot.clone())
-        };
+        let sandbox = registry
+            .get(sandbox_id)
+            .map(|record| record.snapshot.clone());
         Ok(sandbox)
     }
 
@@ -4403,22 +4347,10 @@ impl ComputeDriver for VmDriver {
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
         let request = request.into_inner();
-        if request.sandbox_id.is_empty() && request.name.is_empty() {
-            return Err(Status::invalid_argument(
-                "sandbox_id or sandbox_name is required",
-            ));
-        }
-
         let sandbox = self
-            .get_sandbox(&request.sandbox_id, &request.name)
+            .get_sandbox(&request.sandbox_id)
             .await?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
-
-        if !request.sandbox_id.is_empty() && request.sandbox_id != sandbox.id {
-            return Err(Status::failed_precondition(
-                "sandbox_id did not match the fetched sandbox",
-            ));
-        }
 
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
@@ -4439,8 +4371,7 @@ impl ComputeDriver for VmDriver {
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
         let request = request.into_inner();
-        self.stop_sandbox(&request.sandbox_id, &request.name)
-            .await?;
+        self.stop_sandbox(&request.sandbox_id).await?;
         Ok(Response::new(StopSandboxResponse {}))
     }
 
@@ -4451,7 +4382,6 @@ impl ComputeDriver for VmDriver {
         let request = request.into_inner();
         self.start_sandbox(
             &request.sandbox_id,
-            &request.name,
             &request.generation_id,
             request.launch_authentication,
         )
@@ -4464,9 +4394,7 @@ impl ComputeDriver for VmDriver {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let request = request.into_inner();
-        let response = self
-            .delete_sandbox(&request.sandbox_id, &request.name)
-            .await?;
+        let response = self.delete_sandbox(&request.sandbox_id).await?;
         Ok(Response::new(response))
     }
 
@@ -7292,7 +7220,6 @@ mod tests {
             client
                 .get_sandbox(request_with_traceparent(GetSandboxRequest {
                     sandbox_id: String::new(),
-                    name: String::new(),
                 }))
                 .await
                 .is_err()
@@ -7305,18 +7232,18 @@ mod tests {
             client
                 .stop_sandbox(request_with_traceparent(StopSandboxRequest {
                     sandbox_id: String::new(),
-                    name: String::new(),
                 }))
                 .await
                 .is_err()
         );
-        client
-            .delete_sandbox(request_with_traceparent(DeleteSandboxRequest {
-                sandbox_id: String::new(),
-                name: String::new(),
-            }))
-            .await
-            .unwrap();
+        assert!(
+            client
+                .delete_sandbox(request_with_traceparent(DeleteSandboxRequest {
+                    sandbox_id: String::new(),
+                }))
+                .await
+                .is_err()
+        );
         let watch = client
             .watch_sandboxes(request_with_traceparent(WatchSandboxesRequest {}))
             .await
@@ -7677,7 +7604,7 @@ mod tests {
         let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
         let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
 
-        assert!(driver.delete_sandbox("../invalid", "").await.is_err());
+        assert!(driver.delete_sandbox("../invalid").await.is_err());
 
         let spans = traced.exporter.get_finished_spans().unwrap();
         let deletion = spans
@@ -8750,12 +8677,7 @@ mod tests {
 
         let (fresh_authentication, _) = test_launch_authentication("fresh");
         let err = driver
-            .start_sandbox(
-                &sandbox.id,
-                &sandbox.name,
-                "g0000000000000001",
-                fresh_authentication,
-            )
+            .start_sandbox(&sandbox.id, "g0000000000000001", fresh_authentication)
             .await
             .expect_err("start without an image should fail");
 
@@ -8767,7 +8689,7 @@ mod tests {
             "failed start must retain its durable stop marker"
         );
         let restored = driver
-            .get_sandbox(&sandbox.id, &sandbox.name)
+            .get_sandbox(&sandbox.id)
             .await
             .unwrap()
             .expect("failed start must retain its stopped registry record");
@@ -8825,7 +8747,7 @@ mod tests {
         );
 
         driver
-            .start_sandbox(&sandbox.id, &sandbox.name, "g0000000000000001", Vec::new())
+            .start_sandbox(&sandbox.id, "g0000000000000001", Vec::new())
             .await
             .expect("matching already-running start must remain an idempotent no-op");
 
@@ -9777,7 +9699,7 @@ mod tests {
         .await;
 
         let err = driver
-            .delete_sandbox("sandbox-123", "sandbox-123")
+            .delete_sandbox("sandbox-123")
             .await
             .expect_err("state dir cleanup should fail for a file path");
         assert!(err.message().contains("not a directory"));
@@ -9799,7 +9721,7 @@ mod tests {
         }
 
         let response = driver
-            .delete_sandbox("sandbox-123", "sandbox-123")
+            .delete_sandbox("sandbox-123")
             .await
             .expect("delete retry should succeed once cleanup works");
         assert!(response.deleted);
@@ -9851,7 +9773,7 @@ mod tests {
         }
 
         let response = driver
-            .delete_sandbox("sandbox-123", "sandbox-123")
+            .delete_sandbox("sandbox-123")
             .await
             .expect("delete should handle accepted-but-not-started sandboxes");
         assert!(response.deleted);
@@ -11252,7 +11174,7 @@ mod tests {
         let beta = insert_named_record(&driver, "vm-beta", "demo", "beta").await;
 
         driver
-            .stop_sandbox("vm-beta", "demo")
+            .stop_sandbox("vm-beta")
             .await
             .expect("stop by id should be accepted");
 
@@ -11274,7 +11196,7 @@ mod tests {
         insert_named_record(&driver, "vm-beta", "demo", "beta").await;
 
         let response = driver
-            .delete_sandbox("vm-beta", "demo")
+            .delete_sandbox("vm-beta")
             .await
             .expect("delete by id should be accepted");
 
@@ -11296,7 +11218,7 @@ mod tests {
         insert_named_record(&driver, "vm-beta", "demo", "beta").await;
 
         let first = driver
-            .delete_sandbox("vm-beta", "demo")
+            .delete_sandbox("vm-beta")
             .await
             .expect("the first delete should be accepted");
         assert!(first.deleted);
@@ -11305,7 +11227,7 @@ mod tests {
         // ordinary caller behavior. The id is gone from the registry by now, and
         // resolving it by name instead would destroy the sandbox in `alpha`.
         let second = driver
-            .delete_sandbox("vm-beta", "demo")
+            .delete_sandbox("vm-beta")
             .await
             .expect("a repeated delete should be accepted");
 
@@ -11327,19 +11249,14 @@ mod tests {
         let alpha = insert_named_record(&driver, "vm-alpha", "demo", "alpha").await;
 
         let stop_error = driver
-            .stop_sandbox("vm-absent", "demo")
+            .stop_sandbox("vm-absent")
             .await
             .expect_err("a supplied id that is not registered must not resolve by name");
         assert_eq!(stop_error.code(), Code::NotFound);
 
         let (start_authentication, _) = test_launch_authentication("absent");
         let start_error = driver
-            .start_sandbox(
-                "vm-absent",
-                "demo",
-                "g0000000000000001",
-                start_authentication,
-            )
+            .start_sandbox("vm-absent", "g0000000000000001", start_authentication)
             .await
             .expect_err("a supplied id that is not registered must not resolve by name");
         assert_eq!(start_error.code(), Code::NotFound);
@@ -11351,30 +11268,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_name_only_request_matching_two_sandboxes_is_rejected() {
+    async fn lifecycle_requests_reject_an_empty_id() {
         let temp = tempfile::tempdir().unwrap();
         let driver = resolution_test_driver(temp.path());
         let alpha = insert_named_record(&driver, "vm-alpha", "demo", "alpha").await;
         let beta = insert_named_record(&driver, "vm-beta", "demo", "beta").await;
 
-        // Without an id the driver has nothing to disambiguate with: the request
-        // carries no workspace, and picking by iteration order would stop or
-        // delete an arbitrary one of the two.
         for error in [
-            driver.stop_sandbox("", "demo").await.unwrap_err(),
+            driver.stop_sandbox("").await.unwrap_err(),
             driver
                 .start_sandbox(
                     "",
-                    "demo",
                     "g0000000000000001",
                     test_launch_authentication("ambiguous").0,
                 )
                 .await
                 .unwrap_err(),
-            driver.delete_sandbox("", "demo").await.unwrap_err(),
+            driver.delete_sandbox("").await.unwrap_err(),
         ] {
-            assert_eq!(error.code(), Code::FailedPrecondition);
-            assert!(error.message().contains("matched more than one sandbox"));
+            assert_eq!(error.code(), Code::InvalidArgument);
+            assert_eq!(error.message(), "sandbox id is required");
         }
 
         let registry = driver.registry.lock().await;
@@ -11382,20 +11295,5 @@ mod tests {
         assert!(registry.contains_key("vm-beta"));
         assert!(!alpha.join(SANDBOX_STOPPED_FILE).exists());
         assert!(!beta.join(SANDBOX_STOPPED_FILE).exists());
-    }
-
-    #[tokio::test]
-    async fn a_name_only_request_still_resolves_a_unique_name() {
-        let temp = tempfile::tempdir().unwrap();
-        let driver = resolution_test_driver(temp.path());
-        let alpha = insert_named_record(&driver, "vm-alpha", "demo", "alpha").await;
-        insert_named_record(&driver, "vm-beta", "other", "beta").await;
-
-        driver
-            .stop_sandbox("", "demo")
-            .await
-            .expect("an unambiguous name-only stop should still resolve");
-
-        assert!(alpha.join(SANDBOX_STOPPED_FILE).exists());
     }
 }

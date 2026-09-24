@@ -1282,7 +1282,7 @@ impl ComputeRuntime {
     async fn delete_backend_after_failed_create(
         &self,
         sandbox_id: &str,
-        sandbox_name: &str,
+        _sandbox_name: &str,
     ) -> Result<bool, Status> {
         self.driver
             .call(
@@ -1290,13 +1290,9 @@ impl ComputeRuntime {
                 Some(sandbox_id),
                 |driver| {
                     let sandbox_id = sandbox_id.to_string();
-                    let sandbox_name = sandbox_name.to_string();
                     async move {
                         driver
-                            .delete_sandbox(Request::new(DeleteSandboxRequest {
-                                sandbox_id,
-                                name: sandbox_name,
-                            }))
+                            .delete_sandbox(Request::new(DeleteSandboxRequest { sandbox_id }))
                             .await
                     }
                 },
@@ -1397,7 +1393,7 @@ impl ComputeRuntime {
     async fn complete_sandbox_stop(
         &self,
         sandbox_id: String,
-        sandbox_name: String,
+        _sandbox_name: String,
         previous: Sandbox,
         stopping: Sandbox,
         lifecycle_guard: SandboxLifecycleGuard,
@@ -1409,13 +1405,9 @@ impl ComputeRuntime {
                 Some(&sandbox_id),
                 |driver| {
                     let sandbox_id = sandbox_id.clone();
-                    let sandbox_name = sandbox_name.clone();
                     async move {
                         driver
-                            .stop_sandbox(Request::new(StopSandboxRequest {
-                                sandbox_id,
-                                name: sandbox_name,
-                            }))
+                            .stop_sandbox(Request::new(StopSandboxRequest { sandbox_id }))
                             .await
                     }
                 },
@@ -1690,7 +1682,7 @@ impl ComputeRuntime {
     async fn complete_sandbox_start(
         &self,
         sandbox_id: String,
-        sandbox_name: String,
+        _sandbox_name: String,
         previous: Sandbox,
         starting: Sandbox,
         lifecycle_guard: SandboxLifecycleGuard,
@@ -1715,12 +1707,10 @@ impl ComputeRuntime {
                     Some(&sandbox_id),
                     |driver| {
                         let sandbox_id = sandbox_id.clone();
-                        let sandbox_name = sandbox_name.clone();
                         async move {
                             driver
                                 .start_sandbox(Request::new(StartSandboxRequest {
                                     sandbox_id,
-                                    name: sandbox_name,
                                     launch_authentication,
                                     generation_id,
                                     expected_runtime_identity,
@@ -1911,7 +1901,6 @@ impl ComputeRuntime {
         original: Status,
     ) -> Status {
         let sandbox_id = starting.object_id();
-        let sandbox_name = starting.object_name();
         let stop_result = self
             .driver
             .call(
@@ -1919,13 +1908,9 @@ impl ComputeRuntime {
                 Some(sandbox_id),
                 |driver| {
                     let sandbox_id = sandbox_id.to_string();
-                    let sandbox_name = sandbox_name.to_string();
                     async move {
                         driver
-                            .stop_sandbox(Request::new(StopSandboxRequest {
-                                sandbox_id,
-                                name: sandbox_name,
-                            }))
+                            .stop_sandbox(Request::new(StopSandboxRequest { sandbox_id }))
                             .await
                     }
                 },
@@ -2249,13 +2234,9 @@ impl ComputeRuntime {
                 Some(transition.deleting.object_id()),
                 |driver| {
                     let sandbox_id = transition.deleting.object_id().to_string();
-                    let sandbox_name = transition.deleting.object_name().to_string();
                     async move {
                         driver
-                            .delete_sandbox(Request::new(DeleteSandboxRequest {
-                                sandbox_id,
-                                name: sandbox_name,
-                            }))
+                            .delete_sandbox(Request::new(DeleteSandboxRequest { sandbox_id }))
                             .await
                     }
                 },
@@ -2844,13 +2825,9 @@ impl ComputeRuntime {
                         Some(&sandbox_id),
                         |driver| {
                             let sandbox_id = sandbox_id.clone();
-                            let sandbox_name = sandbox_name.clone();
                             async move {
                                 driver
-                                    .stop_sandbox(Request::new(StopSandboxRequest {
-                                        sandbox_id,
-                                        name: sandbox_name,
-                                    }))
+                                    .stop_sandbox(Request::new(StopSandboxRequest { sandbox_id }))
                                     .await
                             }
                         },
@@ -2990,7 +2967,6 @@ impl ComputeRuntime {
                 continue;
             }
 
-            let sandbox_name = sandbox.object_name().to_string();
             let generation_id = match sandbox_runtime_generation(&sandbox) {
                 Ok(generation) => generation.into_string(),
                 Err(error) => {
@@ -3032,14 +3008,12 @@ impl ComputeRuntime {
                         Some(&sandbox_id),
                         |driver| {
                             let sandbox_id = sandbox_id.clone();
-                            let sandbox_name = sandbox_name.clone();
                             let launch_authentication = launch_authentication.clone();
                             let expected_runtime_identity = expected_runtime_identity.clone();
                             async move {
                                 driver
                                     .start_sandbox(Request::new(StartSandboxRequest {
                                         sandbox_id,
-                                        name: sandbox_name,
                                         launch_authentication,
                                         generation_id,
                                         expected_runtime_identity,
@@ -3208,7 +3182,6 @@ impl ComputeRuntime {
                 }
                 SandboxPhase::Stopping => {
                     let sandbox_id = sandbox.object_id().to_string();
-                    let sandbox_name = sandbox.object_name().to_string();
                     let driver_sandbox_id = sandbox_id.clone();
                     match self
                         .driver
@@ -3219,7 +3192,6 @@ impl ComputeRuntime {
                                 driver
                                     .stop_sandbox(Request::new(StopSandboxRequest {
                                         sandbox_id: driver_sandbox_id,
-                                        name: sandbox_name,
                                     }))
                                     .await
                             },
@@ -3269,7 +3241,6 @@ impl ComputeRuntime {
                         continue;
                     }
                     let sandbox_id = sandbox.object_id().to_string();
-                    let sandbox_name = sandbox.object_name().to_string();
                     let driver_sandbox_id = sandbox_id.clone();
                     let generation_id = match sandbox_runtime_generation(&sandbox) {
                         Ok(generation) => generation.into_string(),
@@ -3288,7 +3259,6 @@ impl ComputeRuntime {
                                 driver
                                     .start_sandbox(Request::new(StartSandboxRequest {
                                         sandbox_id: driver_sandbox_id,
-                                        name: sandbox_name,
                                         launch_authentication: Vec::new(),
                                         generation_id,
                                         expected_runtime_identity,
@@ -4358,13 +4328,9 @@ impl ComputeRuntime {
                 Some(sandbox_id),
                 |driver| {
                     let sandbox_id = sandbox_id.to_string();
-                    let sandbox_name = sandbox_name.to_string();
                     async move {
                         driver
-                            .delete_sandbox(Request::new(DeleteSandboxRequest {
-                                sandbox_id,
-                                name: sandbox_name,
-                            }))
+                            .delete_sandbox(Request::new(DeleteSandboxRequest { sandbox_id }))
                             .await
                     }
                 },
@@ -4690,7 +4656,7 @@ impl ComputeRuntime {
     async fn get_driver_sandbox(
         &self,
         sandbox_id: &str,
-        sandbox_name: &str,
+        _sandbox_name: &str,
     ) -> Result<Option<DriverSandbox>, String> {
         match self
             .driver
@@ -4699,13 +4665,9 @@ impl ComputeRuntime {
                 Some(sandbox_id),
                 |driver| {
                     let sandbox_id = sandbox_id.to_string();
-                    let sandbox_name = sandbox_name.to_string();
                     async move {
                         driver
-                            .get_sandbox(Request::new(GetSandboxRequest {
-                                sandbox_id,
-                                name: sandbox_name,
-                            }))
+                            .get_sandbox(Request::new(GetSandboxRequest { sandbox_id }))
                             .await
                     }
                 },
@@ -6634,18 +6596,9 @@ mod tests {
             };
             let sandbox = current
                 .iter()
-                .find(|sandbox| {
-                    sandbox.name == request.name
-                        && (request.sandbox_id.is_empty() || sandbox.id == request.sandbox_id)
-                })
+                .find(|sandbox| sandbox.id == request.sandbox_id)
                 .cloned()
                 .ok_or_else(|| Status::not_found("sandbox not found"))?;
-
-            if !request.sandbox_id.is_empty() && request.sandbox_id != sandbox.id {
-                return Err(Status::failed_precondition(
-                    "sandbox_id did not match the fetched sandbox",
-                ));
-            }
 
             Ok(tonic::Response::new(GetSandboxResponse {
                 sandbox: Some(sandbox),
@@ -6764,7 +6717,7 @@ mod tests {
         delete_release: Semaphore,
         delete_blocked: AtomicBool,
         delete_calls: AtomicUsize,
-        delete_requests: TestMutex<Vec<(String, String)>>,
+        delete_requests: TestMutex<Vec<String>>,
         delete_outcome: TestMutex<ControlledDeleteOutcome>,
         create_started: Notify,
         create_release: Semaphore,
@@ -6774,14 +6727,14 @@ mod tests {
         stop_release: Semaphore,
         stop_blocked: AtomicBool,
         stop_calls: AtomicUsize,
-        stop_requests: TestMutex<Vec<(String, String)>>,
+        stop_requests: TestMutex<Vec<String>>,
         stop_outcome: TestMutex<ControlledLifecycleOutcome>,
         start_started: Notify,
         start_finished: Notify,
         start_release: Semaphore,
         start_blocked: AtomicBool,
         start_calls: AtomicUsize,
-        start_requests: TestMutex<Vec<(String, String)>>,
+        start_requests: TestMutex<Vec<String>>,
         start_authentications: TestMutex<Vec<Vec<u8>>>,
         start_expected_runtime_identities: TestMutex<Vec<String>>,
         start_outcome: TestMutex<ControlledLifecycleOutcome>,
@@ -6908,7 +6861,7 @@ mod tests {
             self.delete_calls.load(Ordering::SeqCst)
         }
 
-        fn delete_requests(&self) -> Vec<(String, String)> {
+        fn delete_requests(&self) -> Vec<String> {
             self.delete_requests
                 .lock()
                 .expect("delete requests lock poisoned")
@@ -6919,7 +6872,7 @@ mod tests {
             self.stop_calls.load(Ordering::SeqCst)
         }
 
-        fn stop_requests(&self) -> Vec<(String, String)> {
+        fn stop_requests(&self) -> Vec<String> {
             self.stop_requests
                 .lock()
                 .expect("stop requests lock poisoned")
@@ -6930,7 +6883,7 @@ mod tests {
             self.start_calls.load(Ordering::SeqCst)
         }
 
-        fn start_requests(&self) -> Vec<(String, String)> {
+        fn start_requests(&self) -> Vec<String> {
             self.start_requests
                 .lock()
                 .expect("start requests lock poisoned")
@@ -7078,7 +7031,7 @@ mod tests {
             self.stop_requests
                 .lock()
                 .expect("stop requests lock poisoned")
-                .push((request.sandbox_id, request.name));
+                .push(request.sandbox_id);
             self.stop_calls.fetch_add(1, Ordering::SeqCst);
             self.stop_started.notify_one();
             if self.stop_blocked.load(Ordering::SeqCst) {
@@ -7109,7 +7062,7 @@ mod tests {
             self.start_requests
                 .lock()
                 .expect("start requests lock poisoned")
-                .push((request.sandbox_id, request.name));
+                .push(request.sandbox_id);
             self.start_authentications
                 .lock()
                 .expect("start authentications lock poisoned")
@@ -7154,7 +7107,7 @@ mod tests {
             self.delete_requests
                 .lock()
                 .expect("delete requests lock poisoned")
-                .push((request.sandbox_id, request.name));
+                .push(request.sandbox_id);
             self.delete_calls.fetch_add(1, Ordering::SeqCst);
             self.delete_started.notify_one();
             if self.delete_blocked.load(Ordering::SeqCst) {
@@ -7331,10 +7284,7 @@ mod tests {
         assert_eq!(driver.delete_calls(), 1);
         assert_eq!(
             driver.delete_requests(),
-            vec![(
-                sandbox.object_id().to_string(),
-                sandbox.object_name().to_string()
-            )]
+            vec![sandbox.object_id().to_string()]
         );
         assert!(
             runtime
@@ -7456,10 +7406,7 @@ mod tests {
         assert_eq!(driver.delete_calls(), 1);
         assert_eq!(
             driver.delete_requests(),
-            vec![(
-                sandbox.object_id().to_string(),
-                sandbox.object_name().to_string()
-            )]
+            vec![sandbox.object_id().to_string()]
         );
         let retained = runtime
             .store
@@ -10981,10 +10928,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("background driver cleanup did not run");
-        assert_eq!(
-            driver.delete_requests(),
-            vec![("sb-1".to_string(), "sandbox-a".to_string())]
-        );
+        assert_eq!(driver.delete_requests(), vec!["sb-1".to_string()]);
         assert_sandbox_owned_records(&runtime, &sandbox, &session, false).await;
         assert!(
             runtime
@@ -11060,10 +11004,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("background driver cleanup did not run");
-        assert_eq!(
-            driver.delete_requests(),
-            vec![("sb-1".to_string(), "sandbox-a".to_string())]
-        );
+        assert_eq!(driver.delete_requests(), vec!["sb-1".to_string()]);
     }
 
     #[tokio::test]
@@ -12693,11 +12634,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut called_ids = driver
-            .stop_requests()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect::<Vec<_>>();
+        let mut called_ids = driver.stop_requests().into_iter().collect::<Vec<_>>();
         called_ids.sort();
         assert_eq!(
             called_ids,
@@ -12925,11 +12862,7 @@ mod tests {
 
         runtime.start_persisted_sandboxes().await.unwrap();
 
-        let mut called_ids = driver
-            .start_requests()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect::<Vec<_>>();
+        let mut called_ids = driver.start_requests().into_iter().collect::<Vec<_>>();
         called_ids.sort();
         assert_eq!(
             called_ids,
@@ -13146,7 +13079,7 @@ mod tests {
 
             assert_eq!(
                 driver.start_requests(),
-                vec![("sb-1".to_string(), "local".to_string())],
+                vec!["sb-1".to_string()],
                 "{driver_name} should reconcile persisted running intent"
             );
         }
@@ -13429,7 +13362,6 @@ mod tests {
             remote
                 .get_sandbox(Request::new(GetSandboxRequest {
                     sandbox_id: sandbox.id.clone(),
-                    name: String::new(),
                 }))
                 .await
                 .unwrap();
@@ -13440,7 +13372,6 @@ mod tests {
             remote
                 .stop_sandbox(Request::new(StopSandboxRequest {
                     sandbox_id: sandbox.id.clone(),
-                    name: String::new(),
                 }))
                 .await
                 .unwrap();
@@ -13451,7 +13382,6 @@ mod tests {
             remote
                 .delete_sandbox(Request::new(DeleteSandboxRequest {
                     sandbox_id: sandbox.id,
-                    name: String::new(),
                 }))
                 .await
                 .unwrap();
@@ -13617,16 +13547,16 @@ mod tests {
             .unwrap();
         assert!(matches!(
             driver.calls().as_slice(),
-            [FakeComputeDriverCall::StopSandbox { sandbox_id, sandbox_name }]
-                if sandbox_id == "sb-uds" && sandbox_name == "uds-sandbox"
+            [FakeComputeDriverCall::StopSandbox { sandbox_id }]
+                if sandbox_id == "sb-uds"
         ));
 
         driver.clear_calls();
         runtime.start_persisted_sandboxes().await.unwrap();
         assert!(matches!(
             driver.calls().as_slice(),
-            [FakeComputeDriverCall::GetCapabilities, FakeComputeDriverCall::StartSandbox { sandbox_id, sandbox_name }]
-                if sandbox_id == "sb-uds" && sandbox_name == "uds-sandbox"
+            [FakeComputeDriverCall::GetCapabilities, FakeComputeDriverCall::StartSandbox { sandbox_id }]
+                if sandbox_id == "sb-uds"
         ));
         driver.clear_calls();
         assert!(
@@ -13640,12 +13570,8 @@ mod tests {
         let calls = driver.calls();
         assert_eq!(calls.len(), 1, "unexpected calls: {calls:?}");
         match &calls[0] {
-            FakeComputeDriverCall::DeleteSandbox {
-                sandbox_id,
-                sandbox_name,
-            } => {
+            FakeComputeDriverCall::DeleteSandbox { sandbox_id } => {
                 assert_eq!(sandbox_id, "sb-uds");
-                assert_eq!(sandbox_name, "uds-sandbox");
             }
             other => panic!("expected DeleteSandbox call, got {other:?}"),
         }

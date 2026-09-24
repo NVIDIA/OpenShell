@@ -726,7 +726,6 @@ async fn start_sandbox_span_does_not_capture_launch_authentication() {
     test_driver_with_config(runtime_config())
         .start_sandbox(
             "sandbox-1",
-            "sandbox",
             "invalid-generation",
             b"secret-launch-authentication",
         )
@@ -817,11 +816,9 @@ async fn tracing_direct_start_exports_a_docker_start_span() {
     let subscriber = tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider));
     let driver = test_driver_with_config(runtime_config());
 
-    Box::pin(
-        DockerComputeDriver::start_sandbox(&driver, "", "", "", &[]).with_subscriber(subscriber),
-    )
-    .await
-    .expect_err("missing identifier should fail");
+    Box::pin(DockerComputeDriver::start_sandbox(&driver, "", "", &[]).with_subscriber(subscriber))
+        .await
+        .expect_err("missing identifier should fail");
     provider.force_flush().unwrap();
 
     let spans = exporter.get_finished_spans().unwrap();
@@ -2687,19 +2684,12 @@ fn docker_info_reports_wsl2_rejects_plain_linux() {
 }
 
 #[test]
-fn require_sandbox_identifier_rejects_when_id_and_name_are_empty() {
-    // Regression test: `delete_sandbox` (and the other identifier-keyed
-    // RPCs) must refuse requests where both the id and the name are
-    // empty. Otherwise the empty filters fed to
-    // `find_managed_container_summary` match the first managed container
-    // in the namespace, allowing an arbitrary sandbox to be deleted.
-    let err = require_sandbox_identifier("", "").unwrap_err();
+fn require_sandbox_id_rejects_empty_id() {
+    let err = require_sandbox_id("").unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    assert!(err.message().contains("sandbox_id or sandbox_name"));
+    assert!(err.message().contains("sandbox_id"));
 
-    require_sandbox_identifier("sbx-1", "").expect("id-only is accepted");
-    require_sandbox_identifier("", "demo").expect("name-only is accepted");
-    require_sandbox_identifier("sbx-1", "demo").expect("id and name is accepted");
+    require_sandbox_id("sbx-1").expect("non-empty id is accepted");
 }
 
 #[test]
@@ -2976,22 +2966,6 @@ fn pending_sandbox_snapshot_uses_docker_namespace_and_starting_condition() {
     assert_eq!(snapshot.name, "demo");
     assert_eq!(snapshot.namespace, "docker-dev");
     assert!(snapshot.spec.is_none());
-    let pending = HashMap::from([(
-        snapshot.id.clone(),
-        PendingSandboxRecord {
-            sandbox: snapshot.clone(),
-            task: None,
-        },
-    )]);
-    assert_eq!(
-        pending_sandbox_record_id(&pending, "sbx-123", "wrong-name").unwrap(),
-        Some("sbx-123".to_string())
-    );
-    assert_eq!(
-        pending_sandbox_record_id(&pending, "", "demo").unwrap(),
-        Some("sbx-123".to_string())
-    );
-
     let status = snapshot.status.expect("status");
     assert!(!status.deleting);
     assert_eq!(status.name, "demo");
@@ -3000,34 +2974,6 @@ fn pending_sandbox_snapshot_uses_docker_namespace_and_starting_condition() {
     assert_eq!(status.conditions[0].status, "False");
     assert_eq!(status.conditions[0].reason, "Starting");
     assert_eq!(status.conditions[0].message, "Docker container is starting");
-}
-
-#[test]
-fn pending_lookup_is_id_authoritative_and_rejects_ambiguous_names() {
-    let mut alpha = test_sandbox();
-    alpha.id = "sbx-alpha".to_string();
-    alpha.workspace = "workspace-alpha".to_string();
-    let mut beta = alpha.clone();
-    beta.id = "sbx-beta".to_string();
-    beta.workspace = "workspace-beta".to_string();
-    let pending = [alpha, beta]
-        .into_iter()
-        .map(|sandbox| {
-            (
-                sandbox.id.clone(),
-                PendingSandboxRecord {
-                    sandbox,
-                    task: None,
-                },
-            )
-        })
-        .collect();
-
-    assert_eq!(
-        pending_sandbox_record_id(&pending, "sbx-alpha", "demo").unwrap(),
-        Some("sbx-alpha".to_string())
-    );
-    assert!(pending_sandbox_record_id(&pending, "", "demo").is_err());
 }
 
 #[test]
@@ -3292,12 +3238,11 @@ fn lifecycle_fence_rejects_polled_exit_from_before_restart() {
     fences.finish_start("sandbox-1");
     assert!(!fences.start_in_progress("sandbox-1"));
 
-    fences.request_stop("sandbox-1", "demo");
-    assert!(fences.stop_requested("sandbox-1", ""));
-    assert!(fences.stop_requested("", "demo"));
-    fences.clear_stop("sandbox-1", "demo");
-    assert!(!fences.stop_requested("sandbox-1", "demo"));
-    fences.request_stop("sandbox-1", "demo");
+    fences.request_stop("sandbox-1");
+    assert!(fences.stop_requested("sandbox-1"));
+    fences.clear_stop("sandbox-1");
+    assert!(!fences.stop_requested("sandbox-1"));
+    fences.request_stop("sandbox-1");
 
     fences.record_previous_exit("sandbox-1", Some("2026-08-12T16:39:13Z"));
     assert_eq!(
@@ -3333,10 +3278,9 @@ fn lifecycle_fence_rejects_polled_exit_from_before_restart() {
         Some(&new_exit),
     ));
 
-    fences.remove("sandbox-1", "demo");
+    fences.remove("sandbox-1");
     assert!(fences.previous_exit("sandbox-1").is_none());
-    assert!(!fences.stop_requested("sandbox-1", ""));
-    assert!(!fences.stop_requested("", "demo"));
+    assert!(!fences.stop_requested("sandbox-1"));
 }
 
 fn exited_sandbox_with_ready_reason(reason: &str) -> DriverSandbox {

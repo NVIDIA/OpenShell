@@ -501,9 +501,9 @@ impl super::ComputeRuntime {
         expired: &openshell_core::proto::Sandbox,
         lifecycle_guard: &super::SandboxLifecycleGuard,
     ) -> Result<(), String> {
+        use openshell_core::ObjectId;
         use openshell_core::proto::Sandbox;
         use openshell_core::proto::compute::v1::StopSandboxRequest;
-        use openshell_core::{ObjectId, ObjectName};
         let current = {
             let _global_guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
             self.store
@@ -573,7 +573,6 @@ impl super::ComputeRuntime {
                 .map_err(|error| error.to_string())?;
         }
         let sandbox_id = expired.object_id().to_string();
-        let sandbox_name = expired.object_name().to_string();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             self.driver.call(
@@ -583,10 +582,7 @@ impl super::ComputeRuntime {
                     let sandbox_id = sandbox_id.clone();
                     async move {
                         driver
-                            .stop_sandbox(tonic::Request::new(StopSandboxRequest {
-                                sandbox_id,
-                                name: sandbox_name,
-                            }))
+                            .stop_sandbox(tonic::Request::new(StopSandboxRequest { sandbox_id }))
                             .await
                     }
                 },

@@ -21,6 +21,10 @@ changing existing APIs; generated SDK naming follows from these definitions.
   `driver_name`, `runtime_class_name`, `rule_name`, and `middleware_name`.
 - Public callers reference entities by canonical name. Keep immutable IDs at
   authentication, persistence, compute-driver, and other internal boundaries.
+- Compute-driver sandbox lifecycle requests use the gateway-assigned
+  `sandbox_id` as their sole resource reference. `DriverSandbox.name` and
+  `DriverSandbox.workspace` are observation metadata and must not be used as
+  lookup keys by a driver.
 
 For example:
 

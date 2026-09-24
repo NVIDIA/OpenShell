@@ -94,29 +94,13 @@ pub fn authenticate_as_dev_user(mut request: Request<()>) -> Result<Request<()>,
 #[derive(Debug, Clone, PartialEq)]
 pub enum FakeComputeDriverCall {
     GetCapabilities,
-    ValidateSandboxCreate {
-        sandbox: Option<DriverSandbox>,
-    },
-    GetSandbox {
-        sandbox_id: String,
-        sandbox_name: String,
-    },
+    ValidateSandboxCreate { sandbox: Option<DriverSandbox> },
+    GetSandbox { sandbox_id: String },
     ListSandboxes,
-    CreateSandbox {
-        sandbox: Option<DriverSandbox>,
-    },
-    StopSandbox {
-        sandbox_id: String,
-        sandbox_name: String,
-    },
-    StartSandbox {
-        sandbox_id: String,
-        sandbox_name: String,
-    },
-    DeleteSandbox {
-        sandbox_id: String,
-        sandbox_name: String,
-    },
+    CreateSandbox { sandbox: Option<DriverSandbox> },
+    StopSandbox { sandbox_id: String },
+    StartSandbox { sandbox_id: String },
+    DeleteSandbox { sandbox_id: String },
     WatchSandboxes,
 }
 
@@ -331,15 +315,11 @@ impl ComputeDriver for FakeComputeDriver {
         let sandbox = self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::GetSandbox {
                 sandbox_id: request.sandbox_id.clone(),
-                sandbox_name: request.name.clone(),
             });
             state
                 .sandboxes
                 .values()
-                .find(|sandbox| {
-                    (!request.sandbox_id.is_empty() && sandbox.id == request.sandbox_id)
-                        || (!request.name.is_empty() && sandbox.name == request.name)
-                })
+                .find(|sandbox| sandbox.id == request.sandbox_id)
                 .cloned()
         });
         let sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
@@ -387,7 +367,6 @@ impl ComputeDriver for FakeComputeDriver {
         self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::StopSandbox {
                 sandbox_id: request.sandbox_id,
-                sandbox_name: request.name,
             });
         });
         Ok(Response::new(StopSandboxResponse {}))
@@ -402,7 +381,6 @@ impl ComputeDriver for FakeComputeDriver {
         self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::StartSandbox {
                 sandbox_id: request.sandbox_id,
-                sandbox_name: request.name,
             });
         });
         Ok(Response::new(StartSandboxResponse::default()))
@@ -417,21 +395,8 @@ impl ComputeDriver for FakeComputeDriver {
         let deleted = self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::DeleteSandbox {
                 sandbox_id: request.sandbox_id.clone(),
-                sandbox_name: request.name.clone(),
             });
-            if request.sandbox_id.is_empty() {
-                let Some(id) = state
-                    .sandboxes
-                    .iter()
-                    .find(|(_, sandbox)| sandbox.name == request.name)
-                    .map(|(id, _)| id.clone())
-                else {
-                    return false;
-                };
-                state.sandboxes.remove(&id).is_some()
-            } else {
-                state.sandboxes.remove(&request.sandbox_id).is_some()
-            }
+            state.sandboxes.remove(&request.sandbox_id).is_some()
         });
         Ok(Response::new(DeleteSandboxResponse { deleted }))
     }

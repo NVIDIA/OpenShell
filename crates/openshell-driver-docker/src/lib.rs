@@ -395,44 +395,28 @@ impl DockerLifecycleEventFences {
             .contains(sandbox_id)
     }
 
-    fn request_stop(&self, sandbox_id: &str, sandbox_name: &str) {
-        let mut state = self
-            .state
+    fn request_stop(&self, sandbox_id: &str) {
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !sandbox_id.is_empty() {
-            state.stops_requested.insert(format!("id:{sandbox_id}"));
-        }
-        if !sandbox_name.is_empty() {
-            state.stops_requested.insert(format!("name:{sandbox_name}"));
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stops_requested
+            .insert(sandbox_id.to_string());
     }
 
-    fn clear_stop(&self, sandbox_id: &str, sandbox_name: &str) {
-        let mut state = self
-            .state
+    fn clear_stop(&self, sandbox_id: &str) {
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !sandbox_id.is_empty() {
-            state.stops_requested.remove(&format!("id:{sandbox_id}"));
-        }
-        if !sandbox_name.is_empty() {
-            state
-                .stops_requested
-                .remove(&format!("name:{sandbox_name}"));
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stops_requested
+            .remove(sandbox_id);
     }
 
-    fn stop_requested(&self, sandbox_id: &str, sandbox_name: &str) -> bool {
-        let state = self
-            .state
+    fn stop_requested(&self, sandbox_id: &str) -> bool {
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (!sandbox_id.is_empty() && state.stops_requested.contains(&format!("id:{sandbox_id}")))
-            || (!sandbox_name.is_empty()
-                && state
-                    .stops_requested
-                    .contains(&format!("name:{sandbox_name}")))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stops_requested
+            .contains(sandbox_id)
     }
 
     fn record_previous_exit(&self, sandbox_id: &str, finished_at: Option<&str>) {
@@ -461,17 +445,14 @@ impl DockerLifecycleEventFences {
             .cloned()
     }
 
-    fn remove(&self, sandbox_id: &str, sandbox_name: &str) {
+    fn remove(&self, sandbox_id: &str) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.previous_finished_at.remove(sandbox_id);
         state.starts_in_progress.remove(sandbox_id);
-        state.stops_requested.remove(&format!("id:{sandbox_id}"));
-        state
-            .stops_requested
-            .remove(&format!("name:{sandbox_name}"));
+        state.stops_requested.remove(sandbox_id);
     }
 }
 
@@ -1392,14 +1373,11 @@ impl DockerComputeDriver {
     async fn get_sandbox_snapshot(
         &self,
         sandbox_id: &str,
-        sandbox_name: &str,
     ) -> Result<Option<DriverSandbox>, Status> {
-        if let Some(pending) = self.pending_snapshot(sandbox_id, sandbox_name).await? {
+        if let Some(pending) = self.pending_snapshot(sandbox_id).await {
             return Ok(Some(pending));
         }
-        let container = self
-            .find_managed_container_summary(sandbox_id, sandbox_name)
-            .await?;
+        let container = self.find_managed_container_summary(sandbox_id).await?;
         if let Some(mut sandbox) =
             container.and_then(|summary| sandbox_from_container_summary(&summary))
         {
@@ -1485,7 +1463,7 @@ impl DockerComputeDriver {
             .await?;
 
         if self
-            .find_managed_container_summary(&sandbox.id, &sandbox.name)
+            .find_managed_container_summary(&sandbox.id)
             .await?
             .is_some()
         {
@@ -1533,10 +1511,7 @@ impl DockerComputeDriver {
         match Box::pin(self.provision_sandbox_inner(&sandbox)).await {
             Ok(()) => {
                 self.clear_pending_sandbox(&sandbox.id).await;
-                if let Err(error) = self
-                    .publish_container_snapshot(&sandbox.id, &sandbox.name)
-                    .await
-                {
+                if let Err(error) = self.publish_container_snapshot(&sandbox.id).await {
                     warn!(
                         sandbox_id = %sandbox.id,
                         %error,
@@ -1833,10 +1808,7 @@ impl DockerComputeDriver {
         {
             Ok(control) => control,
             Err(status) => {
-                if self
-                    .lifecycle_event_fences
-                    .stop_requested(&sandbox.id, &sandbox.name)
-                {
+                if self.lifecycle_event_fences.stop_requested(&sandbox.id) {
                     debug!(
                         sandbox_id = %sandbox.id,
                         "Ignoring Docker supervisor startup interruption after an explicit stop"
@@ -1859,10 +1831,7 @@ impl DockerComputeDriver {
                 ));
             }
         };
-        if self
-            .lifecycle_event_fences
-            .stop_requested(&sandbox.id, &sandbox.name)
-        {
+        if self.lifecycle_event_fences.stop_requested(&sandbox.id) {
             stop_docker_control_process(control).await;
             debug!(
                 sandbox_id = %sandbox.id,
@@ -2160,14 +2129,8 @@ impl DockerComputeDriver {
         Ok(())
     }
 
-    async fn delete_sandbox_inner(
-        &self,
-        sandbox_id: &str,
-        sandbox_name: &str,
-    ) -> Result<bool, Status> {
-        let pending = self
-            .remove_pending_sandbox(sandbox_id, sandbox_name)
-            .await?;
+    async fn delete_sandbox_inner(&self, sandbox_id: &str) -> Result<bool, Status> {
+        let pending = self.remove_pending_sandbox(sandbox_id).await;
         if let Some(record) = pending.as_ref()
             && let Some(task) = record.task.as_ref()
         {
@@ -2179,10 +2142,7 @@ impl DockerComputeDriver {
                 .await?;
         }
 
-        let Some(container) = self
-            .find_managed_container_summary(sandbox_id, sandbox_name)
-            .await?
-        else {
+        let Some(container) = self.find_managed_container_summary(sandbox_id).await? else {
             if let Some(record) = pending {
                 let container_name = container_name_for_sandbox(&record.sandbox);
                 match self
@@ -2274,16 +2234,12 @@ impl DockerComputeDriver {
         }
     }
 
-    async fn stop_sandbox_inner(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
-        let container = self
-            .find_managed_container_summary(sandbox_id, sandbox_name)
-            .await?;
+    async fn stop_sandbox_inner(&self, sandbox_id: &str) -> Result<(), Status> {
+        let container = self.find_managed_container_summary(sandbox_id).await?;
         // Startup can still be waiting for supervisor readiness after the
         // workload container exists. Cancel it before removing the supervisor
         // so its failure path cannot delete retained workload storage.
-        let mut pending = self
-            .remove_pending_sandbox(sandbox_id, sandbox_name)
-            .await?;
+        let mut pending = self.remove_pending_sandbox(sandbox_id).await;
         if let Some(task) = pending.as_mut().and_then(|record| record.task.take()) {
             task.abort();
             let _ = task.await;
@@ -2357,28 +2313,24 @@ impl DockerComputeDriver {
             otel.name = "docker.start_sandbox",
             otel.status_code = tracing::field::Empty,
             sandbox.id = %sandbox_id,
-            sandbox.name = %sandbox_name,
         )
     )]
     pub async fn start_sandbox(
         &self,
         sandbox_id: &str,
-        sandbox_name: &str,
         generation_id: &str,
         launch_authentication: &[u8],
     ) -> Result<bool, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        require_sandbox_identifier(sandbox_id, sandbox_name)?;
+        require_sandbox_id(sandbox_id)?;
         let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
             generation_id.to_string(),
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        self.lifecycle_event_fences
-            .clear_stop(sandbox_id, sandbox_name);
+        self.lifecycle_event_fences.clear_stop(sandbox_id);
         self.lifecycle_event_fences.begin_start(sandbox_id);
         let result = Box::pin(self.start_sandbox_with_lifecycle_fence(
             sandbox_id,
-            sandbox_name,
             &generation,
             launch_authentication,
         ))
@@ -2390,14 +2342,10 @@ impl DockerComputeDriver {
     async fn start_sandbox_with_lifecycle_fence(
         &self,
         sandbox_id: &str,
-        sandbox_name: &str,
         generation: &openshell_core::sandbox_generation::SandboxGenerationId,
         launch_authentication: &[u8],
     ) -> Result<bool, Status> {
-        let Some(container) = self
-            .find_managed_container_summary(sandbox_id, sandbox_name)
-            .await?
-        else {
+        let Some(container) = self.find_managed_container_summary(sandbox_id).await? else {
             return Ok(false);
         };
         let Some(target) = summary_container_target(&container) else {
@@ -2569,14 +2517,9 @@ impl DockerComputeDriver {
         Ok(())
     }
 
-    async fn pending_snapshot(
-        &self,
-        sandbox_id: &str,
-        sandbox_name: &str,
-    ) -> Result<Option<DriverSandbox>, Status> {
+    async fn pending_snapshot(&self, sandbox_id: &str) -> Option<DriverSandbox> {
         let pending = self.pending.lock().await;
-        let id = pending_sandbox_record_id(&pending, sandbox_id, sandbox_name)?;
-        Ok(id.and_then(|id| pending.get(&id).map(|record| record.sandbox.clone())))
+        pending.get(sandbox_id).map(|record| record.sandbox.clone())
     }
 
     async fn pending_snapshot_map(&self) -> HashMap<String, DriverSandbox> {
@@ -2592,16 +2535,9 @@ impl DockerComputeDriver {
         pending.remove(sandbox_id);
     }
 
-    async fn remove_pending_sandbox(
-        &self,
-        sandbox_id: &str,
-        sandbox_name: &str,
-    ) -> Result<Option<PendingSandboxRecord>, Status> {
+    async fn remove_pending_sandbox(&self, sandbox_id: &str) -> Option<PendingSandboxRecord> {
         let mut pending = self.pending.lock().await;
-        let Some(id) = pending_sandbox_record_id(&pending, sandbox_id, sandbox_name)? else {
-            return Ok(None);
-        };
-        Ok(pending.remove(&id))
+        pending.remove(sandbox_id)
     }
 
     async fn fail_pending_sandbox(
@@ -2638,18 +2574,12 @@ impl DockerComputeDriver {
         self.publish_sandbox_snapshot(snapshot);
     }
 
-    async fn publish_container_snapshot(
-        &self,
-        sandbox_id: &str,
-        sandbox_name: &str,
-    ) -> Result<(), Status> {
-        if let Some(pending) = self.pending_snapshot(sandbox_id, sandbox_name).await? {
+    async fn publish_container_snapshot(&self, sandbox_id: &str) -> Result<(), Status> {
+        if let Some(pending) = self.pending_snapshot(sandbox_id).await {
             self.publish_sandbox_snapshot(pending);
             return Ok(());
         }
-        if let Some(summary) = self
-            .find_managed_container_summary(sandbox_id, sandbox_name)
-            .await?
+        if let Some(summary) = self.find_managed_container_summary(sandbox_id).await?
             && let Some(mut sandbox) = sandbox_from_container_summary(&summary)
         {
             self.apply_runtime_failure(&mut sandbox).await;
@@ -2841,14 +2771,8 @@ impl DockerComputeDriver {
     async fn find_managed_container_summary(
         &self,
         sandbox_id: &str,
-        sandbox_name: &str,
     ) -> Result<Option<ContainerSummary>, Status> {
-        let mut label_filter_values = Vec::new();
-        if !sandbox_id.is_empty() {
-            label_filter_values.push(format!("{LABEL_SANDBOX_ID}={sandbox_id}"));
-        } else if !sandbox_name.is_empty() {
-            label_filter_values.push(format!("{LABEL_SANDBOX_NAME}={sandbox_name}"));
-        }
+        let label_filter_values = vec![format!("{LABEL_SANDBOX_ID}={sandbox_id}")];
 
         let filters =
             managed_container_label_filters(&self.config.sandbox_namespace, label_filter_values);
@@ -2870,15 +2794,10 @@ impl DockerComputeDriver {
             let namespace_matches = labels
                 .get(LABEL_SANDBOX_NAMESPACE)
                 .is_some_and(|value| value == &self.config.sandbox_namespace);
-            let id_matches = sandbox_id.is_empty()
-                || labels
-                    .get(LABEL_SANDBOX_ID)
-                    .is_some_and(|value| value == sandbox_id);
-            let name_matches = sandbox_name.is_empty()
-                || labels
-                    .get(LABEL_SANDBOX_NAME)
-                    .is_some_and(|value| value == sandbox_name);
-            namespace_matches && id_matches && name_matches
+            let id_matches = labels
+                .get(LABEL_SANDBOX_ID)
+                .is_some_and(|value| value == sandbox_id);
+            namespace_matches && id_matches
         }))
     }
 
@@ -3240,18 +3159,12 @@ impl ComputeDriver for DockerComputeDriver {
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
         let request = request.into_inner();
-        require_sandbox_identifier(&request.sandbox_id, &request.name)?;
+        require_sandbox_id(&request.sandbox_id)?;
 
         let sandbox = self
-            .get_sandbox_snapshot(&request.sandbox_id, &request.name)
+            .get_sandbox_snapshot(&request.sandbox_id)
             .await?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
-
-        if !request.sandbox_id.is_empty() && request.sandbox_id != sandbox.id {
-            return Err(Status::failed_precondition(
-                "sandbox_id did not match the fetched sandbox",
-            ));
-        }
 
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
@@ -3297,7 +3210,6 @@ impl ComputeDriver for DockerComputeDriver {
             otel.name = "docker.stop_sandbox",
             otel.status_code = tracing::field::Empty,
             sandbox.id = %request.get_ref().sandbox_id,
-            sandbox.name = %request.get_ref().name,
         )
     )]
     async fn stop_sandbox(
@@ -3306,24 +3218,16 @@ impl ComputeDriver for DockerComputeDriver {
     ) -> Result<Response<StopSandboxResponse>, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let request = request.into_inner();
-        require_sandbox_identifier(&request.sandbox_id, &request.name)?;
+        require_sandbox_id(&request.sandbox_id)?;
 
         self.lifecycle_event_fences
-            .request_stop(&request.sandbox_id, &request.name);
-        if let Err(error) = self
-            .stop_sandbox_inner(&request.sandbox_id, &request.name)
-            .await
-        {
-            self.lifecycle_event_fences
-                .clear_stop(&request.sandbox_id, &request.name);
+            .request_stop(&request.sandbox_id);
+        if let Err(error) = self.stop_sandbox_inner(&request.sandbox_id).await {
+            self.lifecycle_event_fences.clear_stop(&request.sandbox_id);
             return Err(error);
         }
-        if let Err(error) = self
-            .publish_container_snapshot(&request.sandbox_id, &request.name)
-            .await
-        {
-            self.lifecycle_event_fences
-                .clear_stop(&request.sandbox_id, &request.name);
+        if let Err(error) = self.publish_container_snapshot(&request.sandbox_id).await {
+            self.lifecycle_event_fences.clear_stop(&request.sandbox_id);
             return Err(error);
         }
         span_status.finish(Ok(Response::new(StopSandboxResponse {})))
@@ -3337,7 +3241,6 @@ impl ComputeDriver for DockerComputeDriver {
         if !Box::pin(Self::start_sandbox(
             self,
             &request.sandbox_id,
-            &request.name,
             &request.generation_id,
             &request.launch_authentication,
         ))
@@ -3345,8 +3248,7 @@ impl ComputeDriver for DockerComputeDriver {
         {
             return Err(Status::not_found("sandbox not found"));
         }
-        self.publish_container_snapshot(&request.sandbox_id, &request.name)
-            .await?;
+        self.publish_container_snapshot(&request.sandbox_id).await?;
         Ok(Response::new(StartSandboxResponse::default()))
     }
 
@@ -3357,7 +3259,6 @@ impl ComputeDriver for DockerComputeDriver {
             otel.name = "docker.delete_sandbox",
             otel.status_code = tracing::field::Empty,
             sandbox.id = %request.get_ref().sandbox_id,
-            sandbox.name = %request.get_ref().name,
         )
     )]
     async fn delete_sandbox(
@@ -3366,14 +3267,11 @@ impl ComputeDriver for DockerComputeDriver {
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let request = request.into_inner();
-        require_sandbox_identifier(&request.sandbox_id, &request.name)?;
+        require_sandbox_id(&request.sandbox_id)?;
 
         let event_sandbox_id = request.sandbox_id.clone();
-        let deleted = self
-            .delete_sandbox_inner(&request.sandbox_id, &request.name)
-            .await?;
-        self.lifecycle_event_fences
-            .remove(&event_sandbox_id, &request.name);
+        let deleted = self.delete_sandbox_inner(&request.sandbox_id).await?;
+        self.lifecycle_event_fences.remove(&event_sandbox_id);
         if deleted && !event_sandbox_id.is_empty() {
             let _ = self.events.send(WatchSandboxesEvent {
                 payload: Some(watch_sandboxes_event::Payload::Deleted(
@@ -3500,30 +3398,6 @@ fn pending_sandbox_snapshot(
         }),
         workspace: sandbox.workspace.clone(),
     }
-}
-
-fn pending_sandbox_record_id(
-    pending: &HashMap<String, PendingSandboxRecord>,
-    sandbox_id: &str,
-    sandbox_name: &str,
-) -> Result<Option<String>, Status> {
-    if !sandbox_id.is_empty() {
-        return Ok(pending
-            .get(sandbox_id)
-            .map(|record| record.sandbox.id.clone()));
-    }
-
-    let mut matches = pending
-        .values()
-        .filter(|record| !sandbox_name.is_empty() && record.sandbox.name == sandbox_name)
-        .map(|record| record.sandbox.id.clone());
-    let first = matches.next();
-    if first.is_some() && matches.next().is_some() {
-        return Err(Status::failed_precondition(format!(
-            "multiple pending Docker sandboxes are named '{sandbox_name}'; use sandbox_id"
-        )));
-    }
-    Ok(first)
 }
 
 fn provisioning_condition() -> DriverCondition {
@@ -5815,16 +5689,9 @@ fn build_container_create_body_for_image(
     })
 }
 
-/// Reject driver requests that arrive with neither a sandbox id nor a
-/// sandbox name. Without this guard, downstream label filters degenerate
-/// to "match every managed container in the namespace", which would let
-/// `delete_sandbox`/`stop_sandbox`/`get_sandbox` pick an arbitrary
-/// sandbox out of the set the driver manages.
-fn require_sandbox_identifier(sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
-    if sandbox_id.is_empty() && sandbox_name.is_empty() {
-        return Err(Status::invalid_argument(
-            "sandbox_id or sandbox_name is required",
-        ));
+fn require_sandbox_id(sandbox_id: &str) -> Result<(), Status> {
+    if sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox_id is required"));
     }
     Ok(())
 }

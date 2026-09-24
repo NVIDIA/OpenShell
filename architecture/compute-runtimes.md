@@ -195,6 +195,13 @@ same resource. The gateway requires a fresh supervisor session before a
 starting sandbox returns to `Ready`; stale driver snapshots and supervisor
 sessions cannot promote a `Stopped` row.
 
+The gateway addresses `GetSandbox`, `StopSandbox`, `StartSandbox`, and
+`DeleteSandbox` exclusively by the immutable `sandbox_id` assigned at create
+time. Drivers reject an empty ID and do not resolve lifecycle requests by
+sandbox name. `ListSandboxes` returns the driver's complete, unscoped
+inventory; each snapshot has a non-empty, globally unique ID, while its name
+and workspace remain descriptive metadata.
+
 Runtime credentials are generation-scoped and memory-only after launch. A
 supervisor or Sandbox Runtime process replacement does not resume a running
 generation. Planned upgrades stop the sandbox first; the following start mints
