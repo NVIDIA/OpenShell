@@ -18,6 +18,8 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 `database_url` is env-only. The loader rejects it when it appears in the file. When `OPENSHELL_DB_URL` is unset, the gateway stores its SQLite database under `$XDG_STATE_HOME/openshell/gateway/openshell.db`.
 
+On-disk SQLite databases run in WAL mode with `synchronous=FULL`: the gateway keeps `openshell.db-wal` and `openshell.db-shm` next to the database file, the file must live on a local filesystem, and a backup must use `sqlite3 openshell.db ".backup <copy>"` rather than copying `openshell.db` on its own. Every acknowledged write, including SSH session revocations, survives a power loss. The one exception is SSH session issuance, which skips the per-commit sync; a power loss can drop a just-issued session token, and the client must request a new one.
+
 `name` assigns an operator-facing identity to the gateway installation. Set it with `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`. It defaults to `openshell`; the Helm chart defaults it to the chart fullname so all replicas in one installation share a name. Chart fullnames are only unique within their Kubernetes namespace, so set `server.name` explicitly when one collector receives telemetry from multiple namespaces or clusters. This identity is independent of client-side gateway aliases, TLS names, and `gateway_jwt.gateway_id`.
 
 ## Package-Managed Locations
@@ -90,7 +92,8 @@ future version. To migrate an existing file:
 5. Use canonical image pull policies: `always`, `if_not_present`, `never`, or
    Podman-only `newer`. Kubernetes-style capitalization and Podman's `missing`
    spelling are rejected.
-6. Remove zero sentinels. Omit `gateway_jwt.ttl_secs` to use the 900-second default,
+6. Remove zero sentinels. Omit `gateway_jwt.ttl_secs` to use non-expiring local
+   sandbox session credentials and the 900-second typed extension-token default,
    omit Docker or Podman `sandbox_pids_limit` to use OpenShell's default limit
    of 2048, and omit Podman `health_check_interval_secs` to disable health
    checks. Explicit zero values are invalid.
@@ -267,7 +270,7 @@ The client-certificate handshake policy is derived and has no `require_client_au
 
 `[openshell.gateway] policy_validation_failure_mode` controls what sandbox supervisors do when a complete candidate policy fails runtime validation. The default, `fail_closed`, deactivates the previous network policy, closes relays pinned to it, and denies new egress until a valid generation loads. `retain_last_valid` leaves the previous valid generation active. Both modes reject the candidate atomically; startup keeps the workload unstarted until the effective policy and matching provider configuration pass admission. A rejected startup exposes `ConfigurationInvalid` and remains available for policy/provider repair in either mode. Gateway mutation paths that can preflight a known effective scope reject invalid candidates before persistence and leave the active policy unchanged regardless of this setting. Changing the value requires restarting the gateway so it can reload `gateway.toml` and distribute the new posture to sandbox supervisors.
 
-`[openshell.gateway.gateway_jwt] ttl_secs` controls the lifetime of gateway-minted, generation-bound sandbox session JWTs and typed extension JWTs. Omit it to use the 900-second default. Explicit `0` is invalid. Helm renders `3600` seconds by default.
+`[openshell.gateway.gateway_jwt] ttl_secs` controls generation-bound gateway-facing and Sandbox Protocol credentials minted for a sandbox session, plus typed extension JWTs. Omit it for non-expiring local sandbox session credentials: both session tokens carry `exp = 0`, and refresh responses omit their expiration timestamps. Typed extension JWTs retain a 900-second default when the field is omitted. Use omission only for local single-player Docker, Podman, or VM gateways. Explicit `0` is invalid. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway omits the field.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
@@ -928,8 +931,9 @@ image_pull_policy       = "if_not_present" # always | if_not_present | never | n
 grpc_endpoint           = "https://127.0.0.1:17670"
 # The gateway overwrites gateway_port from bind_address at runtime.
 gateway_port            = 17670
-# Omit for the platform default: empty on Linux, 192.168.127.254 on macOS Podman machine.
-# Set "" to force Podman's host-gateway resolver.
+# Trusted supervisor-side destination returned for host.openshell.internal.
+# Omit for the platform default: 127.0.0.1 on native Linux and
+# 192.168.127.254 on macOS Podman Machine.
 # host_gateway_ip       = "192.168.127.254"
 ssh_socket_path         = "/run/openshell/ssh.sock"
 stop_timeout_secs       = 45
@@ -1076,7 +1080,9 @@ default_image    = "nvcr.io/nvidia/base/ubuntu:24.04"
 # Optional override. When omitted, the gateway derives
 # https://host.openshell.internal:<gateway-port> for the VM driver.
 grpc_endpoint    = "https://host.openshell.internal:17670"
-# Empty falls back to default_image.
+# Empty falls back only to default_image. The gateway rejects the VM
+# configuration when both fields are empty; sandbox-requested images are never
+# bootstrap images.
 bootstrap_image  = "nvcr.io/nvidia/base/ubuntu:24.04"
 krun_log_level   = 1
 vcpus            = 2
