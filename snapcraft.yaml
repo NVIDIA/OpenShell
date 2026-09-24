@@ -86,8 +86,10 @@ apps:
     # during snap refreshes, which would kill active sandbox sessions.
     # Operators must manually restart the service after a refresh if needed.
     refresh-mode: endure
-    # The wrapper sets OPENSHELL_DISABLE_TLS=true and OPENSHELL_DB_URL to
-    # use $SNAP_COMMON/gateway.db. Before startup it bootstraps package-managed
+    # Snapd runs this daemon as root, so ordinary CLI users cannot read the
+    # client certificate generated in root-owned snap state. The wrapper sets
+    # OPENSHELL_DISABLE_TLS=true for the loopback-only listener and uses
+    # $SNAP_COMMON/gateway.db. Before startup it bootstraps package-managed
     # credentials and validates the selected operator-provided config without
     # creating or rewriting it. A nonempty OPENSHELL_GATEWAY_CONFIG takes
     # precedence over gateway.toml.

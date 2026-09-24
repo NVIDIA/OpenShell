@@ -103,10 +103,22 @@ sudo snap install openshell
 ```
 
 The snap defines two apps: the `openshell` CLI and the `openshell.gateway`
-systemd service. The gateway listens on `https://127.0.0.1:17670` and
-stores its database at `$SNAP_COMMON/gateway.db` (typically
-`/var/snap/openshell/common/gateway.db`). Create `$SNAP_COMMON/gateway.toml`
-when you need to override gateway settings.
+system service. Unlike the Debian and RPM user services, snapd runs this service
+as root. The gateway therefore generates its certificates in root-owned snap
+state, where ordinary users running the CLI cannot read the client certificate.
+For this reason, the snap disables TLS and listens only on
+`http://127.0.0.1:17670`. Its default configuration permits unauthenticated
+local CLI access. Sandbox connections still use gateway-minted credentials.
+
+The gateway stores its database at `$SNAP_COMMON/gateway.db` and its
+configuration at `$SNAP_COMMON/gateway.toml`, typically under
+`/var/snap/openshell/common/`. Initial snap installation creates the default
+configuration only when no configuration already exists.
+
+Edit `$SNAP_COMMON/gateway.toml` when you need to override gateway settings,
+then restart the service. Do not expose the default plaintext gateway beyond
+the local host while unauthenticated user access is enabled. Any process or user
+on the same host that can connect to the loopback port can operate the gateway.
 
 The snap CLI stores per-user config, data, and state under `$SNAP_USER_COMMON`,
 typically `~/snap/openshell/common`. Gateway registrations live under

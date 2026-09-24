@@ -318,6 +318,13 @@ configure the gateway to use them. The Ubuntu `deb` installer consumes
 for direct executable installation on every environment. Release Dev and
 Release Tag run Ubuntu conformance through the Debian package, while Fedora
 continues using direct executable installation until RPM coverage is available.
+Snapd runs the gateway as a root-owned system service. Its generated client
+certificates reside in root-owned snap state and are unavailable to ordinary CLI
+users, so the Snap uses plaintext loopback transport and enables unauthenticated
+local users by default. Debian and RPM packages instead run systemd user services
+and use user-owned mTLS material. Bootstrap creates the default configuration
+only when it is missing. Sandbox-to-gateway sessions remain authenticated with
+gateway-minted JWTs.
 The Debian qualification profile keeps candidate-image overrides outside the
 operator-owned gateway configuration: it writes a harness-owned file under
 `/var/lib/openshell-qualification` and selects it through the packaged systemd

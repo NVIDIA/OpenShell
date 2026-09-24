@@ -1,0 +1,36 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -eu
+
+config_file="${SNAP_COMMON}/gateway.toml"
+if [ -e "$config_file" ] || [ -L "$config_file" ]; then
+	exit 0
+fi
+
+mkdir -p "$SNAP_COMMON"
+umask 077
+temporary_file=$(mktemp "${config_file}.tmp.XXXXXX")
+trap 'rm -f "$temporary_file"' 0 HUP INT TERM
+
+cat >"$temporary_file" <<'EOF'
+[openshell]
+version = 2
+
+[openshell.gateway]
+
+[openshell.gateway.auth]
+allow_unauthenticated_users = true
+EOF
+
+# A hard link publishes the config atomically without replacing a path created
+# concurrently. SNAP_COMMON and the temporary file are on the same filesystem.
+if ! ln "$temporary_file" "$config_file"; then
+	if [ -e "$config_file" ] || [ -L "$config_file" ]; then
+		exit 0
+	fi
+	exit 1
+fi
+rm -f "$temporary_file"
+trap - 0 HUP INT TERM
