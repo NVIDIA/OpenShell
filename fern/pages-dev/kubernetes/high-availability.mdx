@@ -90,7 +90,6 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --values values-ha.yaml \
   --wait
 ```
@@ -196,7 +195,6 @@ helm upgrade openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --values values-ha.yaml \
   --wait
 ```

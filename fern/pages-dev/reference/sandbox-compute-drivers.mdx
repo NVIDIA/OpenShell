@@ -442,6 +442,11 @@ than being staged into the guest. See the [Gateway Configuration File](./gateway
 Kubernetes-backed sandboxes run as pods in the configured sandbox namespace. Use Kubernetes for shared clusters, remote compute, GPU scheduling, and operator-managed environments.
 
 <Warning>
+The cluster CNI MUST enforce ingress and egress `NetworkPolicy` in every sandbox
+namespace. OpenShell creates the workload policy, but the Kubernetes API cannot
+confirm enforcement. Without it, workload pods may connect directly and bypass
+supervisor network policy.
+
 Kubernetes workspace namespaces are an administrative trust boundary. In
 shared and managed modes, only the OpenShell gateway and its trusted Agent
 Sandbox controller may administer Sandbox CRs, sandbox pods, or the configured
@@ -471,7 +476,6 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `sandbox_runtime_image_pull_policy` | `sandboxRuntime.image.pullPolicy` | Set the Kubernetes image pull policy for the sandbox runtime image. |
 | `supervisor_image` | `supervisor.image.registry` / `supervisor.image.repository` / `supervisor.image.tag` / `supervisor.image.digest` | Override the image that provides `openshell-supervisor`. Individual image values take precedence over `global.image`; a digest takes precedence over the tag. |
 | `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the canonical supervisor pull policy: `always`, `if_not_present`, or `never`. `newer` is Podman-only. |
-| `sandbox_runtime.network_policy_enforced` | `supervisor.sandboxRuntime.networkPolicyEnforced` | Acknowledge that the cluster CNI enforces ingress and egress `NetworkPolicy` in sandbox namespaces. This must be `true`. |
 | `sandbox_runtime.boundary_port` | `supervisor.sandboxRuntime.boundaryPort` | Set the non-privileged TLS port used between the paired supervisor and sandbox Pods. |
 | `https_proxy` | `upstreamProxy.url` | Set the operator-owned `http://host:port` or `https://host:port` corporate forward proxy used for policy-approved TLS CONNECT egress. |
 | `no_proxy` | `upstreamProxy.noProxy` | Set destinations that bypass only the corporate proxy. OpenShell policy evaluation still applies. |
