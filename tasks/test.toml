@@ -19,6 +19,7 @@ depends = [
   "test:packaging-assets",
   "test:qualification-summary",
   "test:codex-security-release-range",
+  "test:security-dispositions",
   "test:docs-website",
 ]
 
@@ -72,6 +73,11 @@ hide = true
 ["test:codex-security-release-range"]
 description = "Test Codex Security release-range resolution"
 run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" tasks/scripts/codex_security_range_test.py"
+hide = true
+
+["test:security-dispositions"]
+description = "Test the security finding disposition gate"
+run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" tasks/scripts/security_dispositions_test.py"
 hide = true
 
 [e2e]
