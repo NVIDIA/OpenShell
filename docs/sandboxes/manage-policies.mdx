@@ -3,31 +3,29 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Manage Sandbox Policies"
 sidebar-title: "Manage Policies"
-description: "Create sandboxes with a policy, inspect and change sandbox policies, verify changes, roll back, and apply a gateway-wide policy."
+description: "Use the OpenShell CLI to set, inspect, change, verify, and roll back sandbox policies, and to apply a gateway-wide policy."
 keywords: "Generative AI, Cybersecurity, Policy, Sandbox, CLI, Hot Reload, Revision"
 position: 3
 ---
 
-This page covers the tasks for working with sandbox policies: setting a policy
-at creation, inspecting it, changing it on a running sandbox, verifying the
-result, and rolling back. For how policies work, refer to
-[Sandbox Policies](/sandboxes/policies).
+This page shows how to use the OpenShell CLI to manage a sandbox's policy. Each
+section covers one task, from setting a policy when you create a sandbox to
+changing it while the sandbox runs, confirming that the change took effect, and
+rolling it back. Run `openshell policy --help` for every command and option.
 
-The command examples use `my-sandbox` as the sandbox name. When you omit the
-name, the CLI uses the last sandbox you used.
+The examples use `my-sandbox` as the sandbox name.
 
 ## Create a Sandbox with a Policy
 
-Pass a policy file when you create a sandbox to set its initial policy,
-including the filesystem, Landlock, and process settings that cannot change
-after the workload starts:
+Pass a policy file when you create a sandbox. Filesystem, Landlock, and process
+settings take effect only when the sandbox starts, so set them here:
 
 ```shell
 openshell sandbox create --name my-sandbox --policy ./policy.yaml
 ```
 
 To use the same file for every sandbox you create, set
-`OPENSHELL_SANDBOX_POLICY`. The CLI reads it whenever you omit `--policy`:
+`OPENSHELL_SANDBOX_POLICY` instead of passing `--policy`:
 
 ```shell
 export OPENSHELL_SANDBOX_POLICY=./policy.yaml
@@ -35,78 +33,63 @@ openshell sandbox create --name my-sandbox
 ```
 
 Without either, the sandbox uses a policy from its image or the restrictive
-[default policy](/reference/default-policy). Write the file from the
-[Network Rules](/sandboxes/network-rules) examples and the
-[Policy Schema Reference](/reference/policy-schema).
+[default policy](/reference/default-policy).
 
 ## Ship a Policy in an Image
 
-A sandbox image can include its own policy at `/etc/openshell/policy.yaml`.
-When the gateway has no saved policy for a sandbox, the supervisor reads that
-file and saves it as the sandbox's policy. The supervisor also checks the legacy
-path `/etc/navigator/policy.yaml`. For example, add the file in a Dockerfile:
+To include a policy in a sandbox image, add it at `/etc/openshell/policy.yaml`:
 
 ```dockerfile
 COPY policy.yaml /etc/openshell/policy.yaml
 ```
 
-A `--policy` file or `OPENSHELL_SANDBOX_POLICY` takes precedence over the image
-policy. If the image policy is invalid, the workload does not start until you
-repair the configuration. OpenShell does not fall back to the default policy.
-Refer to [Repair Initial
-Configuration](/sandboxes/troubleshoot-policies#repair-initial-configuration).
+OpenShell uses the image policy only when the sandbox has no saved policy, so a
+`--policy` file or `OPENSHELL_SANDBOX_POLICY` takes precedence. If the image
+policy is invalid, the sandbox does not start until you [replace it with a valid
+policy](/sandboxes/troubleshoot-policies#repair-initial-configuration). OpenShell
+does not fall back to the default policy.
 
 ## Inspect the Current Policy
 
-Print the sandbox's base policy, without provider-contributed rules, or its
-effective policy, which is what the sandbox enforces:
+A sandbox's policy has two views. The base policy is the policy you manage for
+the sandbox. The effective policy is the one the sandbox enforces. It combines
+the base policy with rules from attached providers, or it is the gateway-global
+policy when one is active.
 
 ```shell
 openshell policy get my-sandbox --base
 openshell policy get my-sandbox --full
 ```
 
-Each view prints status metadata, a `---` separator, and the policy YAML.
-Without `--base` or `--full`, `policy get` prints only the metadata. A `Source`
-value of `global` means a gateway-global policy is active, which blocks sandbox
-policy changes.
+Choose the view that fits your task:
 
-Start edits from the base view so you do not copy provider-owned rules into
-your configuration. Use the effective view to review everything that could allow
-an operation, because several rules can grant permission together.
+- To edit the policy, start from the base view. The effective view also contains
+  rules that attached providers manage. Those rules are not part of the
+  sandbox's own policy, so leave them out of the file you edit.
+- To find out why a request is allowed or denied, use the effective view.
+  Several rules, including provider rules, can allow the same request, and only
+  the effective view shows all of them.
 
-To export the effective policy as plain YAML, for example for review or a
-[policy prover check](/reference/policy-prover):
+To save the effective policy as a YAML file, for example to review it or to
+check it with the [policy prover](/reference/policy-prover):
 
 ```shell
 openshell sandbox get my-sandbox --policy-only > effective-policy.yaml
 ```
 
-To list the policy revision history with each revision's load status:
+To see each revision of the policy and whether the sandbox loaded it:
 
 ```shell
 openshell policy list my-sandbox
 ```
 
-| Status | Meaning |
-|---|---|
-| `Pending` | The gateway saved the revision, and the sandbox has not loaded it yet. |
-| `Loaded` | The sandbox loaded the revision. |
-| `Failed` | The sandbox rejected the revision. Refer to [Troubleshoot Sandbox Policies](/sandboxes/troubleshoot-policies). |
-| `Superseded` | A newer revision was saved before this one loaded. |
-
-To view an earlier revision, add `--rev` with its version number, for example
-`openshell policy get my-sandbox --rev 2 --base`.
-
 ## Add or Remove Network Access
 
-`openshell policy update` changes network rules on a running sandbox without a
-complete policy file. It edits only `network_policies` and preserves every
-other section.
+`openshell policy update` adds or removes network rules on a running sandbox. It
+changes only the `network_policies` section, so you do not need a complete
+policy file.
 
-To give a binary in the sandbox access to a service, add an endpoint that names
-the executable, the destination, and the permitted request types. For a sandbox
-containing `/usr/bin/curl`, this command adds read-only access to the GitHub
+For example, to let `curl` in the sandbox make read-only requests to the GitHub
 API:
 
 ```shell
@@ -117,12 +100,14 @@ openshell policy update my-sandbox \
   --wait
 ```
 
-Here, `rest` enables HTTP request inspection, `read-only` permits `GET`, `HEAD`,
-and `OPTIONS`, and `enforce` blocks other requests. The binary path must match
-the executable inside the sandbox.
+The endpoint sets the host and port, then the request rules. `read-only` allows
+`GET`, `HEAD`, and `OPTIONS` requests, `rest` turns on HTTP request inspection,
+and `enforce` blocks every other request. The `--binary` path must match the
+executable inside the sandbox.
 
-To allow an additional request on an existing rule, name the rule and repeat its
-complete binary list from the base policy:
+To allow another kind of request on an existing rule, add an allow rule. Name
+the rule and repeat its complete binary list from the base policy, so the
+command changes only that rule:
 
 ```shell
 openshell policy update my-sandbox \
@@ -132,31 +117,25 @@ openshell policy update my-sandbox \
   --wait
 ```
 
-The CLI requires the complete scope of the target rule, so the command
-identifies exactly which permissions change. Use `--add-deny` with the same
-syntax to block a request.
-
-To remove access, remove the named rule:
+`--rule-name` refers to the rule's key under `network_policies`, which can
+differ from its `name` field. Use `--add-deny` the same way to block a request.
+To remove the rule:
 
 ```shell
 openshell policy update my-sandbox --remove-rule github_readonly --wait
 ```
 
-`--remove-endpoint host:port` removes a destination from every rule that lists
-it, so preview it first.
-
-To preview any update without saving it, use `--dry-run` instead of `--wait`.
-The preview fetches the current policy and shows the merged result, but does
-not run every check needed to activate it. The [Policy Command
-Reference](/reference/policy-updates) covers the complete update syntax, scope
-rules, and removal behavior.
+To preview a change without applying it, replace `--wait` with `--dry-run`. A
+preview does not guarantee that the sandbox will accept the change. Preview
+`--remove-endpoint` in particular, because it removes the destination from every
+rule that lists it.
 
 ## Replace the Complete Policy
 
-Use `openshell policy set` for changes that `policy update` cannot make, such as
-middleware, GraphQL, MCP, or JSON-RPC rules, `tls: skip`, credential fields, or
-reorganizing rules. A full replacement supplies every section of the policy,
-including settings you intend to keep, so start from the current base policy.
+`openshell policy set` replaces the whole policy. Use it for changes that
+`policy update` cannot make, such as middleware, GraphQL, MCP, or JSON-RPC rules,
+`tls: skip`, or credential settings. The new file replaces every section, so
+start from the current base policy.
 
 <Tabs>
 <Tab title="Edit YAML">
@@ -166,13 +145,12 @@ Print the base policy:
 openshell policy get my-sandbox --base
 ```
 
-Copy only the YAML below the `---` separator into `policy.yaml`. Do not
-redirect the entire output into the file, because the metadata above the
-separator is not part of the policy. Keep the filesystem, Landlock, process,
-and unrelated network settings, including baseline paths that OpenShell added at
-startup, then edit the sections you intend to change.
+The command prints revision details followed by the policy. Save only the policy
+YAML as `policy.yaml`, then edit the sections you want to change. Keep
+everything else, including filesystem paths that OpenShell added when the
+sandbox started.
 
-Submit the edited file and wait for its result:
+Submit the edited file and wait for the result:
 
 ```shell
 openshell policy set my-sandbox --policy policy.yaml --wait
@@ -180,8 +158,7 @@ openshell policy set my-sandbox --policy policy.yaml --wait
 
 </Tab>
 <Tab title="Script with jq">
-Extract the base policy as JSON without display metadata or provider-owned
-rules:
+Save the base policy as JSON:
 
 ```shell
 set -o pipefail
@@ -189,7 +166,7 @@ openshell policy get my-sandbox --base --output json \
   | jq -e '.policy' > base-policy.json
 ```
 
-Edit `base-policy.json`, then submit the complete policy:
+Edit `base-policy.json`, then submit it and wait for the result:
 
 ```shell
 openshell policy set my-sandbox --policy base-policy.json --wait
@@ -198,20 +175,20 @@ openshell policy set my-sandbox --policy base-policy.json --wait
 </Tab>
 </Tabs>
 
-The new policy must pass validation before it becomes active. Changes to
-startup settings are subject to the limits in [How Changes Take
-Effect](/sandboxes/policies#how-changes-take-effect).
+OpenShell validates the new policy before it takes effect. Changes to the
+filesystem, Landlock, and process sections have extra limits, described in the
+next section.
 
 ## Change Filesystem and Process Settings
 
 Filesystem, Landlock, and process settings take effect only when the sandbox
-starts. After the workload starts, OpenShell rejects removed filesystem paths
-and changed workdir, Landlock, or process settings. It can save added
-filesystem paths, but the running workload keeps its existing permissions.
+starts. After that, OpenShell rejects removed filesystem paths and changes to
+workdir, Landlock, or process settings. It accepts added filesystem paths, but
+the running sandbox keeps its existing permissions.
 
-To change these settings, export the base policy as described in
-[Replace the Complete Policy](#replace-the-complete-policy), edit it, and create
-a new sandbox with the file:
+To change these settings, save the base policy as described in [Replace the
+Complete Policy](#replace-the-complete-policy), edit it, and create a new
+sandbox with the file:
 
 ```shell
 openshell sandbox delete my-sandbox
@@ -220,71 +197,62 @@ openshell sandbox create --name my-sandbox --policy ./policy.yaml
 
 Deleting a sandbox stops its processes and removes its state, so copy out
 anything you need first. When the policy allows network access, OpenShell adds
-baseline system paths at startup, so list only the paths your workload
-requires. The [Default Policy](/reference/default-policy) page lists the
-baseline paths.
+the system paths that sandbox processes need, so list only the paths your
+workload requires. [Default Policy](/reference/default-policy) lists those
+paths.
 
 ## Verify a Change
 
-A successful submission without `--wait` means only that the gateway accepted
-the change. With `--wait`, the CLI polls until the revision reaches a result:
+Without `--wait`, a successful command means only that the gateway accepted the
+change. With `--wait`, the CLI also waits for the sandbox to report a result. It
+exits with status `1` if the sandbox rejects the revision, and with status `124`
+if the wait times out. A change whose wait timed out might still load later, so
+check the revision status before you submit it again.
 
-| Result | Exit code |
-|---|---|
-| The sandbox loaded the revision. | `0` |
-| The policy was unchanged, so no revision was created. | `0` |
-| A newer revision superseded this one before it loaded. | `0` |
-| The sandbox rejected the revision. | `1` |
-| The wait timed out. | `124` |
-
-Because a zero exit can mean an unchanged or superseded revision, inspect the
-revision history and the effective policy before you rely on new permissions:
+A successful exit does not always mean your change is active. It can also mean
+that the policy was unchanged, or that a newer change replaced yours before it
+loaded. Confirm the result:
 
 ```shell
 openshell policy list my-sandbox
 openshell policy get my-sandbox --full
 ```
 
-A timeout means the CLI stopped polling. It does not tell you whether the
-revision later loaded or failed, so check the revision status before you submit
-again.
+The latest revision should show `Loaded`, and the effective policy should
+contain your change.
 
-Then test one operation that should be allowed and one that should be blocked.
+Then test one request that should be allowed and one that should be blocked.
 Confirm that a denial comes from OpenShell, as a `policy_denied` response or a
 sandbox log entry, rather than from the destination service or a missing client
-tool. The [first network policy
-tutorial](/get-started/tutorials/first-network-policy) demonstrates these
-checks.
+tool.
 
 ## Roll Back to an Earlier Revision
 
-To restore an earlier policy, choose a compatible revision from
-`openshell policy list my-sandbox` and print its base policy. For example, to
-retrieve revision 2:
+To restore an earlier policy, find the revision in
+`openshell policy list my-sandbox` and print its base policy. For example, for
+revision 2:
 
 ```shell
 openshell policy get my-sandbox --rev 2 --base
 ```
 
-Copy the YAML below the `---` separator into `previous-base.yaml`, review the
-complete policy, and submit it as a new revision:
+Save the policy YAML from the output as `previous-base.yaml`, review it, and
+submit it as a new revision:
 
 ```shell
 openshell policy set my-sandbox --policy previous-base.yaml --wait
-openshell policy list my-sandbox
 ```
 
-Rolling back a policy does not restore provider profiles, attachments,
-credentials, or a gateway-global policy. Startup settings in the earlier
-revision are still subject to the limits in [How Changes Take
-Effect](/sandboxes/policies#how-changes-take-effect).
+Rolling back restores only the policy. It does not restore provider profiles,
+attachments, credentials, or a gateway-global policy, and the limits on
+filesystem and process changes still apply.
 
 ## Apply a Gateway-Wide Policy
 
 A gateway administrator can apply one policy to every sandbox on the gateway.
-The global policy replaces each sandbox's policy, blocks sandbox policy changes,
-and suppresses provider-contributed network rules until you delete it. These
-operations require the platform administrator role.
+The global policy replaces each sandbox's policy and blocks sandbox policy
+changes until you delete it. These commands require the platform administrator
+role:
 
 | Task | Command |
 |---|---|
@@ -293,20 +261,14 @@ operations require the platform administrator role.
 | View global policy history. | `openshell policy list --global` |
 | Remove the global policy and restore normal policy selection. | `openshell policy delete --global` |
 
-A global policy takes effect immediately, so `policy set --global` does not
-accept `--wait`. The set and delete commands ask for confirmation unless you
-pass `--yes`. Keep the prompt during interactive work, because each operation
-changes the network access of every sandbox on the gateway.
-
-The gateway rejects deleting the global policy when the restored sandbox and
-provider configuration would be invalid. Inspect the effective policy of
-affected sandboxes before and after the change.
+A global policy takes effect immediately. The set and delete commands ask for
+confirmation, because each one changes the network access of every sandbox on
+the gateway. Deleting the global policy fails if a sandbox's own policy and
+provider rules would be invalid once restored.
 
 ## Next Steps
 
-- Use [Network Rules](/sandboxes/network-rules) for example rules you can
-  adapt to common services and protocols.
+- Use [Network Rules](/sandboxes/network-rules) for example rules you can adapt
+  to common services and protocols.
 - Use [Troubleshoot Sandbox Policies](/sandboxes/troubleshoot-policies) when a
   change fails to load or a request is denied unexpectedly.
-- Use the [Policy Command Reference](/reference/policy-updates) for every
-  `openshell policy` flag and the complete update syntax.
