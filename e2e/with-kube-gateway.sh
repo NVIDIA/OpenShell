@@ -60,6 +60,12 @@
 #   `vault`; the Rust `credential_drivers` e2e test validates the active
 #   backend. Vault mode installs a dev OpenBao fixture because it exposes the
 #   Vault-compatible API used by the driver.
+#
+# Failure investigation:
+#   Set OPENSHELL_E2E_KUBE_PRESERVE_CLUSTER=1 to preserve a wrapper-created
+#   ephemeral k3d cluster and work directory after success or failure. The
+#   wrapper prints inspection and cleanup commands. This does not change the
+#   lifecycle of a cluster supplied through OPENSHELL_E2E_KUBE_CONTEXT.
 
 set -euo pipefail
 
@@ -79,6 +85,16 @@ AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v1.0.3}"
 
 e2e_preserve_mise_dirs
 e2e_align_docker_host_with_cli_context
+
+PRESERVE_CLUSTER="${OPENSHELL_E2E_KUBE_PRESERVE_CLUSTER:-0}"
+case "${PRESERVE_CLUSTER}" in
+  0 | false | FALSE | no | NO) PRESERVE_CLUSTER=0 ;;
+  1 | true | TRUE | yes | YES) PRESERVE_CLUSTER=1 ;;
+  *)
+    echo "ERROR: OPENSHELL_E2E_KUBE_PRESERVE_CLUSTER must be a boolean (0/1, true/false, or yes/no)" >&2
+    exit 2
+    ;;
+esac
 
 WORKDIR_PARENT="${TMPDIR:-/tmp}"
 WORKDIR_PARENT="${WORKDIR_PARENT%/}"
@@ -495,6 +511,21 @@ cleanup() {
       cat "${PORTFORWARD_HEALTH_LOG}" || true
       echo "=== end health port-forward log ==="
     fi
+  fi
+
+  if [ "${PRESERVE_CLUSTER}" = "1" ] \
+     && [ "${CLUSTER_CREATED_BY_US}" = "1" ] \
+     && [ -n "${CLUSTER_NAME}" ]; then
+    echo "Preserving diagnostic k3d cluster ${CLUSTER_NAME}."
+    echo "Kubernetes context: ${KUBE_CONTEXT}"
+    echo "Kubeconfig: ${KUBECONFIG:-}"
+    echo "E2E work directory: ${WORKDIR}"
+    printf 'Inspect it with: kubectl --kubeconfig %q --context %q get pods -A\n' \
+      "${KUBECONFIG:-}" "${KUBE_CONTEXT}"
+    printf 'Delete the cluster with: k3d cluster delete %q\n' "${CLUSTER_NAME}"
+    printf 'Delete the work directory with: rm -rf -- %q\n' "${WORKDIR}"
+    echo "WARNING: The preserved cluster and work directory contain temporary test credentials, private keys, and gateway metadata. Delete both after investigation."
+    return
   fi
 
   if [ "${EXTERNAL_PG_FIXTURE_DEPLOYED}" = "1" ] \

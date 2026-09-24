@@ -14,6 +14,7 @@ depends = [
   "test:build-env",
   "test:gateway-pull-policy",
   "test:e2e-image-overrides",
+  "test:kubernetes-e2e-preserve",
   "test:gateway-config",
   "test:e2e-parity",
   "test:packaging-assets",
@@ -55,6 +56,12 @@ hide = true
 description = "Test E2E gateway and supervisor image override resolution"
 run = "tasks/scripts/test-e2e-image-overrides.sh"
 run_windows = "echo Skipping test:e2e-image-overrides: Unix E2E wrappers do not apply on Windows."
+hide = true
+
+["test:kubernetes-e2e-preserve"]
+description = "Test Kubernetes E2E cluster preservation and cleanup"
+run = "tasks/scripts/test-kubernetes-e2e-preserve.sh"
+run_windows = "echo Skipping test:kubernetes-e2e-preserve: Unix E2E wrappers do not apply on Windows."
 hide = true
 
 ["test:packaging-assets"]
