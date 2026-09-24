@@ -52,7 +52,7 @@ The chart does not install or upgrade the cluster-scoped Agent Sandbox CRDs or
 controller.
 
 <Note>
-**Air-gapped clusters:** mirror the manifest above and the `registry.k8s.io/agent-sandbox/agent-sandbox-controller` image referenced inside it to your internal registry, then point the manifest's image reference at your mirror before applying. You will also need to mirror the OpenShell gateway and sandbox images — see the chart's `image.repository` value for the gateway and `server.sandboxImage` / `server.supervisorImage` for the sandbox runtime.
+**Air-gapped clusters:** mirror the manifest above and the `registry.k8s.io/agent-sandbox/agent-sandbox-controller` image referenced inside it to your internal registry, then point the manifest's image reference at your mirror before applying. Mirror the OpenShell gateway, supervisor, and trusted sandbox runtime images, then set `global.image.registry` to the mirror. Configure the separate default workload sandbox image with `sandbox.image` when needed.
 </Note>
 
 Confirm the controller pod is running before proceeding:
@@ -219,7 +219,8 @@ The most commonly changed values are:
 
 | Value | Purpose |
 |---|---|
-| `image.repository` / `image.tag` | Gateway container image. Defaults to `ghcr.io/nvidia/openshell/gateway:latest`. |
+| `global.image.registry` / `global.image.tag` / `global.image.pullPolicy` | Shared registry, tag, and pull policy for the gateway, supervisor, and trusted sandbox runtime. Individual image settings take precedence. |
+| `gateway.image.registry` / `gateway.image.repository` / `gateway.image.tag` / `gateway.image.digest` | Gateway container image. Defaults to `ghcr.io/nvidia/openshell/gateway:latest`. |
 | `replicaCount` | Number of gateway replicas. Values above `1` require shared PostgreSQL through `server.externalDbSecret`. |
 | `workload.kind` | Gateway workload controller. Use `statefulset` for SQLite or `deployment` with `server.externalDbSecret`. |
 | `workload.allowMultiReplicaStatefulSet` | Allow `replicaCount > 1` with `workload.kind=statefulset`. Prefer Deployment for external database-backed multi-replica gateways. |
@@ -227,7 +228,9 @@ The most commonly changed values are:
 | `workspaceResources.enabled` | Create namespace-scoped sandbox prerequisites from the gateway chart. Disable when installing the workspace chart separately. |
 | `server.externalDbSecret` | Secret containing a PostgreSQL connection URI in the `uri` key. Use when the database is managed outside the chart. |
 | `server.telemetryEnabled` | Enable anonymous OpenShell telemetry from the gateway and its sandbox supervisors. Set to `false` to opt out. |
-| `server.sandboxImage` | Default sandbox image used when a sandbox does not specify one. |
+| `sandbox.image.repository` / `sandbox.image.tag` / `sandbox.image.digest` | Default sandbox image used when a sandbox does not specify one. |
+| `sandboxRuntime.image.registry` / `sandboxRuntime.image.repository` / `sandboxRuntime.image.tag` / `sandboxRuntime.image.digest` | Trusted workload-side image that provides the `openshell-sandbox` binary. A digest takes precedence over the tag. |
+| `supervisor.image.registry` / `supervisor.image.repository` / `supervisor.image.tag` / `supervisor.image.digest` | Trusted control-side supervisor image. |
 | `server.sandboxImagePullSecrets` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
 | `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
 | `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
