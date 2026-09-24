@@ -40,6 +40,10 @@ finalized supervisor session disconnects.
 Local Docker development builds the supervisor image separately from the
 `openshell-sandbox` workload runtime. Cross-platform runtime extraction uses
 the sandbox image, which exports `/openshell-sandbox`.
+The supervisor image defaults to an unprivileged UID for direct runs; compute
+drivers select the runtime UID explicitly. Kubernetes gateway pods use a
+read-only image filesystem, with persistent state mounted at `/var/openshell`
+for SQLite-backed StatefulSets.
 
 ## Configuration Boundary
 

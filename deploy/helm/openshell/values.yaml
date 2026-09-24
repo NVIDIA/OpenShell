@@ -167,6 +167,8 @@ securityContext:
   runAsUser: 1000
   # -- Whether the gateway container can gain additional privileges.
   allowPrivilegeEscalation: false
+  # -- Keep the image filesystem read-only; gateway state uses its mounted volume.
+  readOnlyRootFilesystem: true
   capabilities:
     # -- Linux capabilities dropped from the gateway container.
     drop:

@@ -212,7 +212,8 @@ Use container logs, engine inspection and the configured exec health probe for
 diagnostics; `exec ... sh`, package installation and in-container shell scripts
 are unavailable. Workload shells belong to the separate sandbox image. Preserve
 the driver-selected UID and writable runtime/log mounts when reproducing a
-supervisor startup failure.
+supervisor startup failure. Direct image runs default to UID/GID 65532; the
+compute driver overrides that identity for managed supervisors.
 
 A `ConfigurationInvalid` readiness condition means startup admission rejected
 the image/effective policy or provider configuration. The supervisor remains
@@ -596,6 +597,9 @@ helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage
 ```
 
 The gateway, sandbox, and supervisor images should use the same release tag. A stale runtime image can make sandbox behavior lag behind gateway policy or protocol changes.
+The Helm gateway container uses a read-only image filesystem. For write errors,
+inspect the `/var/openshell` state mount and its permissions on StatefulSets;
+Deployment installs with an external database do not mount that volume.
 
 For vulnerability reports, record the running image digest and scan that exact
 artifact. The gateway includes a pinned Distroless base; the supervisor includes

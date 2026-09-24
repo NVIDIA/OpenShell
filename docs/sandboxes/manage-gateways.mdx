@@ -176,6 +176,10 @@ kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=100
 kubectl -n openshell get events --sort-by=.lastTimestamp
 ```
 
+The Helm gateway container uses a read-only image filesystem. SQLite-backed
+StatefulSets write persistent state to the volume mounted at `/var/openshell`.
+If a gateway reports a write failure, check that volume and its permissions.
+
 For Podman or MicroVM gateways managed by systemd, inspect the user service and logs:
 
 ```shell

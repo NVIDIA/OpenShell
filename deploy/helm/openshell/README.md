@@ -273,6 +273,7 @@ discovery endpoint or its TLS CA.
 | sandboxServiceAccount.name | string | `""` | Existing service account name for sandbox pods when sandboxServiceAccount.create is false. |
 | securityContext.allowPrivilegeEscalation | bool | `false` | Whether the gateway container can gain additional privileges. |
 | securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the gateway container. |
+| securityContext.readOnlyRootFilesystem | bool | `true` | Keep the image filesystem read-only; gateway state uses its mounted volume. |
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
 | securityContext.runAsUser | int | `1000` | UID assigned to the gateway container. |
 | server.auth.allowUnauthenticatedUsers | bool | `false` | UNSAFE: accept unauthenticated CLI/user requests as a local developer principal. Intended only for trusted local Skaffold/k3d development or a fully trusted fronting proxy. Leave false for shared or production clusters. |

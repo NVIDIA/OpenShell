@@ -5,6 +5,7 @@ suite: gateway pod securityContext
 templates:
   - templates/gateway-config.yaml
   - templates/statefulset.yaml
+  - templates/deployment.yaml
 release:
   name: openshell
   namespace: my-namespace
@@ -34,3 +35,20 @@ tests:
     asserts:
       - notExists:
           path: spec.template.spec.securityContext
+
+  - it: keeps the StatefulSet gateway image filesystem read-only
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
+
+  - it: keeps the Deployment gateway image filesystem read-only
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: openshell-db
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
