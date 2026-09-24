@@ -1,77 +1,112 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Default Policy Reference"
+title: "Default Policy and Baseline Paths"
 sidebar-title: "Default Policy"
-description: "Policy source selection and the restrictive fallback used when a sandbox has no explicit or embedded policy."
-keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Security, Policy"
-position: 2
+description: "The restrictive fallback policy used when a sandbox has no explicit or embedded policy, and the baseline paths OpenShell adds to sandbox policies."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Security, Policy, Landlock, Filesystem"
+position: 8
 ---
 
-OpenShell uses the restrictive fallback only when a sandbox has no stored policy
-and image policy discovery finds no policy. Creating a sandbox without
-`--policy` does not by itself prove that the fallback is active.
+This reference describes the restrictive policy OpenShell uses when a sandbox has
+no other policy, and the filesystem paths that OpenShell adds to sandbox
+policies at runtime.
 
-## Policy Selection
+## When the Default Applies
 
-At creation, an explicit `--policy` file takes precedence over the
-`OPENSHELL_SANDBOX_POLICY` environment variable. Either source supplies the
-sandbox-authored policy stored by the gateway.
+OpenShell uses the restrictive default only when a sandbox has no saved policy
+and its image contains no policy. Creating a sandbox without `--policy` does not
+by itself mean the default is active, because the image or
+`OPENSHELL_SANDBOX_POLICY` can supply one. An invalid image policy keeps the
+workload from starting until you repair it. It does not select the default.
+Refer to [Where the Active Policy Comes
+From](/sandboxes/policies#where-the-active-policy-comes-from) for the complete
+selection order.
 
-When the gateway has no stored sandbox policy, the supervisor checks the image's
-current embedded path, `/etc/openshell/policy.yaml`, and then the legacy path,
-`/etc/navigator/policy.yaml`. A valid embedded policy initializes the missing
-stored policy. A missing embedded policy selects the restrictive fallback. An
-invalid embedded policy keeps the first workload unstarted for configuration
-repair; it does not silently select the fallback.
+## Default Filesystem Access
 
-An active gateway-global policy replaces sandbox policy selection and suppresses
-provider-added network grants. Otherwise, attached providers can add their
-network rules to the selected sandbox policy. Refer to
-[How OpenShell Selects a Policy](/sandboxes/policies#how-openshell-selects-a-policy) for
-the selection order.
+The default policy includes the sandbox working directory as read-write and
+grants read-only access to these paths:
 
-## Fallback Filesystem Access
-
-The restrictive fallback includes the sandbox working directory and grants
-read-only access to these paths:
-
-- `/bin`.
-- `/usr`.
-- `/lib`.
-- `/proc`.
-- `/dev/urandom`.
-- `/etc`.
-- `/var/log`.
+- `/bin`
+- `/usr`
+- `/lib`
+- `/proc`
+- `/dev/urandom`
+- `/etc`
+- `/var/log`
 
 It grants read-write access to `/tmp` and `/dev/null`. Landlock user-policy
-compatibility defaults to `best_effort`.
+compatibility is `best_effort`.
 
-The runtime can enrich filesystem paths required for operation before applying
-the user ruleset. On current Linux isolation paths, a separate mandatory
-Landlock baseline protects the private `/.openshell` hierarchy and requires the
-supported baseline ABI. The user-policy `best_effort` setting does not disable
-that mandatory protection or promise support on a kernel that cannot install it.
+## Default Network Access
 
-## Fallback Network Access
+The default policy defines no network rules or middleware, so all outbound
+network access is denied. Attached providers can still add their network rules
+to the effective policy. Provider rules are runtime composition, not fields in
+the default policy, so inspect the base and effective views separately to
+identify a provider-derived grant.
 
-The fallback defines no network policies or middleware. Outbound network access
-is denied until sandbox-authored or provider-composed rules permit a destination
-and executable.
+## Default Process Identity
 
-Provider additions are runtime composition, not fields in the fallback policy.
-Inspect the base and effective views separately when you need to identify a
-provider-derived grant.
+The default policy leaves process identity to the compute driver. Docker and
+Podman honor a non-root OCI `USER`. When an image declares no user, they use
+numeric UID and GID 1000. Other drivers apply their configured non-root
+identity.
 
-## Fallback Process Identity
+## Baseline Filesystem Paths
 
-The fallback leaves process identity selection to the compute driver. Docker
-and Podman honor a non-root OCI `USER`; when an image declares no user, they use
-numeric UID and GID 1000. Other drivers apply their configured non-root identity.
+Sandbox processes that use the network need system paths for shared libraries,
+DNS resolution, and CA certificates. When the effective policy contains at least
+one network rule, including a provider-contributed rule, OpenShell adds these
+baseline paths to the sandbox's filesystem policy at startup:
+
+| Access | Paths |
+|---|---|
+| Read-only | `/usr`, `/lib`, `/etc`, `/app`, `/var/log`, `/proc`, `/dev/urandom` |
+| Read-write | `/tmp`, `/dev/null` |
+
+OpenShell adds a baseline path only when it is available and your policy does
+not already list it. It never changes the access of a path you list, so a
+baseline read-write path that you list as read-only stays read-only. If the
+policy has no `filesystem_policy` section, OpenShell creates one with
+`include_workdir: true`.
+
+The sandbox saves the enriched filesystem policy as a new revision, so the
+added paths appear in `openshell policy get --base`. Filesystem paths cannot be
+removed from a running sandbox, so keep the added paths when you replace the
+complete policy.
+
+The runtime also grants the workload read-only access to the sandbox's TLS CA
+certificates under `/run/openshell-supervisor-ca`. This grant is not saved to
+the stored policy.
+
+### GPU Sandboxes
+
+On the Docker and VM compute drivers, a sandbox that requests a GPU receives
+additional paths when the corresponding GPU device is present:
+
+| Access | Paths |
+|---|---|
+| Read-only | `/run/nvidia-persistenced`, `/usr/lib/wsl` |
+| Read-write | `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset`, `/dev/dxg`, numbered `/dev/nvidia<N>` device nodes, and `/proc` |
+
+CUDA writes thread names under `/proc` during initialization, so GPU enrichment
+moves `/proc` from read-only to read-write. OpenShell adds each path only when
+it exists in the workload. These paths apply at runtime and are not saved to
+the stored policy.
+
+### Protected Paths
+
+On current Linux isolation paths, a mandatory Landlock baseline protects the
+private `/.openshell` hierarchy and requires Landlock ABI v3. Your filesystem
+policy is applied on top of that baseline and can narrow access, but it cannot
+expose `/.openshell`. The `best_effort` compatibility setting does not disable
+this protection or allow a kernel without ABI v3.
 
 ## Inspect the Selected Policy
 
-Inspect the sandbox-authored base and the gateway's effective representation:
+Inspect the sandbox's base policy and the gateway's effective representation:
 
 ```shell
 openshell policy get <sandbox> --base
