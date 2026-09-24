@@ -119,6 +119,9 @@ data:
 
     [openshell.gateway.oidc]
     issuer                           = {{ .Values.server.oidc.issuer | quote }}
+    {{- if .Values.server.oidc.caConfigMapName }}
+    ca_bundle                        = "/etc/openshell-tls/oidc-ca/ca.crt"
+    {{- end }}
     dangerously_allow_insecure_http = {{ .Values.server.oidc.dangerouslyAllowInsecureHttp }}
     jwks_allowed_origins             = {{ .Values.server.oidc.jwksAllowedOrigins | toJson }}
     audience                         = {{ .Values.server.oidc.audience | quote }}

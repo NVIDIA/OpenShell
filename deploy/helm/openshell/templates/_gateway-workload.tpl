@@ -112,16 +112,7 @@ spec:
         {{- end }}
         # Most gateway settings live in the ConfigMap-backed TOML file
         # mounted at /etc/openshell/gateway.toml. Secret-bearing settings use
-        # env vars that the TOML references by name. Some process-level
-        # settings consumed by libraries outside gateway code also remain here.
-        {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
-        # OIDC issuer custom-CA: rustls/reqwest read SSL_CERT_FILE for
-        # outbound TLS verification. This is a process-level env var
-        # consumed by the TLS stack itself, not by gateway code, so it
-        # cannot be represented in the gateway TOML schema.
-        - name: SSL_CERT_FILE
-          value: /etc/openshell-tls/oidc-ca/ca.crt
-        {{- end }}
+        # env vars that the TOML references by name.
         - name: OPENSHELL_TELEMETRY_ENABLED
           value: {{ .Values.server.telemetryEnabled | quote }}
         {{- if .Values.server.providerTokenGrants.spiffe.enabled }}

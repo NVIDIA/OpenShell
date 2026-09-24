@@ -334,6 +334,12 @@ pub struct OidcConfig {
     /// OIDC issuer URL (e.g., `https://idp.example.com/realms/openshell`).
     pub issuer: String,
 
+    /// Optional PEM CA bundle for an issuer signed by a private CA. These
+    /// certificates augment the platform trust roots for OIDC discovery and
+    /// JWKS requests only.
+    #[serde(default)]
+    pub ca_bundle: Option<PathBuf>,
+
     /// Permit cleartext OIDC metadata and JWKS requests to numeric loopback
     /// addresses. This is a development-only escape hatch and never permits
     /// cleartext requests to hostnames or non-loopback addresses.

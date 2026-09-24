@@ -216,6 +216,7 @@ service_name = "openshell-gateway"
 
 [openshell.gateway.oidc]
 issuer                           = "https://idp.example.com/realms/openshell"
+ca_bundle                        = "/etc/openshell/oidc-ca.pem" # Optional private issuer CA.
 audience                         = "openshell-cli"
 jwks_ttl_secs                    = 3600 # Must be greater than zero.
 jwks_allowed_origins             = ["https://keys.example.com"] # Default: issuer origin only.
@@ -265,6 +266,8 @@ namespace = "openshell"
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to map a verified client certificate to a CLI user identity. This application-layer identity switch does not control the TLS handshake. When `client_ca_path` is set without OIDC, the listener requires a valid client certificate. When OIDC is configured, bearer-only clients may connect; the listener still validates any client certificate they present against the configured CA. Kubernetes deployments must leave `mtls_auth.enabled` unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
 
 The client-certificate handshake policy is derived and has no `require_client_auth` TOML field. This preserves bearer-only OIDC clients and prevents a file setting from silently weakening CA-only gateways.
+
+`[openshell.gateway.oidc] ca_bundle` points to a certificate-only PEM bundle for an issuer signed by a private CA. The bundle augments platform trust roots for OIDC discovery and JWKS requests only; it does not replace native CA discovery or change trust for provider refresh, token exchange, telemetry, Vault, or other gateway HTTPS clients. Set the same value with `--oidc-ca-bundle` or `OPENSHELL_OIDC_CA_BUNDLE`. For Helm deployments, `server.oidc.caConfigMapName` mounts the ConfigMap's `ca.crt` key and renders this path automatically.
 
 `[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
 

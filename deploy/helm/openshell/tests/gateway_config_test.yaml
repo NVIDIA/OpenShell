@@ -278,6 +278,25 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?m)^jwks_allowed_origins\s*=\s*\["https://keys.example.com"\]$'
 
+  - it: scopes the OIDC CA bundle to the OIDC client
+    template: templates/gateway-config.yaml
+    set:
+      server.oidc.issuer: https://issuer.example.com
+      server.oidc.caConfigMapName: openshell-oidc-ca
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.oidc\].*?ca_bundle\s*=\s*"/etc/openshell-tls/oidc-ca/ca\.crt"'
+
+  - it: omits the OIDC CA bundle path when no ConfigMap is configured
+    template: templates/gateway-config.yaml
+    set:
+      server.oidc.issuer: https://issuer.example.com
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^ca_bundle\s*='
+
   - it: treats a null OTLP map as disabled
     template: templates/gateway-config.yaml
     set:
@@ -306,6 +325,11 @@ tests:
       - equal:
           path: spec.template.spec.volumes[3].configMap.name
           value: openshell-oidc-ca
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SSL_CERT_FILE
+          any: true
 
   # Regression for the P1 bug Drew flagged: grpc_endpoint MUST live in the
   # Kubernetes driver table, not in [openshell.gateway]. The gateway-side
