@@ -382,8 +382,8 @@ with `printf '%s'`. Each provider uses the new value at its next refresh;
 
 Set the allowed endpoints at creation. A secret without one cannot be used for
 refresh. The gateway does not follow token endpoint redirects when a workspace
-secret is in use. Workspace secrets work with the OAuth2 and Google service
-account strategies, not `aws_sts_assume_role`.
+secret is in use. Workspace secrets work with the OAuth2, Google service account, and GitHub App
+installation strategies, not `aws_sts_assume_role`.
 
 Before deleting a referenced secret, use `openshell provider refresh inline-secrets`
 to remove the reference without replacing the provider's current grant. Use

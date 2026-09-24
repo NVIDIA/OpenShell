@@ -251,6 +251,27 @@ Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--mate
 
 When many providers share one OAuth client secret, store it once as a workspace secret and reference it with `--material-secret client_secret=NAME`. Rotating it with `openshell secret update` reaches every referencing provider at its next refresh. A secret only reaches the token endpoints it was created with (`--allowed-endpoint`); one created without them is reveal-only and cannot be referenced. and `openshell secret delete` fails while a refresh references it; run `openshell provider refresh inline-secrets` to copy the value into the provider first. The gateway operator must set `enable_workspace_secrets`. See `openshell secret --help`.
 
+For GitHub App installations, check installed refresh help for
+`github-app-installation` and read the
+[provider profile documentation](https://docs.nvidia.com/openshell/latest/providers/profiles.md).
+Use explicit repository IDs and permissions, keep the app private key in secret
+refresh material, and check refresh status before attaching the provider. Token
+permissions do not grant API writes or Git push through a read-only sandbox policy.
+Use `--material-secret private_key=NAME` to reference a workspace secret; allow
+the concrete installation token endpoint when creating it. Updating that secret
+applies at the next refresh without reconfiguration. Inline key or scope
+replacement uses explicit reconfiguration and requires restarting processes with
+old workload handles.
+Use one refresh configuration for the GitHub App token credential. The logical
+name selects its configured environment alias; use status without a credential
+filter and exact-key deletion to clean up legacy alias conflicts.
+
+Do not infer GitHub App installation access from `GITHUB_TOKEN` or `GH_TOKEN`.
+These aliases also carry personal access and OAuth tokens. Choose the provider
+profile for the user's authentication method: existing tokens use static provider
+setup, while App installations use `--runtime-credentials` followed by refresh
+configuration. A static installation token does not rotate automatically.
+
 The gateway stores secret refresh material through its active credential driver.
 With Vault selected, refresh tokens, client secrets, and private keys live in
 Vault alongside injectable provider credentials; refresh state contains only
