@@ -205,7 +205,6 @@ jobs:
           sudo systemctl enable --now snapd.socket
           sudo systemctl start snapd
           sudo snap wait system seed.loaded
-          sudo snap install snapd --edge
 
       - name: Ensure Docker
         run: |
