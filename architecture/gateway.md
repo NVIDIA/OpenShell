@@ -274,6 +274,13 @@ their profile payloads.
 
 The CLI exposes reusable profile definitions through `openshell profile`, with `list` and `describe` reading the same effective catalog used by provider creation. Export, import, update, lint, and delete share that top-level command group. Workspace selection and explicit platform scope apply at the existing profile API boundary; `openshell provider` manages credential-bearing instances.
 
+CLI warnings for credentials passed through `--env` derive setup suggestions from
+that catalog. Static credentials retain existing-token setup; gateway-mintable
+credentials recommend runtime creation and explicit refresh configuration when
+the profile supports runtime creation. Other runtime setups use generic provider
+guidance. Shared environment aliases do not identify the authentication method:
+GitHub tokens and GitHub App installations remain separate choices.
+
 Each logical gateway request captures the selected sources into one validated,
 immutable effective catalog before deriving provider behavior. Policy layers,
 credential scope, injected environment material, dynamic token grants, and
@@ -787,6 +794,28 @@ credential driver is configured, gateways use server-owned encrypted database
 credential storage for defense in depth. Multi-replica deployments can use that
 default with a shared database and shared key-encryption key, or opt into an
 external backend such as Vault or Kubernetes Secrets.
+
+GitHub App installation refresh signs an app JWT at the gateway and exchanges it
+for an installation token using a profile-owned endpoint and its default REST API
+version, allowing GitHub Enterprise Server endpoints to use their supported version.
+Each provider pins one installation and explicit repository IDs and permissions
+in its refresh material; there is no workload-selected scope or installation-wide
+default. The token's logical profile name resolves to the configured environment
+alias, or the first declared alias before configuration. Refresh configuration
+reserves one alias per logical GitHub App credential under the provider mutation
+lock, including pending and failed grants. Management operations use the same
+resolution; exact-key deletion remains available to clean up legacy conflicts.
+The app key is secret material, and only the installation token enters the
+existing credential distribution path. Refresh honors the issuer expiry, caps
+local use at one hour, and preserves the existing authorization epoch during
+routine rotation. Explicit
+reconfiguration revokes the old workload handles. Network policy remains an
+independent constraint on token use. GitHub mint failures use gateway-owned
+recovery classifications without storing issuer-controlled error prose.
+Transport diagnostics classify typed timeout, TLS, and connection failures
+without exposing request material or raw error chains.
+The Go SDK exposes this strategy as `v1.RefreshStrategyGitHubAppInstallation`
+through its curated `openshell/v1` package for use in `v1.RefreshConfig`.
 
 The Vault credential driver requires HTTPS for every non-loopback backend,
 never follows HTTP redirects, and keeps standard certificate hostname

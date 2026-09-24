@@ -40,6 +40,7 @@ PODMAN_CI_TESTS=(
   podman_corporate_proxy
   podman_gateway_start
   podman_host_gateway
+  provider_github_app
   provider_token_exchange
 )
 

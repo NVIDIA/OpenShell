@@ -119,6 +119,11 @@ The root client also exposes subclients for providers, services, files, SSH,
 TCP forwarding, policy, configuration, templates, and workspaces. List methods
 return lazy pagers so callers choose when to fetch the next page.
 
+For [GitHub App installation tokens](/providers/profiles#github-app-installation-tokens),
+use `v1.RefreshStrategyGitHubAppInstallation` in `v1.RefreshConfig` with
+`client.Providers().Refresh().Configure`. The constant is available from the
+same `openshell/v1` import used above.
+
 ## Next Steps
 
 - Review [Gateway Authentication](/reference/gateway-auth) before connecting a service to a production gateway.

@@ -22,7 +22,7 @@ use std::io::IsTerminal;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const DOCS_PROVIDERS_URL: &str = "https://docs.nvidia.com/openshell/latest/sandboxes/providers-v2";
+const DOCS_PROVIDERS_URL: &str = "https://docs.nvidia.com/openshell/latest/providers/profiles";
 
 // ---------------------------------------------------------------------------
 // View types
@@ -755,6 +755,9 @@ pub fn parse_duration_to_ms(s: &str) -> Result<i64> {
 pub struct ProfileSuggestion {
     pub provider_type: String,
     pub credential: String,
+    credential_key: String,
+    display_name: String,
+    refresh: Option<openshell_providers::CredentialRefreshProfile>,
 }
 
 fn credential_env_matches(
@@ -785,10 +788,23 @@ fn credential_env_matches(
         let mut suggestions = Vec::new();
         for profile in profiles {
             for cred in &profile.credentials {
-                if cred.env_vars.iter().any(|v| v.eq_ignore_ascii_case(key)) {
+                if let Some(credential_key) =
+                    cred.env_vars.iter().find(|v| v.eq_ignore_ascii_case(key))
+                {
+                    let refresh = cred.refresh.as_ref().filter(|r| r.is_gateway_mintable());
+                    // Do not offer a static shortcut for runtime credentials.
+                    // Mixed profiles and token grants need their full setup guide.
+                    if cred.is_runtime_resolvable()
+                        && (refresh.is_none() || !profile.allows_runtime_provider_credentials())
+                    {
+                        continue;
+                    }
                     suggestions.push(ProfileSuggestion {
                         provider_type: profile.id.clone(),
                         credential: cred.name.clone(),
+                        credential_key: credential_key.clone(),
+                        display_name: profile.display_name.clone(),
+                        refresh: refresh.cloned(),
                     });
                 }
             }
@@ -800,7 +816,13 @@ fn credential_env_matches(
 
     for key in env.keys() {
         let sug = profile_suggestions(key);
-        if !sug.is_empty() || looks_like_credential(key) {
+        let known_credential = profiles.iter().any(|profile| {
+            profile
+                .credentials
+                .iter()
+                .any(|cred| cred.env_vars.iter().any(|v| v.eq_ignore_ascii_case(key)))
+        });
+        if known_credential || looks_like_credential(key) {
             matches.push((key.clone(), sug));
         }
     }
@@ -824,34 +846,78 @@ pub fn warn_credential_env_vars(
         return;
     }
 
-    let matches = credential_env_matches(env, profiles);
-    if matches.is_empty() {
-        return;
+    for warning in credential_env_warnings(env, profiles) {
+        eprintln!("{warning}");
     }
+}
 
-    for (key, suggestions) in &matches {
-        eprintln!(
-            "{} {key} looks like a credential passed as a plain environment variable.",
-            "⚠".yellow()
-        );
-        eprintln!("  The agent inside the sandbox can read this value directly.");
-        eprintln!();
+fn credential_env_warnings(
+    env: &HashMap<String, String>,
+    profiles: &[openshell_providers::ProviderTypeProfile],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (key, suggestions) in credential_env_matches(env, profiles) {
+        let mut lines = vec![
+            format!(
+                "{} {key} looks like a credential passed as a plain environment variable.",
+                "⚠".yellow()
+            ),
+            "  The agent inside the sandbox can read this value directly.".to_owned(),
+            String::new(),
+        ];
 
         if suggestions.is_empty() {
-            eprintln!("  To hide it from the agent, use a provider instead of --env.");
+            lines.push("  To hide it from the agent, use a provider instead of --env.".to_owned());
         } else {
-            eprintln!("  To hide it from the agent, use a provider instead:");
-            for s in suggestions {
-                eprintln!(
-                    "    openshell provider create --name my-{ty} --type {ty} --credential {key}",
-                    ty = s.provider_type
-                );
+            lines.push("  To hide it from the agent, choose a provider setup that matches your authentication:".to_owned());
+            for s in &suggestions {
+                if let Some(refresh) = &s.refresh {
+                    let strategy =
+                        super::provider::provider_refresh_strategy_name(refresh.strategy)
+                            .replace('_', "-");
+                    lines.push(format!(
+                        "  {} ({strategy}, gateway-managed refresh):",
+                        s.display_name
+                    ));
+                    lines.push(format!(
+                        "    openshell provider create --name my-{ty} --type {ty} --runtime-credentials",
+                        ty = s.provider_type
+                    ));
+                    lines.push(format!(
+                        "    Then run openshell provider refresh configure my-{} --credential-key {} --strategy {strategy}",
+                        s.provider_type, s.credential_key
+                    ));
+                    let material = refresh
+                        .material
+                        .iter()
+                        .filter(|m| m.required)
+                        .map(|m| m.name.as_str())
+                        .collect::<Vec<_>>();
+                    if !material.is_empty() {
+                        lines.push(format!(
+                            "    Supply required refresh material: {}. Use --secret-material-env for secrets.",
+                            material.join(", ")
+                        ));
+                    }
+                    lines.push("    Follow the refresh setup guide before attaching this provider to a sandbox.".to_owned());
+                } else {
+                    lines.push(format!(
+                        "  {} (existing token or credential):",
+                        s.display_name
+                    ));
+                    lines.push(format!(
+                        "    openshell provider create --name my-{ty} --type {ty} --credential {key}",
+                        ty = s.provider_type
+                    ));
+                }
             }
-            eprintln!("    openshell sandbox create --provider my-<name> ...");
+            lines.push("    openshell sandbox create --provider my-<name> ...".to_owned());
         }
-        eprintln!("  See: {DOCS_PROVIDERS_URL}");
-        eprintln!();
+        lines.push(format!("  See: {DOCS_PROVIDERS_URL}"));
+        lines.push(String::new());
+        warnings.push(lines.join("\n"));
     }
+    warnings
 }
 
 pub fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String, String>> {
@@ -1180,13 +1246,15 @@ mod tests {
         assert_eq!(prof[0].0, "GITHUB_TOKEN");
 
         let sug = &prof[0].1;
-        assert_eq!(sug.len(), 2_usize);
+        assert_eq!(sug.len(), 3_usize);
 
         assert_eq!(sug[0].provider_type, "copilot");
         assert_eq!(sug[0].credential, "api_token");
 
         assert_eq!(sug[1].provider_type, "github");
         assert_eq!(sug[1].credential, "api_token");
+        assert_eq!(sug[2].provider_type, "github-app");
+        assert_eq!(sug[2].credential, "api_token");
     }
 
     #[test]
@@ -1198,13 +1266,103 @@ mod tests {
         assert_eq!(prof[0].0, "gh_token");
 
         let sug = &prof[0].1;
-        assert_eq!(sug.len(), 2_usize);
+        assert_eq!(sug.len(), 3_usize);
 
         assert_eq!(sug[0].provider_type, "copilot");
         assert_eq!(sug[0].credential, "api_token");
 
         assert_eq!(sug[1].provider_type, "github");
         assert_eq!(sug[1].credential, "api_token");
+        assert_eq!(sug[2].provider_type, "github-app");
+        assert_eq!(sug[2].credential, "api_token");
+    }
+
+    #[test]
+    fn credential_warning_distinguishes_existing_github_tokens_from_app_refresh() {
+        for key in ["GITHUB_TOKEN", "GH_TOKEN", "gh_token"] {
+            let warnings = credential_env_warnings(&env(&[(key, "secretVALUE42")]), catalog());
+            let warning = &warnings[0];
+            assert!(warning.contains(&format!(
+                "openshell provider create --name my-github --type github --credential {key}"
+            )));
+            assert!(warning.contains("GitHub (existing token or credential)"));
+            assert!(
+                warning.contains("GitHub App (github-app-installation, gateway-managed refresh)")
+            );
+            assert!(warning.contains(
+                "openshell provider create --name my-github-app --type github-app --runtime-credentials"
+            ));
+            assert!(warning.contains(&format!(
+                "openshell provider refresh configure my-github-app --credential-key {} --strategy github-app-installation",
+                key.to_ascii_uppercase()
+            )));
+            assert!(
+                warning.contains(
+                    "client_id, installation_id, private_key, repository_ids, permissions"
+                )
+            );
+            assert!(warning.contains("--secret-material-env"));
+            assert!(warning.contains(DOCS_PROVIDERS_URL));
+            assert!(!warning.contains("--type github-app --credential"));
+            assert!(!warning.contains("secretVALUE42"));
+        }
+    }
+
+    #[test]
+    fn credential_warning_uses_profile_capabilities_not_its_name() {
+        let mut profile = catalog()
+            .iter()
+            .find(|p| p.id == "github-app")
+            .unwrap()
+            .clone();
+        profile.id = "enterprise-repos".to_owned();
+        let env = env(&[("GITHUB_TOKEN", "secretVALUE42")]);
+        let warning = credential_env_warnings(&env, &[profile.clone()]).join("\n");
+        assert!(warning.contains("--type enterprise-repos --runtime-credentials"));
+        assert!(warning.contains("--strategy github-app-installation"));
+
+        // A refresh declaration alone does not imply gateway minting.
+        for strategy in [
+            openshell_core::proto::ProviderCredentialRefreshStrategy::Static,
+            openshell_core::proto::ProviderCredentialRefreshStrategy::External,
+        ] {
+            profile.credentials[0].refresh.as_mut().unwrap().strategy = strategy;
+            let warning = credential_env_warnings(&env, &[profile.clone()]).join("\n");
+            assert!(warning.contains("--type enterprise-repos --credential GITHUB_TOKEN"));
+            assert!(!warning.contains("--runtime-credentials"));
+            assert!(!warning.contains("refresh configure"));
+        }
+    }
+
+    #[test]
+    fn credential_warning_does_not_offer_invalid_runtime_creation_for_mixed_profile() {
+        let mut profile = catalog()
+            .iter()
+            .find(|p| p.id == "github-app")
+            .unwrap()
+            .clone();
+        let mut static_credential = profile.credentials[0].clone();
+        static_credential.name = "other_secret".to_owned();
+        static_credential.env_vars = vec!["OTHER_SECRET".to_owned()];
+        static_credential.refresh = None;
+        profile.credentials.push(static_credential);
+        // A known alias must still warn even without a credential keyword.
+        profile.credentials[0].env_vars = vec!["CUSTOM_AUTH".to_owned()];
+        let warning = credential_env_warnings(&env(&[("CUSTOM_AUTH", "x")]), &[profile]).join("\n");
+        assert!(warning.contains("CUSTOM_AUTH looks like a credential"));
+        assert!(warning.contains("use a provider instead of --env"));
+        assert!(!warning.contains("provider create"));
+    }
+
+    #[test]
+    fn credential_warning_without_catalog_is_generic_and_does_not_leak_values() {
+        let warnings = credential_env_warnings(&env(&[("APP_SECRET", "secretVALUE42")]), &[]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("APP_SECRET looks like a credential"));
+        assert!(warnings[0].contains("use a provider instead of --env"));
+        assert!(!warnings[0].contains("provider create"));
+        assert!(!warnings[0].contains("secretVALUE42"));
+        assert!(credential_env_warnings(&env(&[("PATH", "/usr/bin")]), &[]).is_empty());
     }
 
     #[test]

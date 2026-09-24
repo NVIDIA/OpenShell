@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Import this example explicitly after adapting binaries to your sandbox image.
+# Configure github-app-installation refresh with client_id, installation_id,
+# private_key (secret), repository_ids (JSON array), and permissions (JSON object).
+# Choose GITHUB_TOKEN or GH_TOKEN as the refresh credential key; only the chosen
+# key is injected. api_token selects the configured alias, defaulting to
+# GITHUB_TOKEN. Only one alias can have refresh configured at a time.
+# The app key and JWT remain at the gateway.
+id: github-app
+display_name: GitHub App
+description: GitHub App installation tokens with gateway-managed rotation
+category: source_control
+credentials:
+  - name: api_token
+    description: Short-lived GitHub installation token
+    env_vars: [GITHUB_TOKEN, GH_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+    refresh:
+      strategy: github_app_installation
+      token_url: https://api.github.com/app/installations/{installation_id}/access_tokens
+      refresh_before: 300s
+      max_lifetime: 3600s
+      material:
+        - name: client_id
+          description: GitHub App client ID used as the JWT issuer
+          required: true
+        - name: installation_id
+          description: Positive installation ID for the app
+          required: true
+        - name: private_key
+          description: GitHub App RSA PEM private key
+          required: true
+          secret: true
+        - name: repository_ids
+          description: JSON array of 1 to 500 distinct positive repository IDs
+          required: true
+        - name: permissions
+          description: JSON object of explicit GitHub permission names and levels
+          required: true
+# Token permission does not override sandbox policy. Writes and push stay denied.
+endpoints:
+  - host: api.github.com
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+  - host: api.github.com
+    port: 443
+    path: /graphql
+    protocol: graphql
+    access: read-only
+    enforcement: enforce
+  - host: github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: "**" }
+      - allow: { method: HEAD, path: "**" }
+      - allow: { method: OPTIONS, path: "**" }
+      - allow: { method: POST, path: "/**/git-upload-pack" }
+binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]

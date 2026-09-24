@@ -12,6 +12,16 @@ import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/fake"
 )
 
+func ExampleRefreshStrategyGitHubAppInstallation() {
+	config := v1.RefreshConfig{
+		Provider:      "github-app-test",
+		CredentialKey: "GITHUB_TOKEN",
+		Strategy:      v1.RefreshStrategyGitHubAppInstallation,
+	}
+	fmt.Println(config.Strategy)
+	// Output: GitHubAppInstallation
+}
+
 // ExampleClient_Sandboxes demonstrates the sandbox lifecycle: create a sandbox,
 // wait for it to become ready, and then clean up.
 func ExampleClient_Sandboxes() {

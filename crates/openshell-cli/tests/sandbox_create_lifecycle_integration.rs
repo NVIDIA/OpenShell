@@ -3328,8 +3328,14 @@ async fn sandbox_template_create_warns_for_credential_env_vars() {
         "template create should warn for credential-looking --env values: {stderr}"
     );
     assert!(
-        stderr.contains("To hide it from the agent, use a provider instead"),
-        "warning should point users toward providers: {stderr}"
+        stderr.contains(
+            "openshell provider create --name my-openai --type openai --credential OPENAI_API_KEY"
+        ),
+        "warning should recommend existing-credential provider setup: {stderr}"
+    );
+    assert!(
+        !stderr.contains("plain-secret"),
+        "warning must not expose the credential value"
     );
 
     let requests = template_create_requests(&server).await;

@@ -776,6 +776,7 @@ enum CliProviderRefreshStrategy {
     Oauth2ClientCredentials,
     GoogleServiceAccountJwt,
     AwsStsAssumeRole,
+    GithubAppInstallation,
 }
 
 impl CliProviderRefreshStrategy {
@@ -785,6 +786,7 @@ impl CliProviderRefreshStrategy {
             Self::Oauth2ClientCredentials => "oauth2_client_credentials",
             Self::GoogleServiceAccountJwt => "google_service_account_jwt",
             Self::AwsStsAssumeRole => "aws_sts_assume_role",
+            Self::GithubAppInstallation => "github_app_installation",
         }
     }
 }
@@ -5623,6 +5625,39 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("--credential"));
         assert!(msg.contains("--from-gcloud-adc"));
+    }
+
+    #[test]
+    fn github_app_refresh_command_parses() {
+        let config = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "configure",
+            "repo-reader",
+            "--credential-key",
+            "GITHUB_TOKEN",
+            "--strategy",
+            "github-app-installation",
+            "--material",
+            "repository_ids=[42]",
+            "--material",
+            "permissions={\"contents\":\"read\"}",
+            "--secret-material-env",
+            "private_key=GITHUB_APP_PRIVATE_KEY",
+        ])
+        .expect("GitHub App refresh configuration should parse");
+        assert!(matches!(
+            config.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(
+                    ProviderRefreshCommands::Configure {
+                        strategy: CliProviderRefreshStrategy::GithubAppInstallation,
+                        ..
+                    }
+                ))
+            })
+        ));
     }
 
     #[test]
