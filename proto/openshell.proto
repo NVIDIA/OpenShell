@@ -1912,6 +1912,8 @@ message ExecSandboxEvent {
 
 // Initial frame for one TCP forward stream.
 message TcpForwardInit {
+  // Advertised extensions; unknown capabilities are ignored.
+  repeated string capabilities = 8;
   string sandbox = 1;
   string workspace = 3;
   // Optional service identifier for audit/correlation.
@@ -1926,11 +1928,19 @@ message TcpForwardInit {
   string authorization_token = 7 [(openshell.options.v1.secret) = true];
 }
 
+// Response-only FIN. Request EOF remains the input FIN. This is not cancellation.
+message StreamHalfClose {}
+
 // A single frame on the CLI-to-gateway TCP forward stream.
+// Init must be first; subsequent request frames must contain data. Request EOF
+// closes input while output drains. A response half_close is sent only when
+// stream-half-close-v1 was advertised; final success waits for both directions.
 message TcpForwardFrame {
   oneof payload {
     TcpForwardInit init = 1;
     bytes data = 2;
+    // Response only, negotiated with stream-half-close-v1. No data may follow.
+    StreamHalfClose half_close = 3;
   }
 }
 
@@ -2920,10 +2930,14 @@ message SupervisorHello {
   uint64 connection_epoch = 3;
   // The supervisor can report credential, policy, and launch-environment installation.
   bool supports_provider_readiness = 4;
+  // Supported relay extensions.
+  repeated string capabilities = 5;
 }
 
 // Gateway accepts the supervisor session.
 message SessionAccepted {
+  // Intersection of gateway and SupervisorHello capabilities.
+  repeated string capabilities = 3;
   reserved 2;
   reserved "heartbeat_interval_secs";
   // Gateway-assigned session ID for this connection.
@@ -2996,23 +3010,32 @@ message TcpRelayTarget {
 
 // Initial RelayStream frame sent by the supervisor to claim a pending relay.
 message RelayInit {
+  // Echo negotiated capabilities for this relay stream.
+  repeated string capabilities = 2;
   // Gateway-allocated channel identifier (UUID).
   string channel_id = 1;
+  // Owning ConnectSupervisor session; required with stream-half-close-v1.
+  string session_id = 3;
 }
 
 // A single frame on the RelayStream RPC.
 //
 // The supervisor MUST send `init` as the first frame. All subsequent frames
-// in either direction carry raw bytes in `data`.
+// on the request stream carry raw bytes in `data`; request EOF is FIN.
+// Negotiated response half_close preserves the still-open request direction.
 message RelayFrame {
   oneof payload {
     RelayInit init = 1;
     bytes data = 2;
+    // Response only, negotiated with stream-half-close-v1. No data may follow.
+    StreamHalfClose half_close = 3;
   }
 }
 
 // Initial frame for gateway peer relay forwarding.
 message PeerRelayInit {
+  // Supported extensions for this gateway-to-gateway stream.
+  repeated string capabilities = 4;
   // Stable sandbox UUID whose supervisor relay should be opened.
   string sandbox_id = 1;
   // Relay target to ask the owning gateway to open on its local supervisor
@@ -3027,6 +3050,8 @@ message PeerRelayFrame {
   oneof payload {
     PeerRelayInit init = 1;
     bytes data = 2;
+    // Response only, negotiated with stream-half-close-v1. No data may follow.
+    StreamHalfClose half_close = 3;
   }
 }
 
@@ -3040,8 +3065,20 @@ message RelayOpenResult {
   string error = 3;
 }
 
-// Either side requests closure of a relay channel.
+// Abort reason. Unknown/unspecified values map to UNAVAILABLE.
+enum RelayCloseCode {
+  RELAY_CLOSE_CODE_UNSPECIFIED = 0;
+  RELAY_CLOSE_CODE_CANCELLED = 1;
+  RELAY_CLOSE_CODE_DEADLINE_EXCEEDED = 2;
+  RELAY_CLOSE_CODE_INVALID_ARGUMENT = 3;
+  RELAY_CLOSE_CODE_UNAVAILABLE = 4;
+}
+
+// Either side aborts a relay; buffered data is not guaranteed to drain.
+// Graceful directional closure uses data-stream EOF/half_close instead.
 message RelayClose {
+  // Typed terminal outcome; reason is diagnostic only.
+  RelayCloseCode code = 3;
   // Channel identifier to close.
   string channel_id = 1;
   // Optional reason for closure.

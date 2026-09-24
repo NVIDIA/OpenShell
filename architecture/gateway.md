@@ -985,7 +985,27 @@ name, an authorization token from `CreateSshSession`, and an explicit target:
 `target.ssh` for the sandbox SSH socket or `target.tcp` for a loopback service
 inside the sandbox. The gateway validates the token and sandbox readiness,
 sends a targeted `RelayOpen` to the supervisor, then bridges
-`TcpForwardFrame::Data` to `RelayFrame::Data` until either side closes.
+`TcpForwardFrame::Data` to `RelayFrame::Data`. Request EOF closes only that
+input direction. Peers advertising `stream-half-close-v1` receive a response
+FIN after response bytes and keep the request direction open until its own EOF.
+Final success follows both directions; consumers must still check trailers.
+Legacy peers receive response EOF and retain the old completion behavior.
+
+Each forwarding hop negotiates independently, including gateway-to-gateway
+`PeerRelay`, and propagates downstream limitations upstream. PeerRelay response
+metadata confirms effective support; absence selects legacy EOF for the path.
+Supervisor capabilities are exchanged through Hello/Accepted and
+carried with the owning session ID in RelayInit. The SSH stdio proxy uses legacy
+response EOF because stdout cannot represent an independent socket FIN.
+
+Bridge tasks own both directional pumps. Internal relay pipes retain typed
+abort status and wake blocked readers, writers, and frame senders, so failure
+cannot become a successful byte EOF. `RelayClose` is an abort, scoped to its
+sandbox and supervisor session; stale or unrelated sessions cannot cancel an
+active channel. The first observed abort wins, with transport failure as fallback
+when a typed reason cannot be delivered. Session teardown cancels its owned
+relay tasks without changing reconnect/backoff policy. No new application-idle
+or half-closed timeout is imposed.
 
 Browser service URLs use the same supervisor relay path after host-based
 routing resolves `sandbox--service.<service-routing-domain>` to a stored

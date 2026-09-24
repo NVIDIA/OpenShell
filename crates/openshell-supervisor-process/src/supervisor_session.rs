@@ -10,9 +10,11 @@
 //! and bridges bytes. The supervisor is a dumb byte bridge after target
 //! selection — it has no protocol awareness of the bytes flowing through.
 
+use openshell_core::stream_lifecycle::{self, AbortHandle};
+use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
@@ -26,9 +28,8 @@ use openshell_ocsf::{
     ActivityId, BaseEventBuilder, ConnectionInfo, Endpoint, EventContext, NetworkActivityBuilder,
     OcsfEvent, SeverityId, StatusId, ocsf_emit,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
-use tokio_stream::StreamExt;
 use tracing::{debug, warn};
 
 use openshell_core::grpc_client;
@@ -230,11 +231,6 @@ fn relay_close_from_gateway_event(ctx: &EventContext, channel_id: &str, reason: 
         .build()
 }
 
-/// Size of chunks read from the local SSH socket when forwarding bytes back
-/// to the gateway over the gRPC response stream. 16 KiB matches the default
-/// HTTP/2 frame size so each `RelayFrame::data` fits in one frame.
-const RELAY_CHUNK_SIZE: usize = 16 * 1024;
-
 trait TargetStream: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T> TargetStream for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -415,6 +411,7 @@ async fn run_single_session(
             instance_id: config.instance_id.clone(),
             connection_epoch,
             supports_provider_readiness: true,
+            capabilities: stream_lifecycle::capabilities(),
         })),
     })
     .await
@@ -440,6 +437,9 @@ async fn run_single_session(
         }
         _ => return Err("expected SessionAccepted or SessionRejected".into()),
     };
+
+    let half_close = stream_lifecycle::supports_half_close(&accepted.capabilities);
+    let relays = SessionRelays::default();
 
     let heartbeat_secs = accepted
         .heartbeat_interval
@@ -481,6 +481,9 @@ async fn run_single_session(
                     channel: &channel,
                     tx: &tx,
                     terminating: &config.terminating,
+                    half_close,
+                    session_id: &accepted.session_id,
+                    relays: &relays.0,
                 };
                 handle_gateway_message(
                     &msg,
@@ -541,7 +544,20 @@ pub async fn finalize_main_process_exit(
     Ok(())
 }
 
+#[derive(Default)]
+struct SessionRelays(Arc<Mutex<HashMap<String, AbortHandle>>>);
+impl Drop for SessionRelays {
+    fn drop(&mut self) {
+        for abort in self.0.lock().unwrap().values() {
+            abort.abort(tonic::Status::unavailable("supervisor session ended"));
+        }
+    }
+}
+
 struct GatewayMessageContext<'a> {
+    half_close: bool,
+    session_id: &'a str,
+    relays: &'a Arc<Mutex<HashMap<String, AbortHandle>>>,
     sandbox_id: &'a str,
     ssh_socket_path: &'a std::path::Path,
     port_forward: &'a Arc<dyn BoundaryLoopbackConnector>,
@@ -566,23 +582,43 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
             let port_forward = context.port_forward.clone();
             let expected_ssh_peer_pid = context.expected_ssh_peer_pid;
             let terminating = Arc::clone(context.terminating);
+            let half_close = context.half_close;
+            let session_id = context.session_id.to_string();
+            let relays = Arc::clone(context.relays);
+            let abort = AbortHandle::default();
+            {
+                let mut active = relays.lock().unwrap();
+                if active.contains_key(&channel_id) {
+                    warn!(%channel_id, "duplicate relay open");
+                    return;
+                }
+                active.insert(channel_id.clone(), abort.clone());
+            }
 
             let event = relay_open_event(openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
             ocsf_emit!(event);
 
             tokio::spawn(async move {
                 let event_open = relay_open.clone();
-                match handle_relay_open(
-                    relay_open,
-                    &ssh_socket_path,
-                    port_forward,
+                let context = GatewayMessageContext {
+                    sandbox_id: &sandbox_id,
+                    ssh_socket_path: &ssh_socket_path,
+                    port_forward: &port_forward,
                     expected_ssh_peer_pid,
-                    channel,
-                    tx,
-                    terminating,
-                )
-                .await
-                {
+                    channel: &channel,
+                    tx: &tx,
+                    terminating: &terminating,
+                    half_close,
+                    session_id: &session_id,
+                    relays: &relays,
+                };
+                let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = tokio::select! {
+                    biased;
+                    error = abort.aborted() => Err(error.into()),
+                    result = handle_relay_open(relay_open, &context) => result,
+                };
+                relays.lock().unwrap().remove(&channel_id);
+                match result {
                     Ok(()) => {
                         let event = relay_closed_event(
                             openshell_ocsf::ctx::ctx(),
@@ -592,6 +628,15 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
                         ocsf_emit!(event);
                     }
                     Err(e) => {
+                        let status = e
+                            .downcast_ref::<tonic::Status>()
+                            .cloned()
+                            .unwrap_or_else(|| tonic::Status::unavailable(e.to_string()));
+                        let _ = tx.try_send(SupervisorMessage {
+                            payload: Some(supervisor_message::Payload::RelayClose(
+                                stream_lifecycle::close_message(channel_id.clone(), &status),
+                            )),
+                        });
                         let event = relay_failed_event(
                             openshell_ocsf::ctx::ctx(),
                             &event_open,
@@ -610,6 +655,9 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
             });
         }
         Some(gateway_message::Payload::RelayClose(close)) => {
+            if let Some(abort) = context.relays.lock().unwrap().get(&close.channel_id) {
+                abort.abort(stream_lifecycle::close_status(close));
+            }
             let event = relay_close_from_gateway_event(
                 openshell_ocsf::ctx::ctx(),
                 &close.channel_id,
@@ -631,32 +679,27 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
 /// frames carry raw SSH bytes in `data`.
 async fn handle_relay_open(
     relay_open: RelayOpen,
-    ssh_socket_path: &std::path::Path,
-    port_forward: Arc<dyn BoundaryLoopbackConnector>,
-    expected_ssh_peer_pid: Option<u32>,
-    channel: grpc_client::AuthedChannel,
-    tx: mpsc::Sender<SupervisorMessage>,
-    terminating: Arc<AtomicBool>,
+    context: &GatewayMessageContext<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel_id = relay_open.channel_id.clone();
     let target = match open_target(
         &relay_open,
-        ssh_socket_path,
-        &port_forward,
-        expected_ssh_peer_pid,
+        context.ssh_socket_path,
+        context.port_forward,
+        context.expected_ssh_peer_pid,
     )
     .await
     {
         Ok(target) => target,
         Err(err) => {
-            send_relay_open_result(&tx, &channel_id, false, err.to_string()).await;
+            send_relay_open_result(context.tx, &channel_id, false, err.to_string()).await;
             return Err(err);
         }
     };
 
-    send_relay_open_result(&tx, &channel_id, true, String::new()).await;
+    send_relay_open_result(context.tx, &channel_id, true, String::new()).await;
 
-    let mut client = OpenShellClient::new(channel);
+    let mut client = OpenShellClient::new(context.channel.clone());
 
     // Outbound chunks to the gateway.
     let (out_tx, out_rx) = mpsc::channel::<RelayFrame>(16);
@@ -668,6 +711,12 @@ async fn handle_relay_open(
             payload: Some(openshell_core::proto::relay_frame::Payload::Init(
                 RelayInit {
                     channel_id: channel_id.clone(),
+                    session_id: context.session_id.to_string(),
+                    capabilities: if context.half_close {
+                        stream_lifecycle::capabilities()
+                    } else {
+                        Vec::new()
+                    },
                 },
             )),
         })
@@ -677,7 +726,7 @@ async fn handle_relay_open(
     // Initiate the RPC. This rides the existing HTTP/2 connection.
     let response = match client.relay_stream(outbound).await {
         Ok(response) => response,
-        Err(e) if expected_transport_close_during_shutdown(&e, &terminating) => {
+        Err(e) if expected_transport_close_during_shutdown(&e, context.terminating) => {
             debug!(
                 channel_id = %channel_id,
                 error = %e,
@@ -685,84 +734,18 @@ async fn handle_relay_open(
             );
             return Ok(());
         }
-        Err(e) => return Err(format!("relay_stream RPC failed: {e}").into()),
+        Err(e) => return Err(e.into()),
     };
-    let mut inbound = response.into_inner();
-
-    // Connect to the local SSH daemon on its Unix socket.
-    let (mut target_r, mut target_w) = tokio::io::split(target);
-
-    debug!(
-        channel_id = %channel_id,
-        "relay bridge: connected to local target"
-    );
-
-    // Target → gRPC (out_tx): read local target, forward as `RelayFrame::data`.
-    let out_tx_writer = out_tx.clone();
-    let target_to_grpc = tokio::spawn(async move {
-        let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
-        loop {
-            match target_r.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let chunk = RelayFrame {
-                        payload: Some(openshell_core::proto::relay_frame::Payload::Data(
-                            buf[..n].to_vec(),
-                        )),
-                    };
-                    if out_tx_writer.send(chunk).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    // gRPC (inbound) → target: drain inbound chunks into the local target socket.
-    let mut inbound_err: Option<String> = None;
-    while let Some(next) = inbound.next().await {
-        match next {
-            Ok(frame) => {
-                let Some(openshell_core::proto::relay_frame::Payload::Data(data)) = frame.payload
-                else {
-                    inbound_err = Some("relay inbound received non-data frame".to_string());
-                    break;
-                };
-                if data.is_empty() {
-                    continue;
-                }
-                if let Err(e) = target_w.write_all(&data).await {
-                    inbound_err = Some(format!("write to target failed: {e}"));
-                    break;
-                }
-            }
-            Err(e) => {
-                if expected_transport_close_during_shutdown(&e, &terminating) {
-                    debug!(
-                        channel_id = %channel_id,
-                        error = %e,
-                        "relay bridge: inbound closed during local shutdown"
-                    );
-                } else {
-                    inbound_err = Some(format!("relay inbound errored: {e}"));
-                }
-                break;
-            }
-        }
-    }
-
-    // Half-close the target socket's write side so the service sees EOF.
-    let _ = target_w.shutdown().await;
-
-    // Dropping out_tx closes the outbound gRPC stream, letting the gateway
-    // observe EOF on its side too.
-    drop(out_tx);
-    let _ = target_to_grpc.await;
-
-    if let Some(e) = inbound_err {
-        return Err(e.into());
-    }
-    Ok(())
+    let (read, write) = tokio::io::split(target);
+    stream_lifecycle::client(
+        response.into_inner(),
+        read,
+        write,
+        out_tx,
+        context.half_close,
+    )
+    .await
+    .map_err(Into::into)
 }
 
 async fn send_relay_open_result(

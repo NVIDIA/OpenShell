@@ -2171,7 +2171,6 @@ async fn forward_one_tcp_connection(
     service_id: String,
     authorization_token: String,
 ) -> std::result::Result<(), ForwardTcpConnectionError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_stream::wrappers::ReceiverStream;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
@@ -2186,13 +2185,14 @@ async fn forward_one_tcp_connection(
                     port: u32::from(target_port),
                 })),
                 authorization_token,
+                capabilities: openshell_core::stream_lifecycle::capabilities(),
             },
         )),
     })
     .await
     .map_err(|_| ForwardTcpConnectionError::transient("failed to initialize forward stream"))?;
 
-    let mut response = match client.forward_tcp(ReceiverStream::new(rx)).await {
+    let response = match client.forward_tcp(ReceiverStream::new(rx)).await {
         Ok(response) => response.into_inner(),
         Err(status) => {
             let err = ForwardTcpConnectionError::from_status(status);
@@ -2201,51 +2201,10 @@ async fn forward_one_tcp_connection(
         }
     };
 
-    let (mut local_read, mut local_write) = socket.into_split();
-
-    let to_gateway = tokio::spawn(async move {
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let n = local_read.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            if tx
-                .send(TcpForwardFrame {
-                    payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
-                        buf[..n].to_vec(),
-                    )),
-                })
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-        Ok::<(), std::io::Error>(())
-    });
-
-    while let Some(frame) = response
-        .message()
+    let (local_read, local_write) = socket.into_split();
+    openshell_core::stream_lifecycle::client(response, local_read, local_write, tx, true)
         .await
-        .map_err(ForwardTcpConnectionError::from_status)?
-    {
-        let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
-        else {
-            continue;
-        };
-        if data.is_empty() {
-            continue;
-        }
-        local_write
-            .write_all(&data)
-            .await
-            .map_err(|err| ForwardTcpConnectionError::transient(err.to_string()))?;
-    }
-
-    let _ = local_write.shutdown().await;
-    to_gateway.abort();
-    Ok(())
+        .map_err(ForwardTcpConnectionError::from_status)
 }
 
 async fn drain_and_shutdown_local_socket(mut socket: tokio::net::TcpStream) {

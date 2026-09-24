@@ -56,7 +56,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use russh::ChannelMsg;
 use russh::client::AuthResult;
@@ -72,7 +72,6 @@ use super::validation::{
 use super::{MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN};
 use crate::persistence::current_time_ms;
 
-const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
 const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
 const MAX_TEMPLATES_PER_WORKSPACE: u32 = 1000;
 const MAX_CREATE_SERVICE_EXPOSURES: usize = 32;
@@ -2089,13 +2088,18 @@ pub(super) async fn handle_exec_sandbox(
 /// Returns `Some(stream)` on success. On any failure the error is sent on `tx`
 /// and `None` is returned; the caller should then `return` immediately.
 async fn await_relay_stream<T: Send + 'static>(
-    relay_rx: oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
+    relay_rx: oneshot::Receiver<Result<openshell_core::stream_lifecycle::RelayIo, Status>>,
     tx: &mpsc::Sender<Result<T, Status>>,
     sandbox_id: &str,
     channel_id: &str,
     context: &str,
-) -> Option<tokio::io::DuplexStream> {
-    match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx).await {
+) -> Option<openshell_core::stream_lifecycle::RelayIo> {
+    let result = tokio::select! {
+        biased;
+        () = tx.closed() => return None,
+        result = tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx) => result,
+    };
+    match result {
         Ok(Ok(Ok(stream))) => Some(stream),
         Ok(Ok(Err(status))) => {
             warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %status.message(), "{context}: relay target open failed");
@@ -2140,6 +2144,7 @@ pub(super) async fn handle_forward_tcp(
         ));
     };
 
+    let half_close = openshell_core::stream_lifecycle::supports_half_close(&init.capabilities);
     let target = validate_tcp_forward_init(&init)?;
 
     let sandbox = resolve_and_authorize_sandbox_name(
@@ -2179,7 +2184,7 @@ pub(super) async fn handle_forward_tcp(
             return;
         };
 
-        bridge_forward_tcp_stream(inbound, relay_stream, tx, &sandbox_id, &channel_id).await;
+        bridge_forward_tcp_stream(inbound, relay_stream, tx, half_close).await;
     });
 
     let stream: Pin<
@@ -2354,70 +2359,24 @@ fn validate_tcp_target_parts(host: &str, _port: u32) -> Result<String, Status> {
 }
 
 async fn bridge_forward_tcp_stream(
-    mut inbound: tonic::Streaming<TcpForwardFrame>,
-    relay_stream: tokio::io::DuplexStream,
+    inbound: tonic::Streaming<TcpForwardFrame>,
+    mut relay_stream: openshell_core::stream_lifecycle::RelayIo,
     tx: mpsc::Sender<Result<TcpForwardFrame, Status>>,
-    sandbox_id: &str,
-    channel_id: &str,
+    half_close: bool,
 ) {
-    let (mut relay_read, mut relay_write) = tokio::io::split(relay_stream);
-
-    let sandbox_id_in = sandbox_id.to_string();
-    let channel_id_in = channel_id.to_string();
-    tokio::spawn(async move {
-        loop {
-            match inbound.message().await {
-                Ok(Some(frame)) => {
-                    let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) =
-                        frame.payload
-                    else {
-                        warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, "ForwardTcp: received non-data frame after init");
-                        break;
-                    };
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if let Err(err) =
-                        tokio::io::AsyncWriteExt::write_all(&mut relay_write, &data).await
-                    {
-                        warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "ForwardTcp: write to relay failed");
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(err) => {
-                    debug!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "ForwardTcp: inbound stream ended");
-                    break;
-                }
-            }
-        }
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut relay_write).await;
-    });
-
-    let mut buf = vec![0u8; TCP_FORWARD_CHUNK_SIZE];
-    loop {
-        match tokio::io::AsyncReadExt::read(&mut relay_read, &mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                let frame = TcpForwardFrame {
-                    payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
-                        buf[..n].to_vec(),
-                    )),
-                };
-                if tx.send(Ok(frame)).await.is_err() {
-                    break;
-                }
-            }
-            Err(err) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %err, "ForwardTcp: read from relay failed");
-                let _ = tx
-                    .send(Err(Status::unavailable(format!(
-                        "relay read failed: {err}"
-                    ))))
-                    .await;
-                break;
-            }
-        }
+    let half_close = half_close && relay_stream.supports_half_close();
+    let abort = relay_stream.abort_handle();
+    let result = abort
+        .run(openshell_core::stream_lifecycle::serve(
+            inbound,
+            &mut relay_stream,
+            &tx,
+            half_close,
+        ))
+        .await;
+    if let Err(status) = result {
+        abort.abort(status.clone());
+        let _ = tx.send(Err(status)).await;
     }
 }
 
@@ -2834,7 +2793,7 @@ async fn stream_exec_over_relay(
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
     sandbox_id: &str,
     channel_id: &str,
-    relay_stream: tokio::io::DuplexStream,
+    relay_stream: openshell_core::stream_lifecycle::RelayIo,
     command: &str,
     stdin_payload: Vec<u8>,
     execution_timeout: Option<std::time::Duration>,
@@ -2915,7 +2874,7 @@ async fn stream_interactive_exec_over_relay(
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
     sandbox_id: &str,
     channel_id: &str,
-    relay_stream: tokio::io::DuplexStream,
+    relay_stream: openshell_core::stream_lifecycle::RelayIo,
     command: &str,
     input_stream: tonic::Streaming<ExecSandboxInput>,
     request_tty: bool,
@@ -3215,7 +3174,7 @@ async fn run_interactive_exec_with_russh(
 /// The supervisor bridges the relay to its Unix-socket SSH daemon; filesystem
 /// permissions on that socket are the only access-control boundary.
 async fn start_single_use_ssh_proxy_over_relay(
-    mut relay_stream: tokio::io::DuplexStream,
+    mut relay_stream: openshell_core::stream_lifecycle::RelayIo,
 ) -> Result<(u16, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
@@ -3683,6 +3642,7 @@ mod tests {
                     port: 8080,
                 })),
                 authorization_token: String::new(),
+                capabilities: Vec::new(),
             };
             validate_tcp_forward_init(&init).expect("loopback target should pass");
         }
@@ -3713,6 +3673,7 @@ mod tests {
                 port: 8080,
             })),
             authorization_token: String::new(),
+            capabilities: Vec::new(),
         };
         assert_eq!(
             validate_tcp_forward_init(&init)
@@ -3733,6 +3694,7 @@ mod tests {
                 port: 0,
             })),
             authorization_token: String::new(),
+            capabilities: Vec::new(),
         };
         assert_eq!(
             validate_tcp_forward_init(&init)
