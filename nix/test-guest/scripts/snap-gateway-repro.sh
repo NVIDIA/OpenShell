@@ -88,7 +88,7 @@ diagnostics() {
 failures=0
 for attempt in $(seq 1 "${attempts}"); do
 	echo "==> install.sh Snap ${mode} reproduction attempt ${attempt}/${attempts}"
-	sandbox="snap-repro-${mode}-${attempt}-$$"
+	sandbox="snap-${attempt}-$$"
 	if ! OPENSHELL_VERSION=dev sh "${install_script}" ||
 		! sudo snap list openshell >/dev/null ||
 		! snap info openshell | grep -Eq '^tracking: +latest/edge$' ||
