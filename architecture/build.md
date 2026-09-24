@@ -328,8 +328,7 @@ Explicit release tags and the `pre` alias bypass Snap selection and use the
 native Debian or RPM package path even when `snap` is available. The `pre` alias
 checks matching Git tags in version order, then looks up the exact platform
 artifact and verifies the release run instead of listing every repository
-artifact. The installer blocks a Snap-to-native transition while the OpenShell
-Snap remains installed, before resolving a release or changing packages.
+artifact.
 
 Snapd runs the gateway as a root-owned system service. Its generated client
 certificates reside in root-owned snap state and are unavailable to ordinary CLI

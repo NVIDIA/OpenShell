@@ -138,46 +138,6 @@ assert_linux_package_method "deb is selected without snap" "" 0 1 1 deb
 assert_linux_package_method "dev uses deb without snap" dev 0 1 1 deb
 assert_linux_package_method "rpm is selected without snap or deb" "" 0 0 1 rpm
 
-assert_native_install_blocked_by_snap() {
-  local name=$1
-  local requested_version=$2
-  local method=$3
-  local marker="${tmpdir}/native-install-called"
-  rm -f "$marker"
-
-  if (
-    export OPENSHELL_VERSION="$requested_version"
-    detect_platform() { printf 'linux\n'; }
-    linux_package_method() { printf '%s\n' "$method"; }
-    has_cmd() {
-      [ "$1" = snap ] || command -v "$1" >/dev/null 2>&1
-    }
-    snap() { [ "$1" = list ] && [ "$2" = openshell ]; }
-    resolve_release_tag() { touch "$marker"; }
-    install_linux_deb() { touch "$marker"; }
-    install_linux_rpm() { touch "$marker"; }
-    main
-  ) >"$out" 2>"$err"; then
-    echo "FAIL: ${name}: existing Snap must block native installation" >&2
-    exit 1
-  fi
-  if [ -e "$marker" ]; then
-    echo "FAIL: ${name}: release lookup or native installation ran before the Snap guard" >&2
-    exit 1
-  fi
-  if ! grep -Fq 'remove the OpenShell Snap before installing a native package' "$err" ||
-    ! grep -Fq 'back up' "$err" ||
-    ! grep -Fq 'sudo snap remove openshell' "$err"; then
-    echo "FAIL: ${name}: missing Snap-to-native cleanup instructions" >&2
-    cat "$err" >&2
-    exit 1
-  fi
-}
-
-assert_native_install_blocked_by_snap "pre alias" pre deb
-assert_native_install_blocked_by_snap "exact prerelease" v0.1.0-pre.3 deb
-assert_native_install_blocked_by_snap "pinned stable release" v1.2.3 rpm
-
 if ! (
   find_existing_native_openshell_bin() { return 1; }
   guard_native_to_snap_transition

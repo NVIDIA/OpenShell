@@ -299,7 +299,7 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 ```
 
 The installer checks prerelease tags from newest to oldest, selects an unexpired artifact from a successful release run for the current platform, and downloads only that artifact. Installed packages retain the candidate's exact version, such as `0.1.0-pre.3`. Prerelease tags do not create entries on the GitHub Releases page.
-On Linux, prereleases and explicit release tags use Debian or RPM packages even if `snap` is installed. If the OpenShell snap is already installed, back up and clean up its sandboxes, remove the snap, and rerun the installer.
+On Linux, prereleases and explicit release tags use Debian or RPM packages even if `snap` is installed.
 
 The rolling [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) does not require GitHub authentication:
 

@@ -75,8 +75,7 @@ NOTES:
 
     For explicit versions or without snap, Linux installs the Debian package
     on amd64/arm64 or the RPM packages on x86_64/aarch64, depending on the
-    host package manager. Remove an existing OpenShell snap after backing up
-    and cleaning up its sandboxes before switching to a native package.
+    host package manager.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF
@@ -395,28 +394,6 @@ guard_native_to_snap_transition() {
   fi
 
   error "manual cleanup is required before replacing this non-snap OpenShell installation"
-}
-
-guard_snap_to_native_transition() {
-  has_cmd snap || return 0
-  snap list openshell >/dev/null 2>&1 || return 0
-
-  warn "detected an existing OpenShell Snap installation"
-  cat >&2 <<'EOF'
-
-The Snap gateway may already use port 17670, and native packages do not import
-Snap gateway or CLI state. Before installing a Debian or RPM package, back up
-any sandbox data and Snap state you need, then clean up existing sandboxes.
-
-Stop and remove the OpenShell Snap:
-
-    sudo snap stop openshell.gateway
-    sudo snap remove openshell
-
-Rerun the installer with the same OPENSHELL_VERSION after cleanup.
-
-EOF
-  error "remove the OpenShell Snap before installing a native package"
 }
 
 resolve_release_tag() {
@@ -1466,9 +1443,6 @@ main() {
   if [ "${LINUX_INSTALL_METHOD:-}" = "snap" ]; then
     guard_native_to_snap_transition
   else
-    if [ "$PLATFORM" = "linux" ]; then
-      guard_snap_to_native_transition
-    fi
     RELEASE_TAG="$(resolve_release_tag)"
     guard_breaking_upgrade
   fi

@@ -122,13 +122,6 @@ runtime resources, stop the non-snap gateway, and remove the old installation.
 After completing that cleanup, rerun the installer with
 `OPENSHELL_ACK_BREAKING_UPGRADE=1`.
 
-When you select `pre` or an exact release tag, the installer uses a native
-package. If the OpenShell snap is already installed, the installer stops before
-downloading or installing the package. Back up any sandbox data and Snap state
-you need, clean up existing sandboxes, then stop and remove the Snap with
-`sudo snap stop openshell.gateway` and `sudo snap remove openshell`. Rerun the
-installer with the same `OPENSHELL_VERSION` after cleanup.
-
 Install the OpenShell snap from the Snap Store:
 
 ```shell
