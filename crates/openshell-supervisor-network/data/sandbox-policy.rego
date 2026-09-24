@@ -472,6 +472,10 @@ request_allowed_for_endpoint(request, endpoint) if {
 	rule.allow.method
 	not jsonrpc_response_frame_present(request)
 	jsonrpc_rule_matches(request, endpoint, rule.allow)
+	jsonrpc := object.get(request, "jsonrpc", null)
+	method := object.get(jsonrpc, "method", "")
+	rule_method := object.get(rule.allow, "method", "")
+	jsonrpc_allow_rule_classification_allowed(jsonrpc, endpoint, method, rule_method)
 }
 
 # MCP can allow the method layer by endpoint option while still using
@@ -487,6 +491,7 @@ request_allowed_for_endpoint(request, endpoint) if {
 	method := object.get(jsonrpc, "method", "")
 	is_string(method)
 	method != ""
+	object.get(jsonrpc, "mcp_method_classification", "") == "available"
 	not mcp_tool_call_narrowed_by_policy(endpoint, method)
 }
 
@@ -772,6 +777,23 @@ jsonrpc_rule_matches(request, endpoint, rule) if {
 	rule_method != ""
 	jsonrpc_rule_method_matches(endpoint, method, rule_method)
 	jsonrpc_rule_params_match_for_protocol(jsonrpc, endpoint, rule)
+}
+
+jsonrpc_allow_rule_classification_allowed(_, endpoint, _, _) if {
+	endpoint.protocol == "json-rpc"
+}
+
+jsonrpc_allow_rule_classification_allowed(jsonrpc, endpoint, _, _) if {
+	endpoint.protocol == "mcp"
+	object.get(jsonrpc, "mcp_method_classification", "") == "available"
+}
+
+# Extension methods remain addressable, but only by an exact policy literal.
+# A wildcard must not silently authorize methods outside the selected core profile.
+jsonrpc_allow_rule_classification_allowed(jsonrpc, endpoint, method, rule_method) if {
+	endpoint.protocol == "mcp"
+	object.get(jsonrpc, "mcp_method_classification", "") == "extension"
+	rule_method == method
 }
 
 jsonrpc_rule_method_matches(endpoint, _, rule_method) if {

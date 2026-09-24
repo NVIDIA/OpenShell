@@ -4812,7 +4812,8 @@ process:
                 "path": path,
                 "query_params": {},
                 "jsonrpc": {
-                    "method": method
+                    "method": method,
+                    "mcp_method_classification": "available"
                 }
             }
         })
@@ -6303,6 +6304,90 @@ network_policies:
 
         let list_tools = l7_jsonrpc_input("mcp.default.test", 8000, "/mcp", "tools/list");
         assert!(eval_l7(&engine, &list_tools));
+
+        let mut extension = l7_jsonrpc_input("mcp.default.test", 8000, "/mcp", "vendor/extension");
+        extension["request"]["jsonrpc"]["mcp_method_classification"] =
+            serde_json::json!("extension");
+        assert!(
+            !eval_l7(&engine, &extension),
+            "allow_all_known_mcp_methods must cover only selected-profile methods"
+        );
+    }
+
+    #[test]
+    fn l7_mcp_extension_requires_an_exact_method_literal() {
+        let data = r#"
+network_policies:
+  exact_extension:
+    name: exact_extension
+    endpoints:
+      - host: mcp.extension-exact.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow:
+              method: tools/vendor
+    binaries:
+      - { path: /usr/bin/curl }
+  wildcard_extension:
+    name: wildcard_extension
+    endpoints:
+      - host: mcp.extension-wildcard.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow:
+              method: tools/*
+    binaries:
+      - { path: /usr/bin/curl }
+  denied_extension:
+    name: denied_extension
+    endpoints:
+      - host: mcp.extension-denied.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow:
+              method: tools/vendor
+        deny_rules:
+          - method: tools/*
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+
+        let mut exact = l7_jsonrpc_input("mcp.extension-exact.test", 8000, "/mcp", "tools/vendor");
+        exact["request"]["jsonrpc"]["mcp_method_classification"] = serde_json::json!("extension");
+        assert!(eval_l7(&engine, &exact));
+
+        exact["request"]["jsonrpc"]["mcp_method_classification"] = serde_json::json!("unavailable");
+        assert!(
+            !eval_l7(&engine, &exact),
+            "known methods unavailable in the selected profile must fail closed"
+        );
+
+        let mut wildcard =
+            l7_jsonrpc_input("mcp.extension-wildcard.test", 8000, "/mcp", "tools/vendor");
+        wildcard["request"]["jsonrpc"]["mcp_method_classification"] =
+            serde_json::json!("extension");
+        assert!(
+            !eval_l7(&engine, &wildcard),
+            "wildcards must not authorize unknown extension methods"
+        );
+
+        let mut denied =
+            l7_jsonrpc_input("mcp.extension-denied.test", 8000, "/mcp", "tools/vendor");
+        denied["request"]["jsonrpc"]["mcp_method_classification"] = serde_json::json!("extension");
+        assert!(
+            !eval_l7(&engine, &denied),
+            "deny-rule wildcards must still block explicitly allowed extensions"
+        );
     }
 
     #[test]

@@ -745,6 +745,7 @@ where
         RelayRequestOptions {
             resolver,
             body_classifier: None,
+            mcp_request_validation: None,
             credential_generation: None,
             generation_guard,
             websocket_extensions: WebSocketExtensionMode::Preserve,
@@ -771,6 +772,8 @@ pub(crate) enum WebSocketExtensionMode {
 pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) resolver: Option<&'a SecretResolver>,
     pub(crate) body_classifier: Option<&'a openshell_core::secrets::body::BodyCredentialClassifier>,
+    /// Revalidate buffered MCP requests after header transformations.
+    pub(crate) mcp_request_validation: Option<McpRequestValidation<'a>>,
     pub(crate) credential_generation: Option<CredentialGenerationGuard<'a>>,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) websocket_extensions: WebSocketExtensionMode,
@@ -781,6 +784,14 @@ pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) signing_region: &'a str,
     pub(crate) host: &'a str,
     pub(crate) port: u16,
+}
+
+/// Policy and logging context for checking the MCP request sent upstream.
+#[derive(Clone, Copy)]
+pub(crate) struct McpRequestValidation<'a> {
+    pub(crate) config: &'a crate::l7::L7EndpointConfig,
+    pub(crate) ctx: &'a crate::l7::relay::L7EvalContext,
+    pub(crate) redacted_target: &'a str,
 }
 
 #[derive(Clone, Copy)]
@@ -914,6 +925,33 @@ where
 
     let rewrite_result =
         rewrite_http_header_block(&header_bytes, options.resolver).map_err(miette::Report::new)?;
+
+    if let Some(validation) = options.mcp_request_validation {
+        // Header credential resolution and hop-by-hop cleanup must finish
+        // before checking MCP mirrors. MCP bodies are already fully buffered
+        // and are not eligible for credential body rewriting.
+        let mut raw_header = rewrite_result.rewritten.clone();
+        raw_header.extend_from_slice(&req.raw_header[header_end..]);
+        let outgoing = L7Request {
+            action: req.action.clone(),
+            target: req.target.clone(),
+            query_params: req.query_params.clone(),
+            raw_header,
+            body_length: req.body_length,
+        };
+        if !crate::l7::relay::enforce_final_mcp_protocol_version(
+            validation.config,
+            &outgoing,
+            client,
+            validation.ctx,
+            validation.redacted_target,
+            observer,
+        )
+        .await?
+        {
+            return Ok(RelayOutcome::Consumed);
+        }
+    }
 
     if let Some(guard) = options.generation_guard {
         guard.ensure_current()?;
@@ -2785,12 +2823,26 @@ pub(crate) async fn send_json_response<C: AsyncWrite + Unpin>(
     client: &mut C,
     status: &str,
 ) -> Result<()> {
+    send_json_response_with_allow(policy_name, body, client, status, None).await
+}
+
+/// Send a JSON response, including the required `Allow` field for an HTTP 405.
+/// The allowed methods are supplied by the protocol adapter, never the peer.
+pub(crate) async fn send_json_response_with_allow<C: AsyncWrite + Unpin>(
+    policy_name: &str,
+    body: serde_json::Value,
+    client: &mut C,
+    status: &str,
+    allowed_methods: Option<&'static str>,
+) -> Result<()> {
     let body_bytes = body.to_string();
+    let allow = allowed_methods.map_or_else(String::new, |methods| format!("Allow: {methods}\r\n"));
     let response = format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          X-OpenShell-Policy: {}\r\n\
+         {allow}\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -6025,6 +6077,95 @@ mod tests {
         let observer =
             EndpointObserver::begin(Some(&sender), &config).expect("begin MCP observation");
         (observer, receiver)
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_records_mcp_denial_after_header_cleanup() {
+        for disconnect_client in [false, true] {
+            let (observer, mut receiver) = test_endpoint_observer().await;
+            let config = crate::l7::parse_l7_config(
+                &regorus::Value::from_json_str(
+                    r#"{"protocol":"mcp","mcp_versions":["2025-11-25"]}"#,
+                )
+                .expect("parse MCP config JSON"),
+            )
+            .expect("parse MCP config");
+            let ctx = crate::l7::relay::L7EvalContext {
+                host: "mcp.example.test".into(),
+                port: 8000,
+                policy_name: "mcp-policy".into(),
+                ..Default::default()
+            };
+            let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+            // The incoming version is allowed, but Connection nominates it for
+            // removal. The final gate must observe the outgoing request's denial.
+            let raw_request = format!(
+                "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2025-11-25\r\nConnection: close, MCP-Protocol-Version\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            );
+            let request =
+                request_from_buffered_http("POST", "/mcp", "/mcp", raw_request.into_bytes())
+                    .expect("parse buffered MCP request");
+            let (mut client, peer) = tokio::io::duplex(4096);
+            let mut peer = Some(peer);
+            if disconnect_client {
+                drop(peer.take());
+            }
+            let (mut upstream, mut upstream_peer) = tokio::io::duplex(4096);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                relay_http_request_with_response_middleware_guarded_observed(
+                    &request,
+                    &mut client,
+                    &mut upstream,
+                    RelayRequestOptions {
+                        mcp_request_validation: Some(McpRequestValidation {
+                            config: &config,
+                            ctx: &ctx,
+                            redacted_target: "/mcp",
+                        }),
+                        ..Default::default()
+                    },
+                    None,
+                    Some(&observer),
+                ),
+            )
+            .await
+            .expect("reject before upstream I/O");
+            if disconnect_client {
+                assert!(
+                    result.is_err(),
+                    "denial delivery must fail after disconnect"
+                );
+            } else {
+                assert!(matches!(
+                    result.expect("deliver denial"),
+                    RelayOutcome::Consumed
+                ));
+            }
+            assert!(matches!(
+                receiver.try_recv().expect("final MCP denial observation"),
+                EndpointStatusCommand::Observe {
+                    result: EndpointResult::PolicyDenied,
+                    ..
+                }
+            ));
+            assert!(receiver.try_recv().is_err(), "one result per exchange");
+            drop(client);
+            drop(upstream);
+            let mut sent = Vec::new();
+            upstream_peer.read_to_end(&mut sent).await.unwrap();
+            assert!(sent.is_empty(), "rejected request reached upstream");
+            if let Some(mut peer) = peer {
+                let mut response = String::new();
+                peer.read_to_string(&mut response).await.unwrap();
+                assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+                assert!(
+                    response.contains("mcp_protocol_version_not_allowed"),
+                    "{response}"
+                );
+            }
+        }
     }
 
     async fn assert_observed_response_result(response: &'static [u8], expected: EndpointResult) {
