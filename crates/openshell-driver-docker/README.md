@@ -85,6 +85,7 @@ LSM decisions remain authoritative.
 | Private named volumes | One carries the authenticated sandbox/supervisor channel. The other is mounted only into the supervisor and contains its JWT and private gateway credentials. |
 | In-memory `/run/openshell-supervisor-ca` tmpfs | Holds only the public supervisor CA certificate and trust bundle without making all of `/run` writable. |
 | CDI GPU request | Assigns the exact validated CDI devices requested by driver config or count-based selection. |
+| CDI workload projection | For GPU sandboxes only, embeds selected device metadata in the protected boundary config and mounts Docker daemon CDI spec directories read-only into the workload. |
 
 ## Stop, Start, and Delete
 
@@ -97,6 +98,20 @@ across gateway restarts.
 Delete force-removes both containers, the driver-owned runtime volumes, and the
 host-private runtime descriptor. Missing or altered descriptor and channel resources
 fail closed; the driver does not run an older combined-supervisor layout.
+
+## CDI GPU Metadata
+
+Docker remains the source of truth for GPU injection. The driver selects opaque
+CDI device IDs from `driver_config.cdi_devices` or the daemon's discovered CDI
+inventory, then passes the same IDs to Docker with a CDI `DeviceRequest`.
+
+For a GPU sandbox, the driver writes those IDs and projected CDI spec directory
+paths to a versioned context in the protected workload boundary configuration.
+It bind-mounts the daemon-reported spec directories read-only into the workload.
+The sandbox runtime resolves the selected devices in that mount namespace before
+it launches agent processes and derives Landlock paths and supplemental groups
+from CDI `containerEdits`. A missing context or spec directory fails workload
+startup closed. Non-GPU sandboxes receive no CDI context or spec mounts.
 
 ## Driver Config Mounts
 

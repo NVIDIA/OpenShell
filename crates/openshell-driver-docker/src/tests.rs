@@ -23,6 +23,9 @@ use std::fs;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+const TEST_CDI_SPEC_DIR: &str = "/opt/openshell-test/cdi";
+const TEST_CDI_SPEC_DIR_ALT: &str = "/srv/openshell-test/cdi";
+
 fn test_launch_authentication() -> Vec<u8> {
     serde_json::to_vec(&SandboxLaunchAuthentication {
         supervisor: SupervisorAuthBundle {
@@ -192,6 +195,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         }),
         gpu: DockerGpuRuntimeCapabilities {
             cdi_supported: false,
+            cdi_spec_dirs: Vec::new(),
             wsl_all_gpu_fallback_enabled: false,
         },
         sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
@@ -200,6 +204,59 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         provider_spiffe_workload_api_socket: None,
         app_armor_profile: Some(AppArmorProfile::Unconfined),
     }
+}
+
+fn runtime_config_with_cdi_spec_dirs(cdi_spec_dirs: &[&str]) -> DockerDriverRuntimeConfig {
+    let mut config = runtime_config();
+    config.gpu.cdi_supported = !cdi_spec_dirs.is_empty();
+    config.gpu.cdi_spec_dirs = cdi_spec_dirs
+        .iter()
+        .map(|path| (*path).to_string())
+        .collect();
+    config
+}
+
+#[test]
+fn gpu_runtime_builds_cdi_context_from_selected_devices_and_daemon_dirs() {
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR, TEST_CDI_SPEC_DIR_ALT]);
+    let selected_devices = vec![
+        "nvidia.com/gpu=0".to_string(),
+        "nvidia.com/gpu=1".to_string(),
+    ];
+
+    let context = config
+        .gpu
+        .cdi_context(Some(&selected_devices))
+        .unwrap()
+        .expect("GPU selection should produce a CDI context");
+
+    assert_eq!(context.selected_devices, selected_devices);
+    assert_eq!(
+        context.spec_dirs,
+        vec![
+            CdiSpecDirectory::new(cdi_spec_mount_path(0), TEST_CDI_SPEC_DIR),
+            CdiSpecDirectory::new(cdi_spec_mount_path(1), TEST_CDI_SPEC_DIR_ALT),
+        ]
+    );
+}
+
+#[test]
+fn gpu_runtime_omits_cdi_projection_without_selected_devices() {
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR]);
+    assert_eq!(config.gpu.cdi_context(None).unwrap(), None);
+}
+
+#[test]
+fn gpu_runtime_builds_read_only_cdi_bind_mounts() {
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR, TEST_CDI_SPEC_DIR_ALT]);
+
+    assert_eq!(
+        config.gpu.cdi_spec_bind_strings().unwrap(),
+        vec![
+            format!("{TEST_CDI_SPEC_DIR}:{}:ro,z", cdi_spec_mount_path(0)),
+            format!("{TEST_CDI_SPEC_DIR_ALT}:{}:ro,z", cdi_spec_mount_path(1)),
+        ]
+    );
 }
 
 fn test_workload_identity() -> ResolvedWorkloadIdentity {
@@ -2452,8 +2509,7 @@ fn validate_sandbox_auth_accepts_launch_authentication() {
 
 #[test]
 fn build_container_create_body_maps_default_gpu_to_selected_cdi_device() {
-    let mut config = runtime_config();
-    config.gpu.cdi_supported = true;
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR]);
     let mut sandbox = test_sandbox();
     sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
 
@@ -2478,6 +2534,15 @@ fn build_container_create_body_maps_default_gpu_to_selected_cdi_device() {
         request.device_ids.as_ref().unwrap(),
         &vec!["nvidia.com/gpu=1".to_string()]
     );
+    let binds = create_body
+        .host_config
+        .as_ref()
+        .and_then(|host_config| host_config.binds.as_ref())
+        .expect("GPU request should project CDI specs into the workload");
+    assert!(binds.contains(&format!(
+        "{TEST_CDI_SPEC_DIR}:{}:ro,z",
+        cdi_spec_mount_path(0)
+    )));
 }
 
 #[test]
@@ -2500,8 +2565,7 @@ fn build_container_create_body_omits_devices_without_resolved_default_cdi_device
 
 #[test]
 fn build_container_create_body_passes_explicit_cdi_device_id_through() {
-    let mut config = runtime_config();
-    config.gpu.cdi_supported = true;
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR]);
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(None));
@@ -2571,8 +2635,7 @@ fn build_container_create_body_rejects_empty_cdi_devices() {
 
 #[test]
 fn driver_default_gpu_selection_consumes_distinct_devices_for_creates() {
-    let mut config = runtime_config();
-    config.gpu.cdi_supported = true;
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR]);
     let driver = test_driver_with_config(config);
     driver.gpu_selector.refresh(
         CdiGpuInventory::new(["nvidia.com/gpu=0", "nvidia.com/gpu=1"]),
