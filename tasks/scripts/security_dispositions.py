@@ -35,6 +35,8 @@ SCANNER_SEVERITIES = ("critical", "high")
 ASSESSED_SEVERITIES = ("critical", "high", "medium", "low", "none")
 SLA_DAYS = {"critical": 7, "high": 14, "medium": 30, "low": 90}
 CODEQL_THRESHOLD = 7.0
+# CodeQL rule IDs use short prefixes for some matrix languages.
+CODEQL_RULE_PREFIXES = {"javascript-typescript": "js", "python": "py"}
 EXPIRY_WARNING_DAYS = 7
 
 STRING_FIELDS = (
@@ -434,11 +436,11 @@ def evaluate(
     today: dt.date,
     language: str | None = None,
 ) -> Evaluation:
+    prefix = f"{CODEQL_RULE_PREFIXES.get(language, language)}/" if language else ""
     scoped = [
         entry
         for entry in entries
-        if entry.scanner == scanner
-        and (language is None or entry.rule.startswith(f"{language}/"))
+        if entry.scanner == scanner and entry.rule.startswith(prefix)
     ]
     by_rule_path = {
         (entry.rule, path): entry for entry in scoped for path in entry.alerts.values()

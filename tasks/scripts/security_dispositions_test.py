@@ -670,3 +670,37 @@ def test_script_entrypoint(tmp_path: Path) -> None:
     )
     assert completed.returncode == 0, completed.stderr
     assert "### Security dispositions: zizmor" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    ("language", "rule"),
+    [
+        ("python", "py/unsafe"),
+        ("javascript-typescript", "js/xss"),
+        ("go", "go/zip-slip"),
+    ],
+)
+def test_language_maps_to_codeql_rule_prefix(language: str, rule: str) -> None:
+    entry = sd.Entry(
+        id=f"codeql/{rule}/7",
+        scanner="codeql",
+        rule=rule,
+        disposition="rejected",
+        scanner_severity="high",
+        assessed_severity="none",
+        reason="x",
+        approver="purp",
+        first_seen=TODAY,
+        first_seen_at="x",
+        expires=None,
+        sla_exception=None,
+        alerts={7: "a"},
+    )
+    evaluation = sd.evaluate(
+        [sd.Finding(rule, "a", 1)],
+        [entry],
+        scanner="codeql",
+        today=TODAY,
+        language=language,
+    )
+    assert evaluation.failures == []
