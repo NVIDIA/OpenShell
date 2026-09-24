@@ -74,7 +74,7 @@ include 64 KiB service config, 4 KiB request context, 32 KiB target data, 128
 request headers totaling 64 KiB, 64 header mutations, 32 findings per stage,
 and 64 metadata entries. The external contract lives in
 `proto/supervisor_middleware.proto`, with service-author guidance in the
-[middleware operations guide](../docs/extensibility/supervisor-middleware/operations.mdx).
+[supported middleware operations](../docs/extensibility/supervisor-middleware/operations.mdx).
 
 The work semaphore bounds aggregate buffered middleware input to approximately
 `32 × 4 MiB`, plus bounded envelope and parser overhead. It is a concurrency

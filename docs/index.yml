@@ -81,9 +81,9 @@ navigation:
     slug: supervisor-middleware
     path: extensibility/supervisor-middleware/index.mdx
     contents:
-    - page: "Configure and Operate"
+    - page: "Configuration"
       path: extensibility/supervisor-middleware/configure.mdx
-    - page: "Operations"
+    - page: "Supported Operations"
       path: extensibility/supervisor-middleware/operations.mdx
   - page: "Gateway Interceptors"
     path: extensibility/gateway-interceptors.mdx

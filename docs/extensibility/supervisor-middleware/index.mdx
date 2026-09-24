@@ -47,7 +47,7 @@ OpenShell checks network policy first, so middleware only sees traffic that poli
 
 Each middleware decides whether to allow, deny, or change the traffic. A denial blocks the request even when network policy allows it. If middleware fails or its service is unavailable, OpenShell blocks the affected traffic by default.
 
-Middleware can handle three operations: HTTP requests, HTTP responses, and the text messages an agent sends over a WebSocket connection. Each middleware declares which operations it supports. [Middleware Operations](/extensibility/supervisor-middleware/operations) describes each one.
+Middleware can handle three operations: HTTP requests, HTTP responses, and the text messages an agent sends over a WebSocket connection. Each middleware declares which operations it supports. [Supported Operations](/extensibility/supervisor-middleware/operations) describes each one.
 
 ## Current Limitations
 
@@ -63,7 +63,7 @@ To add middleware to your sandboxes, start with configuration:
 
 <Cards>
 
-<Card title="Configure and Operate" href="/extensibility/supervisor-middleware/configure">
+<Card title="Configuration" href="/extensibility/supervisor-middleware/configure">
 
 Attach built-in middleware, register your own service, choose failure behavior, and observe middleware decisions.
 </Card>
@@ -85,7 +85,7 @@ Every middleware service implements these RPCs:
 - `Describe` returns the service manifest. The manifest lists the operations the service supports, with a payload limit and optional timeout for each. It also carries [protocol negotiation](/extensibility/extension-negotiation) metadata and the [expected audience](/extensibility/extension-authentication#confirm-the-audience-at-startup).
 - `ValidateConfig` checks the `config` object from a policy entry. The gateway calls it before it accepts a policy.
 
-The service then implements an evaluation RPC for each operation it supports, as described in [Middleware Operations](/extensibility/supervisor-middleware/operations).
+The service then implements an evaluation RPC for each operation it supports, as described in [Supported Operations](/extensibility/supervisor-middleware/operations).
 
 Most gRPC servers reject incoming messages larger than 4 MiB by default. Raise your server's limit to at least 4.5 MiB so that a maximum-size payload and the rest of the message fit.
 
@@ -93,7 +93,7 @@ These guides cover the rest of the service contract:
 
 <Cards>
 
-<Card title="Middleware Operations" href="/extensibility/supervisor-middleware/operations">
+<Card title="Supported Operations" href="/extensibility/supervisor-middleware/operations">
 
 When OpenShell calls your service, what it receives, and what it can return for HTTP requests, HTTP responses, and WebSocket messages.
 </Card>

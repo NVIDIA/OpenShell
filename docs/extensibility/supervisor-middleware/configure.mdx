@@ -1,14 +1,68 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Configure and Operate Supervisor Middleware"
-sidebar-title: "Configure and Operate"
+title: "Supervisor Middleware Configuration"
+sidebar-title: "Configuration"
 slug: "extensibility/supervisor-middleware/configure"
 description: "Attach supervisor middleware to sandbox traffic, register your own middleware services, and observe middleware decisions."
 keywords: "Supervisor Middleware, Configuration, Network Policy, Operations, OCSF, Logging"
 ---
 
-You attach middleware to destination hosts in sandbox policy. Built-in middleware needs only a policy entry. Your own middleware service also needs a registration in gateway configuration.
+Register your middleware service in gateway configuration, then attach it to destination hosts in sandbox policy. This page also covers ordering, failure behavior, service lifecycle, and observability. Built-in middleware needs only a policy entry.
+
+## Use Your Own Middleware Service
+
+A middleware service is a gRPC server that implements the supervisor middleware protocol. The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) implements request, response, and WebSocket checks in one service, and includes a policy and a local launcher.
+
+To use your own service:
+
+1. Start the service where both the gateway and sandbox supervisors can reach it.
+2. Register it in gateway configuration.
+3. Restart the gateway.
+4. Attach it in sandbox policy by setting `middleware` to the registration `name`.
+
+Register the service in gateway TOML:
+
+```toml
+[[openshell.supervisor.middleware]]
+name = "content-guard"
+grpc_endpoint = "https://content-guard.example:50051"
+tls_ca_cert_path = "/path/to/content-guard-ca.pem"
+max_payload_bytes = 262144
+timeout = "500ms"
+```
+
+<ParamField path="name" type="string" required={true}>
+  Unique name that policies use to attach the service. The `openshell/` prefix is reserved for built-ins.
+</ParamField>
+
+<ParamField path="grpc_endpoint" type="string" required={true}>
+  Service address reachable from the gateway and sandbox supervisors.
+</ParamField>
+
+<ParamField path="max_payload_bytes" type="integer" required={true}>
+  Largest request body, response body, or WebSocket message the service inspects. Must be at most 4 MiB and no larger than the service advertises.
+</ParamField>
+
+<ParamField path="timeout" type="string" default="500ms">
+  Time limit for `Describe`, `ValidateConfig`, and individual evaluations or stream exchanges. Use an integer followed by `ms` or `s`, from `10ms` through `30s`. A binding may advertise a shorter evaluation timeout. Accepted HTTP response and WebSocket streams have no connection-wide deadline.
+</ParamField>
+
+<ParamField path="tls_ca_cert_path" type="string">
+  Private CA for the service certificate. Without it, OpenShell uses platform trust roots.
+</ParamField>
+
+<ParamField path="audience" type="string" default="urn:openshell:extension:middleware:<name>">
+  Token audience. Refer to [Extension Authentication](/extensibility/extension-authentication).
+</ParamField>
+
+<ParamField path="allow_insecure_transport" type="boolean" default="false">
+  Allows a plaintext `http://` endpoint with no authentication. Use it for local development or on a network that already authenticates callers.
+</ParamField>
+
+At startup, the gateway contacts every registered service to read its capabilities and verify [protocol compatibility](/extensibility/extension-negotiation). The gateway does not start if a service is unavailable or incompatible. [Gateway Configuration](/reference/gateway-config#supervisor-middleware-services) describes the full TOML context.
+
+When the gateway has JWT signing configured, OpenShell authenticates every call to your service with a short-lived token. [Extension Authentication](/extensibility/extension-authentication) describes how your service validates it.
 
 ## Attach Middleware in Policy
 
@@ -43,6 +97,7 @@ network_middlewares:
     order: 10
     endpoints:
       include: ["*.example.com"]
+      exclude: ["trusted.example.com"]
   content-guard:
     name: Content guard
     middleware: content-guard
@@ -107,60 +162,6 @@ The map key, such as `content-guard`, is the entry's stable identity in logs. Ea
 </ParamField>
 
 [Policy Schema](/reference/policy-schema#network-middleware) lists every field and limit.
-
-## Use Your Own Middleware Service
-
-A middleware service is a gRPC server that implements the supervisor middleware protocol. The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) implements request, response, and WebSocket checks in one service, and includes a policy and a local launcher.
-
-To use your own service:
-
-1. Start the service where both the gateway and sandbox supervisors can reach it.
-2. Register it in gateway configuration.
-3. Restart the gateway.
-4. Attach it in sandbox policy by setting `middleware` to the registration `name`.
-
-Register the service in gateway TOML:
-
-```toml
-[[openshell.supervisor.middleware]]
-name = "content-guard"
-grpc_endpoint = "https://content-guard.example:50051"
-tls_ca_cert_path = "/path/to/content-guard-ca.pem"
-max_payload_bytes = 262144
-timeout = "500ms"
-```
-
-<ParamField path="name" type="string" required={true}>
-  Unique name that policies use to attach the service. The `openshell/` prefix is reserved for built-ins.
-</ParamField>
-
-<ParamField path="grpc_endpoint" type="string" required={true}>
-  Service address reachable from the gateway and sandbox supervisors.
-</ParamField>
-
-<ParamField path="max_payload_bytes" type="integer" required={true}>
-  Largest request body, response body, or WebSocket message the service inspects. Must be at most 4 MiB and no larger than the service advertises.
-</ParamField>
-
-<ParamField path="timeout" type="string" default="500ms">
-  Time limit for each call to the service. Must be 10 ms-30 s.
-</ParamField>
-
-<ParamField path="tls_ca_cert_path" type="string">
-  Private CA for the service certificate. Without it, OpenShell uses platform trust roots.
-</ParamField>
-
-<ParamField path="audience" type="string" default="urn:openshell:extension:middleware:<name>">
-  Token audience. Refer to [Extension Authentication](/extensibility/extension-authentication).
-</ParamField>
-
-<ParamField path="allow_insecure_transport" type="boolean" default="false">
-  Allows a plaintext `http://` endpoint with no authentication. Use it for local development or on a network that already authenticates callers.
-</ParamField>
-
-At startup, the gateway contacts every registered service to read its capabilities and verify [protocol compatibility](/extensibility/extension-negotiation). The gateway does not start if a service is unavailable or incompatible. [Gateway Configuration](/reference/gateway-config#supervisor-middleware-services) describes the full TOML context.
-
-When the gateway has JWT signing configured, OpenShell authenticates every call to your service with a short-lived token. [Extension Authentication](/extensibility/extension-authentication) describes how your service validates it.
 
 ## Choose Failure Behavior
 

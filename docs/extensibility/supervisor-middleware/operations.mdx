@@ -1,8 +1,8 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Middleware Operations"
-sidebar-title: "Operations"
+title: "Supported Operations"
+sidebar-title: "Supported Operations"
 slug: "extensibility/supervisor-middleware/operations"
 description: "Build a middleware service that inspects and changes sandbox HTTP requests, HTTP responses, and WebSocket messages."
 keywords: "Supervisor Middleware, Operations, Bindings, HTTP, WebSocket, Request Body, Response Body, Header Mutation, Payload Limits"
@@ -10,7 +10,7 @@ keywords: "Supervisor Middleware, Operations, Bindings, HTTP, WebSocket, Request
 
 A middleware service handles one or more operations, such as HTTP requests or WebSocket messages. This page describes when OpenShell calls your service for each operation, what your service receives, and what it can return. The RPCs that every middleware service implements are described in [Build Your Middleware Service](/extensibility/supervisor-middleware#build-your-middleware-service).
 
-## Supported Operations
+## Operations and Phases
 
 | Operation | Phase | When OpenShell calls your service | RPC |
 | --- | --- | --- | --- |
@@ -26,7 +26,7 @@ When several middleware match the same traffic, OpenShell calls them in ascendin
 
 Every operation includes a request context. The context always includes `sandbox_id`. Use it for authorization, persistence, and correlation. The context also includes `sandbox` and `workspace` names when available. Names can be reused, so use them only for display and logging.
 
-Operations that include headers deliver them in wire order, and repeated headers stay separate. OpenShell removes credential, routing, framing, and hop-by-hop headers before sending them to your service.
+Operations that include headers deliver them in wire order, and repeated headers stay separate. OpenShell removes credential, routing, and hop-by-hop headers before sending them to your service. It also removes framing headers from request input. Response preflight retains upstream `Content-Length`, `Content-Encoding`, and `Content-Range` as read-only metadata, unless `Connection` names them as hop-by-hop headers. Your service cannot change or remove these fields; OpenShell handles downstream framing.
 
 Every result can include an optional reason code, findings, and metadata:
 
@@ -109,7 +109,7 @@ OpenShell applies each middleware's changes as a unit. If one change is invalid,
 
 ### Responses
 
-OpenShell calls your service after the external service responds and before the sandbox receives the response. Your service first decides whether to inspect the response, then can change or block it.
+OpenShell calls your service after the external service responds and before the sandbox receives the response. At preflight, your service can skip inspection, block delivery, or choose how to inspect the response. During inspection, it can change or block the response.
 
 ```mermaid
 sequenceDiagram
@@ -120,7 +120,7 @@ sequenceDiagram
 
   Service-->>Supervisor: HTTP response
   Supervisor->>Middleware: Preflight with status and headers
-  Middleware-->>Supervisor: Skip or inspect
+  Middleware-->>Supervisor: Skip, inspect, or block
   Supervisor->>Middleware: Body, when inspecting
   Middleware-->>Supervisor: Pass, change, or stop
   Supervisor-->>Sandbox: Deliver response
@@ -129,7 +129,7 @@ sequenceDiagram
 <AccordionGroup>
 <Accordion title="Preflight and Body Modes">
 
-The preflight includes the status and headers. A preflight result can skip the response, or inspect it with one body mode:
+The preflight includes the status and headers. A preflight result can skip inspection, block delivery with `block_delivery`, or inspect the response with one body mode:
 
 | Mode | Behavior |
 | --- | --- |
@@ -239,7 +239,7 @@ A denied message closes the connection with code `1008`. When middleware fails, 
 | Limit | Applies to | Value |
 | --- | --- | --- |
 | Payload per middleware | All operations | The registration's `max_payload_bytes`, up to 4 MiB. Applies to a request body, a whole response body or one streamed piece, or one text message, and to each replacement. |
-| Time per call | All operations | The smaller of the registration `timeout` and the timeout in the service manifest. |
+| Time per evaluation or stream exchange | All operations | The smaller of the registration `timeout` and the binding timeout in the service manifest. Accepted HTTP response and WebSocket streams have no connection-wide deadline. |
 | Streamed body piece | HTTP responses | 64 KiB. |
 | Time for all middleware on one streamed piece | HTTP responses | 30 seconds. |
 | Fragments per message | WebSocket messages | 4,096. |
