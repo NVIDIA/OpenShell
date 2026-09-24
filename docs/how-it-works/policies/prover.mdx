@@ -4,7 +4,7 @@
 title: "Policy Prover"
 sidebar-title: "Prover"
 description: "Understand how OpenShell uses the policy prover, and check that a policy grants no more access than a maximum policy you define."
-keywords: "Generative AI, Cybersecurity, Policy, Prover, Boundary, CI, Subagent"
+keywords: "Generative AI, Cybersecurity, Policy, Prover, Boundary, Subagent"
 position: 4
 ---
 
@@ -22,7 +22,7 @@ that an agent proposes. Each answers a different question:
 | | `openshell-prover check` | Policy advisor |
 |---|---|---|
 | Question | Does this policy stay within a maximum policy that I set? | Does this proposed rule add risky new access? |
-| When it runs | When an agent or a person runs the command, for example before applying a policy or in CI. | Automatically, each time an agent in a sandbox proposes a new network rule through the policy advisor. |
+| When it runs | When an agent or a person runs the command, for example before applying a policy. | Automatically, each time an agent in a sandbox proposes a new network rule through the policy advisor. |
 | What it compares | A candidate policy against a boundary policy that you write. | The sandbox's policy with and without the proposed rule. |
 | What it reports | Access that the candidate allows beyond the boundary. | New access to link-local or cloud metadata addresses, uninspected traffic where a provider credential is available, new credentialed destinations, and new HTTP methods. |
 
@@ -46,8 +46,8 @@ The boundary is usually the most access that an environment allows. For
 example, an enterprise can define a maximum policy for all of its agents. A
 parent agent that creates a sandbox for a subagent can check that the policy it
 proposes for the subagent does not exceed the parent's own maximum allowed
-policy. Run the check before you apply a policy, or in CI, so that no change
-grants more than the boundary allows.
+policy. Run the check before you apply a policy, so that no change grants more
+than the boundary allows.
 
 The check covers filesystem access, process identity, Landlock settings, network
 connections, and REST requests. If a policy uses anything else, such as GraphQL
@@ -140,8 +140,8 @@ The prover reports one of these results:
 | `unsupported` | `3` | A policy uses something the prover cannot check. The reason explains what. |
 | `inconclusive` | `3` | The prover could not finish, for example because it ran out of time or the policies are too large. |
 
-Only `within_boundary` means that the check passed. In CI, treat every other
-result as a failure. For example, a candidate with a GraphQL rule returns:
+Only `within_boundary` means that the check passed. Treat every other result as
+a failure. For example, a candidate with a GraphQL rule returns:
 
 ```text
 result: unsupported
@@ -149,9 +149,9 @@ coverage: domains=filesystem,network_l4,network_rest,process,landlock
 reason: candidate policy rule 'g' uses protocol 'graphql'; only L4 TCP and REST are modeled
 ```
 
-For scripts, add `--output json`. Read the `result` and `reason_code` fields
-instead of parsing the text output. `reason_code` is a stable identifier, such
-as `unsupported_policy_shape` or `solver_timeout`. Also check that
+For agents and scripts, add `--output json`. Read the `result` and
+`reason_code` fields instead of parsing the text output. `reason_code` is a
+stable identifier, such as `unsupported_policy_shape` or `solver_timeout`. Also check that
 `coverage.domains` includes every part of the policy that you rely on. Run
 `openshell-prover check --help` for all options, including `--timeout`, which
 changes the default 10-second time limit.
