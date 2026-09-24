@@ -202,6 +202,17 @@ shared workspace mode.
 {{- end }}
 
 {{/*
+Whether to render the gateway workspace admission policy. Shared mode grants
+the gateway nothing cluster-wide that the policy covers.
+*/}}
+{{- define "openshell.admissionPolicyEnabled" -}}
+{{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
+{{- if and .Values.admissionPolicy.enabled (ne $workspaceMode "shared") -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
 Namespace where Kubernetes Secret-backed provider credentials live.
 */}}
 {{- define "openshell.credentialKubernetesSecretsNamespace" -}}

@@ -526,6 +526,15 @@ The gateway ClusterRole grants no Secret permissions in operator mode. The
 `openshell-workspace` chart Role installed in each operator-managed namespace
 grants bootstrap Secret `create` and `delete`.
 
+In managed and operator mode, a chart-installed `ValidatingAdmissionPolicy`
+matching only the gateway ServiceAccount limits the ClusterRole's workspace
+grants: Secret, Pod, Sandbox, Service, ServiceAccount, and NetworkPolicy writes
+are admitted only in namespaces labeled as owned by this gateway, namespaces
+matching the operator label selector, and the sandbox and credential
+namespaces, and Namespace writes only for namespaces this gateway owns. The
+gateway cannot patch namespaces, so it cannot add ownership labels to an
+existing namespace. The policy is on by default and can be disabled.
+
 **Operator** uses pre-provisioned namespaces discovered through two optional
 sources: a K8s label selector (`operator_namespace_label`) and a drop-in
 allowlist file (`operator_namespace_file`). Exactly one must be configured.

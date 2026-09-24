@@ -148,6 +148,17 @@ kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\
 kubectl auth can-i get secrets -n <credential-namespace> --as system:serviceaccount:openshell:openshell
 ```
 
+In managed and operator workspace modes, a gateway error containing `the
+OpenShell gateway may not` comes from the chart's `ValidatingAdmissionPolicy`.
+The target namespace is not labeled as owned by this gateway, does not match
+`operatorNamespaceLabel`, and is not the sandbox or credential namespace. Check
+the namespace labels and the rendered policy:
+
+```bash
+kubectl get namespace <namespace> --show-labels
+kubectl get validatingadmissionpolicy -l app.kubernetes.io/instance=openshell -o yaml
+```
+
 For a configured Vault credential driver, inspect its endpoint and trust bundle
 before debugging provider resolution. Non-loopback addresses must use HTTPS,
 and the driver never follows redirects. A private CA bundle augments platform

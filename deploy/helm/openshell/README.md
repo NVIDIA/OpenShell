@@ -198,6 +198,7 @@ discovery endpoint or its TLS CA.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| admissionPolicy.enabled | bool | `true` | Install a ValidatingAdmissionPolicy that rejects gateway requests to create, update, or delete Secrets, Pods, Sandboxes, Services, ServiceAccounts, NetworkPolicies, and Namespaces outside gateway-owned managed namespaces, operator-selected namespaces, the sandbox namespace, and the credential namespace. |
 | affinity | object | `{}` | Affinity rules for the gateway pod. |
 | agentSandbox.preflight.enabled | bool | `true` | Check the live cluster for a supported Agent Sandbox API before rendering gateway resources. Disable only for offline rendering and linting. |
 | certManager.caSecretName | string | `"openshell-ca-tls"` | Secret created for the intermediate CA (Certificate with isCA: true). |

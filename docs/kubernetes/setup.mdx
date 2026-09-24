@@ -20,7 +20,7 @@ Make sure the following are in place before you install.
 
 | Prerequisite | Required | Notes |
 |---|---|---|
-| Kubernetes 1.29+ with RBAC enabled | Yes | No additional notes. |
+| Kubernetes 1.30+ with RBAC enabled | Yes | Managed and operator workspace modes install a `ValidatingAdmissionPolicy`, which is GA in 1.30. |
 | Helm 3.x | Yes | No additional notes. |
 | Agent Sandbox controller and CRDs | Yes | Install before the OpenShell chart. Refer to [Install Agent Sandbox](#install-agent-sandbox). |
 | cert-manager | No | Refer to [Managing Certificates](/kubernetes/managing-certificates). Use cert-manager only if you prefer it over the built-in PKI job. |
@@ -356,6 +356,27 @@ helm upgrade --install openshell \
 ```
 
 The ServiceAccount must already have the Role and ClusterRole bindings described above.
+
+### Admission policy
+
+In managed and operator workspace modes, the chart installs a
+`ValidatingAdmissionPolicy` that applies only to the gateway ServiceAccount. It
+rejects gateway requests to create, update, or delete Secrets, Pods, Sandboxes,
+Services, ServiceAccounts, and NetworkPolicies unless the namespace is one of:
+
+- A managed namespace labeled with `openshell.ai/managed-by=openshell` and this
+  gateway's `openshell.ai/gateway-id`.
+- A namespace matching `server.drivers.kubernetes.operatorNamespaceLabel`.
+- The sandbox namespace or the credential namespace.
+
+The gateway may create or delete only namespaces labeled as its own. Rejected
+requests report `the OpenShell gateway may not <operation> <resource> in
+namespace <name>`.
+
+The policy supports only `key=value` terms in `operatorNamespaceLabel` and
+cannot enforce `operatorNamespaceFile`; the chart fails to render with either
+unsupported form. Set `admissionPolicy.enabled=false` to run without the policy,
+for example on a cluster that does not serve `ValidatingAdmissionPolicy`.
 
 ## Probes
 

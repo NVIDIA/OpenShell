@@ -608,6 +608,69 @@ async fn managed_gateway_cannot_read_or_modify_workspace_secrets() {
     );
 }
 
+async fn gateway_dry_run(args: &[&str]) -> (bool, String) {
+    let mut full = vec!["--as", GATEWAY_SERVICE_ACCOUNT];
+    full.extend_from_slice(args);
+    full.push("--dry-run=server");
+    kubectl(&full).await
+}
+
+struct NamespaceCleanup(String);
+
+impl Drop for NamespaceCleanup {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("kubectl")
+            .args([
+                "--context",
+                &kube_context(),
+                "delete",
+                "namespace",
+                &self.0,
+                "--ignore-not-found",
+                "--wait=false",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+#[tokio::test]
+async fn managed_admission_policy_confines_gateway_to_owned_namespaces() {
+    // Kubernetes refuses to delete built-in namespaces before admission
+    // policies run, so probe an ordinary unowned namespace.
+    let ns = unique_workspace("e2e-unowned");
+    let (ok, out) = kubectl(&["create", "namespace", &ns]).await;
+    assert!(ok, "failed to create namespace {ns}: {out}");
+    let _cleanup = NamespaceCleanup(ns.clone());
+
+    for (description, args) in [
+        (
+            "create a Secret",
+            &[
+                "-n",
+                &ns,
+                "create",
+                "secret",
+                "generic",
+                "e2e-probe",
+                "--from-literal=k=v",
+            ][..],
+        ),
+        (
+            "create a Pod",
+            &["-n", &ns, "run", "e2e-probe", "--image=busybox"][..],
+        ),
+        ("delete a Namespace", &["delete", "namespace", &ns][..]),
+    ] {
+        let (ok, out) = gateway_dry_run(args).await;
+        assert!(
+            !ok && out.contains("the OpenShell gateway may not"),
+            "admission policy must stop the gateway from being able to {description} outside its namespaces: {out}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn managed_rejects_namespace_owned_by_different_gateway() {
     let ws = unique_workspace("mgdown");

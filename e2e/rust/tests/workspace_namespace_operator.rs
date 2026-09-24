@@ -210,6 +210,37 @@ async fn operator_gateway_has_no_secret_access_without_workspace_chart() {
 }
 
 #[tokio::test]
+async fn operator_admission_policy_confines_gateway_to_selected_namespaces() {
+    for (description, args) in [
+        (
+            "create a Pod",
+            &["-n", "default", "run", "e2e-probe", "--image=busybox"][..],
+        ),
+        (
+            "create a Service",
+            &[
+                "-n",
+                "default",
+                "create",
+                "service",
+                "clusterip",
+                "e2e-probe",
+                "--tcp=80",
+            ][..],
+        ),
+    ] {
+        let mut full = vec!["--as", GATEWAY_SERVICE_ACCOUNT];
+        full.extend_from_slice(args);
+        full.push("--dry-run=server");
+        let (ok, out) = kubectl(&full).await;
+        assert!(
+            !ok && out.contains("the OpenShell gateway may not"),
+            "admission policy must stop the gateway from being able to {description} outside selected namespaces: {out}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn operator_sandbox_in_labeled_namespace() {
     let ns = unique_namespace("op");
     let _cleanup = OperatorCleanup {

@@ -151,6 +151,17 @@ workspaceResources:
   # from this chart. Disable for a gateway-only release.
   enabled: true
 
+# Admission policy limiting gateway workspace requests to namespaces it owns
+# or is granted. Rendered in managed and operator
+# workspace modes. Requires Kubernetes 1.30 or later.
+admissionPolicy:
+  # -- Install a ValidatingAdmissionPolicy that rejects gateway requests to
+  # create, update, or delete Secrets, Pods, Sandboxes, Services,
+  # ServiceAccounts, NetworkPolicies, and Namespaces outside gateway-owned
+  # managed namespaces, operator-selected namespaces, the sandbox namespace, and
+  # the credential namespace.
+  enabled: true
+
 # -- Extra annotations to add to the gateway pod.
 podAnnotations: {}
 # -- Extra labels to add to the gateway pod.
