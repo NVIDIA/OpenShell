@@ -54,6 +54,26 @@ This runs the `mechanistic-proposal`, `new-hostname-proposal`, and
 gateway binaries and runtime images. This manual run does not replace the
 required PR E2E gate.
 
+### Run only the GitHub App provider regression
+
+The GitHub App sandbox regression runs in the curated `e2e:podman:ci` suite
+used by the branch Podman E2E job. It is also independently selectable:
+
+```shell
+OPENSHELL_E2E_PODMAN_TEST=provider_github_app mise run e2e:podman
+```
+
+It builds a tool image with `gh` and Git, then uses a local installation-token
+issuer and authenticated HTTPS API/Git fixture. It checks both clients across
+12 rotations, revocation after reconfiguration, and a fresh process using the
+replacement handle. No live GitHub app or installation is required. It needs
+the wrapper-managed gateway so it can temporarily trust the fixture CA; the
+original gateway configuration is restored afterward. The OAuth counterpart
+remains separately selectable as `provider_refresh_handles`. It uses an HTTP
+fixture and the standard workload image, and supports both wrapper-managed
+gateways and existing gateways selected with `OPENSHELL_GATEWAY_ENDPOINT`.
+It does not install CA trust or restart the gateway.
+
 ## Informational security reports
 
 Security workflow compute runs directly on GitHub-hosted runners instead of

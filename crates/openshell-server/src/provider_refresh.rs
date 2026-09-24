@@ -22,6 +22,11 @@ use std::time::Duration;
 use tonic::{Code, Status};
 use tracing::{info, warn};
 
+mod github_app;
+pub use github_app::validate_configuration as validate_github_app_configuration;
+#[cfg(test)]
+pub use tests::TEST_RSA_PRIVATE_KEY;
+
 use crate::storage_proto::{
     StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
     StoredRefreshMaterialDeletion,
@@ -659,6 +664,7 @@ pub fn refresh_strategy_name(strategy: i32) -> &'static str {
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
+        ProviderCredentialRefreshStrategy::GithubAppInstallation => "github_app_installation",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -675,7 +681,8 @@ pub fn strategy_secret_material_keys(
             &["refresh_token", "client_secret"]
         }
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => &["client_secret"],
-        ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => &["private_key"],
+        ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
+        | ProviderCredentialRefreshStrategy::GithubAppInstallation => &["private_key"],
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
             &["aws_secret_access_key", "aws_session_token"]
         }
@@ -1364,6 +1371,7 @@ async fn mint_credential(
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
             mint_aws_sts_assume_role(state).await
         }
+        ProviderCredentialRefreshStrategy::GithubAppInstallation => github_app::mint(state).await,
         ProviderCredentialRefreshStrategy::External
         | ProviderCredentialRefreshStrategy::Static
         | ProviderCredentialRefreshStrategy::Unspecified => Err(Status::failed_precondition(
@@ -4583,7 +4591,7 @@ mod tests {
         }
     }
 
-    const TEST_RSA_PRIVATE_KEY: &str = r"-----BEGIN PRIVATE KEY-----
+    pub const TEST_RSA_PRIVATE_KEY: &str = r"-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCvCoZ0mVHpCHsF
 zeeqw2caNIe/eb4BQUccFPhZfRnF7sCfyB84zTBmuwG2umRBdjFnVsfIIZRp2HcD
 OESrRYYiE1RGfjBXImGVg2Wtza0HYhL1sLyX1eaEefylxoilmApAgWDh9p36h8J2

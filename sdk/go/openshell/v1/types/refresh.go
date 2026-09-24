@@ -16,6 +16,7 @@ const (
 	RefreshStrategyOAuth2ClientCredentials RefreshStrategy = "OAuth2ClientCredentials"
 	RefreshStrategyGoogleServiceAccountJWT RefreshStrategy = "GoogleServiceAccountJWT"
 	RefreshStrategyAWSStsAssumeRole        RefreshStrategy = "AWSStsAssumeRole"
+	RefreshStrategyGitHubAppInstallation   RefreshStrategy = "GitHubAppInstallation"
 )
 
 // RefreshRecoveryAction describes the action required after a refresh failure.
