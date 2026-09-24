@@ -3,3 +3,6 @@
 
 # Vouch list — maintainers only (bot commits bypass, but manual edits need review)
 .github/VOUCHED.td @NVIDIA/openshell-codeowners
+
+# Security finding dispositions — maintainers only
+security-dispositions.toml @NVIDIA/openshell-codeowners
