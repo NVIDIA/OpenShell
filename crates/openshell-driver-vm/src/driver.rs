@@ -9643,7 +9643,7 @@ mod tests {
         let outside = Path::new("/tmp").join(format!(
             "openshell-vm-layer-test-{}-{:x}",
             std::process::id(),
-            rand::random::<u64>()
+            u64::from_ne_bytes(openshell_crypto::random_bytes::<8>().expect("test entropy"))
         ));
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("sentinel"), "unchanged").unwrap();
