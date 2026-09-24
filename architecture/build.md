@@ -325,6 +325,9 @@ include named artifact inputs. The top-level `.roles` directory is excluded:
 Galaxy release pins in `requirements.yaml` are treated as immutable, including
 any transitive dependency pins. Cache misses with Galaxy enabled reinstall
 the required roles and their dependencies before running playbooks.
+Cache publication requires a graceful guest shutdown. A forced termination
+still cleans up a disposable guest, but fails cache creation so an unclean disk
+cannot become a reusable setup or install layer.
 
 The `tests/artifacts.nix` helpers build the CLI, conformance CLI, and sandbox
 with musl, and the gateway and supervisor with GNU. Image assembly stages

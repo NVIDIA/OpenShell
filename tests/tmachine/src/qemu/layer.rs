@@ -10,7 +10,7 @@ use blake3::Hasher;
 use directories::ProjectDirs;
 
 use super::img::QemuImage;
-use super::vm::QemuVm;
+use super::vm::{QemuVm, ShutdownOutcome};
 
 pub(super) async fn cached_layer(
     base_image: &Path,
@@ -41,11 +41,19 @@ pub(super) async fn cached_layer(
     let image = QemuImage::create(base_image, temporary_disk.clone()).await;
     let vm = QemuVm::start(&image).await;
     let result = run_playbooks(playbooks, inputs, variables).await;
-    vm.stop().await?;
+    let shutdown = vm.stop().await?;
     result?;
 
-    std::fs::rename(temporary_disk, &disk).unwrap();
+    publish_layer(&temporary_disk, &disk, shutdown)?;
     Ok(disk)
+}
+
+fn publish_layer(temporary_disk: &Path, disk: &Path, shutdown: ShutdownOutcome) -> Result<()> {
+    anyhow::ensure!(
+        shutdown == ShutdownOutcome::Graceful,
+        "refusing to cache a guest disk after forced shutdown"
+    );
+    std::fs::rename(temporary_disk, disk).context("publish cached guest disk")
 }
 
 pub(super) async fn run_playbooks(
@@ -113,4 +121,41 @@ pub(super) fn hash_file(hasher: &mut Hasher, file: &Path) -> Result<()> {
         .update_reader(file_handle)
         .with_context(|| format!("failed to read {} while hashing", file.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::publish_layer;
+    use crate::qemu::vm::ShutdownOutcome;
+
+    #[test]
+    fn forced_shutdown_does_not_publish_a_cached_layer() {
+        let dir = tempdir().unwrap();
+        let temporary_disk = dir.path().join("layer.tmp");
+        let disk = dir.path().join("layer.qcow2");
+        std::fs::write(&temporary_disk, b"unclean guest disk").unwrap();
+
+        let result = publish_layer(&temporary_disk, &disk, ShutdownOutcome::Forced);
+
+        assert!(result.is_err(), "forced shutdown must fail cache creation");
+        assert!(
+            !disk.exists(),
+            "an unclean layer must never become a cache hit"
+        );
+    }
+
+    #[test]
+    fn graceful_shutdown_publishes_the_completed_layer() {
+        let dir = tempdir().unwrap();
+        let temporary_disk = dir.path().join("layer.tmp");
+        let disk = dir.path().join("layer.qcow2");
+        std::fs::write(&temporary_disk, b"completed guest disk").unwrap();
+
+        publish_layer(&temporary_disk, &disk, ShutdownOutcome::Graceful).unwrap();
+
+        assert_eq!(std::fs::read(&disk).unwrap(), b"completed guest disk");
+        assert!(!temporary_disk.exists());
+    }
 }

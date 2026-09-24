@@ -22,6 +22,12 @@ pub(super) struct QemuVm {
     runtime_dir: TempDir,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ShutdownOutcome {
+    Graceful,
+    Forced,
+}
+
 impl QemuVm {
     pub(super) async fn start(image: &QemuImage) -> Self {
         let runtime_dir = tempdir().unwrap();
@@ -39,10 +45,10 @@ impl QemuVm {
         Self { child, runtime_dir }
     }
 
-    pub(super) async fn stop(mut self) -> Result<()> {
+    pub(super) async fn stop(mut self) -> Result<ShutdownOutcome> {
         if let Some(status) = self.child.try_wait().context("check QEMU guest state")? {
             anyhow::ensure!(status.success(), "QEMU guest exited with {status}");
-            return Ok(());
+            return Ok(ShutdownOutcome::Graceful);
         }
         let mut killed_by_tmachine = false;
         if let Err(error) =
@@ -84,7 +90,11 @@ impl QemuVm {
             killed_by_tmachine || status.success(),
             "QEMU guest exited with {status}"
         );
-        Ok(())
+        Ok(if killed_by_tmachine {
+            ShutdownOutcome::Forced
+        } else {
+            ShutdownOutcome::Graceful
+        })
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -230,7 +240,7 @@ mod tests {
     use tokio::net::UnixListener;
     use tokio::process::Command;
 
-    use super::QemuVm;
+    use super::{QemuVm, ShutdownOutcome};
 
     #[tokio::test]
     async fn stop_rejects_an_already_exited_guest_with_status_42() {
@@ -298,6 +308,6 @@ mod tests {
             .unwrap();
         let vm = QemuVm { child, runtime_dir };
 
-        vm.stop().await.unwrap();
+        assert_eq!(vm.stop().await.unwrap(), ShutdownOutcome::Forced);
     }
 }
