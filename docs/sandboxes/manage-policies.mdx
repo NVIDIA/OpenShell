@@ -112,7 +112,7 @@ command changes only that rule:
 openshell policy update my-sandbox \
   --rule-name github_readonly \
   --binary /usr/bin/curl \
-  --add-allow 'api.github.com:443:POST:/repos/*/issues' \
+  --add-allow 'api.github.com:443:POST:/repos/*/*/issues' \
   --wait
 ```
 

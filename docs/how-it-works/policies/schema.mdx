@@ -440,7 +440,7 @@ REST rules match HTTP requests by method, path, and optional query parameters.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `method` | string | Yes | HTTP method, such as `GET` or `POST`. `*` matches any method. |
-| `path` | string | Yes | URL path glob. `*` and `**` match zero or more characters and may cross `/`. `?` matches one character. Bracket classes such as `[0-9]` and `[!0]` are supported. |
+| `path` | string | Yes | URL path glob. `*` matches zero or more characters within one path segment, and `**` matches zero or more characters across segments. `?` matches one character. Bracket classes such as `[0-9]` and `[!0]` are supported. |
 | `query` | map | No | Query parameter matchers keyed by decoded, case-sensitive name. A matcher is a glob string (`tag: "foo-*"`) or an object with `any` (`tag: { any: ["foo-*", "bar-*"] }`). |
 
 In an allow rule, every duplicate value for a configured query key must match.
@@ -467,9 +467,9 @@ endpoints:
               any: ["v1.*", "v2.*"]
     deny_rules:
       - method: POST
-        path: "/repos/*/pulls/*/reviews"
+        path: "/repos/*/*/pulls/*/reviews"
       - method: "*"
-        path: "/repos/*/rulesets"
+        path: "/repos/*/*/rulesets"
 ```
 
 ### WebSocket Rules
@@ -799,7 +799,7 @@ Different policy fields use different wildcard boundaries:
 |---|---|---|
 | Endpoint `host` | Case-insensitive DNS name or IP comparison. | DNS `*` matches one label and `**` matches one or more labels. Validation restricts wildcard placement. |
 | Binary `path` | Canonical executable or trusted ancestor path. | Symlinks resolve to canonical identity. `*` matches within a path segment and `**` crosses directories. Identity enforcement depends on trusted runtime configuration. |
-| REST or WebSocket request `path` | Case-sensitive URL path glob. | Both `*` and `**` can cross `/`, unlike common shell globs. |
+| REST or WebSocket request `path` | Case-sensitive URL path glob. | `*` matches within one path segment and `**` crosses `/`. `/repos/**` does not match `/repos` itself. |
 | Query value | Case-sensitive decoded value glob. | In allow rules, every duplicate value for a configured key must match. |
 | Middleware `endpoints` | Case-insensitive DNS name comparison. | Same as endpoint `host`. Brace alternates are rejected. |
 
