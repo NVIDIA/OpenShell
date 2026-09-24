@@ -497,8 +497,9 @@ Profile YAML can declare these refresh strategies:
 | `oauth2_client_credentials` | The gateway mints a short-lived access token with OAuth2 client credentials. |
 | `google_service_account_jwt` | The gateway signs a Google service account JWT and exchanges it for an access token. |
 | `aws_sts_assume_role` | The gateway calls `sts:AssumeRole` and mints `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` in one operation. |
+| `github_app_installation` | The gateway signs a GitHub App JWT and mints an installation token restricted to explicit repositories and permissions. |
 
-`openshell provider refresh configure` accepts only gateway-mintable strategies: `oauth2-refresh-token`, `oauth2-client-credentials`, `google-service-account-jwt`, and `aws-sts-assume-role`. Use `openshell provider update` for `static` and `external` refresh patterns.
+`openshell provider refresh configure` accepts only gateway-mintable strategies: `oauth2-refresh-token`, `oauth2-client-credentials`, `google-service-account-jwt`, `aws-sts-assume-role`, and `github-app-installation`. Use `openshell provider update` for `static` and `external` refresh patterns.
 
 Gateway-managed refresh strategies use these material keys:
 
@@ -508,8 +509,92 @@ Gateway-managed refresh strategies use these material keys:
 | `oauth2_client_credentials` | `client_id`, `client_secret`, optional `tenant_id` for Microsoft Entra token URLs. |
 | `google_service_account_jwt` | `client_email`, `private_key`, optional `subject` or `sub`. |
 | `aws_sts_assume_role` | `role_arn`, optional `session_name`, `external_id`, `aws_region`, and optional long-lived `aws_access_key_id` / `aws_secret_access_key` for gateways without ambient AWS credentials. |
+| `github_app_installation` | `client_id`, `installation_id`, `private_key`, `repository_ids` (JSON array), and `permissions` (JSON object). |
 
 OpenShell keeps token endpoints profile-owned. Refresh material cannot override `token_url` or `token_uri` during refresh configuration.
+
+### GitHub App Installation Tokens
+
+Use a GitHub App provider when agents should act as an app installation. Install
+the app on the intended account and grant it access to the required repositories
+and permissions. Each provider represents one installation and a fixed access
+scope. Use separate providers for different scopes.
+
+Download the [GitHub App example profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/github-app.yaml)
+as `github-app.yaml` and adapt its binary paths to your sandbox image. The profile
+declares `github_app_installation` refresh on its token credential. Its
+`token_url` is `https://api.github.com/app/installations/{installation_id}/access_tokens`.
+The gateway substitutes the numeric installation ID. The endpoint must use HTTPS
+and cannot contain userinfo, query parameters, or a fragment. Loopback HTTP is
+allowed for local tests. The gateway does not follow redirects.
+
+Load the app's RSA PEM key into the CLI environment, then configure refresh.
+Replace the example IDs with your app client ID, installation ID, and repository IDs.
+
+```shell
+export GITHUB_APP_PRIVATE_KEY="$(cat /secure/path/github-app.pem)"
+openshell provider profile import -f github-app.yaml
+openshell provider create --name repo-reader --type github-app --runtime-credentials
+openshell provider refresh configure repo-reader \
+  --credential-key GITHUB_TOKEN \
+  --strategy github-app-installation \
+  --material client_id=Iv1.example \
+  --material installation_id=12345 \
+  --material 'repository_ids=[123456789]' \
+  --material 'permissions={"contents":"read"}' \
+  --secret-material-env private_key=GITHUB_APP_PRIVATE_KEY
+unset GITHUB_APP_PRIVATE_KEY
+openshell provider refresh rotate repo-reader --credential-key GITHUB_TOKEN
+openshell provider refresh status repo-reader
+openshell sandbox create --provider repo-reader
+```
+
+Configuration stores refresh material and schedules minting. The explicit
+`rotate` command mints immediately, so check its result before creating a sandbox.
+Choose either `GITHUB_TOKEN` or `GH_TOKEN` as the credential key. Only the chosen
+environment variable is injected, as a placeholder. The private key remains in
+the gateway's credential backend, and the app JWT stays at the gateway.
+
+Supply 1 to 500 distinct positive repository IDs and a nonempty permission map
+using GitHub permission names and `read`, `write`, or `admin` levels. GitHub
+validates whether the installation grants those permissions. OpenShell rejects
+missing or empty scope rather than requesting installation-wide access. Use
+`permissions`, not OAuth `scopes`.
+
+The gateway honors GitHub's returned expiry and caps local token use at one hour
+or the configured shorter maximum lifetime. The example refreshes five minutes
+before expiry. Routine refresh preserves workload handles, including bearer
+headers used by API clients and Basic authentication used by Git HTTPS. Configure
+Git's credential helper to use `x-access-token` as the username and the token
+placeholder as its password. Git SSH authentication is separate.
+
+Token permissions and sandbox network policy both apply. The example profile
+permits API reads and Git clone/fetch; minting a write-capable token does not
+enable API writes or push. Installation tokens represent the app and do not
+support every operation that requires a GitHub user identity.
+
+For key replacement or a scope change, configure refresh again with all material,
+rotate, and restart processes holding the previous workload handle.
+Reconfiguration starts a new authorization epoch. Transient issuer failures retry
+through the existing refresh worker; configuration failures appear in refresh
+status. Previously minted credentials remain subject to their recorded expiry,
+and expired tokens fail closed. Revoking a key does not constitute explicit
+revocation of already minted tokens in OpenShell.
+
+If rotation reports `github_token_endpoint_unavailable`, the gateway could not
+complete the token endpoint request or read its response. Request failures
+distinguish timeouts, TLS certificate validation, TLS handshakes, and connection
+errors when the HTTP client provides a typed cause. Check DNS, outbound access to
+`api.github.com:443`, proxy settings, and CA trust in the gateway's own process or
+container. A successful request from your CLI host does not verify the gateway's
+network or trust configuration. These transport failures are separate from GitHub
+HTTP rejections of the app credentials, installation, or requested scope.
+
+On Kubernetes, the Helm chart sets the gateway's `SSL_CERT_FILE` when
+`server.oidc.caConfigMapName` is configured. That override applies to all native
+root loading in the gateway, including GitHub requests. Its bundle must contain
+the CA roots needed for both the OIDC issuer and outbound provider endpoints;
+a bundle containing only a private OIDC CA can prevent GitHub TLS validation.
 
 ### Additional Outputs
 

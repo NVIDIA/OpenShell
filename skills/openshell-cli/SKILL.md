@@ -203,6 +203,15 @@ openshell provider refresh rotate my-provider --credential-key ACCESS_TOKEN
 
 Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
 
+For GitHub App installations, check installed refresh help for
+`github-app-installation` and read the
+[provider profile documentation](https://docs.nvidia.com/openshell/latest/providers/profiles.md).
+Use explicit repository IDs and permissions, keep the app private key in secret
+refresh material, and check refresh status before attaching the provider. Token
+permissions do not grant API writes or Git push through a read-only sandbox policy.
+Key or scope replacement uses explicit reconfiguration and requires restarting
+processes with old workload handles.
+
 The gateway stores secret refresh material through its active credential driver.
 With Vault selected, refresh tokens, client secrets, and private keys live in
 Vault alongside injectable provider credentials; refresh state contains only

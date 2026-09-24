@@ -108,6 +108,12 @@ test identity and tools, with Python aligned to the host test runner for
 serialized callable compatibility. Default-image coverage retains the product
 image. Other compute-driver test lanes retain their existing workload fixtures.
 
+The Podman E2E gateway pins both the supervisor and sandbox runtime images
+selected by its wrapper, so a local test cannot mix a checkout's supervisor
+with a registry-default sandbox runtime. GitHub App credential tests run as a
+separate target with a local HTTPS API and Git backend, ephemeral CA trust, and
+real workload clients; they require no live GitHub credentials.
+
 The Docker image pipeline is a two-step flow: build the Rust binary natively
 for the target architecture, then assemble the container image from the
 prebuilt binary. The gateway, sandbox, and supervisor images use distinct

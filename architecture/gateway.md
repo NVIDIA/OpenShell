@@ -788,6 +788,19 @@ credential storage for defense in depth. Multi-replica deployments can use that
 default with a shared database and shared key-encryption key, or opt into an
 external backend such as Vault or Kubernetes Secrets.
 
+GitHub App installation refresh signs an app JWT at the gateway and exchanges it
+for an installation token using a profile-owned endpoint. Each provider pins one
+installation and explicit repository IDs and permissions in its refresh material;
+there is no workload-selected scope or installation-wide default. The app key is
+secret material, and only the installation token enters the existing credential
+distribution path. Refresh honors the issuer expiry, caps local use at one hour,
+and preserves the existing authorization epoch during routine rotation. Explicit
+reconfiguration revokes the old workload handles. Network policy remains an
+independent constraint on token use. GitHub mint failures use gateway-owned
+recovery classifications without storing issuer-controlled error prose.
+Transport diagnostics classify typed timeout, TLS, and connection failures
+without exposing request material or raw error chains.
+
 The Vault credential driver requires HTTPS for every non-loopback backend,
 never follows HTTP redirects, and keeps standard certificate hostname
 verification enabled. Operators can add private Vault trust roots with a PEM
