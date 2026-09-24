@@ -17,6 +17,10 @@ use std::time::Duration;
 use tonic::{Code, Status};
 use tracing::warn;
 
+#[path = "github_app.rs"]
+mod github_app;
+pub use github_app::validate_configuration as validate_github_app_configuration;
+
 const DEFAULT_REFRESH_BEFORE_SECONDS: i64 = 300;
 const DEFAULT_MAX_LIFETIME_SECONDS: i64 = 3600;
 const MAX_OAUTH_ERROR_RESPONSE_BYTES: usize = 8 * 1024;
@@ -247,6 +251,7 @@ pub fn refresh_strategy_name(strategy: i32) -> &'static str {
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
+        ProviderCredentialRefreshStrategy::GithubAppInstallation => "github_app_installation",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -261,7 +266,8 @@ pub fn strategy_secret_material_keys(
             &["refresh_token", "client_secret"]
         }
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => &["client_secret"],
-        ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => &["private_key"],
+        ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
+        | ProviderCredentialRefreshStrategy::GithubAppInstallation => &["private_key"],
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
             &["aws_secret_access_key", "aws_session_token"]
         }
@@ -282,6 +288,14 @@ struct OAuth2RefreshToken;
 struct OAuth2ClientCredentials;
 struct GoogleServiceAccountJwt;
 struct AwsStsAssumeRole;
+struct GithubAppInstallation;
+
+#[async_trait]
+impl TokenMinter for GithubAppInstallation {
+    async fn mint(&self, request: &MintRequest) -> Result<MintedCredential, RefreshFailure> {
+        github_app::mint(request).await
+    }
+}
 
 #[async_trait]
 impl TokenMinter for OAuth2RefreshToken {
@@ -313,7 +327,7 @@ impl TokenMinter for AwsStsAssumeRole {
 
 /// Immutable built-in-only registry. There is deliberately no registration API.
 pub struct BuiltInMinterRegistry {
-    entries: [(&'static str, &'static dyn TokenMinter); 4],
+    entries: [(&'static str, &'static dyn TokenMinter); 5],
 }
 
 static BUILT_IN_MINTERS: BuiltInMinterRegistry = BuiltInMinterRegistry {
@@ -322,6 +336,7 @@ static BUILT_IN_MINTERS: BuiltInMinterRegistry = BuiltInMinterRegistry {
         ("oauth2_client_credentials", &OAuth2ClientCredentials),
         ("google_service_account_jwt", &GoogleServiceAccountJwt),
         ("aws_sts_assume_role", &AwsStsAssumeRole),
+        ("github_app_installation", &GithubAppInstallation),
     ],
 };
 
@@ -992,7 +1007,7 @@ fn ensure_endpoint_allowed(
 }
 
 /// The token endpoint a mint for this request will call, for strategies whose
-/// request goes to a single OAuth token endpoint.
+/// request goes to a single token endpoint.
 ///
 /// # Errors
 ///
@@ -1005,6 +1020,10 @@ pub fn effective_token_endpoint(request: &MintRequest) -> Result<String, Status>
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken
         | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => oauth2_token_url(request),
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => Ok(google_token_url(request)),
+        ProviderCredentialRefreshStrategy::GithubAppInstallation => {
+            github_app::installation_url(&request.token_url, &request.material)
+                .map(|url| url.to_string())
+        }
         strategy => Err(Status::failed_precondition(format!(
             "refresh strategy '{}' does not support workspace secret material",
             refresh_strategy_name(strategy as i32)
@@ -1046,7 +1065,10 @@ fn google_token_url(state: &MintRequest) -> String {
     }
 }
 
-fn required_material(material: &HashMap<String, String>, key: &str) -> Result<String, Status> {
+fn required_material<S: std::hash::BuildHasher>(
+    material: &HashMap<String, String, S>,
+    key: &str,
+) -> Result<String, Status> {
     material_value(material, &[key])
         .ok_or_else(|| Status::invalid_argument(format!("{key} material is required")))
 }
@@ -1097,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_contains_exactly_four_canonical_strategies() {
+    fn built_in_registry_contains_exactly_five_canonical_strategies() {
         let registry = built_in_minters();
         assert_eq!(
             registry.strategy_names().collect::<Vec<_>>(),
@@ -1106,6 +1128,7 @@ mod tests {
                 "oauth2_client_credentials",
                 "google_service_account_jwt",
                 "aws_sts_assume_role",
+                "github_app_installation",
             ]
         );
         for strategy in [
@@ -1113,6 +1136,7 @@ mod tests {
             ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
             ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt,
             ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
+            ProviderCredentialRefreshStrategy::GithubAppInstallation,
         ] {
             assert!(registry.can_mint(strategy as i32));
             assert!(
@@ -1939,7 +1963,7 @@ mod tests {
         assert!(minted.expires_at_ms <= current_time_ms().saturating_add(1_800_000));
     }
 
-    const TEST_RSA_PRIVATE_KEY: &str = r"-----BEGIN PRIVATE KEY-----
+    pub(super) const TEST_RSA_PRIVATE_KEY: &str = r"-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCvCoZ0mVHpCHsF
 zeeqw2caNIe/eb4BQUccFPhZfRnF7sCfyB84zTBmuwG2umRBdjFnVsfIIZRp2HcD
 OESrRYYiE1RGfjBXImGVg2Wtza0HYhL1sLyX1eaEefylxoilmApAgWDh9p36h8J2
@@ -2103,7 +2127,7 @@ pM2zFU8SeVkvHKlEuoHaP0s=
     }
 
     #[test]
-    fn effective_token_endpoint_covers_oauth_and_google_only() {
+    fn effective_token_endpoint_covers_supported_strategies() {
         let oauth = MintRequest {
             strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
             material: HashMap::from([("tenant_id".into(), "tenant".into())]),
@@ -2121,6 +2145,18 @@ pM2zFU8SeVkvHKlEuoHaP0s=
         assert_eq!(
             effective_token_endpoint(&google).unwrap(),
             "https://oauth2.googleapis.com/token"
+        );
+        let github = MintRequest {
+            strategy: ProviderCredentialRefreshStrategy::GithubAppInstallation as i32,
+            material: HashMap::from([("installation_id".into(), "123".into())]),
+            token_url:
+                "https://github.example/api/v3/app/installations/{installation_id}/access_tokens"
+                    .into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_token_endpoint(&github).unwrap(),
+            "https://github.example/api/v3/app/installations/123/access_tokens"
         );
         let aws = MintRequest {
             strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,

@@ -367,8 +367,8 @@ These rules apply:
 - The token endpoint the refresh calls must be one of the secret's allowed
   endpoints, and the gateway does not follow redirects for these requests.
   Allowed endpoints cannot change; create a new secret for a new endpoint.
-- Workspace secrets work with the OAuth2 and Google service account
-  strategies, not `aws_sts_assume_role`.
+- Workspace secrets work with the OAuth2, Google service account, and GitHub
+  App installation strategies, not `aws_sts_assume_role`.
 - `openshell secret delete` fails while a refresh references the secret. Run
   `openshell provider refresh inline-secrets` to copy the current value into
   the provider's own refresh material first. It keeps the current grant,

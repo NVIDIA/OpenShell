@@ -170,6 +170,9 @@ mod tests {
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
+    // GitHub App refresh adds enum value 7 to the public refresh strategy,
+    // also referenced by durable provider profiles. Existing values and fields
+    // retain their meaning; the set of shared type names is unchanged.
     // Restart policy is stored in SandboxSpec, and the count and well-known
     // timestamps are stored in SandboxStatus. Legacy payloads decode with
     // Unspecified (treated as Never), zero count, and absent timestamps.
@@ -228,9 +231,9 @@ mod tests {
     // public-only messages alongside main's public APIs; durable schemas
     // and the public/durable overlap remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "ba37ee30d2e8618b947517c67fa6d336a87097978a55cfa82034366ee36a740e";
+        "3f6f958d6907255c148c366a45bd998beddd39432f2165bebe6c060eb28ef10c";
     const DURABLE_SCHEMA_SHA256: &str =
-        "9a025fc84af7c71bce42a52a282d1a96a02f8d71319478bcdb0e0c6367305888";
+        "23a01535e4ccef81a2452347a3b14ccf510f2aefa158d151227bda04924b3fc8";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these
