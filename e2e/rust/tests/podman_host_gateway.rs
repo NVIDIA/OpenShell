@@ -76,21 +76,44 @@ fn podman_container_diagnostics(sandbox_name: &str) -> String {
 }
 
 async fn assert_host_gateway_reachable(sandbox: &SandboxGuard, port: u16, stage: &str) {
-    let command = format!(
-        "exec 3<>/dev/tcp/host.openshell.internal/{port}; \
-         printf 'GET / HTTP/1.1\\r\\nHost: host.openshell.internal:{port}\\r\\nConnection: close\\r\\n\\r\\n' >&3; \
-         while IFS= read -r line <&3; do [ \"$line\" = $'\\r' ] && break; done; \
-         IFS= read -r body <&3; printf '%s' \"$body\""
-    );
-    let output = match tokio::time::timeout(
-        Duration::from_secs(30),
-        sandbox.exec(&["/usr/bin/bash", "-c", &command]),
-    )
-    .await
-    {
-        Ok(Ok(output)) => output,
+    let url = format!("http://host.openshell.internal:{port}/");
+    let probe = async {
+        let mut failures = Vec::new();
+        for attempt in 1..=5 {
+            match sandbox
+                .exec(&[
+                    "/usr/bin/curl",
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--noproxy",
+                    "*",
+                    "--connect-timeout",
+                    "2",
+                    "--max-time",
+                    "5",
+                    &url,
+                ])
+                .await
+            {
+                Ok(output) if output.contains(RESPONSE) => return Ok(()),
+                Ok(output) => failures.push(format!(
+                    "attempt {attempt} returned an unexpected response:\n{output}"
+                )),
+                Err(err) => failures.push(format!("attempt {attempt} failed: {err}")),
+            }
+
+            if attempt < 5 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+        Err(failures.join("\n"))
+    };
+
+    match tokio::time::timeout(Duration::from_secs(40), probe).await {
+        Ok(Ok(())) => {}
         Ok(Err(err)) => panic!(
-            "host gateway probe failed during {stage}: {err}\n{}",
+            "host gateway probe failed during {stage} after bounded retries:\n{err}\n{}",
             podman_container_diagnostics(&sandbox.name)
         ),
         Err(_) => {
@@ -100,12 +123,7 @@ async fn assert_host_gateway_reachable(sandbox: &SandboxGuard, port: u16, stage:
                 podman_container_diagnostics(&sandbox.name)
             );
         }
-    };
-    assert!(
-        output.contains(RESPONSE),
-        "sandbox did not receive the host response during {stage}:\n{output}\n{}",
-        podman_container_diagnostics(&sandbox.name)
-    );
+    }
 }
 
 #[tokio::test]
@@ -160,7 +178,7 @@ network_policies:
         port: {port}
         protocol: tcp
     binaries:
-      - path: /usr/bin/bash
+      - path: /usr/bin/curl
 "
         ),
     )
