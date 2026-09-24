@@ -324,6 +324,11 @@ positive canary uses system Docker; negative preflight coverage verifies that
 the installer rejects both missing Docker and the Docker Snap before installing
 OpenShell. Its Debian lane removes snapd before running the installer so Snap
 precedence cannot change the package under test.
+Prerelease installs bypass Snap selection and use the native Debian or RPM
+package path even when `snap` is available. The `pre` alias checks matching Git
+tags in version order, then looks up the exact platform artifact and verifies
+the release run instead of listing every repository artifact.
+
 Snapd runs the gateway as a root-owned system service. Its generated client
 certificates reside in root-owned snap state and are unavailable to ordinary CLI
 users, so the Snap uses plaintext loopback transport and enables unauthenticated

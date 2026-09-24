@@ -102,13 +102,15 @@ assert_glibc_preflight_fails \
 
 assert_linux_package_method() {
   local name=$1
-  local snap_present=$2
-  local dpkg_present=$3
-  local rpm_present=$4
-  local expected=$5
+  local requested_version=$2
+  local snap_present=$3
+  local dpkg_present=$4
+  local rpm_present=$5
+  local expected=$6
   local actual
 
   actual="$(
+    export OPENSHELL_VERSION="$requested_version"
     has_cmd() {
       case "$1" in
         snap) [ "$snap_present" = "1" ] ;;
@@ -125,9 +127,14 @@ assert_linux_package_method() {
   fi
 }
 
-assert_linux_package_method "snap takes precedence over deb and rpm" 1 1 1 snap
-assert_linux_package_method "deb is selected without snap" 0 1 1 deb
-assert_linux_package_method "rpm is selected without snap or deb" 0 0 1 rpm
+assert_linux_package_method "snap takes precedence over deb and rpm" "" 1 1 1 snap
+assert_linux_package_method "dev uses snap" dev 1 1 1 snap
+assert_linux_package_method "pre uses deb despite snap" pre 1 1 1 deb
+assert_linux_package_method "numbered prerelease uses deb despite snap" v0.1.0-pre.3 1 1 1 deb
+assert_linux_package_method "pre uses rpm despite snap" pre 1 0 1 rpm
+assert_linux_package_method "stable uses snap" v1.2.3 1 1 1 snap
+assert_linux_package_method "deb is selected without snap" "" 0 1 1 deb
+assert_linux_package_method "rpm is selected without snap or deb" "" 0 0 1 rpm
 
 if ! (
   find_existing_native_openshell_bin() { return 1; }
@@ -223,7 +230,7 @@ if [ -s "$err" ]; then
   exit 1
 fi
 
-for requested_version in pre v1.2.3; do
+for requested_version in v1.2.3; do
   if ! OPENSHELL_VERSION="$requested_version" openshell_snap_channel >"$out" 2>"$err"; then
     echo "FAIL: '${requested_version}' must select the latest/stable Snap channel" >&2
     cat "$err" >&2 || true
@@ -299,7 +306,7 @@ wait:gateway-status"
 
 assert_snap_install_flow \
   "existing OpenShell snap is refreshed" \
-  1 1 pre \
+  1 1 v1.2.3 \
   "wait:docker
 root:snap refresh openshell --channel=latest/stable
 ensure:gateway-config
@@ -502,19 +509,21 @@ gh() {
       ;;
     api:*)
       case "$*" in
-        *"?name="*) printf '123456\n' ;;
-        *"actions/workflows/release-tag.yml/runs?status=success"*)
-          printf '%s\n' 100 101
+        *"git/matching-refs/tags/v"*)
+          printf '%s\n' v2.0.0-pre.1 v1.0.0-pre.2 v0.1.0-pre.9
           ;;
+        *"?name=openshell-v2.0.0-pre.1-linux-amd64-deb"*)
+          [ "${MOCK_NO_PRERELEASE:-0}" = "1" ] || printf '999\n'
+          ;;
+        *"?name=openshell-v1.0.0-pre.2-linux-amd64-deb"*)
+          [ "${MOCK_NO_PRERELEASE:-0}" = "1" ] || printf '101\n'
+          ;;
+        *"?name=openshell-v0.1.0-pre.9-linux-amd64-deb"*)
+          [ "${MOCK_NO_PRERELEASE:-0}" = "1" ] || printf '123456\n'
+          ;;
+        *"actions/runs/999"*) printf 'false\n' ;;
+        *"actions/runs/101"*) printf 'true\n' ;;
         *)
-          if [ "${MOCK_NO_PRERELEASE:-0}" != "1" ]; then
-            printf '%b\n' \
-              '100\topenshell-v0.1.0-pre.9-linux-amd64-deb' \
-              '101\topenshell-v1.0.0-pre.2-linux-amd64-deb' \
-              '101\topenshell-v1.0.0-pre.1-macos-arm64' \
-              '101\topenshell-v0.2.0-pre.10-linux-aarch64-rpm' \
-              '999\topenshell-v2.0.0-pre.1-linux-amd64-deb'
-          fi
           ;;
       esac
       ;;
@@ -539,13 +548,29 @@ if [ "$resolved_prerelease" != "v1.0.0-pre.2" ]; then
   echo "FAIL: pre alias resolved to ${resolved_prerelease}, expected v1.0.0-pre.2" >&2
   exit 1
 fi
-if ! grep -Fq 'actions/workflows/release-tag.yml/runs?status=success' "$mock_gh_log"; then
-  echo "FAIL: pre alias did not query successful Release Tag workflow runs" >&2
+if ! grep -Fq 'git/matching-refs/tags/v' "$mock_gh_log"; then
+  echo "FAIL: pre alias did not query prerelease tags" >&2
   cat "$mock_gh_log" >&2
   exit 1
 fi
-if ! grep -Fq 'select(.status == "completed" and .conclusion == "success")' "$mock_gh_log"; then
-  echo "FAIL: pre alias did not require completed successful workflow runs" >&2
+if ! grep -Fq 'actions/artifacts?name=openshell-v1.0.0-pre.2-linux-amd64-deb' "$mock_gh_log"; then
+  echo "FAIL: pre alias did not query the platform artifact by name" >&2
+  cat "$mock_gh_log" >&2
+  exit 1
+fi
+if ! grep -Fq 'actions/runs/999' "$mock_gh_log" ||
+  ! grep -Fq 'actions/runs/101' "$mock_gh_log"; then
+  echo "FAIL: pre alias did not skip an unsuccessful run" >&2
+  cat "$mock_gh_log" >&2
+  exit 1
+fi
+if ! grep -Fq '.conclusion == "success"' "$mock_gh_log"; then
+  echo "FAIL: pre alias did not require a successful workflow run" >&2
+  cat "$mock_gh_log" >&2
+  exit 1
+fi
+if grep -Fq -- '--paginate' "$mock_gh_log"; then
+  echo "FAIL: pre alias must not scan every workflow run or artifact" >&2
   cat "$mock_gh_log" >&2
   exit 1
 fi

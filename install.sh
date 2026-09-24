@@ -67,13 +67,15 @@ NOTES:
     from ${GITHUB_URL}/releases/latest.
 
     On Linux, the installer uses the OpenShell snap whenever the snap command
-    is available. It installs from latest/edge when OPENSHELL_VERSION=dev and
-    from latest/stable otherwise. The OpenShell snap requires a running Docker
-    Engine installed from a system package or Docker's package repository. The
-    Docker snap is not currently compatible with OpenShell.
+    is available, except for prereleases, which use Debian or RPM packages.
+    Snap installs use latest/edge when OPENSHELL_VERSION=dev and latest/stable
+    otherwise. The OpenShell snap requires a running Docker Engine installed
+    from a system package or Docker's package repository. The Docker snap is
+    not currently compatible with OpenShell.
 
-    Without snap, Linux installs the Debian package on amd64/arm64 or the RPM
-    packages on x86_64/aarch64, depending on the host package manager.
+    For prereleases or without snap, Linux installs the Debian package on
+    amd64/arm64 or the RPM packages on x86_64/aarch64, depending on the host
+    package manager.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF
@@ -432,61 +434,39 @@ resolve_latest_prerelease_tag() {
 
   info "resolving latest prerelease..."
   _artifact_platform="$(prerelease_artifact_platform)"
-  _successful_run_ids="$(gh api --paginate \
-    "repos/${REPO}/actions/workflows/release-tag.yml/runs?status=success&per_page=100" \
-    --jq '.workflow_runs[] | select(.status == "completed" and .conclusion == "success") | .id')" || {
-    error "failed to list successful Release Tag workflow runs"
+  _release_tags="$(gh api "repos/${REPO}/git/matching-refs/tags/v" --jq '
+    [.[].ref | sub("^refs/tags/"; "") |
+      select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+-pre\\.[1-9][0-9]*$"))] |
+    sort_by(split("-pre.") as $parts |
+      ($parts[0] | ltrimstr("v") | split(".") | map(tonumber)) +
+      [($parts[1] | tonumber)]) | reverse | .[]')" || {
+    error "failed to list prerelease tags"
   }
-  _artifact_records="$(gh api --paginate \
-    "repos/${REPO}/actions/artifacts?per_page=100" \
-    --jq '.artifacts[] | select(.expired == false) | [.workflow_run.id, .name] | @tsv')" || {
-    error "failed to list prerelease artifacts"
-  }
-  _artifact_names="$(printf '%s\n--ARTIFACTS--\n%s\n' "$_successful_run_ids" "$_artifact_records" | awk -F '\t' '
-    $0 == "--ARTIFACTS--" {
-      reading_artifacts = 1
-      next
-    }
-    !reading_artifacts {
-      if ($1 ~ /^[0-9]+$/) successful_runs[$1] = 1
-      next
-    }
-    $1 in successful_runs {
-      print $2
-    }
-  ')"
-  _release_tags="$(printf '%s\n' "$_artifact_names" | sed -n "s/^openshell-\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*-pre\.[1-9][0-9]*\)-${_artifact_platform}$/\1/p" | sort -u)"
 
-  _latest_prerelease="$(printf '%s\n' "$_release_tags" | awk '
-    /^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$/ {
-      tag = $0
-      sub(/^v/, "", tag)
-      split(tag, version_parts, "-pre[.]")
-      split(version_parts[1], core, "[.]")
-      sequence = version_parts[2] + 0
+  for _tag in $_release_tags; do
+    _artifact_name="openshell-${_tag}-${_artifact_platform}"
+    info "checking ${_tag} for ${_artifact_platform}..."
+    _run_ids="$(gh api \
+      "repos/${REPO}/actions/artifacts?name=${_artifact_name}&per_page=100" \
+      --jq '[.artifacts[] | select(.expired == false)] |
+        sort_by(.created_at) | reverse | .[] | .workflow_run.id')" || {
+      error "failed to find prerelease artifact ${_artifact_name}"
+    }
 
-      if (!found || core[1] + 0 > major ||
-          (core[1] + 0 == major && core[2] + 0 > minor) ||
-          (core[1] + 0 == major && core[2] + 0 == minor && core[3] + 0 > patch) ||
-          (core[1] + 0 == major && core[2] + 0 == minor && core[3] + 0 == patch && sequence > prerelease)) {
-        selected = $0
-        major = core[1] + 0
-        minor = core[2] + 0
-        patch = core[3] + 0
-        prerelease = sequence
-        found = 1
+    for _run_id in $_run_ids; do
+      _successful="$(gh api "repos/${REPO}/actions/runs/${_run_id}" --jq '
+        .status == "completed" and .conclusion == "success" and
+        (.path | startswith(".github/workflows/release-tag.yml"))')" || {
+        error "failed to check prerelease workflow run ${_run_id}"
       }
-    }
-    END {
-      if (found) print selected
-    }
-  ')"
+      if [ "$_successful" = "true" ]; then
+        printf '%s\n' "$_tag"
+        return 0
+      fi
+    done
+  done
 
-  if [ -z "$_latest_prerelease" ]; then
-    error "no unexpired prerelease artifacts found"
-  fi
-
-  printf '%s\n' "$_latest_prerelease"
+  error "no unexpired prerelease artifacts found"
 }
 
 is_prerelease_tag() {
@@ -678,7 +658,8 @@ local_gateway_endpoint() {
 }
 
 linux_package_method() {
-  if has_cmd snap; then
+  if [ "${OPENSHELL_VERSION:-}" != "pre" ] &&
+    ! is_prerelease_tag "${OPENSHELL_VERSION:-}" && has_cmd snap; then
     echo "snap"
   elif has_cmd dpkg; then
     echo "deb"
