@@ -10,7 +10,7 @@ assert_contains() {
   local file=$1
   local expected=$2
 
-  if ! grep -Fq "$expected" "$file"; then
+  if ! grep -Fq -- "$expected" "$file"; then
     echo "FAIL: ${file} is missing expected text:" >&2
     echo "  ${expected}" >&2
     exit 1
@@ -21,7 +21,7 @@ assert_not_contains() {
   local file=$1
   local unexpected=$2
 
-  if grep -Fq "$unexpected" "$file"; then
+  if grep -Fq -- "$unexpected" "$file"; then
     echo "FAIL: ${file} contains stale text:" >&2
     echo "  ${unexpected}" >&2
     exit 1
@@ -119,11 +119,17 @@ done
 assert_not_contains "$snap_install_docs" "snap connect openshell:home"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network-bind"
-assert_not_contains "$snap_canary" "snap install docker"
-assert_not_contains "$snap_repro" "snap install docker"
 assert_contains "$snap_install_docs" "snap connect openshell:docker :docker"
-assert_contains "$snap_canary" "snap connect openshell:docker :docker"
-assert_contains "$snap_repro" "snap connect openshell:docker :docker"
+assert_contains "$snap_canary" "install.sh | sh"
+assert_contains "$snap_canary" "ubuntu-snap-system-docker:"
+assert_contains "$snap_canary" "ubuntu-snap-provisions-docker:"
+assert_contains "$snap_repro" 'OPENSHELL_VERSION=dev sh "${install_script}"'
+assert_contains "$snap_repro" "system-docker"
+assert_contains "$snap_repro" "provisions-docker"
+assert_not_contains "$snap_canary" "--dangerous"
+assert_not_contains "$snap_repro" "--dangerous"
+assert_not_contains "$snap_canary" "snap connect openshell:docker"
+assert_not_contains "$snap_repro" "snap connect openshell:docker"
 if ! awk '/config preflight/ { seen = 1 } /generate-certs/ { exit !seen }' "$service"; then
   echo "FAIL: Debian preflight must precede certificate generation" >&2
   exit 1

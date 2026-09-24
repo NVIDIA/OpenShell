@@ -318,6 +318,11 @@ configure the gateway to use them. The Ubuntu `deb` installer consumes
 for direct executable installation on every environment. Release Dev and
 Release Tag run Ubuntu conformance through the Debian package, while Fedora
 continues using direct executable installation until RPM coverage is available.
+The release canary separately exercises the public installer on Ubuntu. Its Snap
+lanes install the rolling development release from the Snap Store with both an
+existing system Docker daemon and a host where the installer must provision and
+wait for the Docker snap. Its Debian lane removes snapd before running the
+installer so Snap precedence cannot change the package under test.
 The Debian qualification profile keeps candidate-image overrides outside the
 operator-owned gateway configuration: it writes a harness-owned file under
 `/var/lib/openshell-qualification` and selects it through the packaged systemd

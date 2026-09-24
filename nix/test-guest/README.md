@@ -78,10 +78,10 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 | Fedora 44 | No | Yes | Yes | Yes | `.rpm` |
 | Rocky Linux 9 | Yes | Yes | No | Yes | `.rpm` |
 
-The `snapd` configuration is available for Ubuntu and prepares snapd for
-local Snap lifecycle experiments. Combine it with the `docker` configuration
-to test the Snap gateway against package-installed Docker through the system
-`:docker` slot.
+The `snapd` configuration is available for Ubuntu and prepares snapd for Snap
+Store installation experiments. Combine it with `docker` to reproduce the
+system-Docker canary, or use it alone to verify that `install.sh` provisions the
+Docker snap when the Docker command is absent.
 
 `podman-rootless` configures the explicit rootless Podman guest setup used by
 OpenShell tests. It supports Fedora and Ubuntu 26.04 or later. Ubuntu adds the
@@ -296,15 +296,16 @@ nix run .#test-guest -- \
   -- openshell --version
 ```
 
-## Reproduce Snap gateway startup
+## Reproduce Snap installation
 
-The gateway Snap must be native to the guest architecture. Copy an existing
-Snap artifact and the reproduction script into a prepared Ubuntu guest, then
-run the script as root. It follows the Release Canary ordering exactly: install
-the Snap, manually connect the privileged Docker/log/system interfaces, and
-immediately query the gateway. These connections are required because the local
-Snap is installed with `--dangerous` and therefore has no Snap Store
-assertions. On each failure the script prints snapd and gateway journals.
+Copy the repository installer and reproduction script into a prepared Ubuntu
+guest. The script follows both Release Canary Snap flows: it runs `install.sh`
+with `OPENSHELL_VERSION=dev`, checks the `latest/edge` channel and Docker
+interface, and exercises a sandbox. Repeated attempts also cover the installer's
+idempotent Snap refresh path. On each failure the script prints snapd, Docker,
+and gateway diagnostics.
+
+Reuse system Docker and verify that the Docker snap is not installed:
 
 ```shell
 nix run .#test-guest -- \
@@ -312,15 +313,25 @@ nix run .#test-guest -- \
   --with docker \
   --with snapd \
   --keep \
-  --copy ./openshell_*.snap:/tmp/openshell.snap \
+  --copy ./install.sh:/tmp/install.sh \
   --copy ./nix/test-guest/scripts/snap-gateway-repro.sh:/usr/local/bin/snap-gateway-repro \
-  -- sudo /usr/local/bin/snap-gateway-repro /tmp/openshell.snap 10
+  -- /usr/local/bin/snap-gateway-repro /tmp/install.sh system-docker 10
+```
+
+Start without Docker and verify that `install.sh` provisions the Docker snap:
+
+```shell
+nix run .#test-guest -- \
+  --distro ubuntu-24-04 \
+  --with snapd \
+  --keep \
+  --copy ./install.sh:/tmp/install.sh \
+  --copy ./nix/test-guest/scripts/snap-gateway-repro.sh:/usr/local/bin/snap-gateway-repro \
+  -- /usr/local/bin/snap-gateway-repro /tmp/install.sh provisions-docker 10
 ```
 
 `--keep` retains the overlay and serial log when diagnosing a failure. The
-runner prints their location after shutdown. The reproduction defaults to the
-same 30-second readiness window as Release Canary. Pass `0` as the final
-argument to require the intentionally stricter immediate-readiness check.
+runner prints their location after shutdown.
 
 
 The destination must be an absolute guest path. Use bare octal permission bits
