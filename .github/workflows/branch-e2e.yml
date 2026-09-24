@@ -458,6 +458,7 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes agentgateway E2E
       e2e-task: e2e:kubernetes:agentgateway
+      kubernetes-features: e2e,e2e-host-gateway,e2e-kubernetes
       gateway-controller: agentgateway
       conformance-artifact-prefix: openshell-conformance
 
