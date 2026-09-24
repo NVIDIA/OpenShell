@@ -680,7 +680,9 @@ mod tests {
         assert!(cfg.validate_host_gateway_ip().is_ok());
         assert_eq!(
             cfg.resolved_host_gateway_ip().unwrap(),
-            MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP.parse().unwrap()
+            MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP
+                .parse::<IpAddr>()
+                .unwrap()
         );
     }
 
