@@ -172,9 +172,13 @@ every sandbox by setting `manual` on the gateway.
 
 ### What the Prover Checks
 
-The policy prover compares what the sandbox can reach with and without the
-proposed rule. It reports a finding when the rule would give a binary new access
-of one of these kinds:
+The policy advisor uses the same [policy prover](/reference/policy-prover) as
+the `openshell-prover` command, but runs a different check. Instead of comparing
+a policy with a boundary that you write, it compares what the sandbox can reach
+with and without the proposed rule. The check accounts for the credentials of
+attached providers and for binaries whose traffic OpenShell cannot inspect. It
+reports a finding when the rule would give a binary new access of one of these
+kinds:
 
 | Finding | The proposed rule would let a binary |
 |---|---|

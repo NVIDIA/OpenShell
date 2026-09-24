@@ -3,47 +3,48 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Policy Prover"
 sidebar-title: "Prover"
-description: "Check that a policy grants no more access than a boundary policy you define, for example before you apply a change or in CI."
+description: "Use the policy prover to check that a policy grants no more access than a boundary policy you define, and learn how the policy advisor uses the same prover."
 keywords: "Generative AI, Cybersecurity, Policy, Prover, Boundary, CI"
 position: 8
 ---
 
-The policy prover checks that a policy grants no more access than a limit you
-set. You write the limit as a second policy, called the boundary. The prover
-determines whether everything allowed by the policy you are testing, called the
-candidate, is also allowed by the boundary. If the candidate allows something
-the boundary does not, the prover shows an example.
+The policy prover is OpenShell's policy verification engine. Instead of testing
+individual requests, it uses the Z3 solver to reason about every request that a
+policy could allow. OpenShell uses the prover in two ways, and each answers a
+different question:
 
-The prover checks only some parts of a policy: filesystem access, process
-identity, Landlock settings, network destinations, and REST methods and paths.
-If a policy uses anything else, such as GraphQL or MCP rules, the prover reports
-that it cannot check the policy instead of ignoring those rules.
+| | `openshell-prover check` | Policy advisor |
+|---|---|---|
+| Question | Does this policy stay within a limit that I set? | Does this proposal add risky new access? |
+| When it runs | When you run the command, for example in CI. | Automatically, on every proposal. |
+| What it compares | A candidate policy against a boundary policy that you write. | The sandbox's policy with and without the proposed rule. |
+| What it reports | Access that the candidate allows beyond the boundary. | New access to link-local or cloud metadata addresses, uninspected traffic where a provider credential is available, new credentialed destinations, and new HTTP methods. |
 
-Use the prover to check a policy before you apply it, for example in CI, so
-that no change grants more than your organization allows. The prover is a
-separate command, `openshell-prover`, that reads policy files on your machine.
-It does not connect to a gateway, and it does not apply or approve policies.
+Because the two checks answer different questions, passing one does not imply
+passing the other. A proposal that adds no risky access can still exceed your
+boundary, and a policy within your boundary can still contain access that the
+policy advisor would flag.
 
-The [policy advisor](/sandboxes/policy-advisor#what-the-prover-checks) runs a
-different prover check on each proposal. That check compares the proposal with
-the sandbox's current policy instead of a boundary you write.
+This page covers the `openshell-prover check` command. For the policy advisor's
+check, refer to [What the Prover
+Checks](/sandboxes/policy-advisor#what-the-prover-checks).
 
-## Install the Prover
+## Check a Policy Against a Boundary
 
-The OpenShell installer includes `openshell-prover`:
+`openshell-prover check` determines whether everything allowed by the policy you
+are testing, called the candidate, is also allowed by a boundary policy that you
+write. If the candidate allows something the boundary does not, the prover
+shows an example. Use it to check a policy before you apply it, for example in
+CI, so that no change grants more than your organization allows.
 
-```shell
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
-openshell-prover --version
-```
+The check covers filesystem access, process identity, Landlock settings, network
+destinations, and REST methods and paths. If a policy uses anything else, such
+as GraphQL or MCP rules, the prover reports that it cannot check the policy
+instead of ignoring those rules.
 
-To install only the prover, download its archive from
-[OpenShell releases](https://github.com/NVIDIA/OpenShell/releases). The
-[Support Matrix](/reference/support-matrix#standalone-policy-prover) lists the
-available platforms. The prover runs on its own, without the `openshell` CLI, a
-gateway, or a separate Z3 installation.
-
-## Check a Policy
+The `openshell-prover` command is installed with OpenShell. It is a separate
+command because it reads policy files on your machine and does not need a
+gateway. It does not apply or approve policies.
 
 Create `boundary.yaml`, a boundary that allows reading `/usr` and `/etc`:
 
