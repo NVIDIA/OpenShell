@@ -8,11 +8,15 @@ keywords: "Generative AI, Cybersecurity, Policy Advisor, Policy, Sandbox, policy
 position: 4
 ---
 
-When OpenShell blocks a network request, an agent working in the sandbox usually
-cannot finish its task until someone changes the policy. The policy advisor lets
-the agent propose the network rule it needs. You review each proposal and
-approve or reject it. An approved rule takes effect in the running sandbox
-without a restart.
+The policy advisor lets an agent in a sandbox propose a new network rule when
+OpenShell blocks one of its network requests, and you approve or reject each
+proposal. It handles network access only. A proposal can add a network rule, but
+it cannot remove rules or change filesystem, Landlock, or process settings.
+
+Without the policy advisor, an agent whose request is blocked usually cannot
+finish its task until someone changes the policy by hand. With it, the agent can
+request the access it needs. Because network rules can change while a sandbox
+runs, an approved rule takes effect without a restart.
 
 The policy advisor is off by default. When you enable it, OpenShell gives the
 agent instructions and a local HTTP API for submitting proposals. A proposal
@@ -32,8 +36,12 @@ A proposal goes through these steps:
    policy, and submits a proposal. A proposal is a network rule scoped to the
    host, port, and binary that need access and, for HTTP APIs, the method and
    path.
-3. OpenShell validates the proposal, checks it for added risk, and adds it to
-   the sandbox's pending proposals.
+3. OpenShell validates the proposal and checks it for added risk in two ways.
+   The policy prover compares what the sandbox could reach with and without the
+   rule. OpenShell also flags destinations that are often risky, such as
+   private network addresses and wildcard hosts. OpenShell then adds the
+   proposal and the results of both checks to the sandbox's pending proposals.
+   Refer to [What the Prover Checks](#what-the-prover-checks).
 4. You approve or reject the proposal. With automatic approval turned on,
    OpenShell approves a proposal that passes its risk checks without waiting for
    you.
@@ -61,6 +69,13 @@ so the agent can find and use it:
   endpoint, which point the agent to the guide and the API.
 
 ## Enable the Policy Advisor
+
+The `agent_policy_proposals_enabled` setting turns the policy advisor on or off.
+You can set it for every sandbox on the gateway or for a single sandbox. Enable
+it before you create a sandbox when you can. A running sandbox picks up the
+change without a restart, but many agents read instruction files such as
+`/AGENTS.md` only when they start, and an agent may already have given up on
+requests that were denied before you enabled the policy advisor.
 
 Enable the policy advisor for every sandbox on the gateway:
 
@@ -91,36 +106,25 @@ openshell settings delete --global \
   --yes
 ```
 
-Enable the policy advisor before you create a sandbox. A running sandbox picks
-up the change, but the agent learns about the policy advisor from its first
-denied request, so it is most reliable when the setting is on from the start.
-
 ## Review Proposals
 
-List the sandbox's pending proposals:
+Proposals that are not approved automatically wait for you to approve or reject
+them. List a sandbox's pending proposals with the rule each would add, the
+agent's reason, and the results of the risk checks:
 
 ```shell
 openshell rule get <sandbox-name> --status pending
 ```
 
-Each proposal shows its ID on the `Chunk` line, the rule it would add, the
-agent's stated reason, and the results of OpenShell's risk checks on the
-`Security` and `Prover` lines. For an HTTP rule, the endpoint summary includes
-the method and path:
-
-```text
-Endpoints: api.github.com:443 [L7 rest, allow PUT /repos/NVIDIA/OpenShell/contents/docs/**]
-```
-
-Approve a proposal only when the rule matches the access you intend to grant:
+Approve a proposal when its rule grants only the access you intend. Use the ID
+from the proposal's `Chunk` line:
 
 ```shell
 openshell rule approve <sandbox-name> --chunk-id <proposal-id>
 ```
 
-Reject a proposal that is too broad or targets the wrong service, and explain
-why. OpenShell returns your reason to the agent, which can use it to submit a
-narrower proposal:
+Otherwise, reject it with a reason. OpenShell sends the reason to the agent,
+which can submit a narrower proposal:
 
 ```shell
 openshell rule reject <sandbox-name> \
@@ -128,22 +132,10 @@ openshell rule reject <sandbox-name> \
   --reason "Scope this to docs/ paths only."
 ```
 
-You can also review proposals in the terminal UI. Run `openshell term`, select
-the sandbox, and open its network rules. A rejected proposal shows your reason
-on its `Guidance` line.
-
-### When a Proposal Changes Before Approval
-
-OpenShell checks a proposal against the sandbox's policy, providers, and
-credentials at the time it was submitted. If any of these change before you
-approve the proposal, OpenShell does not apply the outdated version. It
-recalculates the proposal against the current configuration, keeps it pending,
-and asks you to review it again. Run `openshell rule get` to see the updated
-proposal, then approve it.
-
-You cannot approve a proposal that fails validation, such as one that conflicts
-with an existing rule. The proposal shows the error on its `Application` line
-instead.
+If the sandbox's policy or providers change after a proposal is submitted,
+OpenShell rechecks the proposal and asks you to review it again before you can
+approve it. You can also review proposals in the terminal UI with
+`openshell term`.
 
 ## Approve Low-Risk Proposals Automatically
 
@@ -152,9 +144,10 @@ approves a proposal without review when both of these are true:
 
 - The policy prover finds none of the risks described in [What the Prover
   Checks](#what-the-prover-checks).
-- The proposal has no security notes. Security notes flag private or internal
-  addresses, wildcard hosts, `allowed_ips` entries without a host, ephemeral
-  ports, and well-known database or service ports.
+- OpenShell has not flagged the proposal's destination. OpenShell flags private
+  or internal addresses, wildcard hosts, `allowed_ips` entries without a host,
+  ephemeral ports, and well-known database or service ports, and shows each
+  flag on the proposal's `Security` line.
 
 Every other proposal still waits for your review. Turn on automatic mode for
 every sandbox on the gateway:
@@ -190,11 +183,9 @@ of one of these kinds:
 | `credential_reach_expansion` | Use a provider credential at a host and port that it could not reach before. |
 | `capability_expansion` | Use a new HTTP method at a host and port where it already uses a provider credential. |
 
-A proposal with any finding or security note needs your review, even in
-automatic mode. When you reject a proposal, the agent receives the findings with
-your reason, so it can narrow its next attempt. For the prover's full reasoning
-model, refer to
-[`crates/openshell-prover/README.md`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-prover/README.md).
+A proposal with any prover finding or flagged destination needs your review,
+even in automatic mode. When you reject a proposal, the agent receives the findings with
+your reason, so it can narrow its next attempt.
 
 ## What Agents Can Propose
 
@@ -273,7 +264,7 @@ new sandboxes do not receive the guide, and denial responses do not mention
 
 ## Logs
 
-An approved rule takes effect in the running sandbox without a restart.
+An approved network rule takes effect in the running sandbox without a restart.
 OpenShell closes connections opened under the previous rules, so the agent's
 retry uses the new rule. The `/wait` endpoint reports `policy_reloaded: true`
 once the sandbox has loaded the approved rule.
