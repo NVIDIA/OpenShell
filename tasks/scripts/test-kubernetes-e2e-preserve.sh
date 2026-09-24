@@ -86,20 +86,24 @@ run_harness() {
   RUN_COMMAND_LOG="${command_log}"
 }
 
-# Invalid values fail before the wrapper creates a work directory or cluster.
-INVALID_TMP="${TMP_ROOT}/invalid"
-INVALID_OUT="${TMP_ROOT}/invalid.out"
-mkdir -p "${INVALID_TMP}"
-set +e
-TMPDIR="${INVALID_TMP}" OPENSHELL_E2E_KUBE_PRESERVE_CLUSTER=invalid \
-  bash "${WRAPPER}" /bin/true >"${INVALID_OUT}" 2>&1
-invalid_status=$?
-set -e
-[ "${invalid_status}" -eq 2 ] || fail "invalid value returned ${invalid_status}, expected 2"
-assert_contains "${INVALID_OUT}" "OPENSHELL_E2E_KUBE_PRESERVE_CLUSTER must be a boolean"
-if find "${INVALID_TMP}" -mindepth 1 -print -quit | grep -q .; then
-  fail "invalid value created a work directory"
-fi
+# Invalid values, including boolean aliases, fail before the wrapper creates a
+# work directory or cluster.
+for invalid_value in invalid true; do
+  INVALID_TMP="${TMP_ROOT}/invalid-${invalid_value}"
+  INVALID_OUT="${TMP_ROOT}/invalid-${invalid_value}.out"
+  mkdir -p "${INVALID_TMP}"
+  set +e
+  TMPDIR="${INVALID_TMP}" OPENSHELL_E2E_KUBE_PRESERVE_CLUSTER="${invalid_value}" \
+    bash "${WRAPPER}" /bin/true >"${INVALID_OUT}" 2>&1
+  invalid_status=$?
+  set -e
+  [ "${invalid_status}" -eq 2 ] \
+    || fail "invalid value ${invalid_value} returned ${invalid_status}, expected 2"
+  assert_contains "${INVALID_OUT}" "OPENSHELL_E2E_KUBE_PRESERVE_CLUSTER must be 0 or 1"
+  if find "${INVALID_TMP}" -mindepth 1 -print -quit | grep -q .; then
+    fail "invalid value ${invalid_value} created a work directory"
+  fi
+done
 
 # Preservation is independent of the wrapped command's success or failure.
 run_harness preserve-success 1 1 0

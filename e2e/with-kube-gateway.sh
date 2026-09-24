@@ -90,10 +90,9 @@ e2e_align_docker_host_with_cli_context
 
 PRESERVE_CLUSTER="${OPENSHELL_E2E_KUBE_PRESERVE_CLUSTER:-0}"
 case "${PRESERVE_CLUSTER}" in
-  0 | false | FALSE | no | NO) PRESERVE_CLUSTER=0 ;;
-  1 | true | TRUE | yes | YES) PRESERVE_CLUSTER=1 ;;
+  0 | 1) ;;
   *)
-    echo "ERROR: OPENSHELL_E2E_KUBE_PRESERVE_CLUSTER must be a boolean (0/1, true/false, or yes/no)" >&2
+    echo "ERROR: OPENSHELL_E2E_KUBE_PRESERVE_CLUSTER must be 0 or 1" >&2
     exit 2
     ;;
 esac
