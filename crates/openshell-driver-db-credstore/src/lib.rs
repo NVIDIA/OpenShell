@@ -39,6 +39,7 @@ const NONCE_LEN: usize = 12;
 const HANDLE_ID_LEN: usize = 64;
 const ALGORITHM: &str = "AES-256-GCM";
 const DEFAULT_KEY_ENCRYPTION_KEY_FILE: &str = "key-encryption-key.bin";
+const REWRAP_PAGE_SIZE: u32 = 100;
 
 pub const DRIVER_NAME: &str = "openshell-driver-db-credstore";
 pub const OBJECT_TYPE: &str = "credential.gateway-encrypted";
@@ -65,6 +66,14 @@ pub trait DbCredstoreObjectStore: std::fmt::Debug + Send + Sync {
         operation: &'static str,
     ) -> Result<(), Status>;
 
+    async fn list_credential_objects(
+        &self,
+        object_type: &str,
+        after: Option<&CredentialObjectCursor>,
+        limit: u32,
+        operation: &'static str,
+    ) -> Result<Vec<StoredCredentialObject>, Status>;
+
     async fn delete_credential_object(
         &self,
         object_type: &str,
@@ -78,8 +87,36 @@ pub trait DbCredstoreObjectStore: std::fmt::Debug + Send + Sync {
 pub struct StoredCredentialObject {
     pub object_type: String,
     pub id: String,
+    pub name: String,
+    pub workspace: String,
+    pub created_at_ms: i64,
     pub payload: Vec<u8>,
     pub resource_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialObjectCursor {
+    pub created_at_ms: i64,
+    pub name: String,
+    pub workspace: String,
+    pub id: String,
+}
+
+impl From<&StoredCredentialObject> for CredentialObjectCursor {
+    fn from(record: &StoredCredentialObject) -> Self {
+        Self {
+            created_at_ms: record.created_at_ms,
+            name: record.name.clone(),
+            workspace: record.workspace.clone(),
+            id: record.id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CredentialRewrapSummary {
+    pub scanned: u64,
+    pub rewrapped: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -107,13 +144,16 @@ pub struct EncryptedGatewayCredentialStoreCrypto {
 struct EncryptedGatewayCredentialSettings {
     key_encryption_key_path: Option<PathBuf>,
     key_encryption_key_env: Option<String>,
+    decrypt_only_key_encryption_key_paths: Vec<PathBuf>,
+    decrypt_only_key_encryption_key_envs: Vec<String>,
+    rewrap_on_startup: bool,
 }
 
 #[derive(Clone)]
 struct EncryptedGatewayCredentialState {
     settings: EncryptedGatewayCredentialSettings,
-    key_encryption_key: [u8; KEY_LEN],
-    key_encryption_key_id: String,
+    active_key_encryption_key_id: String,
+    key_encryption_keys: HashMap<String, [u8; KEY_LEN]>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -121,9 +161,12 @@ struct EncryptedGatewayCredentialState {
 struct EncryptedGatewayCredentialConfig {
     key_encryption_key_path: Option<PathBuf>,
     key_encryption_key_env: Option<String>,
+    decrypt_only_key_encryption_key_paths: Vec<PathBuf>,
+    decrypt_only_key_encryption_key_envs: Vec<String>,
+    rewrap_on_startup: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedCredentialEnvelope {
     version: u32,
     id: String,
@@ -135,7 +178,7 @@ pub struct EncryptedCredentialEnvelope {
     value: EncryptedBytes,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EncryptedBytes {
     nonce: String,
     ciphertext: String,
@@ -308,6 +351,98 @@ impl DbCredstoreCredentialDriver {
         futures::future::try_join_all(futures).await
     }
 
+    #[must_use]
+    pub fn rewrap_on_startup(&self) -> bool {
+        self.crypto.state.settings.rewrap_on_startup
+    }
+
+    /// Rewrap every credential DEK that does not use the active KEK.
+    ///
+    /// The credential value ciphertext is preserved. Each update uses the
+    /// record's resource version so a concurrent credential update wins rather
+    /// than being overwritten by the maintenance sweep.
+    pub async fn rewrap_credentials(&self) -> Result<CredentialRewrapSummary, Status> {
+        let mut summary = CredentialRewrapSummary::default();
+        let mut after = None;
+
+        loop {
+            let page = self
+                .store
+                .list_credential_objects(
+                    OBJECT_TYPE,
+                    after.as_ref(),
+                    REWRAP_PAGE_SIZE,
+                    "list credentials for key rewrap",
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+
+            for record in &page {
+                summary.scanned += 1;
+                if self.rewrap_record(record).await? {
+                    summary.rewrapped += 1;
+                }
+            }
+
+            after = page.last().map(CredentialObjectCursor::from);
+            if page.len() < REWRAP_PAGE_SIZE as usize {
+                break;
+            }
+        }
+
+        Ok(summary)
+    }
+
+    async fn rewrap_record(&self, initial: &StoredCredentialObject) -> Result<bool, Status> {
+        let mut record = initial.clone();
+        for _attempt in 0..CONFLICT_RETRY_LIMIT {
+            let envelope = deserialize_credential_envelope(&record)?;
+            let Some(rewrapped) = self.crypto.rewrap_envelope(&envelope)? else {
+                return Ok(false);
+            };
+            let payload = EncryptedGatewayCredentialStoreCrypto::serialize_envelope(&rewrapped)?;
+            let labels = credential_labels(&rewrapped.provider_name, &rewrapped.credential_key)?;
+            let write = CredentialObjectWrite {
+                object_type: OBJECT_TYPE.to_string(),
+                id: record.id.clone(),
+                name: record.name.clone(),
+                payload,
+                labels: Some(labels),
+                condition: DbCredstoreWriteCondition::MatchResourceVersion(record.resource_version),
+            };
+
+            match self
+                .store
+                .put_credential_object(write, "rewrap credential key")
+                .await
+            {
+                Ok(()) => return Ok(true),
+                Err(err) if err.code() == tonic::Code::Aborted => {
+                    let Some(current) = self
+                        .store
+                        .get_credential_object(
+                            OBJECT_TYPE,
+                            &record.id,
+                            "reload credential after rewrap conflict",
+                        )
+                        .await?
+                    else {
+                        return Ok(false);
+                    };
+                    record = current;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(Status::aborted(format!(
+            "credential '{}' was modified concurrently during key rewrap; exceeded retry limit",
+            record.id
+        )))
+    }
+
     async fn write_envelope(
         &self,
         id: &str,
@@ -397,6 +532,13 @@ impl EncryptedGatewayCredentialStoreCrypto {
         decrypt_envelope(&self.state, envelope)
     }
 
+    pub fn rewrap_envelope(
+        &self,
+        envelope: &EncryptedCredentialEnvelope,
+    ) -> Result<Option<EncryptedCredentialEnvelope>, Status> {
+        rewrap_envelope(&self.state, envelope)
+    }
+
     pub fn ensure_envelope_owner(
         envelope: &EncryptedCredentialEnvelope,
         id: &str,
@@ -434,7 +576,14 @@ impl std::fmt::Debug for EncryptedGatewayCredentialStoreCrypto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EncryptedGatewayCredentialStoreCrypto")
             .field("settings", &self.state.settings)
-            .field("key_encryption_key_id", &self.state.key_encryption_key_id)
+            .field(
+                "active_key_encryption_key_id",
+                &self.state.active_key_encryption_key_id,
+            )
+            .field(
+                "key_encryption_key_ids",
+                &self.state.key_encryption_keys.keys().collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -464,24 +613,64 @@ impl EncryptedGatewayCredentialSettings {
             .key_encryption_key_env
             .map(|name| validate_env_name("key_encryption_key_env", &name))
             .transpose()?;
+        let decrypt_only_key_encryption_key_paths = config
+            .decrypt_only_key_encryption_key_paths
+            .into_iter()
+            .map(|path| validate_path("decrypt_only_key_encryption_key_paths", path))
+            .collect::<CoreResult<Vec<_>>>()?;
+        let decrypt_only_key_encryption_key_envs = config
+            .decrypt_only_key_encryption_key_envs
+            .into_iter()
+            .map(|name| validate_env_name("decrypt_only_key_encryption_key_envs", &name))
+            .collect::<CoreResult<Vec<_>>>()?;
 
         Ok(Self {
             key_encryption_key_path,
             key_encryption_key_env,
+            decrypt_only_key_encryption_key_paths,
+            decrypt_only_key_encryption_key_envs,
+            rewrap_on_startup: config.rewrap_on_startup,
         })
     }
 }
 
 impl EncryptedGatewayCredentialState {
     fn from_settings(settings: EncryptedGatewayCredentialSettings) -> CoreResult<Self> {
-        let key_encryption_key = load_key_encryption_key(&settings)?;
-        let key_encryption_key_id = key_id(&key_encryption_key);
+        let active_key_encryption_key = load_active_key_encryption_key(&settings)?;
+        let active_key_encryption_key_id = key_id(&active_key_encryption_key);
+        let mut key_encryption_keys = HashMap::from([(
+            active_key_encryption_key_id.clone(),
+            active_key_encryption_key,
+        )]);
+
+        for path in &settings.decrypt_only_key_encryption_key_paths {
+            let key = load_existing_file_key_encryption_key(path)?;
+            insert_decrypt_only_key(&mut key_encryption_keys, key)?;
+        }
+        for env_name in &settings.decrypt_only_key_encryption_key_envs {
+            let key = load_env_key_encryption_key(env_name)?;
+            insert_decrypt_only_key(&mut key_encryption_keys, key)?;
+        }
+
         Ok(Self {
             settings,
-            key_encryption_key,
-            key_encryption_key_id,
+            active_key_encryption_key_id,
+            key_encryption_keys,
         })
     }
+}
+
+fn insert_decrypt_only_key(
+    keyring: &mut HashMap<String, [u8; KEY_LEN]>,
+    key: [u8; KEY_LEN],
+) -> CoreResult<()> {
+    let id = key_id(&key);
+    if keyring.insert(id.clone(), key).is_some() {
+        return Err(Error::config(format!(
+            "[openshell.gateway.credential_storage] duplicate key-encryption key '{id}'"
+        )));
+    }
+    Ok(())
 }
 
 fn default_key_encryption_key_path() -> CoreResult<PathBuf> {
@@ -528,22 +717,47 @@ fn validate_env_name(field_name: &str, value: &str) -> CoreResult<String> {
     Ok(trimmed.to_string())
 }
 
-fn load_key_encryption_key(
+fn load_active_key_encryption_key(
     settings: &EncryptedGatewayCredentialSettings,
 ) -> CoreResult<[u8; KEY_LEN]> {
     if let Some(env_name) = &settings.key_encryption_key_env {
-        let value = std::env::var(env_name).map_err(|_| {
-            Error::config(format!(
-                "[openshell.gateway.credential_storage] environment variable '{env_name}' is not set"
-            ))
-        })?;
-        return decode_key_encryption_key_base64(&value).map_err(Error::config);
+        return load_env_key_encryption_key(env_name);
     }
     let path = settings
         .key_encryption_key_path
         .as_ref()
         .expect("settings always has key_encryption_key_path unless key_encryption_key_env is set");
     load_or_create_file_key_encryption_key(path)
+}
+
+fn load_env_key_encryption_key(env_name: &str) -> CoreResult<[u8; KEY_LEN]> {
+    let value = std::env::var(env_name).map_err(|_| {
+        Error::config(format!(
+            "[openshell.gateway.credential_storage] environment variable '{env_name}' is not set"
+        ))
+    })?;
+    decode_key_encryption_key_base64(&value).map_err(Error::config)
+}
+
+fn load_existing_file_key_encryption_key(path: &Path) -> CoreResult<[u8; KEY_LEN]> {
+    let bytes = fs::read(path).map_err(|err| {
+        Error::config(format!(
+            "failed to read decrypt-only credential storage key-encryption key '{}': {err}",
+            path.display()
+        ))
+    })?;
+    openshell_core::paths::set_file_owner_only(path).map_err(|err| {
+        Error::config(format!(
+            "failed to restrict decrypt-only credential storage key-encryption key '{}': {err}",
+            path.display()
+        ))
+    })?;
+    fixed_bytes::<KEY_LEN>(&bytes).map_err(|()| {
+        Error::config(format!(
+            "[openshell.gateway.credential_storage] decrypt-only key-encryption key '{}' must contain exactly 32 bytes",
+            path.display()
+        ))
+    })
 }
 
 fn decode_key_encryption_key_base64(value: &str) -> Result<[u8; KEY_LEN], String> {
@@ -625,19 +839,13 @@ fn new_handle_id() -> Result<String, Status> {
     Ok(hex_encode(&random_bytes_status::<KEY_LEN>()?))
 }
 
-fn credential_handle(state: &EncryptedGatewayCredentialState, id: &str) -> CredentialHandle {
+fn credential_handle(_state: &EncryptedGatewayCredentialState, id: &str) -> CredentialHandle {
     CredentialHandle {
         driver: DRIVER_NAME.to_string(),
         handle: format!("{HANDLE_VERSION}:{id}"),
-        metadata: [
-            ("algorithm".to_string(), ALGORITHM.to_string()),
-            (
-                "key_encryption_key_id".to_string(),
-                state.key_encryption_key_id.clone(),
-            ),
-        ]
-        .into_iter()
-        .collect(),
+        // The handle must remain stable when the envelope's DEK is rewrapped.
+        // KEK identity is authoritative only inside the encrypted envelope.
+        metadata: std::iter::once(("algorithm".to_string(), ALGORITHM.to_string())).collect(),
     }
 }
 
@@ -658,9 +866,10 @@ fn encrypt_envelope(
     credential_key: &str,
     value: &str,
 ) -> Result<EncryptedCredentialEnvelope, Status> {
+    let active_key = active_key_encryption_key(state)?;
     let dek = random_bytes_status::<KEY_LEN>()?;
     let wrapped_dek = encrypt_bytes(
-        &state.key_encryption_key,
+        active_key,
         &dek_aad(id, provider_name, credential_key),
         &dek,
     )?;
@@ -676,7 +885,7 @@ fn encrypt_envelope(
         provider_name: provider_name.to_string(),
         credential_key: credential_key.to_string(),
         algorithm: ALGORITHM.to_string(),
-        key_encryption_key_id: state.key_encryption_key_id.clone(),
+        key_encryption_key_id: state.active_key_encryption_key_id.clone(),
         wrapped_dek,
         value: encrypted_value,
     })
@@ -687,13 +896,9 @@ fn decrypt_envelope(
     envelope: &EncryptedCredentialEnvelope,
 ) -> Result<String, Status> {
     validate_envelope_metadata(envelope)?;
-    if envelope.key_encryption_key_id != state.key_encryption_key_id {
-        return Err(Status::failed_precondition(
-            "default credential storage object was encrypted with a different key-encryption key",
-        ));
-    }
+    let key_encryption_key = key_encryption_key_for_envelope(state, envelope)?;
     let dek = decrypt_bytes(
-        &state.key_encryption_key,
+        key_encryption_key,
         &dek_aad(
             &envelope.id,
             &envelope.provider_name,
@@ -714,6 +919,56 @@ fn decrypt_envelope(
     )?;
     String::from_utf8(plaintext)
         .map_err(|_| Status::data_loss("default credential storage value is not valid UTF-8"))
+}
+
+fn rewrap_envelope(
+    state: &EncryptedGatewayCredentialState,
+    envelope: &EncryptedCredentialEnvelope,
+) -> Result<Option<EncryptedCredentialEnvelope>, Status> {
+    validate_envelope_metadata(envelope)?;
+    if envelope.key_encryption_key_id == state.active_key_encryption_key_id {
+        return Ok(None);
+    }
+
+    let old_key = key_encryption_key_for_envelope(state, envelope)?;
+    let aad = dek_aad(
+        &envelope.id,
+        &envelope.provider_name,
+        &envelope.credential_key,
+    );
+    let dek = decrypt_bytes(old_key, &aad, &envelope.wrapped_dek)?;
+    let dek = fixed_bytes::<KEY_LEN>(&dek)
+        .map_err(|()| Status::data_loss("default credential storage DEK has invalid length"))?;
+
+    let mut rewrapped = envelope.clone();
+    rewrapped
+        .key_encryption_key_id
+        .clone_from(&state.active_key_encryption_key_id);
+    rewrapped.wrapped_dek = encrypt_bytes(active_key_encryption_key(state)?, &aad, &dek)?;
+    Ok(Some(rewrapped))
+}
+
+fn active_key_encryption_key(
+    state: &EncryptedGatewayCredentialState,
+) -> Result<&[u8; KEY_LEN], Status> {
+    state
+        .key_encryption_keys
+        .get(&state.active_key_encryption_key_id)
+        .ok_or_else(|| Status::internal("default credential storage active key is unavailable"))
+}
+
+fn key_encryption_key_for_envelope<'a>(
+    state: &'a EncryptedGatewayCredentialState,
+    envelope: &EncryptedCredentialEnvelope,
+) -> Result<&'a [u8; KEY_LEN], Status> {
+    state
+        .key_encryption_keys
+        .get(&envelope.key_encryption_key_id)
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "default credential storage object was encrypted with an unavailable key-encryption key",
+            )
+        })
 }
 
 fn encrypt_bytes(
@@ -974,6 +1229,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct MemoryObjectStore {
         objects: Mutex<HashMap<String, StoredCredentialObject>>,
+        conflict_payload_once: Mutex<Option<Vec<u8>>>,
     }
 
     #[async_trait]
@@ -998,6 +1254,13 @@ mod tests {
                     return Err(Status::already_exists("object already exists"));
                 }
                 DbCredstoreWriteCondition::MatchResourceVersion(expected) => {
+                    let conflict_payload = self.conflict_payload_once.lock().unwrap().take();
+                    if let Some(payload) = conflict_payload {
+                        let current = objects.get_mut(&write.id).unwrap();
+                        current.payload = payload;
+                        current.resource_version += 1;
+                        return Err(Status::aborted("injected resource version conflict"));
+                    }
                     let Some(current) = objects.get(&write.id) else {
                         return Err(Status::not_found("object not found"));
                     };
@@ -1015,12 +1278,56 @@ mod tests {
                 write.id.clone(),
                 StoredCredentialObject {
                     object_type: write.object_type,
-                    id: write.id,
+                    id: write.id.clone(),
+                    name: write.name,
+                    workspace: String::new(),
+                    created_at_ms: 0,
                     payload: write.payload,
                     resource_version,
                 },
             );
             Ok(())
+        }
+
+        async fn list_credential_objects(
+            &self,
+            _object_type: &str,
+            after: Option<&CredentialObjectCursor>,
+            limit: u32,
+            _operation: &'static str,
+        ) -> Result<Vec<StoredCredentialObject>, Status> {
+            let mut records = self
+                .objects
+                .lock()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            records.sort_by(|left, right| {
+                (left.created_at_ms, &left.name, &left.workspace, &left.id).cmp(&(
+                    right.created_at_ms,
+                    &right.name,
+                    &right.workspace,
+                    &right.id,
+                ))
+            });
+            if let Some(after) = after {
+                records.retain(|record| {
+                    (
+                        record.created_at_ms,
+                        &record.name,
+                        &record.workspace,
+                        &record.id,
+                    ) > (
+                        after.created_at_ms,
+                        &after.name,
+                        &after.workspace,
+                        &after.id,
+                    )
+                });
+            }
+            records.truncate(limit as usize);
+            Ok(records)
         }
 
         async fn delete_credential_object(
@@ -1056,6 +1363,28 @@ mod tests {
         config.insert(
             "key_encryption_key_path".to_string(),
             toml::Value::String(path.to_string_lossy().to_string()),
+        );
+        config
+    }
+
+    fn driver_config_for_keyring(
+        active_path: &Path,
+        decrypt_only_paths: &[&Path],
+        rewrap_on_startup: bool,
+    ) -> toml::Table {
+        let mut config = driver_config_for_key_encryption_key_path(active_path);
+        config.insert(
+            "decrypt_only_key_encryption_key_paths".to_string(),
+            toml::Value::Array(
+                decrypt_only_paths
+                    .iter()
+                    .map(|path| toml::Value::String(path.to_string_lossy().to_string()))
+                    .collect(),
+            ),
+        );
+        config.insert(
+            "rewrap_on_startup".to_string(),
+            toml::Value::Boolean(rewrap_on_startup),
         );
         config
     }
@@ -1214,6 +1543,164 @@ mod tests {
             restarted.decrypt_envelope(&envelope).unwrap(),
             "sk-persisted"
         );
+    }
+
+    #[tokio::test]
+    async fn keyring_rewraps_existing_credentials_without_reencrypting_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_path = tmp.path().join("old-key.bin");
+        let new_path = tmp.path().join("new-key.bin");
+        fs::write(&new_path, [0x42; KEY_LEN]).unwrap();
+
+        let store = Arc::new(MemoryObjectStore::default());
+        let old_object_store: Arc<dyn DbCredstoreObjectStore> = store.clone();
+        let old_driver = DbCredstoreCredentialDriver::from_config(
+            old_object_store,
+            &driver_config_for_key_encryption_key_path(&old_path),
+        )
+        .unwrap();
+        let handle = old_driver
+            .store_credential(request(
+                "openai-local",
+                "OPENAI_API_KEY",
+                "sk-original",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert!(!handle.metadata.contains_key("key_encryption_key_id"));
+
+        let id = EncryptedGatewayCredentialStoreCrypto::id_from_handle(&handle).unwrap();
+        let before = store.objects.lock().unwrap().get(&id).unwrap().clone();
+        let before_envelope = deserialize_credential_envelope(&before).unwrap();
+
+        let new_object_store: Arc<dyn DbCredstoreObjectStore> = store.clone();
+        let new_driver = DbCredstoreCredentialDriver::from_config(
+            new_object_store,
+            &driver_config_for_keyring(&new_path, &[old_path.as_path()], true),
+        )
+        .unwrap();
+        assert!(new_driver.rewrap_on_startup());
+
+        let resolved = new_driver
+            .resolve_credentials(vec![resolve_request(
+                "credential-0",
+                "openai-local",
+                "OPENAI_API_KEY",
+                handle.clone(),
+            )])
+            .await
+            .unwrap();
+        assert_eq!(resolved[0].value, "sk-original");
+
+        let summary = new_driver.rewrap_credentials().await.unwrap();
+        assert_eq!(
+            summary,
+            CredentialRewrapSummary {
+                scanned: 1,
+                rewrapped: 1,
+            }
+        );
+        let after = store.objects.lock().unwrap().get(&id).unwrap().clone();
+        let after_envelope = deserialize_credential_envelope(&after).unwrap();
+        assert_ne!(
+            after_envelope.key_encryption_key_id,
+            before_envelope.key_encryption_key_id
+        );
+        assert_eq!(
+            after_envelope.value.ciphertext,
+            before_envelope.value.ciphertext
+        );
+        assert_eq!(after_envelope.value.nonce, before_envelope.value.nonce);
+
+        let summary = new_driver.rewrap_credentials().await.unwrap();
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.rewrapped, 0);
+
+        let error = old_driver
+            .resolve_credentials(vec![resolve_request(
+                "credential-0",
+                "openai-local",
+                "OPENAI_API_KEY",
+                handle,
+            )])
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn rewrap_retries_without_overwriting_a_concurrent_credential_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_path = tmp.path().join("old-key.bin");
+        let new_path = tmp.path().join("new-key.bin");
+        fs::write(&new_path, [0x42; KEY_LEN]).unwrap();
+
+        let store = Arc::new(MemoryObjectStore::default());
+        let old_object_store: Arc<dyn DbCredstoreObjectStore> = store.clone();
+        let old_driver = DbCredstoreCredentialDriver::from_config(
+            old_object_store,
+            &driver_config_for_key_encryption_key_path(&old_path),
+        )
+        .unwrap();
+        let handle = old_driver
+            .store_credential(request(
+                "openai-local",
+                "OPENAI_API_KEY",
+                "sk-original",
+                None,
+            ))
+            .await
+            .unwrap();
+        let id = EncryptedGatewayCredentialStoreCrypto::id_from_handle(&handle).unwrap();
+        let concurrent_envelope = old_driver
+            .crypto
+            .encrypt_envelope(
+                &id,
+                "openai-local",
+                "OPENAI_API_KEY",
+                "sk-concurrent-update",
+            )
+            .unwrap();
+        let concurrent_payload =
+            EncryptedGatewayCredentialStoreCrypto::serialize_envelope(&concurrent_envelope)
+                .unwrap();
+        *store.conflict_payload_once.lock().unwrap() = Some(concurrent_payload);
+
+        let new_object_store: Arc<dyn DbCredstoreObjectStore> = store.clone();
+        let new_driver = DbCredstoreCredentialDriver::from_config(
+            new_object_store,
+            &driver_config_for_keyring(&new_path, &[old_path.as_path()], false),
+        )
+        .unwrap();
+        let summary = new_driver.rewrap_credentials().await.unwrap();
+        assert_eq!(summary.rewrapped, 1);
+
+        let resolved = new_driver
+            .resolve_credentials(vec![resolve_request(
+                "credential-0",
+                "openai-local",
+                "OPENAI_API_KEY",
+                handle,
+            )])
+            .await
+            .unwrap();
+        assert_eq!(resolved[0].value, "sk-concurrent-update");
+    }
+
+    #[test]
+    fn decrypt_only_key_must_already_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_path = tmp.path().join("active-key.bin");
+        let missing_path = tmp.path().join("missing-key.bin");
+        let error = EncryptedGatewayCredentialStoreCrypto::from_config(&driver_config_for_keyring(
+            &active_path,
+            &[missing_path.as_path()],
+            false,
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("failed to read decrypt-only"));
+        assert!(!missing_path.exists());
     }
 
     #[test]

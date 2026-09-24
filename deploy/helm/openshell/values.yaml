@@ -354,6 +354,16 @@ server:
     # with a base64-encoded 32-byte value. Required for GitOps workflows that
     # render manifests with `helm template` (where `lookup` is unavailable).
     existingSecret: ""
+    # -- Existing Secrets containing additional key-encryption keys that may
+    # decrypt older credential envelopes but are never used for new writes.
+    # Each Secret must contain a `key-encryption-key` data key. Use this during
+    # a staged rotation and remove the retired Secret only after rewrap
+    # completion and backup verification.
+    decryptOnlyExistingSecrets: []
+    # -- Rewrap stored credential data-encryption keys with the active key when
+    # the gateway starts. Stage both keys on every replica before enabling this
+    # during a rolling update.
+    rewrapOnStartup: false
   # Provider credential drivers store provider credential secret material in an
   # external or native backend. When no driver is enabled, the gateway uses its
   # default encrypted database credential storage with a retained Kubernetes

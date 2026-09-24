@@ -36,11 +36,14 @@ use openshell_core::proto::credentials::v1::{
 use openshell_core::proto::{CredentialHandle, Provider};
 use openshell_core::{Config, Error, Result as CoreResult};
 use openshell_driver_db_credstore::{
-    CredentialObjectWrite, DbCredstoreCredentialDriver, DbCredstoreObjectStore,
-    DbCredstoreWriteCondition, StoredCredentialObject,
+    CredentialObjectCursor, CredentialObjectWrite, DbCredstoreCredentialDriver,
+    DbCredstoreObjectStore, DbCredstoreWriteCondition, StoredCredentialObject,
 };
 use openshell_driver_kubernetes_secrets::KubernetesSecretsCredentialDriver;
 use openshell_driver_vault::VaultCredentialDriver;
+use openshell_ocsf::{
+    ConfigStateChangeBuilder, EventContext, OCSF_TARGET, SeverityId, StateId, StatusId,
+};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -51,9 +54,9 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 #[cfg(unix)]
 use tower::service_fn;
-use tracing::warn;
+use tracing::{info, warn};
 
-use crate::persistence::{PersistenceError, Store, WriteCondition};
+use crate::persistence::{ObjectCursor, PersistenceError, Store, WriteCondition};
 use crate::storage_proto::StoredRefreshMaterialDeletion;
 
 const DEFAULT_CREDENTIAL_DRIVER_STARTUP_TIMEOUT_SECS: u64 = 10;
@@ -143,7 +146,7 @@ impl CredentialRuntime {
     ) -> CoreResult<Self> {
         let registry = CredentialDriverRegistry::from_config(config)?;
         let mut drivers = BTreeMap::new();
-        connect_default_credential_store(
+        let _ = connect_default_credential_store(
             &mut drivers,
             store.clone(),
             &toml::Table::new(),
@@ -198,12 +201,46 @@ impl CredentialRuntime {
         let default_store_config = config_file
             .and_then(|file| file.openshell.gateway.credential_storage.as_ref())
             .unwrap_or(&empty_config);
-        connect_default_credential_store(
+        let default_store = connect_default_credential_store(
             &mut drivers,
             store.clone(),
             default_store_config,
             registry.requires_default_store(),
         )?;
+        if let Some(default_store) = default_store
+            && default_store.rewrap_on_startup()
+        {
+            emit_credential_rewrap_event(
+                StatusId::Unknown,
+                SeverityId::Informational,
+                "credential_kek_rewrap_started",
+                "Default credential storage key rewrap started",
+                None,
+            );
+            match default_store.rewrap_credentials().await {
+                Ok(summary) => {
+                    emit_credential_rewrap_event(
+                        StatusId::Success,
+                        SeverityId::Informational,
+                        "credential_kek_rewrap_completed",
+                        "Default credential storage key rewrap completed",
+                        Some((summary.scanned, summary.rewrapped)),
+                    );
+                }
+                Err(status) => {
+                    emit_credential_rewrap_event(
+                        StatusId::Failure,
+                        SeverityId::Medium,
+                        "credential_kek_rewrap_failed",
+                        "Default credential storage key rewrap failed",
+                        None,
+                    );
+                    return Err(Error::config(format!(
+                        "failed to rewrap default credential storage keys at startup: {status}"
+                    )));
+                }
+            }
+        }
         if drivers.contains_key(DbCredstoreCredentialDriver::NAME) {
             negotiated_extensions.push(negotiate_builtin_credential_driver(
                 DbCredstoreCredentialDriver::NAME,
@@ -765,6 +802,40 @@ impl CredentialRuntime {
     }
 }
 
+fn emit_credential_rewrap_event(
+    status: StatusId,
+    severity: SeverityId,
+    state_label: &'static str,
+    message: &'static str,
+    counts: Option<(u64, u64)>,
+) {
+    let context = EventContext {
+        sandbox_id: String::new(),
+        sandbox_name: String::new(),
+        container_image: "openshell/gateway".to_string(),
+        hostname: "openshell-gateway".to_string(),
+        product_version: openshell_core::VERSION.to_string(),
+        proxy_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        proxy_port: 0,
+    };
+    let mut builder = ConfigStateChangeBuilder::new(&context)
+        .severity(severity)
+        .status(status)
+        .state(StateId::Enabled, state_label)
+        .message(message);
+    if let Some((scanned, rewrapped)) = counts {
+        builder = builder
+            .unmapped("credential_records_scanned", scanned)
+            .unmapped("credential_records_rewrapped", rewrapped);
+    }
+    let event = builder.build();
+    info!(
+        target: OCSF_TARGET,
+        sandbox_id = "",
+        message = %event.format_shorthand()
+    );
+}
+
 fn effective_credential_expiration_ms(
     provider_expiration_ms: Option<i64>,
     driver_expiration_ms: Option<i64>,
@@ -1127,9 +1198,9 @@ fn connect_default_credential_store(
     store: Option<Arc<Store>>,
     config: &toml::Table,
     required: bool,
-) -> CoreResult<()> {
+) -> CoreResult<Option<Arc<DbCredstoreCredentialDriver>>> {
     if !required && config.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(store) = store else {
@@ -1138,17 +1209,18 @@ fn connect_default_credential_store(
                 "default encrypted credential storage requires the gateway object store",
             ));
         }
-        return Ok(());
+        return Ok(None);
     };
 
     let object_store: Arc<dyn DbCredstoreObjectStore> =
         Arc::new(ServerDbCredstoreObjectStore::new(store));
-    let storage: Arc<dyn CredentialDriver> = Arc::new(DbCredstoreCredentialDriver::from_config(
+    let storage = Arc::new(DbCredstoreCredentialDriver::from_config(
         object_store,
         config,
     )?);
-    drivers.insert(DbCredstoreCredentialDriver::NAME.to_string(), storage);
-    Ok(())
+    let registered: Arc<dyn CredentialDriver> = storage.clone();
+    drivers.insert(DbCredstoreCredentialDriver::NAME.to_string(), registered);
+    Ok(Some(storage))
 }
 
 fn negotiate_builtin_credential_driver(name: &str) -> CoreResult<NegotiatedExtension> {
@@ -1278,9 +1350,45 @@ impl DbCredstoreObjectStore for ServerDbCredstoreObjectStore {
                 record.map(|record| StoredCredentialObject {
                     object_type: record.object_type,
                     id: record.id,
+                    name: record.name,
+                    workspace: record.workspace,
+                    created_at_ms: record.created_at_ms,
                     payload: record.payload,
                     resource_version: record.resource_version,
                 })
+            })
+            .map_err(|err| default_credential_store_persistence_error_to_status(err, operation))
+    }
+
+    async fn list_credential_objects(
+        &self,
+        object_type: &str,
+        after: Option<&CredentialObjectCursor>,
+        limit: u32,
+        operation: &'static str,
+    ) -> Result<Vec<StoredCredentialObject>, Status> {
+        let after = after.map(|cursor| ObjectCursor {
+            created_at_ms: cursor.created_at_ms,
+            name: cursor.name.clone(),
+            workspace: cursor.workspace.clone(),
+            id: cursor.id.clone(),
+        });
+        self.store
+            .list_by_type_after(object_type, after.as_ref(), limit)
+            .await
+            .map(|records| {
+                records
+                    .into_iter()
+                    .map(|record| StoredCredentialObject {
+                        object_type: record.object_type,
+                        id: record.id,
+                        name: record.name,
+                        workspace: record.workspace,
+                        created_at_ms: record.created_at_ms,
+                        payload: record.payload,
+                        resource_version: record.resource_version,
+                    })
+                    .collect()
             })
             .map_err(|err| default_credential_store_persistence_error_to_status(err, operation))
     }
@@ -2428,6 +2536,88 @@ key_encryption_key_path = {key_encryption_key_path_toml}
             resolved.values.get("OPENAI_API_KEY").map(String::as_str),
             Some("sk-test")
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_rewraps_default_credentials_at_startup() {
+        let storage = tempfile::tempdir().unwrap();
+        let old_key_path = storage.path().join("old-key.bin");
+        let new_key_path = storage.path().join("new-key.bin");
+        std::fs::write(&new_key_path, [0x42; 32]).unwrap();
+        let store = Arc::new(crate::persistence::test_store().await);
+        let config = Config::new(None);
+
+        let old_file = config_file(&format!(
+            r"
+[openshell.gateway.credential_storage]
+key_encryption_key_path = {}
+",
+            toml_path(&old_key_path)
+        ));
+        let old_runtime = CredentialRuntime::from_config_file_with_store(
+            &config,
+            Some(&old_file),
+            Arc::clone(&store),
+        )
+        .await
+        .unwrap();
+        let handles = old_runtime
+            .store_provider_credentials(
+                "openai-local",
+                "test-workspace",
+                "test-provider-id",
+                &HashMap::from([("OPENAI_API_KEY".to_string(), "sk-test".to_string())]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let provider = Provider {
+            metadata: Some(openshell_core::proto::ObjectMeta {
+                name: "openai-local".to_string(),
+                ..Default::default()
+            }),
+            credential_handles: handles,
+            ..Default::default()
+        };
+
+        let new_file = config_file(&format!(
+            r"
+[openshell.gateway.credential_storage]
+key_encryption_key_path = {}
+decrypt_only_key_encryption_key_paths = [{}]
+rewrap_on_startup = true
+",
+            toml_path(&new_key_path),
+            toml_path(&old_key_path)
+        ));
+        let new_runtime = CredentialRuntime::from_config_file_with_store(
+            &config,
+            Some(&new_file),
+            Arc::clone(&store),
+        )
+        .await
+        .unwrap();
+        let resolved = new_runtime
+            .resolve_provider_handles(&provider, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.values.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-test")
+        );
+
+        let old_only_runtime = CredentialRuntime::from_config_file_with_store(
+            &config,
+            Some(&old_file),
+            Arc::clone(&store),
+        )
+        .await
+        .unwrap();
+        let error = old_only_runtime
+            .resolve_provider_handles(&provider, 1_000)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
     }
 
     #[tokio::test]

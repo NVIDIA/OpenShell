@@ -102,6 +102,13 @@ spec:
             secretKeyRef:
               name: {{ include "openshell.credentialStorageKeyEncryptionKeySecretName" . }}
               key: {{ include "openshell.credentialStorageKeyEncryptionKeySecretKey" . }}
+        {{- range $index, $secretName := .Values.server.credentialStorage.decryptOnlyExistingSecrets }}
+        - name: {{ include "openshell.credentialStorageDecryptOnlyKeyEnvName" $index }}
+          valueFrom:
+            secretKeyRef:
+              name: {{ $secretName | quote }}
+              key: {{ include "openshell.credentialStorageKeyEncryptionKeySecretKey" $ }}
+        {{- end }}
         {{- end }}
         {{- if .Values.server.externalDbSecret }}
         - name: OPENSHELL_DB_URL

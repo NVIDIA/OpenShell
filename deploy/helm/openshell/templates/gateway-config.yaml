@@ -239,6 +239,16 @@ data:
 
     [openshell.gateway.credential_storage]
     key_encryption_key_env = {{ include "openshell.credentialStorageKeyEncryptionKeyEnvName" . | quote }}
+    {{- with .Values.server.credentialStorage.decryptOnlyExistingSecrets }}
+    decrypt_only_key_encryption_key_envs = [
+      {{- range $index, $_ := . }}
+      {{ include "openshell.credentialStorageDecryptOnlyKeyEnvName" $index | quote }},
+      {{- end }}
+    ]
+    {{- end }}
+    {{- if .Values.server.credentialStorage.rewrapOnStartup }}
+    rewrap_on_startup = true
+    {{- end }}
     {{- end }}
 
     {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled }}

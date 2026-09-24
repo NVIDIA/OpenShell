@@ -428,6 +428,12 @@ Credential driver tables are backend-owned and live under `[openshell.credential
 ```toml
 [openshell.gateway.credential_storage]
 key_encryption_key_path = "/var/lib/openshell/credentials/key-encryption-key.bin"
+# Optional keys used only to decrypt envelopes written with an earlier key.
+decrypt_only_key_encryption_key_paths = [
+  "/var/lib/openshell/credentials/previous-key-encryption-key.bin",
+]
+# Rewrap existing data-encryption keys with the active key during startup.
+rewrap_on_startup = true
 ```
 
 For Kubernetes Secrets:
@@ -456,7 +462,22 @@ role = "openshell-gateway"
 service_account_token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 ```
 
-For the default encrypted database store, OpenShell stores provider credentials as JSON envelopes encrypted with AES-256-GCM in the gateway database. Each credential gets a random data-encryption key; the gateway wraps that key with a local key-encryption key. By default, the key-encryption key is created at `$XDG_STATE_HOME/openshell/gateway/credentials/key-encryption-key.bin` with owner-only permissions. Use `[openshell.gateway.credential_storage] key_encryption_key_env` instead of `key_encryption_key_path` to load a base64-encoded 32-byte key-encryption key from an environment variable. Back up the database and key-encryption key together; losing either makes stored credentials unrecoverable. In Kubernetes, the Helm chart creates a retained Secret containing the shared key-encryption key, injects it as `OPENSHELL_GATEWAY_CREDENTIAL_KEY_ENCRYPTION_KEY`, and renders `key_encryption_key_env` for the gateway when no external credential driver is enabled. Multi-replica deployments need every replica to use the same database and key-encryption key; the chart default handles the key-encryption key side.
+For the default encrypted database store, OpenShell stores provider credentials as JSON envelopes encrypted with AES-256-GCM in the gateway database. Each credential gets a random data-encryption key; the gateway wraps that key with a local key-encryption key. By default, the active key-encryption key is created at `$XDG_STATE_HOME/openshell/gateway/credentials/key-encryption-key.bin` with owner-only permissions. Use `[openshell.gateway.credential_storage] key_encryption_key_env` instead of `key_encryption_key_path` to load a base64-encoded 32-byte active key from an environment variable.
+
+`decrypt_only_key_encryption_key_paths` and `decrypt_only_key_encryption_key_envs` add keys that may decrypt older envelopes but are never used for new writes. OpenShell derives the key identifier from the key material and rejects duplicate keys. Unknown key identifiers fail closed. Set `rewrap_on_startup = true` to scan the encrypted credential records at gateway startup and rewrap their data-encryption keys with the active key. Rewrap preserves the credential ciphertext and uses compare-and-swap updates so it cannot overwrite a concurrent credential change. The sweep is idempotent and a later startup can resume after interruption.
+
+Back up the database and every key required by retained backups together; losing a required key makes those stored credentials unrecoverable. A rewrap changes the live envelopes but does not change historical backups. Keep the previous key until a backup created after rewrap has been restore-tested and older backups have reached the end of their retention period.
+
+In Kubernetes, the Helm chart creates a retained Secret containing the shared active key, injects it as `OPENSHELL_GATEWAY_CREDENTIAL_KEY_ENCRYPTION_KEY`, and renders `key_encryption_key_env` for the gateway when no external credential driver is enabled. Multi-replica deployments need every replica to use the same database and keyring.
+
+Rotate the key in an HA deployment with staged rolling updates:
+
+1. Set `server.credentialStorage.existingSecret` to the current key Secret and add the future key Secret to `decryptOnlyExistingSecrets`. Leave `rewrapOnStartup` disabled and wait for every replica to become ready.
+2. Set `existingSecret` to the future key Secret and put the previous Secret in `decryptOnlyExistingSecrets`. Keep `rewrapOnStartup` disabled and wait until every replica uses the future key for new writes.
+3. Enable `rewrapOnStartup` without changing the keyring and complete another rolling update. Check the completion events; the final replica should report zero remaining rewraps after all earlier replicas finish.
+4. Create and restore-test a new backup. After older backups have reached the end of their retention period, remove the previous Secret from `decryptOnlyExistingSecrets`, disable `rewrapOnStartup`, and complete one final rolling update.
+
+Each referenced Secret must contain a base64-encoded 32-byte key under `key-encryption-key`. Do not change the active key without first staging both keys on every replica.
 
 For GitOps and `helm template` workflows where `lookup` returns empty, the chart-generated KEK Secret gets a random value on every render, making credentials unrecoverable. Set `server.credentialStorage.existingSecret` to the name of a pre-provisioned Secret containing the key-encryption key under the `key-encryption-key` data key. When set, the chart skips KEK Secret generation and references the provided Secret directly.
 
@@ -464,6 +485,8 @@ For GitOps and `helm template` workflows where `lookup` returns empty, the chart
 server:
   credentialStorage:
     existingSecret: my-preprovisioned-kek-secret
+    decryptOnlyExistingSecrets: []
+    rewrapOnStartup: false
 ```
 
 For `kubernetes-secrets`, `namespace` sets where OpenShell-managed provider Secret objects are stored in every workspace mode. When omitted, the driver uses the in-cluster ServiceAccount namespace when available, otherwise `default`. The driver rejects credential handles that reference any other namespace. The Helm chart creates a Role granting the gateway access to all Secrets in the credential namespace because OpenShell-managed Secret names are dynamic SHA-256 hashes that cannot be restricted with `resourceNames`; the gateway ClusterRole grants no credential Secret permissions. Deploy credential Secrets in a dedicated namespace (`server.credentialDrivers.kubernetesSecrets.namespace`) to limit the RBAC blast radius. When the credential namespace is the release namespace, the Role also covers the gateway's own TLS and database Secrets. Set `server.credentialDrivers.kubernetesSecrets.createNamespace=true` to have the chart create the dedicated namespace. The chart retains it on uninstall so stored credentials survive, and leaves an existing namespace it does not own untouched.

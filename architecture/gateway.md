@@ -764,8 +764,12 @@ records created before credential driver storage. New provider and
 refresh-material writes keep driver-owned credential handles. When no external
 credential driver is configured, gateways use server-owned encrypted database
 credential storage for defense in depth. Multi-replica deployments can use that
-default with a shared database and shared key-encryption key, or opt into an
-external backend such as Vault or Kubernetes Secrets.
+default with a shared database and key-encryption keyring, or opt into an
+external backend such as Vault or Kubernetes Secrets. The keyring has one
+active key for new envelopes and may retain decrypt-only keys during a staged
+rotation. An opt-in startup sweep rewraps only each envelope's data-encryption
+key, preserves the credential ciphertext, and uses resource-version
+compare-and-swap writes so concurrent credential changes win.
 
 The Vault credential driver requires HTTPS for every non-loopback backend,
 never follows HTTP redirects, and keeps standard certificate hostname

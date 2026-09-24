@@ -236,6 +236,13 @@ OPENSHELL_GATEWAY_CREDENTIAL_KEY_ENCRYPTION_KEY
 {{- end }}
 
 {{/*
+Gateway environment variable used for one decrypt-only credential storage key.
+*/}}
+{{- define "openshell.credentialStorageDecryptOnlyKeyEnvName" -}}
+{{- printf "OPENSHELL_GATEWAY_CREDENTIAL_DECRYPT_ONLY_KEY_%d" (int .) -}}
+{{- end }}
+
+{{/*
 Name of the Secret holding gateway-minted sandbox JWT signing material.
 */}}
 {{- define "openshell.sandboxJwtSecretName" -}}

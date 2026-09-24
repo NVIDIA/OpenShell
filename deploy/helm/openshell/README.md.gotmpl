@@ -127,6 +127,11 @@ The gateway writes encrypted provider credential envelopes to the OpenShell
 database. The chart creates a retained Kubernetes Secret with the shared
 key-encryption key and injects that key into every gateway pod, so the same
 default works for single-replica and external database-backed HA deployments.
+For staged rotation, configure the active Secret with
+`server.credentialStorage.existingSecret`, add the other key Secrets to
+`decryptOnlyExistingSecrets`, switch every replica to the new active key, and
+then enable `rewrapOnStartup` in a separate rollout. See the gateway
+configuration reference for the full sequence and backup requirements.
 
 Use `kubernetes-secrets` or `vault` instead when credentials should live in a
 cluster or external secret backend. Enabling one external credential driver

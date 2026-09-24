@@ -127,6 +127,11 @@ The gateway writes encrypted provider credential envelopes to the OpenShell
 database. The chart creates a retained Kubernetes Secret with the shared
 key-encryption key and injects that key into every gateway pod, so the same
 default works for single-replica and external database-backed HA deployments.
+For staged rotation, configure the active Secret with
+`server.credentialStorage.existingSecret`, add the other key Secrets to
+`decryptOnlyExistingSecrets`, switch every replica to the new active key, and
+then enable `rewrapOnStartup` in a separate rollout. See the gateway
+configuration reference for the full sequence and backup requirements.
 
 Use `kubernetes-secrets` or `vault` instead when credentials should live in a
 cluster or external secret backend. Enabling one external credential driver
@@ -291,7 +296,9 @@ discovery endpoint or its TLS CA.
 | server.credentialDrivers.vault.serviceAccountTokenPath | string | `"/var/run/secrets/kubernetes.io/serviceaccount/token"` | ServiceAccount token path used for Kubernetes auth. |
 | server.credentialDrivers.vault.timeoutSecs | string | `""` | HTTP request timeout in seconds. Empty = driver default. |
 | server.credentialDrivers.vault.tokenPath | string | `""` | Mounted token file path when authMethod is token_file. |
+| server.credentialStorage.decryptOnlyExistingSecrets | list | `[]` | Existing Secrets containing additional key-encryption keys that may decrypt older credential envelopes but are never used for new writes. Each Secret must contain a `key-encryption-key` data key. Use this during a staged rotation and remove the retired Secret only after rewrap completion and backup verification. |
 | server.credentialStorage.existingSecret | string | `""` | Name of a pre-existing Secret containing the key-encryption key. When set, the chart does NOT generate a new Secret; it references this one instead. The Secret must contain a key named "key-encryption-key" with a base64-encoded 32-byte value. Required for GitOps workflows that render manifests with `helm template` (where `lookup` is unavailable). |
+| server.credentialStorage.rewrapOnStartup | bool | `false` | Rewrap stored credential data-encryption keys with the active key when the gateway starts. Stage both keys on every replica before enabling this during a rolling update. |
 | server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL (used for the default SQLite backend). |
 | server.defaultRuntimeClassName | string | `""` | Default Kubernetes runtimeClassName for sandbox pods. Applied when a CreateSandbox request does not specify one. Empty (default) = omit the field, using the cluster's default RuntimeClass. Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it to all sandboxes that don't explicitly override it. |
 | server.disableTls | bool | `false` | Disable TLS entirely - the server listens on plaintext HTTP. Set to true when a reverse proxy / tunnel terminates TLS at the edge. |

@@ -402,6 +402,24 @@ stores encrypted credential envelopes in the OpenShell database. For
 mentioning `server.credentialDrivers` means the values selected multiple
 external credential backends.
 
+During a staged KEK rotation, `server.credentialStorage.existingSecret` names
+the active key Secret and `decryptOnlyExistingSecrets` names keys retained for
+older envelopes. Confirm every replica completed the keyring rollout before
+switching the active Secret, then enable `rewrapOnStartup` in a separate rollout.
+Gateway logs and OCSF output report rewrap start, completion, failure, and the
+number of records scanned and changed. Do not print Secret data while checking
+the rollout:
+
+```bash
+helm -n <namespace> get values openshell | rg -n 'credentialStorage|existingSecret|decryptOnlyExistingSecrets|rewrapOnStartup'
+kubectl -n <namespace> get secret <active-key-secret> <decrypt-only-key-secret>
+kubectl -n <namespace> logs <gateway-pod> -c openshell-gateway | rg 'credential storage key rewrap'
+```
+
+An unavailable-key error means the serving replica does not have the key named
+by an existing envelope. Restore the missing decrypt-only Secret reference and
+roll the gateway before retrying rewrap or retiring the older key.
+
 For HA or PostgreSQL-backed installs, also check the external database Secret
 referenced by `server.externalDbSecret` and the PostgreSQL workload when it is
 deployed in-cluster:
