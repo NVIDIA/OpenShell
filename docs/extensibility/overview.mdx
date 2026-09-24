@@ -1,0 +1,43 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Extensibility"
+sidebar-title: "Overview"
+slug: "extensibility/overview"
+description: "Extend OpenShell with custom traffic checks, gateway governance, drivers, and isolation backends."
+keywords: "OpenShell Extensions, Protocol Negotiation, Supervisor Middleware, Gateway Interceptors, Compute Drivers, Credential Drivers, Isolation Backends"
+---
+
+OpenShell has several extension points that let you connect your own services and runtimes without changing OpenShell. Choose an extension point based on what you need to control, then implement the shared extension protocol that every extension service uses.
+
+## Extension Protocol
+
+Before OpenShell uses an extension service, both peers exchange their protocol version and supported capabilities. This lets OpenShell and your service detect incompatible versions at startup instead of failing on live traffic. [Extension Protocol Negotiation](/extensibility/extension-negotiation) describes the metadata to exchange and the version-skew policy.
+
+Extension services reachable over the network also need to know that a call comes from your OpenShell gateway. [Extension Authentication](/extensibility/extension-authentication) describes the tokens OpenShell attaches and how your service validates them.
+
+## Extension Points
+
+<Cards>
+
+<Card title="Supervisor Middleware" href="/extensibility/supervisor-middleware">
+
+Check or change the content an agent sends and receives over the network, such as redacting API tokens from outgoing requests or blocking prohibited content.
+</Card>
+
+<Card title="Gateway Interceptors" href="/extensibility/gateway-interceptors">
+
+Enforce rules on how people and applications manage OpenShell resources, such as applying an approved policy to new sandboxes or auditing completed operations.
+</Card>
+
+<Card title="Drivers" href="/extensibility/drivers">
+
+Connect the gateway to the runtimes that host sandbox workloads and to the stores that hold provider credentials.
+</Card>
+
+<Card title="Isolation Backends" href="/extensibility/isolation-backends">
+
+Understand the runtime boundary the supervisor uses to launch and control processes inside a sandbox.
+</Card>
+
+</Cards>

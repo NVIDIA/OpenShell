@@ -370,7 +370,7 @@ The service `grpc_endpoint` supports plaintext `http://` and TLS `https://`. HTT
 
 When `gateway_jwt` is configured, OpenShell attaches short-lived bearer credentials to gateway and supervisor calls and requires `https://`. A middleware endpoint must be reachable from sandbox supervisors, so Unix sockets are not an option here. Set `allow_insecure_transport = true` on a registration to keep a plaintext `http://` endpoint: OpenShell then attaches no credential, supervisors do not request one, and the gateway logs a warning naming the registration at every startup. mTLS client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
 
-See [Supervisor Middleware](/extensibility/supervisor-middleware) for selection, failure, payload-limit, and operational guidance.
+See [Configure and Operate Supervisor Middleware](/extensibility/supervisor-middleware/configure) for attachment, failure, and operational guidance.
 
 ## Gateway Interceptors
 

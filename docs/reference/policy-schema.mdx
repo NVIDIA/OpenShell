@@ -633,7 +633,7 @@ network_middlewares:
 
 Host selectors use the same case-insensitive exact and DNS glob semantics as network endpoints: `*` matches exactly one DNS label and `**` matches one or more labels, so `**.example.com` covers subdomains but not `example.com` itself. Brace alternates are rejected at validation. A matching attachment joins only the operation chains its implementation advertises. An HTTP-only attachment may inspect a WebSocket upgrade GET without joining the post-upgrade chain; OpenShell permits the messages and records `binding_not_selected` coverage regardless of `on_error`. WebSocket bindings inspect complete client text messages. Binary messages pass with `unsupported_message_type` coverage for active stages. A fail-closed selector that can cover a `tls: skip` endpoint is rejected because OpenShell cannot inspect that traffic through any operation. An all-`fail_open` match may cover the endpoint; the supervisor bypasses the middleware and emits a detection finding.
 
-See [Supervisor Middleware](/extensibility/supervisor-middleware) for registration, failure behavior, body limits, and operational guidance.
+See [Configure and Operate Supervisor Middleware](/extensibility/supervisor-middleware/configure) for registration, failure behavior, and operational guidance.
 
 ## Full Example
 

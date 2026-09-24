@@ -72,6 +72,8 @@ redirects:
     destination: "/openshell/latest/about/run-an-agent"
   - source: "/openshell/dev/about/supported-agents"
     destination: "/openshell/dev/about/run-an-agent"
+  - source: "/openshell/dev/extensibility/middleware"
+    destination: "/openshell/dev/extensibility/supervisor-middleware"
   - source: "/openshell/latest/get-started/quickstart"
     destination: "/openshell/latest/about/run-an-agent"
   - source: "/openshell/dev/get-started/quickstart"
