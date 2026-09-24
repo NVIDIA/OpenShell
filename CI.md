@@ -10,6 +10,11 @@ PR CI that runs on NVIDIA self-hosted runners uses NVIDIA's copy-pr-bot. The bot
 
 `Branch Checks` run automatically after copy-pr-bot mirrors the PR. `Required CI Gates` posts PR-head statuses that verify the mirror exists, is current, and ran the expected push-based workflows. E2E suites are opt-in because they are more expensive and publish temporary images.
 
+`Workflow Policy` separately checks every new or changed `uses:` reference in
+workflow and composite-action definitions against the repository's live,
+effective GitHub Actions policy. It publishes `OpenShell / Workflow Policy` on
+the PR head before the change can merge.
+
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
 
 Windows PR checks are opt-in: add `test:windows`, then select **Re-run all jobs**
@@ -33,6 +38,48 @@ The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated 
 The GitHub ruleset should require the `OpenShell / ...` statuses published by
 `Required CI Gates` plus the direct `OpenShell / Trivy Changes` result, not the
 push-triggered workflow jobs themselves.
+
+## Required workflow policy
+
+`.github/workflows/workflow-policy-request.yml` creates an unprivileged request
+on pull requests and merge groups. It has no secrets, write permissions,
+checkout, or candidate execution. After that request completes,
+`.github/workflows/workflow-policy.yml` runs through `workflow_run`, so its
+workflow and `tasks/scripts/github_actions_policy.py` come from the trusted
+default branch. The checker fetches candidate files only as data. For pull
+requests, it compares changed workflow and `.github/actions/**/action.yml`
+`uses:` references with the base revision and skips policy lookup when no
+reference changed. This split also supports Dependabot, whose pull-request
+workflows cannot receive Actions secrets or write tokens.
+
+The checker reads the effective repository settings from GitHub's
+`actions/permissions` and `selected-actions` APIs. The repository does not keep
+a second copy of the returned exception list. Repository-owner and GitHub-owned
+references use GitHub's implicit categories. When the policy permits
+Marketplace-verified creators, the checker reads the live
+Marketplace listing metadata and binds its verification flag to the exact
+`owner/repository` action prefix. Missing credentials, API failures, ambiguous
+Marketplace metadata, and unsupported reference syntax fail closed. Rejected
+references produce file-and-line annotations.
+
+The workflow requires two Actions secrets:
+
+- `ACTIONS_POLICY_READ_TOKEN`: a fine-grained token scoped only to
+  `NVIDIA/OpenShell` with repository **Administration: read**. The built-in
+  `GITHUB_TOKEN` cannot request that permission.
+- `ACTIONS_ENTERPRISE_READ_TOKEN`: a classic token with only the
+  `read:enterprise` scope, used to identify organizations whose actions GitHub
+  implicitly permits as enterprise-owned. Keep this separate from repository
+  access so the credential remains read-only and narrowly scoped.
+
+The secrets are exposed only to the default-branch policy step; candidate files
+remain inert input.
+
+For merge groups, the trusted consumer enumerates every workflow and composite
+action in the queued tree and evaluates every reference against the current
+live policy. A truncated or oversized tree fails closed. The result is
+published on the merge-group SHA, so policy changes and interactions between
+queued pull requests are checked again immediately before merge.
 
 ## Informational security reports
 
@@ -338,6 +385,7 @@ GitHub merge queue is required for `main`. Repository administrators must enable
 - `OpenShell / GPU E2E`
 - `OpenShell / Helm Lint`
 - `OpenShell / Trivy Changes`
+- `OpenShell / Workflow Policy`
 
 `Required CI Gates` publishes the stable statuses for mirror-based workflows.
 `Trivy Changes` runs directly on pull requests and merge groups and publishes
@@ -349,6 +397,7 @@ Merge-group runs use the `merge_group` event. The event is distinct from `pull_r
 - `Branch E2E Checks` runs core E2E and GPU E2E for merge groups. Kubernetes HA E2E remains optional and label-driven on PRs.
 - `Helm Lint` runs for merge groups without the PR diff optimization, because the merge-group branch is the final integration state.
 - `Trivy Changes` compares the merge-group configuration with its base and rejects new High or Critical findings.
+- `Workflow Policy Request` starts the trusted default-branch `Workflow Policy` consumer, which reevaluates the complete queued tree and publishes `OpenShell / Workflow Policy` on the merge-group SHA.
 - `Required CI Gates` posts the same `OpenShell / ...` statuses to the merge-group SHA and does not require a `pull-request/<N>` mirror for merge-group events.
 
 Maintainers should add ready PRs to the queue rather than pressing a direct merge button. GitHub removes a PR from the queue if the merge-group checks fail or time out.
@@ -385,6 +434,8 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/required-ci-gates.yml` | Posts required PR-head and merge-group statuses for gated CI workflows. This is what branch protection and merge queue should require. |
 | `.github/workflows/e2e-label-help.yml` | When a `test:e2e*` label is applied, posts a PR comment telling the maintainer the next manual step (re-run an existing workflow run, or `/ok to test <SHA>` to refresh the mirror). |
 | `.github/workflows/workflow-security.yml` | Runs informational Actionlint and High-severity Zizmor reports on GitHub-hosted runners. |
+| `.github/workflows/workflow-policy-request.yml` | Creates an unprivileged PR or merge-group request for workflow policy evaluation. |
+| `.github/workflows/workflow-policy.yml` | Runs trusted default-branch code after a policy request, evaluates references against the live effective Actions policy, and publishes the required PR-head or merge-group status. |
 | `.github/workflows/dependency-review.yml` | Reports dependency changes when GitHub Dependency Graph is available; otherwise publishes a neutral warning. |
 | `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
 | `.github/workflows/codex-security.yml` | Scans the cumulative diff from the previous stable release to each pre-release candidate and publishes train-scoped SARIF on `main`. |
@@ -410,12 +461,14 @@ Require these statuses in the branch ruleset for PR and merge-queue CI:
 - `OpenShell / GPU E2E`
 - `OpenShell / Helm Lint`
 - `OpenShell / Trivy Changes`
+- `OpenShell / Workflow Policy`
 
 For mirror-based workflows, require the statuses published by
 `Required CI Gates`, not their underlying jobs. `OpenShell / Trivy Changes` is
-the stable result job of the direct pull-request workflow. Together these
-contexts prove the expected checks completed for the commit GitHub is about to
-merge.
+the stable result job of the direct pull-request workflow. `OpenShell / Workflow
+Policy` comes from the trusted default-branch policy consumer.
+Together these contexts prove the expected checks completed for the commit
+GitHub is about to merge.
 
 Do not add the informational Actionlint, Zizmor, Dependency Review, or CodeQL
 jobs to the required status list while they remain in observation mode.

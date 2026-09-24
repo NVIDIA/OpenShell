@@ -19,8 +19,14 @@ depends = [
   "test:packaging-assets",
   "test:qualification-summary",
   "test:codex-security-release-range",
+  "test:github-actions-policy",
   "test:docs-website",
 ]
+
+["test:github-actions-policy"]
+description = "Test GitHub Actions policy compatibility checks"
+run = "uv run --no-project --with pytest --with pyyaml pytest -o \"python_files=*_test.py\" tasks/scripts/github_actions_policy_test.py"
+hide = true
 
 ["test:docs-website"]
 description = "Test the docs-website sync script"

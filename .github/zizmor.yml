@@ -11,3 +11,4 @@ rules:
       - release-canary.yml:3
       - required-ci-gates.yml:3
       - vouch-check.yml:3
+      - workflow-policy.yml:3

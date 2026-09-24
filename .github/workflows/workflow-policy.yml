@@ -1,0 +1,44 @@
+name: Workflow Policy
+
+on:
+  workflow_run:
+    workflows: ["Workflow Policy Request"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: workflow-policy-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate changed workflow references
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # workflow_run loads this workflow from the default branch. Pin the checkout
+      # to that same trusted commit; candidate files are fetched only as data.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+
+      - name: Install policy parser
+        run: |
+          uv venv --python 3.13
+          uv pip install --python .venv/bin/python pyyaml==6.0.2
+
+      - name: Check effective Actions policy
+        env:
+          ACTIONS_ENTERPRISE_READ_TOKEN: ${{ secrets.ACTIONS_ENTERPRISE_READ_TOKEN }}
+          ACTIONS_POLICY_READ_TOKEN: ${{ secrets.ACTIONS_POLICY_READ_TOKEN }}
+          GITHUB_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .venv/bin/python tasks/scripts/github_actions_policy.py

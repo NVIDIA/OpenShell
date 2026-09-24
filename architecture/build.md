@@ -374,16 +374,32 @@ Required checks run on GitHub Actions. Pull-request workflows that use NVIDIA se
 The high-level CI model:
 
 1. PR-context gate jobs publish required statuses for the PR head commit.
-2. Standard branch checks run from trusted mirror branches.
-3. Label-gated Docker, Podman, VM, GPU, and Kubernetes E2E checks run from
+2. An unprivileged request workflow triggers a trusted default-branch consumer
+   that checks action and reusable-workflow references against the live
+   effective GitHub Actions policy without executing candidate code.
+3. Standard branch checks run from trusted mirror branches.
+4. Label-gated Docker, Podman, VM, GPU, and Kubernetes E2E checks run from
    trusted mirror branches.
-4. Merge-group checks run against GitHub's temporary queue branch for the final integration state.
-5. Gate jobs verify that the mirror branch matches the PR head, or that the merge-group workflow ran for the queued SHA, and that the expected non-gate workflow actually ran.
-6. Release workflows rebuild and publish binaries, wheels, images, and docs.
+5. Merge-group checks run against GitHub's temporary queue branch for the final integration state.
+6. Gate jobs verify that the mirror branch matches the PR head, or that the merge-group workflow ran for the queued SHA, and that the expected non-gate workflow actually ran.
+7. Release workflows rebuild and publish binaries, wheels, images, and docs.
 
 Repository CI keeps telemetry compiled into release-parity artifacts but
 disables emission for Rust tests, E2E runs, and release canaries. This prevents
 synthetic activity from contributing to product usage metrics.
+
+Workflow-reference policy validation is a required gate rather than an
+informational scanner. An unprivileged pull-request or merge-group workflow
+causes a `workflow_run` consumer to execute from the default branch. The
+consumer fetches candidate YAML only as data and reads the live effective
+Actions policy with a repository-scoped Administration(read) token. A separate
+read:enterprise token resolves enterprise-owned organizations instead of
+maintaining an organization list in the repository. This avoids duplicated
+policy data, supports Dependabot, and keeps privileged credentials out of
+PR-controlled execution. Policy, enterprise-membership, Marketplace-metadata,
+parsing, truncated-tree, and size-limit failures fail closed. Pull requests
+check added references; merge groups reevaluate the complete queued tree against
+the current policy before publishing the required status on the queued SHA.
 
 Static security checks are deliberately outside the mirror-branch path. They run
 directly on GitHub-hosted runners and none of them consume NVIDIA self-hosted
