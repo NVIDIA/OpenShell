@@ -13,11 +13,11 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 
 | Job | Runner | Verifies |
 |---|---|---|
-| `macos` | `macos-latest-xlarge` | Installs the dev Homebrew artifacts, reaches the VM gateway, and creates, executes in, and deletes a sandbox. |
+| `macos` | `macos-latest-xlarge` | Installs the dev Homebrew artifacts and reaches the VM gateway. The hosted runner cannot create a nested Hypervisor.framework sandbox. |
 | `ubuntu-deb` | `ubuntu-latest` | Installs the dev Debian package, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
 | `fedora` | `fedora:latest` container | Installs the dev RPM packages, reaches the Podman gateway, and creates, executes in, and deletes a sandbox. |
 | `ubuntu-snap-system-docker` | `ubuntu-latest` | Uses `install.sh` to install the snap from `latest/edge`, reuses system Docker, reaches the Docker gateway, and creates, executes in, and deletes a sandbox, and verifies that the Docker snap is not installed. |
-| `ubuntu-snap-provisions-docker` | `ubuntu-latest` | Uses `install.sh` to install the Docker and OpenShell snaps, waits for Docker, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
+| `ubuntu-snap-docker-preflight` | `ubuntu-latest` | Verifies that `install.sh` rejects the OpenShell Snap path when Docker is absent or supplied by the Docker snap, without installing OpenShell. |
 | `kubernetes` | `ubuntu-latest` + kind | Installs the dev Helm chart, reaches the in-cluster gateway, and creates, executes in, and deletes a sandbox using the published runtime images. |
 
 All canary jobs disable anonymous OpenShell telemetry. Host package jobs inject
@@ -25,10 +25,10 @@ All canary jobs disable anonymous OpenShell telemetry. Host package jobs inject
 Kubernetes job installs with `server.telemetryEnabled=false`, so smoke traffic
 does not contribute to product usage metrics.
 
-The workflow sets `OPENSHELL_VERSION=dev`, so every `install.sh` job consumes the
-rolling dev release produced by the triggering workflow. Both snap lanes track
-`latest/edge`; one reuses system Docker while the other verifies automatic
-Docker snap provisioning. The Debian and Kubernetes CLI lanes remove snapd so
+The workflow sets `OPENSHELL_VERSION=dev` for every `install.sh` job. Positive
+jobs consume the rolling dev release produced by the triggering workflow. The
+system-Docker Snap lane tracks `latest/edge`; the missing-Docker lane exits
+before installing a snap. The Debian and Kubernetes CLI lanes remove snapd so
 they continue to exercise the dev Debian package. Kubernetes pins the matching
 `0.0.0-dev` chart and `:dev` images.
 
@@ -138,7 +138,7 @@ Loopback registration auto-derives the gateway name to `openshell` if `--name` i
 | Sandbox create or exec fails | Published sandbox and supervisor artifacts are missing, incompatible, or cannot establish the protected runtime channel. | Gateway logs plus Docker, Podman, VM, Snap, or Kubernetes runtime diagnostics for the job. |
 | `macos`/`ubuntu-deb`/`fedora` job fails on `openshell status` | Local gateway service did not start (systemd/brew/podman). Often a driver issue. | Service logs in the job log; `OPENSHELL_COMPUTE_DRIVER` env in the "Ensure …" step. |
 | `ubuntu-snap-system-docker` fails during `install.sh` | System Docker was unavailable, the edge revision or automatic interfaces were unavailable, or the gateway did not become reachable. | Failure diagnostics dump system Docker, snap service/connection/change state, gateway and snapd journals, snap logs, and port 17670 listeners. |
-| `ubuntu-snap-provisions-docker` fails during `install.sh` | The Docker snap was not installed or did not become ready before OpenShell installation, or the gateway did not become reachable. | Failure diagnostics also dump the Docker snap service and journal. |
+| `ubuntu-snap-docker-preflight` unexpectedly succeeds | The installer no longer fails before installing the OpenShell snap when Docker is absent or supplied by the Docker snap. | Inspect `install.log`, `docker-snap.log`, `snap list`, and snapd changes. |
 | `kubernetes` job fails on `helm install --wait` | Chart did not deploy in 5 min — usually image pull failure or readiness probe failing. | "Diagnostics on failure" step dumps `helm status`, manifest, pod describe, pod logs. |
 | `kubernetes` job fails on `kubectl wait` | Gateway pod stuck `CrashLoopBackOff` or `ImagePullBackOff`. | Diagnostics dump; check `:dev` image existence at `ghcr.io/nvidia/openshell/gateway`. |
 | `kubernetes` job fails on `openshell gateway add` or `status` | Port-forward not reachable, or CLI/gateway proto mismatch. | `port-forward.log` and `openshell gateway list` in the diagnostics dump. |

@@ -80,8 +80,8 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 
 The `snapd` configuration is available for Ubuntu and prepares snapd for Snap
 Store installation experiments. Combine it with `docker` to reproduce the
-system-Docker canary, or use it alone to verify that `install.sh` provisions the
-Docker snap when the Docker command is absent.
+system-Docker canary, or use it alone to verify that `install.sh` fails safely
+when Docker is absent.
 
 `podman-rootless` configures the explicit rootless Podman guest setup used by
 OpenShell tests. It supports Fedora and Ubuntu 26.04 or later. Ubuntu adds the
@@ -318,7 +318,7 @@ nix run .#test-guest -- \
   -- /usr/local/bin/snap-gateway-repro /tmp/install.sh system-docker 10
 ```
 
-Start without Docker and verify that `install.sh` provisions the Docker snap:
+Start without Docker and verify that `install.sh` rejects the Snap installation:
 
 ```shell
 nix run .#test-guest -- \
@@ -327,7 +327,7 @@ nix run .#test-guest -- \
   --keep \
   --copy ./install.sh:/tmp/install.sh \
   --copy ./nix/test-guest/scripts/snap-gateway-repro.sh:/usr/local/bin/snap-gateway-repro \
-  -- /usr/local/bin/snap-gateway-repro /tmp/install.sh provisions-docker 10
+  -- /usr/local/bin/snap-gateway-repro /tmp/install.sh missing-docker 10
 ```
 
 `--keep` retains the overlay and serial log when diagnosing a failure. The

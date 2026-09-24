@@ -258,11 +258,11 @@ assert_snap_install_flow() {
       esac
     }
     snap() {
-      if [ "$1" = list ] && [ "$2" = openshell ]; then
-        [ "$openshell_present" = "1" ]
-      else
-        command snap "$@"
-      fi
+      case "${1:-}:${2:-}" in
+        list:docker) return 1 ;;
+        list:openshell) [ "$openshell_present" = "1" ] ;;
+        *) command snap "$@" ;;
+      esac
     }
     as_root() { printf 'root:%s\n' "$*"; }
     set_linux_target_runtime_dir() { :; }
@@ -298,18 +298,6 @@ wait:gateway-listener
 wait:gateway-status"
 
 assert_snap_install_flow \
-  "missing Docker is installed before OpenShell" \
-  0 0 dev \
-  "root:snap install docker
-wait:docker
-root:snap install openshell --channel=latest/edge
-ensure:gateway-config
-root:snap restart openshell.gateway
-register:gateway
-wait:gateway-listener
-wait:gateway-status"
-
-assert_snap_install_flow \
   "existing OpenShell snap is refreshed" \
   1 1 pre \
   "wait:docker
@@ -319,6 +307,59 @@ root:snap restart openshell.gateway
 register:gateway
 wait:gateway-listener
 wait:gateway-status"
+
+assert_snap_install_rejected() {
+  local name=$1
+  local docker_present=$2
+  local docker_snap_present=$3
+  local expected=$4
+
+  if (
+    has_cmd() {
+      case "$1" in
+        snap) return 0 ;;
+        docker) [ "$docker_present" = "1" ] ;;
+        *) command -v "$1" >/dev/null 2>&1 ;;
+      esac
+    }
+    snap() {
+      if [ "${1:-}:${2:-}" = list:docker ]; then
+        [ "$docker_snap_present" = "1" ]
+      else
+        echo "FAIL: ${name}: unexpected snap command: $*" >&2
+        return 99
+      fi
+    }
+    as_root() {
+      echo "FAIL: ${name}: installation reached root command: $*" >&2
+      return 99
+    }
+    set_linux_target_runtime_dir() { :; }
+    install_linux_snap
+  ) >"$out" 2>"$err"; then
+    echo "FAIL: ${name}: Snap installation should have been rejected" >&2
+    exit 1
+  fi
+  if ! grep -Fq "$expected" "$err"; then
+    echo "FAIL: ${name}: missing rejection message" >&2
+    cat "$err" >&2 || true
+    exit 1
+  fi
+  if grep -Fq "installation reached root command" "$err"; then
+    cat "$err" >&2 || true
+    exit 1
+  fi
+}
+
+assert_snap_install_rejected \
+  "missing Docker" \
+  0 0 \
+  "Docker is required before installing the OpenShell snap"
+
+assert_snap_install_rejected \
+  "Docker snap" \
+  1 1 \
+  "the Docker snap is not currently compatible with OpenShell"
 
 snap_config_dir="${tmpdir}/snap-config"
 snap_config="${snap_config_dir}/gateway.toml"

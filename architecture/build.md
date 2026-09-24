@@ -318,11 +318,12 @@ configure the gateway to use them. The Ubuntu `deb` installer consumes
 for direct executable installation on every environment. Release Dev and
 Release Tag run Ubuntu conformance through the Debian package, while Fedora
 continues using direct executable installation until RPM coverage is available.
-The release canary separately exercises the public installer on Ubuntu. Its Snap
-lanes install the rolling development release from the Snap Store with both an
-existing system Docker daemon and a host where the installer must provision and
-wait for the Docker snap. Its Debian lane removes snapd before running the
-installer so Snap precedence cannot change the package under test.
+The release canary separately exercises the public installer on Ubuntu. The
+OpenShell Snap requires a compatible, preinstalled non-Snap Docker daemon. Its
+positive canary uses system Docker; negative preflight coverage verifies that
+the installer rejects both missing Docker and the Docker Snap before installing
+OpenShell. Its Debian lane removes snapd before running the installer so Snap
+precedence cannot change the package under test.
 Snapd runs the gateway as a root-owned system service. Its generated client
 certificates reside in root-owned snap state and are unavailable to ordinary CLI
 users, so the Snap uses plaintext loopback transport and enables unauthenticated

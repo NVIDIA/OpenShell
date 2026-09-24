@@ -74,7 +74,10 @@ brew services restart openshell
 
 ## Linux
 
-On Linux systems with the `snap` command, the install script uses the OpenShell snap. If Docker is absent, it installs the Docker snap and waits for the Docker daemon before installing OpenShell.
+On Linux systems with the `snap` command, the install script uses the OpenShell
+snap. Install and start Docker Engine from a system package or Docker's package
+repository before running the installer. The Docker snap is not currently
+compatible with OpenShell.
 
 On Fedora and RHEL without `snap`, the install script uses RPM packages. The RPMs install the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, and a systemd user service.
 
@@ -103,10 +106,11 @@ sudo loginctl enable-linger $USER
 ## Snap
 
 The OpenShell snap requires a running Docker daemon. Docker can come from the
-Docker snap, a distribution package, Docker's package repository, or another
-compatible installation method. The install script reuses an existing Docker
-daemon. If Docker is absent, it installs the Docker snap and waits for the
-daemon before installing OpenShell.
+distribution's Docker package, Docker's package repository, or another
+compatible non-Snap installation. The Docker snap is not currently compatible:
+its AppArmor confinement prevents OpenShell's hardened containers from starting.
+The installer exits without installing OpenShell when Docker is absent or the
+Docker snap is installed.
 
 The snap keeps gateway and CLI state in snap-specific directories and does not
 import state from a Debian, RPM, Homebrew, or manual installation. If the
@@ -159,9 +163,9 @@ typically `~/snap/openshell/common`. Gateway registrations live under
 
 When installing OpenShell from the Snap Store, snapd automatically connects all
 required interfaces. The `docker` plug connects to the system `:docker` slot,
-which exposes the installed Docker daemon regardless of how Docker was
-packaged. The `log-observe` and `system-observe` plugs are also automatically
-connected through the OpenShell snap's store assertions.
+which exposes the compatible Docker daemon installed on the host. The
+`log-observe` and `system-observe` plugs are also automatically connected
+through the OpenShell snap's store assertions.
 
 ### Locally built snap packages
 

@@ -17,8 +17,8 @@ description: |
   **Setup instructions**
 
     1. Install and start Docker using your preferred package source before
-       installing the OpenShell snap. The OpenShell snap works with Docker
-       regardless of how it was installed.
+       installing the OpenShell snap. Use a system package or Docker's package
+       repository. The Docker snap is not currently compatible with OpenShell.
 
        Snap Store installations automatically connect the required interfaces.
 

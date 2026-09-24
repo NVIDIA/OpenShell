@@ -68,9 +68,9 @@ NOTES:
 
     On Linux, the installer uses the OpenShell snap whenever the snap command
     is available. It installs from latest/edge when OPENSHELL_VERSION=dev and
-    from latest/stable otherwise. If Docker is not installed, the installer
-    installs the Docker snap and waits for its daemon before installing
-    OpenShell.
+    from latest/stable otherwise. The OpenShell snap requires a running Docker
+    Engine installed from a system package or Docker's package repository. The
+    Docker snap is not currently compatible with OpenShell.
 
     Without snap, Linux installs the Debian package on amd64/arm64 or the RPM
     packages on x86_64/aarch64, depending on the host package manager.
@@ -1345,12 +1345,15 @@ install_linux_snap() {
   require_cmd snap
   set_linux_target_runtime_dir
 
-  if ! has_cmd docker; then
-    info "Docker not found; installing the Docker snap..."
-    as_root snap install docker
-  else
-    info "using existing Docker installation"
+  if snap list docker >/dev/null 2>&1; then
+    error "the Docker snap is not currently compatible with OpenShell because its AppArmor confinement prevents OpenShell's hardened containers from starting.
+Remove the Docker snap and install Docker Engine from a system package or Docker's package repository, then rerun this installer."
   fi
+  if ! has_cmd docker; then
+    error "Docker is required before installing the OpenShell snap.
+Install Docker Engine from a system package or Docker's package repository, then rerun this installer. The Docker snap is not currently compatible with OpenShell."
+  fi
+  info "using existing Docker installation"
   wait_for_docker_daemon
 
   _channel="$(openshell_snap_channel)"
