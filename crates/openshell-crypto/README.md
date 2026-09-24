@@ -113,7 +113,8 @@ and deployment qualification belong in follow-up work.
 
 Runtime refresh replay hashes and derived token IDs, bearer-cache fingerprints,
 Sandbox Protocol request digests and request-ID entropy, Kubernetes/VM runtime
-fence entropy, and rootfs staging-token entropy use the selected backend.
+fence entropy, VM socket-directory entropy, and rootfs staging-token entropy use
+the selected backend.
 These operations retain SHA-256, UUID v4 encoding where applicable, and existing
 hex encodings. Backend failures propagate; callers must not substitute another
 implementation or continue with a placeholder identity.
