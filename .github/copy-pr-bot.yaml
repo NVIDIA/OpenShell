@@ -1,3 +1,21 @@
 enabled: true
 auto_sync_draft: false
 auto_sync_ready: true
+vetters_override:
+  - alangou
+  - derekwaynecarr
+  - drew
+  - elezar
+  - johnnygreco
+  - johntmyers
+  - kirit93
+  - krishicks
+  - matthewgrossman
+  - mrunalp
+  - pimlock
+  - purp
+  - SDAChess
+  - shailendra-nv
+  - sjenning
+  - TaylorMutch
+  - zredlined

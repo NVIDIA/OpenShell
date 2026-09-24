@@ -372,6 +372,10 @@ the release tag.
 
 Required checks run on GitHub Actions. Pull-request workflows that use NVIDIA self-hosted runners trigger from copy-pr-bot mirror branches, so trusted PRs are mirrored into `pull-request/<N>` branches before those workflows run. `main` also uses GitHub merge queue so the final queued integration commit is validated before it merges.
 
+For PRs that need manual admission, copy-pr-bot accepts `/ok to test <SHA>`
+only from the explicit `vetters_override` list in `.github/copy-pr-bot.yaml`.
+This list is maintained separately from the bot's automatic PR trust policy.
+
 The high-level CI model:
 
 1. PR-context gate jobs publish required statuses for the PR head commit.

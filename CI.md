@@ -8,6 +8,12 @@ For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CO
 
 PR CI that runs on NVIDIA self-hosted runners uses NVIDIA's copy-pr-bot. The bot mirrors trusted PR commits to internal `pull-request/<N>` branches in this repository. The gated workflows trigger on pushes to those branches, not on the original PR.
 
+When a PR is not mirrored automatically, only the GitHub users listed in
+`.github/copy-pr-bot.yaml` under `vetters_override` can admit its current
+revision with `/ok to test <SHA>`. The list is a snapshot of the codeowners
+and selected repository maintainers; update it when those people change.
+This setting does not change the bot's automatic trust policy for ready PRs.
+
 `Branch Checks` run automatically after copy-pr-bot mirrors the PR. `Required CI Gates` posts PR-head statuses that verify the mirror exists, is current, and ran the expected push-based workflows. E2E suites are opt-in because they are more expensive and publish temporary images.
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
@@ -313,21 +319,21 @@ Flow:
 6. New commits push to the mirror automatically and re-trigger `Branch Checks` plus any labeled E2E jobs in `Branch E2E Checks`.
 7. When the PR is ready to merge, use **Add to merge queue** instead of merging directly. The queue validates the final integration state before updating `main`.
 
-### Forked PR
+### PR requiring manual admission
 
 Prerequisites:
 
-- DCO sign-off (`git commit -s`) on every commit. Commit signing is not required for forks - copy-pr-bot trusts forks based on maintainer review, not signing.
-- A maintainer must vouch you. See the [Vouch System](AGENTS.md#vouch-system).
+- DCO sign-off (`git commit -s`) on every commit. Manual admission does not require cryptographic commit signing.
+- First-time external contributors must be vouched. See the [Vouch System](AGENTS.md#vouch-system).
 
 Flow:
 
-1. Open the PR. The vouch check confirms you are vouched (otherwise the PR is auto-closed).
-2. copy-pr-bot does not mirror forks automatically. A maintainer reviews the diff and comments `/ok to test <SHA>` with your latest commit SHA.
-3. After `/ok to test`, copy-pr-bot mirrors to `pull-request/<N>`. From here the flow is identical to internal PRs: `Required CI Gates` verifies the mirror and required push workflows, and maintainers apply the E2E label when the extra suites are needed.
+1. Open the PR. The vouch check confirms first-time external contributors are vouched (otherwise their PRs are auto-closed).
+2. If copy-pr-bot does not mirror it automatically, a listed vetter reviews the diff and comments `/ok to test <SHA>` with the latest commit SHA. Fork location alone does not determine whether a PR is mirrored automatically.
+3. After `/ok to test`, copy-pr-bot mirrors to `pull-request/<N>`. From here the flow is identical to automatically admitted PRs: `Required CI Gates` verifies the mirror and required push workflows, and maintainers apply the E2E label when the extra suites are needed.
 4. When the PR is ready to merge, maintainers add it to the merge queue so the queued integration state is tested before it reaches `main`.
 
-Important: every new commit you push requires another `/ok to test <new-SHA>` from a maintainer before push-based CI will run on it. If a label is applied while the mirror is stale, `E2E Label Help` will post a comment explaining what's needed.
+Important: if a PR requires manual admission, every new commit needs another `/ok to test <new-SHA>` from a listed vetter before push-based CI will run on it. If a label is applied while the mirror is stale, `E2E Label Help` will post a comment explaining what's needed.
 
 ## Merge queue
 
