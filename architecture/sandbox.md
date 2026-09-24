@@ -259,6 +259,13 @@ Input mediation, DNS/TCP authorization, and outer-fence enforcement are
 identical in both modes. The selected mode is emitted in the sandbox
 qualification output (`seccomp_listener_mode`).
 
+The broker treats a target that exits during signal mediation (`ESRCH`) or a
+socket that closes or disconnects during inspection (`ENOTCONN`) as an expected
+notification race. Individual races are debug diagnostics, with counts emitted
+as a periodic informational summary. Enforcement rejections and unexpected
+dispatch failures remain separate warning diagnostics, while listener failure
+is a broker-health error.
+
 DNS uses an exact sandbox-local resolver at `127.0.0.53:53`. The driver sets the
 nameserver and permits an unprivileged bind to port 53. UDP and TCP DNS requests
 are forwarded through the supervisor, which applies hostname-based DNS policy.

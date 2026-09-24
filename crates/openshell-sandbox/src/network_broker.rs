@@ -41,9 +41,113 @@ const DNS_RELAY_ADDRESS: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new
 ));
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const NETWORK_DECISION_TIMEOUT: Duration = Duration::from_secs(30);
+const TRANSIENT_FAILURE_SUMMARY_INTERVAL: Duration = Duration::from_mins(1);
 
 fn retry_notification_receive(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::ENOENT)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispatchFailureKind {
+    TransientRace,
+    EnforcementDecision,
+    Unexpected,
+}
+
+fn classify_dispatch_failure(error: &io::Error) -> DispatchFailureKind {
+    match error.raw_os_error() {
+        Some(libc::ENOTCONN | libc::ESRCH) => DispatchFailureKind::TransientRace,
+        Some(libc::EACCES | libc::EPERM) => DispatchFailureKind::EnforcementDecision,
+        _ => DispatchFailureKind::Unexpected,
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TransientFailureSummary {
+    not_connected: u64,
+    no_such_process: u64,
+}
+
+struct TransientFailureReporter {
+    window_started: Instant,
+    not_connected: u64,
+    no_such_process: u64,
+}
+
+impl TransientFailureReporter {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_started: now,
+            not_connected: 0,
+            no_such_process: 0,
+        }
+    }
+
+    fn record(&mut self, errno: i32, now: Instant) -> Option<TransientFailureSummary> {
+        match errno {
+            libc::ENOTCONN => self.not_connected = self.not_connected.saturating_add(1),
+            libc::ESRCH => self.no_such_process = self.no_such_process.saturating_add(1),
+            _ => return None,
+        }
+        if now.saturating_duration_since(self.window_started) < TRANSIENT_FAILURE_SUMMARY_INTERVAL {
+            return None;
+        }
+        let summary = TransientFailureSummary {
+            not_connected: self.not_connected,
+            no_such_process: self.no_such_process,
+        };
+        self.window_started = now;
+        self.not_connected = 0;
+        self.no_such_process = 0;
+        Some(summary)
+    }
+}
+
+fn report_dispatch_failure(
+    reporter: &mut TransientFailureReporter,
+    tid: u32,
+    syscall: i32,
+    error: &io::Error,
+    now: Instant,
+) {
+    let errno = error_to_errno(error);
+    match classify_dispatch_failure(error) {
+        DispatchFailureKind::TransientRace => {
+            tracing::debug!(
+                tid,
+                syscall,
+                errno,
+                %error,
+                "transient sandbox network notification race"
+            );
+            if let Some(summary) = reporter.record(errno, now) {
+                tracing::info!(
+                    not_connected = summary.not_connected,
+                    no_such_process = summary.no_such_process,
+                    interval_seconds = TRANSIENT_FAILURE_SUMMARY_INTERVAL.as_secs(),
+                    "suppressed transient sandbox network notification races"
+                );
+            }
+        }
+        DispatchFailureKind::EnforcementDecision => {
+            tracing::warn!(
+                tid,
+                syscall,
+                errno,
+                %error,
+                "sandbox network notification rejected by enforcement"
+            );
+        }
+        DispatchFailureKind::Unexpected => {
+            tracing::warn!(
+                tid,
+                syscall,
+                errno,
+                %error,
+                "sandbox network notification dispatch failed"
+            );
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -276,6 +380,7 @@ impl NetworkBroker {
         std::thread::Builder::new()
             .name("openshell-network-broker".to_string())
             .spawn(move || {
+                let mut transient_failures = TransientFailureReporter::new(Instant::now());
                 while broker_healthy.load(Ordering::Acquire) {
                     let notification = match listener.receive() {
                         Ok(notification) => notification,
@@ -297,13 +402,12 @@ impl NetworkBroker {
                         notification,
                         queues.clone(),
                     ) {
-                        tracing::warn!(
-                            tid = notification.tid,
-                            syscall = notification.syscall,
-                            %error,
-                            "sandbox network notification denied (tid={}, syscall={}): {error}",
+                        report_dispatch_failure(
+                            &mut transient_failures,
                             notification.tid,
-                            notification.syscall
+                            notification.syscall,
+                            &error,
+                            Instant::now(),
                         );
                         let _ = listener.respond_errno(notification.id, error_to_errno(&error));
                     }
@@ -1829,6 +1933,20 @@ mod tests {
     use openshell_isolation_interface::linux::seccomp_notify::ListenerMode;
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::{UnixListener, UnixStream};
+    use tracing::Subscriber;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
+    use tracing_subscriber::registry::LookupSpan;
+
+    #[derive(Clone)]
+    struct WarnCounter(Arc<AtomicUsize>);
+
+    impl<S: Subscriber + for<'lookup> LookupSpan<'lookup>> Layer<S> for WarnCounter {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
 
     #[test]
     fn retained_socket_capacity_reserves_process_descriptor_headroom() {
@@ -1923,6 +2041,99 @@ mod tests {
         assert!(!retry_notification_receive(&io::Error::from_raw_os_error(
             libc::EBADF
         )));
+    }
+
+    #[test]
+    fn dispatch_failure_classification_separates_races_from_enforcement() {
+        for errno in [libc::ENOTCONN, libc::ESRCH] {
+            assert_eq!(
+                classify_dispatch_failure(&io::Error::from_raw_os_error(errno)),
+                DispatchFailureKind::TransientRace
+            );
+        }
+        for errno in [libc::EACCES, libc::EPERM] {
+            assert_eq!(
+                classify_dispatch_failure(&io::Error::from_raw_os_error(errno)),
+                DispatchFailureKind::EnforcementDecision
+            );
+        }
+        assert_eq!(
+            classify_dispatch_failure(&io::Error::from_raw_os_error(libc::EIO)),
+            DispatchFailureKind::Unexpected
+        );
+    }
+
+    #[test]
+    fn transient_dispatch_failure_counts_are_periodically_drained() {
+        let started = Instant::now();
+        let mut reporter = TransientFailureReporter::new(started);
+        assert_eq!(reporter.record(libc::ENOTCONN, started), None);
+        assert_eq!(
+            reporter.record(
+                libc::ESRCH,
+                started
+                    + TRANSIENT_FAILURE_SUMMARY_INTERVAL
+                        .checked_sub(Duration::from_nanos(1))
+                        .unwrap()
+            ),
+            None
+        );
+        assert_eq!(
+            reporter.record(libc::ENOTCONN, started + TRANSIENT_FAILURE_SUMMARY_INTERVAL),
+            Some(TransientFailureSummary {
+                not_connected: 2,
+                no_such_process: 1,
+            })
+        );
+        assert_eq!(
+            reporter.record(libc::ESRCH, started + TRANSIENT_FAILURE_SUMMARY_INTERVAL),
+            None
+        );
+        assert_eq!(reporter.not_connected, 0);
+        assert_eq!(reporter.no_such_process, 1);
+    }
+
+    #[test]
+    fn disappearing_targets_and_closed_sockets_do_not_emit_warning_storms() {
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(WarnCounter(Arc::clone(&warnings)));
+        let started = Instant::now();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut reporter = TransientFailureReporter::new(started);
+            for _ in 0..1_000 {
+                report_dispatch_failure(
+                    &mut reporter,
+                    std::process::id(),
+                    i32::try_from(libc::SYS_getpeername).unwrap(),
+                    &io::Error::from_raw_os_error(libc::ENOTCONN),
+                    started,
+                );
+                report_dispatch_failure(
+                    &mut reporter,
+                    std::process::id(),
+                    i32::try_from(libc::SYS_kill).unwrap(),
+                    &io::Error::from_raw_os_error(libc::ESRCH),
+                    started,
+                );
+            }
+            assert_eq!(warnings.load(Ordering::SeqCst), 0);
+
+            report_dispatch_failure(
+                &mut reporter,
+                std::process::id(),
+                i32::try_from(libc::SYS_connect).unwrap(),
+                &io::Error::from_raw_os_error(libc::EACCES),
+                started,
+            );
+            report_dispatch_failure(
+                &mut reporter,
+                std::process::id(),
+                i32::try_from(libc::SYS_socket).unwrap(),
+                &io::Error::from_raw_os_error(libc::EIO),
+                started,
+            );
+        });
+        assert_eq!(warnings.load(Ordering::SeqCst), 2);
     }
 
     #[test]
