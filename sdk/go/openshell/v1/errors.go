@@ -23,6 +23,7 @@ const (
 	ErrorUnimplemented    = types.ErrorUnimplemented
 	ErrorConflict         = types.ErrorConflict
 	ErrorUnauthenticated  = types.ErrorUnauthenticated
+	ErrorOutOfRange       = types.ErrorOutOfRange
 )
 
 // StatusError is the typed error returned by all SDK operations.
@@ -64,3 +65,7 @@ func IsConflict(err error) bool { return types.IsConflict(err) }
 
 // IsUnauthenticated returns true if the error indicates invalid or missing credentials.
 func IsUnauthenticated(err error) bool { return types.IsUnauthenticated(err) }
+
+// IsOutOfRange returns true if the error indicates a resume cursor is no longer
+// available and the events after it are unrecoverable.
+func IsOutOfRange(err error) bool { return types.IsOutOfRange(err) }

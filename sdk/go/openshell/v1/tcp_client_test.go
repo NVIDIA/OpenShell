@@ -1023,6 +1023,9 @@ func (r *flippableResolver) WaitReady(context.Context, string, string, ...WaitOp
 func (r *flippableResolver) Watch(context.Context, string, string, ...WatchOptions) (WatchInterface[*Sandbox], error) {
 	panic("not implemented")
 }
+func (r *flippableResolver) WatchLogs(context.Context, string, string, ...WatchLogsOptions) (WatchInterface[*WatchLogEvent], error) {
+	panic("not implemented")
+}
 func (r *flippableResolver) GetLogs(context.Context, string, string, ...LogOption) (*LogResult, error) {
 	panic("not implemented")
 }
