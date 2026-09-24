@@ -84,6 +84,7 @@ snap_install_docs="${ROOT}/docs/about/installation.mdx"
 snap_canary="${ROOT}/.github/workflows/release-canary.yml"
 snap_repro="${ROOT}/nix/test-guest/scripts/snap-gateway-repro.sh"
 snap_docker_hook="${ROOT}/snap/hooks/connect-plug-docker"
+snap_install_hook="${ROOT}/snap/hooks/install"
 package_deb="${ROOT}/tasks/scripts/package-deb.sh"
 assert_file_exists "$snap_wrapper"
 assert_file_exists "$snapcraft"
@@ -91,6 +92,7 @@ assert_file_exists "$snap_install_docs"
 assert_file_exists "$snap_canary"
 assert_file_exists "$snap_repro"
 assert_file_exists "$snap_docker_hook"
+assert_file_exists "$snap_install_hook"
 assert_file_exists "$package_deb"
 assert_contains "$service" "ExecStartPre=/usr/bin/openshell-gateway config preflight"
 assert_contains "$package_deb" "\$src_dir/openshell-gateway.service"
@@ -112,10 +114,17 @@ for snap_file in \
   "$snap_install_docs" \
   "$snap_canary" \
   "$snap_repro" \
-  "$snap_docker_hook"; do
+  "$snap_docker_hook" \
+  "$snap_install_hook"; do
   assert_not_contains "$snap_file" "docker:docker-daemon"
   assert_not_contains "$snap_file" "default-provider: docker"
 done
+if [[ ! -x "$snap_install_hook" ]]; then
+  echo "FAIL: Snap install hook must be executable" >&2
+  exit 1
+fi
+assert_contains "$snap_install_hook" 'allow_unauthenticated_users = true'
+bash "$ROOT/tasks/scripts/test-snap-install-hook.sh" "$snap_install_hook"
 assert_not_contains "$snap_install_docs" "snap connect openshell:home"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network-bind"

@@ -323,6 +323,13 @@ lanes install the rolling development release from the Snap Store with both an
 existing system Docker daemon and a host where the installer must provision and
 wait for the Docker snap. Its Debian lane removes snapd before running the
 installer so Snap precedence cannot change the package under test.
+Snapd runs the gateway as a root-owned system service. Its generated client
+certificates reside in root-owned snap state and are unavailable to ordinary CLI
+users, so the Snap uses plaintext loopback transport and enables unauthenticated
+local users by default. Debian and RPM packages instead run systemd user services
+and use user-owned mTLS material. Bootstrap creates the default configuration
+only when it is missing. Sandbox-to-gateway sessions remain authenticated with
+gateway-minted JWTs.
 The Debian qualification profile keeps candidate-image overrides outside the
 operator-owned gateway configuration: it writes a harness-owned file under
 `/var/lib/openshell-qualification` and selects it through the packaged systemd
