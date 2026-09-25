@@ -106,7 +106,8 @@ When `protocol` is omitted, OpenShell allows any method and path. Unless the
 endpoint sets `tls: skip`, it still terminates TLS and rejects HTTP requests
 that are addressed to another host or have malformed paths, such as paths that
 contain `%2F`. It relays traffic that is neither TLS nor HTTP without inspecting
-it.
+it. For a protocol in which the server sends first, such as SMTP, set
+`tls: skip`.
 
 Use an inspected endpoint when the request, not only the destination,
 determines the risk, such as allowing reads but not writes on an API.
@@ -580,9 +581,10 @@ server, but it does not prove that database credentials are correct.
 OpenShell prepares DNS and TCP handling when the sandbox starts, so you can add
 a TCP endpoint to a running sandbox without recreating it.
 
-For a client that starts TLS as soon as it connects, or that must complete TLS
-itself, for example to present a client certificate, set `tls: skip` so that
-OpenShell relays the encrypted connection without terminating it. Clients that
+Set `tls: skip` so that OpenShell relays the connection without examining it
+when the client starts TLS as soon as it connects, when the client must complete
+TLS itself, for example to present a client certificate, or when the server
+sends first, as with SMTP, IMAP, and MySQL. Clients that send first and
 negotiate TLS within their protocol, such as `psql`, do not need it. Refer to
 [Inspection Fields](/reference/policy-schema#inspection-fields).
 
