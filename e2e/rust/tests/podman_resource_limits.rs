@@ -16,6 +16,16 @@
 
 use openshell_e2e::harness::sandbox::SandboxGuard;
 
+const CGROUP_READ_POLICY: &str = r"version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /lib64, /proc, /etc, /sys/fs/cgroup]
+  read_write: [/sandbox, /tmp, /dev/null]
+landlock:
+  compatibility: best_effort
+network_policies: {}
+";
+
 const CPU_REQUEST: &str = "500m";
 const MEMORY_REQUEST: &str = "512Mi";
 
@@ -39,9 +49,19 @@ async fn sandbox_resource_limits_are_enforced_via_cgroups() {
         return;
     }
 
-    let mut sandbox = SandboxGuard::create(&["--cpu", CPU_REQUEST, "--memory", MEMORY_REQUEST])
-        .await
-        .expect("sandbox create with resource limits should succeed");
+    let policy = tempfile::NamedTempFile::new().expect("create cgroup read policy file");
+    std::fs::write(policy.path(), CGROUP_READ_POLICY).expect("write cgroup read policy");
+    let policy_path = policy.path().to_str().expect("policy path is UTF-8");
+    let mut sandbox = SandboxGuard::create(&[
+        "--cpu",
+        CPU_REQUEST,
+        "--memory",
+        MEMORY_REQUEST,
+        "--policy",
+        policy_path,
+    ])
+    .await
+    .expect("sandbox create with resource limits should succeed");
 
     let memory_max = sandbox
         .exec(&["cat", "/sys/fs/cgroup/memory.max"])
