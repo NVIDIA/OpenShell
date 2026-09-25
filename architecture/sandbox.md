@@ -284,6 +284,11 @@ inheriting process or after exec, and neither the connecting binary nor a later
 descriptor-owner snapshot proves who sent an already queued query. Consumers
 must not use this unavailable identity to grant binary-specific access. TCP
 connection authorization still uses decision-time binary identity.
+For legacy proxy sockets, the supervisor resolves every live process holding
+the peer socket and denies conflicting identities. A process that exits between
+the socket scan and identity lookup no longer holds the socket, so its stale
+record is ignored; missing identity for a live owner or no surviving owner
+still denies the connection.
 
 The sandbox retains only bounded DNS socket-admission records, consumes TCP
 records on accept, and reclaims closed UDP records when capacity is reached.
