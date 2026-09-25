@@ -97,6 +97,8 @@ across gateway restarts.
 Delete force-removes both containers, the driver-owned runtime volumes, and the
 host-private runtime descriptor. Missing or altered descriptor and channel resources
 fail closed; the driver does not run an older combined-supervisor layout.
+Docker may briefly retain a volume mount after acknowledging container removal;
+the driver retries only that volume-in-use response for a bounded interval.
 
 ## Driver Config Mounts
 
