@@ -18,7 +18,12 @@ or policy model.
 ## The Interface
 
 Each step returns a new type, so the supervisor can't start an agent on a
-boundary that hasn't been confirmed.
+boundary that hasn't been confirmed. The traits are defined in
+[`contract.rs`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-isolation-interface/src/contract.rs)
+in the
+[`openshell-isolation-interface`](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-isolation-interface)
+crate. `OpenShellRuntimeBackend` is implemented in
+[`openshell-sandbox-backend`](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-sandbox-backend).
 
 | Rust surface | What it does | Returns |
 |---|---|---|
