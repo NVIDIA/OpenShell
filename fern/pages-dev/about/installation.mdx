@@ -19,11 +19,11 @@ Install OpenShell with a single command:
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
-The script detects your operating system and installs the OpenShell CLI, standalone policy prover, and gateway. On Linux, it installs from the Snap Store whenever the `snap` command is available. Otherwise, it uses the native Debian or RPM package. It then starts the local gateway server so you can begin creating sandboxes.
+The script detects your operating system and installs the OpenShell CLI, standalone policy prover, and gateway. On Linux, it installs from the Snap Store when `snap` is available and `OPENSHELL_VERSION` is unset or `dev`. Explicit release tags and prereleases use the native Debian or RPM package. It then starts the local gateway server so you can begin creating sandboxes.
 
 Snap installs use `latest/stable` by default and `latest/edge` when
-`OPENSHELL_VERSION=dev`. Other `OPENSHELL_VERSION` values also use the stable
-Snap channel because Snap Store channels do not select an exact GitHub release.
+`OPENSHELL_VERSION=dev`. Set `OPENSHELL_VERSION` to a release tag to install
+that exact Debian or RPM version, even if `snap` is available.
 
 You can also download release artifacts directly from the [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
 
@@ -75,13 +75,15 @@ brew services restart openshell
 ## Linux
 
 On Linux systems with the `snap` command, the install script uses the OpenShell
-snap. Install and start Docker Engine from a system package or Docker's package
-repository before running the installer. The Docker snap is not currently
-compatible with OpenShell.
+snap when `OPENSHELL_VERSION` is unset or `dev`. Explicit release tags and the
+`pre` prerelease alias use Debian or RPM packages even when `snap` is available.
+For Snap installs, install and start Docker Engine from a system package or
+Docker's package repository first. The Docker snap is not currently compatible
+with OpenShell.
 
-On Fedora and RHEL without `snap`, the install script uses RPM packages. The RPMs install the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, and a systemd user service.
+On Fedora and RHEL without `snap`, or when a release tag or `pre` is specified, the install script uses RPM packages. The RPMs install the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, and a systemd user service.
 
-On Debian and Ubuntu without `snap`, the install script uses a Debian package. The Debian package installs the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, VM sandbox support, and a systemd user service.
+On Debian and Ubuntu without `snap`, or when a release tag or `pre` is specified, the install script uses a Debian package. The Debian package installs the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, VM sandbox support, and a systemd user service.
 
 Linux packages require glibc 2.28 or newer. The installer checks libc before downloading packages and exits with an error on older glibc versions, Alpine, musl-based distributions, or unknown libc environments.
 
