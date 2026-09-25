@@ -80,7 +80,6 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - create a dedicated Envoy Gateway
 - [`ci/values-gateway-agentgateway.yaml`](ci/values-gateway-agentgateway.yaml) - attach to a shared agentgateway Gateway
 - [`ci/values-gateway-agentgateway-shared-tls.yaml`](ci/values-gateway-agentgateway-shared-tls.yaml) - add an HTTPS ListenerSet to a shared agentgateway Gateway
-- [`ci/values-gateway-agentgateway-dedicated-tls.yaml`](ci/values-gateway-agentgateway-dedicated-tls.yaml) - create a dedicated agentgateway Gateway with an HTTPS listener
 - [`ci/values-gateway-agentgateway-backend-tls.yaml`](ci/values-gateway-agentgateway-backend-tls.yaml) - terminate frontend TLS and re-encrypt to the OpenShell pod
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
@@ -228,7 +227,7 @@ discovery endpoint or its TLS CA.
 | grpcRoute.backendTLSPolicy.enabled | bool | `false` | Create a BackendTLSPolicy resource for end-to-end TLS between the Gateway proxy and the OpenShell gateway pod. The traffic flow is: client → HTTPS → Gateway (terminate) → TLS (re-encrypt) → gateway pod. Requires server.disableTls=false and server.tls.enableMtls=false. The certgen hook auto-creates the backend CA ConfigMap. |
 | grpcRoute.backendTLSPolicy.hostname | string | `""` | Hostname the Gateway proxy validates against the backend's TLS certificate SAN. Defaults to the service FQDN (`<fullname>.<namespace>.svc.cluster.local`) when empty, which matches the SAN included by both cert-manager and the pkiInitJob. |
 | grpcRoute.enabled | bool | `false` | Create a Gateway API GRPCRoute for the gateway service. |
-| grpcRoute.gateway.className | string | `"eg"` | GatewayClass to reference when gateway.create is true. Envoy Gateway uses "eg"; agentgateway uses "agentgateway". |
+| grpcRoute.gateway.className | string | `"eg"` | GatewayClass to reference when gateway.create is true. Envoy Gateway uses "eg"; set another installed GatewayClass as needed. |
 | grpcRoute.gateway.create | bool | `false` | When true, a Gateway resource is created in the release namespace. Set to false and provide name/namespace to attach to a pre-existing Gateway. |
 | grpcRoute.gateway.listener.allowedRoutes | string | `"Same"` | "Same" restricts attached routes to the release namespace; "All" allows any namespace. |
 | grpcRoute.gateway.listener.port | int | `80` | Listener port for the generated Gateway resource. Use 443 with protocol HTTPS. |

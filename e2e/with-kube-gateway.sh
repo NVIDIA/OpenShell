@@ -65,8 +65,6 @@
 #   Set OPENSHELL_E2E_KUBE_GATEWAY_BACKEND_TLS=1 as well to keep TLS enabled on
 #   the OpenShell pod and validate agentgateway re-encryption through a
 #   BackendTLSPolicy.
-#   Set OPENSHELL_E2E_KUBE_AGENTGATEWAY_TOPOLOGY=dedicated to have the OpenShell
-#   chart create the agentgateway Gateway and its HTTPS listener directly.
 #   Set OPENSHELL_E2E_KUBE_DIRECT_GATEWAY_PORT to expose agentgateway TLS through
 #   the ephemeral k3d load balancer instead of using kubectl port-forward.
 #
@@ -128,7 +126,6 @@ AGENTGATEWAY_GATEWAY_NAME="openshell-ingress"
 AGENTGATEWAY_HELM_INSTALLED=0
 AGENTGATEWAY_TLS="${OPENSHELL_E2E_KUBE_GATEWAY_TLS:-0}"
 AGENTGATEWAY_BACKEND_TLS="${OPENSHELL_E2E_KUBE_GATEWAY_BACKEND_TLS:-0}"
-AGENTGATEWAY_TOPOLOGY="${OPENSHELL_E2E_KUBE_AGENTGATEWAY_TOPOLOGY:-shared}"
 AGENTGATEWAY_TLS_DIR="${WORKDIR}/agentgateway-tls"
 AGENTGATEWAY_TLS_SECRET="openshell-ingress-tls"
 DIRECT_GATEWAY_PORT="${OPENSHELL_E2E_KUBE_DIRECT_GATEWAY_PORT:-}"
@@ -169,23 +166,6 @@ fi
 if [ "${AGENTGATEWAY_BACKEND_TLS}" = "1" ] \
    && { [ "${GATEWAY_CONTROLLER}" != "agentgateway" ] || [ "${AGENTGATEWAY_TLS}" != "1" ]; }; then
   echo "ERROR: OPENSHELL_E2E_KUBE_GATEWAY_BACKEND_TLS=1 requires agentgateway frontend TLS" >&2
-  exit 2
-fi
-case "${AGENTGATEWAY_TOPOLOGY}" in
-  shared | dedicated) ;;
-  *)
-    echo "ERROR: OPENSHELL_E2E_KUBE_AGENTGATEWAY_TOPOLOGY must be shared or dedicated" >&2
-    exit 2
-    ;;
-esac
-if [ "${AGENTGATEWAY_TOPOLOGY}" = "dedicated" ] \
-   && { [ "${GATEWAY_CONTROLLER}" != "agentgateway" ] || [ "${AGENTGATEWAY_TLS}" != "1" ]; }; then
-  echo "ERROR: dedicated agentgateway topology requires agentgateway frontend TLS" >&2
-  exit 2
-fi
-if [ "${AGENTGATEWAY_TOPOLOGY}" = "dedicated" ] \
-   && [ "${AGENTGATEWAY_BACKEND_TLS}" = "1" ]; then
-  echo "ERROR: dedicated agentgateway backend TLS is not part of this E2E matrix" >&2
   exit 2
 fi
 if [ -n "${DIRECT_GATEWAY_PORT}" ]; then
@@ -302,10 +282,6 @@ use_agentgateway_backend_tls() {
   use_agentgateway_tls && [ "${AGENTGATEWAY_BACKEND_TLS}" = "1" ]
 }
 
-use_agentgateway_dedicated() {
-  use_agentgateway && [ "${AGENTGATEWAY_TOPOLOGY}" = "dedicated" ]
-}
-
 provision_agentgateway_tls() {
   echo "Provisioning agentgateway frontend TLS fixture..."
   require_cmd openssl
@@ -378,13 +354,8 @@ install_envoy_gateway() {
 }
 
 install_agentgateway() {
-  local apply_shared_gateway=1
-  if use_agentgateway_dedicated; then
-    apply_shared_gateway=0
-  fi
   echo "Installing agentgateway..."
   AGENTGATEWAY_HELM_INSTALLED=1
-  OPENSHELL_AGENTGATEWAY_APPLY_SHARED_GATEWAY="${apply_shared_gateway}" \
   OPENSHELL_AGENTGATEWAY_KUBE_CONTEXT="${KUBE_CONTEXT}" \
     "${ROOT}/tasks/scripts/agentgateway-k8s-setup.sh" install
 }
@@ -422,65 +393,22 @@ wait_for_envoy_service() {
 }
 
 wait_for_agentgateway_service() {
-  local service_namespace="${AGENTGATEWAY_NAMESPACE}"
-  if use_agentgateway_dedicated; then
-    service_namespace="${NAMESPACE}"
-  fi
   for _ in $(seq 1 60); do
-    if kctl -n "${service_namespace}" get service \
+    if kctl -n "${AGENTGATEWAY_NAMESPACE}" get service \
       "${AGENTGATEWAY_GATEWAY_NAME}" >/dev/null 2>&1 \
-      && kctl -n "${service_namespace}" wait --for=condition=Ready pod \
+      && kctl -n "${AGENTGATEWAY_NAMESPACE}" wait --for=condition=Ready pod \
         -l "gateway.networking.k8s.io/gateway-name=${AGENTGATEWAY_GATEWAY_NAME}" \
         --timeout=5s >/dev/null 2>&1; then
-      printf '%s/%s\n' "${service_namespace}" "${AGENTGATEWAY_GATEWAY_NAME}"
+      printf '%s/%s\n' "${AGENTGATEWAY_NAMESPACE}" "${AGENTGATEWAY_GATEWAY_NAME}"
       return 0
     fi
     sleep 2
   done
 
   echo "ERROR: agentgateway proxy Service ${AGENTGATEWAY_GATEWAY_NAME} was not ready." >&2
-  kctl -n "${service_namespace}" get gateway,service,pod -o wide >&2 || true
+  kctl -n "${AGENTGATEWAY_NAMESPACE}" get gateway,service,pod -o wide >&2 || true
   kctl -n "${NAMESPACE}" get grpcroute -o yaml >&2 || true
   return 1
-}
-
-wait_for_agentgateway_dedicated_gateway() {
-  local accepted=""
-  local programmed=""
-
-  for _ in $(seq 1 60); do
-    accepted="$(kctl -n "${NAMESPACE}" get gateway "${AGENTGATEWAY_GATEWAY_NAME}" \
-      -o jsonpath='{range .status.conditions[?(@.type=="Accepted")]}{.status}{end}' \
-      2>/dev/null || true)"
-    programmed="$(kctl -n "${NAMESPACE}" get gateway "${AGENTGATEWAY_GATEWAY_NAME}" \
-      -o jsonpath='{range .status.conditions[?(@.type=="Programmed")]}{.status}{end}' \
-      2>/dev/null || true)"
-    if [[ "${accepted}" == *True* && "${programmed}" == *True* ]]; then
-      return 0
-    fi
-    sleep 2
-  done
-
-  echo "ERROR: dedicated agentgateway Gateway ${NAMESPACE}/${AGENTGATEWAY_GATEWAY_NAME} was not programmed." >&2
-  kctl -n "${NAMESPACE}" get gateway "${AGENTGATEWAY_GATEWAY_NAME}" -o yaml >&2 || true
-  return 1
-}
-
-verify_agentgateway_dedicated_topology() {
-  local listener_sets=""
-
-  listener_sets="$(kctl -n "${NAMESPACE}" get listenerset -o name 2>/dev/null || true)"
-  if [ -n "${listener_sets}" ]; then
-    echo "ERROR: dedicated agentgateway topology unexpectedly created a ListenerSet:" >&2
-    printf '%s\n' "${listener_sets}" >&2
-    return 1
-  fi
-
-  if kctl -n "${AGENTGATEWAY_NAMESPACE}" get gateway \
-    "${AGENTGATEWAY_GATEWAY_NAME}" >/dev/null 2>&1; then
-    echo "ERROR: dedicated agentgateway topology unexpectedly created the shared Gateway ${AGENTGATEWAY_NAMESPACE}/${AGENTGATEWAY_GATEWAY_NAME}." >&2
-    return 1
-  fi
 }
 
 wait_for_agentgateway_listenerset() {
@@ -1732,9 +1660,7 @@ if use_envoy_gateway; then
   helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway.yaml")
   install_envoy_gateway
 elif use_agentgateway; then
-  if use_agentgateway_dedicated; then
-    helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway-agentgateway-dedicated-tls.yaml")
-  elif use_agentgateway_backend_tls; then
+  if use_agentgateway_backend_tls; then
     helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway-agentgateway-backend-tls.yaml")
   elif use_agentgateway_tls; then
     helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway-agentgateway-shared-tls.yaml")
@@ -1798,19 +1724,12 @@ else
 
   if [ "${GATEWAY_CONTROLLER}" != "none" ]; then
     if use_agentgateway_tls; then
-      if use_agentgateway_dedicated; then
-        wait_for_agentgateway_dedicated_gateway || exit 1
-      else
-        wait_for_agentgateway_listenerset || exit 1
-      fi
+      wait_for_agentgateway_listenerset || exit 1
     fi
     if use_agentgateway_backend_tls; then
       wait_for_agentgateway_backend_tls || exit 1
     fi
     wait_for_gateway_route || exit 1
-    if use_agentgateway_dedicated; then
-      verify_agentgateway_dedicated_topology || exit 1
-    fi
   fi
 
   if [ -n "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET:-}" ]; then

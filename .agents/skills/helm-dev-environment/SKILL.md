@@ -301,12 +301,6 @@ suite's unrelated host fixtures. The shared Gateway must allow ListenerSets
 from the `openshell` namespace; `deploy/kube/manifests/agentgateway-openshell.yaml`
 configures that selector.
 
-Use `mise run e2e:kubernetes:agentgateway-dedicated-tls` to have the OpenShell
-chart create a dedicated agentgateway `Gateway` with a direct HTTPS listener in
-the release namespace. The task verifies the Gateway and GRPCRoute conditions,
-then runs the same CLI conformance and SSH forwarding scenarios without
-creating a ListenerSet.
-
 Use `mise run e2e:kubernetes:agentgateway-backend-tls` to exercise the same
 frontend HTTPS ListenerSet on the shared Gateway while keeping TLS enabled on
 the OpenShell pod. The task waits for the standard `BackendTLSPolicy` to be
@@ -490,7 +484,6 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
 | `deploy/helm/openshell/ci/values-gateway-agentgateway.yaml` | agentgateway GRPCRoute overlay |
 | `deploy/helm/openshell/ci/values-gateway-agentgateway-shared-tls.yaml` | shared agentgateway HTTPS ListenerSet + GRPCRoute overlay |
-| `deploy/helm/openshell/ci/values-gateway-agentgateway-dedicated-tls.yaml` | dedicated agentgateway HTTPS Gateway overlay |
 | `deploy/helm/openshell/ci/values-gateway-agentgateway-backend-tls.yaml` | shared agentgateway frontend and backend TLS overlay |
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |

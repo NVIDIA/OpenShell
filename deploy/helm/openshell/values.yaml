@@ -585,7 +585,7 @@ grpcRoute:
     # Set to false and provide name/namespace to attach to a pre-existing Gateway.
     create: false
     # -- GatewayClass to reference when gateway.create is true. Envoy Gateway
-    # uses "eg"; agentgateway uses "agentgateway".
+    # uses "eg"; set another installed GatewayClass as needed.
     className: "eg"
     # -- Name of the Gateway resource. Defaults to the chart fullname.
     name: ""
