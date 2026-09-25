@@ -933,7 +933,7 @@ impl SupervisorSessionRegistry {
                 payload: Some(gateway_message::Payload::RelayOpen(relay_open)),
             };
             if tx.send(msg).await.is_err() {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "supervisor session: failed to replay pending relay to superseding session");
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "supervisor session: failed to replay pending relay to new session");
                 break;
             }
         }
@@ -1960,12 +1960,12 @@ async fn establish_supervisor_session(
     }
     state.telemetry.sandbox_session_connected(&sandbox_id);
 
-    if superseded {
-        state
-            .supervisor_sessions
-            .replay_pending_relays(&sandbox_id, &tx)
-            .await;
-    }
+    // The previous session may already have been removed before this one
+    // registers. Pending relay opens still need to reach the new session.
+    state
+        .supervisor_sessions
+        .replay_pending_relays(&sandbox_id, &tx)
+        .await;
 
     // Step 4: Spawn the session loop that reads inbound messages.
     let state_clone = Arc::clone(&state);
@@ -2968,6 +2968,52 @@ mod tests {
                 assert_eq!(open.channel_id, channel_id);
             }
             other => panic!("expected RelayOpen on replay, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_pending_relays_reissues_open_after_disconnected_session() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx_old, mut rx_old) = mpsc::channel::<GatewayMessage>(4);
+        let (tx_new, mut rx_new) = mpsc::channel::<GatewayMessage>(4);
+
+        registry.register(
+            "sbx".to_string(),
+            "s-old".to_string(),
+            tx_old,
+            make_shutdown(),
+        );
+        let (channel_id, _relay_rx) = registry
+            .open_relay("sbx", Duration::from_secs(1))
+            .await
+            .expect("open_relay should succeed");
+        rx_old
+            .recv()
+            .await
+            .expect("old session should receive RelayOpen");
+
+        assert_eq!(registry.remove_if_current("sbx", "s-old"), Some(false));
+        let superseded = registry.register(
+            "sbx".to_string(),
+            "s-new".to_string(),
+            tx_new,
+            make_shutdown(),
+        );
+        assert!(!superseded, "old session was removed before reconnect");
+
+        registry
+            .replay_pending_relays("sbx", &registry.lookup_session("sbx").unwrap())
+            .await;
+
+        let replayed = rx_new
+            .recv()
+            .await
+            .expect("new session should receive RelayOpen");
+        match replayed.payload {
+            Some(gateway_message::Payload::RelayOpen(open)) => {
+                assert_eq!(open.channel_id, channel_id);
+            }
+            other => panic!("expected RelayOpen, got {other:?}"),
         }
     }
 
