@@ -3,20 +3,14 @@
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 import textwrap
-from pathlib import Path
+from typing import TYPE_CHECKING
 
+import check_docs_nav
 import pytest
 
-SPEC = importlib.util.spec_from_file_location(
-    "check_docs_nav", Path(__file__).with_name("check_docs_nav.py")
-)
-check_docs_nav = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = check_docs_nav
-assert SPEC.loader is not None
-SPEC.loader.exec_module(check_docs_nav)
+if TYPE_CHECKING:
+    from pathlib import Path
 
 FERN_CONFIG = """\
 instances:
@@ -97,7 +91,7 @@ def test_label_url_that_differs_from_file_path_fails(tmp_path: Path) -> None:
     issues = check_docs_nav.run(root)
     assert len(issues) == 1
     assert "URL /sdk/type-script" in issues[0]
-    assert 'slug: "sdk/typescript"' in issues[0]
+    assert "relative slug in docs/index.yml" in issues[0]
 
 
 def test_frontmatter_slug_can_pin_the_url_to_the_file_path(tmp_path: Path) -> None:
@@ -133,6 +127,70 @@ def test_sidebar_name_must_match_nav_label(tmp_path: Path) -> None:
     assert issues == [
         "about/overview.mdx: title 'Overview of the Product' does not match nav label 'Overview'"
     ]
+
+
+@pytest.mark.parametrize(
+    ("nav", "rel"),
+    [
+        (
+            """
+            navigation:
+            - section: Guides
+              slug: ignored
+              skip-slug: true
+              contents:
+              - page: Setup
+                path: setup.mdx
+            """,
+            "setup.mdx",
+        ),
+        (
+            """
+            navigation:
+            - section: Guides
+              contents:
+              - page: Setup
+                slug: ignored
+                skip-slug: true
+                path: guides/index.mdx
+            """,
+            "guides/index.mdx",
+        ),
+        (
+            """
+            navigation:
+            - section: Guides
+              contents:
+              - folder: guides
+                slug: ignored
+                skip-slug: true
+            """,
+            "guides/setup.mdx",
+        ),
+    ],
+)
+def test_skip_slug_omits_navigation_level(tmp_path: Path, nav: str, rel: str) -> None:
+    root = build(tmp_path, nav, {rel: page("Setup")})
+    assert check_docs_nav.run(root) == []
+
+
+def test_skip_slug_detects_url_that_differs_from_file_path(tmp_path: Path) -> None:
+    root = build(
+        tmp_path,
+        """
+        navigation:
+        - section: Guides
+          skip-slug: true
+          contents:
+          - page: Setup
+            path: guides/setup.mdx
+        """,
+        {"guides/setup.mdx": page("Setup")},
+    )
+    issues = check_docs_nav.run(root)
+    assert len(issues) == 1
+    assert "URL /setup" in issues[0]
+    assert "does not match its file path /guides/setup" in issues[0]
 
 
 def test_folder_pages_use_file_names_and_orphans_fail(tmp_path: Path) -> None:

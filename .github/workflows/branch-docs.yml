@@ -7,7 +7,9 @@ on:
       - "fern/**"
       - "mise.toml"
       - "tasks/docs.toml"
+      - "tasks/test.toml"
       - "tasks/scripts/check_docs_nav.py"
+      - "tasks/scripts/check_docs_nav_test.py"
       - ".github/workflows/branch-docs.yml"
       - ".github/workflows/release-tag.yml"
 
@@ -53,6 +55,9 @@ jobs:
         with:
           version: "0.10.12"
           python-version: "3.13"
+
+      - name: Test docs navigation check
+        run: uv run --no-project --with pytest --with pytest-asyncio --with pyyaml pytest tasks/scripts/check_docs_nav_test.py
 
       - name: Check docs navigation matches file paths
         run: uv run tasks/scripts/check_docs_nav.py
