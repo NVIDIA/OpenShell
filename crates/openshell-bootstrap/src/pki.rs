@@ -4,7 +4,7 @@
 use crate::jwt::{JwtKeyMaterial, generate_jwt_key};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, Ia5String, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, DnType, IsCa, KeyUsagePurpose, SanType, string::Ia5String,
 };
 use std::net::IpAddr;
 
@@ -54,7 +54,7 @@ pub const DEFAULT_SERVER_SANS: &[&str] = &[
 /// are ephemeral to the cluster's lifetime.
 pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
     // --- CA ---
-    let ca_key = KeyPair::generate()
+    let ca_key = openshell_crypto::pki::generate_keypair()
         .into_diagnostic()
         .wrap_err("failed to generate CA key")?;
     let mut ca_params = CertificateParams::new(Vec::<String>::new())
@@ -69,13 +69,12 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
         .distinguished_name
         .push(DnType::CommonName, "openshell-ca");
 
-    let ca_cert = ca_params
-        .self_signed(&ca_key)
+    let ca_cert = openshell_crypto::pki::self_signed(ca_params, &ca_key)
         .into_diagnostic()
         .wrap_err("failed to self-sign CA certificate")?;
 
     // --- Server cert ---
-    let server_key = KeyPair::generate()
+    let server_key = openshell_crypto::pki::generate_keypair()
         .into_diagnostic()
         .wrap_err("failed to generate server key")?;
     let server_sans = build_server_sans(extra_sans);
@@ -88,13 +87,13 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
         .distinguished_name
         .push(DnType::CommonName, "openshell-server");
 
-    let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
-        .into_diagnostic()
-        .wrap_err("failed to sign server certificate")?;
+    let server_cert =
+        openshell_crypto::pki::signed_by(server_params, &server_key, &ca_cert, &ca_key)
+            .into_diagnostic()
+            .wrap_err("failed to sign server certificate")?;
 
     // --- Client cert (shared by CLI and sandbox pods) ---
-    let client_key = KeyPair::generate()
+    let client_key = openshell_crypto::pki::generate_keypair()
         .into_diagnostic()
         .wrap_err("failed to generate client key")?;
     let mut client_params = CertificateParams::new(Vec::<String>::new())
@@ -108,10 +107,10 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
         .distinguished_name
         .push(DnType::OrganizationalUnitName, "openshell-user");
 
-    let client_cert = client_params
-        .signed_by(&client_key, &ca_cert, &ca_key)
-        .into_diagnostic()
-        .wrap_err("failed to sign client certificate")?;
+    let client_cert =
+        openshell_crypto::pki::signed_by(client_params, &client_key, &ca_cert, &ca_key)
+            .into_diagnostic()
+            .wrap_err("failed to sign client certificate")?;
 
     // --- JWT signing key (Ed25519, used to mint per-sandbox identity tokens) ---
     let JwtKeyMaterial {
@@ -122,11 +121,11 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
 
     Ok(PkiBundle {
         ca_cert_pem: ca_cert.pem(),
-        ca_key_pem: ca_key.serialize_pem(),
+        ca_key_pem: ca_key.serialize_pem().into_diagnostic()?,
         server_cert_pem: server_cert.pem(),
-        server_key_pem: server_key.serialize_pem(),
+        server_key_pem: server_key.serialize_pem().into_diagnostic()?,
         client_cert_pem: client_cert.pem(),
-        client_key_pem: client_key.serialize_pem(),
+        client_key_pem: client_key.serialize_pem().into_diagnostic()?,
         jwt_signing_key_pem,
         jwt_public_key_pem,
         jwt_key_id,

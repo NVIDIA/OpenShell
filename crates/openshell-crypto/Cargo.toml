@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-crypto"
+description = "Crypto backend contract and protocol adapters for OpenShell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Only this feature selects the default backend. With defaults disabled an
+# embedder must install its backend before any crypto operation.
+default = ["aws-lc"]
+aws-lc = ["dep:aws-lc-rs", "rustls/aws_lc_rs", "rcgen/aws_lc_rs", "jsonwebtoken/aws_lc_rs", "tonic?/tls-aws-lc", "hyper-rustls?/aws-lc-rs", "kube?/aws-lc-rs", "sqlx?/tls-rustls-aws-lc-rs"]
+tls-tonic = ["dep:tonic"]
+tls-hyper = ["dep:hyper-rustls"]
+tls-kube = ["dep:kube", "dep:k8s-openapi"]
+tls-sqlx = ["dep:sqlx"]
+
+[dependencies]
+tonic = { workspace = true, optional = true }
+hyper-rustls = { version = "0.27", default-features = false, optional = true }
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+
+aws-lc-rs = { workspace = true, optional = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+jsonwebtoken = { workspace = true }
+pem = "3"
+x509-parser = { version = "0.18.1", default-features = false }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

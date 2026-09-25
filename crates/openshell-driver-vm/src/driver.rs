@@ -1362,9 +1362,9 @@ impl VmDriver {
         let boundary_generation =
             match tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE)).await {
                 Ok(generation) if !generation.trim().is_empty() => generation.trim().to_string(),
-                Ok(_) => random_boundary_token(),
+                Ok(_) => random_boundary_token()?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    random_boundary_token()
+                    random_boundary_token()?
                 }
                 Err(error) => {
                     return Err(Status::internal(format!(
@@ -5536,12 +5536,14 @@ fn merged_environment(sandbox: &Sandbox) -> HashMap<String, String> {
     environment
 }
 
-fn random_boundary_token() -> String {
+fn random_boundary_token() -> Result<String, Status> {
     let mut token = String::with_capacity(64);
-    for byte in rand::random::<[u8; 32]>() {
+    for byte in openshell_crypto::random_bytes::<32>()
+        .map_err(|error| Status::internal(error.to_string()))?
+    {
         write!(&mut token, "{byte:02x}").expect("writing to String cannot fail");
     }
-    token
+    Ok(token)
 }
 
 fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<String> {
@@ -5609,17 +5611,19 @@ fn sandbox_socket_dir(socket_root: &Path, sandbox_id: &str) -> PathBuf {
 fn allocate_socket_root() -> Result<(PathBuf, OwnedFd), std::io::Error> {
     let uid = rustix::process::geteuid().as_raw();
     allocate_socket_root_with(Path::new("/tmp"), || {
-        let random: u128 = rand::random();
-        format!("os-{uid}-{random:032x}")
+        let random = u128::from_ne_bytes(
+            openshell_crypto::random_bytes::<16>().map_err(std::io::Error::other)?,
+        );
+        Ok(format!("os-{uid}-{random:032x}"))
     })
 }
 
 fn allocate_socket_root_with(
     base: &Path,
-    mut gen_name: impl FnMut() -> String,
+    mut gen_name: impl FnMut() -> Result<String, std::io::Error>,
 ) -> Result<(PathBuf, OwnedFd), std::io::Error> {
     for _ in 0..SOCKET_ROOT_ALLOC_RETRIES {
-        let root = base.join(gen_name());
+        let root = base.join(gen_name()?);
         match rustix::fs::mkdir(&root, rustix::fs::Mode::from_raw_mode(0o700)) {
             Ok(()) => {
                 let fd = rustix::fs::open(
@@ -6983,7 +6987,10 @@ mod tests {
     use tonic::Code;
 
     fn test_socket_root() -> (PathBuf, Arc<OwnedFd>) {
-        let dir = std::env::temp_dir().join(format!("os-test-{:016x}", rand::random::<u64>()));
+        let dir = std::env::temp_dir().join(format!(
+            "os-test-{:016x}",
+            u64::from_ne_bytes(openshell_crypto::random_bytes::<8>().expect("test entropy"))
+        ));
         std::fs::create_dir(&dir).expect("create test socket root");
         std::fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
             .expect("set test socket root permissions");
@@ -8570,12 +8577,12 @@ mod tests {
         let mut counter = 0u64;
         let (root_a, _fd_a) = allocate_socket_root_with(tmp.path(), || {
             counter += 1;
-            format!("root-{counter}")
+            Ok(format!("root-{counter}"))
         })
         .unwrap();
         let (root_b, _fd_b) = allocate_socket_root_with(tmp.path(), || {
             counter += 1;
-            format!("root-{counter}")
+            Ok(format!("root-{counter}"))
         })
         .unwrap();
         assert_ne!(
@@ -8599,7 +8606,7 @@ mod tests {
         let call_count = AtomicUsize::new(0);
         let (root, _fd) = allocate_socket_root_with(tmp.path(), || {
             let n = call_count.fetch_add(1, Ordering::SeqCst);
-            format!("attempt-{n}")
+            Ok(format!("attempt-{n}"))
         })
         .expect("should succeed after retries");
 
@@ -8626,12 +8633,23 @@ mod tests {
     }
 
     #[test]
+    fn allocate_socket_root_propagates_name_generation_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = allocate_socket_root_with(tmp.path(), || {
+            Err(std::io::Error::other(openshell_crypto::CryptoError::Random))
+        })
+        .expect_err("entropy failure must stop allocation");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn allocate_socket_root_exhaustion_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         let blocked = tmp.path().join("blocked");
         std::fs::create_dir(&blocked).unwrap();
 
-        let err = allocate_socket_root_with(tmp.path(), || "blocked".to_string())
+        let err = allocate_socket_root_with(tmp.path(), || Ok("blocked".to_string()))
             .expect_err("should fail when all names are occupied");
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
@@ -9625,7 +9643,7 @@ mod tests {
         let outside = Path::new("/tmp").join(format!(
             "openshell-vm-layer-test-{}-{:x}",
             std::process::id(),
-            rand::random::<u64>()
+            u64::from_ne_bytes(openshell_crypto::random_bytes::<8>().expect("test entropy"))
         ));
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("sentinel"), "unchanged").unwrap();

@@ -50,6 +50,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
 | `crates/openshell-otel/` | OpenTelemetry support | Shared OTLP trace provider, resource, and tracing-layer construction |
 | `crates/openshell-otel-test-support/` | OpenTelemetry test support | Shared loopback OTLP collector fixture for tracing tests |
+| `crates/openshell-crypto/` | Crypto backend | Backend-neutral primitives and TLS, PKI, JWT adapters; AWS-LC implementation |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
 | `crates/openshell-extension-core/` | Extension core | Shared extension identity, JWT claims, bearer-token rotation, and TLS transport primitives |
 | `crates/openshell-gateway/` | Gateway binary composition | Links selected first-party compute drivers into the backend-agnostic server registry |
@@ -285,6 +286,7 @@ When behavior, commands, or development workflows change, review the related age
 
 ## Security
 
+- Route first-party security-sensitive cryptographic operations through `openshell-crypto`. If an operation is missing, extend the facade and backend implementation instead of adding a direct cryptographic implementation in an application crate. Preserve protocol compatibility and propagate backend failures without fallback. Protocol/parsing types and documented non-security or dependency-owned exceptions remain permitted; classify exceptions explicitly. Follow [Cryptography and FIPS](architecture/crypto.md).
 - Never commit secrets, API keys, or credentials. If a file looks like it contains secrets (`.env`, `credentials.json`, etc.), do not stage it.
 - Do not run destructive operations (force push, hard reset, database drops) without explicit human confirmation.
 - Scope changes to the issue at hand. Do not make unrelated changes in the same branch.

@@ -3378,7 +3378,7 @@ mod linux {
     fn load_tls_server_config(
         tls: &openshell_sandbox_backend::boundary_protocol::SandboxTlsServerConfig,
     ) -> io::Result<rustls::ServerConfig> {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let certificate_bytes = std::fs::read(&tls.certificate_chain_path)?;
         let certificates = rustls_pemfile::certs(&mut certificate_bytes.as_slice())
             .collect::<Result<Vec<_>, _>>()?;
@@ -3396,11 +3396,12 @@ mod linux {
                     "boundary TLS private-key file contains no private key",
                 )
             })?;
-        let mut config =
-            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .with_no_client_auth()
-                .with_single_cert(certificates, private_key)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let mut config = openshell_crypto::tls::server_builder_with_protocol_versions(&[
+            &rustls::version::TLS13,
+        ])
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         config.alpn_protocols = vec![b"h2".to_vec()];
         for path in [&tls.certificate_chain_path, &tls.private_key_path] {
             std::fs::remove_file(path)?;
@@ -3620,7 +3621,7 @@ mod linux {
             GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
             generate_sandbox_tls_material,
         };
-        use rcgen::{KeyPair, PKCS_ED25519};
+        use rcgen::PKCS_ED25519;
 
         #[test]
         fn exec_tombstones_outlive_retained_handles_and_fail_closed_at_capacity() {
@@ -3687,7 +3688,8 @@ mod linux {
         }
 
         fn test_verification_key() -> GatewayVerificationKey {
-            let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate gateway key");
+            let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519)
+                .expect("generate gateway key");
             GatewayVerificationKey {
                 key_id: "test-key".to_string(),
                 public_key_pem: key.public_key_pem(),
@@ -3695,13 +3697,14 @@ mod linux {
         }
 
         fn test_auth_material(sandbox_id: &str) -> (GatewayVerificationKey, String) {
-            let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate gateway key");
+            let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519)
+                .expect("generate gateway key");
             let verification_key = GatewayVerificationKey {
                 key_id: "test-key".to_string(),
                 public_key_pem: key.public_key_pem(),
             };
             let issuer = SessionJwtIssuer::from_ed25519_pem(
-                key.serialize_pem().as_bytes(),
+                key.serialize_pem().unwrap().as_bytes(),
                 "test-key",
                 "test-gateway",
                 Some(DEFAULT_SESSION_TOKEN_TTL),
@@ -3774,7 +3777,7 @@ mod linux {
                     .add(certificate.expect("parse test CA"))
                     .expect("add test CA");
             }
-            let mut config = rustls::ClientConfig::builder()
+            let mut config = openshell_crypto::tls::client_builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             config.alpn_protocols = vec![b"h2".to_vec()];
