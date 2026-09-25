@@ -231,8 +231,31 @@ jobs:
           docker info
           sudo snap connections openshell | grep -E '^docker +openshell:docker +:docker +'
           openshell --version
+          openshell.prover --version
           sudo snap services openshell
           openshell status
+
+      - name: Check a policy boundary with the Snap prover
+        run: |
+          set -euo pipefail
+          prover_dir=$(mktemp -d "$HOME/openshell-prover-canary.XXXXXX")
+          trap 'rm -rf "$prover_dir"' EXIT
+          cat >"$prover_dir/boundary.yaml" <<'EOF'
+          version: 1
+          filesystem_policy:
+            read_only:
+              - /usr
+              - /etc
+          EOF
+          cat >"$prover_dir/candidate.yaml" <<'EOF'
+          version: 1
+          filesystem_policy:
+            read_only:
+              - /usr
+          EOF
+          result=$(openshell.prover check "$prover_dir/candidate.yaml" \
+            --boundary "$prover_dir/boundary.yaml")
+          grep -q '^result: within_boundary$' <<<"$result"
 
       - name: Create and exercise a sandbox
         run: |
