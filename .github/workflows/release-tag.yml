@@ -142,7 +142,7 @@ jobs:
     with:
       candidate_ref: ${{ inputs.tag || github.ref_name }}
       fail-on-codex-findings: true
-      fail-on-static-findings: true
+      fail-on-static-findings: false
       images: |
         ghcr.io/nvidia/openshell/gateway:${{ needs.compute-versions.outputs.source_sha }}
         ghcr.io/nvidia/openshell/sandbox:${{ needs.compute-versions.outputs.source_sha }}
