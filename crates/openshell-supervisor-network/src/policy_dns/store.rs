@@ -17,6 +17,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// Keep unapproved names from consuming the pool reserved for policy-backed
+/// destinations. Allocations are never reused, even after their TTL expires.
+const OBSERVATION_POOL_DIVISOR: usize = 8;
+const OBSERVATION_ALLOCATION_IDENTITY: [u8; 32] = [0; 32];
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PolicyEndpointId {
     pub(crate) policy_name: String,
@@ -299,6 +304,41 @@ impl ResolvedEndpointStore {
             return Err(PublishError::InvalidMapping);
         }
 
+        self.publish_checked(request, now)
+    }
+
+    /// Correlate a denied hostname with a later TCP attempt without resolving
+    /// it upstream or granting any port. Only the intent lookup may read this
+    /// record; the authorization lookup requires an endpoint contract.
+    pub(crate) fn publish_observation(
+        &self,
+        normalized_name: NormalizedName,
+        family: AddressFamily,
+        policy_generation: u64,
+        current_policy_generation: u64,
+        now: Instant,
+    ) -> Result<ResolvedEndpointRecord, PublishError> {
+        if policy_generation != current_policy_generation {
+            return Err(PublishError::StalePolicy);
+        }
+        self.publish_checked(
+            PublishRequest {
+                normalized_name,
+                family,
+                allocation_identity: OBSERVATION_ALLOCATION_IDENTITY,
+                policy_generation,
+                ttl: super::MAX_MAPPING_TTL,
+                contracts: Vec::new(),
+            },
+            now,
+        )
+    }
+
+    fn publish_checked(
+        &self,
+        request: PublishRequest,
+        now: Instant,
+    ) -> Result<ResolvedEndpointRecord, PublishError> {
         let key = AllocationKey {
             normalized_name: request.normalized_name.clone(),
             family: request.family,
@@ -308,6 +348,16 @@ impl ResolvedEndpointStore {
         let synthetic_address = if let Some(address) = state.allocations.get(&key) {
             *address
         } else {
+            if request.contracts.is_empty()
+                && state
+                    .allocations
+                    .keys()
+                    .filter(|key| key.allocation_identity == OBSERVATION_ALLOCATION_IDENTITY)
+                    .count()
+                    >= (self.config.max_mappings / OBSERVATION_POOL_DIVISOR).max(1)
+            {
+                return Err(PublishError::PoolExhausted);
+            }
             if state.allocations.len() >= self.config.max_mappings {
                 return Err(PublishError::PoolExhausted);
             }
@@ -405,6 +455,44 @@ impl ResolvedEndpointStore {
         })
     }
 
+    /// Look up the hostname of an observation-only mapping for a policy
+    /// decision. Ordinary mappings still enforce their authored port scope.
+    /// The caller must never use this lookup to establish an upstream relay.
+    pub(crate) fn lookup_intent(
+        &self,
+        synthetic_address: IpAddr,
+        port: u16,
+        current_policy_generation: u64,
+        now: Instant,
+    ) -> Result<MappingLookup, MappingLookupError> {
+        match self.lookup(synthetic_address, port, current_policy_generation, now) {
+            Err(MappingLookupError::PortMismatch) => {
+                let state = self
+                    .state
+                    .read()
+                    .map_err(|_| MappingLookupError::LockPoisoned)?;
+                let record = state
+                    .records
+                    .get(&synthetic_address)
+                    .ok_or(MappingLookupError::Missing)?;
+                if now >= record.expires_at {
+                    return Err(MappingLookupError::Expired);
+                }
+                if record.policy_generation != current_policy_generation {
+                    return Err(MappingLookupError::StalePolicy);
+                }
+                if !record.contracts.is_empty() {
+                    return Err(MappingLookupError::PortMismatch);
+                }
+                Ok(MappingLookup {
+                    record: record.clone(),
+                    port,
+                })
+            }
+            result => result,
+        }
+    }
+
     /// Remove expired active records without freeing their synthetic identity.
     pub(crate) fn expire(&self, now: Instant) -> Result<usize, MappingLookupError> {
         let mut state = self
@@ -495,6 +583,36 @@ mod tests {
                 pinned_addresses: vec!["203.0.113.8".parse().unwrap()],
             }],
         }
+    }
+
+    #[test]
+    fn observation_budget_preserves_capacity_for_policy_backed_names() {
+        let store = store(8);
+        let now = Instant::now();
+        let first = store
+            .publish_observation(
+                NormalizedName::parse("unknown.example").unwrap(),
+                AddressFamily::Ipv4,
+                1,
+                1,
+                now,
+            )
+            .unwrap();
+        assert!(first.contracts.is_empty());
+        assert!(matches!(
+            store.publish_observation(
+                NormalizedName::parse("another.example").unwrap(),
+                AddressFamily::Ipv4,
+                1,
+                1,
+                now,
+            ),
+            Err(PublishError::PoolExhausted)
+        ));
+        let approved = store
+            .publish(request("db.example", 1, Duration::from_secs(10)), 1, now)
+            .unwrap();
+        assert_ne!(first.synthetic_address, approved.synthetic_address);
     }
 
     #[test]

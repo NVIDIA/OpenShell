@@ -144,6 +144,47 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             self.trusted_host_gateway,
         )?;
         if eligible.is_empty() {
+            // DNS alone cannot identify the requesting executable or intended
+            // port. Publish a synthetic, contract-free address so the later
+            // TCP attempt can be denied with its verified binary and port.
+            // No upstream DNS request or egress grant is made here.
+            if normalized_name.as_str() != "localhost"
+                && !openshell_core::net::is_known_metadata_hostname(normalized_name.as_str())
+                && !is_host_gateway_alias(normalized_name.as_str())
+            {
+                let record = self
+                    .policy
+                    .with_current_generation(snapshot.generation, |generation| {
+                        self.store.publish_observation(
+                            normalized_name.clone(),
+                            family,
+                            snapshot.generation,
+                            generation,
+                            now,
+                        )
+                    })
+                    .map_err(|error| PolicyDnsError::Policy(error.to_string()))?
+                    .ok_or(PolicyDnsError::StalePolicy)??;
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "observation")
+                        .unmapped("normalized_domain", normalized_name.as_str())
+                        .unmapped("synthetic_address", record.synthetic_address.to_string())
+                        .message(format!(
+                            "Policy DNS staged unapproved name {normalized_name} for TCP policy review"
+                        ))
+                        .build()
+                );
+                return Ok(SyntheticAnswer {
+                    address: record.synthetic_address,
+                    ttl: MAX_MAPPING_TTL,
+                    mapping_id: record.mapping_id,
+                    mapping_generation: record.mapping_generation,
+                    policy_generation: record.policy_generation,
+                });
+            }
             emit_dns_denial(
                 &normalized_name,
                 "policy_dns_ineligible",
@@ -648,13 +689,58 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 ";
 
     #[tokio::test]
-    async fn refuses_ineligible_name_before_upstream_resolution() {
+    async fn stages_unknown_name_without_upstream_resolution_by_default() {
         let service = service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]);
-        let result = service
+        let answer = service
             .answer_query("other.example", AddressFamily::Ipv4, Instant::now())
-            .await;
-        assert!(matches!(result, Err(PolicyDnsError::Ineligible)));
+            .await
+            .expect("unapproved name receives a local synthetic address");
+        assert!(
+            service
+                .store
+                .lookup_intent(
+                    answer.address,
+                    80,
+                    service.policy.current_generation(),
+                    Instant::now()
+                )
+                .is_ok()
+        );
         assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_name_correlates_without_authorizing_a_port() {
+        let service = service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]);
+        let now = Instant::now();
+        let answer = service
+            .answer_query("PyPI.org", AddressFamily::Ipv4, now)
+            .await
+            .expect("synthetic observation address");
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+        let generation = service.policy.current_generation();
+        assert!(matches!(
+            service.store.lookup(answer.address, 80, generation, now),
+            Err(MappingLookupError::PortMismatch)
+        ));
+        let intent = service
+            .store
+            .lookup_intent(answer.address, 80, generation, now)
+            .expect("name available for a later denied connection");
+        assert_eq!(intent.record.normalized_name.as_str(), "pypi.org");
+        assert!(intent.record.contracts.is_empty());
+        assert!(matches!(
+            service
+                .store
+                .lookup_intent(answer.address, 80, generation + 1, now),
+            Err(MappingLookupError::StalePolicy)
+        ));
+        assert!(matches!(
+            service
+                .answer_query("metadata.google.internal", AddressFamily::Ipv4, now)
+                .await,
+            Err(PolicyDnsError::Ineligible)
+        ));
     }
 
     #[tokio::test]

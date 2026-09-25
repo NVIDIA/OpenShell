@@ -711,6 +711,28 @@ async fn preauthorize_transparent_open(
         let _ = completion.send(TcpOpenDecision::Denied(denial));
         return None;
     }
+    // Observation-only DNS records have no approved endpoint or real address.
+    // Even if a future policy decision were to allow this intent, it cannot
+    // use the synthetic observation address as an upstream destination.
+    if policy_dns_store.is_some_and(|store| {
+        store
+            .lookup_intent(
+                destination.ip(),
+                destination.port(),
+                opa_engine.current_generation(),
+                std::time::Instant::now(),
+            )
+            .is_ok_and(|mapping| mapping.record.contracts.is_empty())
+    }) {
+        emit_staged_transparent_denial(
+            destination,
+            &binary_identity,
+            "unapproved DNS observation cannot authorize egress",
+            "transparent_tcp_observation_denied",
+        );
+        let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
+        return None;
+    }
     if let Err(denial) =
         hydrate_destination_plan(&mut decision, backend_host_gateway, trusted_host_gateway)
     {
@@ -835,7 +857,7 @@ fn transparent_destination_host(
     let Some(store) = policy_dns_store else {
         return Ok(destination.ip().to_string());
     };
-    match store.lookup(
+    match store.lookup_intent(
         destination.ip(),
         destination.port(),
         opa_engine.current_generation(),
@@ -982,7 +1004,7 @@ async fn handle_transparent_tcp_connection(
     let workload_addr = client.peer_addr().into_diagnostic()?;
     let original = original_destination(&client).into_diagnostic()?;
     let current_generation = opa_engine.current_generation();
-    let mapping = match store.lookup(
+    let mapping = match store.lookup_intent(
         original.ip(),
         original.port(),
         current_generation,
@@ -1023,6 +1045,16 @@ async fn handle_transparent_tcp_connection(
             "transparent-tcp",
         );
         emit_activity(&activity_tx, true, "transparent_tcp_policy");
+        return Ok(());
+    }
+
+    if mapping.record.contracts.is_empty() {
+        emit_transparent_mapping_denial(
+            workload_addr,
+            original,
+            MappingLookupError::EndpointMismatch,
+        );
+        emit_activity(&activity_tx, true, "transparent_tcp_mapping");
         return Ok(());
     }
 

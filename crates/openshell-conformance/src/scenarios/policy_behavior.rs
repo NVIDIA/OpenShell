@@ -37,6 +37,21 @@ pub const MECHANISTIC_PROPOSAL_SCENARIO: Scenario = Scenario {
     run: run_mechanistic_proposal,
 };
 
+pub const NEW_HOSTNAME_PROPOSAL_SCENARIO: Scenario = Scenario {
+    name: "new-hostname-proposal",
+    description: "Turn a denied TCP open to a hostname absent from policy into a scoped draft.",
+    run: run_new_hostname_proposal,
+};
+
+const EMPTY_NETWORK_POLICY: &[u8] = br"version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /bin, /lib, /lib64, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_write: [/sandbox, /tmp, /dev/null]
+landlock: { compatibility: best_effort }
+network_policies: {}
+";
+
 fn run_policy_local(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(async move {
         let name = format!("ct-{}-pl", runner.id());
@@ -279,16 +294,7 @@ fn run_mechanistic_proposal(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> 
     Box::pin(async move {
         let mut policy = NamedTempFile::new().map_err(|error| error.to_string())?;
         policy
-            .write_all(
-                br"version: 1
-filesystem_policy:
-  include_workdir: true
-  read_only: [/usr, /bin, /lib, /lib64, /proc, /dev/urandom, /app, /etc, /var/log]
-  read_write: [/sandbox, /tmp, /dev/null]
-landlock: { compatibility: best_effort }
-network_policies: {}
-",
-            )
+            .write_all(EMPTY_NETWORK_POLICY)
             .map_err(|error| error.to_string())?;
         let policy_path = policy
             .path()
@@ -374,6 +380,78 @@ network_policies: {}
             assert_mechanistic_draft(draft.stdout(), &binary)
                 .map_err(|error| draft.failure_diagnostic(&error))?;
             return Ok(());
+        }
+    })
+}
+
+fn run_new_hostname_proposal(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
+    Box::pin(async move {
+        let mut policy = NamedTempFile::new().map_err(|error| error.to_string())?;
+        policy
+            .write_all(EMPTY_NETWORK_POLICY)
+            .map_err(|error| error.to_string())?;
+        let policy_path = policy
+            .path()
+            .to_str()
+            .ok_or("temporary policy path is not UTF-8")?;
+        let name = format!("ct-{}-nh", runner.id());
+        create_sandbox(runner, &name, Some(policy_path)).await?;
+        let binary = sandbox_bash_path(runner, &name).await?;
+
+        let probe = runner
+            .step("denied-new-hostname")
+            .description("Bash cannot connect to pypi.org:80 before approval")
+            .with_timeout(COMMAND_TIMEOUT)
+            .run(&[
+                "sandbox",
+                "exec",
+                "--name",
+                &name,
+                "--no-tty",
+                "--",
+                "bash",
+                "-c",
+                "if exec 3<>/dev/tcp/pypi.org/80; then echo UNEXPECTED_ALLOWED; exit 1; else echo DENIED; fi",
+            ])
+            .await
+            .map_err(|error| error.to_string())?;
+        probe.require_success()?;
+        if !probe.stdout().lines().any(|line| line == "DENIED") {
+            return Err(probe.failure_diagnostic("new hostname stays denied before approval"));
+        }
+
+        let started = Instant::now();
+        loop {
+            let draft = runner
+                .step("new-hostname-draft")
+                .description("a host, port, and binary scoped draft appears")
+                .with_timeout(COMMAND_TIMEOUT)
+                .run(&["rule", "get", &name])
+                .await
+                .map_err(|error| error.to_string())?;
+            draft.require_success()?;
+            if draft.stdout().contains("Chunk:") {
+                let fields = draft.stdout().lines().map(str::trim).collect::<Vec<_>>();
+                if fields.contains(&"Rule: allow_pypi_org_80")
+                    && fields.contains(&"Endpoints: pypi.org:80 [L4]")
+                    && fields
+                        .iter()
+                        .any(|line| *line == format!("Binary: {binary}"))
+                    && fields
+                        .iter()
+                        .any(|line| matches!(*line, "Status: pending" | "Status: approved"))
+                {
+                    return Ok(());
+                }
+                return Err(draft
+                    .failure_diagnostic("one L4 draft for pypi.org:80 scoped to the Bash binary"));
+            }
+            if started.elapsed() >= PROPOSAL_TIMEOUT {
+                return Err(
+                    draft.failure_diagnostic("new-hostname denial appears in the reviewer inbox")
+                );
+            }
+            sleep(POLL_INTERVAL).await;
         }
     })
 }

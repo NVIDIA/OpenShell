@@ -289,15 +289,14 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     }
 
     #[tokio::test]
-    async fn ineligible_query_is_refused_without_upstream_call() {
+    async fn unknown_query_gets_observation_address_without_upstream_call() {
         let service = service();
         let wire = handle_udp_query(&service, &request("other.example.", RecordType::A))
             .await
             .unwrap();
-        assert_eq!(
-            Message::from_vec(&wire).unwrap().metadata.response_code,
-            ResponseCode::Refused
-        );
+        let response = Message::from_vec(&wire).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(matches!(response.answers[0].data, RData::A(_)));
         assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
     }
 
