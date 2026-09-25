@@ -15,7 +15,7 @@
 [![Project Status](https://img.shields.io/badge/status-alpha-orange)](https://github.com/NVIDIA/OpenShell/releases)
 
 > [!IMPORTANT]
-> **New in OpenShell 0.1.0:** a stable release cadence, an improved security model, an expanded extension surface, and new APIs. [Read the 0.1.0 upgrade guide](https://docs.nvidia.com/openshell/latest/upgrade/0-1-0).
+> **New in OpenShell 0.1.0:** a stable release cadence, new isolation primitives, an expanded extension surface, and new APIs. [Read the 0.1.0 upgrade guide](https://docs.nvidia.com/openshell/latest/upgrade/0-1-0).
 
 OpenShell is the safe, private runtime for autonomous AI agents. It runs agents in sandboxes that protect your data, credentials, and infrastructure, governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
 
