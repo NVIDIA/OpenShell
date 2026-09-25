@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Manage Sandbox Policies"
 sidebar-title: "Manage Policies"
-description: "Use the OpenShell CLI to set, inspect, change, verify, and roll back sandbox policies, and to apply a gateway-wide policy."
+description: "Use the OpenShell CLI to set, inspect, change, verify, and roll back sandbox policies, apply a gateway-wide policy, and troubleshoot policy problems."
 keywords: "Generative AI, Cybersecurity, Policy, Sandbox, CLI, Hot Reload, Revision"
 position: 3
 ---
@@ -48,7 +48,7 @@ COPY policy.yaml /etc/openshell/policy.yaml
 OpenShell uses the image policy only when the sandbox has no saved policy, so a
 `--policy` file or `OPENSHELL_SANDBOX_POLICY` takes precedence. If the image
 policy is invalid, the sandbox does not start until you [replace it with a valid
-policy](/sandboxes/troubleshoot-policies#repair-initial-configuration). OpenShell
+policy](#a-new-sandbox-stays-in-provisioning). OpenShell
 does not fall back to the default policy.
 
 ## Inspect the Current Policy
@@ -212,8 +212,8 @@ rules and other changes that arrive at the same time. If the sandbox cannot load
 a revision, the gateway's `policy_validation_failure_mode` setting decides what
 happens. With `fail_closed`, the default, the sandbox blocks network traffic
 until you submit a valid policy. With `retain_last_valid`, the last valid policy
-stays active. [Troubleshoot Sandbox Policies](/sandboxes/troubleshoot-policies)
-explains how to identify and repair each kind of failure.
+stays active. [A Change Fails to Load](#a-change-fails-to-load) explains how to
+repair a rejected change.
 
 ## Change Filesystem and Process Settings
 
@@ -302,9 +302,64 @@ confirmation, because each one changes the network access of every sandbox on
 the gateway. Deleting the global policy fails if a sandbox's own policy and
 provider rules would be invalid once restored.
 
+## Troubleshoot
+
+### A Request Is Denied
+
+OpenShell logs every denied connection and request with the destination, the
+binary, and the reason. Check the sandbox log first:
+
+```shell
+openshell logs my-sandbox --since 10m --source sandbox
+```
+
+Policy events are INFO-level log records, so do not filter the log with
+`--level warn`. Compare the logged binary and destination with the effective
+policy, and use the error code in the response to find the cause:
+
+| Error | Cause | What to check |
+|---|---|---|
+| `policy_denied` | No rule allows the connection, or a request rule blocks the request. | A rule lists the logged binary, host, and port, and its request rules allow the method and path. Scripts appear as their interpreter, such as `/usr/bin/python3.12`. |
+| `request_authority_mismatch` | The HTTP request's host or port differs from the connection's destination. | The client's `Host` header, including any non-default port, matches the connection. |
+| `credential_endpoint_mismatch` | A network rule allowed the request, but the provider credential is not bound to this destination. | The provider's profile endpoints or credential binding. Do not widen the network rule. |
+| `credential_placeholder_in_request_body` | The request body contains an invalid or revoked credential placeholder. | Remove the stale placeholder or restore the provider. |
+
+### A Change Fails to Load
+
+`openshell policy list my-sandbox` shows a revision that the sandbox rejected as
+`Failed`, with the error. What happens to network access depends on the failure
+mode described in [How Changes Take Effect](#how-changes-take-effect). With the
+default, `fail_closed`, the sandbox blocks network traffic until a valid policy
+loads. Fix the error and submit the policy again, or [roll back to an earlier
+revision](#roll-back-to-an-earlier-revision).
+
+### A New Sandbox Stays in Provisioning
+
+If a new sandbox's policy or provider configuration is invalid, including an
+invalid image policy, the sandbox stays in `Provisioning` with a
+`ConfigurationInvalid` condition and its workload does not start. Check the
+diagnostic:
+
+```shell
+openshell sandbox get my-sandbox --output json
+```
+
+You have 300 seconds to fix the configuration. Replace the policy with
+`openshell policy set`, or fix the provider configuration. Until the workload
+first starts, you can also change filesystem, Landlock, and process settings.
+Each change to the policy, providers, or settings restarts the 300 seconds.
+
+If the time runs out, the sandbox moves to `Error` with the reason
+`ProvisioningTimedOut`. Fixing the configuration does not restart it. After you
+fix it, start the sandbox again, which begins a new 300-second window:
+
+```shell
+openshell sandbox start my-sandbox
+```
+
 ## Next Steps
 
 - Use [Network Rules](/sandboxes/network-rules) for example rules you can adapt
   to common services and protocols.
-- Use [Troubleshoot Sandbox Policies](/sandboxes/troubleshoot-policies) when a
-  change fails to load or a request is denied unexpectedly.
+- Use the [Policy Schema Reference](/reference/policy-schema) for every field,
+  default, and constraint.
