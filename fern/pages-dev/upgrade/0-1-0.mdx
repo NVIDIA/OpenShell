@@ -7,9 +7,16 @@ description: "Prepare OpenShell operators and users for the breaking changes in 
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Upgrade, Migration"
 ---
 
-Upgrading from OpenShell 0.0.x to 0.1.0? Start with the section that matches how you use the platform.
+<Warning>
+Local OpenShell 0.0.x installations cannot be upgraded in place. Clean up the
+old runtime and [uninstall the existing package](/about/installation#uninstall-openshell)
+before installing OpenShell 0.1.0.
+</Warning>
 
-Each item links to the pull request that defines the change.
+OpenShell 0.1.0 introduces breaking changes for deployments, sandboxes, policies, APIs, and SDKs. Review the changes that apply to your role before upgrading:
+
+- [Operators](#operators): Plan the rollout, migrate configuration and credentials, and update custom extensions.
+- [End users](#end-users): Update sandbox workflows, policies, API clients, and SDK integrations.
 
 ## Operators
 
@@ -26,7 +33,7 @@ If you run OpenShell for a team, start here.
   openshell profile import --from ./profiles --global
   ```
 
-- **Migrate `gateway.toml` to schema version 2.** Add the version, replace the plural compute-driver selector, move driver settings under `[openshell.drivers.<name>]`, and apply the renamed Docker, Podman, and VM fields. Validate the file before restarting. See [Gateway Configuration](/reference/gateway-config#migrate-to-schema-version-2) for the complete field mapping and [PR #2814](https://github.com/NVIDIA/OpenShell/pull/2814) for the implementation.
+- **Migrate `gateway.toml` to schema version 2.** Add the version, replace the plural compute-driver selector, move driver settings under `[openshell.drivers.<name>]`, and apply the renamed Docker, Podman, and VM fields. Validate the file before restarting. See [Gateway Configuration](/how-it-works/gateways/configuration#migrate-to-schema-version-2) for the complete field mapping and [PR #2814](https://github.com/NVIDIA/OpenShell/pull/2814) for the implementation.
 
   ```toml
   [openshell]
@@ -61,7 +68,7 @@ If you run OpenShell for a team, start here.
 
 - **Install the workspace chart in operator-managed namespaces.** In operator workspace mode, the gateway receives Secret permissions only from the `openshell-workspace` chart. Install the matching chart release in every operator-managed namespace; without it, sandbox bootstrap fails ([PR #3616](https://github.com/NVIDIA/OpenShell/pull/3616)).
 
-- **Implement extension protocol negotiation.** Custom compute drivers, credential drivers, gateway interceptors, and middleware must exchange `PeerMetadata`, use protocol `1.0`, and advertise their family base capability. Upgrade both peers together. See [Extension Protocol Negotiation](/extensibility/extension-negotiation) and [PR #3352](https://github.com/NVIDIA/OpenShell/pull/3352).
+- **Implement extension protocol negotiation.** Custom compute drivers, credential drivers, gateway interceptors, and middleware must exchange `PeerMetadata`, use protocol `1.0`, and advertise their family base capability. Upgrade both peers together. See [Extension Protocol Negotiation](/extensibility/overview#protocol-negotiation) and [PR #3352](https://github.com/NVIDIA/OpenShell/pull/3352).
 
 - **Remove compute-driver callback-listener negotiation.** Regenerate custom compute-driver bindings and connect supervisors to the operator-configured primary gateway endpoint ([PR #3365](https://github.com/NVIDIA/OpenShell/pull/3365)).
 
@@ -85,7 +92,7 @@ If you use OpenShell through the CLI, policies, APIs, or SDKs, review these chan
 
 - **Name providers explicitly.** A trailing sandbox command no longer infers or attaches a provider. Pass `--provider <name>`, and ask the operator to import the referenced profile when it is missing ([PR #3383](https://github.com/NVIDIA/OpenShell/pull/3383)).
 
-- **Replace managed inference routes.** The `openshell inference` commands, route APIs, and `inference.local` endpoint are removed. Attach a provider to each sandbox and call its native endpoint with its native model and request format. See [Migrate from Managed Inference Routes](/sandboxes/inference-routing#migrate-from-managed-inference-routes) and [PR #3195](https://github.com/NVIDIA/OpenShell/pull/3195).
+- **Replace managed inference routes.** The `openshell inference` commands, route APIs, and `inference.local` endpoint are removed. Attach a provider to each sandbox and call its native endpoint with its native model and request format. See [Migrate from Managed Inference Routes](/how-it-works/inference#migrate-from-managed-inference-routes) and [PR #3195](https://github.com/NVIDIA/OpenShell/pull/3195).
 
 - **Remove `NetworkBinary.harness`.** In authored policies, keep each binary as an object containing only `path`, such as `- path: /usr/bin/curl`. In provider profiles, write binaries as scalar paths such as `- /usr/bin/curl` ([PR #3222](https://github.com/NVIDIA/OpenShell/pull/3222)).
 
@@ -97,15 +104,15 @@ If you use OpenShell through the CLI, policies, APIs, or SDKs, review these chan
 
 - **Send the negotiated MCP version.** MCP clients must include one `MCP-Protocol-Version` header on each post-initialization request, and the endpoint policy must allow that revision ([PR #3241](https://github.com/NVIDIA/OpenShell/pull/3241)).
 
-- **Select workspaces explicitly.** Regenerate clients for `WorkspaceSelector`, and select the literal `default` workspace when appropriate. Omission no longer selects it. See [Manage Workspaces](/sandboxes/manage-workspaces) and [PR #3245](https://github.com/NVIDIA/OpenShell/pull/3245).
+- **Select workspaces explicitly.** Regenerate clients for `WorkspaceSelector`, and select the literal `default` workspace when appropriate. Omission no longer selects it. See [Manage Workspaces](/how-it-works/workspaces) and [PR #3245](https://github.com/NVIDIA/OpenShell/pull/3245).
 
 - **Use canonical resource names.** Public sandbox RPCs accept a sandbox name plus its workspace instead of an internal sandbox ID. Update renamed request and JSON fields such as `sandbox`, `provider`, and `name` ([PR #3272](https://github.com/NVIDIA/OpenShell/pull/3272)).
 
-- **Use protobuf time types.** Replace scalar millisecond, second, and string fields with `google.protobuf.Timestamp` and `google.protobuf.Duration`. Preserve the distinction between an absent field and a zero value. See [Protobuf Time Types](/reference/protobuf-time-types) and [PR #3113](https://github.com/NVIDIA/OpenShell/pull/3113).
+- **Use protobuf time types.** Replace scalar millisecond, second, and string fields with `google.protobuf.Timestamp` and `google.protobuf.Duration`. Preserve the distinction between an absent field and a zero value. See [Protobuf Time Types](/sdk/protobuf-time-types) and [PR #3113](https://github.com/NVIDIA/OpenShell/pull/3113).
 
 - **Replace offset pagination.** Send `page_size` and the opaque `page_token`, then continue while `next_page_token` is non-empty. Curated SDK list methods may return lazy, single-pass pagers; use `list_all` or `ListAll` only when the full collection is required ([PR #3249](https://github.com/NVIDIA/OpenShell/pull/3249), [PR #3256](https://github.com/NVIDIA/OpenShell/pull/3256), [PR #3279](https://github.com/NVIDIA/OpenShell/pull/3279)).
 
-- **Handle typed deletion outcomes.** Replace `deleted`, `removed`, and `revoked` booleans with `DeletionOutcome`. Treat `ACCEPTED` as asynchronous, use the returned sandbox ID when waiting, and set `allow_missing` only when absence is acceptable. See [SDK Migration for Deletion](/reference/api-errors#sdk-migration-for-deletion) and [PR #3317](https://github.com/NVIDIA/OpenShell/pull/3317).
+- **Handle typed deletion outcomes.** Replace `deleted`, `removed`, and `revoked` booleans with `DeletionOutcome`. Treat `ACCEPTED` as asynchronous, use the returned sandbox ID when waiting, and set `allow_missing` only when absence is acceptable. See [SDK Migration for Deletion](/sdk/api-errors#sdk-migration-for-deletion) and [PR #3317](https://github.com/NVIDIA/OpenShell/pull/3317).
 
 - **Update SDK error handling.** Python clients raise `GatewayError`, which is a `grpc.RpcError` but not a `grpc.Call`. Rust error variants contain additional status fields. SDKs expose retry details but do not automatically retry mutations ([PR #3313](https://github.com/NVIDIA/OpenShell/pull/3313)).
 

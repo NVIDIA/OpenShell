@@ -9,10 +9,6 @@ position: 1
 ---
 
 <Warning>
-The OpenShell Helm chart is experimental and under active development. Templates, values, and defaults can change between releases. Do not use it in production.
-</Warning>
-
-<Warning>
 Your cluster MUST use a CNI that enforces Kubernetes `NetworkPolicy` for both
 ingress and egress in every sandbox namespace. OpenShell creates the policies,
 but Kubernetes accepts them even when no CNI enforces them. Without enforcement,
@@ -20,7 +16,21 @@ sandbox workloads may reach the network directly and bypass supervisor policy.
 Verify CNI support before installing OpenShell.
 </Warning>
 
-Use the Kubernetes deployment when the gateway should run on a shared cluster, in a cloud environment, or as part of team infrastructure. The Helm chart handles PKI bootstrap, RBAC, sandbox namespace setup, and the gateway workload. It uses a StatefulSet by default for the SQLite database, and can render a Deployment when `server.externalDbSecret` points at an external database.
+![OpenShell on Kubernetes: the gateway provisions a Sandbox resource, separate supervisor and workload Pods, a boundary Service, NetworkPolicy, and a workspace PVC.](../images/openshell-kubernetes-runtime.svg)
+
+The gateway's Kubernetes compute driver creates a `Sandbox` resource and a
+separate supervisor Pod. The Agent Sandbox controller creates the workload Pod
+from that resource. A Service gives the supervisor a stable address for the
+workload's authenticated TLS boundary, and a PVC preserves `/sandbox` across
+Pod restarts. The gateway can run in the same namespace as these resources or
+in a separate namespace.
+
+The supervisor opens the boundary connection and maintains an outbound session
+to the gateway. A `NetworkPolicy` allows only supervisor ingress to the
+workload's boundary port and denies new workload-initiated connections. Agent
+network requests return on the established channel; the supervisor evaluates
+policy and opens approved upstream connections. For the trust boundaries and
+request flow, see [Architecture](/about/architecture).
 
 ## Prerequisites
 
@@ -163,7 +173,7 @@ helm upgrade --install openshell \
 The driver stores every credential in that namespace, in every workspace mode.
 The gateway receives Secret permissions through a Role in that namespace only. For
 the full set of options, refer to the
-[gateway configuration reference](/reference/gateway-config#credential-drivers).
+[gateway configuration reference](/how-it-works/gateways/configuration#credential-drivers).
 
 ## Wait for the gateway to be ready
 
@@ -244,12 +254,6 @@ The most commonly changed values are:
 | `pkiInitJob.serverDnsNames` / `certManager.serverDnsNames` | Additional gateway server DNS SANs. Wildcard SANs also enable sandbox service URLs under that domain. |
 | `supervisor.sandboxRuntime.boundaryPort` | Non-privileged TLS port used between paired supervisor and sandbox Pods. |
 | `upstreamProxy` | Operator-owned corporate HTTP forward proxy for policy-approved TLS egress. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
-
-### Run multiple gateway replicas
-
-Use a Deployment and shared PostgreSQL to run more than one gateway replica.
-Refer to [High Availability](/kubernetes/high-availability) for the database
-Secret, Helm values, pod placement, verification, and failover behavior.
 
 Use a values file for repeatable deployments:
 
@@ -368,9 +372,8 @@ The gateway exposes `/healthz` for process liveness and `/readyz` for dependency
 
 ## Next Steps
 
-- Kubernetes sandboxes use separate workload and directly managed supervisor Pods; refer to [Sandbox runtime](/kubernetes/sandbox-runtime).
 - To run multiple gateway replicas, refer to [High Availability](/kubernetes/high-availability).
 - To enable automatic certificate rotation with cert-manager, refer to [Managing Certificates](/kubernetes/managing-certificates).
 - To expose the gateway externally without port-forwarding, refer to [Ingress](/kubernetes/ingress).
 - To configure OIDC or reverse-proxy authentication, refer to [Access Control](/kubernetes/access-control).
-- To create your first sandbox, refer to [Manage Sandboxes](/sandboxes/manage-sandboxes).
+- To create your first sandbox, refer to [Manage Sandboxes](/how-it-works/sandboxes/overview).

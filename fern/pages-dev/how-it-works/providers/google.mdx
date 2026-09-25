@@ -1,0 +1,375 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Google"
+sidebar-title: "Google"
+description: "Authenticate with Google Cloud APIs and Vertex AI inside OpenShell sandboxes."
+keywords: "Generative AI, Google Cloud, Vertex AI, GCP, OAuth2, Credentials, Sandbox"
+---
+
+The `google-cloud` provider gives sandboxes native GCP credentials so
+any Google Cloud SDK works out of the box — Cloud Storage, BigQuery, Drive,
+Maps, Discovery Engine, or any other GCP API. A GCE metadata server emulator
+on loopback provides credential placeholders that the
+sandbox proxy resolves to real tokens at request time. The sandbox process
+never holds a real GCP credential.
+
+## Quick Start
+
+Import the `google-cloud` profile first; a gateway serves only the profiles you
+imported:
+
+```shell
+openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/google-cloud.yaml --global
+```
+
+If you already have `gcloud` configured with Application Default Credentials,
+create a provider with automatic credential refresh in one command:
+
+```shell
+openshell provider create \
+  --name my-gcp \
+  --type google-cloud \
+  --from-gcloud-adc \
+  --config project_id="$(gcloud config get-value project)" \
+  --config region=global
+```
+
+`--from-gcloud-adc` reads your ADC file, configures OAuth2 refresh on the
+gateway, and mints the first access token before the command returns. The
+gateway rotates the token automatically — no manual refresh needed.
+
+## Authentication Flows
+
+Two credential flows are supported. Choose based on your environment.
+
+### Application Default Credentials (gcloud ADC)
+
+Use credentials from `gcloud auth application-default login`. The gateway
+exchanges the refresh token for short-lived access tokens automatically.
+
+```shell
+openshell provider create \
+  --name my-gcp \
+  --type google-cloud \
+  --config project_id=my-project \
+  --config region=us-central1 \
+  --credential GCP_ADC_ACCESS_TOKEN=placeholder
+```
+
+Configure credential refresh with the ADC JSON fields:
+
+```shell
+openshell provider refresh configure my-gcp \
+  --credential-key GCP_ADC_ACCESS_TOKEN \
+  --strategy oauth2-refresh-token \
+  --material client_id=YOUR_CLIENT_ID \
+  --material client_secret=YOUR_CLIENT_SECRET \
+  --material refresh_token=YOUR_REFRESH_TOKEN \
+  --secret-material-key client_secret \
+  --secret-material-key refresh_token
+```
+
+Find these values in your ADC file at
+`~/.config/gcloud/application_default_credentials.json`.
+
+Trigger the first token mint:
+
+```shell
+openshell provider refresh rotate my-gcp \
+  --credential-key GCP_ADC_ACCESS_TOKEN
+```
+
+### Service Account Key
+
+Use a GCP service account JSON key file. The gateway signs JWTs and
+exchanges them for access tokens using the `google-service-account-jwt`
+strategy.
+
+```shell
+openshell provider create \
+  --name my-gcp \
+  --type google-cloud \
+  --config project_id=my-project \
+  --config region=us-central1 \
+  --credential GCP_SA_ACCESS_TOKEN=placeholder
+```
+
+```shell
+openshell provider refresh configure my-gcp \
+  --credential-key GCP_SA_ACCESS_TOKEN \
+  --strategy google-service-account-jwt \
+  --material client_email=sa@my-project.iam.gserviceaccount.com \
+  --material private_key="$(jq -r .private_key /path/to/sa-key.json)" \
+  --secret-material-key private_key
+```
+
+```shell
+openshell provider refresh rotate my-gcp \
+  --credential-key GCP_SA_ACCESS_TOKEN
+```
+
+## Configuration Keys
+
+Set these with `--config key=value` during provider creation:
+
+| Key | Description | Example |
+|-----|-------------|---------|
+| `project_id` | GCP project ID | `my-project-123` |
+| `region` | GCP region | `us-central1` |
+| `service_account_email` | SA email for metadata endpoint | `sa@proj.iam.gserviceaccount.com` |
+
+## How It Works
+
+When a sandbox starts with the `google-cloud` provider attached:
+
+1. The gateway mints a fresh GCP access token and stores it in the
+   sandbox proxy's credential resolver.
+2. A loopback HTTP server on `127.0.0.1:8174` emulates the GCE instance
+   metadata API, serving **credential placeholders** (not real tokens) to
+   GCP SDKs. The sandbox process never holds a real GCP credential.
+3. When the SDK makes an API call, it sends the placeholder in the
+   `Authorization` header. The sandbox proxy TLS-terminates the
+   outbound connection, resolves the placeholder to the real token,
+   and forwards the request to GCP.
+4. When the token approaches expiry, the gateway refreshes it. The
+   proxy's resolver is updated atomically — subsequent API calls
+   use the new token automatically.
+
+Configuration values (`project_id`, `region`, `service_account_email`)
+are **visible in plain text** inside the sandbox — they appear as
+environment variables and are served by the metadata endpoint. These are
+non-secret identifiers, not credentials. Access tokens are never exposed;
+only placeholders reach the sandbox process.
+
+### Injected Environment Variables
+
+The provider automatically injects these into the sandbox. Non-secret
+vars are resolved to real values at process spawn time; token vars stay
+as placeholders for proxy-time resolution.
+
+| Variable | Value | Purpose |
+|----------|-------|---------|
+| `GCE_METADATA_HOST` | `127.0.0.1:8174` | GCP SDK metadata discovery (loopback server) |
+| `GCE_METADATA_IP` | `127.0.0.1:8174` | Python google-auth ping detection |
+| `METADATA_SERVER_DETECTION` | `assume-present` | Node.js gcp-metadata skip detection |
+| `GCP_PROJECT_ID` | from `project_id` config | GCP SDK project |
+| `GOOGLE_CLOUD_PROJECT` | from `project_id` config | Alternative project var |
+| `CLOUD_ML_REGION` | from `region` config | GCP region |
+| `GCP_LOCATION` | from `region` config | Alternative region var |
+
+## Using with GCP APIs
+
+The metadata emulator serves tokens with the `cloud-platform` OAuth2 scope,
+which grants access to any GCP API the underlying service account has IAM
+permissions for. Add the target API hosts to your sandbox network policy:
+
+```yaml
+network_policies:
+  gcp_apis:
+    name: gcp-apis
+    endpoints:
+      - host: "*.googleapis.com"
+        port: 443
+        protocol: rest
+        access: read-write
+        enforcement: enforce
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/node }
+      - { path: "/sandbox/.uv/python/**" }
+      - { path: "/sandbox/.venv/**" }
+```
+
+Or update a live sandbox directly:
+
+```shell
+openshell policy update my-sandbox \
+  --add-endpoint "*.googleapis.com:443:read-write:rest:enforce" \
+  --binary "/usr/bin/curl" \
+  --binary "/usr/bin/node" \
+  --binary "/sandbox/.uv/python/**" \
+  --binary "/sandbox/.venv/**" \
+  --wait
+```
+
+## Network Policy
+
+The `google-cloud` provider type does not include any network policy
+endpoints by default. You must add endpoint rules to your sandbox policy
+for each GCP API the sandbox needs to reach. See "Using with GCP APIs"
+above for an example.
+
+## Vertex AI
+
+The `google-vertex-ai` provider gives selected sandboxes access to native
+Google Vertex AI endpoints. OpenShell keeps refresh bootstrap material at the
+gateway, rotates short-lived access tokens, and resolves token placeholders
+only at endpoints authorized by the provider profile.
+
+OpenShell does not choose a model or transform a request. The workload uses the
+native Vertex endpoint and request format for its selected model.
+
+### Prerequisites
+
+- A GCP project with the Vertex AI API enabled.
+- A service account with the Vertex AI User role and a downloaded JSON key for
+  production, or gcloud Application Default Credentials for local development.
+- Access to the selected model in the intended Vertex region.
+
+### Create a Vertex AI Provider
+
+Import the `google-vertex-ai` profile first:
+
+```shell
+openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/google-vertex-ai.yaml --global
+```
+
+#### Service Account Key
+
+Create the provider with the JSON key as gateway-only bootstrap material:
+
+```shell
+openshell provider create \
+  --name vertex-prod \
+  --type google-vertex-ai \
+  --credential GOOGLE_SERVICE_ACCOUNT_KEY="$(cat /path/to/key.json)" \
+  --config VERTEX_AI_PROJECT_ID=my-gcp-project \
+  --config VERTEX_AI_REGION=us-central1
+```
+
+Configure gateway-managed refresh:
+
+```shell
+openshell provider refresh configure vertex-prod \
+  --credential-key GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN \
+  --strategy google-service-account-jwt \
+  --material client_email="sa@my-gcp-project.iam.gserviceaccount.com" \
+  --material private_key="$(jq -r .private_key /path/to/key.json)" \
+  --secret-material-key private_key
+```
+
+The private key remains in the gateway credential store. Sandboxes receive
+only an opaque placeholder for the short-lived access token.
+
+#### gcloud Application Default Credentials
+
+For local development:
+
+```shell
+gcloud auth application-default login
+
+openshell provider create \
+  --name vertex-local \
+  --type google-vertex-ai \
+  --from-gcloud-adc \
+  --config VERTEX_AI_PROJECT_ID=my-gcp-project \
+  --config VERTEX_AI_REGION=us-central1
+```
+
+`--from-gcloud-adc` reads authorized-user ADC, configures an OAuth2 refresh
+grant at the gateway, and immediately mints `GOOGLE_VERTEX_AI_TOKEN`. The ADC
+file and refresh token do not enter the sandbox.
+
+### Vertex AI Configuration Keys
+
+| Key | Required | Default | Description |
+|---|---|---|---|
+| `VERTEX_AI_PROJECT_ID` | Yes | — | GCP project ID exposed as non-secret workload configuration. |
+| `VERTEX_AI_REGION` | No | `us-central1` | Vertex location exposed as non-secret workload configuration. |
+
+When the provider is attached, OpenShell also projects standard project and
+location aliases such as `GOOGLE_CLOUD_PROJECT`, `ANTHROPIC_VERTEX_PROJECT_ID`,
+`CLOUD_ML_REGION`, and `VERTEX_LOCATION`.
+
+### Attach the Vertex AI Provider
+
+Attach it while creating a sandbox:
+
+```shell
+openshell sandbox create \
+  --from registry.example.com/team/agent:1.0 \
+  --name vertex-agent \
+  --provider vertex-local
+```
+
+Or attach it to an existing sandbox:
+
+```shell
+openshell sandbox provider attach vertex-agent vertex-local
+```
+
+Launch a new process after runtime attachment so it receives the provider
+environment. Existing processes do not gain newly attached environment
+variables.
+
+### Call the Native Vertex API
+
+Claude models use Vertex's publisher-model endpoint. Run a request from a new
+sandbox process:
+
+```shell
+openshell sandbox exec vertex-agent -- sh -lc '
+  token=${GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN:-$GOOGLE_VERTEX_AI_TOKEN}
+  curl -X POST \
+    -H "Authorization: Bearer $token" \
+    -H "Content-Type: application/json" \
+    -d '\''{
+      "anthropic_version":"vertex-2023-10-16",
+      "max_tokens":1024,
+      "messages":[{"role":"user","content":"Hello"}]
+    }'\'' \
+    "https://${CLOUD_ML_REGION}-aiplatform.googleapis.com/v1/projects/${GOOGLE_CLOUD_PROJECT}/locations/${CLOUD_ML_REGION}/publishers/anthropic/models/claude-sonnet-4-6:rawPredict"
+'
+```
+
+Use the model ID and location supported by your GCP project. For `global`, `us`,
+or `eu`, use the corresponding Google-documented hostname instead of the
+regional `<location>-aiplatform.googleapis.com` form.
+
+Gemini and third-party models use their documented native or
+OpenAI-compatible Vertex endpoints. Configure the model, URL, streaming mode,
+and timeout in the client. OpenShell does not rewrite them.
+
+### Verify and Troubleshoot Vertex AI
+
+Inspect the attachment and effective policy:
+
+```shell
+openshell sandbox provider list vertex-agent
+openshell policy get vertex-agent --full
+openshell provider refresh status vertex-local
+```
+
+Common failures:
+
+- A missing token variable usually means the process started before provider
+  attachment. Launch a new process.
+- `connection not allowed by policy` means the provider endpoint or caller
+  binary is absent from the effective policy. A gateway global policy override
+  suppresses provider-derived entries.
+- `credential_endpoint_mismatch` means the request destination is outside the
+  provider profile's endpoint binding.
+- A Vertex 400 or 404 usually means the model, location, publisher path, or
+  request body does not match the native API.
+- A Vertex 401 or 403 can indicate an expired refresh grant or missing GCP IAM
+  permission. Check `provider refresh status` and the Vertex AI User role.
+
+Provider creation does not verify model access. The native request is the
+end-to-end check.
+
+### Migrate an Existing Vertex Route
+
+An earlier managed route stored the provider and model separately and rewrote
+requests for the workload. After upgrading, the provider and its refresh state
+remain, but the route does not.
+
+1. Attach the preserved Vertex provider to each intended sandbox.
+2. Launch new workload processes.
+3. Move the route's model and timeout into the client configuration.
+4. Change the client to the native Vertex endpoint and request format.
+5. Verify one non-streaming and one streaming native request before production
+   rollout.
+
+Do not attach the provider to every sandbox automatically. The old route was
+workspace-global; the replacement intentionally grants access per sandbox.

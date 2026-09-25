@@ -11,7 +11,7 @@ position: 1
 NVIDIA OpenShell is an open-source runtime for executing autonomous AI agents in sandboxed environments with kernel-level isolation. It combines sandbox runtime controls and a declarative YAML policy so teams can run agents without giving them unrestricted access to local files, credentials, and external networks.
 
 <Note>
-New in OpenShell 0.1.0 is a [stable release cadence](/about/installation#release-cadence), a stronger [security model](/about/how-it-works), and an expanded [extension surface](/extensibility/overview), along with much more.
+New in OpenShell 0.1.0: a [stable release cadence](/about/support-matrix#releases), new [isolation primitives](/about/architecture), and an expanded [extension surface](/extensibility/overview), along with much more.
 
 See our [upgrade guide](/upgrade/0-1-0) for everything that's changed.
 </Note>
@@ -42,7 +42,7 @@ OpenShell applies defense in depth across the following policy domains.
 | Process | Blocks privilege escalation and dangerous syscalls. | Locked at sandbox creation. |
 | Provider credentials | Resolves opaque credential placeholders only at profile-authorized endpoints. | Attachments, rotation, and revocation update at runtime; new environment variables require a new process. |
 
-For details, refer to [Customize Sandbox Policies](/sandboxes/policies) and [Default Policy](/reference/default-policy).
+For details, refer to [Customize Sandbox Policies](/how-it-works/policies/overview) and [Default Policy](/how-it-works/policies/default-policy).
 
 ## Common Use Cases
 
@@ -59,6 +59,6 @@ OpenShell supports a range of agent deployment patterns.
 
 Explore these topics to go deeper:
 
-- To understand the runtime architecture, refer to [How OpenShell Works](/about/how-it-works).
-- To prepare an image and launch an agent, refer to [Run Your First Agent](/about/run-an-agent).
-- To learn how OpenShell enforces policy controls across protection layers, refer to [Customize Sandbox Policies](/sandboxes/policies).
+- To understand the runtime architecture, refer to [Architecture](/about/architecture).
+- To prepare an image and launch an agent, refer to [Run Your First Agent](/about/run-your-first-agent).
+- To learn how OpenShell enforces policy controls across protection layers, refer to [Customize Sandbox Policies](/how-it-works/policies/overview).

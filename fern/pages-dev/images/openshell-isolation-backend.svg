@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="260" viewBox="0 0 1280 260" role="img" aria-labelledby="title desc">
+  <title id="title">OpenShell isolation backend</title>
+  <desc id="desc">The supervisor calls the IsolationBackend Rust interface. OpenShellRuntimeBackend implements that interface as a supervisor-side client and talks to openshell-sandbox, the workload-side server, over the OpenShell Sandbox Protocol.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#579000"/>
+    </marker>
+    <style>
+      .section { font: 700 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; letter-spacing: .08em; }
+      .label { font: 700 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .small { font: 500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .tiny { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .trusted { fill: #eff6ff; stroke: #3b82f6; stroke-width: 2.5; }
+      .line { fill: none; stroke: #334155; stroke-width: 2.5; marker-end: url(#arrow); }
+      .flow { fill: none; stroke: #579000; stroke-width: 3; marker-start: url(#arrow-green); marker-end: url(#arrow-green); }
+    </style>
+  </defs>
+
+  <rect width="1280" height="260" rx="20" fill="#ffffff"/>
+
+  <text x="45" y="50" class="section">TRUSTED</text>
+  <text x="1015" y="50" class="section">SANDBOX</text>
+
+  <!-- Supervisor process -->
+  <rect x="40" y="70" width="840" height="160" rx="18" fill="#f8fafc" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="65" y="98" class="tiny">SUPERVISOR PROCESS</text>
+
+  <rect x="65" y="115" width="200" height="90" rx="14" class="trusted"/>
+  <text x="165" y="155" text-anchor="middle" class="label">Supervisor</text>
+  <text x="165" y="180" text-anchor="middle" class="small">consumer</text>
+
+  <path d="M265 160 H345" class="line"/>
+  <text x="305" y="148" text-anchor="middle" class="tiny">CALLS</text>
+
+  <rect x="345" y="115" width="210" height="90" rx="14" class="box"/>
+  <text x="450" y="155" text-anchor="middle" class="label">IsolationBackend</text>
+  <text x="450" y="180" text-anchor="middle" class="small">shared interface</text>
+
+  <path d="M555 160 H625" class="line"/>
+  <text x="590" y="148" text-anchor="middle" class="tiny">IMPL</text>
+
+  <rect x="625" y="115" width="230" height="90" rx="14" class="trusted"/>
+  <text x="740" y="150" text-anchor="middle" style="font:700 16px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#111827">OpenShellRuntimeBackend</text>
+  <text x="740" y="180" text-anchor="middle" class="small">supervisor-side client</text>
+
+  <!-- Sandbox -->
+  <rect x="1010" y="70" width="230" height="160" rx="18" fill="#ffffff" stroke="#76b900" stroke-width="3" stroke-dasharray="10 7"/>
+  <rect x="1030" y="115" width="190" height="90" rx="14" class="box"/>
+  <text x="1125" y="155" text-anchor="middle" class="label">openshell-sandbox</text>
+  <text x="1125" y="180" text-anchor="middle" class="small">workload-side server</text>
+
+  <path d="M855 160 H1030" class="flow"/>
+  <text x="945" y="140" text-anchor="middle" class="tiny">SANDBOX</text>
+  <text x="945" y="190" text-anchor="middle" class="tiny">PROTOCOL</text>
+</svg>

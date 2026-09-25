@@ -3,130 +3,84 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Run Your First Agent"
 sidebar-title: "Run Your First Agent"
-description: "Prepare a sandbox image, provider profile, and policy for an AI agent or another autonomous workload."
+description: "Configure a provider, image, and policy to run an AI agent in an OpenShell sandbox."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Provider Profiles, Policies, Custom Images"
 position: 4
 ---
 
-OpenShell can run an AI agent or another autonomous command when its executable
-is available in the sandbox image. The image, provider profile, and policy
-define what the workload can execute and access. OpenShell does not require the
-agent to use a specific framework or model API.
+OpenShell can run any agent that is available in a sandbox image. Configure the
+agent's external services, choose its image and policy, then create the sandbox
+with the agent as its main process.
 
-## Prepare the Workload
+**1. Configure what the agent has access to.**
 
-An agent needs three pieces:
-
-| Requirement | Purpose |
-|---|---|
-| Sandbox image | Contains the agent executable and its runtime dependencies. |
-| Provider profile | Declares credential fields, service endpoints, and the executable paths allowed to use them. |
-| Sandbox policy | Controls filesystem access, process behavior, and network destinations beyond access contributed by attached providers. |
-
-Build and maintain an OCI image for each workload. Install the agent, shell,
-development tools, CA certificates, and language runtimes that the workload
-needs. Use pinned versions so you can review and reproduce image updates.
+A [provider profile](/how-it-works/providers/profiles) defines the credentials, service
+endpoints, and executable paths an agent may use. For Claude Code, review the
+[example profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/claude-code.yaml),
+including its executable paths for your image, then import it and
+[create a provider](/how-it-works/providers/overview#create-a-provider) that
+stores its credentials.
 
 ```shell
-docker build -t registry.example.com/team/agent:1.0 .
-docker push registry.example.com/team/agent:1.0
-openshell sandbox create --from registry.example.com/team/agent:1.0
+openshell profile import \
+  --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/claude-code.yaml
+
+openshell provider create \
+  --name claude-code \
+  --type claude-code \
+  --from-existing
 ```
 
-The `--from` option also accepts a local rootfs archive. It does not build a
-Dockerfile or directory. Refer to
-[Custom Containers](/sandboxes/manage-sandboxes#custom-containers) for image and
-runtime details. The fallback image contains no agent or development toolchain,
-so pass your image explicitly for agent workloads.
+Set `ANTHROPIC_API_KEY` before creating the provider. OpenShell stores its
+value in the credential store.
 
-## Prepare Provider Access
+**2. Configure the sandbox image.**
 
-A provider profile defines the credentials and endpoints an agent uses. The
-gateway serves only profiles that an administrator or user has imported.
-Review a profile before importing it, especially its executable paths and
-network endpoints.
+Build or select a [sandbox image](/how-it-works/sandboxes/overview#sandbox-images)
+containing Claude Code and every tool it needs:
 
 ```shell
-curl -LsSfO https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/claude-code.yaml
-openshell profile import -f claude-code.yaml --global
-ANTHROPIC_API_KEY=<your-key> \
-  openshell provider create --name my-claude --type claude-code --from-existing
+docker build -t agent:local .
 ```
 
-The repository includes example profiles in
-[`providers/`](https://github.com/NVIDIA/OpenShell/tree/main/providers). Copy
-and adapt an example when the agent binary is installed at another path or uses
-a different service endpoint. Refer to [Profiles](/providers/profiles) for the
-profile schema and import workflow.
+For a remote gateway, push the image to a registry that the gateway can pull
+from. Use an explicit version instead of a mutable tag for reproducible
+deployments.
 
-## Launch the Agent
+The built-in fallback policy grants access to the working directory and common
+runtime paths, and denies network egress unless an attached provider contributes
+an endpoint. Create a custom [sandbox policy](/how-it-works/policies/overview) when the
+agent needs more filesystem access, package registries, source hosts, tool
+servers, or other destinations.
 
-Pass the agent command after `--` and attach the provider instances it needs.
-For example, this command starts Claude Code from an image your team built with
-the `claude` executable installed:
+**3. Create the sandbox.**
+
+[Create the sandbox](/how-it-works/sandboxes/overview#create-a-sandbox), attach the
+provider, and pass the agent command after `--`:
 
 ```shell
 openshell sandbox create \
-  --from registry.example.com/team/claude-code:1.0 \
-  --provider my-claude \
+  --name my-agent \
+  --from agent:local \
+  --provider claude-code \
   -- claude
 ```
 
-The command before `--` configures the sandbox. The command after `--` becomes
-the sandbox's main process. OpenShell keeps the sandbox after that process exits
-unless you pass `--no-keep`.
+Add `--policy sandbox-policy.yaml` when the workload needs a custom policy. The
+command after `--` becomes the sandbox's main process, and every child process
+it starts remains inside the sandbox boundary.
 
-Use `--detach` for an unattended or long-running agent:
+## Examples
 
-```shell
-openshell sandbox create \
-  --name worker \
-  --detach \
-  --from my-registry.example.com/team/agent:latest \
-  --provider model-provider \
-  -- ./worker
-```
-
-Use a profile-backed provider for credentials that the agent should not read
-directly. Plain values passed with `--env` are visible to the agent process.
-
-## Build an Agent Image
-
-Prepare each agent as part of your normal container build and release process:
-
-1. Select a trusted base image and install the agent executable and tools.
-2. Create or adapt provider profiles for every external service the agent uses.
-3. Add policy rules for required files, child processes, package registries,
-   tool servers, and other network destinations.
-4. Build, scan, sign, and publish the image to a registry the gateway can pull.
-5. Launch the executable as the sandbox's main process.
-
-Provider profiles can contribute endpoint and executable rules to the effective
-policy. They do not grant unrelated network or filesystem access. Use
-[Customize Sandbox Policies](/sandboxes/policies) when the agent needs access
-beyond its attached providers.
-
-## Verify and Troubleshoot
-
-Inspect the sandbox, effective policy, provider attachments, and logs:
-
-```shell
-openshell sandbox list
-openshell policy get my-sandbox --full
-openshell sandbox provider list my-sandbox
-openshell logs my-sandbox --tail
-```
-
-If the executable is missing, change the sandbox image. If a provider request
-is denied, confirm that the profile names the actual endpoint and executable
-path. For another denied network or filesystem operation, update the sandbox
-policy after reviewing the requested access.
+For a complete worked example, follow [Run Pi in OpenShell](/tutorials/run-pi).
+The tutorial builds a Pi image, configures narrowly scoped Anthropic access,
+uploads a project, and starts the agent inside the sandbox boundary.
 
 ## Next Steps
 
 - For sandbox lifecycle, resources, templates, files, and connectivity, refer
-  to [Sandboxes](/sandboxes/manage-sandboxes).
+  to [Sandboxes](/how-it-works/sandboxes/overview).
 - For the restrictive fallback policy, refer to
-  [Default Policy](/reference/default-policy).
+  [Default Policy](/how-it-works/policies/default-policy).
 - For operating-system and runtime requirements, refer to the
-  [Support Matrix](/reference/support-matrix).
+  [Support Matrix](/about/support-matrix).

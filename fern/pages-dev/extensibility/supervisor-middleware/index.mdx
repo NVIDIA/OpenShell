@@ -76,13 +76,13 @@ A middleware service is a gRPC server that implements the services in [`proto/su
 
 <Warning>
 
-The middleware API is still evolving. Future versions will change it to make the contract consistent across HTTP requests, HTTP responses, and WebSocket messages. Expect to update your service when you upgrade OpenShell. [Protocol negotiation](/extensibility/extension-negotiation) detects incompatible versions at startup.
+The middleware API is still evolving. Future versions will change it to make the contract consistent across HTTP requests, HTTP responses, and WebSocket messages. Expect to update your service when you upgrade OpenShell. [Protocol negotiation](/extensibility/overview#protocol-negotiation) detects incompatible versions at startup.
 
 </Warning>
 
 Every middleware service implements these RPCs:
 
-- `Describe` returns the service manifest. The manifest lists the operations the service supports, with a payload limit and optional timeout for each. It also carries [protocol negotiation](/extensibility/extension-negotiation) metadata and the [expected audience](/extensibility/extension-authentication#confirm-the-audience-at-startup).
+- `Describe` returns the service manifest. The manifest lists the operations the service supports, with a payload limit and optional timeout for each. It also carries [protocol negotiation](/extensibility/overview#protocol-negotiation) metadata and the [expected audience](/extensibility/overview#confirm-the-audience-at-startup).
 - `ValidateConfig` checks the `config` object from a policy entry. The gateway calls it before it accepts a policy.
 
 The service then implements an evaluation RPC for each operation it supports, as described in [Supported Operations](/extensibility/supervisor-middleware/operations).
@@ -98,12 +98,12 @@ These guides cover the rest of the service contract:
 When OpenShell calls your service, what it receives, and what it can return for HTTP requests, HTTP responses, and WebSocket messages.
 </Card>
 
-<Card title="Extension Authentication" href="/extensibility/extension-authentication">
+<Card title="Extension Authentication" href="/extensibility/overview#authentication">
 
 How to verify that calls to your service come from your OpenShell gateway.
 </Card>
 
-<Card title="Protocol Negotiation" href="/extensibility/extension-negotiation">
+<Card title="Protocol Negotiation" href="/extensibility/overview#protocol-negotiation">
 
 How your service and OpenShell agree on a protocol version at startup.
 </Card>

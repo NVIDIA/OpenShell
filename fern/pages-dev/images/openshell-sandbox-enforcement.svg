@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="540" viewBox="0 0 1280 540" role="img" aria-labelledby="title desc">
+  <title id="title">OpenShell sandbox enforcement flow</title>
+  <desc id="desc">The sandbox workload and trusted supervisor are separate boundaries. All workload network egress is denied except the authenticated Sandbox Protocol connection to the supervisor.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#579000"/>
+    </marker>
+    <style>
+            .section { font: 700 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; letter-spacing: .08em; }
+      .label { font: 700 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .small { font: 500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .tiny { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .step { font: 700 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #ffffff; }
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .soft { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 2; }
+      .green { fill: #f2f9e8; stroke: #76b900; stroke-width: 2.5; }
+      .trusted { fill: #eff6ff; stroke: #3b82f6; stroke-width: 2.5; }
+      .dark { fill: #1f2937; stroke: #111827; stroke-width: 2; }
+      .flow { fill: none; stroke: #579000; stroke-width: 3; marker-end: url(#arrow-green); }
+      .blocked { fill: none; stroke: #c2413b; stroke-width: 2.5; stroke-dasharray: 8 7; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="540" rx="20" fill="#ffffff"/>
+
+  <g transform="translate(0,-50)">
+
+  <text x="45" y="100" class="section">SANDBOX · NETWORK ISOLATED</text>
+  <rect x="40" y="120" width="360" height="310" rx="18" fill="#ffffff" stroke="#76b900" stroke-width="3" stroke-dasharray="10 7"/>
+  <text x="65" y="150" class="tiny">CONTAINER · VM</text>
+  <rect x="75" y="205" width="125" height="94" rx="14" class="dark"/>
+  <text x="137" y="245" text-anchor="middle" style="font:700 20px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#fff">Agent</text>
+  <text x="137" y="270" text-anchor="middle" style="font:500 13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#d1d5db">process</text>
+  <rect x="240" y="190" width="130" height="124" rx="14" class="box"/>
+  <text x="305" y="230" text-anchor="middle" class="label">OpenShell</text>
+  <text x="305" y="254" text-anchor="middle" class="label">Sandbox</text>
+  <text x="305" y="282" text-anchor="middle" class="small">process owner</text>
+  <path d="M200 252 H240" class="flow"/>
+  <circle cx="220" cy="228" r="13" fill="#579000"/>
+  <text x="220" y="233" text-anchor="middle" class="step">1</text>
+  <text x="305" y="340" text-anchor="middle" class="small">TCP or DNS request</text>
+  <text x="305" y="360" text-anchor="middle" class="small">Identifies the program</text>
+  <path d="M137 299 V421" class="blocked"/>
+  <line x1="128" y1="421" x2="146" y2="439" stroke="#c2413b" stroke-width="3"/>
+  <line x1="146" y1="421" x2="128" y2="439" stroke="#c2413b" stroke-width="3"/>
+  <text x="160" y="410" class="tiny">ALL OTHER EGRESS DENIED</text>
+
+  <text x="525" y="190" text-anchor="middle" class="tiny">ONLY ALLOWED EGRESS</text>
+  <text x="525" y="215" text-anchor="middle" class="label">Sandbox Protocol</text>
+  <text x="525" y="238" text-anchor="middle" class="small">Unix socket · TCP · vsock</text>
+  <path d="M370 252 H680" class="flow"/>
+  <circle cx="525" cy="252" r="13" fill="#579000"/>
+  <text x="525" y="257" text-anchor="middle" class="step">2</text>
+
+  <text x="655" y="100" class="section">SUPERVISOR · TRUSTED</text>
+  <rect x="650" y="120" width="390" height="310" rx="18" class="trusted"/>
+  <rect x="680" y="190" width="150" height="124" rx="14" class="green"/>
+  <text x="755" y="230" text-anchor="middle" class="label">Isolation</text>
+  <text x="755" y="254" text-anchor="middle" class="label">backend</text>
+  <text x="755" y="282" text-anchor="middle" class="small">verifies boundary</text>
+  <rect x="860" y="190" width="150" height="124" rx="14" class="box"/>
+  <text x="935" y="230" text-anchor="middle" class="label">Policy</text>
+  <text x="935" y="254" text-anchor="middle" class="label">enforcement</text>
+  <text x="935" y="282" text-anchor="middle" class="small">policy · credentials</text>
+  <path d="M830 252 H860" class="flow"/>
+  <circle cx="845" cy="228" r="13" fill="#579000"/>
+  <text x="845" y="233" text-anchor="middle" class="step">3</text>
+  <text x="755" y="360" text-anchor="middle" class="small">Receives request with</text>
+  <text x="755" y="381" text-anchor="middle" class="small">trusted process identity</text>
+  <text x="935" y="360" text-anchor="middle" class="small">Checks destination, binary,</text>
+  <text x="935" y="381" text-anchor="middle" class="small">L7 rules, and credentials</text>
+
+  <rect x="1080" y="190" width="160" height="124" rx="14" class="box"/>
+  <text x="1160" y="230" text-anchor="middle" class="label">Upstream</text>
+  <text x="1160" y="254" text-anchor="middle" class="label">service</text>
+  <text x="1160" y="282" text-anchor="middle" class="small">approved connection</text>
+  <path d="M1010 252 H1080" class="flow"/>
+  <circle cx="1045" cy="228" r="13" fill="#579000"/>
+  <text x="1045" y="233" text-anchor="middle" class="step">4</text>
+
+  <text x="45" y="485" class="section">LAUNCH GATE</text>
+  <line x1="150" y1="520" x2="1130" y2="520" stroke="#cbd5e1" stroke-width="4"/>
+  <g>
+    <circle cx="180" cy="520" r="20" fill="#ffffff" stroke="#64748b" stroke-width="3"/>
+    <text x="180" y="555" text-anchor="middle" class="tiny">ATTACH</text>
+    <circle cx="380" cy="520" r="20" fill="#ffffff" stroke="#64748b" stroke-width="3"/>
+    <text x="380" y="555" text-anchor="middle" class="tiny">BOUND</text>
+    <circle cx="580" cy="520" r="20" fill="#f2f9e8" stroke="#76b900" stroke-width="4"/>
+    <text x="580" y="555" text-anchor="middle" class="tiny">CONFIRMED</text>
+    <circle cx="780" cy="520" r="20" fill="#f2f9e8" stroke="#76b900" stroke-width="4"/>
+    <text x="780" y="555" text-anchor="middle" class="tiny">READY</text>
+    <circle cx="980" cy="520" r="20" fill="#76b900" stroke="#579000" stroke-width="4"/>
+    <text x="980" y="526" text-anchor="middle" class="step">✓</text>
+    <text x="980" y="555" text-anchor="middle" class="tiny">RUNNING</text>
+  </g>
+  <path d="M600 485 H950" stroke="#76b900" stroke-width="2"/>
+  <text x="775" y="477" text-anchor="middle" class="small">Agent cannot start until the boundary is confirmed</text>
+  </g>
+</svg>

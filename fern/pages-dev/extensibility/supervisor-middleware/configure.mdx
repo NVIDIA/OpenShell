@@ -53,16 +53,16 @@ timeout = "500ms"
 </ParamField>
 
 <ParamField path="audience" type="string" default="urn:openshell:extension:middleware:<name>">
-  Token audience. Refer to [Extension Authentication](/extensibility/extension-authentication).
+  Token audience. Refer to [Extension Authentication](/extensibility/overview#authentication).
 </ParamField>
 
 <ParamField path="allow_insecure_transport" type="boolean" default="false">
   Allows a plaintext `http://` endpoint with no authentication. Use it for local development or on a network that already authenticates callers.
 </ParamField>
 
-At startup, the gateway contacts every registered service to read its capabilities and verify [protocol compatibility](/extensibility/extension-negotiation). The gateway does not start if a service is unavailable or incompatible. [Gateway Configuration](/reference/gateway-config#supervisor-middleware-services) describes the full TOML context.
+At startup, the gateway contacts every registered service to read its capabilities and verify [protocol compatibility](/extensibility/overview#protocol-negotiation). The gateway does not start if a service is unavailable or incompatible. [Gateway Configuration](/how-it-works/gateways/configuration#supervisor-middleware-services) describes the full TOML context.
 
-When the gateway has JWT signing configured, OpenShell authenticates every call to your service with a short-lived token. [Extension Authentication](/extensibility/extension-authentication) describes how your service validates it.
+When the gateway has JWT signing configured, OpenShell authenticates every call to your service with a short-lived token. [Extension Authentication](/extensibility/overview#authentication) describes how your service validates it.
 
 ## Attach Middleware in Policy
 
@@ -161,7 +161,7 @@ The map key, such as `content-guard`, is the entry's stable identity in logs. Ea
   Display name. Defaults to the map key.
 </ParamField>
 
-[Policy Schema](/reference/policy-schema#network-middleware) lists every field and limit.
+[Policy Schema](/how-it-works/policies/schema#network-middleware) lists every field and limit.
 
 ## Choose Failure Behavior
 

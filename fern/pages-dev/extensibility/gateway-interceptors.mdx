@@ -49,7 +49,7 @@ An interceptor implements the `openshell.gateway_interceptor.v1.GatewayIntercept
 - `Evaluate` handles one selected operation phase.
 - `SnapshotProviderProfiles` optionally returns a provider profile catalog.
 
-`DescribeRequest` carries gateway protocol metadata, and `InterceptorManifest.extension` returns the interceptor's protocol and implementation metadata. The gateway rejects missing metadata, incompatible majors, and unmet required capabilities before it accepts bindings. See [Extension Protocol Negotiation](/extensibility/extension-negotiation).
+`DescribeRequest` carries gateway protocol metadata, and `InterceptorManifest.extension` returns the interceptor's protocol and implementation metadata. The gateway rejects missing metadata, incompatible majors, and unmet required capabilities before it accepts bindings. See [Extension Protocol Negotiation](/extensibility/overview#protocol-negotiation).
 
 Each `InterceptorEvaluation` identifies the configured interceptor, manifest binding, public OpenShell service and method, authenticated principal, and active phase. The phase determines whether the payload contains a proposed operation, optional current state, or committed response.
 
@@ -97,9 +97,9 @@ phases = ["validate"]
 
 The gateway supports `http://`, `https://`, and `unix://` interceptor endpoints. When gateway JWT signing is configured, authenticated network interceptors use `https://`; Unix sockets remain available for local integrations. HTTPS uses platform trust roots unless `tls_ca_cert_path` supplies a private CA, and normal hostname verification remains enabled. The gateway calls `Describe` and builds an immutable execution plan during startup. An unavailable service, invalid manifest, missing credential, or unauthorized configured binding prevents the gateway from starting.
 
-When gateway JWT signing is configured, the gateway authenticates every call to the interceptor with a short-lived token. [Extension Authentication](/extensibility/extension-authentication) describes how your service validates it. Set `allow_insecure_transport = true` to use a plaintext `http://` endpoint without authentication, for local development or on a network that already authenticates callers.
+When gateway JWT signing is configured, the gateway authenticates every call to the interceptor with a short-lived token. [Extension Authentication](/extensibility/overview#authentication) describes how your service validates it. Set `allow_insecure_transport = true` to use a plaintext `http://` endpoint without authentication, for local development or on a network that already authenticates callers.
 
-Registration is static. Restart the gateway after adding, removing, or changing an interceptor. See [Gateway Configuration](/reference/gateway-config#gateway-interceptors) for the complete field reference.
+Registration is static. Restart the gateway after adding, removing, or changing an interceptor. See [Gateway Configuration](/how-it-works/gateways/configuration#gateway-interceptors) for the complete field reference.
 
 ## Select RPCs and Phases
 
@@ -170,5 +170,5 @@ The gateway emits structured evaluation logs containing the interceptor name, bi
 - Only explicitly allowlisted unary write RPCs are interceptable. New gateway RPCs are non-interceptable until added to the allowlist.
 - `current_state` is available only in the `validate` contract. The gateway does not yet populate it with method-specific state.
 - Registration changes require a gateway restart.
-- Service health checks and runtime registration are not available. [Extension Authentication](/extensibility/extension-authentication#current-limitations) lists authentication limitations.
+- Service health checks and runtime registration are not available. [Extension Authentication](/extensibility/overview#current-limitations) lists authentication limitations.
 - Interceptors cannot receive or mutate protobuf fields marked secret.

@@ -8,71 +8,69 @@ navigation:
   - page: Why OpenShell
     path: ../pages-dev/about/overview.mdx
   - page: Architecture
-    path: ../pages-dev/about/how-it-works.mdx
+    path: ../pages-dev/about/architecture.mdx
   - page: Installation
     path: ../pages-dev/about/installation.mdx
   - page: Run Your First Agent
     path: ../pages-dev/about/run-an-agent.mdx
   - page: Support Matrix
-    path: ../pages-dev/reference/support-matrix.mdx
+    path: ../pages-dev/about/support-matrix.mdx
 - section: How It Works
-  slug: manage
+  slug: how-it-works
   contents:
   - section: Gateways
     slug: gateways
     contents:
     - page: Overview
-      path: ../pages-dev/sandboxes/manage-gateways.mdx
+      path: ../pages-dev/how-it-works/gateways/overview.mdx
     - page: Authentication
-      path: ../pages-dev/reference/gateway-auth.mdx
+      path: ../pages-dev/how-it-works/gateways/authentication.mdx
     - page: Configuration
-      path: ../pages-dev/reference/gateway-config.mdx
+      path: ../pages-dev/how-it-works/gateways/configuration.mdx
     - page: Container Deployment
-      path: ../pages-dev/reference/container-gateway.mdx
+      path: ../pages-dev/how-it-works/gateways/container-deployment.mdx
   - page: Workspaces
-    path: ../pages-dev/sandboxes/manage-workspaces.mdx
+    path: ../pages-dev/how-it-works/workspaces.mdx
   - section: Sandboxes
     slug: sandboxes
     contents:
     - page: Overview
-      path: ../pages-dev/sandboxes/manage-sandboxes.mdx
+      path: ../pages-dev/how-it-works/sandboxes/overview.mdx
+    - page: Templates
+      path: ../pages-dev/how-it-works/sandboxes/templates.mdx
     - page: Runtimes
-      path: ../pages-dev/reference/sandbox-compute-drivers.mdx
+      path: ../pages-dev/how-it-works/sandboxes/runtimes.mdx
   - section: Providers
     slug: providers
     contents:
     - page: Overview
-      path: ../pages-dev/sandboxes/manage-providers.mdx
+      path: ../pages-dev/how-it-works/providers/overview.mdx
     - page: Profiles
-      path: ../pages-dev/providers/profiles.mdx
+      path: ../pages-dev/how-it-works/providers/profiles.mdx
     - page: AWS
-      path: ../pages-dev/providers/aws-sigv4.mdx
+      path: ../pages-dev/how-it-works/providers/aws.mdx
     - page: Google
-      path: ../pages-dev/providers/google-cloud.mdx
+      path: ../pages-dev/how-it-works/providers/google.mdx
   - section: Policies
     slug: policies
     contents:
     - page: Overview
-      path: ../pages-dev/sandboxes/policies.mdx
+      path: ../pages-dev/how-it-works/policies/overview.mdx
     - page: Advisor
-      path: ../pages-dev/sandboxes/policy-advisor.mdx
+      path: ../pages-dev/how-it-works/policies/advisor.mdx
     - page: Schema
-      path: ../pages-dev/reference/policy-schema.mdx
+      path: ../pages-dev/how-it-works/policies/schema.mdx
     - page: Prover
-      path: ../pages-dev/reference/policy-prover.mdx
+      path: ../pages-dev/how-it-works/policies/prover.mdx
     - page: Default Policy
-      path: ../pages-dev/reference/default-policy.mdx
+      path: ../pages-dev/how-it-works/policies/default-policy.mdx
   - page: Inference
-    path: ../pages-dev/sandboxes/inference-routing.mdx
+    path: ../pages-dev/how-it-works/inference.mdx
 - section: Extensibility
   slug: extensibility
   contents:
   - page: Overview
     path: ../pages-dev/extensibility/overview.mdx
-  - page: Protocol Negotiation
-    path: ../pages-dev/extensibility/extension-negotiation.mdx
-  - page: Authentication
-    path: ../pages-dev/extensibility/extension-authentication.mdx
   - section: Supervisor Middleware
     slug: supervisor-middleware
     path: ../pages-dev/extensibility/supervisor-middleware/index.mdx
@@ -94,12 +92,14 @@ navigation:
 - section: Tutorials
   slug: tutorials
   contents:
+  - page: Run Pi
+    path: ../pages-dev/tutorials/run-pi.mdx
   - page: First Network Policy
-    path: ../pages-dev/get-started/tutorials/first-network-policy.mdx
+    path: ../pages-dev/tutorials/first-network-policy.mdx
   - page: GitHub Push Access
-    path: ../pages-dev/get-started/tutorials/github-sandbox.mdx
+    path: ../pages-dev/tutorials/github-sandbox.mdx
   - page: Microsoft Graph Provider Refresh
-    path: ../pages-dev/get-started/tutorials/microsoft-graph-provider-refresh.mdx
+    path: ../pages-dev/tutorials/microsoft-graph-provider-refresh.mdx
 - section: SDK Reference
   slug: sdk
   contents:
@@ -112,9 +112,9 @@ navigation:
   - page: TypeScript
     path: ../pages-dev/sdk/typescript.mdx
   - page: API Errors
-    path: ../pages-dev/reference/api-errors.mdx
+    path: ../pages-dev/sdk/api-errors.mdx
   - page: Protobuf Time Types
-    path: ../pages-dev/reference/protobuf-time-types.mdx
+    path: ../pages-dev/sdk/protobuf-time-types.mdx
 - folder: ../pages-dev/security
   title: Security
 - section: Upgrade Guides

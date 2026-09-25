@@ -3,95 +3,55 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Installation"
 sidebar-title: "Installation"
-description: "Install OpenShell, choose a sandbox runtime, and connect to a gateway."
+description: "Install OpenShell on a local workstation or Kubernetes."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Installation, Setup, Gateway, Docker, Podman, MicroVM, Kubernetes"
 position: 3
 ---
 
-Install OpenShell on a local workstation, choose the runtime that runs
-your sandboxes, and verify the package-managed gateway configuration.
+Install OpenShell on a local workstation or Kubernetes.
 
 ## Install OpenShell
 
-Install OpenShell with a single command:
+Install the CLI, policy prover, and a local gateway with one command:
 
 ```shell
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
-The script detects your operating system and installs the OpenShell CLI, standalone policy prover, and gateway. On Linux, it installs from the Snap Store when `snap` is available and `OPENSHELL_VERSION` is unset or `dev`. Explicit release tags and prereleases use the native Debian or RPM package. It then starts the local gateway server so you can begin creating sandboxes.
+The script picks a package for your platform and starts the gateway. Confirm the CLI can reach it:
 
-Snap installs use `latest/stable` by default and `latest/edge` when
-`OPENSHELL_VERSION=dev`. Set `OPENSHELL_VERSION` to a release tag to install
-that exact Debian or RPM version, even if `snap` is available.
+```shell
+openshell status
+```
 
-You can also download release artifacts directly from the [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
-
-Use `openshell status` to confirm the CLI can reach the gateway.
-
-## Release Cadence
-
-OpenShell publishes stable versions as coordinated release sets. The default
-installer selects the newest stable release, and the `latest` documentation
-channel follows that release. Use the same version of the gateway, compute and
-credential drivers, supervisors, CLI, and SDK clients together.
-
-Between stable releases, numbered prereleases such as `0.1.0-pre.3` provide
-evaluation checkpoints. Rolling development builds track successful releases
-from `main` and use versions such as `0.0.0-dev.<commit-sha>`. Prerelease and
-development builds may change before the next stable release; their matching
-documentation is published in the `dev` channel.
+To install a specific release, set `OPENSHELL_VERSION` to a release tag. Release artifacts are also on the [GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
 
 ## Supported Runtimes
 
-OpenShell supports several sandbox runtimes. Package-managed gateways leave the
-runtime unset by default so the gateway can auto-detect an available backend.
-Set `compute_driver` in the gateway TOML when you need to pin a specific
-runtime.
+The local gateway auto-detects an available runtime. To pin one, set `compute_driver` in the gateway TOML file. See [Sandbox Runtimes](/how-it-works/sandboxes/runtimes).
 
-| Runtime | How It Is Configured | System Requirements |
-|---|---|---|
-| Podman | The gateway is configured to create rootless Podman containers through the Podman API socket. | Linux with Podman 5.x, cgroups v2, rootless networking, and an active Podman user socket. |
-| Docker | The gateway is configured to create containers through Docker Desktop or Docker Engine. | Docker Desktop or Docker Engine 28.0 or later on the gateway host. |
-| MicroVM | The gateway is configured to create VM-backed sandboxes. | Host virtualization support. MicroVM uses Hypervisor.framework on macOS, KVM on Linux, and QEMU for GPU-backed sandboxes on Linux. |
-
-For detailed runtime behavior, refer to [Sandbox Runtimes](/reference/sandbox-compute-drivers). For gateway and sandbox operations, refer to [Gateways](/sandboxes/manage-gateways) and [Sandboxes](/sandboxes/manage-sandboxes).
+| Runtime | Requirements |
+|---|---|
+| Docker | Docker Desktop or Docker Engine 28.0 or later. |
+| Podman | Linux with Podman 5.x, cgroups v2, and an active Podman user socket. |
+| MicroVM | Host virtualization: Hypervisor.framework on macOS or KVM on Linux. |
 
 ## macOS
 
-On macOS, the install script uses Homebrew. The Homebrew package installs the `openshell` CLI, `openshell-prover`, the gateway binary, and a Homebrew-managed gateway service.
-
-The Homebrew service uses the gateway's built-in `127.0.0.1:17670` listener and generates a local mTLS bundle on install. The installer registers `https://localhost:17670` with the CLI so TLS uses a DNS name covered by the generated certificate. The formula creates a Homebrew prefix config, such as `/opt/homebrew/var/openshell/gateway.toml`, without overriding `bind_address`. Host-networked Docker Desktop and Podman Machine supervisors reuse the primary listener when they can reach host loopback. The gateway reads `~/.config/openshell/gateway.toml` instead when that file exists. Homebrew upgrades migrate exact package-generated schema-v1 prefix configs, including the affected IPv6 variant. They preserve edited prefix configs and all user configs. Follow the [schema version 2 migration steps](/reference/gateway-config#migrate-to-schema-version-2) for an edited v1 file.
-
-The CLI reads the client bundle from `~/.config/openshell/gateways/openshell/mtls/`.
-
-The installer starts the service for you. Use Homebrew service commands when you need to inspect, restart, or stop the gateway service:
+The script installs OpenShell with Homebrew and runs the gateway as a Homebrew service at `https://localhost:17670`.
 
 ```shell
 brew services list
 brew services restart openshell
 ```
 
+The gateway reads `~/.config/openshell/gateway.toml` if it exists, otherwise the Homebrew config at `$(brew --prefix)/var/openshell/gateway.toml`.
+
 ## Linux
 
-On Linux systems with the `snap` command, the install script uses the OpenShell
-snap when `OPENSHELL_VERSION` is unset or `dev`. Explicit release tags and the
-`pre` prerelease alias use Debian or RPM packages even when `snap` is available.
-For Snap installs, install and start Docker Engine from a system package or
-Docker's package repository first. The Docker snap is not currently compatible
-with OpenShell.
+The script uses the [Snap](#snap) package when `snap` is available. Otherwise, or when you set `OPENSHELL_VERSION` to a release tag, it installs a Debian package on Debian and Ubuntu or an RPM package on Fedora and RHEL. Linux packages require glibc 2.28 or newer.
 
-On Fedora and RHEL without `snap`, or when a release tag or `pre` is specified, the install script uses RPM packages. The RPMs install the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, and a systemd user service.
-
-On Debian and Ubuntu without `snap`, or when a release tag or `pre` is specified, the install script uses a Debian package. The Debian package installs the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, VM sandbox support, and a systemd user service.
-
-Linux packages require glibc 2.28 or newer. The installer checks libc before downloading packages and exits with an error on older glibc versions, Alpine, musl-based distributions, or unknown libc environments.
-
-The Linux user service listens on `https://127.0.0.1:17670` and generates a local mTLS bundle before the gateway starts. Debian uses built-in gateway defaults unless you create a config. RPM seeds `~/.config/openshell/gateway.toml` from its packaged Podman template on first start. RPM upgrades migrate only an unchanged package-generated schema-v1 file; they preserve edited files. Follow the [schema version 2 migration steps](/reference/gateway-config#migrate-to-schema-version-2) when upgrading an edited v1 configuration.
-
-The CLI reads the client bundle from `~/.config/openshell/gateways/openshell/mtls/`.
-
-The installer starts the service for you. Use systemd user commands when you need to inspect, restart, or stop the gateway service:
+The gateway runs as a systemd user service at `https://127.0.0.1:17670` and reads `~/.config/openshell/gateway.toml`.
 
 ```shell
 systemctl --user status openshell-gateway
@@ -99,7 +59,7 @@ systemctl --user restart openshell-gateway
 journalctl --user -u openshell-gateway -f
 ```
 
-To keep the user service running after logout, enable linger:
+To keep the gateway running after you log out, enable linger:
 
 ```shell
 sudo loginctl enable-linger $USER
@@ -107,74 +67,27 @@ sudo loginctl enable-linger $USER
 
 ## Snap
 
-The OpenShell snap requires a running Docker daemon. Docker can come from the
-distribution's Docker package, Docker's package repository, or another
-compatible non-Snap installation. The Docker snap is not currently compatible:
-its AppArmor confinement prevents OpenShell's hardened containers from starting.
-The installer exits without installing OpenShell when Docker is absent or the
-Docker snap is installed.
-
-The snap keeps gateway and CLI state in snap-specific directories and does not
-import state from a Debian, RPM, Homebrew, or manual installation. If the
-installer detects an existing non-snap OpenShell binary, it stops before
-installing the snap. Back up anything you need, clean up existing sandboxes and
-runtime resources, stop the non-snap gateway, and remove the old installation.
-After completing that cleanup, rerun the installer with
-`OPENSHELL_ACK_BREAKING_UPGRADE=1`.
-
-Install the OpenShell snap from the Snap Store:
+The snap requires Docker Engine installed from your distribution or Docker's package repository. The Docker snap is not compatible.
 
 ```shell
 sudo snap install openshell
 ```
 
-The install script installs `latest/stable` by default. Set
-`OPENSHELL_VERSION=dev` to install from `latest/edge`:
+The snap does not migrate existing Debian, RPM, or Homebrew installs. Remove any existing installation first, then rerun the script with `OPENSHELL_ACK_BREAKING_UPGRADE=1`.
+
+The gateway runs as a system service at `http://127.0.0.1:17670` and reads `/var/snap/openshell/common/gateway.toml`.
+
+<Warning>
+The snap gateway allows unauthenticated access from the local host. Any local user or process can operate it. Do not expose it beyond the local host.
+</Warning>
+
+Snap refreshes do not restart the gateway, so active sandboxes keep running. Restart it to pick up a new version:
 
 ```shell
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
-  OPENSHELL_VERSION=dev sh
+sudo systemctl restart snap.openshell.gateway
 ```
 
-The snap defines two apps: the `openshell` CLI and the `openshell.gateway`
-system service. Unlike the Debian and RPM user services, snapd runs this service
-as root. The gateway therefore generates its certificates in root-owned snap
-state, where ordinary users running the CLI cannot read the client certificate.
-For this reason, the snap disables TLS and listens only on
-`http://127.0.0.1:17670`. Its default configuration permits unauthenticated
-local CLI access. Sandbox connections still use gateway-minted credentials.
-
-The gateway stores its database at `$SNAP_COMMON/gateway.db` and its
-configuration at `$SNAP_COMMON/gateway.toml`, typically under
-`/var/snap/openshell/common/`. Initial snap installation creates the default
-configuration only when no configuration already exists.
-The install script applies the same default when it installs or refreshes a snap
-that has no existing gateway configuration, then restarts the gateway.
-
-Edit `$SNAP_COMMON/gateway.toml` when you need to override gateway settings,
-then restart the service. Do not expose the default plaintext gateway beyond
-the local host while unauthenticated user access is enabled. Any process or user
-on the same host that can connect to the loopback port can operate the gateway.
-
-The snap CLI stores per-user config, data, and state under `$SNAP_USER_COMMON`,
-typically `~/snap/openshell/common`. Gateway registrations live under
-`$SNAP_USER_COMMON/.config/openshell/gateways/` instead of
-`~/.config/openshell/gateways/`.
-
-### Snap store installs
-
-When installing OpenShell from the Snap Store, snapd automatically connects all
-required interfaces. The `docker` plug connects to the system `:docker` slot,
-which exposes the compatible Docker daemon installed on the host. The
-`log-observe` and `system-observe` plugs are also automatically connected
-through the OpenShell snap's store assertions.
-
-### Locally built snap packages
-
-To install a locally-built snap, one can install directly from a `.snap` file
-with the `--dangerous` flag to acknowledge that it has not been signed by the
-Snap Store. Thus, it lacks the store assertions which tell snapd to auto-
-connect the privileged interfaces, so they must be connected manually.
+To install a locally built snap, connect its interfaces manually:
 
 ```shell
 sudo snap install ./openshell_*.snap --dangerous
@@ -183,61 +96,58 @@ sudo snap connect openshell:system-observe
 sudo snap connect openshell:docker :docker
 ```
 
-The `log-observe` and `system-observe` plugs are needed for the gateway service
-to read logs and inspect system processes. The `docker` plug connects to the
-same system `:docker` slot used by Store installations.
-
-### Gateway service
-
-The gateway runs as a snap daemon with `refresh-mode: endure`, meaning snapd
-will not restart it during snap refreshes. This prevents the gateway from
-killing active sandbox sessions during automatic or direct snap refreshes.
-Restart the service manually after a direct `snap refresh` when you need the
-updated binary:
-
-```shell
-sudo systemctl restart snap.openshell.gateway
-```
-
-Rerunning `install.sh` explicitly refreshes the snap and restarts the gateway so
-the refreshed binary is active when installation completes. That restart
-interrupts active sandbox sessions.
-
 ## Kubernetes
 
-Kubernetes deployments use the OpenShell Helm chart. For step-by-step installation, refer to [Kubernetes Setup](/kubernetes/setup). For chart values and packaging details, refer to the [Helm chart README](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md).
+Deploy the gateway to a cluster with the OpenShell Helm chart. See [Kubernetes Setup](/kubernetes/setup).
 
-## Validate a package-managed gateway configuration
+## Validate Gateway Configuration
 
-Debian and Ubuntu packages validate the selected gateway configuration before
-generating local certificates or starting the service. Snap does the same before
-its gateway daemon starts. The validation never changes the file. If startup reports a legacy schema,
-malformed TOML, a symlink, or a nonregular configuration path, fix or manually
-migrate the operator-owned file instead of deleting it.
-
-Check the selected file before restarting a service:
+Check a gateway config file before restarting the service:
 
 ```shell
 openshell-gateway config preflight --path ~/.config/openshell/gateway.toml
 ```
 
-Without `--path`, preflight checks a nonempty `OPENSHELL_GATEWAY_CONFIG` or an
-auto-discovered XDG config; no config is also a successful result. It applies
-read-only startup validation to the effective selector, registered compute driver,
-driver configuration, socket, rate limits, TLS, interceptors, and middleware. If
-a selected file omits the selector, preflight validates configured tables for
-auto-detectable drivers without running socket or process-based detection probes.
-Wrappers can pass daemon arguments after `--` to validate the exact startup
-invocation. Debian keeps its bare service invocation and `gateway.env` semantics.
-Snap replays its effective daemon arguments through preflight and gives a nonempty
-`OPENSHELL_GATEWAY_CONFIG` precedence over `SNAP_COMMON/gateway.toml`.
-See [Gateway Configuration](/reference/gateway-config#gateway-config-preflight)
-for preflight details and manual schema-v1 migration steps.
+Preflight never changes the file. If the gateway reports a legacy schema, follow the [schema version 2 migration steps](/how-it-works/gateways/configuration#migrate-to-schema-version-2).
+
+## Uninstall OpenShell
+
+Homebrew:
+
+```shell
+brew services stop nvidia/openshell/openshell
+brew uninstall nvidia/openshell/openshell
+rm -rf "$(brew --prefix)/var/openshell"
+```
+
+Debian and Ubuntu:
+
+```shell
+systemctl --user disable --now openshell-gateway
+sudo apt remove openshell
+rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/openshell"
+```
+
+Fedora and RHEL:
+
+```shell
+systemctl --user disable --now openshell-gateway
+sudo dnf remove openshell-gateway openshell-prover openshell
+rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/openshell"
+```
+
+Snap:
+
+```shell
+sudo snap remove --purge openshell
+```
+
+Remove any custom config or database set through `OPENSHELL_GATEWAY_CONFIG` or `OPENSHELL_DB_URL` separately.
 
 ## Next Steps
 
-- To prepare an image and launch an agent, refer to [Run Your First Agent](/about/run-an-agent).
-- To run the gateway as a container without the installer, refer to [Running the Gateway as a Container](/reference/container-gateway).
-- To register, select, and inspect gateways, refer to [Gateways](/sandboxes/manage-gateways).
-- To supply API keys or tokens, refer to [Manage Providers](/sandboxes/manage-providers).
-- To control what the agent can access, refer to [Policies](/sandboxes/policies).
+- [Run Your First Agent](/about/run-your-first-agent) to prepare an image and launch an agent.
+- [Running the Gateway as a Container](/how-it-works/gateways/container-deployment) to skip the installer.
+- [Gateways](/how-it-works/gateways/overview) to register, select, and inspect gateways.
+- [Providers](/how-it-works/providers/overview) to supply API keys and tokens.
+- [Policies](/how-it-works/policies/overview) to control what the agent can access.

@@ -12,71 +12,69 @@ navigation:
   - page: "Why OpenShell"
     path: about/overview.mdx
   - page: "Architecture"
-    path: about/how-it-works.mdx
+    path: about/architecture.mdx
   - page: "Installation"
     path: about/installation.mdx
   - page: "Run Your First Agent"
     path: about/run-an-agent.mdx
   - page: "Support Matrix"
-    path: reference/support-matrix.mdx
+    path: about/support-matrix.mdx
 - section: "How It Works"
-  slug: manage
+  slug: how-it-works
   contents:
   - section: "Gateways"
     slug: gateways
     contents:
     - page: "Overview"
-      path: sandboxes/manage-gateways.mdx
+      path: how-it-works/gateways/overview.mdx
     - page: "Authentication"
-      path: reference/gateway-auth.mdx
+      path: how-it-works/gateways/authentication.mdx
     - page: "Configuration"
-      path: reference/gateway-config.mdx
+      path: how-it-works/gateways/configuration.mdx
     - page: "Container Deployment"
-      path: reference/container-gateway.mdx
+      path: how-it-works/gateways/container-deployment.mdx
   - page: "Workspaces"
-    path: sandboxes/manage-workspaces.mdx
+    path: how-it-works/workspaces.mdx
   - section: "Sandboxes"
     slug: sandboxes
     contents:
     - page: "Overview"
-      path: sandboxes/manage-sandboxes.mdx
+      path: how-it-works/sandboxes/overview.mdx
+    - page: "Templates"
+      path: how-it-works/sandboxes/templates.mdx
     - page: "Runtimes"
-      path: reference/sandbox-compute-drivers.mdx
+      path: how-it-works/sandboxes/runtimes.mdx
   - section: "Providers"
     slug: providers
     contents:
     - page: "Overview"
-      path: sandboxes/manage-providers.mdx
+      path: how-it-works/providers/overview.mdx
     - page: "Profiles"
-      path: providers/profiles.mdx
+      path: how-it-works/providers/profiles.mdx
     - page: "AWS"
-      path: providers/aws-sigv4.mdx
+      path: how-it-works/providers/aws.mdx
     - page: "Google"
-      path: providers/google-cloud.mdx
+      path: how-it-works/providers/google.mdx
   - section: "Policies"
     slug: policies
     contents:
     - page: "Overview"
-      path: sandboxes/policies.mdx
+      path: how-it-works/policies/overview.mdx
     - page: "Advisor"
-      path: sandboxes/policy-advisor.mdx
+      path: how-it-works/policies/advisor.mdx
     - page: "Schema"
-      path: reference/policy-schema.mdx
+      path: how-it-works/policies/schema.mdx
     - page: "Prover"
-      path: reference/policy-prover.mdx
+      path: how-it-works/policies/prover.mdx
     - page: "Default Policy"
-      path: reference/default-policy.mdx
+      path: how-it-works/policies/default-policy.mdx
   - page: "Inference"
-    path: sandboxes/inference-routing.mdx
+    path: how-it-works/inference.mdx
 - section: "Extensibility"
   slug: extensibility
   contents:
   - page: "Overview"
     path: extensibility/overview.mdx
-  - page: "Protocol Negotiation"
-    path: extensibility/extension-negotiation.mdx
-  - page: "Authentication"
-    path: extensibility/extension-authentication.mdx
   - section: "Supervisor Middleware"
     slug: supervisor-middleware
     path: extensibility/supervisor-middleware/index.mdx
@@ -98,12 +96,14 @@ navigation:
 - section: "Tutorials"
   slug: tutorials
   contents:
+  - page: "Run Pi"
+    path: tutorials/run-pi.mdx
   - page: "First Network Policy"
-    path: get-started/tutorials/first-network-policy.mdx
+    path: tutorials/first-network-policy.mdx
   - page: "GitHub Push Access"
-    path: get-started/tutorials/github-sandbox.mdx
+    path: tutorials/github-sandbox.mdx
   - page: "Microsoft Graph Provider Refresh"
-    path: get-started/tutorials/microsoft-graph-provider-refresh.mdx
+    path: tutorials/microsoft-graph-provider-refresh.mdx
 - section: "SDK Reference"
   slug: sdk
   contents:
@@ -116,9 +116,9 @@ navigation:
   - page: "TypeScript"
     path: sdk/typescript.mdx
   - page: "API Errors"
-    path: reference/api-errors.mdx
+    path: sdk/api-errors.mdx
   - page: "Protobuf Time Types"
-    path: reference/protobuf-time-types.mdx
+    path: sdk/protobuf-time-types.mdx
 - folder: security
   title: "Security"
 - section: "Upgrade Guides"

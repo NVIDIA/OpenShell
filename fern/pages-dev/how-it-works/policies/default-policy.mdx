@@ -1,0 +1,34 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Default Policy Reference"
+sidebar-title: "Default Policy"
+description: "Breakdown of the built-in default policy applied when you create an OpenShell sandbox without a custom policy."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Security, Policy"
+position: 2
+---
+
+When you create a sandbox without `--policy`, OpenShell applies a restrictive built-in fallback. The policy comes from the OpenShell runtime and does not depend on the selected workload image.
+
+## Filesystem Access
+
+The fallback includes the sandbox working directory and grants read-only access to standard runtime paths:
+
+- `/usr`
+- `/lib`
+- `/proc`
+- `/dev/urandom`
+- `/etc`
+- `/var/log`
+
+It grants read-write access to `/tmp` and `/dev/null`. Landlock enforcement uses `best_effort` compatibility so OpenShell can use the strongest ABI available on the host while retaining its mandatory baseline protections.
+
+## Network Access
+
+The fallback defines no network policies or provider-derived endpoints, so outbound network access is denied. Attach a provider or apply a custom policy that names the required endpoints and executable paths before running a networked agent.
+
+## Process Identity
+
+The fallback leaves process identity selection to the compute driver. Docker and Podman honor a non-root OCI `USER`; when an image declares no user, they use numeric UID and GID `1000`. Kubernetes and MicroVM drivers apply their configured non-root identities.
+
+Use `openshell policy get <sandbox> --full` to inspect the effective policy. Refer to [Customize Sandbox Policies](/how-it-works/policies/overview) to replace the fallback.
