@@ -522,6 +522,28 @@ mod tests {
     }
 
     #[test]
+    fn address_filter_drops_nat64_answers_wrapping_internal_ipv4() {
+        let plan = DestinationValidationPlan {
+            address_authorization: AddressAuthorization::DefaultPublicOnly,
+        };
+        let public: IpAddr = "64:ff9b::8c52:7003".parse().unwrap();
+        let private: IpAddr = "64:ff9b::a01:203".parse().unwrap();
+        let metadata: IpAddr = "64:ff9b::a9fe:a9fe".parse().unwrap();
+
+        let allowed =
+            filter_resolved_addresses(&plan, "dns64.example", 443, &[private, metadata, public])
+                .unwrap();
+        assert_eq!(allowed, vec![public]);
+
+        let exact = DestinationValidationPlan {
+            address_authorization: AddressAuthorization::ExactDeclaredHost,
+        };
+        let allowed =
+            filter_resolved_addresses(&exact, "dns64.example", 443, &[metadata, private]).unwrap();
+        assert_eq!(allowed, vec![private]);
+    }
+
+    #[test]
     fn address_filter_exact_host_allows_private_but_not_always_blocked() {
         let plan = DestinationValidationPlan {
             address_authorization: AddressAuthorization::ExactDeclaredHost,

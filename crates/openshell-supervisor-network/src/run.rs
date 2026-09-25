@@ -63,7 +63,8 @@ impl std::fmt::Debug for ProxyListenerConfig {
     }
 }
 
-pub use crate::policy_dns::PolicyDnsIpv6Egress;
+pub use openshell_core::PolicyDnsIpv6Egress;
+pub use openshell_core::net::nat64::Nat64Prefix;
 
 #[cfg(target_os = "linux")]
 pub struct TransparentRuntimeSetup {
@@ -295,6 +296,7 @@ pub async fn run_networking(
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
     additional_ca_bundle: Option<&str>,
     policy_dns_ipv6_egress: PolicyDnsIpv6Egress,
+    nat64_prefixes: Vec<Nat64Prefix>,
     host_gateway_ip: Option<IpAddr>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
     network_mediation_source: Option<Arc<NetworkMediationSource>>,
@@ -560,16 +562,25 @@ pub async fn run_networking(
         (None, None)
     };
 
+    // Register NAT64 prefixes before any egress path starts, so SSRF checks
+    // classify translated addresses by their embedded IPv4 address.
+    configure_nat64(nat64_prefixes).await;
+
     let mediated_policy_dns = if let Some(source) = network_mediation_source.clone() {
         let engine = opa_engine
             .cloned()
             .ok_or_else(|| miette::miette!("Mediated DNS requires an OPA engine"))?;
+        let ipv6_egress = crate::policy_dns::Ipv6EgressDecision::resolve(
+            policy_dns_ipv6_egress,
+            crate::policy_dns::DefaultRoutes::read(),
+        );
+        ocsf_emit!(ipv6_egress.event());
         Some(crate::policy_dns::PolicyDnsRuntime::start_mediated(
             engine,
             source,
             host_gateway_ip,
             crate::policy_dns::PolicyDnsRuntimeConfig::for_epoch(0)?
-                .with_ipv6_egress(policy_dns_ipv6_egress.resolve()),
+                .with_ipv6_egress(ipv6_egress.enabled),
             engine_ready_rx.clone(),
         )?)
     } else {
@@ -770,4 +781,29 @@ mod transparent_runtime_tests {
     fn generate_test_ca_pem() -> String {
         SandboxCa::generate().unwrap().cert_pem().to_string()
     }
+}
+
+/// Register configured NAT64 prefixes and discover the network's prefix
+/// through the trusted resolver, then report the prefixes in effect.
+async fn configure_nat64(configured: Vec<Nat64Prefix>) {
+    let setup = match crate::policy_dns::trusted_resolver_from_resolv_conf() {
+        Ok(server) => {
+            crate::policy_dns::Nat64Setup::apply(
+                configured,
+                &crate::policy_dns::SocketTrustedResolver::new(server),
+            )
+            .await
+        }
+        Err(error) => {
+            for prefix in &configured {
+                openshell_core::net::nat64::register_network_prefix(*prefix);
+            }
+            crate::policy_dns::Nat64Setup {
+                configured,
+                discovered: Vec::new(),
+                discovery_error: Some(error.to_string()),
+            }
+        }
+    };
+    ocsf_emit!(setup.event());
 }

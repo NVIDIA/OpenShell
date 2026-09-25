@@ -4283,14 +4283,16 @@ pub(crate) fn is_host_gateway_alias(host: &str) -> bool {
 /// Returns `true` if `ip` is a known cloud instance metadata endpoint that
 /// must never be exempted from SSRF blocking.
 ///
-/// IPv4-mapped IPv6 addresses (e.g. `::ffff:169.254.169.254`) are normalized
-/// to their embedded IPv4 representation before comparison, so the invariant
-/// holds regardless of how the address is represented.
+/// IPv4-mapped IPv6 addresses (e.g. `::ffff:169.254.169.254`) and NAT64
+/// addresses (e.g. `64:ff9b::a9fe:a9fe`) are normalized to their embedded IPv4
+/// representation before comparison, so the invariant holds regardless of how
+/// the address is represented.
 fn is_cloud_metadata_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(_) => CLOUD_METADATA_IPS.contains(&ip),
         IpAddr::V6(v6) => v6
             .to_ipv4_mapped()
+            .or_else(|| openshell_core::net::nat64::embedded_ipv4(v6))
             .is_some_and(|v4| CLOUD_METADATA_IPS.contains(&IpAddr::V4(v4))),
     }
 }
@@ -9433,6 +9435,325 @@ process:
         assert_eq!(connector.addrs(), [SocketAddr::new(upstream, 443)]);
     }
 
+    /// Mediation source fed by the test: DNS queries and TCP opens are handed
+    /// to the runtime exactly as an isolation backend would stage them.
+    struct ChannelMediationSource {
+        dns: tokio::sync::Mutex<
+            mpsc::UnboundedReceiver<openshell_isolation_interface::contract::PendingDnsQuery>,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl rpc_test::NetworkMediationSource for ChannelMediationSource {
+        async fn accept_tcp(
+            &self,
+        ) -> std::result::Result<
+            PendingTcpOpen,
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            std::future::pending().await
+        }
+
+        async fn accept_dns(
+            &self,
+        ) -> std::result::Result<
+            openshell_isolation_interface::contract::PendingDnsQuery,
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            self.dns.lock().await.recv().await.ok_or_else(|| {
+                openshell_isolation_interface::contract::BackendError::Unavailable(
+                    "test source closed".to_string(),
+                )
+            })
+        }
+    }
+
+    /// Trusted upstream DNS on 127.0.0.1 answering like a DNS64 resolver:
+    /// `v6.example` has native AAAA; the other names are IPv4-only and get
+    /// answers synthesized under the well-known NAT64 prefix, wrapping
+    /// 10.0.0.5 or the cloud metadata address.
+    async fn spawn_dns64_upstream() -> SocketAddr {
+        use hickory_proto::op::{Message, MessageType, ResponseCode};
+        use hickory_proto::rr::rdata::{A, AAAA};
+        use hickory_proto::rr::{RData, Record, RecordType};
+
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buffer = vec![0_u8; 4096];
+            loop {
+                let Ok((length, peer)) = socket.recv_from(&mut buffer).await else {
+                    return;
+                };
+                let request = Message::from_vec(&buffer[..length]).unwrap();
+                let query = request.queries[0].clone();
+                let name = query.name().to_ascii();
+                let data = match (name.as_str(), query.query_type()) {
+                    ("v6.example.", RecordType::AAAA) => {
+                        Some(RData::AAAA(AAAA("2606:4700::6810:84e5".parse().unwrap())))
+                    }
+                    ("dns64.example." | "private.wild.example.", RecordType::AAAA) => {
+                        Some(RData::AAAA(AAAA("64:ff9b::a00:5".parse().unwrap())))
+                    }
+                    ("nsp.wild.example.", RecordType::AAAA) => {
+                        Some(RData::AAAA(AAAA("2001:db8:7777::a00:5".parse().unwrap())))
+                    }
+                    ("metadata.example.", RecordType::AAAA) => {
+                        Some(RData::AAAA(AAAA("64:ff9b::a9fe:a9fe".parse().unwrap())))
+                    }
+                    (_, RecordType::A) => Some(RData::A(A("104.16.132.229".parse().unwrap()))),
+                    _ => None,
+                };
+                let mut response = Message::new(
+                    request.metadata.id,
+                    MessageType::Response,
+                    request.metadata.op_code,
+                );
+                response.metadata.recursion_desired = request.metadata.recursion_desired;
+                response.metadata.recursion_available = true;
+                response.metadata.response_code = ResponseCode::NoError;
+                response.add_query(query.clone());
+                if let Some(data) = data {
+                    response.add_answer(Record::from_rdata(query.name().clone(), 30, data));
+                }
+                let _ = socket.send_to(&response.to_vec().unwrap(), peer).await;
+            }
+        });
+        address
+    }
+
+    fn dns_query(name: &str, record_type: hickory_proto::rr::RecordType) -> Vec<u8> {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        let mut message = Message::new(0x5151, MessageType::Query, OpCode::Query);
+        message.metadata.recursion_desired = true;
+        message.add_query(Query::query(
+            hickory_proto::rr::Name::from_ascii(name).unwrap(),
+            record_type,
+        ));
+        message.to_vec().unwrap()
+    }
+
+    fn curl_identity() -> ContractBinaryIdentity {
+        ContractBinaryIdentity {
+            executable: ContractExecutableIdentity {
+                path: PathBuf::from("/usr/bin/curl"),
+                digest: Some("00".repeat(32).parse().unwrap()),
+            },
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn mediated_policy_dns_ipv6_end_to_end() {
+        use crate::policy_dns::{PolicyDnsRuntime, PolicyDnsRuntimeConfig};
+        use hickory_proto::op::{Message, ResponseCode};
+        use hickory_proto::rr::{RData, RecordType};
+        use openshell_isolation_interface::contract::{DnsTransport, PendingDnsQuery};
+
+        let engine = Arc::new(
+            OpaEngine::from_strings(
+                include_str!("../data/sandbox-policy.rego"),
+                r#"
+network_policies:
+  allowed:
+    name: allowed
+    endpoints:
+      - host: v6.example
+        port: 443
+      - host: dns64.example
+        port: 443
+      - host: metadata.example
+        port: 443
+      - host: "*.wild.example"
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#,
+            )
+            .unwrap(),
+        );
+        let upstream = spawn_dns64_upstream().await;
+        let (dns_tx, dns_rx) = mpsc::unbounded_channel();
+        let source = rpc_test::network(Arc::new(ChannelMediationSource {
+            dns: tokio::sync::Mutex::new(dns_rx),
+        }));
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(true);
+        let runtime = PolicyDnsRuntime::start_mediated(
+            engine.clone(),
+            source,
+            None,
+            PolicyDnsRuntimeConfig::for_epoch(7)
+                .unwrap()
+                .with_ipv6_egress(true)
+                .with_trusted_resolver(upstream),
+            ready_rx,
+        )
+        .unwrap();
+        let _ready_tx = ready_tx;
+
+        // The sandbox broker keeps DNS-over-TCP framing on TCP queries and
+        // expects it on the response.
+        let ask = |name: &str, transport: DnsTransport| {
+            let (response, reply) = tokio::sync::oneshot::channel();
+            let mut message = dns_query(name, RecordType::AAAA);
+            if transport == DnsTransport::Tcp {
+                let length = u16::try_from(message.len()).unwrap().to_be_bytes();
+                message.splice(0..0, length);
+            }
+            dns_tx
+                .send(PendingDnsQuery {
+                    message,
+                    transport,
+                    binary_identity: Ok(curl_identity()),
+                    timing: MediationTiming::default(),
+                    response,
+                })
+                .unwrap();
+            async move {
+                let wire = reply.await.unwrap().unwrap();
+                let wire = if transport == DnsTransport::Tcp {
+                    let length = usize::from(u16::from_be_bytes([wire[0], wire[1]]));
+                    assert_eq!(wire.len(), length + 2, "framed TCP response");
+                    wire[2..].to_vec()
+                } else {
+                    wire
+                };
+                Message::from_vec(&wire).unwrap()
+            }
+        };
+
+        // AAAA over both mediated transports maps to one synthetic IPv6
+        // address pinned to the upstream IPv6 answer.
+        let mut synthetic = Vec::new();
+        for transport in [DnsTransport::Udp, DnsTransport::Tcp] {
+            let response = ask("v6.example.", transport).await;
+            assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+            let RData::AAAA(address) = &response.answers[0].data else {
+                panic!("expected an AAAA answer over {transport:?}");
+            };
+            let address = IpAddr::V6(address.0);
+            let pool = PolicyDnsRuntimeConfig::for_epoch(7).unwrap().ipv6_cidr;
+            assert!(pool.contains(&address.to_string().parse::<Ipv6Addr>().unwrap()));
+            synthetic.push(address);
+        }
+        assert_eq!(synthetic[0], synthetic[1]);
+
+        // A TCP open to the synthetic address is authorized by policy and
+        // dials only the pinned upstream IPv6 address.
+        let open = |binary_identity| {
+            let (stream, _peer) = tokio::io::duplex(64);
+            let (decision, completion) = tokio::sync::oneshot::channel();
+            (
+                PendingTcpOpen {
+                    stream: Box::new(stream),
+                    binary_identity,
+                    destination: SocketAddr::new(synthetic[0], 443),
+                    socket: Some(
+                        openshell_isolation_interface::contract::NetworkSocketMetadata {
+                            socket_cookie: 11,
+                            nonblocking: false,
+                            process_generation: 1,
+                        },
+                    ),
+                    policy_generation: engine.current_generation(),
+                    timing: MediationTiming::default(),
+                    decision,
+                },
+                completion,
+            )
+        };
+        let (pending, completion) = open(Ok(curl_identity()));
+        let accepted = preauthorize_transparent_open(
+            pending,
+            Some(&runtime.store),
+            &engine,
+            &BinaryIdentityCache::new(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("allowed binary reaches the synthetic IPv6 destination");
+        assert_eq!(completion.await.unwrap(), TcpOpenDecision::RelayReady);
+        let (_, connector) = accepted
+            .3
+            .and_then(|open| open.authorization)
+            .expect("transparent authorization");
+        assert_eq!(
+            connector.addrs(),
+            [SocketAddr::new(
+                "2606:4700::6810:84e5".parse().unwrap(),
+                443
+            )]
+        );
+
+        // The same destination is denied to a binary the policy does not name.
+        let mut wget = curl_identity();
+        wget.executable.path = PathBuf::from("/usr/bin/wget");
+        let (pending, completion) = open(Ok(wget));
+        assert!(
+            preauthorize_transparent_open(
+                pending,
+                Some(&runtime.store),
+                &engine,
+                &BinaryIdentityCache::new(),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .is_none()
+        );
+        assert!(matches!(
+            completion.await.unwrap(),
+            TcpOpenDecision::Denied(_)
+        ));
+
+        // DNS64 answers follow the IPv4 SSRF tiers of the address they embed.
+        for transport in [DnsTransport::Udp, DnsTransport::Tcp] {
+            // An exact declared host may resolve to a private address, as it
+            // may over IPv4.
+            let response = ask("dns64.example.", transport).await;
+            assert_eq!(response.answers.len(), 1, "exact host over {transport:?}");
+            // Metadata is always blocked, even for an exact declared host.
+            let response = ask("metadata.example.", transport).await;
+            assert!(
+                response.answers.is_empty(),
+                "NAT64-embedded metadata address mapped over {transport:?}"
+            );
+            // A wildcard host is public-only: a wrapped private address is
+            // internal and gets no synthetic address.
+            let response = ask("private.wild.example.", transport).await;
+            assert!(
+                response.answers.is_empty(),
+                "NAT64-embedded private address mapped for a wildcard host over {transport:?}"
+            );
+        }
+
+        // An operator-chosen network-specific prefix gets the same treatment
+        // once configured. Only this test uses 2001:db8:7777::/96.
+        openshell_core::net::nat64::register_network_prefix("2001:db8:7777::/96".parse().unwrap());
+        for transport in [DnsTransport::Udp, DnsTransport::Tcp] {
+            let response = ask("nsp.wild.example.", transport).await;
+            assert!(
+                response.answers.is_empty(),
+                "configured NAT64 prefix not classified over {transport:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn staged_transparent_open_reports_invalid_identity_as_unavailable() {
         let engine = OpaEngine::from_strings(
@@ -13772,6 +14093,43 @@ network_policies:
             is_cloud_metadata_ip(IpAddr::V6(mapped)),
             "::ffff:169.254.169.254 must be recognized as cloud metadata"
         );
+    }
+
+    #[test]
+    fn test_is_cloud_metadata_ip_blocks_nat64_metadata() {
+        assert!(is_cloud_metadata_ip("64:ff9b::a9fe:a9fe".parse().unwrap()));
+        assert!(!is_cloud_metadata_ip("64:ff9b::a9fe:102".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_nat64_answers_follow_ipv4_ssrf_tiers() {
+        let addr = |raw: &str| vec![SocketAddr::new(raw.parse().unwrap(), 443)];
+        // DNS64 answer wrapping 10.1.2.3: internal without allowed_ips.
+        assert!(
+            reject_internal_resolved_addrs("dns64.example", &addr("64:ff9b::a01:203")).is_err()
+        );
+        // Wrapping a public IPv4 address: allowed.
+        assert!(
+            reject_internal_resolved_addrs("dns64.example", &addr("64:ff9b::8c52:7003")).is_ok()
+        );
+        // Wrapping loopback or metadata: blocked even for declared hosts and
+        // allowed_ips that cover the translated address.
+        for blocked in ["64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe"] {
+            assert!(
+                validate_declared_endpoint_resolved_addrs("dns64.example", 443, &addr(blocked))
+                    .is_err()
+            );
+            let nets = vec!["64:ff9b::/96".parse().unwrap()];
+            assert!(
+                validate_allowed_ips_for_resolved_addrs(
+                    "dns64.example",
+                    443,
+                    &addr(blocked),
+                    &nets
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
