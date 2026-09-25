@@ -6,17 +6,28 @@ description: "Build a Pi coding-agent image, configure OpenRouter access, and ru
 keywords: "Generative AI, Cybersecurity, Tutorial, Pi Coding Agent, OpenRouter, Sandbox, Provider Profile"
 ---
 
+This tutorial runs [Pi](https://pi.dev), a terminal coding agent, inside an
+OpenShell sandbox. Pi gets its models from [OpenRouter](https://openrouter.ai),
+which offers models from many providers through one API key.
 
-This tutorial runs [Pi](https://pi.dev), a terminal coding agent, with models
-from [OpenRouter](https://openrouter.ai). You will build Pi into an OCI image,
-configure narrowly scoped model access, and run it inside OpenShell.
+You build a Pi image, give the sandbox access to OpenRouter, and start Pi. The
+sandbox lets Pi reach OpenRouter and blocks all other network access. Pi never
+sees your real API key.
+
+## Prerequisites
+
+- A working OpenShell installation with an active gateway. Refer to
+  [Installation](/about/installation).
+- Docker or Podman to build the image.
+- An OpenRouter API key.
+
+<Steps toc={true}>
 
 ## Build the Pi Image
 
-Pi does not publish an official OCI image. Its
-[container guide](https://pi.dev/docs/latest/containerization) installs the
-maintained `@earendil-works/pi-coding-agent` npm package into a Node.js image.
-Create `Dockerfile.pi` with the same approach:
+Pi doesn't publish a container image, so build one from its npm package. Save
+this Dockerfile as `Dockerfile.pi`. It's based on Pi's
+[container guide](https://pi.dev/docs/latest/containerization).
 
 ```dockerfile
 FROM node:24-bookworm-slim
@@ -37,30 +48,37 @@ WORKDIR /workspace
 ENV PI_CODING_AGENT_DIR=/tmp/pi-agent
 ```
 
-This Dockerfile adds `fd` to the packages from Pi's container guide. Pi uses
-`fd` and `ripgrep` for file search and downloads them from GitHub on first use
-if they aren't installed. The sandbox policy doesn't allow access to GitHub, so
-that download fails and Pi's file search reports
-`fd is not available and could not be downloaded`. Installing both tools in the
-image avoids the download.
+Two details matter for running in a sandbox:
 
-Build the image with the container engine used by your local gateway:
+- The image installs `fd` and `ripgrep`. Pi uses them to search files, and if
+  they're missing it tries to download them from GitHub the first time it
+  needs them. The sandbox blocks that download, so the image includes them.
+- `PI_CODING_AGENT_DIR` keeps Pi's settings and sessions in `/tmp`, one of the
+  few places the sandbox lets Pi write.
+
+Build the image:
 
 ```shell
 docker build -t pi-agent:local -f Dockerfile.pi .
 ```
 
-For Podman, use `podman build -t localhost/pi-agent:local -f Dockerfile.pi .`
-and substitute `localhost/pi-agent:local` in the commands below. For a remote
-gateway, push the image to a registry the gateway can pull from. Pin
-`PI_VERSION` to a reviewed release when you publish a reproducible image.
+<Note>
+If your gateway uses Podman, build with
+`podman build -t localhost/pi-agent:local -f Dockerfile.pi .` and use
+`localhost/pi-agent:local` in the commands below. If your gateway runs on
+another machine, push the image to a registry the gateway can pull from, and
+use that image reference with `--from`.
+</Note>
 
-## Configure OpenRouter Access
+## Give Pi Access to OpenRouter
 
-Create `provider-openrouter.yaml`. The profile permits only the image's Node.js
-runtime, which runs Pi, to reach the OpenRouter API. OpenShell supplies a
-credential placeholder to Pi and replaces it only on requests to the declared
-endpoint.
+A sandbox has no network access until you grant it. To let Pi reach
+OpenRouter, create a provider. A provider stores your API key and opens access
+to the service. Pi gets a placeholder instead of the real key, and OpenShell
+swaps in the key only on requests to OpenRouter.
+
+Each provider is based on a provider profile that describes the service. Save
+this profile as `provider-openrouter.yaml`:
 
 ```yaml
 id: openrouter
@@ -93,8 +111,16 @@ binaries:
   - /usr/local/bin/node
 ```
 
-Lint and import the profile into your current workspace, then store an
-OpenRouter API key in a provider:
+The profile controls three things:
+
+- `credentials` declares the API key. Pi finds the placeholder in
+  `OPENROUTER_API_KEY`.
+- `endpoints` allows only `openrouter.ai`, and OpenShell sends the key nowhere
+  else.
+- `binaries` allows only the `node` program to use this access. Pi runs on
+  Node.js, so this includes Pi.
+
+Check the profile, import it, and create a provider named `openrouter`:
 
 ```shell
 openshell profile lint -f provider-openrouter.yaml
@@ -107,9 +133,13 @@ OPENROUTER_API_KEY=your-key \
     --from-existing
 ```
 
-## Create the Pi Sandbox
+Replace `your-key` with your OpenRouter API key, or drop that prefix if
+`OPENROUTER_API_KEY` is already set in your shell. `--from-existing` reads the
+key from that variable.
 
-Create the sandbox, attach the provider, and run Pi interactively:
+## Start Pi in a Sandbox
+
+Create a sandbox from the image, attach the provider, and start Pi:
 
 ```shell
 openshell sandbox create \
@@ -119,21 +149,42 @@ openshell sandbox create \
   -- pi
 ```
 
-The command after `--` is the sandbox's main process. Pi and every command it
-starts run inside the sandbox boundary.
+The command after `--` starts Pi inside the sandbox. Any commands Pi runs stay
+inside the sandbox too.
 
-Pi starts with its default OpenRouter model. To use a different one, run
-`/model` in Pi and select any OpenRouter model from the list. OpenRouter
-typically offers some free models, marked with a `:free` suffix, that you can
-use to test the setup without spending credits.
+Pi starts with its default OpenRouter model. To choose a different one, type
+`/model` in Pi and pick any OpenRouter model from the list. OpenRouter usually
+offers some free models, marked with a `:free` suffix, that you can use to try
+this setup without spending credits.
 
-Try asking Pi:
+Then ask Pi a question:
 
 ```text
 Explain what files are available in this workspace.
 ```
 
-To give Pi a local project, upload it before the main process starts:
+The workspace starts empty. A later step gives Pi your own code.
+
+## Inspect the Sandbox
+
+While Pi is running, open another terminal and check the sandbox's status, the
+access it has, its providers, and its logs:
+
+```shell
+openshell sandbox list
+openshell policy get pi --full
+openshell sandbox provider list pi
+openshell logs pi --tail
+```
+
+`openshell logs` streams the sandbox's activity, including any connections it
+blocks. When you're done, type `/quit` in Pi to exit.
+
+## Work on a Local Project
+
+To have Pi work on your code, run this command from your project directory.
+`--upload` copies the directory into the sandbox before Pi starts and skips
+files that `.gitignore` excludes.
 
 ```shell
 openshell sandbox create \
@@ -144,46 +195,37 @@ openshell sandbox create \
   -- pi
 ```
 
-The provider grants Pi access to `openrouter.ai`. The built-in fallback
-policy grants access to the working directory and standard runtime paths while
-denying all other network egress. Add a reviewed custom policy when Pi needs
-package registries, source hosts, tool servers, or other destinations.
+Pi's changes stay inside the sandbox. To copy them back to your machine, run
+`openshell sandbox download` from another terminal while Pi is still running.
+Refer to [Transfer Files](/how-it-works/sandboxes/overview#transfer-files).
 
-## Adapt the Pi Workflow
+## Clean Up
 
-Pi supports other model providers besides OpenRouter. To use one, create or
-adapt a provider profile for that service, and make its `binaries` paths match
-the Pi installation in your image. The OpenShell repository contains reviewable
-profile examples in
-[`providers/`](https://github.com/NVIDIA/OpenShell/tree/main/providers).
-
-Install any additional compilers, package managers, and agent tools in the
-image. Grant their filesystem and network requirements through
-[sandbox policy](/how-it-works/policies/overview) instead of giving the workload broad
-access. Refer to [Profiles](/how-it-works/providers/profiles) for credential and endpoint
-configuration.
-
-## Verify and Troubleshoot
-
-Inspect the sandbox, effective policy, provider attachments, and logs:
+Delete the sandboxes when you're finished:
 
 ```shell
-openshell sandbox list
-openshell policy get pi --full
-openshell sandbox provider list pi
-openshell logs pi --tail
+openshell sandbox delete pi pi-project
 ```
 
-If `pi` is missing, confirm that the image was built with the selected local
-container engine or pushed to a registry visible to the gateway. If a model
-request is denied, confirm that the profile's `binaries` path matches
-`readlink -f "$(command -v node)"` inside the image. Review any other denied
-network or filesystem operation before updating the sandbox policy.
+</Steps>
+
+## Troubleshooting
+
+- If the gateway can't find `pi-agent:local`, build the image with the same
+  container engine your gateway uses, or push it to a registry the gateway can
+  reach.
+- If Pi's requests to OpenRouter are denied, make sure the `binaries` path in
+  the profile matches where `node` is installed in your image. In the image
+  above, that's `/usr/local/bin/node`.
 
 ## Next Steps
 
-- To give Pi access to source control, package registries, or tool servers, add
-  the corresponding provider profiles or a reviewed [sandbox policy](/how-it-works/policies/overview).
-- To understand image, resource, upload, and lifecycle options, refer to
-  [Sandboxes](/how-it-works/sandboxes/overview).
-- To configure another model service, refer to [Profiles](/how-it-works/providers/profiles).
+- To give Pi more tools, add them to the image. To let Pi reach package
+  registries, source hosts, or other services, grant access with a
+  [sandbox policy](/how-it-works/policies/overview).
+- To use a different model service, write a provider profile for it. The
+  [`providers/`](https://github.com/NVIDIA/OpenShell/tree/main/providers)
+  directory has examples, and [Profiles](/how-it-works/providers/profiles)
+  describes each field.
+- To learn about images, resources, file transfer, and the sandbox lifecycle,
+  refer to [Sandboxes](/how-it-works/sandboxes/overview).
