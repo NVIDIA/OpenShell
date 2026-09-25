@@ -11,42 +11,38 @@ position: 4
 The policy prover is OpenShell's policy verification engine. It uses an SMT
 solver to check whether policies satisfy specified properties, such as staying
 within an allowed access boundary. Its guarantees apply to the policy features
-and behavior represented by its model.
+and behavior represented by its model. OpenShell is actively extending the model
+to cover more policy features.
 
-OpenShell uses the prover in two ways: the `openshell-prover check` command, and
-the [policy advisor](/sandboxes/policy-advisor), which checks every network rule
-that an agent proposes. Each answers a different question:
+OpenShell uses the prover for two types of checks:
 
-| | `openshell-prover check` | Policy advisor |
-|---|---|---|
-| Question | Does this policy stay within a maximum policy that I set? | Does this proposed rule add risky new access? |
-| When it runs | When an agent or a person runs the command, for example before applying a policy. | Automatically, each time an agent in a sandbox proposes a new network rule through the policy advisor. |
-| What it compares | A candidate policy against a boundary policy that you write. | The sandbox's policy with and without the proposed rule. |
-| What it reports | Access that the candidate allows beyond the boundary. | New access to link-local or cloud metadata addresses, uninspected traffic where a provider credential is available, new credentialed destinations, and new HTTP methods. |
+- A boundary check verifies that a policy allows no access beyond a boundary
+  policy, which defines the most access allowed in an environment.
+- A proposal risk check verifies that a proposed network rule adds no risky
+  access compared with the sandbox's current policy, such as access to cloud
+  metadata addresses or new destinations for provider credentials.
 
-Because the two checks answer different questions, passing one does not imply
-passing the other. A proposal that adds no risky access can still exceed your
-boundary, and a policy within your boundary can still contain access that the
-policy advisor would flag.
+You run a boundary check with the `openshell-prover` CLI, which is primarily
+intended for agents. For example, a parent agent can check that a policy it
+writes for a subagent stays within the parent's own maximum allowed policy. A
+proposal risk check runs automatically each time an agent proposes a network
+rule through the [policy advisor](/sandboxes/policy-advisor).
 
-This page covers the `openshell-prover check` command. [What the Boundary Check
-Covers](#what-the-boundary-check-covers) describes what its model includes. For
-the policy advisor's check, refer to [What the Prover
-Checks](/sandboxes/policy-advisor#what-the-prover-checks).
+The two checks answer different questions, so passing one does not imply
+passing the other. A proposed rule that passes the proposal risk check can still
+exceed your boundary, and a policy that passes the boundary check can still
+contain access that the proposal risk check would flag.
 
-## Check a Policy Against a Boundary
+This page covers the boundary check. To learn about the proposal risk check,
+refer to [Policy Advisor](/sandboxes/policy-advisor).
 
-`openshell-prover check` determines whether everything allowed by the policy you
-are testing, called the candidate, is also allowed by a boundary policy that you
-write. If the candidate allows something the boundary does not, the prover
-shows an example.
+## Run a Boundary Check
 
-The boundary is usually the most access that an environment allows. For
-example, an enterprise can define a maximum policy for all of its agents. A
-parent agent that creates a sandbox for a subagent can check that the policy it
-proposes for the subagent does not exceed the parent's own maximum allowed
-policy. Run the check before you apply a policy, so that no change grants more
-than the boundary allows.
+A boundary check compares the policy you are testing, called the candidate, with
+a boundary policy that you write. The boundary is usually the most access that
+an environment allows, such as an enterprise's maximum policy for its agents. If
+the candidate allows something the boundary does not, the prover shows an
+example.
 
 The check covers filesystem access, process identity, Landlock settings, network
 connections, and REST requests. If a policy uses anything else, such as GraphQL
@@ -54,9 +50,8 @@ or MCP rules, the prover reports that it cannot check the policy instead of
 ignoring those rules. [What the Boundary Check
 Covers](#what-the-boundary-check-covers) describes each part and its limits.
 
-The `openshell-prover` command is installed with OpenShell. It is a separate
-command because it reads policy files on your machine and does not need a
-gateway. It does not apply or approve policies.
+The `openshell-prover` CLI is installed with OpenShell. It reads policy files on
+your machine, does not need a gateway, and does not apply or approve policies.
 
 Create `boundary.yaml`, a boundary that allows reading `/usr` and `/etc`:
 
@@ -150,10 +145,10 @@ reason: candidate policy rule 'g' uses protocol 'graphql'; only L4 TCP and REST 
 
 For agents and scripts, add `--output json`. Read the `result` and
 `reason_code` fields instead of parsing the text output. `reason_code` is a
-stable identifier, such as `unsupported_policy_shape` or `solver_timeout`. Also check that
-`coverage.domains` includes every part of the policy that you rely on. Run
-`openshell-prover check --help` for all options, including `--timeout`, which
-changes the default 10-second time limit.
+stable identifier, such as `unsupported_policy_shape` or `solver_timeout`. Also
+check that `coverage.domains` includes every part of the policy that you rely
+on. Run `openshell-prover check --help` for all options, including `--timeout`,
+which changes the default 10-second time limit.
 
 ## What the Boundary Check Covers
 
@@ -162,10 +157,10 @@ the parts of the policy that the prover checks. It does not mean that the policy
 is as narrow as it could be, that it is safe for a particular task, or that a
 running sandbox enforces it.
 
-The check covers five parts of a policy. Within each part, some comparisons
-depend on information that the prover does not have, such as the files in the
-sandbox image. For those comparisons, the prover returns `unsupported` instead
-of guessing. Very large policies, for example with more than 1,024 network rules
+The check currently covers five parts of a policy. Within each part, some
+comparisons depend on information that the prover does not have, such as the
+files in the sandbox image. For those comparisons, the prover returns
+`unsupported` instead of guessing. Very large policies, for example with more than 1,024 network rules
 or 4,096 endpoints across both files, return `inconclusive` with the
 `reason_code` `resource_limit`.
 
