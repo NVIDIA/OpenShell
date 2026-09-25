@@ -39,7 +39,7 @@ network_policies:
         port: 443
     binaries:
       - path: /usr/bin/curl
-      - path: /usr/bin/python3
+      - path: /usr/bin/wget
 ```
 
 The rule allows these four combinations:
@@ -48,30 +48,33 @@ The rule allows these four combinations:
 |---|---|
 | `/usr/bin/curl` | `api.example.com:443` |
 | `/usr/bin/curl` | `uploads.example.com:443` |
-| `/usr/bin/python3` | `api.example.com:443` |
-| `/usr/bin/python3` | `uploads.example.com:443` |
+| `/usr/bin/wget` | `api.example.com:443` |
+| `/usr/bin/wget` | `uploads.example.com:443` |
 
-If `python3` should reach only `api.example.com`, put that binary and endpoint in
-a separate rule.
+If `wget` should reach only `api.example.com`, put that binary and endpoint in a
+separate rule.
 
 ### Binary Matching
 
 When you write a network rule, list the path of the executable that opens the
 connection. This is not always the command you run. For example, `pip` is a
-Python script, so the process that connects to PyPI is the Python interpreter. A
-rule for `pip install` must list `/usr/bin/python3`, not `/usr/bin/pip`. When
-OpenShell denies a connection, the sandbox log shows the binary it identified.
-[Allow PyPI Downloads](#allow-pypi-downloads) and [Allow npm
-Installs](#allow-npm-installs) show rules that list interpreters.
+Python script, so the process that connects to PyPI is the Python interpreter,
+and a rule for `pip install` must list the interpreter, not `/usr/bin/pip`.
+
+OpenShell identifies each process by the real path of its executable, as the
+kernel reports it, so list real paths rather than symlinks. For example, on
+Ubuntu 24.04, `/usr/bin/python3` is a symlink to `/usr/bin/python3.12`. To find
+the real path, run `readlink -f` on the path inside the sandbox. When OpenShell
+denies a connection, the sandbox log shows the path it identified. [Allow PyPI
+Downloads](#allow-pypi-downloads) and [Allow npm Installs](#allow-npm-installs)
+show rules that list interpreters.
 
 A rule also applies to processes that a listed binary starts. For example, if a
 rule lists an agent's executable, tools that the agent launches can use the rule
 too. A rule with an empty `binaries` list matches no binary and allows nothing.
 
-OpenShell resolves symlinks to the real executable path, so a symlink cannot
-select a different rule. It also records a checksum of each executable the
-first time a rule allows it, and denies later connections if the file at that
-path changes.
+OpenShell records a hash of each executable the first time it takes part in a
+connection, and denies later connections if the file at that path changes.
 
 ### Connection and Request Checks
 
@@ -80,8 +83,9 @@ OpenShell checks network traffic in two stages:
 1. When a binary opens a connection, OpenShell checks the destination host and
    port and the binary against your rules. If no rule matches, OpenShell denies
    the connection.
-2. If the matching endpoint sets `protocol`, OpenShell also reads each request
-   sent over the connection and checks it against the endpoint's request rules.
+2. If the matching endpoint sets a request protocol, such as `rest`, OpenShell
+   also reads each request sent over the connection and checks it against the
+   endpoint's request rules.
    For example, with `protocol: rest`, a rule can allow `GET` requests to an API
    while blocking `POST` and `DELETE` requests.
 
@@ -95,8 +99,14 @@ an inspected endpoint. The `protocol` field selects what OpenShell inspects:
 | `graphql` | GraphQL operation type, operation name, and top-level fields. | [GraphQL](#allow-graphql-operations) |
 | `mcp` | MCP method and tool name. | [MCP](#allow-mcp-tools) |
 | `json-rpc` | JSON-RPC method name. | [JSON-RPC rules](/reference/policy-schema#json-rpc-rules) |
-| `tcp` | Nothing. The binary gets a native TCP connection, which suits clients such as databases. | [Native TCP](#allow-native-tcp) |
-| Omitted | No request rules apply. OpenShell still terminates TLS and checks that each HTTP request is addressed to the allowed host, but it allows any method or path. | -- |
+| `tcp` | No request rules. Use it for clients that speak a protocol other than HTTP, such as databases. | [Native TCP](#allow-native-tcp) |
+| Omitted | No request rules. | -- |
+
+When `protocol` is omitted, OpenShell allows any method and path. Unless the
+endpoint sets `tls: skip`, it still terminates TLS and rejects HTTP requests
+that are addressed to another host or have malformed paths, such as paths that
+contain `%2F`. It relays traffic that is neither TLS nor HTTP without inspecting
+it.
 
 Use an inspected endpoint when the request, not only the destination,
 determines the risk, such as allowing reads but not writes on an API.
@@ -106,8 +116,13 @@ determines the risk, such as allowing reads but not writes on an API.
 The `enforcement` field on an inspected endpoint decides what happens when a
 request breaks the endpoint's request rules:
 
-- `enforce` blocks the request with an OpenShell `policy_denied` response.
+- `enforce` blocks the request. An HTTP client receives an OpenShell
+  `policy_denied` response.
 - `audit` allows the request and logs the violation. This is the default.
+
+Audit mode applies only to the endpoint's allow and deny rules. OpenShell still
+rejects requests that it cannot process safely, such as malformed requests and
+requests addressed to another host.
 
 Use `audit` to see what a new rule would block before you enforce it. Apply the
 rule with `enforcement: audit`, run your workload, then look for violation
@@ -117,16 +132,19 @@ events in the sandbox log:
 openshell logs my-sandbox --since 5m --source sandbox
 ```
 
-Policy events are INFO-level log records, so do not filter them out with
-`--level warn`. When the log shows only the violations you expect, switch the
-endpoint to `enforce`. An endpoint in audit mode blocks no requests.
+Do not filter this log with `--level warn`, which hides policy events. When the
+log shows only the violations you expect, switch the endpoint to `enforce`,
+because an endpoint in audit mode does not block requests that break its rules.
 
 ### Overlapping Rules
 
 Network rules are not an ordered firewall list. Several rules can match the same
 connection or request, and every matching rule adds the access it allows. A
 matching deny rule takes precedence over any allow, regardless of where either
-appears in the file.
+appears in the file. If one matching rule inspects requests and another does
+not, OpenShell inspects the connection, and the rule without `protocol` adds no
+request access. Endpoints that can match the same host and port must also agree
+on settings such as `tls` and `allowed_ips`, or OpenShell rejects the policy.
 
 For example, suppose one rule allows `GET /repos/**` on a host and another rule
 for the same host, port, and binary denies `GET /repos/private/**`. OpenShell
@@ -151,8 +169,8 @@ The following rules cover common services and protocols. Replace the example
 hosts, paths, and binaries with your own values, and make sure the sandbox
 contains the client executable.
 
-When `openshell policy update` can express a rule, the example shows the
-command. Otherwise, add the YAML under the `network_policies` section of a
+When a single `openshell policy update` command can create a rule, the example
+shows it. Otherwise, add the YAML under the `network_policies` section of a
 complete policy file and apply it with `openshell policy set`, as described in
 [Replace the Complete
 Policy](/sandboxes/manage-policies#replace-the-complete-policy). After you apply
@@ -258,8 +276,8 @@ Agent](/get-started/tutorials/github-sandbox).
 
 Package managers download packages with `GET` requests, so a read-only REST rule
 allows installs while blocking uploads. `pip` is a Python script, so the rule
-lists the Python interpreter, and any Python program in the sandbox can use it.
-This rule lets `pip` and `uv` install packages from PyPI:
+lists the real path of the Python interpreter, and any Python program in the
+sandbox can use it. This rule lets `pip` and `uv` install packages from PyPI:
 
 ```yaml
 pypi:
@@ -275,15 +293,15 @@ pypi:
       enforcement: enforce
       access: read-only
   binaries:
-    - path: /usr/bin/python3
+    - path: /usr/bin/python3.12
     - path: /usr/local/bin/uv
 ```
 
-OpenShell resolves `/usr/bin/python3` to its versioned interpreter, such as
-`/usr/bin/python3.12`. If your image uses another interpreter, such as a
-uv-managed Python, list its canonical path or a glob that matches it, such as
-`/sandbox/.uv/python/*/bin/python3*`. Globs are not symlink-resolved. For a
-private package index, replace the hosts with your index's hosts.
+`/usr/bin/python3.12` is the interpreter on Ubuntu 24.04. To find yours, run
+`readlink -f /usr/bin/python3` inside the sandbox. If your image uses another
+interpreter, such as a uv-managed Python, list its real path or a glob that
+matches it, such as `/sandbox/.uv/python/*/bin/python3*`. For a private package
+index, replace the hosts with your index's hosts.
 
 For a sandbox with `pip` installed, verify that a download succeeds:
 
@@ -295,9 +313,9 @@ openshell sandbox exec -n my-sandbox --no-login-shell -- \
 ### Allow npm Installs
 
 Like `pip`, `npm` is a script, so the rule lists the Node.js interpreter. This
-rule lets `npm` install packages from the public npm registry. Node images from
-the official Node.js project install `node` at `/usr/local/bin/node`, so adjust
-the path for your image:
+rule lets `npm` install packages from the public npm registry. It lists
+`/usr/bin/node`, but official Node.js images install `node` at
+`/usr/local/bin/node`, so adjust the path for your image:
 
 ```yaml
 npm_registry:
@@ -315,8 +333,9 @@ npm_registry:
 npm requests scoped packages, such as `@types/node`, with an encoded slash in
 the path. OpenShell rejects `%2F` in request paths unless the endpoint sets
 `allow_encoded_slash: true`. npm also sends its security audit as a `POST`
-request, which the read-only preset denies. Run `npm install --no-audit`, or add
-an allow rule for the audit request if you need it.
+request, which the read-only preset denies. Run `npm install --no-audit`, or
+replace `access: read-only` with explicit rules that also allow the audit's
+`POST` requests. An endpoint cannot combine `access` and `rules`.
 
 Verify that a scoped package lookup succeeds:
 
@@ -329,8 +348,10 @@ openshell sandbox exec -n my-sandbox --no-login-shell -- \
 
 OpenShell blocks connections to private network addresses by default to prevent
 server-side request forgery (SSRF). An endpoint with an exact hostname can still
-reach the private addresses that its hostname resolves to, but loopback,
-link-local, and cloud metadata addresses are always blocked.
+reach the private addresses that its hostname resolves to, unless the endpoint
+comes from an approved [policy advisor](/sandboxes/policy-advisor) proposal.
+Loopback, link-local, and unspecified addresses, including the cloud metadata
+address `169.254.169.254`, are always blocked.
 
 Use `allowed_ips` to limit the addresses an endpoint can reach, or to let a
 wildcard host such as `*.internal.example` reach private addresses. This rule
@@ -378,10 +399,10 @@ instead of broadening the range when an address changes.
 
 ### Allow WebSocket Messages
 
-Use `protocol: websocket` for an RFC 6455 upgrade and client-to-server message
-policy. This template requires `/usr/bin/node` and a WebSocket service you
-control. It permits the `/v1/realtime` upgrade and client text messages on that
-upgraded path, while denying `/v1/admin/**`:
+Use `protocol: websocket` to control WebSocket connections and the messages
+that clients send over them. This template requires `/usr/bin/node` and a
+WebSocket service you control. It permits the `/v1/realtime` upgrade and client
+text messages on that upgraded path, while denying `/v1/admin/**`:
 
 ```yaml
 realtime:
@@ -409,13 +430,16 @@ Use your Node client to test a successful upgrade and text message on
 `WEBSOCKET_TEXT` rule is the original upgrade path, not text-frame content.
 
 OpenShell inspects complete client text messages. It does not inspect binary
-frames or upstream-to-client messages. Provider-credentialed endpoints remain
-on the parsed relay and reject binary frames unless
-`allow_uninspected_credentials: true` explicitly accepts the weaker boundary.
-Set `websocket_credential_rewrite: true` only when client text messages contain
-OpenShell credential placeholders that must be resolved. When new network rules
-take effect, OpenShell closes the upgraded connection with close code `1012`, so
-the client must reconnect.
+frames or messages from the server. If the endpoint carries provider
+credentials, OpenShell closes the connection with close code `1008` when the
+client sends a binary frame, because it cannot check the frame for credentials.
+Set `allow_uninspected_credentials: true` to relay binary frames anyway. Set
+`websocket_credential_rewrite: true` only when client text messages contain
+OpenShell credential placeholders that must be resolved.
+
+When new network rules take effect, OpenShell closes open WebSocket connections,
+so the client must reconnect. The client might receive close code `1012`, or the
+connection might close without a close frame.
 
 ### Allow GraphQL Operations
 
@@ -467,9 +491,10 @@ mutation other than `createIssue` returns an OpenShell denial.
 ### Allow MCP Tools
 
 Use `protocol: mcp` for sandbox-to-server MCP Streamable HTTP requests. This
-template requires `/usr/bin/python3` with an MCP client and a Streamable HTTP
-server you control. It allows initialization, tool discovery, and
-`read_status`, while denying `delete_resource`:
+template requires an MCP client that runs on the Python interpreter at
+`/usr/bin/python3.12`, and a Streamable HTTP server you control. It allows
+initialization, tool discovery, and `read_status`, while denying
+`delete_resource`:
 
 ```yaml
 mcp_server:
@@ -493,7 +518,7 @@ mcp_server:
         - method: tools/call
           tool: delete_resource
   binaries:
-    - path: /usr/bin/python3
+    - path: /usr/bin/python3.12
 ```
 
 Verify initialization and `read_status` before confirming that `delete_resource`
@@ -503,15 +528,20 @@ tool can receive any arguments accepted by the server.
 Omitting `mcp.versions` allows only the `2025-11-25` revision. To support an
 older server, list the exact revisions it needs, as described in [MCP Version
 Selection](/reference/policy-schema#mcp-version-selection). Server responses and
-SSE messages are relayed without MCP policy parsing. An MCP endpoint cannot
-share a host and port with an endpoint that uses a different protocol.
+SSE messages are relayed without MCP policy parsing. Do not put an MCP endpoint
+on the same host and port as an endpoint that uses a different protocol.
+`openshell policy update` rejects this combination.
 
 ### Allow Native TCP
 
-Use `protocol: tcp` when the application needs ordinary DNS resolution and a
-native TCP socket, such as a database client. OpenShell checks the hostname,
-port, and executable but does not inspect the application payload, so prefer an
-inspected protocol whenever the client supports one.
+Use `protocol: tcp` for a client that speaks a protocol other than HTTP, such
+as a database client. OpenShell checks the hostname, port, and executable but
+applies no request rules, so prefer an inspected protocol whenever the client
+supports one.
+
+On Debian and Ubuntu, `/usr/bin/psql` is a wrapper script that starts
+`/usr/lib/postgresql/<version>/bin/psql`, so this rule lists that path with a
+glob:
 
 <Tabs>
 <Tab title="CLI">
@@ -519,7 +549,7 @@ inspected protocol whenever the client supports one.
 ```shell
 openshell policy update my-sandbox \
   --rule-name postgres \
-  --binary /usr/bin/psql \
+  --binary '/usr/lib/postgresql/*/bin/psql' \
   --add-endpoint db.internal.example:5432::tcp \
   --wait
 ```
@@ -534,7 +564,7 @@ postgres:
       port: 5432
       protocol: tcp
   binaries:
-    - path: /usr/bin/psql
+    - path: /usr/lib/postgresql/*/bin/psql
 ```
 
 </Tab>
@@ -547,29 +577,27 @@ command that fails before application authentication when the rule is absent. A
 database authentication error can show that the TCP connection reached the
 server, but it does not prove that database credentials are correct.
 
-Docker and Podman support native TCP enforcement. The standard runtime prepares
-DNS and TCP connection handling before the workload starts, even when the
-initial policy has no TCP endpoints, so you can add the first endpoint without
-recreating the sandbox. Other runtimes must provide the same support before
-they can activate a TCP rule.
+OpenShell prepares DNS and TCP handling when the sandbox starts, so you can add
+a TCP endpoint to a running sandbox without recreating it.
+
+For a client that starts TLS as soon as it connects, or that must complete TLS
+itself, for example to present a client certificate, set `tls: skip` so that
+OpenShell relays the encrypted connection without terminating it. Clients that
+negotiate TLS within their protocol, such as `psql`, do not need it. Refer to
+[Inspection Fields](/reference/policy-schema#inspection-fields).
 
 Prefer exact hostnames. A wildcard authorizes DNS queries for every matching
 name, which can expose a DNS-label exfiltration channel. An allowed hostname on
 shared infrastructure can also reach other tenants or virtual services behind
-the same connection, because OpenShell does not inspect the payload's
-authority.
+the same connection, because OpenShell cannot check which service a non-HTTP
+payload addresses.
 
-Policy DNS returns a supervisor-owned synthetic address with a bounded TTL.
-Clients must honor that TTL and resolve the hostname again before reconnecting.
-A client that caches the synthetic address indefinitely can fail after its
-mapping expires, even while the endpoint remains allowed. Docker and Podman
-currently advertise IPv4 egress for policy DNS, so AAAA queries return a
-successful empty answer and dual-stack clients must continue with the A record.
-
-If a client that uses the sandbox proxy must complete TLS with the upstream
-service itself, for example to present a client certificate, set `tls: skip` on
-an endpoint without `protocol` instead. Refer to [Inspection
-Fields](/reference/policy-schema#inspection-fields).
+OpenShell answers DNS queries for the hosts in your rules with placeholder
+addresses whose TTL is at most 30 seconds. Clients must resolve the hostname
+again before reconnecting. A client that caches an address indefinitely can fail
+after it expires, even while the endpoint remains allowed. OpenShell returns an
+empty answer to AAAA queries, so dual-stack clients must fall back to the A
+record.
 
 ## Next Steps
 
