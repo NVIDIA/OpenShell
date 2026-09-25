@@ -197,7 +197,10 @@ pub(crate) fn filter_resolved_addresses(
                     Some(format!(
                         "{host} resolves to always-blocked address {ip}, connection rejected"
                     ))
-                } else if !networks.iter().any(|network| network.contains(&ip)) {
+                } else if !networks
+                    .iter()
+                    .any(|network| openshell_core::net::allowed_net_contains(network, ip))
+                {
                     Some(format!(
                         "{host} resolves to {ip} which is not in allowed_ips, connection rejected"
                     ))
@@ -541,6 +544,25 @@ mod tests {
         let allowed =
             filter_resolved_addresses(&exact, "dns64.example", 443, &[metadata, private]).unwrap();
         assert_eq!(allowed, vec![private]);
+    }
+
+    #[test]
+    fn address_filter_matches_nat64_answers_against_allowed_ipv4_networks() {
+        let plan = DestinationValidationPlan {
+            address_authorization: AddressAuthorization::ExplicitAllowedIps(vec![
+                "10.0.0.0/8".parse().unwrap(),
+                "127.0.0.0/8".parse().unwrap(),
+            ]),
+        };
+        let inside: IpAddr = "64:ff9b::a00:5".parse().unwrap();
+        let outside: IpAddr = "64:ff9b::b00:5".parse().unwrap();
+        let loopback: IpAddr = "64:ff9b::7f00:1".parse().unwrap();
+
+        let allowed =
+            filter_resolved_addresses(&plan, "dns64.example", 443, &[outside, loopback, inside])
+                .unwrap();
+        // Same result as the IPv4 answers 11.0.0.5, 127.0.0.1 and 10.0.0.5.
+        assert_eq!(allowed, vec![inside]);
     }
 
     #[test]

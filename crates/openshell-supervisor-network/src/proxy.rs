@@ -4618,7 +4618,9 @@ fn validate_allowed_ips_for_resolved_addrs(
         }
 
         // Check resolved IP against the allowlist
-        let ip_allowed = allowed_ips.iter().any(|net| net.contains(&addr.ip()));
+        let ip_allowed = allowed_ips
+            .iter()
+            .any(|net| openshell_core::net::allowed_net_contains(net, addr.ip()));
         if !ip_allowed {
             return Err(format!(
                 "{host} resolves to {} which is not in allowed_ips, connection rejected",
@@ -9435,6 +9437,35 @@ process:
         assert_eq!(connector.addrs(), [SocketAddr::new(upstream, 443)]);
     }
 
+    const MEDIATED_IPV6_POLICY: &str = r#"
+network_policies:
+  allowed:
+    name: allowed
+    endpoints:
+      - host: v6.example
+        port: 443
+      - host: dns64.example
+        port: 443
+      - host: metadata.example
+        port: 443
+      - host: "*.wild.example"
+        port: 443
+      - host: "*.allowed.example"
+        port: 443
+        allowed_ips: ["10.0.0.0/8"]
+    binaries:
+      - path: /usr/bin/curl
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+
     /// Mediation source fed by the test: DNS queries and TCP opens are handed
     /// to the runtime exactly as an isolation backend would stage them.
     struct ChannelMediationSource {
@@ -9492,9 +9523,10 @@ process:
                     ("v6.example.", RecordType::AAAA) => {
                         Some(RData::AAAA(AAAA("2606:4700::6810:84e5".parse().unwrap())))
                     }
-                    ("dns64.example." | "private.wild.example.", RecordType::AAAA) => {
-                        Some(RData::AAAA(AAAA("64:ff9b::a00:5".parse().unwrap())))
-                    }
+                    (
+                        "dns64.example." | "private.wild.example." | "private.allowed.example.",
+                        RecordType::AAAA,
+                    ) => Some(RData::AAAA(AAAA("64:ff9b::a00:5".parse().unwrap()))),
                     ("nsp.wild.example.", RecordType::AAAA) => {
                         Some(RData::AAAA(AAAA("2001:db8:7777::a00:5".parse().unwrap())))
                     }
@@ -9554,31 +9586,7 @@ process:
         let engine = Arc::new(
             OpaEngine::from_strings(
                 include_str!("../data/sandbox-policy.rego"),
-                r#"
-network_policies:
-  allowed:
-    name: allowed
-    endpoints:
-      - host: v6.example
-        port: 443
-      - host: dns64.example
-        port: 443
-      - host: metadata.example
-        port: 443
-      - host: "*.wild.example"
-        port: 443
-    binaries:
-      - path: /usr/bin/curl
-filesystem_policy:
-  include_workdir: true
-  read_only: []
-  read_write: []
-landlock:
-  compatibility: best_effort
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-"#,
+                MEDIATED_IPV6_POLICY,
             )
             .unwrap(),
         );
@@ -9650,14 +9658,14 @@ process:
 
         // A TCP open to the synthetic address is authorized by policy and
         // dials only the pinned upstream IPv6 address.
-        let open = |binary_identity| {
+        let open = |binary_identity, destination| {
             let (stream, _peer) = tokio::io::duplex(64);
             let (decision, completion) = tokio::sync::oneshot::channel();
             (
                 PendingTcpOpen {
                     stream: Box::new(stream),
                     binary_identity,
-                    destination: SocketAddr::new(synthetic[0], 443),
+                    destination,
                     socket: Some(
                         openshell_isolation_interface::contract::NetworkSocketMetadata {
                             socket_cookie: 11,
@@ -9672,7 +9680,7 @@ process:
                 completion,
             )
         };
-        let (pending, completion) = open(Ok(curl_identity()));
+        let (pending, completion) = open(Ok(curl_identity()), SocketAddr::new(synthetic[0], 443));
         let accepted = preauthorize_transparent_open(
             pending,
             Some(&runtime.store),
@@ -9701,25 +9709,48 @@ process:
         // The same destination is denied to a binary the policy does not name.
         let mut wget = curl_identity();
         wget.executable.path = PathBuf::from("/usr/bin/wget");
-        let (pending, completion) = open(Ok(wget));
-        assert!(
-            preauthorize_transparent_open(
-                pending,
-                Some(&runtime.store),
+        assert_denied(
+            &runtime.store,
+            &engine,
+            open(Ok(wget), SocketAddr::new(synthetic[0], 443)),
+            "unlisted binary",
+        )
+        .await;
+
+        // Everything that is not the live mapping fails closed: the real
+        // upstream address, an unallocated address in the synthetic pool, and
+        // the mapped address on a port the policy does not allow.
+        let IpAddr::V6(mapped) = synthetic[0] else {
+            unreachable!("AAAA answers are IPv6")
+        };
+        let unallocated = IpAddr::V6(Ipv6Addr::from(u128::from(mapped) + 1));
+        for (destination, case) in [
+            (
+                SocketAddr::new("2606:4700::6810:84e5".parse().unwrap(), 443),
+                "direct real IPv6",
+            ),
+            (SocketAddr::new(unallocated, 443), "unknown synthetic IPv6"),
+            (SocketAddr::new(synthetic[0], 8443), "wrong port"),
+        ] {
+            assert_denied(
+                &runtime.store,
                 &engine,
-                &BinaryIdentityCache::new(),
-                None,
-                None,
-                false,
-                None,
+                open(Ok(curl_identity()), destination),
+                case,
             )
-            .await
-            .is_none()
-        );
-        assert!(matches!(
-            completion.await.unwrap(),
-            TcpOpenDecision::Denied(_)
-        ));
+            .await;
+        }
+        // Without an attributable binary identity there is no grant either.
+        assert_denied(
+            &runtime.store,
+            &engine,
+            open(
+                Err(ResolveError::Failed("unknown sender".into())),
+                SocketAddr::new(synthetic[0], 443),
+            ),
+            "unavailable identity",
+        )
+        .await;
 
         // DNS64 answers follow the IPv4 SSRF tiers of the address they embed.
         for transport in [DnsTransport::Udp, DnsTransport::Tcp] {
@@ -9732,6 +9763,13 @@ process:
             assert!(
                 response.answers.is_empty(),
                 "NAT64-embedded metadata address mapped over {transport:?}"
+            );
+            // allowed_ips written for IPv4 cover the translated address.
+            let response = ask("private.allowed.example.", transport).await;
+            assert_eq!(
+                response.answers.len(),
+                1,
+                "allowed_ips host over {transport:?}"
             );
             // A wildcard host is public-only: a wrapped private address is
             // internal and gets no synthetic address.
@@ -9752,6 +9790,107 @@ process:
                 "configured NAT64 prefix not classified over {transport:?}"
             );
         }
+
+        // A policy reload starts a new generation; the old IPv6 mapping is
+        // stale and no longer authorizes a connection.
+        engine
+            .reload(
+                include_str!("../data/sandbox-policy.rego"),
+                MEDIATED_IPV6_POLICY,
+            )
+            .unwrap();
+        assert_denied(
+            &runtime.store,
+            &engine,
+            open(Ok(curl_identity()), SocketAddr::new(synthetic[0], 443)),
+            "stale policy generation",
+        )
+        .await;
+    }
+
+    async fn assert_denied(
+        store: &Arc<ResolvedEndpointStore>,
+        engine: &OpaEngine,
+        (pending, completion): (
+            PendingTcpOpen,
+            tokio::sync::oneshot::Receiver<TcpOpenDecision>,
+        ),
+        case: &str,
+    ) {
+        assert!(
+            preauthorize_transparent_open(
+                pending,
+                Some(store),
+                engine,
+                &BinaryIdentityCache::new(),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .is_none(),
+            "{case} must not be authorized"
+        );
+        assert!(
+            matches!(completion.await.unwrap(), TcpOpenDecision::Denied(_)),
+            "{case} must be denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn mediated_policy_dns_ipv6_fails_closed_without_trusted_resolver() {
+        use crate::policy_dns::{PolicyDnsRuntime, PolicyDnsRuntimeConfig};
+        use hickory_proto::op::Message;
+        use hickory_proto::rr::RecordType;
+        use openshell_isolation_interface::contract::{DnsTransport, PendingDnsQuery};
+
+        // Nothing listens here, so every upstream exchange fails.
+        let closed = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let unreachable = closed.local_addr().unwrap();
+        drop(closed);
+        let engine = Arc::new(
+            OpaEngine::from_strings(
+                include_str!("../data/sandbox-policy.rego"),
+                MEDIATED_IPV6_POLICY,
+            )
+            .unwrap(),
+        );
+        let (dns_tx, dns_rx) = mpsc::unbounded_channel();
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(true);
+        let _runtime = PolicyDnsRuntime::start_mediated(
+            engine,
+            rpc_test::network(Arc::new(ChannelMediationSource {
+                dns: tokio::sync::Mutex::new(dns_rx),
+            })),
+            None,
+            PolicyDnsRuntimeConfig::for_epoch(9)
+                .unwrap()
+                .with_ipv6_egress(true)
+                .with_trusted_resolver(unreachable),
+            ready_rx,
+        )
+        .unwrap();
+        let _ready_tx = ready_tx;
+        let (response, reply) = tokio::sync::oneshot::channel();
+        dns_tx
+            .send(PendingDnsQuery {
+                message: dns_query("v6.example.", RecordType::AAAA),
+                transport: DnsTransport::Udp,
+                binary_identity: Ok(curl_identity()),
+                timing: MediationTiming::default(),
+                response,
+            })
+            .unwrap();
+        // Either an error to the backend or a response without answers.
+        let answer = reply.await.unwrap().map_or_else(
+            |_| Vec::new(),
+            |wire| Message::from_vec(&wire).unwrap().answers,
+        );
+        assert!(
+            answer.is_empty(),
+            "no AAAA without a trusted upstream answer"
+        );
     }
 
     #[tokio::test]
@@ -14114,6 +14253,26 @@ network_policies:
         );
         // Wrapping loopback or metadata: blocked even for declared hosts and
         // allowed_ips that cover the translated address.
+        // allowed_ips written for IPv4 cover the translated addresses too.
+        let v4_nets = vec!["10.0.0.0/8".parse().unwrap()];
+        assert!(
+            validate_allowed_ips_for_resolved_addrs(
+                "dns64.example",
+                443,
+                &addr("64:ff9b::a01:203"),
+                &v4_nets
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_allowed_ips_for_resolved_addrs(
+                "dns64.example",
+                443,
+                &addr("64:ff9b::b01:203"),
+                &v4_nets
+            )
+            .is_err()
+        );
         for blocked in ["64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe"] {
             assert!(
                 validate_declared_endpoint_resolved_addrs("dns64.example", 443, &addr(blocked))

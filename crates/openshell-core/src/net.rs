@@ -269,6 +269,21 @@ pub fn is_internal_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// Check whether an `allowed_ips` entry covers `ip`.
+///
+/// A NAT64 address also matches through the IPv4 address it embeds, so
+/// `10.0.0.0/8` covers the DNS64 answer `64:ff9b::a00:5` exactly as it covers
+/// `10.0.0.5`. Callers apply the always-blocked check first.
+pub fn allowed_net_contains(net: &IpNet, ip: IpAddr) -> bool {
+    if net.contains(&ip) {
+        return true;
+    }
+    match ip {
+        IpAddr::V6(v6) => nat64::embedded_ipv4(v6).is_some_and(|v4| net.contains(&IpAddr::V4(v4))),
+        IpAddr::V4(_) => false,
+    }
+}
+
 /// Check if a CIDR network intersects any address range classified by
 /// [`is_internal_ip`].
 pub fn is_internal_net(net: IpNet) -> bool {
@@ -882,5 +897,25 @@ mod tests {
         assert!(is_internal_net(net("64:ff9b::a00:0/104")));
         assert!(is_internal_net(net("64:ff9b:1::/64")));
         assert!(!is_internal_net(net("64:ff9b::8c52:7000/120")));
+    }
+
+    #[test]
+    fn nat64_answers_match_allowed_ipv4_networks() {
+        let net: IpNet = "10.0.0.0/8".parse().unwrap();
+        assert!(allowed_net_contains(&net, "10.0.0.5".parse().unwrap()));
+        assert!(allowed_net_contains(
+            &net,
+            "64:ff9b::a00:5".parse().unwrap()
+        ));
+        assert!(!allowed_net_contains(
+            &net,
+            "64:ff9b::b00:5".parse().unwrap()
+        ));
+        assert!(!allowed_net_contains(
+            &net,
+            "2001:db8::a00:5".parse().unwrap()
+        ));
+        let v6: IpNet = "2001:db8::/32".parse().unwrap();
+        assert!(allowed_net_contains(&v6, "2001:db8::1".parse().unwrap()));
     }
 }
