@@ -3719,7 +3719,9 @@ impl KubernetesComputeDriver {
             else {
                 continue;
             };
-            if !sandbox_runtime_namespace_fence_generation_matches(&fence, &object) {
+            if sandbox_runtime_requires_namespace_fence_generation(&object)
+                && !sandbox_runtime_namespace_fence_generation_matches(&fence, &object)
+            {
                 warn!(
                     sandbox_id,
                     "namespace workload fence generation changed; suspending stale boundary"
@@ -5460,6 +5462,10 @@ fn sandbox_runtime_should_run(obj: &DynamicObject) -> bool {
         .and_then(|spec| spec.get("replicas"))
         .and_then(serde_json::Value::as_i64)
         .is_none_or(|replicas| replicas > 0)
+}
+
+fn sandbox_runtime_requires_namespace_fence_generation(obj: &DynamicObject) -> bool {
+    sandbox_runtime_should_run(obj) || sandbox_runtime_bootstrap_in_progress(obj)
 }
 
 fn update_indexes(
@@ -7587,6 +7593,239 @@ mod tests {
                 "code": 404
             }),
         )
+    }
+
+    type ObservedKubeRequests =
+        Arc<std::sync::Mutex<Vec<(http::Method, String, Option<serde_json::Value>)>>>;
+
+    fn sandbox_runtime_reconcile_test_sandbox(operating_mode: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {
+                "name": "sandbox-cr",
+                "namespace": "openshell",
+                "resourceVersion": "42",
+                "labels": {
+                    LABEL_SANDBOX_ID: "sandbox-1",
+                    LABEL_SANDBOX_WORKSPACE: "team-a"
+                },
+                "annotations": {
+                    crate::resource_admission::CONFIG_USED: "false",
+                    crate::resource_admission::IDENTITIES: "{}",
+                    ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: "old-policy-uid",
+                    ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_VERSION: "old-policy-version",
+                    ANNOTATION_SANDBOX_RUNTIME_READINESS: "unavailable"
+                }
+            },
+            "spec": {
+                "operatingMode": operating_mode,
+                "podTemplate": {
+                    "spec": {
+                        "automountServiceAccountToken": false,
+                        "volumes": [{
+                            "name": SANDBOX_BOOTSTRAP_VOLUME_NAME,
+                            "secret": {"secretName": "os-sandbox-sandbox-1-oldgeneration"}
+                        }]
+                    }
+                }
+            }
+        })
+    }
+
+    fn sandbox_runtime_reconcile_test_driver(
+        sandbox: serde_json::Value,
+        observed: ObservedKubeRequests,
+    ) -> KubernetesComputeDriver {
+        use http_body_util::BodyExt as _;
+
+        let config = KubernetesComputeConfig::default();
+        let names = SandboxRuntimeNames::new("sandbox-1");
+        let mut fences = workload_fence("openshell", &names, config.sandbox_runtime.boundary_port);
+        for (policy, component) in [
+            (&mut fences.workload_policy, "sandbox-workload-fence"),
+            (&mut fences.supervisor_policy, "sandbox-supervisor-egress"),
+        ] {
+            let labels = policy.metadata.labels.get_or_insert_default();
+            labels.insert(
+                LABEL_MANAGED_BY.to_string(),
+                LABEL_MANAGED_BY_VALUE.to_string(),
+            );
+            labels.insert("openshell.ai/component".to_string(), component.to_string());
+            policy.metadata.uid = Some(format!("{component}-uid"));
+            policy.metadata.resource_version = Some("current-policy-version".to_string());
+        }
+        let workload_policy = serde_json::to_value(fences.workload_policy)
+            .expect("serialize workload NetworkPolicy fixture");
+        let supervisor_policy = serde_json::to_value(fences.supervisor_policy)
+            .expect("serialize supervisor NetworkPolicy fixture");
+        let workload_policy_path = format!(
+            "/apis/networking.k8s.io/v1/namespaces/openshell/networkpolicies/{}",
+            names.workload_policy
+        );
+        let supervisor_policy_path = format!(
+            "/apis/networking.k8s.io/v1/namespaces/openshell/networkpolicies/{}",
+            names.supervisor_policy
+        );
+        let supervisor_pod_path =
+            format!("/api/v1/namespaces/openshell/pods/{}", names.supervisor_pod);
+        let boundary_service_path = format!(
+            "/api/v1/namespaces/openshell/services/{}",
+            names.boundary_service
+        );
+        let supervisor_pod_name = names.supervisor_pod;
+        let boundary_service_name = names.boundary_service;
+        let sandbox_for_service = sandbox;
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let sandbox = sandbox_for_service.clone();
+            let observed = observed.clone();
+            let workload_policy = workload_policy.clone();
+            let supervisor_policy = supervisor_policy.clone();
+            let workload_policy_path = workload_policy_path.clone();
+            let supervisor_policy_path = supervisor_policy_path.clone();
+            let supervisor_pod_path = supervisor_pod_path.clone();
+            let boundary_service_path = boundary_service_path.clone();
+            let supervisor_pod_name = supervisor_pod_name.clone();
+            let boundary_service_name = boundary_service_name.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let method = parts.method;
+                let path = parts.uri.path().to_string();
+                let bytes = body
+                    .collect()
+                    .await
+                    .expect("read Kubernetes test request body")
+                    .to_bytes();
+                let body = (!bytes.is_empty()).then(|| {
+                    serde_json::from_slice(&bytes).expect("parse Kubernetes test request body")
+                });
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((method.clone(), path.clone(), body));
+
+                let response = match (method.clone(), path.as_str()) {
+                    (
+                        http::Method::GET,
+                        "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes",
+                    ) => kube_test_response(
+                        http::StatusCode::OK,
+                        serde_json::json!({
+                            "apiVersion": "agents.x-k8s.io/v1beta1",
+                            "kind": "SandboxList",
+                            "items": [sandbox]
+                        }),
+                    ),
+                    (http::Method::GET, path) if path == workload_policy_path => {
+                        kube_test_response(http::StatusCode::OK, workload_policy)
+                    }
+                    (http::Method::GET, path) if path == supervisor_policy_path => {
+                        kube_test_response(http::StatusCode::OK, supervisor_policy)
+                    }
+                    (http::Method::GET, path) if path == supervisor_pod_path => {
+                        kube_test_not_found("pods", &supervisor_pod_name)
+                    }
+                    (http::Method::GET, path) if path == boundary_service_path => {
+                        kube_test_not_found("services", &boundary_service_name)
+                    }
+                    (http::Method::GET, "/api/v1/namespaces/openshell/secrets") => {
+                        kube_test_response(
+                            http::StatusCode::OK,
+                            serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "SecretList",
+                                "items": []
+                            }),
+                        )
+                    }
+                    (
+                        http::Method::PATCH,
+                        "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr",
+                    ) => kube_test_response(http::StatusCode::OK, sandbox),
+                    _ => kube_test_response(
+                        http::StatusCode::METHOD_NOT_ALLOWED,
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "status": "Failure",
+                            "message": format!("unexpected test request: {method} {path}"),
+                            "reason": "MethodNotAllowed",
+                            "code": 405
+                        }),
+                    ),
+                };
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        let client = Client::new(service, "openshell");
+        let driver = KubernetesComputeDriver {
+            client: client.clone(),
+            watch_client: client,
+            sandbox_api_version: Arc::new(OnceCell::new()),
+            config,
+            operator_allowlist: None,
+        };
+        driver
+            .sandbox_api_version
+            .set(SANDBOX_VERSION_V1BETA1)
+            .expect("set test Sandbox API version");
+        driver
+    }
+
+    #[tokio::test]
+    async fn suspended_stale_namespace_fence_reconciliation_converges_without_mutation() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let driver = sandbox_runtime_reconcile_test_driver(
+            sandbox_runtime_reconcile_test_sandbox("Suspended"),
+            observed.clone(),
+        );
+
+        driver.reconcile_sandbox_runtime_resources().await;
+        driver.reconcile_sandbox_runtime_resources().await;
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|(method, path, _)| {
+                    method == http::Method::GET
+                        && path == "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes"
+                })
+                .count(),
+            2,
+            "the fixture must exercise two complete reconciliation passes"
+        );
+        assert!(
+            observed
+                .iter()
+                .all(|(method, _, _)| method == http::Method::GET),
+            "stable suspended reconciliation must not mutate Kubernetes resources: {observed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn running_stale_namespace_fence_reconciliation_still_fails_closed() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let driver = sandbox_runtime_reconcile_test_driver(
+            sandbox_runtime_reconcile_test_sandbox("Running"),
+            observed.clone(),
+        );
+
+        driver.reconcile_sandbox_runtime_resources().await;
+
+        let observed = observed.lock().unwrap();
+        let patches = observed
+            .iter()
+            .filter(|(method, _, _)| method == http::Method::PATCH)
+            .collect::<Vec<_>>();
+        assert_eq!(patches.len(), 1, "active stale boundary must suspend once");
+        let patch = patches[0].2.as_ref().expect("suspension PATCH has a body");
+        assert_eq!(patch["metadata"]["resourceVersion"], "42");
+        assert_eq!(patch["spec"]["operatingMode"], "Suspended");
+        assert_eq!(
+            patch["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE],
+            SandboxRuntimeBootstrapPhase::Suspending.as_str()
+        );
     }
 
     #[test]
@@ -11652,5 +11891,38 @@ mod tests {
         assert!(!sandbox_runtime_should_run(&alpha));
         alpha.data = serde_json::json!({"spec": {"replicas": 1}});
         assert!(sandbox_runtime_should_run(&alpha));
+    }
+
+    #[test]
+    fn namespace_fence_generation_is_required_until_suspension_is_stable() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+
+        sandbox.data = serde_json::json!({"spec": {"operatingMode": "Running"}});
+        assert!(sandbox_runtime_requires_namespace_fence_generation(
+            &sandbox
+        ));
+
+        sandbox.data = serde_json::json!({"spec": {"operatingMode": "Suspended"}});
+        assert!(!sandbox_runtime_requires_namespace_fence_generation(
+            &sandbox
+        ));
+
+        sandbox.data = serde_json::json!({"spec": {"replicas": 0}});
+        assert!(!sandbox_runtime_requires_namespace_fence_generation(
+            &sandbox
+        ));
+
+        sandbox.metadata.annotations = Some(BTreeMap::from([(
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING.to_string(),
+            "true".to_string(),
+        )]));
+        assert!(sandbox_runtime_requires_namespace_fence_generation(
+            &sandbox
+        ));
     }
 }
