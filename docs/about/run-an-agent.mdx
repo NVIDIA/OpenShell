@@ -15,36 +15,36 @@ with the agent as its main process.
 **1. Configure what the agent has access to.**
 
 A [provider profile](/how-it-works/providers/profiles) defines the credentials, service
-endpoints, and executable paths an agent may use. For Claude Code, review the
-[example profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/claude-code.yaml),
-including its executable paths for your image, then import it and
+endpoints, and executable paths an agent may use. This example runs OpenCode
+against Anthropic. Download the
+[example Anthropic profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/anthropic.yaml),
+set its `binaries` to the OpenCode executable in the image, then import it and
 [create a provider](/how-it-works/providers/overview#create-a-provider) that
 stores its credentials.
 
 ```shell
-openshell profile import \
-  --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/claude-code.yaml
+curl -fsSLo anthropic.yaml \
+  https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/anthropic.yaml
+sed -i.bak 's|^binaries: .*|binaries: [/usr/local/bin/opencode]|' anthropic.yaml
+
+openshell profile import -f anthropic.yaml
 
 openshell provider create \
-  --name claude-code \
-  --type claude-code \
+  --name anthropic \
+  --type anthropic \
   --from-existing
 ```
 
 Set `ANTHROPIC_API_KEY` before creating the provider. OpenShell stores its
-value in the credential store.
+value in the credential store. Only the listed executable can send the key, and
+only to `api.anthropic.com`.
 
-**2. Configure the sandbox image.**
+**2. Choose the sandbox image.**
 
-Build or select a [sandbox image](/how-it-works/sandboxes/overview#sandbox-images)
-containing Claude Code and every tool it needs:
-
-```shell
-docker build -t agent:local .
-```
-
-For a remote gateway, push the image to a registry that the gateway can pull
-from. Use an explicit version instead of a mutable tag for reproducible
+Use any [sandbox image](/how-it-works/sandboxes/overview#sandbox-images) that
+contains the agent and every tool it needs. The published OpenCode image
+installs `opencode` at `/usr/local/bin/opencode`, so it works without a custom
+build. Use an explicit version tag instead of `latest` for reproducible
 deployments.
 
 The built-in fallback policy grants access to the working directory and common
@@ -61,9 +61,9 @@ provider, and pass the agent command after `--`:
 ```shell
 openshell sandbox create \
   --name my-agent \
-  --from agent:local \
-  --provider claude-code \
-  -- claude
+  --from ghcr.io/anomalyco/opencode:latest \
+  --provider anthropic \
+  -- opencode
 ```
 
 Add `--policy sandbox-policy.yaml` when the workload needs a custom policy. The
