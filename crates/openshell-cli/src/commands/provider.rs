@@ -2171,6 +2171,7 @@ async fn load_profile_import_items_with_url(
             "provider profile URL must end in .yaml, .yml, or .json"
         ));
     }
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
