@@ -89,6 +89,8 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing"
 
 For explicit entries in `docs/index.yml`, keep `page:`. Fern still requires it. If the page defines `sidebar-title`, set `page:` to that value. Otherwise set `page:` to the frontmatter `title`.
 
+Keep every page URL equal to its file path under `docs/`, without `.mdx`. Fern builds URLs from nav labels and slugs, not from file paths, so rename the file when you rename a page, and add a redirect in `fern/docs.yml` for the old URL. When a nav label does not produce the file name, for example `TypeScript`, which Fern turns into `type-script`, set a relative `slug:` on the entry in `docs/index.yml`. `mise run docs` runs `mise run docs:nav`, which fails when a page URL differs from its file path, when a nav label differs from the page's sidebar name, when a page is missing from the navigation, or when a redirect points to a page that does not exist.
+
 ### Page Structure
 
 1. Frontmatter `title` and `description`, plus any relevant page metadata.

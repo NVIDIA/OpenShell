@@ -20,6 +20,7 @@ depends = [
   "test:qualification-summary",
   "test:codex-security-release-range",
   "test:docs-website",
+  "test:docs-nav",
 ]
 
 ["test:docs-website"]
@@ -27,6 +28,10 @@ description = "Test the docs-website sync script"
 # --no-project skips installing the OpenShell package; --with supplies the test
 # dependencies and the script's runtime dependency, which live outside the project env.
 run = "uv run --no-project --with pytest --with pytest-asyncio --with pyyaml pytest tasks/scripts/sync_docs_website_test.py"
+
+["test:docs-nav"]
+description = "Test the docs navigation check"
+run = "uv run --no-project --with pytest --with pyyaml pytest tasks/scripts/check_docs_nav_test.py"
 
 ["test:sbom"]
 description = "Run SBOM tooling tests"
