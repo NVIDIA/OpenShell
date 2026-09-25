@@ -62,8 +62,7 @@ ENVIRONMENT VARIABLES:
                         Set to 1 only after backing up and cleaning up a
                         pre-v0.0.37 or non-snap installation.
     OPENSHELL_INSTALL_SNAP
-                        Set to 1 to install the OpenShell snap on Linux. The
-                        snap gateway allows unauthenticated local access.
+                        Set to 1 to install the OpenShell snap on Linux.
 
 NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
@@ -71,16 +70,16 @@ NOTES:
 
     Linux installs the Debian package on amd64/arm64 or the RPM packages on
     x86_64/aarch64, depending on the host package manager.
+    macOS installs the release Homebrew formula on Apple Silicon and starts a
+    brew services-backed local gateway.
 
     The installer uses the OpenShell snap only when OPENSHELL_INSTALL_SNAP=1 is
     set or an OpenShell snap is already installed, the snap command is
     available, and OPENSHELL_VERSION is unset or dev. Snap installs use
-    latest/stable by default and latest/edge for dev. The snap gateway allows
-    unauthenticated access from any local user. The OpenShell snap requires a
-    running Docker Engine installed from a system package or Docker's package
-    repository. The Docker snap is not currently compatible with OpenShell.
-    macOS installs the release Homebrew formula on Apple Silicon and starts a
-    brew services-backed local gateway.
+    latest/stable by default and latest/edge for dev. The OpenShell snap
+    requires a running Docker Engine installed from a system package or
+    Docker's package repository. The Docker snap is not currently compatible
+    with OpenShell.
 EOF
 }
 
