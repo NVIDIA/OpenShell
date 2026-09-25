@@ -38,23 +38,28 @@ experimental:
   mdx-components:
   - ./pages-latest/_components
   - ./pages-dev/_components
+  - ./pages-v0.1.0/_components
   - ./components
 versions:
-- display-name: Latest (v0.0.116)
+- display-name: Latest (v0.1.0)
   path: ./versions/latest.yml
   slug: latest
   announcement:
-    message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>OpenShell
-      0.1.0 is coming soon.</strong> <a href="https://github.com/NVIDIA/OpenShell/milestone/10"
-      target="_blank" rel="noreferrer">Track progress in the 0.1.0 milestone</a>,
-      <a href="https://docs.nvidia.com/openshell/dev/index.html" target="_blank" rel="noreferrer">read
-      the prerelease documentation</a>, or <a href="https://docs.nvidia.com/openshell/dev/about/installation#install-a-prerelease"
-      target="_blank" rel="noreferrer">install a prerelease</a>.<br/>Version 0.0.116
-      will reach end of support and upgrading will require migration; notes will be
-      provided with 0.1.0 release.</span>'
+    message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>New
+      in OpenShell 0.1.0:</strong> a stable release cadence, new isolation primitives,
+      an expanded extension surface, and new APIs. <a href="https://docs.nvidia.com/openshell/dev/upgrade/0-1-0"
+      target="_blank" rel="noreferrer">Read the 0.1.0 upgrade guide</a>.</span>'
 - display-name: Dev
   path: ./versions/dev.yml
   slug: dev
+  announcement:
+    message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>New
+      in OpenShell 0.1.0:</strong> a stable release cadence, new isolation primitives,
+      an expanded extension surface, and new APIs. <a href="https://docs.nvidia.com/openshell/dev/upgrade/0-1-0"
+      target="_blank" rel="noreferrer">Read the 0.1.0 upgrade guide</a>.</span>'
+- display-name: v0.1.0
+  path: ./versions/v0.1.0.yml
+  slug: v0.1.0
   announcement:
     message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>New
       in OpenShell 0.1.0:</strong> a stable release cadence, new isolation primitives,

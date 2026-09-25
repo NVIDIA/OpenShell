@@ -1,0 +1,115 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Run Your First Agent"
+sidebar-title: "Run Your First Agent"
+description: "Configure a provider, image, and policy to run an AI agent in an OpenShell sandbox."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Provider Profiles, Policies, Custom Images"
+position: 4
+---
+
+OpenShell can run any agent that is available in a sandbox image. Configure the
+agent's external services, choose its image and policy, then create the sandbox
+with the agent as its main process.
+
+**1. Configure what the agent has access to.**
+
+A [provider profile](/how-it-works/providers/profiles) defines the credentials, service
+endpoints, and executable paths an agent may use.
+
+This example runs OpenCode
+against OpenRouter. Review the
+[example profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/openrouter.yaml),
+which allows `/usr/local/bin/opencode` to reach `openrouter.ai`, then import
+it and [create a provider](/how-it-works/providers/overview#create-a-provider)
+that stores its credentials.
+
+```shell
+openshell profile import \
+  --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/openrouter.yaml
+
+openshell provider create \
+  --name openrouter \
+  --type openrouter \
+  --from-existing
+```
+
+Set `OPENROUTER_API_KEY` before creating the provider. OpenShell stores its
+value in the credential store and sends it only to `openrouter.ai`.
+
+**2. Choose the sandbox image.**
+
+Use any [sandbox image](/how-it-works/sandboxes/overview#sandbox-images) that
+contains the agent and every tool it needs.
+
+In this example, the OpenCode image installs `opencode` at `/usr/local/bin/opencode`.
+
+Create a custom [sandbox policy](/how-it-works/policies/overview) when the
+agent needs more filesystem access, package registries, source hosts, tool
+servers, or other destinations.
+
+**3. Create the sandbox.**
+
+[Create the sandbox](/how-it-works/sandboxes/overview#create-a-sandbox), attach the
+provider, and pass the agent command after `--`:
+
+```shell
+openshell sandbox create \
+  --name my-agent \
+  --from ghcr.io/anomalyco/opencode:latest \
+  --provider openrouter \
+  -- opencode -m openrouter/nvidia/nemotron-3.5-lightning:free
+```
+
+OpenCode detects the OpenRouter credential and starts with the model passed to
+`-m`. This example uses a free model, so it works without OpenRouter credits.
+Choose any model from `opencode models openrouter`.
+
+For more control over what the agent can access, refer to
+[Policies](/how-it-works/policies/overview).
+
+**4. Grant more access as the agent needs it.**
+
+When the agent reaches a destination that policy does not allow, OpenShell
+denies the request and drafts a rule for it. The
+[policy advisor](/how-it-works/policies/advisor)'s mechanistic mapper groups
+recent denials by host, port, and calling program, then submits a narrow
+proposal to the gateway. The gateway checks each proposal with the
+[policy prover](/how-it-works/policies/prover) before you review it.
+
+List pending proposals from the host:
+
+```shell
+openshell rule get my-agent --status pending
+```
+
+Approve a proposal when its rule matches the access you intend to grant, or
+reject it with a reason:
+
+```shell
+openshell rule approve my-agent --chunk-id <chunk-id>
+
+openshell rule reject my-agent \
+  --chunk-id <chunk-id> \
+  --reason "Not needed for this task."
+```
+
+Approved rules hot-reload into the running sandbox without a restart, so the
+agent can retry the request. To let the agent propose its own narrower rules,
+or to approve proposals automatically when the prover finds no new risk, refer
+to [Policy Advisor](/how-it-works/policies/advisor).
+
+## Examples
+
+For a complete worked example, follow [Run Pi in OpenShell](/tutorials/run-pi).
+The tutorial builds a Pi image, configures narrowly scoped Anthropic access,
+uploads a project, and starts the agent inside the sandbox boundary.
+
+## Next Steps
+
+- For sandbox lifecycle, resources, templates, files, and connectivity, refer
+  to [Sandboxes](/how-it-works/sandboxes/overview).
+- For the restrictive fallback policy, refer to
+  [Default Policy](/how-it-works/policies/default-policy).
+- For operating-system and runtime requirements, refer to the
+  [Support Matrix](/about/support-matrix).

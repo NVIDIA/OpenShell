@@ -2,28 +2,132 @@ landing-page:
   page: Home
   path: ../pages-latest/index.mdx
 navigation:
-- folder: ../pages-latest/about
-  title: About NVIDIA OpenShell
-- section: Get Started
-  slug: get-started
+- section: About NVIDIA OpenShell
+  slug: about
   contents:
-  - page: Quickstart
-    path: ../pages-latest/get-started/quickstart.mdx
-  - folder: ../pages-latest/get-started/tutorials
-    skip-slug: true
-- folder: ../pages-latest/sandboxes
-  title: Manage OpenShell
-- folder: ../pages-latest/providers
-  title: Providers
-- folder: ../pages-latest/extensibility
-  title: Extensibility
+  - page: Why OpenShell
+    path: ../pages-latest/about/overview.mdx
+  - page: Architecture
+    path: ../pages-latest/about/architecture.mdx
+  - page: Installation
+    path: ../pages-latest/about/installation.mdx
+  - page: Run Your First Agent
+    path: ../pages-latest/about/run-an-agent.mdx
+  - page: Support Matrix
+    path: ../pages-latest/about/support-matrix.mdx
+- section: How It Works
+  slug: how-it-works
+  contents:
+  - section: Gateways
+    slug: gateways
+    contents:
+    - page: Overview
+      path: ../pages-latest/how-it-works/gateways/overview.mdx
+    - page: Authentication
+      path: ../pages-latest/how-it-works/gateways/authentication.mdx
+    - page: Configuration
+      path: ../pages-latest/how-it-works/gateways/configuration.mdx
+    - page: Container Deployment
+      path: ../pages-latest/how-it-works/gateways/container-deployment.mdx
+  - page: Workspaces
+    path: ../pages-latest/how-it-works/workspaces.mdx
+  - section: Sandboxes
+    slug: sandboxes
+    contents:
+    - page: Overview
+      path: ../pages-latest/how-it-works/sandboxes/overview.mdx
+    - page: Templates
+      path: ../pages-latest/how-it-works/sandboxes/templates.mdx
+    - page: Runtimes
+      path: ../pages-latest/how-it-works/sandboxes/runtimes.mdx
+  - section: Providers
+    slug: providers
+    contents:
+    - page: Overview
+      path: ../pages-latest/how-it-works/providers/overview.mdx
+    - page: Profiles
+      path: ../pages-latest/how-it-works/providers/profiles.mdx
+    - page: AWS
+      path: ../pages-latest/how-it-works/providers/aws.mdx
+    - page: Google
+      path: ../pages-latest/how-it-works/providers/google.mdx
+  - section: Policies
+    slug: policies
+    contents:
+    - page: Overview
+      path: ../pages-latest/how-it-works/policies/overview.mdx
+    - page: Network Rules
+      path: ../pages-latest/how-it-works/policies/network-rules.mdx
+    - page: Manage Policies
+      path: ../pages-latest/how-it-works/policies/manage-policies.mdx
+    - page: Policy Prover
+      path: ../pages-latest/how-it-works/policies/prover.mdx
+      slug: prover
+    - page: Policy Advisor
+      path: ../pages-latest/how-it-works/policies/advisor.mdx
+      slug: advisor
+    - page: Default Policy
+      path: ../pages-latest/how-it-works/policies/default-policy.mdx
+    - page: Schema Reference
+      path: ../pages-latest/how-it-works/policies/schema.mdx
+      slug: schema
+  - page: Inference
+    path: ../pages-latest/how-it-works/inference.mdx
+- section: Extensibility
+  slug: extensibility
+  contents:
+  - page: Overview
+    path: ../pages-latest/extensibility/overview.mdx
+  - section: Supervisor Middleware
+    slug: supervisor-middleware
+    path: ../pages-latest/extensibility/supervisor-middleware/index.mdx
+    contents:
+    - page: Configuration
+      path: ../pages-latest/extensibility/supervisor-middleware/configure.mdx
+    - page: Supported Operations
+      path: ../pages-latest/extensibility/supervisor-middleware/operations.mdx
+  - page: Gateway Interceptors
+    path: ../pages-latest/extensibility/gateway-interceptors.mdx
+  - page: Drivers
+    path: ../pages-latest/extensibility/drivers.mdx
+  - page: Isolation Backends
+    path: ../pages-latest/extensibility/isolation-backends.mdx
 - folder: ../pages-latest/observability
   title: Observability
 - folder: ../pages-latest/kubernetes
   title: Kubernetes
-- folder: ../pages-latest/reference
-  title: Reference
+- section: Tutorials
+  slug: tutorials
+  contents:
+  - page: Run Pi
+    path: ../pages-latest/tutorials/run-pi.mdx
+  - page: First Network Policy
+    path: ../pages-latest/tutorials/first-network-policy.mdx
+  - page: GitHub Push Access
+    path: ../pages-latest/tutorials/github-sandbox.mdx
+  - page: Microsoft Graph Provider Refresh
+    path: ../pages-latest/tutorials/microsoft-graph-provider-refresh.mdx
+- section: SDK Reference
+  slug: sdk
+  contents:
+  - page: Go
+    path: ../pages-latest/sdk/go.mdx
+  - page: Rust
+    path: ../pages-latest/sdk/rust.mdx
+  - page: Python
+    path: ../pages-latest/sdk/python.mdx
+  - page: TypeScript
+    path: ../pages-latest/sdk/typescript.mdx
+  - page: API Errors
+    path: ../pages-latest/sdk/api-errors.mdx
+  - page: Protobuf Time Types
+    path: ../pages-latest/sdk/protobuf-time-types.mdx
 - folder: ../pages-latest/security
   title: Security
+- section: Upgrade Guides
+  slug: upgrade
+  contents:
+  - page: 0.1.0
+    path: ../pages-latest/upgrade/0-1-0.mdx
 - folder: ../pages-latest/resources
   title: Resources

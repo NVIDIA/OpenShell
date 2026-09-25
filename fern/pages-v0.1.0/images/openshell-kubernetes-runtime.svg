@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="680" viewBox="0 0 1200 680" role="img" aria-labelledby="title desc">
+  <title id="title">OpenShell runtime on Kubernetes</title>
+  <desc id="desc">The gateway creates an Agent Sandbox custom resource and a separate supervisor Pod. The Agent Sandbox controller creates the workload Pod. A NetworkPolicy denies workload-initiated egress and admits only supervisor traffic to the workload's boundary Service. The supervisor initiates an authenticated TLS channel, evaluates agent requests, and opens policy-approved upstream connections.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#579000"/>
+    </marker>
+    <style>
+      .section { font: 700 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; letter-spacing: .08em; }
+      .label { font: 700 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .small { font: 500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .tiny { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .soft { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 2; }
+      .trusted { fill: #eff6ff; stroke: #3b82f6; stroke-width: 2.5; }
+      .green { fill: #f2f9e8; stroke: #76b900; stroke-width: 2.5; }
+      .dark { fill: #1f2937; stroke: #111827; stroke-width: 2; }
+      .line { fill: none; stroke: #334155; stroke-width: 2.5; marker-end: url(#arrow); }
+      .flow { fill: none; stroke: #579000; stroke-width: 3; marker-end: url(#arrow-green); }
+      .blocked { fill: none; stroke: #c2413b; stroke-width: 2.5; stroke-dasharray: 8 7; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="680" rx="20" fill="#ffffff"/>
+
+  <g transform="translate(0,-90)">
+
+  <text x="45" y="305" class="section">GATEWAY</text>
+  <rect x="40" y="320" width="280" height="240" rx="18" class="soft"/>
+  <rect x="65" y="350" width="230" height="82" rx="14" class="trusted"/>
+  <text x="180" y="384" text-anchor="middle" class="label">API Server</text>
+  <text x="180" y="409" text-anchor="middle" class="small">Deployment or StatefulSet</text>
+  <rect x="65" y="465" width="230" height="72" rx="14" class="green"/>
+  <text x="180" y="495" text-anchor="middle" class="label">Compute driver</text>
+  <text x="180" y="519" text-anchor="middle" class="small">provisions resources</text>
+  <path d="M180 432 V465" class="line"/>
+
+
+  <rect x="415" y="145" width="220" height="94" rx="14" class="box"/>
+  <text x="525" y="180" text-anchor="middle" class="label">Sandbox CR</text>
+  <text x="525" y="204" text-anchor="middle" class="small">Agent Sandbox API</text>
+  <text x="525" y="225" text-anchor="middle" class="small">controller creates Pod</text>
+
+  <rect x="665" y="145" width="220" height="94" rx="14" class="green"/>
+  <text x="775" y="180" text-anchor="middle" class="label">NetworkPolicy</text>
+  <text x="775" y="204" text-anchor="middle" class="small">no workload egress</text>
+  <text x="775" y="225" text-anchor="middle" class="small">supervisor ingress only</text>
+
+  <rect x="915" y="145" width="235" height="94" rx="14" class="box"/>
+  <text x="1032" y="180" text-anchor="middle" class="label">Workspace PVC</text>
+  <text x="1032" y="207" text-anchor="middle" class="small">/sandbox persists</text>
+
+  <rect x="415" y="330" width="280" height="280" rx="18" class="trusted"/>
+  <text x="440" y="360" class="tiny">SUPERVISOR POD</text>
+  <rect x="440" y="385" width="230" height="164" rx="14" class="box"/>
+  <text x="555" y="422" text-anchor="middle" class="label">Supervisor</text>
+  <text x="555" y="457" text-anchor="middle" class="small">Policy evaluation</text>
+  <text x="555" y="485" text-anchor="middle" class="small">Credentials and proxying</text>
+  <text x="555" y="513" text-anchor="middle" class="small">Gateway session</text>
+  <text x="440" y="580" class="tiny">DIRECTLY MANAGED</text>
+  <text x="440" y="597" class="tiny">BY OPENSHELL</text>
+
+  <rect x="875" y="330" width="275" height="280" rx="18" fill="#ffffff" stroke="#76b900" stroke-width="3" stroke-dasharray="10 7"/>
+  <text x="900" y="360" class="tiny">WORKLOAD POD</text>
+  <rect x="900" y="385" width="225" height="78" rx="13" class="box"/>
+  <text x="1012" y="417" text-anchor="middle" class="label">OpenShell Sandbox</text>
+  <text x="1012" y="443" text-anchor="middle" class="small">process and syscall boundary</text>
+  <path d="M1012 463 V493" class="line"/>
+  <rect x="900" y="493" width="225" height="76" rx="13" class="dark"/>
+  <text x="1012" y="524" text-anchor="middle" style="font:700 18px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#fff">Agent</text>
+  <text x="1012" y="548" text-anchor="middle" style="font:500 14px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#d1d5db">untrusted workload</text>
+  <text x="1012" y="592" text-anchor="middle" class="tiny">AGENT SANDBOX CONTROLLER POD</text>
+
+  <text x="785" y="376" text-anchor="middle" class="tiny">SUPERVISOR DIALS</text>
+  <text x="785" y="394" text-anchor="middle" class="tiny">TLS CHANNEL</text>
+  <rect x="725" y="408" width="120" height="96" rx="14" class="box"/>
+  <text x="785" y="443" text-anchor="middle" class="label">Service</text>
+  <text x="785" y="468" text-anchor="middle" class="small">TLS · 5500</text>
+  <text x="785" y="488" text-anchor="middle" class="small">boundary</text>
+  <path d="M695 456 H725" class="flow"/>
+  <path d="M845 456 H875" class="flow"/>
+  <text x="785" y="539" text-anchor="middle" class="small">Agent requests return</text>
+  <text x="785" y="560" text-anchor="middle" class="small">on this channel</text>
+
+  <path d="M295 501 H350 V192 H415" class="line"/>
+  <text x="355" y="177" text-anchor="middle" class="tiny">K8S API</text>
+  <path d="M415 562 H320" class="line"/>
+  <text x="367" y="529" text-anchor="middle" class="tiny">OUTBOUND</text>
+  <text x="367" y="547" text-anchor="middle" class="tiny">SESSION</text>
+
+  <rect x="445" y="660" width="220" height="80" rx="16" class="soft"/>
+  <text x="555" y="693" text-anchor="middle" class="label">External services</text>
+  <text x="555" y="719" text-anchor="middle" class="small">APIs · tools · models</text>
+  <path d="M630 549 V660" class="flow"/>
+  <text x="642" y="640" class="tiny">POLICY-APPROVED EGRESS</text>
+
+  <path d="M1012 610 V638" class="blocked"/>
+  <line x1="1002" y1="640" x2="1022" y2="660" stroke="#c2413b" stroke-width="3"/>
+  <line x1="1022" y1="640" x2="1002" y2="660" stroke="#c2413b" stroke-width="3"/>
+  <text x="1012" y="685" text-anchor="middle" class="tiny">NO WORKLOAD-INITIATED EGRESS</text>
+  </g>
+</svg>

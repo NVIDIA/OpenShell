@@ -1,0 +1,168 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Run Pi in OpenShell"
+sidebar-title: "Run Pi"
+description: "Build a Pi coding-agent image, configure Anthropic access, and run Pi inside an OpenShell sandbox."
+keywords: "Generative AI, Cybersecurity, Tutorial, Pi Coding Agent, Anthropic, Sandbox, Provider Profile"
+---
+
+
+This tutorial runs [Pi](https://pi.dev), a terminal coding agent, with the
+Anthropic API. You will build Pi into an OCI image, configure narrowly scoped
+model access, and run it inside OpenShell.
+
+## Build the Pi Image
+
+Pi does not publish an official OCI image. Its
+[container guide](https://pi.dev/docs/latest/containerization) installs the
+maintained `@earendil-works/pi-coding-agent` npm package into a Node.js image.
+Create `Dockerfile.pi` with the same approach:
+
+```dockerfile
+FROM node:24-bookworm-slim
+
+ARG PI_VERSION=latest
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash ca-certificates git ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}"
+
+RUN mkdir -p /workspace && chown node:node /workspace
+USER node
+WORKDIR /workspace
+
+ENV PI_CODING_AGENT_DIR=/tmp/pi-agent
+```
+
+Build the image with the container engine used by your local gateway:
+
+```shell
+docker build -t pi-agent:local -f Dockerfile.pi .
+```
+
+For Podman, use `podman build -t localhost/pi-agent:local -f Dockerfile.pi .`
+and substitute `localhost/pi-agent:local` in the commands below. For a remote
+gateway, push the image to a registry the gateway can pull from. Pin
+`PI_VERSION` to a reviewed release when you publish a reproducible image.
+
+## Configure Anthropic Access
+
+Create `pi-anthropic.yaml`. The profile permits only the Pi executable from
+this image to reach the Anthropic API. OpenShell supplies a credential
+placeholder to Pi and replaces it only on requests to the declared endpoint.
+
+```yaml
+id: pi-anthropic
+display_name: Pi with Anthropic
+description: Anthropic model access for the Pi coding agent
+category: agent
+inference_capable: true
+credentials:
+  - name: api_key
+    description: Anthropic API key used by Pi
+    env_vars: [ANTHROPIC_API_KEY]
+    required: true
+    auth_style: header
+    header_name: x-api-key
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.anthropic.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries:
+  - /usr/local/bin/pi
+  - /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/**
+```
+
+Lint and import the profile into your current workspace, then store an
+Anthropic API key in a provider:
+
+```shell
+openshell provider profile lint -f pi-anthropic.yaml
+openshell provider profile import -f pi-anthropic.yaml
+
+ANTHROPIC_API_KEY=your-key \
+  openshell provider create \
+    --name pi-anthropic \
+    --type pi-anthropic \
+    --from-existing
+```
+
+## Create the Pi Sandbox
+
+Create the sandbox, attach the provider, and run Pi interactively:
+
+```shell
+openshell sandbox create \
+  --name pi \
+  --from pi-agent:local \
+  --provider pi-anthropic \
+  -- pi
+```
+
+The command after `--` is the sandbox's main process. Pi and every command it
+starts run inside the sandbox boundary. Try asking Pi:
+
+```text
+Explain what files are available in this workspace.
+```
+
+To give Pi a local project, upload it before the main process starts:
+
+```shell
+openshell sandbox create \
+  --name pi-project \
+  --from pi-agent:local \
+  --provider pi-anthropic \
+  --upload .:/workspace \
+  -- pi
+```
+
+The provider grants Pi access to `api.anthropic.com`. The built-in fallback
+policy grants access to the working directory and standard runtime paths while
+denying all other network egress. Add a reviewed custom policy when Pi needs
+package registries, source hosts, tool servers, or other destinations.
+
+## Adapt the Pi Workflow
+
+Pi supports multiple model providers. Create or adapt a provider profile for
+the service you use, and make its `binaries` paths match the Pi installation in
+your image. The OpenShell repository contains reviewable profile examples in
+[`providers/`](https://github.com/NVIDIA/OpenShell/tree/main/providers).
+
+Install any additional compilers, package managers, and agent tools in the
+image. Grant their filesystem and network requirements through
+[sandbox policy](/how-it-works/policies/overview) instead of giving the workload broad
+access. Refer to [Profiles](/how-it-works/providers/profiles) for credential and endpoint
+configuration.
+
+## Verify and Troubleshoot
+
+Inspect the sandbox, effective policy, provider attachments, and logs:
+
+```shell
+openshell sandbox list
+openshell policy get pi --full
+openshell sandbox provider list pi
+openshell logs pi --tail
+```
+
+If `pi` is missing, confirm that the image was built with the selected local
+container engine or pushed to a registry visible to the gateway. If a model
+request is denied, confirm that the profile's `binaries` paths match
+`command -v pi` and `npm root -g` inside the image. Review any other denied
+network or filesystem operation before updating the sandbox policy.
+
+## Next Steps
+
+- To give Pi access to source control, package registries, or tool servers, add
+  the corresponding provider profiles or a reviewed [sandbox policy](/how-it-works/policies/overview).
+- To understand image, resource, upload, and lifecycle options, refer to
+  [Sandboxes](/how-it-works/sandboxes/overview).
+- To configure another model service, refer to [Profiles](/how-it-works/providers/profiles).
