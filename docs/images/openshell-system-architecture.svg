@@ -3,7 +3,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="760" viewBox="0 0 1280 760" role="img" aria-labelledby="title desc">
   <title id="title">OpenShell system architecture</title>
-  <desc id="desc">User interfaces connect to the gateway, which checks proposed policy changes with the policy prover before approval. The OpenShell Runtime places a trusted supervisor separately from a network-isolated sandbox workload. The workload's only allowed network path is its mediated connection to the supervisor, which connects to approved external services.</desc>
+  <desc id="desc">User interfaces connect to the gateway, which uses the policy prover to formally verify proposed policy changes before approval. The OpenShell Runtime places a trusted supervisor separately from a network-isolated sandbox workload. The workload's only allowed network path is its mediated connection to the supervisor, which connects to approved external services.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
@@ -56,7 +56,7 @@
   <text x="230" y="434" text-anchor="middle" class="small">API, authentication, lifecycle, relays</text>
   <rect x="85" y="490" width="290" height="70" rx="14" class="box"/>
   <text x="230" y="520" text-anchor="middle" class="label">Policy prover</text>
-  <text x="230" y="544" text-anchor="middle" class="small">checks policy changes before approval</text>
+  <text x="230" y="544" text-anchor="middle" class="small">formal verification of policy changes</text>
   <rect x="85" y="600" width="290" height="70" rx="14" class="box"/>
   <text x="230" y="630" text-anchor="middle" class="label">Durable state</text>
   <text x="230" y="654" text-anchor="middle" class="small">sandboxes · policies · providers · settings</text>
