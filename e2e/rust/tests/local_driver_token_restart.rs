@@ -279,7 +279,8 @@ fn require_unexpired_token(token: &str, context: &str) -> Result<(), String> {
             .as_secs(),
     )
     .map_err(|_| "current Unix timestamp does not fit in i64".to_string())?;
-    if exp <= now {
+    // Sandbox session tokens use exp=0 when no TTL is configured.
+    if exp != 0 && exp <= now {
         return Err(format!(
             "{context} should expire in the future, got exp={exp}, now={now}"
         ));
