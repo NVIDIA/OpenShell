@@ -724,7 +724,8 @@ pub async fn sandbox_create(
     // Persist `--approval-mode` as a sandbox-scoped setting now that the
     // sandbox exists. `manual` is the implicit default (no setting needed);
     // any other value is written so it survives sandbox restarts and can be
-    // flipped later via `openshell settings set <name> proposal_approval_mode`.
+    // flipped later via
+    // `openshell settings set <name> --key proposal_approval_mode --value <mode>`.
     // If the write fails the sandbox still runs in default `manual` — surface
     // the recovery command so the user can retry.
     if approval_mode != "manual" {
@@ -744,7 +745,7 @@ pub async fn sandbox_create(
             Ok(_) => {}
             Err(status) => {
                 eprintln!(
-                    "{} failed to set approval mode '{approval_mode}' on sandbox '{sandbox_name}': {}\n  retry with: openshell settings set {sandbox_name} proposal_approval_mode {approval_mode}",
+                    "{} failed to set approval mode '{approval_mode}' on sandbox '{sandbox_name}': {}\n  retry with: openshell settings set {sandbox_name} --key proposal_approval_mode --value {approval_mode}",
                     "warning:".yellow().bold(),
                     status.message(),
                 );
