@@ -891,10 +891,11 @@ Each attached provider with a matching profile contributes a provider policy lay
 
 Updating a custom provider profile affects every provider instance whose `type` matches that profile ID. Provider instances are not rewritten, and sandbox-authored policies are not modified. Running sandboxes observe the updated provider-derived policy on their next config sync. If a gateway-global policy is active, provider-derived policy layers remain suppressed.
 
-The CLI can infer a provider profile from a recognized sandbox command and
-auto-create the provider from profile discovery. Attach a different existing
-provider explicitly with `--provider`, or use `openshell sandbox provider
-attach` after creation.
+Name a provider with `--provider` when creating a sandbox. If no provider has
+that name and it matches an imported profile ID, the CLI can create the
+provider from local profile discovery. The trailing sandbox command does not
+select a provider. Use `openshell sandbox provider attach` to add an existing
+provider after creation.
 
 List providers attached to a sandbox:
 
