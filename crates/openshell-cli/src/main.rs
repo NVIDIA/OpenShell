@@ -1105,8 +1105,8 @@ enum ProfileCommands {
         global: bool,
     },
 
-    /// Import provider profiles from a file or directory.
-    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    /// Import provider profiles from a file, directory, or HTTP URL.
+    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from", "url"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Import {
         /// Profile file to import.
         #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
@@ -1115,6 +1115,10 @@ enum ProfileCommands {
         /// Directory containing profile files to import.
         #[arg(long = "from", value_hint = ValueHint::DirPath)]
         from: Option<PathBuf>,
+
+        /// HTTP or HTTPS URL of one YAML or JSON profile.
+        #[arg(long)]
+        url: Option<String>,
 
         /// Import as platform-scoped profiles (ignores --workspace).
         #[arg(long)]
@@ -1137,7 +1141,7 @@ enum ProfileCommands {
     },
 
     /// Validate provider profile files without registering them.
-    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from", "url"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Lint {
         /// Profile file to lint.
         #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
@@ -1146,6 +1150,10 @@ enum ProfileCommands {
         /// Directory containing profile files to lint.
         #[arg(long = "from", value_hint = ValueHint::DirPath)]
         from: Option<PathBuf>,
+
+        /// HTTP or HTTPS URL of one YAML or JSON profile.
+        #[arg(long)]
+        url: Option<String>,
 
         /// Lint against platform scope (ignores --workspace).
         #[arg(long)]
@@ -1209,11 +1217,17 @@ impl ProfileCommands {
                 )
                 .await?;
             }
-            Self::Import { file, from, global } => {
+            Self::Import {
+                file,
+                from,
+                url,
+                global,
+            } => {
                 run::provider_profile_import(
                     endpoint,
                     file.as_deref(),
                     from.as_deref(),
+                    url.as_deref(),
                     profile_workspace(global),
                     tls,
                 )
@@ -1223,11 +1237,17 @@ impl ProfileCommands {
                 run::provider_profile_update(endpoint, &id, &file, profile_workspace(global), tls)
                     .await?;
             }
-            Self::Lint { file, from, global } => {
+            Self::Lint {
+                file,
+                from,
+                url,
+                global,
+            } => {
                 run::provider_profile_lint(
                     endpoint,
                     file.as_deref(),
                     from.as_deref(),
+                    url.as_deref(),
                     profile_workspace(global),
                     tls,
                 )
@@ -5022,7 +5042,7 @@ mod tests {
     #[test]
     fn profile_import_and_lint_require_exactly_one_source() {
         for verb in ["import", "lint"] {
-            for source in ["-f", "--from"] {
+            for source in ["-f", "--from", "--url"] {
                 let cli = Cli::try_parse_from([
                     "openshell",
                     "profile",
@@ -5032,19 +5052,30 @@ mod tests {
                     "--global",
                 ])
                 .expect("profile source should parse");
-                let (file, from, global) = match cli.command {
+                let (file, from, url, global) = match cli.command {
                     Some(Commands::Profile {
                         command:
                             Some(
-                                ProfileCommands::Import { file, from, global }
-                                | ProfileCommands::Lint { file, from, global },
+                                ProfileCommands::Import {
+                                    file,
+                                    from,
+                                    url,
+                                    global,
+                                }
+                                | ProfileCommands::Lint {
+                                    file,
+                                    from,
+                                    url,
+                                    global,
+                                },
                             ),
-                    }) => (file, from, global),
+                    }) => (file, from, url, global),
                     other => panic!("unexpected profile command: {other:?}"),
                 };
                 assert!(global);
                 assert_eq!(file.is_some(), source == "-f");
                 assert_eq!(from.is_some(), source == "--from");
+                assert_eq!(url.is_some(), source == "--url");
             }
             assert!(Cli::try_parse_from(["openshell", "profile", verb]).is_err());
             assert!(

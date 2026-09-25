@@ -168,7 +168,13 @@ openshell profile describe github
 openshell profile export github --output yaml
 openshell profile lint --file ./my-profile.yaml
 openshell profile import --file ./my-profile.yaml
+openshell profile lint --url https://example.com/profiles/my-profile.yaml
+openshell profile import --url https://example.com/profiles/my-profile.yaml
 ```
+
+`--url` accepts one HTTP or HTTPS YAML or JSON profile. Review its endpoint and
+binary grants before importing it. The URL path must end in `.yaml`, `.yml`, or
+`.json`; downloads are limited to 1 MiB and 15 seconds.
 
 Use `profile describe` to inspect a definition's credential metadata, endpoints, TLS handling, MCP access settings, rule counts, binaries, source, and scope before creating a provider. Check for `tls: skip` and the uninspected-credential opt-in before relying on displayed L7 rules. List and describe accept table, JSON, and YAML output; use structured output for complete rule definitions, `--workspace` for a workspace catalog, or `--global` for platform scope. Use `profile export` when preparing an editable definition, `profile update <id> --file <file>` to replace an existing custom profile with its current resource version, and `profile delete <id>...` to remove custom profiles. Provider instances remain under `provider`.
 

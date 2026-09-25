@@ -277,6 +277,19 @@ Import one profile file at platform scope:
 openshell profile import -f providers/github.yaml --global
 ```
 
+Import a published YAML or JSON profile directly from an HTTP or HTTPS URL:
+
+```shell
+openshell profile lint --url https://example.com/profiles/github.yaml
+openshell profile import --url https://example.com/profiles/github.yaml --global
+```
+
+Review profiles from remote sources before importing them. A profile can grant
+network access and bind credentials to the endpoints and binaries it declares.
+The URL path must end in `.yaml`, `.yml`, or `.json`; query parameters are allowed.
+Remote downloads have a 1 MiB size limit and a 15 second timeout. `--url` is
+mutually exclusive with `-f` and `--from`.
+
 Import all non-recursive `*.yaml`, `*.yml`, and `*.json` files from a directory:
 
 ```shell

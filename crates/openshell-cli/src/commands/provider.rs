@@ -1702,10 +1702,11 @@ pub async fn provider_profile_import(
     server: &str,
     file: Option<&Path>,
     from: Option<&Path>,
+    url: Option<&str>,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let (items, mut diagnostics) = load_profile_import_items(file, from)?;
+    let (items, mut diagnostics) = load_profile_import_items_with_url(file, from, url).await?;
     if items.is_empty() && diagnostics.is_empty() {
         return Err(miette!("no provider profile files found"));
     }
@@ -1792,10 +1793,11 @@ pub async fn provider_profile_lint(
     server: &str,
     file: Option<&Path>,
     from: Option<&Path>,
+    url: Option<&str>,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let (items, mut diagnostics) = load_profile_import_items(file, from)?;
+    let (items, mut diagnostics) = load_profile_import_items_with_url(file, from, url).await?;
     if items.is_empty() && diagnostics.is_empty() {
         return Err(miette!("no provider profile files found"));
     }
@@ -2137,6 +2139,91 @@ fn load_profile_import_items(
     Ok((items, diagnostics))
 }
 
+const MAX_REMOTE_PROFILE_BYTES: usize = 1024 * 1024;
+
+async fn load_profile_import_items_with_url(
+    file: Option<&Path>,
+    from: Option<&Path>,
+    url: Option<&str>,
+) -> Result<(
+    Vec<ProviderProfileImportItem>,
+    Vec<ProviderProfileDiagnostic>,
+)> {
+    let Some(source) = url else {
+        return load_profile_import_items(file, from);
+    };
+    let parsed = reqwest::Url::parse(source)
+        .into_diagnostic()
+        .wrap_err("invalid provider profile URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(miette!("provider profile URL must use http or https"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(miette!("provider profile URL must not contain userinfo"));
+    }
+    let mut display_url = parsed.clone();
+    display_url.set_query(None);
+    display_url.set_fragment(None);
+    let path = parsed.path().to_owned();
+    let format = Path::new(&path).extension().and_then(|ext| ext.to_str());
+    if !matches!(format, Some("yaml" | "yml" | "json")) {
+        return Err(miette!(
+            "provider profile URL must end in .yaml, .yml, or .json"
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .into_diagnostic()?;
+    let mut response = client
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|err| {
+            miette!(
+                "failed to fetch provider profile from {display_url}: {}",
+                err.without_url()
+            )
+        })?
+        .error_for_status()
+        .map_err(|err| {
+            miette!(
+                "failed to fetch provider profile from {display_url}: {}",
+                err.without_url()
+            )
+        })?;
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_REMOTE_PROFILE_BYTES as u64)
+    {
+        return Err(miette!(
+            "provider profile at {display_url} exceeds the 1 MiB download limit"
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|err| {
+        miette!(
+            "failed to read provider profile from {display_url}: {}",
+            err.without_url()
+        )
+    })? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_REMOTE_PROFILE_BYTES {
+            return Err(miette!(
+                "provider profile at {display_url} exceeds the 1 MiB download limit"
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let input = std::str::from_utf8(&bytes)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("provider profile at {display_url} is not UTF-8"))?;
+    let item = parse_profile_import_item(display_url.as_str(), input, format);
+    Ok(match item {
+        Ok(item) => (vec![item], Vec::new()),
+        Err(diagnostic) => (Vec::new(), vec![diagnostic]),
+    })
+}
+
 fn profile_source_paths(file: Option<&Path>, from: Option<&Path>) -> Result<Vec<PathBuf>> {
     if let Some(file) = file {
         return Ok(vec![file.to_path_buf()]);
@@ -2176,19 +2263,31 @@ fn load_profile_import_item(
             format!("failed to read provider profile file: {err}"),
         )
     })?;
-    let profile = match path.extension().and_then(|ext| ext.to_str()) {
-        Some("yaml" | "yml") => parse_profile_yaml(&input),
-        Some("json") => parse_profile_json(&input),
+    parse_profile_import_item(
+        &source,
+        &input,
+        path.extension().and_then(|ext| ext.to_str()),
+    )
+}
+
+fn parse_profile_import_item(
+    source: &str,
+    input: &str,
+    format: Option<&str>,
+) -> Result<ProviderProfileImportItem, ProviderProfileDiagnostic> {
+    let profile = match format {
+        Some("yaml" | "yml") => parse_profile_yaml(input),
+        Some("json") => parse_profile_json(input),
         _ => {
             return Err(profile_file_diagnostic(
-                &source,
+                source,
                 "unsupported provider profile file format".to_string(),
             ));
         }
     }
-    .map_err(|err| profile_file_diagnostic(&source, err.to_string()))?;
+    .map_err(|err| profile_file_diagnostic(source, err.to_string()))?;
 
-    let pre_lower = profile.validate_before_lowering(&source);
+    let pre_lower = profile.validate_before_lowering(source);
     if let Some(diag) = pre_lower.into_iter().find(|d| d.severity == "error") {
         return Err(ProviderProfileDiagnostic {
             source: diag.source,
@@ -2201,7 +2300,7 @@ fn load_profile_import_item(
 
     Ok(ProviderProfileImportItem {
         profile: Some(profile.to_proto()),
-        source,
+        source: source.to_string(),
     })
 }
 
