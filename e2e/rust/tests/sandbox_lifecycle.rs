@@ -217,6 +217,55 @@ async fn sandbox_exec_large_output_is_complete() {
     sandbox.cleanup().await;
 }
 
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn piped_exec_stdin_crosses_grpc_message_limit() {
+    let mut sandbox = SandboxGuard::create(&[])
+        .await
+        .expect("create sandbox for streamed stdin");
+
+    for size in [1_048_576, 4_194_304] {
+        let mut command = openshell_cmd();
+        command
+            .args([
+                "sandbox",
+                "exec",
+                "--name",
+                &sandbox.name,
+                "--no-tty",
+                "--no-login-shell",
+                "--",
+                "wc",
+                "-c",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn sandbox exec");
+        let mut input = child.stdin.take().expect("piped stdin");
+        input
+            .write_all(&vec![b'x'; size])
+            .await
+            .expect("write piped stdin");
+        drop(input);
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .expect("streamed exec timed out")
+            .expect("wait for streamed exec");
+        assert!(
+            output.status.success(),
+            "streamed exec failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            size.to_string()
+        );
+    }
+
+    sandbox.cleanup().await;
+}
+
 async fn run_sandbox_lifecycle_command(operation: &str, name: &str) -> String {
     let mut cmd = openshell_cmd();
     cmd.args(["sandbox", operation, name])

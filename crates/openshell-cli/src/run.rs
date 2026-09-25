@@ -1794,10 +1794,6 @@ where
     Ok(())
 }
 
-/// Maximum stdin payload size (4 MiB). Prevents the CLI from reading unbounded
-/// data into memory before the server rejects an oversized message.
-const MAX_STDIN_PAYLOAD: usize = 4 * 1024 * 1024;
-
 fn local_terminal_size() -> Option<(u32, u32)> {
     crossterm::terminal::size()
         .ok()
@@ -1846,37 +1842,14 @@ pub async fn sandbox_exec_grpc(
         ));
     }
 
-    // Read stdin if piped (not a TTY), using spawn_blocking to avoid blocking
-    // the async runtime. Cap the read at MAX_STDIN_PAYLOAD + 1 so we never
-    // buffer more than the limit into memory.
-    let stdin_payload = if std::io::stdin().is_terminal() {
-        Vec::new()
-    } else {
-        tokio::task::spawn_blocking(|| {
-            let limit = (MAX_STDIN_PAYLOAD + 1) as u64;
-            let mut buf = Vec::new();
-            std::io::stdin()
-                .take(limit)
-                .read_to_end(&mut buf)
-                .into_diagnostic()?;
-            if buf.len() > MAX_STDIN_PAYLOAD {
-                return Err(miette::miette!(
-                    "stdin payload exceeds {} byte limit; pipe smaller inputs or use `sandbox upload`",
-                    MAX_STDIN_PAYLOAD
-                ));
-            }
-            Ok(buf)
-        })
-        .await
-        .into_diagnostic()?? // first ? unwraps JoinError, second ? unwraps Result
-    };
-
     // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
-    let tty = tty_override
-        .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+    let stdin_is_terminal = std::io::stdin().is_terminal();
+    let tty = tty_override.unwrap_or_else(|| stdin_is_terminal && std::io::stdout().is_terminal());
 
-    if tty && std::io::stdin().is_terminal() {
-        return sandbox_exec_interactive_grpc(
+    // The unary request has a 1 MiB encoded-message limit. Stream piped input
+    // in bounded frames, including for commands that do not request a PTY.
+    if tty || !stdin_is_terminal {
+        return sandbox_exec_streaming_grpc(
             client,
             &sandbox,
             command,
@@ -1884,6 +1857,8 @@ pub async fn sandbox_exec_grpc(
             timeout_seconds,
             environment,
             no_login_shell,
+            tty,
+            stdin_is_terminal,
         )
         .await;
     }
@@ -1906,7 +1881,7 @@ pub async fn sandbox_exec_grpc(
             workdir: workdir.unwrap_or_default().to_string(),
             environment: environment.clone(),
             execution_timeout: proto_execution_timeout(timeout_seconds)?,
-            stdin: stdin_payload,
+            stdin: Vec::new(),
             tty,
             cols,
             rows,
@@ -2279,7 +2254,8 @@ impl Drop for TaskGuard {
     }
 }
 
-async fn sandbox_exec_interactive_grpc(
+#[allow(clippy::too_many_arguments)]
+async fn sandbox_exec_streaming_grpc(
     mut client: crate::tls::GrpcClient,
     sandbox: &Sandbox,
     command: &[String],
@@ -2287,15 +2263,21 @@ async fn sandbox_exec_interactive_grpc(
     timeout_seconds: u32,
     environment: &HashMap<String, String>,
     no_login_shell: bool,
+    tty: bool,
+    stdin_is_terminal: bool,
 ) -> Result<i32> {
     #[cfg(unix)]
     use openshell_core::proto::ExecSandboxWindowResize;
     use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
 
-    let (cols, rows) = local_terminal_size().unwrap_or((80, 24));
+    let (cols, rows) = if tty {
+        local_terminal_size().unwrap_or((80, 24))
+    } else {
+        (0, 0)
+    };
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(4096);
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
 
     // Send the start message with exec metadata.
     input_tx
@@ -2312,7 +2294,7 @@ async fn sandbox_exec_interactive_grpc(
                 no_login_shell,
                 execution_timeout: proto_execution_timeout(timeout_seconds)?,
                 stdin: Vec::new(),
-                tty: true,
+                tty,
                 cols,
                 rows,
             })),
@@ -2326,9 +2308,13 @@ async fn sandbox_exec_interactive_grpc(
         .into_diagnostic()?
         .into_inner();
 
-    // Enable raw mode so keystrokes are forwarded immediately.
-    crossterm::terminal::enable_raw_mode().into_diagnostic()?;
-    let raw_guard = RawModeGuard;
+    // Raw mode is only appropriate for an interactive terminal, not a pipe.
+    let raw_guard = if tty && stdin_is_terminal {
+        crossterm::terminal::enable_raw_mode().into_diagnostic()?;
+        Some(RawModeGuard)
+    } else {
+        None
+    };
 
     // Stdin reader on a detached OS thread. Using std::thread (not
     // spawn_blocking) so the tokio runtime shutdown doesn't wait for a
@@ -2357,9 +2343,9 @@ async fn sandbox_exec_interactive_grpc(
 
     // SIGWINCH handler: forward terminal resize events.
     #[cfg(unix)]
-    let resize_task = {
+    let resize_task = if tty && stdin_is_terminal {
         let resize_tx = input_tx.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut sig =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                     .expect("failed to register SIGWINCH handler");
@@ -2375,10 +2361,18 @@ async fn sandbox_exec_interactive_grpc(
                     }
                 }
             }
-        })
+        }))
+    } else {
+        None
     };
     #[cfg(unix)]
-    let _resize_guard = TaskGuard(resize_task);
+    let _resize_guard = resize_task.map(TaskGuard);
+
+    // For a pipe, the reader's sender is the last one. Closing it at EOF
+    // half-closes SSH stdin so commands such as `cat` can finish.
+    if !stdin_is_terminal {
+        drop(input_tx);
+    }
 
     let mut exit_code = 0i32;
     let mut exit_seen = false;
@@ -2406,8 +2400,6 @@ async fn sandbox_exec_interactive_grpc(
             None => {}
         }
     }
-
-    drop(input_tx);
 
     // Drop the raw mode guard to restore the terminal before returning.
     drop(raw_guard);
