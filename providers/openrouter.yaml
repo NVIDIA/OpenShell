@@ -18,7 +18,7 @@
 # Endpoint access:   openrouter.ai, read-write, L7 enforced.
 # Smoke test:        openshell sandbox create --provider <name> \
 #                      --from ghcr.io/anomalyco/opencode:latest -- \
-#                      opencode run -m openrouter/anthropic/claude-sonnet-4.5 'reply with OK'
+#                      opencode run -m openrouter/nvidia/nemotron-3.5-lightning:free 'reply with OK'
 
 id: openrouter
 display_name: OpenRouter

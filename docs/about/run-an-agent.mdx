@@ -58,11 +58,12 @@ openshell sandbox create \
   --name my-agent \
   --from ghcr.io/anomalyco/opencode:latest \
   --provider openrouter \
-  -- opencode -m openrouter/anthropic/claude-sonnet-4.5
+  -- opencode -m openrouter/nvidia/nemotron-3.5-lightning:free
 ```
 
 OpenCode detects the OpenRouter credential and starts with the model passed to
-`-m`. Choose any model from `opencode models openrouter`.
+`-m`. This example uses a free model, so it works without OpenRouter credits.
+Choose any model from `opencode models openrouter`.
 
 For more control over what the agent can access, refer to
 [Policies](/how-it-works/policies/overview).
