@@ -545,7 +545,7 @@ In a separate terminal or as the agent:
 openshell logs dev --tail --source sandbox
 ```
 
-Look for log lines with `action: deny` -- these indicate blocked network requests. The logs include:
+Look for `DENIED` log lines. `NET:OPEN [MED] DENIED` marks a blocked connection, and `HTTP:<METHOD> [MED] DENIED` marks a blocked request. Policy events are INFO-level log records, so do not add `--level warn`. The logs include:
 
 - **Destination host and port** (what was blocked)
 - **Binary path** (which process attempted the connection)
@@ -554,17 +554,18 @@ Look for log lines with `action: deny` -- these indicate blocked network request
 ### Step 3: Pull the current policy
 
 ```bash
-openshell policy get dev --full > current-policy.yaml
+set -o pipefail
+openshell policy get dev --base | sed '1,/^---$/d' > current-policy.yaml
 ```
 
-The `--full` flag includes the effective policy, including provider-composed entries. Use `--base` instead when the editable base policy is needed without provider-composed entries. Before resubmitting a `--full` result, review composed entries and prefer incremental updates or the base policy when appropriate.
+`--base` returns the editable policy without provider-composed entries; OpenShell composes attached provider rules separately. The command prints revision details, a `---` line, and then the policy YAML. The `sed` expression keeps only the YAML, because `policy set` cannot parse the revision details. Use `--full` only to inspect the effective policy, not as input to `policy set`.
 
 ### Step 4: Modify the policy
 
 Edit `current-policy.yaml` to allow the blocked actions. **For policy content authoring, delegate to the `generate-sandbox-policy` skill.** That skill handles:
 
 - Network endpoint rule structure
-- L4 vs REST, WebSocket, JSON-RPC, MCP, and SQL L7 policy decisions
+- L4 vs REST, WebSocket, JSON-RPC, and MCP L7 policy decisions
 - Access presets (`read-only`, `read-write`, `full`)
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
@@ -741,7 +742,7 @@ openshell sandbox connect work-session --editor vscode
 Monitor denied activity:
 
 ```bash
-openshell logs work-session --tail --source sandbox --level warn
+openshell logs work-session --tail --source sandbox
 ```
 
 When denied actions appear:
@@ -760,9 +761,11 @@ When denied actions appear:
    one.
 
    `--add-allow` and `--add-deny` require `--rule-name` and the complete binary scope through repeated `--binary` or explicit `--any-binary`. Declare every port on the endpoint in the operation, for example `api.example.com:443,8443:POST:/admin`. Use `--endpoint-path` to disambiguate endpoints within the selected rule; an explicitly empty path selects an endpoint without a path selector. The gateway rejects missing or mismatched scope before persistence. Inspect the current policy and confirm the intended affected scope; do not automatically fill declarations from current policy just to make a rejection pass.
-2. Use full YAML replacement for broad changes or non-network fields, including
-   any change that would otherwise require restating a large existing scope:
-   `openshell policy get work-session --full > policy.yaml`
+2. Use full YAML replacement for broad network changes or settings that
+   `policy update` cannot express, including any change that would otherwise
+   require restating a large existing scope. Filesystem, Landlock, and process
+   changes still require recreating the sandbox:
+   `openshell policy get work-session --base | sed '1,/^---$/d' > policy.yaml`
    Modify the policy with the `generate-sandbox-policy` skill.
    `openshell policy set work-session --policy policy.yaml --wait`
 3. Verify with `openshell policy list work-session`.

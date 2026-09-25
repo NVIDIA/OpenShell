@@ -35,7 +35,7 @@ Examples:
 - "Let /usr/bin/myapp talk to internal-svc:8080 but only for reading"
 
 This is sufficient for:
-- **L4-only** policies (allow all traffic to host:port, no HTTP inspection)
+- **L4-only** policies (host:port + binary checks, no method or path rules)
 - **Preset-based L7** policies (`read-only`, `read-write`, `full` on all paths)
 
 For this tier, default to:
@@ -109,12 +109,12 @@ Ask these when the user's intent is broad and more specificity is possible:
 |-----------|--------------|
 | "Full access" / "allow everything" | "Do you actually need DELETE access, or would read-write (everything except DELETE) be enough?" |
 | "Allow access to api.example.com" (no method/path detail) | "Do you know which specific API paths or operations you need? If so, I can lock the policy down to just those. Otherwise I'll use a broad preset." |
-| L4-only / "just pass it through" | "L4-only means the proxy won't inspect HTTP traffic at all — any method and path will be allowed. Are you sure you don't want at least read-only or read-write restriction?" |
+| L4-only / "just pass it through" | "L4-only means the proxy applies no method or path rules — any method and path will be allowed. Are you sure you don't want at least read-only or read-write restriction?" |
 | Wildcard binary (`/usr/bin/*`) | "A wildcard binary pattern means any binary in that directory can use this policy. Can you narrow it to specific binaries?" |
 | Multiple hosts in one policy | "Do all of these hosts need the same access level? If some need tighter restrictions, I can split them into separate policies." |
 | `access: full` with `enforcement: audit` | "Full access in audit mode means nothing is actually restricted — all traffic flows through and violations are only logged. Is that intentional, or did you want to enforce restrictions?" |
 | `**` path glob on all rules | "Using `**` on all paths allows any URL path. Do you know the specific API path prefixes you need (e.g., `/api/v1/`)?" |
-| Private/internal IP destination | "Does this service resolve to a private IP (10.x, 172.16.x, 192.168.x)? If so, you'll need `allowed_ips` to permit access — what CIDR range should be allowed?" |
+| Private/internal IP destination | "Does this service resolve to a private IP (10.x, 172.16.x, 192.168.x)? An exact hostname can reach its private addresses without `allowed_ips`, but a wildcard or hostless endpoint needs it. Should I pin the endpoint to a specific CIDR range?" |
 
 ### Auto-Discovery of API Docs for Well-Known Services
 
@@ -278,7 +278,8 @@ network_policies:
           - allow:
               method: <METHOD>
               path: "<glob_pattern>"
-        # Optional: allow private IP destinations (CIDR or exact IP)
+        # Optional: restrict resolved addresses (CIDR or exact IP). Required
+        # for private IPs on wildcard or hostless endpoints.
         # allowed_ips:
         #   - "10.0.5.0/24"
     binaries:
@@ -327,19 +328,24 @@ github_api:
     - { path: /usr/bin/curl }
 ```
 
-Deny rules support the same matching capabilities as allow rules: `method`, `path`, `command` (SQL), and `query` parameter matchers. When generating policies, prefer deny rules when the user needs broad access with a small set of blocked operations — it produces a shorter, more maintainable policy than enumerating 60+ allow rules.
+Deny rules support the same matching capabilities as allow rules: `method`, `path`, and `query` parameter matchers. When generating policies, prefer deny rules when the user needs broad access with a small set of blocked operations — it produces a shorter, more maintainable policy than enumerating 60+ allow rules.
 
 ### Private IP Destinations
 
-When the endpoint resolves to a private IP (RFC 1918), the proxy's SSRF protection blocks the connection by default. Use `allowed_ips` to selectively allow specific private IP ranges:
+The proxy's SSRF protection treats private (RFC 1918) destinations differently depending on how the endpoint names its host:
+
+- **Exact hostname** (`host: api.internal.corp`) — the connection may reach the private addresses the hostname resolves to without `allowed_ips`.
+- **Wildcard host, hostless endpoint, or policy-advisor proposal** — private resolved addresses are blocked unless `allowed_ips` covers them.
+
+Use `allowed_ips` to pin the addresses an endpoint may reach. When it is set, every resolved address must fall within the list, including public addresses:
 
 - **Host + allowlist**: `host` + `allowed_ips` — domain must resolve to an IP in the allowlist
 - **Hostless allowlist**: `allowed_ips` only (no `host`) — any domain on the port is allowed if it resolves to an IP in the allowlist
 
-Loopback (`127.0.0.0/8`) and link-local (`169.254.0.0/16`) are **always blocked** regardless of `allowed_ips`.
+Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), unspecified, and cloud metadata addresses are **always blocked** regardless of `allowed_ips`.
 
 ```yaml
-# Example: Allow access to internal service at a known private IP range
+# Example: Pin an internal service to a known private IP range
 internal_api:
   name: internal_api
   endpoints:
@@ -375,7 +381,6 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
       hostless, an IP literal, a trailing-dot name, or a malformed DNS selector
 - [ ] `tls` is either omitted or set to `skip`; no other value is accepted
 - [ ] `rules` list is not empty when present
-- [ ] If `protocol: sql`, `enforcement` is not `enforce`
 - [ ] Every middleware config has a non-empty `middleware` name and non-empty `endpoints.include`
 - [ ] Middleware `order` values are unique and no selected chain exceeds 10 stages
 - [ ] No fail-closed middleware selector can cover a `tls: skip` endpoint
@@ -405,7 +410,7 @@ Evaluate the generated policy for overly broad access and **include warnings in 
 
 | Condition | Warning to show |
 |-----------|----------------|
-| **L4-only** (no `protocol`, or `protocol: tcp`) | "This policy allows all application methods and paths without inspection. An omitted protocol uses explicit-proxy behavior. `protocol: tcp` enables policy DNS and transparent TCP only on a runtime that advertises the complete substrate (currently Docker and Podman); its hostname constrains connection routing, not application authority, so compatible shared infrastructure may expose other tenants or services. Consider `protocol: rest` with a preset if you want HTTP method-level or authority control." |
+| **L4-only** (no `protocol`, or `protocol: tcp`) | "This policy allows all application methods and paths. An omitted protocol uses explicit-proxy behavior and applies no method or path rules. With default TLS handling, the proxy terminates detected TLS and checks the authority of the HTTP requests it parses, but other CONNECT payloads, such as HTTP/2 prior knowledge or non-HTTP protocols, can pass through a raw relay; `tls: skip` also bypasses termination and parsing. `protocol: tcp` enables policy DNS and transparent TCP only on a runtime that advertises the complete substrate (currently Docker and Podman); its hostname constrains connection routing, not application authority, so compatible shared infrastructure may expose other tenants or services. Consider `protocol: rest` with a preset if you want HTTP method-level or authority control." |
 | **`access: full`** | "This policy allows all HTTP methods (including DELETE) on all paths. If you don't need DELETE, `read-write` is safer. If you only need to read, `read-only` is the most restrictive option." |
 | **`access: full` + `enforcement: audit`** | "Full access in audit mode provides no actual restriction — all traffic flows through. This is effectively a monitoring-only policy." |
 | **`access: read-write`** when user hasn't confirmed write need | "This policy allows POST, PUT, and PATCH on all paths. If you only need to read data, `read-only` is more restrictive." |
@@ -532,7 +537,7 @@ After presenting or applying the policy, ask if the user wants to:
 
 ## Quick Reference: Common Patterns
 
-### L4-Only (no HTTP inspection)
+### L4-Only (no method or path rules)
 
 ```yaml
 my_api:
