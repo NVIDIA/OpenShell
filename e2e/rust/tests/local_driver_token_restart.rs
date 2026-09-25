@@ -74,7 +74,7 @@ impl LocalDriver {
             ],
             Self::Podman => vec![
                 "label=openshell.managed=true".to_string(),
-                format!("label=openshell.io/isolation-role={role}"),
+                format!("label=openshell.ai/isolation-role={role}"),
                 format!("label=openshell.ai/sandbox-name={sandbox_name}"),
             ],
             Self::Vm => Vec::new(),
