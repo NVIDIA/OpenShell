@@ -638,16 +638,57 @@ network_policies:
     )
 }
 
-/// Appends corporate-proxy keys to the harness-generated gateway TOML and
+/// Inserts corporate-proxy keys into the harness-generated Docker table and
 /// restores the original file when dropped.
-///
-/// `[openshell.drivers.docker]` is the last table `with-docker-gateway.sh`
-/// writes, so appending bare keys lands in that table without introducing a
-/// duplicate header.
 struct GatewayProxyConfig {
     config_path: PathBuf,
     original: Vec<u8>,
     restored: bool,
+}
+
+fn insert_docker_driver_settings(config: &str, extra: &str) -> Result<String, String> {
+    let table_header = "[openshell.drivers.docker]";
+    let table_start = config
+        .find(table_header)
+        .ok_or_else(|| format!("gateway config has no {table_header} table"))?;
+    let table_body = table_start + table_header.len();
+    let insert_at = config[table_body..]
+        .find("\n[")
+        .map_or(config.len(), |offset| table_body + offset);
+
+    let mut updated = String::with_capacity(config.len() + extra.len() + 2);
+    updated.push_str(&config[..insert_at]);
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(extra);
+    if !extra.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&config[insert_at..]);
+    Ok(updated)
+}
+
+#[test]
+fn proxy_settings_are_inserted_before_nested_driver_tables() {
+    let config = r#"[openshell.drivers.docker]
+socket_path = "/var/run/docker.sock"
+
+[openshell.drivers.docker.resource_admission]
+enabled = true
+"#;
+
+    let updated = insert_docker_driver_settings(config, "https_proxy = \"http://proxy\"\n")
+        .expect("insert proxy settings");
+    let proxy_position = updated
+        .find("https_proxy = \"http://proxy\"")
+        .expect("proxy setting is present");
+    let nested_table_position = updated
+        .find("[openshell.drivers.docker.resource_admission]")
+        .expect("nested table is preserved");
+
+    assert!(proxy_position < nested_table_position);
+    assert!(updated.contains("enabled = true"));
 }
 
 impl GatewayProxyConfig {
@@ -669,7 +710,7 @@ impl GatewayProxyConfig {
             .ok_or_else(|| format!("no --config argument in gateway args file '{args_file}'"))
     }
 
-    /// Append raw TOML lines to `[openshell.drivers.docker]` and restart the
+    /// Insert raw TOML lines into `[openshell.drivers.docker]` and restart the
     /// gateway, without waiting for it to become healthy.
     ///
     /// Used directly by the fail-closed case, which expects the gateway *not*
@@ -679,12 +720,15 @@ impl GatewayProxyConfig {
         let original = std::fs::read(&config_path)
             .map_err(|err| format!("read gateway config '{}': {err}", config_path.display()))?;
 
-        let mut updated = original.clone();
-        if !updated.ends_with(b"\n") {
-            updated.push(b'\n');
-        }
-        updated.extend_from_slice(extra.as_bytes());
-        std::fs::write(&config_path, &updated)
+        let config = std::str::from_utf8(&original).map_err(|err| {
+            format!(
+                "gateway config '{}' is not UTF-8: {err}",
+                config_path.display()
+            )
+        })?;
+        let updated = insert_docker_driver_settings(config, extra)
+            .map_err(|err| format!("gateway config '{}': {err}", config_path.display()))?;
+        std::fs::write(&config_path, updated.as_bytes())
             .map_err(|err| format!("write gateway config '{}': {err}", config_path.display()))?;
 
         let guard = Self {

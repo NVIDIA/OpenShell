@@ -273,6 +273,26 @@ fn docker_proxy_ca_bundle_validation_is_fail_closed() {
     assert!(error.to_string().contains("no PEM certificate"), "{error}");
 }
 
+#[tokio::test]
+async fn docker_constructor_rejects_proxy_ca_bundle_without_proxy() {
+    let directory = TempDir::new().expect("create CA directory");
+    let mut config = DockerComputeConfig {
+        socket_path: Some(directory.path().join("unused-docker.sock")),
+        proxy_ca_bundle: Some(write_test_proxy_ca_bundle(&directory)),
+        ..DockerComputeConfig::default()
+    };
+    config.upstream_proxy.https_proxy = None;
+
+    let Err(error) =
+        DockerComputeDriver::new("127.0.0.1:17670".parse().unwrap(), "info", &config).await
+    else {
+        panic!("constructor must reject incoherent proxy CA configuration before Docker I/O");
+    };
+
+    assert!(error.to_string().contains("proxy_ca_bundle"), "{error}");
+    assert!(error.to_string().contains("https_proxy"), "{error}");
+}
+
 #[test]
 fn docker_proxy_ca_bundle_uses_fixed_supervisor_path() {
     let proxy = UpstreamProxyConfig {

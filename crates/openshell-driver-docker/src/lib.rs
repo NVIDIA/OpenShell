@@ -846,10 +846,7 @@ impl DockerComputeDriver {
         gateway_log_level: &str,
         docker_config: &DockerComputeConfig,
     ) -> CoreResult<Self> {
-        docker_config
-            .resource_admission
-            .validate()
-            .map_err(Error::config)?;
+        docker_config.validate_configuration(gateway_bind_address)?;
         let socket_path = docker_config
             .socket_path
             .clone()
@@ -882,15 +879,8 @@ impl DockerComputeDriver {
             cdi_supported,
             wsl_all_gpu_fallback_enabled,
         };
-        validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
-        validate_image_pull_policy(docker_config.image_pull_policy)?;
         validate_docker_app_armor_profile(docker_config.app_armor_profile.as_ref(), &info)?;
         let gateway_port = gateway_bind_address.port();
-        if gateway_port == 0 {
-            return Err(Error::config(
-                "docker compute driver requires a fixed non-zero gateway bind port",
-            ));
-        }
         let mut docker_config = docker_config.clone();
         if docker_config.grpc_endpoint.trim().is_empty() {
             docker_config.grpc_endpoint = default_docker_supervisor_grpc_endpoint(
