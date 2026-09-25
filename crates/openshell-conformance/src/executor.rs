@@ -50,6 +50,7 @@ impl CliExecutor for ProcessCli {
             process
                 .args(&args)
                 .envs(environment)
+                .env("NO_COLOR", "1")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);

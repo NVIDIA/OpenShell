@@ -59,6 +59,9 @@
           - --workspace-remap
           - /var/lib/openshell-conformance/tests
           - --no-capture
+          # The guest has 4 GiB; keep sandbox creates from competing for it.
+          - --test-threads
+          - "1"
           - --filterset
           - "{{ conformance_filter | default('all()') }}"
       environment:

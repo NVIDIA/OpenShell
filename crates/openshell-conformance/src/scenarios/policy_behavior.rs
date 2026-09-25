@@ -42,8 +42,10 @@ fn run_policy_local(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
         let name = format!("ct-{}-pl", runner.id());
         create_sandbox(runner, &name, None).await?;
         enable_proposals(runner, &name).await?;
+        let binary = sandbox_bash_path(runner, &name).await?;
 
         let started = Instant::now();
+        let readiness_path = format!("/v1/proposals/ct-{}-readiness", runner.id());
         loop {
             match request_policy_local(runner, &name, "/v1/policy/current").await {
                 Ok(response)
@@ -52,7 +54,20 @@ fn run_policy_local(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
                             .as_str()
                             .is_some_and(|yaml| yaml.contains("version: 1")) =>
                 {
-                    break;
+                    // The current-policy route is local; proposal submission also
+                    // needs the supervisor's workspace and gateway lookup session.
+                    match request_policy_local_http(runner, &name, "GET", &readiness_path, "", 404)
+                        .await
+                    {
+                        Ok(lookup) if lookup["error"] == "chunk_not_found" => break,
+                        Ok(lookup) => {
+                            return Err(format!(
+                                "policy.local proposal lookup returned an invalid readiness response: {lookup}"
+                            ));
+                        }
+                        Err(error) if started.elapsed() >= READY_TIMEOUT => return Err(error),
+                        Err(_) => {}
+                    }
                 }
                 Ok(response) => {
                     return Err(format!(
@@ -89,7 +104,7 @@ fn run_policy_local(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
                             "enforcement": "enforce",
                             "rules": [{"allow": {"method": "GET", "path": "/conformance"}}]
                         }],
-                        "binaries": [{"path": "/usr/bin/bash"}]
+                        "binaries": [{"path": &binary}]
                     }
                 }
             }]
@@ -115,7 +130,7 @@ fn run_policy_local(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
             request_policy_local(runner, &name, &format!("/v1/proposals/{chunk_id}")).await?;
         if state["chunk_id"] != chunk_id
             || state["rule_name"] != rule_name
-            || state["binary"] != "/usr/bin/bash"
+            || state["binary"] != binary
             || !matches!(state["status"].as_str(), Some("pending" | "approved"))
         {
             return Err(format!("policy.local returned the wrong proposal: {state}"));
@@ -136,6 +151,32 @@ fn run_policy_local(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
         }
         Ok(())
     })
+}
+
+async fn sandbox_bash_path(runner: &OpenShellRunner, name: &str) -> Result<String, String> {
+    let result = runner
+        .step("bash-binary")
+        .description("the sandbox's Bash executable has a canonical path")
+        .with_timeout(COMMAND_TIMEOUT)
+        .run(&[
+            "sandbox",
+            "exec",
+            "--name",
+            name,
+            "--no-tty",
+            "--",
+            "bash",
+            "-c",
+            "readlink -f /proc/$$/exe",
+        ])
+        .await
+        .map_err(|error| error.to_string())?;
+    result.require_success()?;
+    let binary = result.stdout().trim();
+    if !binary.starts_with('/') || binary.contains('\n') {
+        return Err(result.failure_diagnostic("one absolute Bash executable path"));
+    }
+    Ok(binary.to_string())
 }
 
 async fn enable_proposals(runner: &OpenShellRunner, name: &str) -> Result<(), String> {
@@ -310,7 +351,13 @@ network_policies: {}
                 .run(&["rule", "get", &name])
                 .await
                 .map_err(|error| error.to_string())?;
-            draft.require_success()?;
+            if !draft.success() {
+                if started.elapsed() >= PROPOSAL_TIMEOUT {
+                    return Err(draft.failure_diagnostic("the reviewer inbox is readable"));
+                }
+                sleep(POLL_INTERVAL).await;
+                continue;
+            }
             if !draft.stdout().contains("Chunk:") {
                 if started.elapsed() >= PROPOSAL_TIMEOUT {
                     return Err(draft.failure_diagnostic(&format!(
