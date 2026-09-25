@@ -307,10 +307,11 @@ Attach to the canonical main process in a running sandbox:
 openshell sandbox connect my-sandbox
 ```
 
-Disconnecting does not stop the process or close its stdin. A later `connect`
-attaches to the same process instance and replays up to 1 MiB of recent
-output. One attachment owns stdin at a time. Use `sandbox exec --tty --
-/bin/bash -l` when you want a new independent shell instead.
+Press `Ctrl-P`, then `Ctrl-Q` in sequence to disconnect. The main process keeps
+running and its stdin stays open. A later `connect` attaches to the same process
+instance and replays up to 1 MiB of recent output. One attachment owns stdin
+at a time. Use `sandbox exec --tty -- /bin/bash -l` when you want a new
+independent shell instead.
 
 If an established connection is interrupted, for example when a laptop sleeps
 and wakes, the CLI obtains a new SSH session and reattaches to the same main
@@ -318,13 +319,12 @@ process. It retries transient transport failures for up to 60 seconds. Initial
 authentication failures, sandbox lifecycle changes, and clean SSH exits are
 not retried.
 
-Press `Ctrl-P`, then `Ctrl-Q` to disconnect without terminating the main
-process. `Ctrl-C` retains its normal terminal behavior and interrupts the
-foreground process. For read-only attachments, `Ctrl-C` only exits the
-current viewer. OpenSSH's `~.` escape reports the same status as a broken
-transport, so it starts automatic recovery instead of exiting. After `~.`, use
-`Ctrl-P`, then `Ctrl-Q` once OpenShell reattaches, or press `Ctrl-C` while the
-CLI is between retry attempts to cancel recovery.
+`Ctrl-C` retains its normal terminal behavior and interrupts the foreground
+process. For read-only attachments, `Ctrl-C` only exits the current viewer.
+OpenSSH's `~.` escape reports the same status as a broken transport, so it
+starts automatic recovery instead of exiting. After `~.`, use `Ctrl-P`, then
+`Ctrl-Q` once OpenShell reattaches, or press `Ctrl-C` while the CLI is between
+retry attempts to cancel recovery.
 
 Launch VS Code or Cursor directly into the sandbox workspace:
 
@@ -376,6 +376,8 @@ Run an interactive shell with a TTY:
 ```shell
 openshell sandbox exec -n my-sandbox --tty -- /bin/bash
 ```
+
+Run `exit` or press `Ctrl-D` to close this separate shell.
 
 OpenShell allocates a TTY automatically when both stdin and stdout are terminals. Force the behavior with `--tty` or disable it with `--no-tty`.
 
