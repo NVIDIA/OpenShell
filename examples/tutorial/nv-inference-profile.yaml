@@ -1,0 +1,17 @@
+id: nv-inference
+display_name: NVIDIA Inference (custom endpoint)
+description: OpenAI-compatible credential for a self-hosted NVIDIA inference endpoint. Endpointless by design; the sandbox policy binds it explicitly via credential_binding.provider.
+category: inference
+credentials:
+  - name: api_key
+    description: OpenAI-compatible API key for the NVIDIA inference endpoint
+    env_vars:
+      - OPENAI_API_KEY
+    required: true
+    auth_style: bearer
+    header_name: authorization
+    query_param: ""
+inference_capable: true
+discovery:
+  credentials:
+    - api_key

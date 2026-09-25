@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-policy-cedar"
+description = "Experimental Cedar-based network policy evaluation engine for OpenShell (proof of concept, not wired into the gateway)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cedar-policy = "4.13"
+miette = { workspace = true }
+openshell-policy-cedar-schema = { path = "../openshell-policy-cedar-schema" }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

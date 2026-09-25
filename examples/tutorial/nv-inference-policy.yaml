@@ -1,0 +1,15 @@
+network_policies:
+  nv_inference_api:
+    name: nv_inference_api
+    endpoints:
+      - host: inference-api.nvidia.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: read-write
+        credential_binding:
+          provider: nv-inference
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /usr/local/bin/curl }
