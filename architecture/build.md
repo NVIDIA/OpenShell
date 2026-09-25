@@ -26,6 +26,7 @@ OpenShell builds these main artifacts:
 Release Tag publishes the same tagged docs commit as an immutable `vX.Y.Z`
 snapshot and the mutable `latest` alias. Release Dev updates `dev`. The Fern
 selector pins `latest` and `dev`, then lists versioned snapshots newest first.
+The selector does not show availability badges.
 
 Workload images are standard OCI images supplied by operators or users.
 

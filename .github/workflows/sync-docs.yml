@@ -30,10 +30,6 @@ on:
         description: "Optional version selector display name"
         required: false
         type: string
-      availability:
-        description: "Optional Fern availability status"
-        required: false
-        type: string
       publish:
         description: "Publish production docs after syncing"
         required: false
@@ -80,10 +76,6 @@ on:
         type: string
       display_name:
         description: "Optional selector name, e.g. Dev"
-        required: false
-        type: string
-      availability:
-        description: "Optional Fern status: beta, deprecated, ga, or stable"
         required: false
         type: string
       publish:
@@ -176,7 +168,6 @@ jobs:
           RELEASE_VERSION: ${{ inputs.release_version }}
           VERSION_SLUG: ${{ inputs.version_slug }}
           DISPLAY_NAME: ${{ inputs.display_name }}
-          AVAILABILITY: ${{ inputs.availability }}
           ALLOW_ROLLBACK: ${{ inputs.allow_rollback }}
         run: |
           SOURCE_SHA=""
@@ -197,7 +188,6 @@ jobs:
             --release-version "$RELEASE_VERSION" \
             --version-slug "$VERSION_SLUG" \
             --display-name "$DISPLAY_NAME" \
-            --availability "$AVAILABILITY" \
             "${rollback_args[@]}"
 
       - name: Setup Node.js

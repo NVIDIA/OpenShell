@@ -577,7 +577,6 @@ jobs:
       source_ref: ${{ github.sha }}
       release_version: ${{ needs.compute-versions.outputs.docs_version }}
       display_name: Dev
-      availability: beta
       publish: true
     secrets:
       FERN_TOKEN: ${{ secrets.FERN_TOKEN }}

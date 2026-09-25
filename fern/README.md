@@ -41,15 +41,17 @@ The generated `docs-website` branch contains the complete production input for F
 
 The automated site uses these version types:
 
-| Version | Source | Update policy | Fern status |
-|---|---|---|---|
-| `latest` | The newest stable release. | Mutable. A maintenance release older than the current stable release cannot move it backward unless a maintainer explicitly allows a rollback. | Stable from v0.1.0; no status before then. |
-| `dev` | The most recent successful Release Dev run from `main`. | Mutable. Automation rejects an older version or the same version from a different commit unless a maintainer explicitly allows a rollback. | Beta. |
-| `vX.Y.Z` | The tagged release commit. | Immutable. A later sync cannot replace its source commit. | Stable from v0.1.0; earlier historical versions can omit a status. |
+| Version | Source | Update policy |
+|---|---|---|
+| `latest` | The newest stable release. | Mutable. A maintenance release older than the current stable release cannot move it backward unless a maintainer explicitly allows a rollback. |
+| `dev` | The most recent successful Release Dev run from `main`. | Mutable. Automation rejects an older version or the same version from a different commit unless a maintainer explicitly allows a rollback. |
+| `vX.Y.Z` | The tagged release commit. | Immutable. A later sync cannot replace its source commit. |
 
 Release Dev waits for the development artifacts and Helm chart, then calls `.github/workflows/sync-docs.yml` once. The reusable workflow updates `dev`, validates the generated site, commits and pushes the branch when needed, and publishes the production site once.
 
 Release Tag follows the same sequence for a non-prerelease tag after the release artifacts, SDK package, Helm chart, and wheel publication complete. One sync copies the tagged source into both the immutable `vX.Y.Z` snapshot and `latest` when the release is not older than the current version, then publishes the production site once. The version selector pins `latest` and `dev` first, followed by versioned snapshots in descending version order. Other historical entries follow in their existing order.
+
+The selector does not show availability badges. Each sync removes any existing `availability` fields from the generated version list, including the earlier `dev` Beta badge.
 
 The sync and publish workflows share the `docs-website` concurrency group. This serializes writes and publication. Queued runs remain pending instead of replacing one another.
 
