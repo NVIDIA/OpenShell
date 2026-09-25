@@ -257,15 +257,15 @@ github_repository_api:
     - path: /usr/local/bin/gh
 ```
 
-In request paths, `*` matches within one path segment and `**` matches across
-segments, so `/repos/<org>/<repo>/**` covers every path under the repository
-but not `/repos/<org>/<repo>` itself. The deny rules list the webhooks path and
-everything under it separately for the same reason. The allow rule grants every
-HTTP method under the repository path, including writes, so narrow it if the
-agent needs only specific operations. It does not cover Git
-transport or GraphQL requests. To add a deny rule to an existing rule without a
-complete policy file, use `openshell policy update` with `--add-deny`, as
-described in [Add or Remove Network
+In request paths, `*` matches within one path segment, and `**` written as a
+whole segment matches across segments, so `/repos/<org>/<repo>/**` covers every
+path under the repository but not `/repos/<org>/<repo>` itself. The deny rules
+list the webhooks path and everything under it separately for the same reason.
+The allow rule grants every HTTP method under the repository path, including
+writes, so narrow it if the agent needs only specific operations. It does not
+cover Git transport or GraphQL requests. To add a deny rule to an existing rule
+without a complete policy file, use `openshell policy update` with `--add-deny`,
+as described in [Add or Remove Network
 Access](/how-it-works/policies/manage-policies#add-or-remove-network-access).
 
 Apply the rule with a GitHub provider attached. Its profile must permit

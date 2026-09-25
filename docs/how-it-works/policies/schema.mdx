@@ -446,12 +446,34 @@ network_middlewares:
 
 ## Matcher Semantics
 
-| Matcher | Case-sensitive | Wildcards |
+Glob patterns follow one set of rules. Each matcher splits values at a
+separator:
+
+| Matcher | Separator | Case-sensitive |
 |---|---|---|
-| Endpoint `host` and middleware hosts | No | `*` matches characters within one DNS label, and `**` matches one or more labels. |
-| Binary `path` | Yes | `*` matches within one path segment, and `**` matches across segments. |
-| REST and WebSocket `path` | Yes | `*` matches within one path segment, and `**` matches across segments. `?` matches one character, and bracket classes such as `[0-9]` are supported. `/repos/**` does not match `/repos`. |
-| Query values and MCP tool names | Yes | `*` matches any characters except `.`, and `**` matches any characters. |
+| Endpoint `host` and middleware hosts | `.` | No |
+| Binary `path` | `/` | Yes |
+| REST and WebSocket rule `path` | `/` | Yes |
+| Query values and MCP tool names | `.` | Yes |
+
+- `*` matches any characters except the separator.
+- `**` matches across separators only when it is a whole segment, as in
+  `/repos/**`, `**.example.com`, or `github.**`. Next to other characters, as in
+  `**secret**`, it behaves like `*`. A whole-segment `**` needs at least one
+  segment, so `/repos/**` does not match `/repos`.
+- `?` matches one character except the separator, and bracket classes such as
+  `[0-9]` match one character from a set. Endpoint hosts accept only `*` and
+  `**`, as described in [Destination Fields](#destination-fields).
+
+Because query values and MCP tool names use `.` as the separator, `*` does not
+match a value that contains a dot. For example, `1.*` matches `1.2` but not
+`1.2.3`, and `github.*` matches `github.search` but not `github.search.code`.
+Use `**` to match any value.
+
+The endpoint `path` field, which selects among endpoints on the same host and
+port, uses different rules. An empty path, `**`, or `/**` matches every path,
+`/v1/**` matches `/v1` and every path under it, and in other patterns `*` also
+matches `/`.
 
 ## Full Example
 
