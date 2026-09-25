@@ -361,7 +361,8 @@ successor removes that retry path across every gateway replica. Short
 that has not yet been refreshed. Omitting `gateway_jwt.ttl_secs` selects
 non-expiring launch-scoped gateway and Sandbox Protocol tokens for local
 single-player Docker, Podman, and VM gateways; both token profiles carry
-`exp = 0`. Typed extension JWTs retain a 900-second default when the field is
+`exp = 0`, and supervisors skip periodic renewal of those session tokens.
+Typed extension JWTs retain a 900-second default when the field is
 omitted. Kubernetes and other shared deployments should set a positive TTL.
 Explicit zero is rejected.
 
