@@ -60,14 +60,21 @@ navigation:
     contents:
     - page: "Overview"
       path: how-it-works/policies/overview.mdx
-    - page: "Advisor"
-      path: how-it-works/policies/advisor.mdx
-    - page: "Schema"
-      path: how-it-works/policies/schema.mdx
-    - page: "Prover"
+    - page: "Network Rules"
+      path: how-it-works/policies/network-rules.mdx
+    - page: "Manage Policies"
+      path: how-it-works/policies/manage-policies.mdx
+    - page: "Policy Prover"
       path: how-it-works/policies/prover.mdx
+      slug: prover
+    - page: "Policy Advisor"
+      path: how-it-works/policies/advisor.mdx
+      slug: advisor
     - page: "Default Policy"
       path: how-it-works/policies/default-policy.mdx
+    - page: "Schema Reference"
+      path: how-it-works/policies/schema.mdx
+      slug: schema
   - page: "Inference"
     path: how-it-works/inference.mdx
 - section: "Extensibility"

@@ -128,8 +128,8 @@ To see the complete policy, run `openshell policy get demo --base`.
 This tutorial uses `curl` and `read-only` access to keep things simple. When building policies for real workloads:
 
 - To scope the rule to an agent, use your agent's binary, such as `/usr/local/bin/claude`, instead of `curl`.
-- To grant write access, use the `read-write` preset or add explicit rules for specific paths. Refer to the [Policy Schema](/reference/policy-schema).
-- To allow other services, such as PyPI, npm, or your internal APIs, adapt the examples in [Network Rules](/sandboxes/network-rules).
+- To grant write access, use the `read-write` preset or add explicit rules for specific paths. Refer to the [Policy Schema](/how-it-works/policies/schema).
+- To allow other services, such as PyPI, npm, or your internal APIs, adapt the examples in [Network Rules](/how-it-works/policies/network-rules).
 
 </Tip>
 
@@ -205,5 +205,5 @@ bash examples/sandbox-policy-quickstart/demo.sh
 
 ## Next Steps
 
-- To understand how OpenShell evaluates network rules, refer to [Sandbox Policies](/sandboxes/policies).
-- To walk through a full policy iteration with Claude Code, including diagnosing denials and applying fixes from outside the sandbox, refer to [GitHub Sandbox](/get-started/tutorials/github-sandbox).
+- To understand how OpenShell evaluates network rules, refer to [Sandbox Policies](/how-it-works/policies/overview).
+- To walk through a full policy iteration with Claude Code, including diagnosing denials and applying fixes from outside the sandbox, refer to [GitHub Sandbox](/tutorials/github-push-access).

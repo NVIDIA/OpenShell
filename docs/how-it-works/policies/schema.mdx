@@ -34,7 +34,7 @@ network_middlewares: { ... }
 
 Startup fields take effect when a sandbox starts. Live fields can change while
 it runs. Refer to [How Changes Take
-Effect](/sandboxes/manage-policies#how-changes-take-effect).
+Effect](/how-it-works/policies/manage-policies#how-changes-take-effect).
 
 ## Filesystem Policy
 
@@ -48,7 +48,7 @@ When `filesystem_policy` is omitted, `include_workdir` is `true`. When
 `filesystem_policy` is present, `include_workdir` defaults to `false`. Paths
 that are not listed are inaccessible. When the effective policy has at least one
 network rule, OpenShell also adds the baseline paths described in [Default
-Policy](/reference/default-policy#baseline-filesystem-paths).
+Policy](/how-it-works/policies/default-policy#baseline-filesystem-paths).
 
 Each path must be absolute, must not contain `..`, and must not exceed 4096
 bytes. `read_write` cannot contain `/`. A policy can list at most 256 paths.
@@ -103,7 +103,7 @@ process:
 
 A map of named rules. The key is the rule's name. Each rule allows every listed
 binary to reach every listed endpoint. For how OpenShell evaluates rules, and
-for examples, refer to [Network Rules](/sandboxes/network-rules).
+for examples, refer to [Network Rules](/how-it-works/policies/network-rules).
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -149,7 +149,7 @@ for `host.openshell.internal` can still reach services on the gateway host.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `protocol` | string | None | `rest`, `websocket`, `graphql`, `mcp`, or `json-rpc` for request inspection, or `tcp` for a native TCP connection. Refer to [Connection and Request Checks](/sandboxes/network-rules#connection-and-request-checks). |
+| `protocol` | string | None | `rest`, `websocket`, `graphql`, `mcp`, or `json-rpc` for request inspection, or `tcp` for a native TCP connection. Refer to [Connection and Request Checks](/how-it-works/policies/network-rules#connection-and-request-checks). |
 | `tls` | string | Automatic | `skip` relays traffic without terminating TLS, so OpenShell cannot inspect it. Do not use it with a request protocol. |
 | `enforcement` | string | `audit` | `enforce` blocks requests that break the endpoint's rules. `audit` logs them and allows the request. |
 | `access` | string | None | Access preset: `read-only`, `read-write`, or `full`. Refer to [Access Presets](#access-presets). |
@@ -172,9 +172,9 @@ for `host.openshell.internal` can still reach services on the gateway host.
 Credential placeholders use the form `openshell:resolve:env:KEY`. Body rewriting
 applies to UTF-8 JSON, form, and text bodies of up to 256 KiB, and cannot be
 combined with `credential_signing`. Signing requires an attached provider with
-AWS credentials. Refer to [AWS SigV4](/providers/aws-sigv4) and [Static
+AWS credentials. Refer to [AWS SigV4](/how-it-works/providers/aws) and [Static
 Credential Endpoint
-Binding](/providers/profiles#understand-static-credential-endpoint-binding).
+Binding](/how-it-works/providers/profiles#understand-static-credential-endpoint-binding).
 
 ```yaml showLineNumbers={false}
 network_policies:
@@ -408,7 +408,8 @@ processes. Scripts run as their interpreter, so list the interpreter, such as
 `/usr/bin/python3.12`, for a Python script. List the executable's real path, not
 a symlink to it. OpenShell records a hash of each executable the first time it
 takes part in a connection, and denies later connections if the file changes.
-Refer to [Binary Matching](/sandboxes/network-rules#binary-matching).
+Refer to [Binary
+Matching](/how-it-works/policies/network-rules#binary-matching).
 
 ## Network Middleware
 
@@ -427,7 +428,8 @@ network rules allow, in ascending `order`.
 
 Host patterns match the same way as endpoint hosts, up to 32 patterns per
 configuration. A `fail_closed` configuration cannot apply to an endpoint with
-`tls: skip`. Refer to [Supervisor Middleware](/extensibility/supervisor-middleware).
+`tls: skip`. Refer to [Supervisor
+Middleware](/extensibility/supervisor-middleware).
 
 ```yaml showLineNumbers={false}
 network_middlewares:

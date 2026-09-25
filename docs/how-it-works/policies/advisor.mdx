@@ -181,8 +181,8 @@ every sandbox by setting `manual` on the gateway.
 
 ### Proposal Risk Check
 
-The policy advisor uses the [policy prover](/reference/policy-prover) to run a
-proposal risk check on every proposal. Unlike the boundary check that the
+The policy advisor uses the [policy prover](/how-it-works/policies/prover) to
+run a proposal risk check on every proposal. Unlike the boundary check that the
 `openshell-prover` CLI runs, it does not compare a policy with a boundary that
 you write. It compares what the sandbox can reach with and without the proposed
 rule. The check accounts for the credentials of attached providers and for
@@ -250,7 +250,7 @@ MCP tool rules, query matchers, credential settings, or endpoint path selectors,
 and it ignores them if an agent sends them. Review the rule that
 `openshell rule get` shows, not the agent's description of it. Add rules that
 need those fields yourself, as described in [Manage Sandbox
-Policies](/sandboxes/manage-policies).
+Policies](/how-it-works/policies/manage-policies).
 
 If a proposed hostname resolves to a private address, OpenShell still blocks the
 connection after approval until you add an `allowed_ips` entry or declare the
@@ -305,10 +305,10 @@ if the agent was waiting for the decision. An automatic approval's
 
 ## Next Steps
 
-- Use [Manage Sandbox Policies](/sandboxes/manage-policies) to change policies
-  yourself.
-- Use [Network Rules](/sandboxes/network-rules) and the
-  [Policy Schema Reference](/reference/policy-schema) for rules that agents
+- Use [Manage Sandbox Policies](/how-it-works/policies/manage-policies) to
+  change policies yourself.
+- Use [Network Rules](/how-it-works/policies/network-rules) and the
+  [Policy Schema Reference](/how-it-works/policies/schema) for rules that agents
   cannot propose.
-- Use the [Policy Prover](/reference/policy-prover) to check a
+- Use the [Policy Prover](/how-it-works/policies/prover) to check a
   complete policy against a boundary you define.

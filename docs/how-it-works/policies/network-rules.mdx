@@ -98,7 +98,7 @@ an inspected endpoint. The `protocol` field selects what OpenShell inspects:
 | `websocket` | The WebSocket upgrade request and each text message the client sends. | [WebSocket](#allow-websocket-messages) |
 | `graphql` | GraphQL operation type, operation name, and top-level fields. | [GraphQL](#allow-graphql-operations) |
 | `mcp` | MCP method and tool name. | [MCP](#allow-mcp-tools) |
-| `json-rpc` | JSON-RPC method name. | [JSON-RPC rules](/reference/policy-schema#json-rpc-rules) |
+| `json-rpc` | JSON-RPC method name. | [JSON-RPC rules](/how-it-works/policies/schema#json-rpc-rules) |
 | `tcp` | No request rules. Use it for clients that speak a protocol other than HTTP, such as databases. | [Native TCP](#allow-native-tcp) |
 | Omitted | No request rules. | -- |
 
@@ -161,8 +161,9 @@ send provider credentials there. OpenShell supplies a provider's credentials
 only to the destinations that the provider's profile or an explicit credential
 binding allows. When a request fails a credential check, correct the provider
 binding instead of widening the network rule. Refer to [Provider
-Profiles](/providers/profiles) for profile endpoints, and to [Credential
-Fields](/reference/policy-schema#credential-fields) for explicit bindings.
+Profiles](/how-it-works/providers/profiles) for profile endpoints, and to
+[Credential Fields](/how-it-works/policies/schema#credential-fields) for
+explicit bindings.
 
 ## Examples
 
@@ -174,9 +175,10 @@ When a single `openshell policy update` command can create a rule, the example
 shows it. Otherwise, add the YAML under the `network_policies` section of a
 complete policy file and apply it with `openshell policy set`, as described in
 [Replace the Complete
-Policy](/sandboxes/manage-policies#replace-the-complete-policy). After you apply
-a rule, [verify the change](/sandboxes/manage-policies#verify-a-change) before
-testing traffic.
+Policy](/how-it-works/policies/manage-policies#replace-the-complete-policy).
+After you apply a rule, [verify the
+change](/how-it-works/policies/manage-policies#verify-a-change) before testing
+traffic.
 
 ### Allow Read-Only API Access
 
@@ -264,14 +266,14 @@ agent needs only specific operations. It does not cover Git
 transport or GraphQL requests. To add a deny rule to an existing rule without a
 complete policy file, use `openshell policy update` with `--add-deny`, as
 described in [Add or Remove Network
-Access](/sandboxes/manage-policies#add-or-remove-network-access).
+Access](/how-it-works/policies/manage-policies#add-or-remove-network-access).
 
 Apply the rule with a GitHub provider attached. Its profile must permit
 credential use at `api.github.com`, and the token must authorize the repository
 operations. Verify that `gh api repos/<org>/<repo>/issues` succeeds and that
 `gh api repos/<org>/<repo>/hooks` returns an OpenShell denial. For a complete
 Git push example, see [Grant GitHub Push Access to a Sandboxed
-Agent](/get-started/tutorials/github-sandbox).
+Agent](/tutorials/github-push-access).
 
 ### Allow PyPI Downloads
 
@@ -350,9 +352,9 @@ openshell sandbox exec -n my-sandbox --no-login-shell -- \
 OpenShell blocks connections to private network addresses by default to prevent
 server-side request forgery (SSRF). An endpoint with an exact hostname can still
 reach the private addresses that its hostname resolves to, unless the endpoint
-comes from an approved [policy advisor](/sandboxes/policy-advisor) proposal.
-Loopback, link-local, and unspecified addresses, including the cloud metadata
-address `169.254.169.254`, are always blocked.
+comes from an approved [policy advisor](/how-it-works/policies/advisor)
+proposal. Loopback, link-local, and unspecified addresses, including the cloud
+metadata address `169.254.169.254`, are always blocked.
 
 Use `allowed_ips` to limit the addresses an endpoint can reach, or to let a
 wildcard host such as `*.internal.example` reach private addresses. This rule
@@ -483,7 +485,7 @@ For allow rules, every top-level field in an operation must match. A malformed
 or disallowed operation denies an entire batched request. GraphQL field names
 are application-specific, so review them against the service's schema before
 you rely on them. For deny rules, persisted queries, and GraphQL over WebSocket,
-refer to [GraphQL Rules](/reference/policy-schema#graphql-rules).
+refer to [GraphQL Rules](/how-it-works/policies/schema#graphql-rules).
 
 With a GitHub provider attached, verify a REST read with `gh api zen` and a
 query with `gh api graphql -f query='{ viewer { login } }'`, then confirm that a
@@ -528,10 +530,10 @@ tool can receive any arguments accepted by the server.
 
 Omitting `mcp.versions` allows only the `2025-11-25` revision. To support an
 older server, list the exact revisions it needs, as described in [MCP Version
-Selection](/reference/policy-schema#mcp-version-selection). Server responses and
-SSE messages are relayed without MCP policy parsing. Do not put an MCP endpoint
-on the same host and port as an endpoint that uses a different protocol.
-`openshell policy update` rejects this combination.
+Selection](/how-it-works/policies/schema#mcp-version-selection). Server
+responses and SSE messages are relayed without MCP policy parsing. Do not put an
+MCP endpoint on the same host and port as an endpoint that uses a different
+protocol. `openshell policy update` rejects this combination.
 
 ### Allow Native TCP
 
@@ -586,7 +588,7 @@ when the client starts TLS as soon as it connects, when the client must complete
 TLS itself, for example to present a client certificate, or when the server
 sends first, as with SMTP, IMAP, and MySQL. Clients that send first and
 negotiate TLS within their protocol, such as `psql`, do not need it. Refer to
-[Inspection Fields](/reference/policy-schema#inspection-fields).
+[Inspection Fields](/how-it-works/policies/schema#inspection-fields).
 
 Prefer exact hostnames. A wildcard authorizes DNS queries for every matching
 name, which can expose a DNS-label exfiltration channel. An allowed hostname on
@@ -603,9 +605,9 @@ record.
 
 ## Next Steps
 
-- Use [Manage Sandbox Policies](/sandboxes/manage-policies) to apply, verify,
-  and roll back policy changes.
-- Use the [Policy Schema Reference](/reference/policy-schema) for protocol
+- Use [Manage Sandbox Policies](/how-it-works/policies/manage-policies) to
+  apply, verify, and roll back policy changes.
+- Use the [Policy Schema Reference](/how-it-works/policies/schema) for protocol
   defaults, field constraints, and matcher semantics.
-- Use [Troubleshoot](/sandboxes/manage-policies#troubleshoot) when a request is
-  denied unexpectedly.
+- Use [Troubleshoot](/how-it-works/policies/manage-policies#troubleshoot) when a
+  request is denied unexpectedly.

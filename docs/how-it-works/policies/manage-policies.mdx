@@ -35,7 +35,7 @@ openshell sandbox create --name my-sandbox
 ```
 
 Without either, the sandbox uses a policy from its image or the restrictive
-[default policy](/reference/default-policy).
+[default policy](/how-it-works/policies/default-policy).
 
 ## Ship a Policy in an Image
 
@@ -69,7 +69,7 @@ to the sandbox's own policy. Use the effective policy to see everything the
 sandbox can reach, for example to find out why a request is allowed.
 
 To save the effective policy as a YAML file, for example to review it or to
-check it with the [policy prover](/reference/policy-prover):
+check it with the [policy prover](/how-it-works/policies/prover):
 
 ```shell
 openshell sandbox get my-sandbox --policy-only > effective-policy.yaml
@@ -103,7 +103,7 @@ enforcement mode. `read-only` allows `GET`, `HEAD`, and `OPTIONS` requests,
 `rest` turns on HTTP request inspection, and `enforce` blocks every other
 request. The `--binary` value must be the real path of the executable inside the
 sandbox, as described in [Binary
-Matching](/sandboxes/network-rules#binary-matching).
+Matching](/how-it-works/policies/network-rules#binary-matching).
 
 To allow another kind of request on an existing rule, add an allow rule. Name
 the rule with `--rule-name`, and list every binary in the rule with `--binary`.
@@ -214,11 +214,11 @@ flowchart TD
 The sandbox validates the revision again because it also accounts for provider
 rules and other changes that arrive at the same time. If the sandbox cannot load
 a revision, the `policy_validation_failure_mode` option in the [gateway
-configuration](/reference/gateway-config#full-example) decides what happens.
-With `fail_closed`, the default, the sandbox blocks network traffic until you
-submit a valid policy. With `retain_last_valid`, the last valid policy stays
-active. [A Change Fails to Load](#a-change-fails-to-load) explains how to repair
-a rejected change.
+configuration](/how-it-works/gateways/configuration#full-example) decides what
+happens. With `fail_closed`, the default, the sandbox blocks network traffic
+until you submit a valid policy. With `retain_last_valid`, the last valid policy
+stays active. [A Change Fails to Load](#a-change-fails-to-load) explains how to
+repair a rejected change.
 
 ## Change Filesystem and Process Settings
 
@@ -229,7 +229,8 @@ edit these settings in the file.
 
 When the policy allows network access, OpenShell adds the system paths that
 sandbox processes need, so list only the paths your workload requires. [Baseline
-Filesystem Paths](/reference/default-policy#baseline-filesystem-paths) lists
+Filesystem
+Paths](/how-it-works/policies/default-policy#baseline-filesystem-paths) lists
 those paths.
 
 <Warning>
@@ -379,11 +380,11 @@ openshell sandbox start my-sandbox
 
 ## Next Steps
 
-- Use [Network Rules](/sandboxes/network-rules) for example rules you can adapt
-  to common services and protocols.
-- Use the [Policy Prover](/reference/policy-prover) to check that a policy
+- Use [Network Rules](/how-it-works/policies/network-rules) for example rules
+  you can adapt to common services and protocols.
+- Use the [Policy Prover](/how-it-works/policies/prover) to check that a policy
   grants no more access than a boundary you define.
-- Use the [Policy Advisor](/sandboxes/policy-advisor) to let an agent propose
-  the network rules it needs for your review.
-- Use the [Policy Schema Reference](/reference/policy-schema) for every field,
-  default, and constraint.
+- Use the [Policy Advisor](/how-it-works/policies/advisor) to let an agent
+  propose the network rules it needs for your review.
+- Use the [Policy Schema Reference](/how-it-works/policies/schema) for every
+  field, default, and constraint.
