@@ -17,17 +17,16 @@
 > [!IMPORTANT]
 > **New in OpenShell 0.1.0:** a stable release cadence, new isolation primitives, an expanded extension surface, and new APIs. [Read the 0.1.0 upgrade guide](https://docs.nvidia.com/openshell/latest/upgrade/0-1-0).
 
-OpenShell is the safe, private runtime for fleets of autonomous AI agents. It runs agents in sandboxes that protect your data, credentials, and infrastructure, governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
+OpenShell is the safe, private runtime for fleets of autonomous AI agents. Agents are most useful when they can read files, install packages, call APIs, and use credentials. OpenShell gives them that capability without giving them unrestricted access to your data, secrets, or network. You declare what each agent can touch in a policy, and OpenShell enforces it.
 
 ## How It Works
 
-A gateway control plane manages sandbox lifecycle through a compute driver: Docker, Podman, MicroVM, or Kubernetes. Inside each sandbox, a trusted supervisor launches the agent workload with filesystem and process restrictions, and routes all of its network traffic through a policy-enforcing proxy. For every outbound request, the proxy does one of three things:
+OpenShell governs what agents can do in two ways: it instruments the kernel to enforce policy on every file access, system call, and network connection at runtime, and it uses formal verification to check what a policy change would allow before it is applied.
 
-- **Allows** it when the destination and calling binary match a network policy.
-- **Binds credentials** to it: the agent only sees placeholders, and the proxy substitutes real provider credentials after policy admits a request to a profile-authorized endpoint.
-- **Denies** it and logs the decision.
+- **Kernel-level enforcement.** Each agent runs in an isolated sandbox. Kernel controls confine which files it can access and which system calls it can make, and every network connection passes through a policy check before it leaves the sandbox. Agents never see real credentials; OpenShell adds them only to requests bound for approved endpoints.
+- **Formally verified policy changes.** Before a policy change is approved, OpenShell uses formal verification to flag risky new access it would grant, such as reaching a new host with credentials or calling a new API method, so those changes wait for human review.
 
-Filesystem and process policy are locked when the sandbox is created. Network policy and provider attachments can be updated on a running sandbox. See [Architecture](https://docs.nvidia.com/openshell/latest/about/architecture).
+See [Architecture](https://docs.nvidia.com/openshell/latest/about/architecture) for how the gateway, supervisor, and sandbox fit together.
 
 ## Quickstart
 
@@ -61,13 +60,15 @@ Walk through it in the [First Network Policy tutorial](https://docs.nvidia.com/o
 
 ## Explore Further
 
-- [Custom images](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview): bring your own container image with `--from`. See the [BYOC example](examples/bring-your-own-container).
-- [Runtimes and GPUs](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/runtimes): choose a compute driver and request GPUs with `--gpu`.
-- [Providers](https://docs.nvidia.com/openshell/latest/how-it-works/providers/overview) and [inference](https://docs.nvidia.com/openshell/latest/how-it-works/inference): give agents endpoint-bound access to model APIs and other services.
-- [Policies](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview): the full filesystem, network, and process policy model.
-- [Kubernetes](https://docs.nvidia.com/openshell/latest/kubernetes/setup) (experimental): deploy the gateway with Helm. Your cluster CNI must enforce `NetworkPolicy` for sandbox isolation.
+- [Sandboxes](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview): images, runtimes, GPUs, and lifecycle.
+- [Policies](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview): filesystem, network, and process rules, with the [advisor](https://docs.nvidia.com/openshell/latest/how-it-works/policies/advisor) and [prover](https://docs.nvidia.com/openshell/latest/how-it-works/policies/prover) for reviewing changes.
+- [Providers](https://docs.nvidia.com/openshell/latest/how-it-works/providers/overview): credentials that work only at approved endpoints, including [inference](https://docs.nvidia.com/openshell/latest/how-it-works/inference).
+- [Gateways](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/overview): the control plane for sandboxes, policy, and access.
+- [Kubernetes](https://docs.nvidia.com/openshell/latest/kubernetes/setup): deploy the gateway with Helm. Your CNI must enforce `NetworkPolicy`.
+- [Extensibility](https://docs.nvidia.com/openshell/latest/extensibility/overview): middleware, interceptors, and compute drivers.
+- [Tutorials](https://docs.nvidia.com/openshell/latest/tutorials/first-network-policy): step-by-step policy and agent walkthroughs.
 - [Prerelease and development builds](https://docs.nvidia.com/openshell/latest/about/installation#prerelease-and-development-builds): try an upcoming release or the latest commit on `main`.
-- Agent skills: install the public OpenShell skills for your coding agent with `npx skills add NVIDIA/OpenShell`. See [`skills/`](skills/).
+- Agent skills: `npx skills add NVIDIA/OpenShell` installs the public OpenShell skills for your coding agent.
 
 ## SDKs
 
