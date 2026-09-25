@@ -1,0 +1,118 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Access Control"
+sidebar-title: "Access Control"
+description: "Configure OIDC user authentication or reverse-proxy auth termination for a Kubernetes-deployed OpenShell gateway."
+keywords: "Generative AI, Cybersecurity, Kubernetes, Authentication, mTLS, OIDC, Keycloak, Entra ID, Okta, Gateway Auth"
+position: 5
+---
+
+The OpenShell gateway supports two access-control models for human callers on Kubernetes:
+
+| Model | When to use |
+|---|---|
+| OIDC (recommended) | Production deployments. Integrates with an existing identity provider, supports role-based access control, and gives each user their own identity without distributing certificates. |
+| Reverse-proxy auth termination | An access proxy (Cloudflare Access, ngrok, corporate SSO) authenticates callers in front of the gateway. The gateway trusts the proxy and skips its own client-cert check. |
+
+The Helm chart always generates mTLS certificates at install time. The gateway uses them for transport-layer security regardless of which access-control model you choose. The client bundle in the `openshell-client-tls` secret is used internally by sandbox supervisors, not for granting access to individual users.
+
+For how the CLI resolves gateways and stores credentials, refer to [Gateway Authentication](/reference/gateway-auth).
+
+## Sandbox Supervisor Identity
+
+Kubernetes sandbox supervisors authenticate back to the gateway as sandbox workloads. By default, the gateway mints its own sandbox JWTs and Kubernetes sandboxes bootstrap them with a projected ServiceAccount token.
+
+Dynamic provider token grants can use SPIFFE without changing supervisor-to-gateway authentication. Set `server.providerTokenGrants.spiffe.enabled=true` to mount the SPIFFE CSI Workload API socket into gateway and sandbox pods while keeping the projected ServiceAccount token bootstrap and gateway-minted sandbox JWT path.
+
+Provider token grants require a SPIFFE implementation such as SPIRE and identities for the gateway and sandbox pods. The repository's local SPIRE overlay assigns sandbox IDs from the pod's `openshell.io/sandbox-id` annotation, but the gateway validation path only requires the supervisor SVID to be valid and in the same SPIFFE trust domain as the gateway SVID. Provider profiles with `token_grant` metadata cause the sandbox supervisor to request JWT-SVIDs and exchange them for upstream OAuth2 access tokens. Token-exchange profiles also require a gateway SPIFFE identity because the gateway brokers the intermediate token exchange with its own JWT-SVID.
+
+The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the SPIFFE Workload API, so intermediate token exchange does not require gateway access to the SPIRE OIDC discovery endpoint or its TLS CA.
+
+## OIDC User Authentication
+
+Set `server.oidc.issuer` to enable OIDC. The gateway validates the `Authorization: Bearer <token>` header on every request against the issuer's JWKS endpoint.
+
+```shell
+helm upgrade openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set server.oidc.issuer=https://your-idp.example.com/realms/openshell \
+  --set server.oidc.audience=openshell-cli
+```
+
+The `audience` value must match the client ID configured in your identity provider for the OpenShell resource server.
+
+### OIDC values reference
+
+| Value | Default | Purpose |
+|---|---|---|
+| `server.oidc.issuer` | `""` | OIDC issuer URL. Empty disables OIDC. |
+| `server.oidc.audience` | `openshell-cli` | Expected `aud` claim in the JWT. |
+| `server.oidc.jwksTtl` | `3600` | JWKS key cache TTL in seconds. |
+| `server.oidc.rolesClaim` | `""` | Dot-separated path to the roles array in JWT claims. |
+| `server.oidc.adminRole` | `""` | Role name that grants admin access. |
+| `server.oidc.userRole` | `""` | Role name that grants standard user access. |
+| `server.oidc.scopesClaim` | `""` | Dot-separated path to the scopes array in JWT claims. |
+
+### Auth-only mode vs. RBAC mode
+
+Leave both `adminRole` and `userRole` empty to use auth-only mode: any request with a valid JWT from the configured issuer is accepted, but no role distinction is enforced.
+
+Set both values to enable RBAC mode, where the gateway checks the role claim and enforces access based on the assigned role:
+
+```shell
+helm upgrade openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set server.oidc.issuer=https://your-idp.example.com/realms/openshell \
+  --set server.oidc.audience=openshell-cli \
+  --set server.oidc.rolesClaim=realm_access.roles \
+  --set server.oidc.adminRole=openshell-admin \
+  --set server.oidc.userRole=openshell-user
+```
+
+Both `adminRole` and `userRole` must be set, or both must be empty. Setting only one is not supported.
+
+OIDC RBAC is method-level authorization. It controls which API operations a caller can perform, but provider and sandbox records are not owned by individual OIDC subjects. In shared clusters, treat provider credentials as gateway-wide resources and use separate gateways or external tenancy controls when users must not see or attach each other's providers and sandboxes.
+
+### Provider-specific rolesClaim paths
+
+| Provider | rolesClaim value |
+|---|---|
+| Keycloak | `realm_access.roles` |
+| Microsoft Entra ID | `roles` |
+| Okta | `groups` |
+
+## Reverse-Proxy Auth Termination
+
+When an access proxy, such as Cloudflare Access, ngrok, or a corporate SSO gateway, handles authentication in front of the OpenShell gateway, you can explicitly allow unauthenticated user calls at the gateway:
+
+```shell
+helm upgrade openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set server.auth.allowUnauthenticatedUsers=true
+```
+
+The gateway still serves TLS and sandbox supervisors still authenticate with gateway-minted sandbox JWTs. User-facing CLI/API calls without OIDC or mTLS credentials are accepted as an unauthenticated local developer principal. The proxy is responsible for authenticating callers and forwarding only authorized traffic.
+
+To also disable TLS entirely (when the proxy terminates TLS before the request reaches the gateway):
+
+```shell
+  --set server.disableTls=true \
+  --set server.auth.allowUnauthenticatedUsers=true
+```
+
+<Warning>
+Only enable unauthenticated users when the gateway is not reachable from outside a trusted local development environment or the proxy path is fully trusted. Never expose a plaintext, auth-disabled gateway to a public network.
+</Warning>
+
+Register the gateway with the CLI using the proxy's public URL. The browser-based login flow runs automatically on first use:
+
+```shell
+openshell gateway add https://gateway.example.com --name production
+```

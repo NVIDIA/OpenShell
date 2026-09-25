@@ -1,0 +1,29 @@
+landing-page:
+  page: Home
+  path: ../pages-v0.0.116/index.mdx
+navigation:
+- folder: ../pages-v0.0.116/about
+  title: About NVIDIA OpenShell
+- section: Get Started
+  slug: get-started
+  contents:
+  - page: Quickstart
+    path: ../pages-v0.0.116/get-started/quickstart.mdx
+  - folder: ../pages-v0.0.116/get-started/tutorials
+    skip-slug: true
+- folder: ../pages-v0.0.116/sandboxes
+  title: Manage OpenShell
+- folder: ../pages-v0.0.116/providers
+  title: Providers
+- folder: ../pages-v0.0.116/extensibility
+  title: Extensibility
+- folder: ../pages-v0.0.116/observability
+  title: Observability
+- folder: ../pages-v0.0.116/kubernetes
+  title: Kubernetes
+- folder: ../pages-v0.0.116/reference
+  title: Reference
+- folder: ../pages-v0.0.116/security
+  title: Security
+- folder: ../pages-v0.0.116/resources
+  title: Resources
