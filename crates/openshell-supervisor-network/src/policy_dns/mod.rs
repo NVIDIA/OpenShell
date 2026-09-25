@@ -144,53 +144,18 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             self.trusted_host_gateway,
         )?;
         if eligible.is_empty() {
-            // DNS alone cannot identify the requesting executable or intended
-            // port. Publish a synthetic, contract-free address so the later
-            // TCP attempt can be denied with its verified binary and port.
-            // No upstream DNS request or egress grant is made here.
-            if normalized_name.as_str() != "localhost"
-                && !openshell_core::net::is_known_metadata_hostname(normalized_name.as_str())
-                && !is_host_gateway_alias(normalized_name.as_str())
-            {
-                let record = self
-                    .policy
-                    .with_current_generation(snapshot.generation, |generation| {
-                        self.store.publish_observation(
-                            normalized_name.clone(),
-                            family,
-                            snapshot.generation,
-                            generation,
-                            now,
-                        )
-                    })
-                    .map_err(|error| PolicyDnsError::Policy(error.to_string()))?
-                    .ok_or(PolicyDnsError::StalePolicy)??;
-                ocsf_emit!(
-                    ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                        .severity(SeverityId::Informational)
-                        .status(StatusId::Success)
-                        .state(StateId::Enabled, "observation")
-                        .unmapped("normalized_domain", normalized_name.as_str())
-                        .unmapped("synthetic_address", record.synthetic_address.to_string())
-                        .message(format!(
-                            "Policy DNS staged unapproved name {normalized_name} for TCP policy review"
-                        ))
-                        .build()
-                );
-                return Ok(SyntheticAnswer {
-                    address: record.synthetic_address,
-                    ttl: MAX_MAPPING_TTL,
-                    mapping_id: record.mapping_id,
-                    mapping_generation: record.mapping_generation,
-                    policy_generation: record.policy_generation,
-                });
-            }
             emit_dns_denial(
                 &normalized_name,
                 "policy_dns_ineligible",
                 "Policy DNS refused a name that is not eligible in the active policy",
             );
-            return Err(PolicyDnsError::Ineligible);
+            // DNS alone cannot identify the requesting executable or intended
+            // port. Outside quarantine, stage a contract-free observation so
+            // the later TCP attempt can be denied with both and proposed.
+            if snapshot.fail_closed || !observation_eligible(&normalized_name) {
+                return Err(PolicyDnsError::Ineligible);
+            }
+            return self.stage_observation(&normalized_name, family, snapshot.generation, now);
         }
 
         // The trusted resolver is invoked only after the immutable snapshot
@@ -262,50 +227,13 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             ttl,
             contracts,
         };
-        let record = match self
-            .policy
-            .with_current_generation(snapshot.generation, |current_generation| {
-                self.store.publish(request, current_generation, now)
-            }) {
-            Ok(Some(Ok(record))) => record,
-            Ok(Some(Err(error))) => {
-                // InvalidMapping is unreachable for the well-formed request
-                // assembled above, and LockPoisoned requires a prior panic
-                // while holding the store lock. Keep both defensive outcomes
-                // observable because the store API intentionally rejects them.
-                emit_dns_failure(
-                    &normalized_name,
-                    family,
-                    &endpoint_context,
-                    snapshot.generation,
-                    publication_failure_detail(error),
-                    "Policy DNS resolved-endpoint mapping publication failed",
-                );
-                return Err(PolicyDnsError::Publish(error));
-            }
-            Ok(None) => {
-                emit_dns_failure(
-                    &normalized_name,
-                    family,
-                    &endpoint_context,
-                    snapshot.generation,
-                    "policy_dns_publication_stale_generation",
-                    "Policy DNS discarded a stale resolved-endpoint mapping",
-                );
-                return Err(PolicyDnsError::StalePolicy);
-            }
-            Err(error) => {
-                emit_dns_failure(
-                    &normalized_name,
-                    family,
-                    &endpoint_context,
-                    snapshot.generation,
-                    "policy_dns_publication_generation_check_failed",
-                    "Policy DNS could not validate the active policy generation before publication",
-                );
-                return Err(PolicyDnsError::Policy(error.to_string()));
-            }
-        };
+        let record = self.publish_guarded(
+            &normalized_name,
+            family,
+            &endpoint_context,
+            snapshot.generation,
+            |current_generation| self.store.publish(request, current_generation, now),
+        )?;
         emit_mapping_publication(&record);
         Ok(SyntheticAnswer {
             address: record.synthetic_address,
@@ -316,9 +244,105 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
         })
     }
 
+    /// Stage a contract-free observation for a name absent from policy. No
+    /// upstream DNS request or egress grant is made.
+    fn stage_observation(
+        &self,
+        name: &NormalizedName,
+        family: AddressFamily,
+        policy_generation: u64,
+        now: Instant,
+    ) -> Result<SyntheticAnswer, PolicyDnsError> {
+        let record = self
+            .publish_guarded(name, family, &[], policy_generation, |current_generation| {
+                self.store.publish_observation(
+                    name.clone(),
+                    family,
+                    policy_generation,
+                    current_generation,
+                    now,
+                )
+            })
+            .map_err(|error| match error {
+                // Without capacity, keep the refusal unknown names received
+                // before observations existed.
+                PolicyDnsError::Publish(
+                    PublishError::ObservationBudgetExhausted | PublishError::PoolExhausted,
+                ) => PolicyDnsError::Ineligible,
+                error => error,
+            })?;
+        emit_observation_publication(&record);
+        Ok(SyntheticAnswer {
+            address: record.synthetic_address,
+            ttl: MAX_MAPPING_TTL,
+            mapping_id: record.mapping_id,
+            mapping_generation: record.mapping_generation,
+            policy_generation: record.policy_generation,
+        })
+    }
+
+    /// Publish only while `policy_generation` is current. The store rejects
+    /// invalid or stale mappings, exhausted capacity, and a poisoned lock;
+    /// every rejection stays observable.
+    fn publish_guarded(
+        &self,
+        name: &NormalizedName,
+        family: AddressFamily,
+        endpoint_context: &[PolicyEndpointId],
+        policy_generation: u64,
+        publish: impl FnOnce(u64) -> Result<ResolvedEndpointRecord, PublishError>,
+    ) -> Result<ResolvedEndpointRecord, PolicyDnsError> {
+        match self
+            .policy
+            .with_current_generation(policy_generation, publish)
+        {
+            Ok(Some(Ok(record))) => Ok(record),
+            Ok(Some(Err(error))) => {
+                emit_dns_failure(
+                    name,
+                    family,
+                    endpoint_context,
+                    policy_generation,
+                    publication_failure_detail(error),
+                    "Policy DNS resolved-endpoint mapping publication failed",
+                );
+                Err(PolicyDnsError::Publish(error))
+            }
+            Ok(None) => {
+                emit_dns_failure(
+                    name,
+                    family,
+                    endpoint_context,
+                    policy_generation,
+                    "policy_dns_publication_stale_generation",
+                    "Policy DNS discarded a stale resolved-endpoint mapping",
+                );
+                Err(PolicyDnsError::StalePolicy)
+            }
+            Err(error) => {
+                emit_dns_failure(
+                    name,
+                    family,
+                    endpoint_context,
+                    policy_generation,
+                    "policy_dns_publication_generation_check_failed",
+                    "Policy DNS could not validate the active policy generation before publication",
+                );
+                Err(PolicyDnsError::Policy(error.to_string()))
+            }
+        }
+    }
+
     pub(crate) fn store(&self) -> &Arc<ResolvedEndpointStore> {
         &self.store
     }
+}
+
+/// Reserved names keep the plain refusal and never become proposals.
+fn observation_eligible(name: &NormalizedName) -> bool {
+    name.as_str() != "localhost"
+        && !openshell_core::net::is_known_metadata_hostname(name.as_str())
+        && !is_host_gateway_alias(name.as_str())
 }
 
 struct EligibleEndpoint {
@@ -486,6 +510,7 @@ fn publication_failure_detail(error: PublishError) -> &'static str {
         PublishError::StalePolicy => "policy_dns_publication_stale_generation",
         PublishError::InvalidMapping => "policy_dns_publication_invalid_mapping",
         PublishError::PoolExhausted => "policy_dns_publication_pool_exhausted",
+        PublishError::ObservationBudgetExhausted => "policy_dns_observation_budget_exhausted",
         PublishError::LockPoisoned => "policy_dns_publication_store_unavailable",
     }
 }
@@ -546,6 +571,30 @@ fn emit_dns_failure(
 
 fn emit_mapping_publication(record: &ResolvedEndpointRecord) {
     ocsf_emit!(build_mapping_publication_event(record));
+}
+
+fn emit_observation_publication(record: &ResolvedEndpointRecord) {
+    ocsf_emit!(build_observation_publication_event(record));
+}
+
+fn build_observation_publication_event(
+    record: &ResolvedEndpointRecord,
+) -> openshell_ocsf::OcsfEvent {
+    ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .state(StateId::Enabled, "observation")
+        .unmapped("normalized_domain", record.normalized_name.as_str())
+        .unmapped("address_family", format!("{:?}", record.family))
+        .unmapped("synthetic_ip", record.synthetic_address.to_string())
+        .unmapped("policy_generation", record.policy_generation)
+        .unmapped("mapping_generation", record.mapping_generation)
+        .unmapped("mapping_id", record.mapping_id.to_string())
+        .message(format!(
+            "Policy DNS staged unapproved name {} synthetic={} for TCP policy review",
+            record.normalized_name, record.synthetic_address
+        ))
+        .build()
 }
 
 fn build_mapping_publication_event(record: &ResolvedEndpointRecord) -> openshell_ocsf::OcsfEvent {
@@ -689,7 +738,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 ";
 
     #[tokio::test]
-    async fn stages_unknown_name_without_upstream_resolution_by_default() {
+    async fn stages_unknown_name_without_upstream_resolution() {
         let service = service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]);
         let answer = service
             .answer_query("other.example", AddressFamily::Ipv4, Instant::now())
@@ -728,19 +777,213 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .lookup_intent(answer.address, 80, generation, now)
             .expect("name available for a later denied connection");
         assert_eq!(intent.record.normalized_name.as_str(), "pypi.org");
-        assert!(intent.record.contracts.is_empty());
+        assert!(intent.record.is_observation());
         assert!(matches!(
             service
                 .store
                 .lookup_intent(answer.address, 80, generation + 1, now),
             Err(MappingLookupError::StalePolicy)
         ));
+    }
+
+    #[tokio::test]
+    async fn reserved_names_and_quarantine_are_refused_without_spending_the_budget() {
+        let service = service_with_gateway(
+            BASE_POLICY,
+            Vec::new(),
+            Some(IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1))),
+        );
+        let now = Instant::now();
+        for name in [
+            "localhost",
+            "metadata.google.internal",
+            "host.openshell.internal",
+        ] {
+            assert!(
+                matches!(
+                    service.answer_query(name, AddressFamily::Ipv4, now).await,
+                    Err(PolicyDnsError::Ineligible)
+                ),
+                "{name} must stay refused"
+            );
+        }
+
+        service
+            .policy
+            .enter_fail_closed("invalid candidate")
+            .unwrap();
         assert!(matches!(
             service
-                .answer_query("metadata.google.internal", AddressFamily::Ipv4, now)
+                .answer_query("pypi.org", AddressFamily::Ipv4, now)
                 .await,
             Err(PolicyDnsError::Ineligible)
         ));
+        service.policy.exit_fail_closed().unwrap();
+
+        // This pool admits two observations; none were spent above.
+        for name in ["pypi.org", "files.pythonhosted.org"] {
+            service
+                .answer_query(name, AddressFamily::Ipv4, now)
+                .await
+                .expect("observation budget remains available");
+        }
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn exhausted_observation_budget_refuses_only_new_unknown_names() {
+        let service = service(BASE_POLICY, vec!["203.0.113.8".parse().unwrap()]);
+        let now = Instant::now();
+        let first = service
+            .answer_query("first.example", AddressFamily::Ipv4, now)
+            .await
+            .unwrap();
+        service
+            .answer_query("second.example", AddressFamily::Ipv4, now)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            service
+                .answer_query("third.example", AddressFamily::Ipv4, now)
+                .await,
+            Err(PolicyDnsError::Ineligible)
+        ));
+        let refreshed = service
+            .answer_query("first.example", AddressFamily::Ipv4, now)
+            .await
+            .expect("a staged name keeps its observation");
+        assert_eq!(refreshed.address, first.address);
+        service
+            .answer_query("db.example", AddressFamily::Ipv4, now)
+            .await
+            .expect("policy-backed names keep their reserved capacity");
+    }
+
+    struct OcsfCapture(Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for OcsfCapture {
+        fn on_event(&self, _: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            if let Some(event) = openshell_ocsf::tracing_layers::clone_current_event() {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(&event).unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_names_keep_the_ineligible_denial_event() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const CHILD: &str = "OPENSHELL_TEST_POLICY_DNS_EVENTS_CHILD";
+        // Tracing callsite interest is process-wide, so concurrent tests with
+        // other subscribers can disable this thread's capture. Exercise the
+        // service in an isolated test process with the same executable.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "policy_dns::tests::unknown_names_keep_the_ineligible_denial_event",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let service = service(BASE_POLICY, Vec::new());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(OcsfCapture(Arc::clone(&events))),
+        );
+        let drain = || {
+            events
+                .lock()
+                .unwrap()
+                .drain(..)
+                .map(|event| {
+                    event["status_detail"]
+                        .as_str()
+                        .or_else(|| event["state"].as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        let now = Instant::now();
+
+        for name in ["first.example", "second.example"] {
+            service
+                .answer_query(name, AddressFamily::Ipv4, now)
+                .await
+                .unwrap();
+            assert_eq!(drain(), ["policy_dns_ineligible", "observation"], "{name}");
+        }
+        assert!(
+            service
+                .answer_query("third.example", AddressFamily::Ipv4, now)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            drain(),
+            [
+                "policy_dns_ineligible",
+                "policy_dns_observation_budget_exhausted"
+            ]
+        );
+        service
+            .policy
+            .enter_fail_closed("invalid candidate")
+            .unwrap();
+        assert!(
+            service
+                .answer_query("fourth.example", AddressFamily::Ipv4, now)
+                .await
+                .is_err()
+        );
+        assert_eq!(drain(), ["policy_dns_ineligible"]);
+    }
+
+    #[test]
+    fn observation_event_correlates_the_name_with_its_synthetic_address() {
+        let store = ResolvedEndpointStore::new(
+            StoreConfig::new(
+                SyntheticPools::new(
+                    Ipv4Addr::new(198, 18, 0, 1)..=Ipv4Addr::new(198, 18, 0, 8),
+                    "fd00:1::1".parse::<Ipv6Addr>().unwrap()
+                        ..="fd00:1::8".parse::<Ipv6Addr>().unwrap(),
+                )
+                .unwrap(),
+                16,
+            )
+            .unwrap(),
+        );
+        let record = store
+            .publish_observation(
+                NormalizedName::parse("pypi.org").unwrap(),
+                AddressFamily::Ipv4,
+                3,
+                3,
+                Instant::now(),
+            )
+            .unwrap();
+
+        let json = serde_json::to_value(build_observation_publication_event(&record)).unwrap();
+
+        assert_eq!(json["state"], "observation");
+        assert_eq!(json["unmapped"]["normalized_domain"], "pypi.org");
+        assert_eq!(json["unmapped"]["synthetic_ip"], "198.18.0.1");
+        assert_eq!(json["unmapped"]["policy_generation"], 3);
     }
 
     #[tokio::test]

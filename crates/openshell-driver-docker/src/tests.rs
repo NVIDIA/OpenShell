@@ -1278,6 +1278,7 @@ fn container_creation_uses_inspected_immutable_image() {
     );
     assert_eq!(host.network_mode.as_deref(), Some("none"));
     assert_eq!(host.dns, Some(vec!["127.0.0.53".to_string()]));
+    assert_eq!(host.dns_search, Some(vec![".".to_string()]));
 }
 
 #[test]
@@ -2714,6 +2715,11 @@ fn build_container_create_body_disables_docker_networking() {
     );
     assert_eq!(host_config.extra_hosts, None);
     assert_eq!(host_config.dns, Some(vec!["127.0.0.53".to_string()]));
+    assert_eq!(
+        host_config.dns_search,
+        Some(vec![".".to_string()]),
+        "host search domains must not expand workload names before policy DNS"
+    );
 }
 
 #[test]

@@ -5796,6 +5796,10 @@ fn build_container_create_body_for_image(
             }),
             network_mode: Some("none".to_string()),
             dns: Some(vec!["127.0.0.53".to_string()]),
+            // Docker otherwise copies the host's search domains. Like the
+            // Podman, Kubernetes, and VM resolvers, send names to policy DNS
+            // exactly as written so short names never expand to host domains.
+            dns_search: Some(vec![".".to_string()]),
             tmpfs: Some(HashMap::from([(
                 openshell_sandbox_backend::SUPERVISOR_CA_RUNTIME_DIR.to_string(),
                 format!(

@@ -17,10 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-/// Keep unapproved names from consuming the pool reserved for policy-backed
-/// destinations. Allocations are never reused, even after their TTL expires.
-const OBSERVATION_POOL_DIVISOR: usize = 8;
-const OBSERVATION_ALLOCATION_IDENTITY: [u8; 32] = [0; 32];
+/// Unapproved-name observations may hold at most this fraction of each
+/// address family's identities; the rest stay available to policy-backed
+/// names. Allocations are never reused, even after their TTL expires.
+const OBSERVATION_POOL_DIVISOR: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PolicyEndpointId {
@@ -63,6 +63,12 @@ pub(crate) struct ResolvedEndpointRecord {
 }
 
 impl ResolvedEndpointRecord {
+    /// An observation correlates a name absent from policy with a later TCP
+    /// attempt. It carries no endpoint contract and never authorizes egress.
+    pub(crate) fn is_observation(&self) -> bool {
+        self.contracts.is_empty()
+    }
+
     pub(crate) fn allowed_ports(&self) -> BTreeSet<u16> {
         self.contracts
             .iter()
@@ -211,6 +217,8 @@ pub(crate) enum PublishError {
     InvalidMapping,
     #[error("synthetic address pool is exhausted")]
     PoolExhausted,
+    #[error("unapproved-name observation budget is exhausted")]
+    ObservationBudgetExhausted,
     #[error("resolved endpoint store lock was poisoned")]
     LockPoisoned,
 }
@@ -233,11 +241,26 @@ pub(crate) enum MappingLookupError {
     LockPoisoned,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AllocationIdentity {
+    /// Contract-free correlation for a name absent from policy.
+    Observation,
+    /// Digest of every compatible endpoint contract.
+    Contracts([u8; 32]),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct AllocationKey {
     normalized_name: NormalizedName,
     family: AddressFamily,
-    allocation_identity: [u8; 32],
+    identity: AllocationIdentity,
+}
+
+struct Publication {
+    key: AllocationKey,
+    policy_generation: u64,
+    ttl: Duration,
+    contracts: Vec<ResolvedPortContract>,
 }
 
 struct StoreState {
@@ -304,7 +327,19 @@ impl ResolvedEndpointStore {
             return Err(PublishError::InvalidMapping);
         }
 
-        self.publish_checked(request, now)
+        self.publish_checked(
+            Publication {
+                key: AllocationKey {
+                    normalized_name: request.normalized_name,
+                    family: request.family,
+                    identity: AllocationIdentity::Contracts(request.allocation_identity),
+                },
+                policy_generation: request.policy_generation,
+                ttl: request.ttl,
+                contracts: request.contracts,
+            },
+            now,
+        )
     }
 
     /// Correlate a denied hostname with a later TCP attempt without resolving
@@ -322,10 +357,12 @@ impl ResolvedEndpointStore {
             return Err(PublishError::StalePolicy);
         }
         self.publish_checked(
-            PublishRequest {
-                normalized_name,
-                family,
-                allocation_identity: OBSERVATION_ALLOCATION_IDENTITY,
+            Publication {
+                key: AllocationKey {
+                    normalized_name,
+                    family,
+                    identity: AllocationIdentity::Observation,
+                },
                 policy_generation,
                 ttl: super::MAX_MAPPING_TTL,
                 contracts: Vec::new(),
@@ -334,47 +371,62 @@ impl ResolvedEndpointStore {
         )
     }
 
+    fn observation_budget(&self, family: AddressFamily) -> usize {
+        (self
+            .config
+            .pools
+            .capacity(family)
+            .min(self.config.max_mappings)
+            / OBSERVATION_POOL_DIVISOR)
+            .max(1)
+    }
+
     fn publish_checked(
         &self,
-        request: PublishRequest,
+        publication: Publication,
         now: Instant,
     ) -> Result<ResolvedEndpointRecord, PublishError> {
-        let key = AllocationKey {
-            normalized_name: request.normalized_name.clone(),
-            family: request.family,
-            allocation_identity: request.allocation_identity,
-        };
+        let Publication {
+            key,
+            policy_generation,
+            ttl,
+            contracts,
+        } = publication;
+        let family = key.family;
         let mut state = self.state.write().map_err(|_| PublishError::LockPoisoned)?;
         let synthetic_address = if let Some(address) = state.allocations.get(&key) {
             *address
         } else {
-            if request.contracts.is_empty()
+            if key.identity == AllocationIdentity::Observation
                 && state
                     .allocations
                     .keys()
-                    .filter(|key| key.allocation_identity == OBSERVATION_ALLOCATION_IDENTITY)
+                    .filter(|allocated| {
+                        allocated.identity == AllocationIdentity::Observation
+                            && allocated.family == family
+                    })
                     .count()
-                    >= (self.config.max_mappings / OBSERVATION_POOL_DIVISOR).max(1)
+                    >= self.observation_budget(family)
             {
-                return Err(PublishError::PoolExhausted);
+                return Err(PublishError::ObservationBudgetExhausted);
             }
             if state.allocations.len() >= self.config.max_mappings {
                 return Err(PublishError::PoolExhausted);
             }
             let address =
-                allocate_address(&mut state, request.family).ok_or(PublishError::PoolExhausted)?;
-            state.allocations.insert(key, address);
+                allocate_address(&mut state, family).ok_or(PublishError::PoolExhausted)?;
+            state.allocations.insert(key.clone(), address);
             let allocated = state
                 .allocations
                 .keys()
-                .filter(|key| key.family == request.family)
+                .filter(|allocated| allocated.family == family)
                 .count();
             let capacity = self
                 .config
                 .pools
-                .capacity(request.family)
+                .capacity(family)
                 .min(self.config.max_mappings);
-            let emitted = match request.family {
+            let emitted = match family {
                 AddressFamily::Ipv4 => &self.ipv4_pool_high_water_emitted,
                 AddressFamily::Ipv6 => &self.ipv6_pool_high_water_emitted,
             };
@@ -382,9 +434,7 @@ impl ResolvedEndpointStore {
                 && !emitted.swap(true, Ordering::Relaxed)
             {
                 openshell_ocsf::ocsf_emit!(build_pool_high_water_event(
-                    allocated,
-                    capacity,
-                    request.family,
+                    allocated, capacity, family,
                 ));
             }
             address
@@ -396,7 +446,7 @@ impl ResolvedEndpointStore {
         if state
             .records
             .get(&synthetic_address)
-            .is_some_and(|record| record.policy_generation > request.policy_generation)
+            .is_some_and(|record| record.policy_generation > policy_generation)
         {
             return Err(PublishError::StalePolicy);
         }
@@ -404,14 +454,14 @@ impl ResolvedEndpointStore {
         state.next_mapping_generation = state.next_mapping_generation.saturating_add(1);
         let record = ResolvedEndpointRecord {
             synthetic_address,
-            normalized_name: request.normalized_name,
-            family: request.family,
-            policy_generation: request.policy_generation,
+            normalized_name: key.normalized_name,
+            family,
+            policy_generation,
             mapping_generation: state.next_mapping_generation,
             mapping_id: Uuid::new_v4(),
             created_at: now,
-            expires_at: now + request.ttl,
-            contracts: request.contracts,
+            expires_at: now + ttl,
+            contracts,
         };
         state.expired_allocations.remove(&synthetic_address);
         state.records.insert(synthetic_address, record.clone());
@@ -429,19 +479,7 @@ impl ResolvedEndpointStore {
             .state
             .read()
             .map_err(|_| MappingLookupError::LockPoisoned)?;
-        let Some(record) = state.records.get(&synthetic_address) else {
-            return if state.expired_allocations.contains(&synthetic_address) {
-                Err(MappingLookupError::Expired)
-            } else {
-                Err(MappingLookupError::Missing)
-            };
-        };
-        if now >= record.expires_at {
-            return Err(MappingLookupError::Expired);
-        }
-        if record.policy_generation != current_policy_generation {
-            return Err(MappingLookupError::StalePolicy);
-        }
+        let record = live_record(&state, synthetic_address, current_policy_generation, now)?;
         if !record
             .contracts
             .iter()
@@ -465,32 +503,23 @@ impl ResolvedEndpointStore {
         current_policy_generation: u64,
         now: Instant,
     ) -> Result<MappingLookup, MappingLookupError> {
-        match self.lookup(synthetic_address, port, current_policy_generation, now) {
-            Err(MappingLookupError::PortMismatch) => {
-                let state = self
-                    .state
-                    .read()
-                    .map_err(|_| MappingLookupError::LockPoisoned)?;
-                let record = state
-                    .records
-                    .get(&synthetic_address)
-                    .ok_or(MappingLookupError::Missing)?;
-                if now >= record.expires_at {
-                    return Err(MappingLookupError::Expired);
-                }
-                if record.policy_generation != current_policy_generation {
-                    return Err(MappingLookupError::StalePolicy);
-                }
-                if !record.contracts.is_empty() {
-                    return Err(MappingLookupError::PortMismatch);
-                }
-                Ok(MappingLookup {
-                    record: record.clone(),
-                    port,
-                })
-            }
-            result => result,
+        let state = self
+            .state
+            .read()
+            .map_err(|_| MappingLookupError::LockPoisoned)?;
+        let record = live_record(&state, synthetic_address, current_policy_generation, now)?;
+        if !record.is_observation()
+            && !record
+                .contracts
+                .iter()
+                .any(|contract| contract.port == port)
+        {
+            return Err(MappingLookupError::PortMismatch);
         }
+        Ok(MappingLookup {
+            record: record.clone(),
+            port,
+        })
     }
 
     /// Remove expired active records without freeing their synthetic identity.
@@ -510,6 +539,28 @@ impl ResolvedEndpointStore {
         }
         Ok(expired.len())
     }
+}
+
+fn live_record(
+    state: &StoreState,
+    synthetic_address: IpAddr,
+    current_policy_generation: u64,
+    now: Instant,
+) -> Result<&ResolvedEndpointRecord, MappingLookupError> {
+    let Some(record) = state.records.get(&synthetic_address) else {
+        return if state.expired_allocations.contains(&synthetic_address) {
+            Err(MappingLookupError::Expired)
+        } else {
+            Err(MappingLookupError::Missing)
+        };
+    };
+    if now >= record.expires_at {
+        return Err(MappingLookupError::Expired);
+    }
+    if record.policy_generation != current_policy_generation {
+        return Err(MappingLookupError::StalePolicy);
+    }
+    Ok(record)
 }
 
 fn build_pool_high_water_event(
@@ -585,34 +636,121 @@ mod tests {
         }
     }
 
+    fn observation(
+        store: &ResolvedEndpointStore,
+        name: &str,
+        family: AddressFamily,
+        now: Instant,
+    ) -> Result<ResolvedEndpointRecord, PublishError> {
+        store.publish_observation(NormalizedName::parse(name).unwrap(), family, 1, 1, now)
+    }
+
     #[test]
     fn observation_budget_preserves_capacity_for_policy_backed_names() {
         let store = store(8);
         let now = Instant::now();
-        let first = store
-            .publish_observation(
-                NormalizedName::parse("unknown.example").unwrap(),
-                AddressFamily::Ipv4,
-                1,
-                1,
-                now,
-            )
-            .unwrap();
-        assert!(first.contracts.is_empty());
+        let first = observation(&store, "unknown.example", AddressFamily::Ipv4, now).unwrap();
+        assert!(first.is_observation());
         assert!(matches!(
-            store.publish_observation(
-                NormalizedName::parse("another.example").unwrap(),
-                AddressFamily::Ipv4,
-                1,
-                1,
-                now,
-            ),
-            Err(PublishError::PoolExhausted)
+            observation(&store, "another.example", AddressFamily::Ipv4, now),
+            Err(PublishError::ObservationBudgetExhausted)
         ));
+        let refreshed = observation(&store, "unknown.example", AddressFamily::Ipv4, now).unwrap();
+        assert_eq!(refreshed.synthetic_address, first.synthetic_address);
         let approved = store
             .publish(request("db.example", 1, Duration::from_secs(10)), 1, now)
             .unwrap();
         assert_ne!(first.synthetic_address, approved.synthetic_address);
+    }
+
+    #[test]
+    fn observation_budget_is_counted_per_address_family() {
+        let store = store(8);
+        let now = Instant::now();
+        observation(&store, "first.example", AddressFamily::Ipv4, now).unwrap();
+        assert!(matches!(
+            observation(&store, "second.example", AddressFamily::Ipv4, now),
+            Err(PublishError::ObservationBudgetExhausted)
+        ));
+        let ipv6 = observation(&store, "second.example", AddressFamily::Ipv6, now).unwrap();
+        assert!(ipv6.synthetic_address.is_ipv6());
+    }
+
+    #[test]
+    fn production_observation_budget_is_a_quarter_of_each_family_pool() {
+        let pools = SyntheticPools::new(
+            Ipv4Addr::new(198, 18, 0, 2)..=Ipv4Addr::new(198, 18, 1, 255),
+            "fd23:6f70:656e::".parse().unwrap()..="fd23:6f70:656e::1ff".parse().unwrap(),
+        )
+        .unwrap();
+        let store = ResolvedEndpointStore::new(StoreConfig::new(pools, 1024).unwrap());
+        let now = Instant::now();
+
+        for index in 0..127 {
+            observation(
+                &store,
+                &format!("unknown-{index}.example"),
+                AddressFamily::Ipv4,
+                now,
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            observation(&store, "unknown-127.example", AddressFamily::Ipv4, now),
+            Err(PublishError::ObservationBudgetExhausted)
+        ));
+        for index in 0..383 {
+            store
+                .publish(
+                    request(&format!("host-{index}.example"), 1, Duration::from_secs(5)),
+                    1,
+                    now,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            store.publish(
+                request("host-383.example", 1, Duration::from_secs(5)),
+                1,
+                now
+            ),
+            Err(PublishError::PoolExhausted)
+        ));
+    }
+
+    #[test]
+    fn only_the_intent_lookup_exposes_an_observation() {
+        let store = store(8);
+        let now = Instant::now();
+        let observed = observation(&store, "unknown.example", AddressFamily::Ipv4, now).unwrap();
+        let approved = store
+            .publish(request("db.example", 1, Duration::from_mins(1)), 1, now)
+            .unwrap();
+
+        assert!(matches!(
+            store.lookup(observed.synthetic_address, 443, 1, now),
+            Err(MappingLookupError::PortMismatch)
+        ));
+        let intent = store
+            .lookup_intent(observed.synthetic_address, 443, 1, now)
+            .unwrap();
+        assert_eq!(intent.record.normalized_name.as_str(), "unknown.example");
+        assert!(intent.pinned_addresses().is_empty());
+        assert!(matches!(
+            store.lookup_intent(observed.synthetic_address, 443, 2, now),
+            Err(MappingLookupError::StalePolicy)
+        ));
+        assert!(matches!(
+            store.lookup_intent(approved.synthetic_address, 3306, 1, now),
+            Err(MappingLookupError::PortMismatch)
+        ));
+
+        let expired_at = now + crate::policy_dns::MAX_MAPPING_TTL;
+        assert_eq!(store.expire(expired_at).unwrap(), 1);
+        assert!(matches!(
+            store.lookup_intent(observed.synthetic_address, 443, 1, expired_at),
+            Err(MappingLookupError::Expired)
+        ));
     }
 
     #[test]

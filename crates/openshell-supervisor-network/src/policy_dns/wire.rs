@@ -301,6 +301,22 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     }
 
     #[tokio::test]
+    async fn unknown_query_is_refused_after_the_observation_budget() {
+        let service = service();
+        handle_udp_query(&service, &request("first.example.", RecordType::A))
+            .await
+            .unwrap();
+        let wire = handle_udp_query(&service, &request("second.example.", RecordType::A))
+            .await
+            .unwrap();
+        assert_eq!(
+            Message::from_vec(&wire).unwrap().metadata.response_code,
+            ResponseCode::Refused
+        );
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn eligible_family_without_records_returns_empty_success() {
         let service = service_with_resolver(NoDataResolver);
         let wire = handle_udp_query(&service, &request("db.example.", RecordType::AAAA))

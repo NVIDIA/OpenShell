@@ -4,7 +4,8 @@
 //! Installed-artifact policy advisor conformance.
 
 use openshell_conformance::{
-    MECHANISTIC_PROPOSAL_SCENARIO, OpenShellRunner, POLICY_LOCAL_SCENARIO, Scenario,
+    MECHANISTIC_PROPOSAL_SCENARIO, NEW_HOSTNAME_PROPOSAL_SCENARIO, OpenShellRunner,
+    POLICY_LOCAL_SCENARIO, Scenario,
 };
 
 async fn run(scenario: &'static Scenario) {
@@ -23,6 +24,11 @@ async fn run(scenario: &'static Scenario) {
 #[tokio::test]
 async fn mechanistic_proposal() {
     run(&MECHANISTIC_PROPOSAL_SCENARIO).await;
+}
+
+#[tokio::test]
+async fn new_hostname_proposal() {
+    run(&NEW_HOSTNAME_PROPOSAL_SCENARIO).await;
 }
 
 #[tokio::test]

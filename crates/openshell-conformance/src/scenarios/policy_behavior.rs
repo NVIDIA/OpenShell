@@ -351,36 +351,17 @@ fn run_mechanistic_proposal(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> 
             return Err(probe.failure_diagnostic("TCP open is denied before any upstream dial"));
         }
 
-        let started = Instant::now();
-        loop {
-            let draft = runner
-                .step("mechanistic-draft")
-                .description("a single scoped mechanistic draft appears")
-                .with_timeout(COMMAND_TIMEOUT)
-                .run(&["rule", "get", &name])
-                .await
-                .map_err(|error| error.to_string())?;
-            if !draft.success() {
-                if started.elapsed() >= PROPOSAL_TIMEOUT {
-                    return Err(draft.failure_diagnostic("the reviewer inbox is readable"));
-                }
-                sleep(POLL_INTERVAL).await;
-                continue;
-            }
-            if !draft.stdout().contains("Chunk:") {
-                if started.elapsed() >= PROPOSAL_TIMEOUT {
-                    return Err(draft.failure_diagnostic(&format!(
-                        "one mechanistic draft for 1.1.1.1:443 and {binary}; probe stderr:\n{}",
-                        probe.stderr()
-                    )));
-                }
-                sleep(POLL_INTERVAL).await;
-                continue;
-            }
-            assert_mechanistic_draft(draft.stdout(), &binary)
-                .map_err(|error| draft.failure_diagnostic(&error))?;
-            return Ok(());
-        }
+        await_mechanistic_draft(
+            runner,
+            &name,
+            &ExpectedDraft {
+                rule: "allow_1_1_1_1_443",
+                endpoint: "1.1.1.1:443",
+                binary: &binary,
+            },
+            probe.stderr(),
+        )
+        .await
     })
 }
 
@@ -420,63 +401,89 @@ fn run_new_hostname_proposal(runner: &mut OpenShellRunner) -> ScenarioFuture<'_>
             return Err(probe.failure_diagnostic("new hostname stays denied before approval"));
         }
 
-        let started = Instant::now();
-        loop {
-            let draft = runner
-                .step("new-hostname-draft")
-                .description("a host, port, and binary scoped draft appears")
-                .with_timeout(COMMAND_TIMEOUT)
-                .run(&["rule", "get", &name])
-                .await
-                .map_err(|error| error.to_string())?;
-            draft.require_success()?;
-            if draft.stdout().contains("Chunk:") {
-                let fields = draft.stdout().lines().map(str::trim).collect::<Vec<_>>();
-                if fields.contains(&"Rule: allow_pypi_org_80")
-                    && fields.contains(&"Endpoints: pypi.org:80 [L4]")
-                    && fields
-                        .iter()
-                        .any(|line| *line == format!("Binary: {binary}"))
-                    && fields
-                        .iter()
-                        .any(|line| matches!(*line, "Status: pending" | "Status: approved"))
-                {
-                    return Ok(());
-                }
-                return Err(draft
-                    .failure_diagnostic("one L4 draft for pypi.org:80 scoped to the Bash binary"));
-            }
-            if started.elapsed() >= PROPOSAL_TIMEOUT {
-                return Err(
-                    draft.failure_diagnostic("new-hostname denial appears in the reviewer inbox")
-                );
-            }
-            sleep(POLL_INTERVAL).await;
-        }
+        await_mechanistic_draft(
+            runner,
+            &name,
+            &ExpectedDraft {
+                rule: "allow_pypi_org_80",
+                endpoint: "pypi.org:80",
+                binary: &binary,
+            },
+            probe.stderr(),
+        )
+        .await
     })
 }
 
-fn assert_mechanistic_draft(output: &str, binary: &str) -> Result<(), String> {
+/// The single L4 mechanistic draft expected for one denied endpoint.
+struct ExpectedDraft<'a> {
+    rule: &'a str,
+    endpoint: &'a str,
+    binary: &'a str,
+}
+
+/// Poll the reviewer inbox until a draft appears, tolerating transient read
+/// failures, then require that it is the single expected draft.
+async fn await_mechanistic_draft(
+    runner: &OpenShellRunner,
+    sandbox: &str,
+    expected: &ExpectedDraft<'_>,
+    probe_stderr: &str,
+) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        let draft = runner
+            .step("mechanistic-draft")
+            .description("a single scoped mechanistic draft appears")
+            .with_timeout(COMMAND_TIMEOUT)
+            .run(&["rule", "get", sandbox])
+            .await
+            .map_err(|error| error.to_string())?;
+        if !draft.success() {
+            if started.elapsed() >= PROPOSAL_TIMEOUT {
+                return Err(draft.failure_diagnostic("the reviewer inbox is readable"));
+            }
+            sleep(POLL_INTERVAL).await;
+            continue;
+        }
+        if !draft.stdout().contains("Chunk:") {
+            if started.elapsed() >= PROPOSAL_TIMEOUT {
+                return Err(draft.failure_diagnostic(&format!(
+                    "one mechanistic draft for {} and {}; probe stderr:\n{probe_stderr}",
+                    expected.endpoint, expected.binary
+                )));
+            }
+            sleep(POLL_INTERVAL).await;
+            continue;
+        }
+        return assert_mechanistic_draft(draft.stdout(), expected)
+            .map_err(|error| draft.failure_diagnostic(&error));
+    }
+}
+
+fn assert_mechanistic_draft(output: &str, expected: &ExpectedDraft<'_>) -> Result<(), String> {
     let fields = output.lines().map(str::trim).collect::<Vec<_>>();
     let field = |name: &str| {
         fields
             .iter()
             .find_map(|line| line.strip_prefix(name).map(str::trim))
     };
+    let endpoints = format!("{} [L4]", expected.endpoint);
     if fields
         .iter()
         .filter(|line| line.starts_with("Chunk:"))
         .count()
         != 1
         || !matches!(field("Status:"), Some("pending" | "approved"))
-        || field("Rule:") != Some("allow_1_1_1_1_443")
-        || field("Binary:") != Some(binary)
-        || field("Binaries:") != Some(binary)
-        || field("Endpoints:") != Some("1.1.1.1:443 [L4]")
-        || !field("Rationale:").is_some_and(|value| value.contains("1.1.1.1:443"))
+        || field("Rule:") != Some(expected.rule)
+        || field("Binary:") != Some(expected.binary)
+        || field("Binaries:") != Some(expected.binary)
+        || field("Endpoints:") != Some(endpoints.as_str())
+        || !field("Rationale:").is_some_and(|value| value.contains(expected.endpoint))
     {
         return Err(format!(
-            "expected one pending or approved L4 mechanistic draft scoped to {binary} and 1.1.1.1:443"
+            "expected one pending or approved L4 mechanistic draft scoped to {} and {}",
+            expected.binary, expected.endpoint
         ));
     }
     Ok(())
@@ -540,11 +547,36 @@ async fn create_sandbox(
 
 #[cfg(test)]
 mod tests {
-    use super::assert_mechanistic_draft;
+    use super::{ExpectedDraft, assert_mechanistic_draft};
+
+    const EXPECTED: ExpectedDraft<'static> = ExpectedDraft {
+        rule: "allow_pypi_org_80",
+        endpoint: "pypi.org:80",
+        binary: "/usr/bin/bash",
+    };
+
+    fn draft(binary: &str) -> String {
+        format!(
+            "Chunk: id\nStatus: pending\nRule: allow_pypi_org_80\nBinary: {binary}\nRationale: Allow {binary} to connect to pypi.org:80 (HTTP).\nEndpoints: pypi.org:80 [L4]\nBinaries: {binary}\n"
+        )
+    }
+
+    #[test]
+    fn draft_assertion_accepts_a_hostname_scoped_draft() {
+        assert!(assert_mechanistic_draft(&draft("/usr/bin/bash"), &EXPECTED).is_ok());
+    }
 
     #[test]
     fn draft_assertion_rejects_unrelated_binary() {
-        let draft = "Chunk: id\nStatus: pending\nRule: allow_1_1_1_1_443\nBinary: /usr/bin/sh\nRationale: Allow sh to connect to 1.1.1.1:443.\nEndpoints: 1.1.1.1:443 [L4]\nBinaries: /usr/bin/sh\n";
-        assert!(assert_mechanistic_draft(draft, "/usr/bin/bash").is_err());
+        assert!(assert_mechanistic_draft(&draft("/usr/bin/sh"), &EXPECTED).is_err());
+    }
+
+    #[test]
+    fn draft_assertion_rejects_fields_spread_across_drafts() {
+        let drafts = format!(
+            "{}Chunk: other\nStatus: pending\nRule: allow_1_1_1_1_443\n",
+            draft("/usr/bin/bash")
+        );
+        assert!(assert_mechanistic_draft(&drafts, &EXPECTED).is_err());
     }
 }

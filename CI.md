@@ -50,8 +50,8 @@ Manually dispatch `Integration Tests` on the candidate branch with an
 [{"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"policy-advisor"}]
 ```
 
-This runs the `mechanistic-proposal` and `policy-local` conformance tests in the
-installed-artifact suite. The artifact run must contain the candidate CLI and
+This runs the `mechanistic-proposal`, `new-hostname-proposal`, and
+`policy-local` conformance tests in the installed-artifact suite. The artifact run must contain the candidate CLI and
 gateway binaries and runtime images. This manual run does not replace the
 required PR E2E gate.
 

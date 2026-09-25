@@ -73,6 +73,8 @@ pub struct MatchedEndpoint {
 pub struct PolicyDnsEligibilitySnapshot {
     pub endpoints: Vec<MatchedEndpoint>,
     pub generation: u64,
+    /// The generation is a fail-closed quarantine, so every name is refused.
+    pub fail_closed: bool,
 }
 
 /// Atomic policy result used to authorize and materialize one egress request.
@@ -645,7 +647,7 @@ impl OpaEngine {
     /// The owned endpoint records and generation are captured while holding
     /// the engine lock, so reloads cannot mix data from one generation with
     /// the generation number of another. Fail-closed quarantine produces an
-    /// empty snapshot for its quarantine generation.
+    /// empty snapshot, marked `fail_closed`, for its quarantine generation.
     pub fn policy_dns_eligibility_snapshot(&self) -> Result<PolicyDnsEligibilitySnapshot> {
         let mut engine = self
             .engine
@@ -662,6 +664,7 @@ impl OpaEngine {
             return Ok(PolicyDnsEligibilitySnapshot {
                 endpoints: Vec::new(),
                 generation,
+                fail_closed: true,
             });
         }
 
@@ -679,6 +682,7 @@ impl OpaEngine {
         Ok(PolicyDnsEligibilitySnapshot {
             endpoints,
             generation,
+            fail_closed: false,
         })
     }
 
@@ -4033,6 +4037,7 @@ process:
         let snapshot = engine.policy_dns_eligibility_snapshot().unwrap();
 
         assert_eq!(snapshot.generation, engine.current_generation());
+        assert!(!snapshot.fail_closed);
         assert_eq!(snapshot.endpoints.len(), 4);
         assert_eq!(snapshot.endpoints[0].policy_name, "dns_transport");
         assert_eq!(snapshot.endpoints[0].endpoint_index, 0);
@@ -4068,6 +4073,7 @@ process:
 
         assert_eq!(snapshot.generation, generation);
         assert!(snapshot.endpoints.is_empty());
+        assert!(snapshot.fail_closed);
     }
 
     #[test]

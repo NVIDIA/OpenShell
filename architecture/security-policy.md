@@ -288,8 +288,13 @@ an upstream resolver. It carries only the name to the subsequent TCP mediation
 step, which supplies the destination port and verified process identity for a
 denial summary. Observation mappings have no endpoint contracts or real pinned
 addresses, cannot authorize a relay, and become stale on policy generation
-change. This mechanistic observation path does not depend on the agent-authored
-proposal setting.
+change. Transparent TCP re-acquires the mapping at the generation that
+authorized the connection, so a reload between DNS and authorization fails
+closed instead of resolving the name again. Every unknown name still produces a
+DNS denial event. Reserved names, fail-closed quarantine, and an exhausted
+observation budget (a quarter of each address family's synthetic pool) keep the
+plain DNS refusal. This mechanistic observation path does not depend on the
+agent-authored proposal setting.
 When enabled, L7 `policy_denied` responses include both structured
 `next_steps` and a short `agent_guidance` string so generic agents can continue
 through the proposal loop instead of treating the denial as terminal.
