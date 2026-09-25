@@ -360,7 +360,8 @@ echo "hello" | openshell sandbox exec -n my-sandbox -- cat
 The CLI sends small piped input in one request for compatibility with older
 gateways. It streams larger input in bounded frames, including for commands
 without a TTY, so input is not limited by the gateway's per-message request
-size. The CLI closes remote stdin when the pipe reaches EOF and continues
+size. Piped input is limited to 4 MiB; use `sandbox upload` for larger files.
+The CLI closes remote stdin when the pipe reaches EOF and continues
 reading command output until the command finishes.
 
 The command's exit code is propagated to the CLI, so `exec` works in scripts that check return codes.

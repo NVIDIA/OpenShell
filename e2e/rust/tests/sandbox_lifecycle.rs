@@ -263,6 +263,78 @@ async fn piped_exec_stdin_crosses_grpc_message_limit() {
         );
     }
 
+    let mut oversized = openshell_cmd();
+    let mut oversized_child = oversized
+        .args([
+            "sandbox",
+            "exec",
+            "--name",
+            &sandbox.name,
+            "--no-tty",
+            "--no-login-shell",
+            "--",
+            "wc",
+            "-c",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oversized stdin exec");
+    oversized_child
+        .stdin
+        .take()
+        .expect("oversized stdin pipe")
+        .write_all(&vec![b'x'; 4_194_305])
+        .await
+        .expect("write oversized stdin");
+    let oversized_output = oversized_child
+        .wait_with_output()
+        .await
+        .expect("wait for oversized stdin error");
+    assert!(!oversized_output.status.success());
+    assert!(oversized_output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&oversized_output.stderr).contains("4 MiB limit"));
+
+    // A forced PTY with a small pipe must keep using the unary RPC for
+    // compatibility with older gateways.
+    let mut tty_command = openshell_cmd();
+    let mut tty_child = tty_command
+        .args([
+            "sandbox",
+            "exec",
+            "--name",
+            &sandbox.name,
+            "--tty",
+            "--no-login-shell",
+            "--",
+            "sh",
+            "-c",
+            "printf tty-ok",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn forced TTY exec");
+    tty_child
+        .stdin
+        .take()
+        .expect("piped TTY stdin")
+        .write_all(b"x")
+        .await
+        .expect("write TTY stdin");
+    let tty_output = tokio::time::timeout(Duration::from_secs(30), tty_child.wait_with_output())
+        .await
+        .expect("forced TTY exec timed out")
+        .expect("wait for forced TTY exec");
+    assert!(
+        tty_output.status.success(),
+        "forced TTY exec failed: {}",
+        String::from_utf8_lossy(&tty_output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&tty_output.stdout).contains("tty-ok"));
+
     #[cfg(unix)]
     {
         let directory = std::fs::File::open("/").expect("open directory as stdin");

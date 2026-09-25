@@ -1802,6 +1802,7 @@ fn local_terminal_size() -> Option<(u32, u32)> {
 }
 
 const MAX_EXEC_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_EXEC_STDIN_BYTES: usize = 4 * 1024 * 1024;
 
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
 ///
@@ -1850,23 +1851,34 @@ pub async fn sandbox_exec_grpc(
     let tty = tty_override.unwrap_or_else(|| stdin_is_terminal && std::io::stdout().is_terminal());
 
     // Preserve unary exec for small pipes, including older gateways whose
-    // interactive RPC closes the SSH channel when stdin reaches EOF. Read no
-    // more than one decoder window before switching to bounded streaming.
+    // interactive RPC closes the SSH channel when stdin reaches EOF. Retain
+    // the existing 4 MiB input cap because the supervisor's process stdin
+    // queue is unbounded; larger input should use file upload instead.
     let stdin_prefix = if stdin_is_terminal {
         Vec::new()
     } else {
         tokio::task::spawn_blocking(|| {
             let mut prefix = Vec::new();
             std::io::stdin()
-                .take(MAX_EXEC_REQUEST_BYTES as u64)
+                .take((MAX_EXEC_STDIN_BYTES + 1) as u64)
                 .read_to_end(&mut prefix)
                 .into_diagnostic()?;
+            if prefix.len() > MAX_EXEC_STDIN_BYTES {
+                return Err(miette::miette!(
+                    "piped stdin exceeds the 4 MiB limit; use `sandbox upload` for larger input"
+                ));
+            }
             Ok::<_, miette::Report>(prefix)
         })
         .await
         .into_diagnostic()??
     };
 
+    let (cols, rows) = if tty {
+        local_terminal_size().unwrap_or((80, 24))
+    } else {
+        (0, 0)
+    };
     let mut request = ExecSandboxRequest {
         request_id: String::new(),
         sandbox: name.to_string(),
@@ -1879,17 +1891,20 @@ pub async fn sandbox_exec_grpc(
         execution_timeout: proto_execution_timeout(timeout_seconds)?,
         stdin: stdin_prefix,
         tty,
-        cols: 0,
-        rows: 0,
+        cols,
+        rows,
         no_login_shell,
     };
 
-    if !tty && stdin_is_terminal && request.encoded_len() > MAX_EXEC_REQUEST_BYTES {
+    let stdin_for_size_check = std::mem::take(&mut request.stdin);
+    let start_request_bytes = request.encoded_len();
+    request.stdin = stdin_for_size_check;
+    if start_request_bytes > MAX_EXEC_REQUEST_BYTES {
         return Err(miette::miette!(
-            "exec request exceeds the gateway's 1 MiB message limit"
+            "exec command or environment exceeds the gateway's 1 MiB message limit"
         ));
     }
-    if tty || request.encoded_len() > MAX_EXEC_REQUEST_BYTES {
+    if (tty && stdin_is_terminal) || request.encoded_len() > MAX_EXEC_REQUEST_BYTES {
         return sandbox_exec_streaming_grpc(
             client,
             &sandbox,
@@ -2408,11 +2423,10 @@ async fn sandbox_exec_streaming_grpc(
     #[cfg(unix)]
     let _resize_guard = resize_task.map(TaskGuard);
 
-    // For a pipe, the reader's sender is the last one. Closing it at EOF
-    // half-closes SSH stdin so commands such as `cat` can finish.
-    if !stdin_is_terminal {
-        drop(input_tx);
-    }
+    // Keep a sender until the reader confirms clean EOF. On a read error,
+    // cancel the response stream before the gateway can treat channel EOF as
+    // successful completion of a partial command.
+    let mut pipe_input_tx = Some(input_tx);
 
     let mut exit_code = 0i32;
     let mut exit_seen = false;
@@ -2424,7 +2438,29 @@ async fn sandbox_exec_streaming_grpc(
         let event = tokio::select! {
             result = &mut stdin_result_rx, if !stdin_reader_done => {
                 stdin_reader_done = true;
-                result.into_diagnostic()?.into_diagnostic()?;
+                match result.into_diagnostic()? {
+                    Ok(()) => {
+                        let sender = pipe_input_tx.take().expect("stdin sender is held until EOF");
+                        drop(sender);
+                    }
+                    Err(error) => {
+                        let sender = pipe_input_tx.take().expect("stdin sender is held until EOF");
+                        // A clean request EOF would make the gateway execute
+                        // the truncated input. An invalid frame makes the
+                        // gateway abort the command instead.
+                        let abort = ExecSandboxInput { payload: None };
+                        if tokio::time::timeout(Duration::from_secs(5), sender.send(abort))
+                            .await
+                            .is_err()
+                        {
+                            // Keep the request body open if a blocked remote
+                            // stdin prevents delivery of the abort frame.
+                            std::mem::forget(sender);
+                        }
+                        drop(stream);
+                        return Err(error).into_diagnostic();
+                    }
+                }
                 continue;
             }
             event = stream.next() => event,
