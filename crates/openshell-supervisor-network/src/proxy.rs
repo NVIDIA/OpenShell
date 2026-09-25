@@ -614,6 +614,7 @@ async fn preauthorize_transparent_open(
         if destination.port() != 80 || !has_policy_local {
             emit_staged_transparent_denial(
                 destination,
+                None,
                 &binary_identity,
                 "sandbox-local policy API requires port 80 and an active context",
                 "transparent_tcp_policy_local_invalid_destination",
@@ -637,6 +638,7 @@ async fn preauthorize_transparent_open(
         if let Err(denial) = identity_check {
             emit_staged_transparent_denial(
                 destination,
+                None,
                 &binary_identity,
                 "sandbox-local policy API requires a verified workload identity",
                 "transparent_tcp_policy_local_identity_unavailable",
@@ -664,6 +666,7 @@ async fn preauthorize_transparent_open(
                 warn!(%destination, %error, "Denied staged transparent connection");
                 emit_staged_transparent_denial(
                     destination,
+                    None,
                     &binary_identity,
                     &error.to_string(),
                     "transparent_tcp_mapping_denied",
@@ -672,6 +675,7 @@ async fn preauthorize_transparent_open(
                 return None;
             }
         };
+    let mapped_host = intent.is_some().then_some(host.as_str());
     let supplied_authorization = authorize_supplied_identity_with_denial(
         opa_engine,
         identity_cache,
@@ -694,7 +698,13 @@ async fn preauthorize_transparent_open(
             },
         );
         warn!(%destination, %reason, "Denied staged transparent connection");
-        emit_staged_transparent_denial(destination, &binary_identity, reason, status_detail);
+        emit_staged_transparent_denial(
+            destination,
+            mapped_host,
+            &binary_identity,
+            reason,
+            status_detail,
+        );
         if supplied_authorization.denial.is_none()
             && !is_always_blocked_ip(destination.ip())
             && let Some(binary) = decision.binary.as_ref()
@@ -742,6 +752,7 @@ async fn preauthorize_transparent_open(
                 warn!(%destination, %reason, "Denied staged transparent connection");
                 emit_staged_transparent_denial(
                     destination,
+                    mapped_host,
                     &binary_identity,
                     &reason,
                     status_detail,
@@ -757,6 +768,7 @@ async fn preauthorize_transparent_open(
         warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
         emit_staged_transparent_denial(
             destination,
+            mapped_host,
             &binary_identity,
             &denial.reason,
             "transparent_tcp_destination_denied",
@@ -785,6 +797,7 @@ async fn preauthorize_transparent_open(
             warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
             emit_staged_transparent_denial(
                 destination,
+                mapped_host,
                 &binary_identity,
                 &denial.reason,
                 "transparent_tcp_destination_denied",
@@ -809,10 +822,27 @@ async fn preauthorize_transparent_open(
 
 fn emit_staged_transparent_denial(
     destination: SocketAddr,
+    mapped_host: Option<&str>,
     identity: &Result<ContractBinaryIdentity, ResolveError>,
     reason: &str,
     status_detail: &'static str,
 ) {
+    ocsf_emit!(build_staged_transparent_denial_event(
+        destination,
+        mapped_host,
+        identity,
+        reason,
+        status_detail,
+    ));
+}
+
+fn build_staged_transparent_denial_event(
+    destination: SocketAddr,
+    mapped_host: Option<&str>,
+    identity: &Result<ContractBinaryIdentity, ResolveError>,
+    reason: &str,
+    status_detail: &'static str,
+) -> openshell_ocsf::OcsfEvent {
     let (binary, ancestors, cmdline) = identity.as_ref().map_or_else(
         |_| ("-".to_string(), "-".to_string(), "-".to_string()),
         |identity| {
@@ -833,19 +863,28 @@ fn emit_staged_transparent_denial(
             )
         },
     );
-    ocsf_emit!(
-        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Denied)
-            .disposition(DispositionId::Blocked)
-            .severity(SeverityId::Medium)
-            .status(StatusId::Failure)
-            .dst_endpoint(Endpoint::from_ip(destination.ip(), destination.port()))
-            .actor_process(Process::from_bypass(&binary, "-", &ancestors).with_cmd_line(&cmdline))
-            .message(format!("Transparent TCP denied before relay: {reason}"))
-            .status_detail(status_detail)
-            .build()
-    );
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .dst_endpoint(transparent_destination_endpoint(destination, mapped_host))
+        .actor_process(Process::from_bypass(&binary, "-", &ancestors).with_cmd_line(&cmdline))
+        .message(format!("Transparent TCP denied before relay: {reason}"))
+        .status_detail(status_detail)
+        .build()
+}
+
+/// Name the policy DNS host an operator recognizes while keeping the
+/// synthetic address the workload dialed.
+fn transparent_destination_endpoint(
+    destination: SocketAddr,
+    mapped_host: Option<&str>,
+) -> Endpoint {
+    let mut endpoint = Endpoint::from_ip(destination.ip(), destination.port());
+    endpoint.domain = mapped_host.map(str::to_string);
+    endpoint
 }
 
 /// Logical destination recovered for a staged transparent TCP open.
@@ -1046,7 +1085,7 @@ async fn handle_transparent_tcp_connection(
     ) {
         Ok(mapping) => mapping,
         Err(error) => {
-            emit_transparent_mapping_denial(workload_addr, original, error);
+            emit_transparent_mapping_denial(workload_addr, original, None, error);
             emit_activity(&activity_tx, true, "transparent_tcp_mapping");
             return Ok(());
         }
@@ -1086,6 +1125,7 @@ async fn handle_transparent_tcp_connection(
         emit_transparent_mapping_denial(
             workload_addr,
             original,
+            Some(&host),
             MappingLookupError::EndpointMismatch,
         );
         emit_activity(&activity_tx, true, "transparent_tcp_mapping");
@@ -1100,7 +1140,12 @@ async fn handle_transparent_tcp_connection(
     let Ok(generation_guard) =
         relay::pin_policy_generation(&opa_engine, decision.policy_generation)
     else {
-        emit_transparent_mapping_denial(workload_addr, original, MappingLookupError::StalePolicy);
+        emit_transparent_mapping_denial(
+            workload_addr,
+            original,
+            Some(&host),
+            MappingLookupError::StalePolicy,
+        );
         emit_activity(&activity_tx, true, "transparent_tcp_mapping");
         return Ok(());
     };
@@ -1112,7 +1157,7 @@ async fn handle_transparent_tcp_connection(
     ) {
         Ok(mapping) => mapping,
         Err(error) => {
-            emit_transparent_mapping_denial(workload_addr, original, error);
+            emit_transparent_mapping_denial(workload_addr, original, Some(&host), error);
             emit_activity(&activity_tx, true, "transparent_tcp_mapping");
             return Ok(());
         }
@@ -1381,6 +1426,7 @@ fn original_destination(stream: &TcpStream) -> std::io::Result<SocketAddr> {
 fn emit_transparent_mapping_denial(
     workload: SocketAddr,
     original: SocketAddr,
+    mapped_host: Option<&str>,
     error: MappingLookupError,
 ) {
     let detail = match error {
@@ -1399,7 +1445,7 @@ fn emit_transparent_mapping_denial(
             .disposition(DispositionId::Blocked)
             .severity(SeverityId::Medium)
             .status(StatusId::Failure)
-            .dst_endpoint(Endpoint::from_ip(original.ip(), original.port()))
+            .dst_endpoint(transparent_destination_endpoint(original, mapped_host))
             .src_endpoint_addr(workload.ip(), workload.port())
             .message(format!("Transparent TCP denied: {error}"))
             .status_detail(detail)
@@ -7489,6 +7535,38 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             pinned_transparent_plan(&store, mapped_destination, &reloaded),
             Err(MappingLookupError::StalePolicy)
         ));
+    }
+
+    #[test]
+    fn staged_denial_names_the_mapped_host_and_keeps_the_synthetic_address() {
+        let (open, _) = staged_curl_open("198.18.0.2:80".parse().unwrap(), 1);
+        let mapped = build_staged_transparent_denial_event(
+            open.destination,
+            Some("blocked.invalid"),
+            &open.binary_identity,
+            "endpoint blocked.invalid:80 is not allowed by any policy",
+            "transparent_tcp_policy_denied",
+        );
+        assert_eq!(
+            mapped.format_shorthand(),
+            "NET:OPEN [MED] DENIED /usr/bin/curl(0) -> blocked.invalid:80 [reason:transparent_tcp_policy_denied]"
+        );
+        assert_eq!(
+            serde_json::to_value(mapped).unwrap()["dst_endpoint"],
+            serde_json::json!({"domain": "blocked.invalid", "ip": "198.18.0.2", "port": 80})
+        );
+
+        let unmapped = build_staged_transparent_denial_event(
+            "203.0.113.7:443".parse().unwrap(),
+            None,
+            &open.binary_identity,
+            "endpoint 203.0.113.7:443 is not allowed by any policy",
+            "transparent_tcp_policy_denied",
+        );
+        assert_eq!(
+            serde_json::to_value(unmapped).unwrap()["dst_endpoint"],
+            serde_json::json!({"ip": "203.0.113.7", "port": 443})
+        );
     }
 
     #[tokio::test]

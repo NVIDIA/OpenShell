@@ -477,19 +477,35 @@ fn clamp_mapping_ttl(ttl: Duration) -> Duration {
     ttl.max(MIN_MAPPING_TTL).min(MAX_MAPPING_TTL)
 }
 
+/// A policy DNS decision concerns the queried name, not a connection to it,
+/// so the endpoint carries no port.
+fn dns_query_endpoint(name: &NormalizedName) -> Endpoint {
+    Endpoint {
+        domain: Some(name.as_str().to_string()),
+        ip: None,
+        port: None,
+    }
+}
+
 fn emit_dns_denial(name: &NormalizedName, detail: &str, message: &str) {
-    ocsf_emit!(
-        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Refuse)
-            .action(ActionId::Denied)
-            .disposition(DispositionId::Blocked)
-            .severity(SeverityId::Medium)
-            .status(StatusId::Failure)
-            .dst_endpoint(Endpoint::from_domain(name.as_str(), 53))
-            .status_detail(detail)
-            .message(message)
-            .build()
-    );
+    ocsf_emit!(build_dns_denial_event(name, detail, message));
+}
+
+fn build_dns_denial_event(
+    name: &NormalizedName,
+    detail: &str,
+    message: &str,
+) -> openshell_ocsf::OcsfEvent {
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Refuse)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .dst_endpoint(dns_query_endpoint(name))
+        .status_detail(detail)
+        .message(message)
+        .build()
 }
 
 fn resolver_failure_detail(error: &resolver::ResolveError) -> &'static str {
@@ -538,7 +554,7 @@ fn build_dns_failure_event(
         .disposition(DispositionId::Blocked)
         .severity(SeverityId::Low)
         .status(StatusId::Failure)
-        .dst_endpoint(Endpoint::from_domain(name.as_str(), 53))
+        .dst_endpoint(dns_query_endpoint(name))
         .status_detail(detail)
         .unmapped("normalized_name", name.as_str())
         .unmapped("address_family", family.as_str())
@@ -955,6 +971,24 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     }
 
     #[test]
+    fn dns_denial_names_the_query_without_a_port() {
+        let event = build_dns_denial_event(
+            &NormalizedName::parse("blocked.invalid").unwrap(),
+            "policy_dns_ineligible",
+            "Policy DNS refused a name that is not eligible in the active policy",
+        );
+
+        assert_eq!(
+            event.format_shorthand(),
+            "NET:REFUSE [MED] DENIED blocked.invalid [reason:policy_dns_ineligible]"
+        );
+        assert_eq!(
+            serde_json::to_value(event).unwrap()["dst_endpoint"],
+            serde_json::json!({"domain": "blocked.invalid"})
+        );
+    }
+
+    #[test]
     fn observation_event_correlates_the_name_with_its_synthetic_address() {
         let store = ResolvedEndpointStore::new(
             StoreConfig::new(
@@ -1328,8 +1362,10 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         assert_eq!(json["severity"], "Low");
         assert_eq!(json["status"], "Failure");
         assert_eq!(json["status_detail"], "policy_dns_upstream_nxdomain");
-        assert_eq!(json["dst_endpoint"]["domain"], "db.example");
-        assert_eq!(json["dst_endpoint"]["port"], 53);
+        assert_eq!(
+            json["dst_endpoint"],
+            serde_json::json!({"domain": "db.example"})
+        );
         assert_eq!(json["unmapped"]["normalized_name"], "db.example");
         assert_eq!(json["unmapped"]["address_family"], "ipv4");
         assert_eq!(json["unmapped"]["policy_generation"], 7);
