@@ -142,6 +142,8 @@ client → HTTPS → Gateway (terminate TLS) → plaintext → openshell gateway
 
 The Gateway only terminates TLS here; OpenShell still authenticates clients. When using Envoy Gateway, do not enable an OIDC `SecurityPolicy` in front of OpenShell: that flow relies on browser redirects and cookies and cannot work with the OpenShell CLI or headless agents. Instead, the OpenShell gateway validates an OIDC bearer token that the client sends in the gRPC `authorization` metadata, which the proxy forwards untouched.
 
+With agentgateway, an [`AgentgatewayPolicy`](https://agentgateway.dev/docs/kubernetes/latest/documentation/security/jwt/setup/) can validate the CLI's bearer token without a browser redirect. Set `spec.traffic.jwtAuthentication.preserveToken` to `true` so the token is forwarded to OpenShell for validation; agentgateway removes validated tokens by default.
+
 Because the ingress proxy terminates TLS, the OpenShell gateway never sees a client certificate, so client mTLS cannot provide identity on this path. Use OIDC bearer tokens for client identity instead.
 
 For an interactive login on a headless machine, set `OPENSHELL_NO_BROWSER=1` before running `openshell gateway add`. The CLI uses the Device Authorization Grant with S256 PKCE and prompts the user to approve the login from another browser. For unattended agents and CI, set `OPENSHELL_OIDC_CLIENT_SECRET` to use the OAuth2 client-credentials grant instead. The client id comes from `--oidc-client-id` (default `openshell-cli`); pass it explicitly if your identity provider uses a different id. Interactive users with a local browser get the Authorization Code flow with PKCE by default.
