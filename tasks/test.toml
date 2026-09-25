@@ -20,6 +20,7 @@ depends = [
   "test:qualification-summary",
   "test:codex-security-release-range",
   "test:docs-website",
+  "test:maintainer-approval",
 ]
 
 ["test:docs-website"]
@@ -72,6 +73,11 @@ hide = true
 ["test:codex-security-release-range"]
 description = "Test Codex Security release-range resolution"
 run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" tasks/scripts/codex_security_range_test.py"
+hide = true
+
+["test:maintainer-approval"]
+description = "Test the maintainer approval gate and change-alert tools"
+run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" tasks/scripts/check_maintainer_approval_test.py tasks/scripts/alert_maintainer_change_test.py"
 hide = true
 
 [e2e]
