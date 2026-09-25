@@ -24,7 +24,12 @@ e2e_run_openshell_conformance() {
   fi
 
   echo "==> Running standalone CLI conformance against the ${gateway_label} gateway"
-  "${OPENSHELL_CONFORMANCE_BIN}" run \
+  "${OPENSHELL_CONFORMANCE_BIN}" run --group core \
+    --openshell-bin "${OPENSHELL_BIN}" \
+    --output json
+
+  # Run both proposal paths, including the opt-in sandbox-local API scenario.
+  "${OPENSHELL_CONFORMANCE_BIN}" run --group policy-advisor \
     --openshell-bin "${OPENSHELL_BIN}" \
     --output json
 }

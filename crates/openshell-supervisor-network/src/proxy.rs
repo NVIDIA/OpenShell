@@ -435,6 +435,8 @@ impl ProxyHandle {
                                     let cache = identity_cache.clone();
                                     let backend_gateway = *backend_host_gateway;
                                     let trusted_gateway = *trusted_host_gateway;
+                                    let dtx = denial_tx.clone();
+                                    let has_policy_local = policy_local_ctx.is_some();
                                     tokio::spawn(async move {
                                         if let Some(connection) = preauthorize_transparent_open(
                                             connection,
@@ -443,6 +445,8 @@ impl ProxyHandle {
                                             &cache,
                                             backend_gateway,
                                             trusted_gateway,
+                                            has_policy_local,
+                                            dtx.as_ref(),
                                         )
                                         .await
                                         {
@@ -582,6 +586,7 @@ impl ProxyHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn preauthorize_transparent_open(
     connection: PendingTcpOpen,
     policy_dns_store: Option<&Arc<ResolvedEndpointStore>>,
@@ -589,6 +594,8 @@ async fn preauthorize_transparent_open(
     identity_cache: &BinaryIdentityCache,
     backend_host_gateway: Option<IpAddr>,
     trusted_host_gateway: Option<IpAddr>,
+    has_policy_local: bool,
+    denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
 ) -> Option<AcceptedProxyConnection> {
     let PendingTcpOpen {
         stream,
@@ -603,6 +610,53 @@ async fn preauthorize_transparent_open(
         timing,
         operation: "tcp",
     };
+    if destination.ip() == IpAddr::V4(crate::policy_dns::POLICY_LOCAL_ADDRESS) {
+        if destination.port() != 80 || !has_policy_local {
+            emit_staged_transparent_denial(
+                destination,
+                &binary_identity,
+                "sandbox-local policy API requires port 80 and an active context",
+                "transparent_tcp_policy_local_invalid_destination",
+            );
+            let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
+            return None;
+        }
+        let identity_check = binary_identity
+            .as_ref()
+            .map_err(|_| TcpOpenDenial::IdentityUnavailable)
+            .and_then(|identity| {
+                identity_cache
+                    .verify_or_cache_supplied_identity(identity)
+                    .map_err(|error| match error {
+                        SuppliedIdentityError::Unavailable(_) => TcpOpenDenial::IdentityUnavailable,
+                        SuppliedIdentityError::CapacityExhausted => {
+                            TcpOpenDenial::ResourceExhausted
+                        }
+                    })
+            });
+        if let Err(denial) = identity_check {
+            emit_staged_transparent_denial(
+                destination,
+                &binary_identity,
+                "sandbox-local policy API requires a verified workload identity",
+                "transparent_tcp_policy_local_identity_unavailable",
+            );
+            let _ = completion.send(TcpOpenDecision::Denied(denial));
+            return None;
+        }
+        if completion.send(TcpOpenDecision::RelayReady).is_err() {
+            return None;
+        }
+        return Some((
+            stream,
+            Some(binary_identity),
+            None,
+            Some(TransparentOpen {
+                destination,
+                authorization: None,
+            }),
+        ));
+    }
     let host = match transparent_destination_host(destination, policy_dns_store, opa_engine) {
         Ok(host) => host,
         Err(error) => {
@@ -640,6 +694,20 @@ async fn preauthorize_transparent_open(
         );
         warn!(%destination, %reason, "Denied staged transparent connection");
         emit_staged_transparent_denial(destination, &binary_identity, reason, status_detail);
+        if supplied_authorization.denial.is_none()
+            && !is_always_blocked_ip(destination.ip())
+            && let Some(binary) = decision.binary.as_ref()
+        {
+            emit_denial_simple(
+                denial_tx,
+                &host,
+                destination.port(),
+                &binary.to_string_lossy(),
+                &decision,
+                reason,
+                "transparent_tcp_connect",
+            );
+        }
         let _ = completion.send(TcpOpenDecision::Denied(denial));
         return None;
     }
@@ -779,6 +847,20 @@ fn transparent_destination_host(
             "transparent destination mapping is unavailable: {error}"
         )),
     }
+}
+
+fn valid_policy_local_request(method: &str, target: &str, request_headers: &str) -> bool {
+    if method == "CONNECT" || !target.starts_with('/') {
+        return false;
+    }
+    let hosts = request_headers
+        .split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.trim())
+        .collect::<Vec<_>>();
+    matches!(hosts.as_slice(), [host] if host.eq_ignore_ascii_case(POLICY_LOCAL_HOST)
+        || host.eq_ignore_ascii_case("policy.local:80"))
 }
 
 impl Drop for ProxyHandle {
@@ -2221,20 +2303,29 @@ async fn handle_mediated_connection(
     let endpoint_observation_context = endpoint_observation_tx
         .as_ref()
         .and_then(EndpointObservationSender::capture);
+    let mut policy_local_transparent = false;
     let (mut preauthorized_decision, prevalidated_connector) = if let Some(transparent) =
         transparent_open
     {
         let destination = transparent.destination;
-        let host =
-            transparent_destination_host(destination, policy_dns_store.as_ref(), &opa_engine)?;
-        let (decision, connector) = transparent
-            .authorization
-            .map_or((None, None), |(decision, connector)| {
-                (Some(decision), Some(connector))
-            });
-        let authority = format!("{host}:{}", destination.port());
-        client = tokio::io::BufReader::new(virtual_connect_stream(client.into_inner(), authority));
-        (decision, connector)
+        if destination.ip() == IpAddr::V4(crate::policy_dns::POLICY_LOCAL_ADDRESS)
+            && destination.port() == 80
+        {
+            policy_local_transparent = true;
+            (None, None)
+        } else {
+            let host =
+                transparent_destination_host(destination, policy_dns_store.as_ref(), &opa_engine)?;
+            let (decision, connector) = transparent
+                .authorization
+                .map_or((None, None), |(decision, connector)| {
+                    (Some(decision), Some(connector))
+                });
+            let authority = format!("{host}:{}", destination.port());
+            client =
+                tokio::io::BufReader::new(virtual_connect_stream(client.into_inner(), authority));
+            (decision, connector)
+        }
     } else {
         (None, None)
     };
@@ -2282,6 +2373,24 @@ async fn handle_mediated_connection(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
+
+    if policy_local_transparent {
+        if !valid_policy_local_request(method, target, request) {
+            respond(&mut client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
+            return Ok(());
+        }
+        let ctx = policy_local_ctx
+            .as_ref()
+            .ok_or_else(|| miette::miette!("sandbox-local policy context is unavailable"))?;
+        return crate::policy_local::handle_forward_request(
+            ctx,
+            method,
+            target,
+            &buf[..used],
+            &mut client,
+        )
+        .await;
+    }
 
     if method != "CONNECT" {
         return Box::pin(handle_forward_proxy(
@@ -6892,6 +7001,7 @@ process:
         )
         .unwrap();
         let identity_cache = BinaryIdentityCache::new();
+        let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
         let identity = || {
             Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
@@ -6925,9 +7035,18 @@ process:
 
         let (allowed, allowed_result) = pending("203.0.113.7:443");
         assert!(
-            preauthorize_transparent_open(allowed, None, &engine, &identity_cache, None, None)
-                .await
-                .is_some()
+            preauthorize_transparent_open(
+                allowed,
+                None,
+                &engine,
+                &identity_cache,
+                None,
+                None,
+                false,
+                Some(&denial_tx)
+            )
+            .await
+            .is_some()
         );
         assert_eq!(allowed_result.await.unwrap(), TcpOpenDecision::RelayReady);
 
@@ -6940,6 +7059,8 @@ process:
                 &identity_cache,
                 None,
                 None,
+                false,
+                Some(&denial_tx),
             )
             .await
             .is_none()
@@ -6948,17 +7069,154 @@ process:
             unsafe_result.await.unwrap(),
             TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination)
         );
+        assert!(
+            denial_rx.try_recv().is_err(),
+            "destination failures are not policy proposals"
+        );
 
         let (denied, denied_result) = pending("203.0.113.8:443");
         assert!(
-            preauthorize_transparent_open(denied, None, &engine, &identity_cache, None, None)
-                .await
-                .is_none()
+            preauthorize_transparent_open(
+                denied,
+                None,
+                &engine,
+                &identity_cache,
+                None,
+                None,
+                false,
+                Some(&denial_tx)
+            )
+            .await
+            .is_none()
         );
         assert_eq!(
             denied_result.await.unwrap(),
             TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)
         );
+        let event = denial_rx
+            .try_recv()
+            .expect("policy denial is sent to mapper");
+        assert_eq!(event.host, "203.0.113.8");
+        assert_eq!(event.port, 443);
+        assert_eq!(event.binary, "/usr/bin/curl");
+        assert_eq!(event.denial_stage, "transparent_tcp_connect");
+        assert!(denial_rx.try_recv().is_err(), "exactly one mapper event");
+    }
+
+    #[tokio::test]
+    async fn staged_policy_local_open_reaches_the_sandbox_scoped_api() {
+        let engine = Arc::new(
+            OpaEngine::from_strings(
+                include_str!("../data/sandbox-policy.rego"),
+                "network_policies: {}\n",
+            )
+            .unwrap(),
+        );
+        let cache = Arc::new(BinaryIdentityCache::new());
+        let identity = ContractBinaryIdentity {
+            executable: ContractExecutableIdentity {
+                path: PathBuf::from("/usr/bin/bash"),
+                digest: Some("44".repeat(32).parse().unwrap()),
+            },
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+        };
+        let (stream, mut workload) = tokio::io::duplex(4096);
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        let pending = PendingTcpOpen {
+            stream: Box::new(stream),
+            binary_identity: Ok(identity.clone()),
+            destination: SocketAddr::from((crate::policy_dns::POLICY_LOCAL_ADDRESS, 80)),
+            socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
+                socket_cookie: 7,
+                nonblocking: false,
+                process_generation: 1,
+            },
+            policy_generation: engine.current_generation(),
+            timing: MediationTiming::default(),
+            decision,
+        };
+        let (stream, supplied_identity, socket_addrs, transparent) =
+            preauthorize_transparent_open(pending, None, &engine, &cache, None, None, true, None)
+                .await
+                .expect("sandbox-local open is admitted");
+        assert_eq!(completion.await.unwrap(), TcpOpenDecision::RelayReady);
+
+        let proposals = AgentProposals::new(true);
+        let (_workspace_tx, workspace_rx) = tokio::sync::watch::channel("default".to_string());
+        let context = Arc::new(PolicyLocalContext::new(
+            Some(openshell_core::proto::SandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            None,
+            Some("test-sandbox".to_string()),
+            proposals.clone(),
+            workspace_rx,
+        ));
+        let handler = tokio::spawn(handle_mediated_connection(
+            tokio::io::BufReader::new(stream),
+            supplied_identity,
+            socket_addrs,
+            transparent,
+            None,
+            engine,
+            cache,
+            Arc::new(AtomicU32::new(0)),
+            None,
+            Some(context),
+            proposals,
+            Arc::new(None),
+            Arc::new(None),
+            Arc::new(None),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        workload
+            .write_all(b"GET /v1/policy/current HTTP/1.1\r\nHost: policy.local\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            workload.read_to_end(&mut response),
+        )
+        .await
+        .expect("policy.local response timed out")
+        .unwrap();
+        handler.await.unwrap().unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        assert!(response.contains("\"format\":\"yaml\""), "{response}");
+    }
+
+    #[test]
+    fn policy_local_route_requires_one_exact_host_and_an_origin_form_target() {
+        assert!(valid_policy_local_request(
+            "GET",
+            "/v1/policy/current",
+            "GET /v1/policy/current HTTP/1.1\r\nHost: policy.local:80\r\n"
+        ));
+        for (method, target, headers) in [
+            ("CONNECT", "/v1/policy/current", "Host: policy.local\r\n"),
+            (
+                "GET",
+                "http://policy.local/v1/policy/current",
+                "Host: policy.local\r\n",
+            ),
+            ("GET", "/v1/policy/current", "Host: external.example\r\n"),
+            (
+                "GET",
+                "/v1/policy/current",
+                "Host: policy.local\r\nHost: external.example\r\n",
+            ),
+        ] {
+            assert!(!valid_policy_local_request(method, target, headers));
+        }
     }
 
     #[tokio::test]
@@ -7011,9 +7269,18 @@ process:
         };
 
         assert!(
-            preauthorize_transparent_open(pending, None, &engine, &identity_cache, None, None)
-                .await
-                .is_none()
+            preauthorize_transparent_open(
+                pending,
+                None,
+                &engine,
+                &identity_cache,
+                None,
+                None,
+                false,
+                None
+            )
+            .await
+            .is_none()
         );
         assert_eq!(
             completion.await.unwrap(),
@@ -7083,9 +7350,18 @@ process:
         };
 
         assert!(
-            preauthorize_transparent_open(pending, None, &engine, &identity_cache, None, None)
-                .await
-                .is_none()
+            preauthorize_transparent_open(
+                pending,
+                None,
+                &engine,
+                &identity_cache,
+                None,
+                None,
+                false,
+                None
+            )
+            .await
+            .is_none()
         );
         assert_eq!(
             completion.await.unwrap(),

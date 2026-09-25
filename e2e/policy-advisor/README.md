@@ -53,20 +53,22 @@ Requires Docker, `agent_policy_proposals_enabled=true`, and a GitHub token with
 contents write on the repository. The test auto-resolves the token from
 `DEMO_GITHUB_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`.
 
-## Mechanistic smoke
+## Conformance coverage
 
-Lightweight regression for the L4 CONNECT deny → mechanistic chunk pipeline.
-No GitHub token or LLM required.
-
-```bash
-mise run e2e:mechanistic-smoke
-```
-
-Or manually against a running gateway with `agent_policy_proposals_enabled=true`:
+The `policy-advisor` conformance group checks mechanistic draft generation and
+uses `policy.local` to inspect policy, submit a narrow permission request, and
+read the resulting proposal. Run the group against a configured gateway with
+`--openshell-bin` pointing to the CLI under test:
 
 ```bash
-OPENSHELL_BIN=target/debug/openshell bash e2e/policy-advisor/mechanistic-smoke.sh
+openshell-conformance run --group policy-advisor --openshell-bin target/debug/openshell
 ```
+
+Run `openshell-conformance list` to see each scenario and its group. You can
+also run either scenario by name.
+
+The GitHub write test above and the regressions below still exercise distinct
+proposal review, approval, and hot-reload behavior.
 
 The #2821 regression additionally verifies that a denial on an existing
 inspected endpoint becomes a binary expansion, auto-approves, hot-reloads, and

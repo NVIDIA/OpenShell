@@ -46,6 +46,9 @@ use std::time::{Duration, Instant};
 
 pub(crate) const MIN_MAPPING_TTL: Duration = Duration::from_secs(1);
 pub(crate) const MAX_MAPPING_TTL: Duration = Duration::from_secs(30);
+/// Reserved within the first synthetic IPv4 pool for the sandbox-local API.
+/// It is never published as an external endpoint mapping.
+pub(crate) const POLICY_LOCAL_ADDRESS: std::net::Ipv4Addr = std::net::Ipv4Addr::new(198, 18, 0, 1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SyntheticAnswer {
@@ -110,6 +113,19 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
     ) -> Result<SyntheticAnswer, PolicyDnsError> {
         let normalized_name =
             NormalizedName::parse(raw_name).map_err(|_| PolicyDnsError::InvalidName)?;
+        if normalized_name.as_str() == crate::policy_local::POLICY_LOCAL_HOST {
+            return if family == AddressFamily::Ipv4 {
+                Ok(SyntheticAnswer {
+                    address: POLICY_LOCAL_ADDRESS.into(),
+                    ttl: MAX_MAPPING_TTL,
+                    mapping_id: uuid::Uuid::nil(),
+                    mapping_generation: 0,
+                    policy_generation: self.policy.current_generation(),
+                })
+            } else {
+                Err(PolicyDnsError::Resolver(resolver::ResolveError::NoData))
+            };
+        }
         if is_host_gateway_alias(normalized_name.as_str()) && self.trusted_host_gateway.is_none() {
             emit_dns_denial(
                 &normalized_name,
@@ -600,6 +616,23 @@ mod tests {
             )),
             trusted_host_gateway,
         )
+    }
+
+    #[tokio::test]
+    async fn policy_local_resolves_without_an_authored_rule_or_external_lookup() {
+        let service = service("network_policies: {}\n", vec![]);
+        let answer = service
+            .answer_query("PoLiCy.LoCaL.", AddressFamily::Ipv4, Instant::now())
+            .await
+            .expect("sandbox-local address");
+        assert_eq!(answer.address, IpAddr::V4(POLICY_LOCAL_ADDRESS));
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            service
+                .answer_query("policy.local", AddressFamily::Ipv6, Instant::now())
+                .await,
+            Err(PolicyDnsError::Resolver(resolver::ResolveError::NoData))
+        ));
     }
 
     const BASE_POLICY: &str = r"

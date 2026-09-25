@@ -23,13 +23,20 @@ use tokio::time::sleep;
 
 use self::executor::{CliExecutionError, CliExecutor, ProcessCli};
 
-pub use scenarios::{SANDBOX_LIFECYCLE_SCENARIO, SMOKE_SCENARIO};
+pub use scenarios::{
+    MECHANISTIC_PROPOSAL_SCENARIO, POLICY_LOCAL_SCENARIO, SANDBOX_LIFECYCLE_SCENARIO,
+    SMOKE_SCENARIO,
+};
 
 /// An installed conformance scenario.
 #[derive(Debug)]
 pub struct Scenario {
     pub name: &'static str,
     pub description: &'static str,
+    /// Named set for running related scenarios together.
+    pub group: &'static str,
+    /// Whether a bare `run` should select this scenario.
+    pub default: bool,
     run: for<'a> fn(&'a mut OpenShellRunner) -> ScenarioFuture<'a>,
 }
 
@@ -41,7 +48,12 @@ impl Scenario {
     }
 }
 
-const SCENARIOS: &[Scenario] = &[SMOKE_SCENARIO, SANDBOX_LIFECYCLE_SCENARIO];
+const SCENARIOS: &[Scenario] = &[
+    SMOKE_SCENARIO,
+    SANDBOX_LIFECYCLE_SCENARIO,
+    MECHANISTIC_PROPOSAL_SCENARIO,
+    POLICY_LOCAL_SCENARIO,
+];
 
 /// Returns every scenario compiled into this distribution.
 pub fn scenarios() -> &'static [Scenario] {

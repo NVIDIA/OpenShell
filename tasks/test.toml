@@ -285,13 +285,6 @@ description = "Run Docker conformance and Rust e2e tests against a standalone ga
 depends = ["e2e:conformance:build"]
 run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-docker.sh"
 
-["e2e:mechanistic-smoke"]
-description = "Run mechanistic L4 smoke against a Docker-backed gateway"
-run = [
-  "cargo build -p openshell-cli",
-  "e2e/with-docker-gateway.sh bash -lc 'target/debug/openshell settings set --global --key agent_policy_proposals_enabled --value true --yes && OPENSHELL_BIN=$PWD/target/debug/openshell bash e2e/policy-advisor/mechanistic-smoke.sh'",
-]
-
 ["e2e:mechanistic-existing-endpoint"]
 description = "Run #2821 existing inspected-endpoint auto-approval regression"
 run = [

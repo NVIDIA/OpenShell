@@ -254,7 +254,9 @@ Reviewers see the same guidance in the terminal UI. Run `openshell term`, open t
 
 ## Agent API
 
-`policy.local` is available only inside the sandbox and uses plain HTTP:
+`policy.local` is available only inside the sandbox and uses plain HTTP. It
+resolves through sandbox-local DNS and does not need a proxy environment variable
+or a network policy rule:
 
 | Endpoint | Purpose |
 |---|---|

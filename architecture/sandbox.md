@@ -321,6 +321,16 @@ captured before the bypass fence, mapped back to its workload process, authorize
 through the same egress pipeline, and dialed only through the pinned addresses.
 Omitted protocol endpoints retain explicit-proxy behavior.
 
+Policy DNS reserves `policy.local` inside each sandbox without requiring an
+authored network endpoint or a trusted external lookup. The source-backed TCP
+boundary routes plain HTTP on the reserved address and port 80 to the
+supervisor's sandbox-local policy API; it does not open an upstream connection.
+The API checks the effective agent proposal setting for every request. Policy
+denials at the staged TCP authorization gate enter the supervisor's denial
+aggregator with the resolved binary and destination, so the mechanistic mapper
+can propose a scoped rule. Invalid mappings and destination validation failures
+do not become policy proposals.
+
 Provider credential placeholders are resolved through the live provider state
 for each HTTP request, after destination and L7 policy admission. A static
 credential resolves only when the request host, port, and path match an endpoint
