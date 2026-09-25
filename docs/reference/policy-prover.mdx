@@ -121,13 +121,17 @@ The `counterexample.domain` field selects one of these objects:
 | `filesystem` | `access` (`read` or `write`) and `path`. |
 | `process` | `field` (`run_as_user` or `run_as_group`), `boundary`, and `candidate`. |
 | `landlock` | `boundary` and `candidate` compatibility modes. |
-| `network` | `binary`, `ancestor_binary`, `binary_identity_required`, `host`, `destination_ip`, `trusted_gateway`, `port`, `protocol`, `method`, and `path`. |
+| `network` | `binary`, `ancestor_binary`, `binary_identity_required`, `host`, `destination_ip`, `trusted_gateway`, `port`, `protocol`, `method`, `path`, and optional `query_params`. |
 
 Network `binary` and `ancestor_binary` values are `null` when binary identity
 enforcement is disabled. `method` and `path` are `null` for L4 witnesses.
 `trusted_gateway: true` means the witness uses a recognized host-gateway alias
 with a runtime-provided trusted gateway binding; `false` uses ordinary
 destination validation.
+
+`query_params` contains decoded query values as arrays, preserving distinct repeated
+values. It is omitted when empty. Percent-encode keys and values when constructing
+a request to replay the counterexample.
 
 The stable reason codes are `invalid_input`, `unsupported_policy_shape`,
 `unresolved_workdir`, `unresolved_binary_path`,
@@ -161,7 +165,7 @@ inconclusive results as failures in CI.
 
 The containment check covers filesystem paths, process identity settings,
 Landlock compatibility requirements, L4 destination authority, and enforced
-REST method and path authority, including explicit REST denies. The result
+REST method, path, and supported query constraints, including explicit REST denies. The result
 object reports the policy domains modeled by each check. Policies that use
 recognized authority outside that coverage return `unsupported` rather than
 silently ignoring it.
@@ -175,12 +179,27 @@ containment model return `unsupported` and exit `3`.
 The prover applies aggregate limits across the candidate and boundary before
 semantic shape validation: 1,024 network rules, 4,096 endpoints, 4,096 binary
 selectors, 65,536 authored port entries, 4,096 `allowed_ips` entries, 16,384
-REST rules, 4 KiB per modeled pattern, and 1 MiB of modeled pattern text.
+REST rules, 256 query matchers, 4 KiB per modeled pattern, and 1 MiB of modeled pattern text.
+Query keys and values count toward the pattern-byte limits. These limits combine
+both inputs: comparing identical policies with 129 query matchers exceeds the limit.
 Exceeding any limit returns `inconclusive` with `reason_code: resource_limit`.
 A cancellation already requested at preflight takes precedence over that
 result; otherwise a resource limit takes precedence over unsupported
 policy-shape diagnostics. This ordering keeps validation work bounded for
 checked-in CI inputs.
+
+### REST query constraints
+
+Query keys and exact values must be ASCII without NUL. Exact strings and the whole
+`*` wildcard are supported; partial globs and `any` matchers return `unsupported`.
+The runtime uses `.` as a glob delimiter: `*` matches `a` and an empty value, but
+not `a.b`. A boundary `q: "*"` therefore does not contain a candidate `q: "a.b"`.
+
+Every configured key must be present. All repeated values must match an allow
+constraint; any matching value satisfies each configured deny constraint. Thus
+`q=a&q=a.b` fails an allow `q: "*"` but matches a deny `q: "*"`.
+Unconfigured keys are unrestricted. Comparisons use decoded values and do not
+infer that one application operation includes another.
 
 ### Process and Landlock settings
 

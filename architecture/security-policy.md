@@ -398,7 +398,10 @@ or decide whether an in-boundary change is eligible for automatic approval.
 
 The containment model covers filesystem paths, supported process identities,
 Landlock compatibility requirements, L4 destinations including IP ranges, and
-enforced REST method and path authority. Identity comparisons assume consistent
+enforced REST method, path, and supported query-parameter authority. Query checks
+support exact ASCII values and `*` with the runtime's dot-delimited glob semantics,
+including missing and repeated parameters. Other query matchers remain unsupported.
+Identity comparisons assume consistent
 user and group resolution. Compatibility checks compare requested enforcement
 requirements, not the actual kernel state of a running sandbox.
 It returns explicit unsupported or inconclusive

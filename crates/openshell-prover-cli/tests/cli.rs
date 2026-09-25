@@ -39,6 +39,41 @@ fn check_json(candidate: &str, boundary: &str) -> Output {
 }
 
 #[test]
+fn query_containment_and_counterexample_are_exposed_in_cli() {
+    let within = check_json("query-upload.yaml", "query-any.yaml");
+    assert_eq!(
+        within.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&within.stdout)
+    );
+    let denied = check_json("query-receive.yaml", "query-upload.yaml");
+    assert_eq!(
+        denied.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&denied.stdout)
+    );
+    let value: Value = serde_json::from_slice(&denied.stdout).unwrap();
+    assert_eq!(
+        value["counterexample"]["query_params"]["service"],
+        serde_json::json!(["git-receive-pack"])
+    );
+    let text = run(&[
+        "check",
+        fixture("query-receive.yaml").to_str().unwrap(),
+        "--boundary",
+        fixture("query-upload.yaml").to_str().unwrap(),
+    ]);
+    assert_eq!(text.status.code(), Some(1));
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(
+        text.contains("query_params=") && text.contains("git-receive-pack"),
+        "{text}"
+    );
+}
+
+#[test]
 fn help_and_version_succeed() {
     for args in [
         &["--help"][..],

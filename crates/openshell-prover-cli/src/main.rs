@@ -109,6 +109,8 @@ enum CounterexampleJson<'a> {
         protocol: &'a str,
         method: Option<&'a str>,
         path: Option<&'a str>,
+        #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        query_params: &'a std::collections::BTreeMap<String, Vec<String>>,
     },
 }
 
@@ -413,6 +415,7 @@ fn counterexample_json(counterexample: &Counterexample) -> Result<Counterexample
             protocol,
             method,
             path,
+            query_params,
             ..
         } => CounterexampleJson::Network {
             binary: binary.as_deref(),
@@ -425,6 +428,7 @@ fn counterexample_json(counterexample: &Counterexample) -> Result<Counterexample
             protocol: protocol.as_str(),
             method: method.as_deref(),
             path: path.as_deref(),
+            query_params,
         },
         _ => return Err("unsupported counterexample kind returned by containment API".to_owned()),
     };
@@ -471,9 +475,10 @@ fn render_text(mut writer: impl Write, envelope: &Envelope<'_>) -> Result<(), St
                 protocol,
                 method,
                 path,
+                query_params,
             } => writeln!(
                 writer,
-                "counterexample: network binary={} ancestor_binary={} binary_identity_required={} host={}:{} destination_ip={} trusted_gateway={} protocol={} method={} path={}",
+                "counterexample: network binary={} ancestor_binary={} binary_identity_required={} host={}:{} destination_ip={} trusted_gateway={} protocol={} method={} path={} query_params={query_params:?}",
                 binary.map_or("-".to_owned(), escape_terminal),
                 ancestor_binary.map_or("-".to_owned(), escape_terminal),
                 binary_identity_required,

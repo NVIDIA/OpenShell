@@ -86,6 +86,80 @@ fn eval_array_len(engine: &mut Engine, input: &Value, rule: &str) -> usize {
 }
 
 #[test]
+fn query_counterexamples_replay_against_runtime() {
+    let policy = |allow: serde_json::Value, deny: Option<serde_json::Value>| {
+        json!({"version":1, "network_policies":{"n":{
+            "binaries":[{"path":"/usr/bin/curl"}],
+            "endpoints":[{"host":"api.example.com", "ports":[443],
+                "protocol":"rest", "enforcement":"enforce",
+                "rules":[{"allow":{"method":"GET", "path":"/info/refs", "query":allow}}],
+                "deny_rules":deny.into_iter().map(|query| json!({"method":"GET", "path":"/info/refs", "query":query})).collect::<Vec<_>>()
+            }]
+        }}}).to_string()
+    };
+    for (boundary, candidate) in [
+        (
+            policy(json!({"service":"*"}), None),
+            policy(json!({"service":"a.b"}), None),
+        ),
+        (
+            policy(json!({}), Some(json!({"service":"a.b"}))),
+            policy(json!({}), Some(json!({"service":"*"}))),
+        ),
+        (
+            policy(json!({"service":"git-upload-pack"}), None),
+            policy(json!({"service":"git-receive-pack"}), None),
+        ),
+        (
+            policy(json!({"service":"*"}), None),
+            policy(json!({}), None),
+        ),
+        (
+            policy(json!({}), Some(json!({"service":"git-receive-pack"}))),
+            policy(json!({}), None),
+        ),
+        (
+            policy(json!({"service":""}), None),
+            policy(json!({"service":"*"}), None),
+        ),
+    ] {
+        let result = check(&boundary, &candidate);
+        let CheckResult::Exceeds(evidence) = result else {
+            panic!("{result:?}")
+        };
+        let Counterexample::Network {
+            binary,
+            ancestor_binary,
+            binary_identity_required,
+            host,
+            port,
+            method,
+            path,
+            query_params,
+            ..
+        } = evidence.counterexample()
+        else {
+            panic!("expected network witness")
+        };
+        let input: Value = serde_json::from_value(json!({
+            "exec":{"path":binary.as_deref().unwrap_or(""), "ancestors":ancestor_binary.iter().collect::<Vec<_>>(), "cmdline_paths":[]},
+            "network":{"host":host, "port":port},
+            "request":{"method":method, "path":path, "query_params":query_params}
+        })).unwrap();
+        assert!(eval_bool(
+            &mut runtime_engine_with_identity(&candidate, *binary_identity_required),
+            &input,
+            "data.openshell.sandbox.allow_request"
+        ));
+        assert!(!eval_bool(
+            &mut runtime_engine_with_identity(&boundary, *binary_identity_required),
+            &input,
+            "data.openshell.sandbox.allow_request"
+        ));
+    }
+}
+
+#[test]
 fn underscore_host_counterexample_replays_at_runtime() {
     let boundary = "version: 1\n";
     let candidate = r"
