@@ -273,17 +273,24 @@ The kube e2e wrapper creates only one port-forward, to `svc/openshell`; it no
 longer forwards the unauthenticated health listener or runs a `/readyz` e2e
 target. `/readyz` remains covered by server unit/integration tests.
 
-Use `mise run e2e:kubernetes:ha-rebalancing` for Envoy Gateway HA coverage or
-`mise run e2e:kubernetes:agentgateway-ha-rebalancing` for agentgateway HA
-coverage. Both tasks create an external PostgreSQL fixture, enable the chart
-`GRPCRoute`, and run the full Kubernetes e2e suite, including
-`kubernetes_ha_rebalancing`. The Envoy task installs Envoy Gateway and applies
-`deploy/kube/manifests/envoy-gateway-openshell.yaml`; the agentgateway task
-installs the pinned agentgateway release and its shared `Gateway`. This coverage
-validates sandbox create/watch and exec through the selected proxy while gateway
-replicas scale up, scale down, and rotate. It also keeps a long-running sandbox
-alive and runs upload/download operations while gateway pods roll, so file sync
-exercises the same relay retry path as interactive sessions.
+Use `mise run e2e:kubernetes:ha-rebalancing` for HA coverage through Envoy
+Gateway, the default controller. Select agentgateway with:
+
+```bash
+OPENSHELL_E2E_KUBE_GATEWAY_CONTROLLER=agentgateway \
+  mise run e2e:kubernetes:ha-rebalancing
+```
+
+The task creates an external PostgreSQL fixture, enables the chart `GRPCRoute`,
+and runs the full Kubernetes e2e suite, including
+`kubernetes_ha_rebalancing`. The Envoy selection installs Envoy Gateway and
+applies `deploy/kube/manifests/envoy-gateway-openshell.yaml`; the agentgateway
+selection installs the pinned agentgateway release and its shared `Gateway`.
+This coverage validates sandbox create/watch and exec through the selected
+proxy while gateway replicas scale up, scale down, and rotate. It also keeps a
+long-running sandbox alive and runs upload/download operations while gateway
+pods roll, so file sync exercises the same relay retry path as interactive
+sessions.
 
 Use `mise run e2e:kubernetes:agentgateway-shared-tls` to add an OpenShell-owned HTTPS
 `ListenerSet` to the shared agentgateway `Gateway`, provision a short-lived

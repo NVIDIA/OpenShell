@@ -473,7 +473,7 @@ jobs:
     with:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes agentgateway HA E2E
-      e2e-task: e2e:kubernetes:agentgateway-ha-rebalancing
+      e2e-task: e2e:kubernetes:ha-rebalancing
       extra-helm-values: deploy/helm/openshell/ci/values-high-availability.yaml
       external-postgres-secret: openshell-ha-pg
       test-name: kubernetes_ha_rebalancing
