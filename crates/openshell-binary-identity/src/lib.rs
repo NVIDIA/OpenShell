@@ -474,20 +474,22 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn resolver_cache_is_owned_and_only_explicit_clones_share_it() {
-        let first = ProcfsIdentityResolver::for_pid_namespace();
+        let pid = std::process::id();
+        let first = ProcfsIdentityResolver::for_process_tree(pid);
         let shared = first.clone();
-        let separate = ProcfsIdentityResolver::for_pid_namespace();
+        let separate = ProcfsIdentityResolver::for_process_tree(pid);
         assert!(Arc::ptr_eq(&first.cache, &shared.cache));
         assert!(!Arc::ptr_eq(&first.cache, &separate.cache));
-        first.resolve(std::process::id()).unwrap();
+        first.resolve(pid).unwrap();
         assert!(!shared.cache.lock().unwrap().is_empty());
         assert!(separate.cache.lock().unwrap().is_empty());
     }
 
     #[test]
     fn resolves_current_process_from_live_executable() {
-        let identity = ProcfsIdentityResolver::for_pid_namespace()
-            .resolve(std::process::id())
+        let pid = std::process::id();
+        let identity = ProcfsIdentityResolver::for_process_tree(pid)
+            .resolve(pid)
             .expect("resolve current process");
 
         assert!(identity.executable.path.is_absolute());
@@ -497,7 +499,8 @@ mod tests {
     #[test]
     #[ignore = "subprocess fixture for executable identity tests"]
     fn identity_helper_process() {
-        std::thread::sleep(std::time::Duration::from_secs(30));
+        // Stay alive until the parent closes stdin or ChildGuard terminates us.
+        let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0_u8]);
     }
 
     #[test]
@@ -505,6 +508,7 @@ mod tests {
         let parent_pid = std::process::id();
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", "tests::identity_helper_process"])
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .expect("spawn child");
         let child = ChildGuard(child);
