@@ -167,14 +167,17 @@ async fn sandbox_bash_path(runner: &OpenShellRunner, name: &str) -> Result<Strin
             "--",
             "bash",
             "-c",
-            "readlink -f /proc/$$/exe",
+            "printf '%s\\n' \"$(readlink -f /proc/$$/exe)\"",
         ])
         .await
         .map_err(|error| error.to_string())?;
     result.require_success()?;
     let binary = result.stdout().trim();
-    if !binary.starts_with('/') || binary.contains('\n') {
-        return Err(result.failure_diagnostic("one absolute Bash executable path"));
+    if !binary.starts_with('/')
+        || binary.contains('\n')
+        || binary.rsplit('/').next() != Some("bash")
+    {
+        return Err(result.failure_diagnostic("one absolute Bash executable path ending in /bash"));
     }
     Ok(binary.to_string())
 }
@@ -335,7 +338,7 @@ network_policies: {}
             .stdout()
             .lines()
             .find_map(|line| line.strip_prefix("BINARY="))
-            .filter(|binary| binary.starts_with('/'))
+            .filter(|binary| binary.starts_with('/') && binary.rsplit('/').next() == Some("bash"))
             .ok_or_else(|| probe.failure_diagnostic("canonical Bash executable path is reported"))?
             .to_string();
         if !probe.stdout().lines().any(|line| line == "DENIED") {
