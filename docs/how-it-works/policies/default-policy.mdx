@@ -8,18 +8,18 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Security, Policy
 position: 6
 ---
 
-This reference describes the restrictive policy OpenShell uses when a sandbox has
-no other policy, and the filesystem paths that OpenShell adds to sandbox
+This reference describes the restrictive policy OpenShell uses when a sandbox
+has no other policy, and the filesystem paths that OpenShell adds to sandbox
 policies at runtime.
 
 ## When the Default Applies
 
-OpenShell uses the restrictive default only when a sandbox has no saved policy
-and its image contains no policy. Creating a sandbox without `--policy` does not
-by itself mean the default is active, because the image or
-`OPENSHELL_SANDBOX_POLICY` can supply one. An invalid image policy keeps the
-workload from starting until you repair it. It does not select the default.
-Refer to [Where the Active Policy Comes
+OpenShell uses the restrictive default only when no global policy is active, the
+sandbox has no saved policy, and its image contains no policy. Creating a
+sandbox without `--policy` does not by itself mean the default is active,
+because the image or `OPENSHELL_SANDBOX_POLICY` can supply one. An invalid image
+policy keeps the workload from starting until you repair it. It does not select
+the default. Refer to [Where the Active Policy Comes
 From](/sandboxes/policies#where-the-active-policy-comes-from) for the complete
 selection order.
 
@@ -42,17 +42,18 @@ compatibility is `best_effort`.
 ## Default Network Access
 
 The default policy defines no network rules or middleware, so all outbound
-network access is denied. Attached providers can still add their network rules
-to the effective policy. Provider rules are runtime composition, not fields in
-the default policy, so inspect the base and effective views separately to
-identify a provider-derived grant.
+network access is denied. Attached providers can still add network rules to the
+effective policy. To see them, compare the base and effective policies, as
+described in [Inspect the Selected Policy](#inspect-the-selected-policy).
 
 ## Default Process Identity
 
 The default policy leaves process identity to the compute driver. Docker and
-Podman honor a non-root OCI `USER`. When an image declares no user, they use
-numeric UID and GID 1000. Other drivers apply their configured non-root
-identity.
+Podman run the workload as the image's `USER` when it names a non-root user, and
+as UID and GID 1000 when the image declares no user. They reject an image whose
+user is root unless the policy you pass when you create the sandbox sets a
+non-root `run_as_user`. Kubernetes and VM sandboxes run as the identity
+configured for their driver.
 
 ## Baseline Filesystem Paths
 
@@ -67,19 +68,20 @@ baseline paths to the sandbox's filesystem policy at startup:
 | Read-write | `/tmp`, `/dev/null` |
 
 OpenShell adds a baseline path only when it is available and your policy does
-not already list it. It never changes the access of a path you list, so a
+not already list it, so list the paths your workload needs, such as `/app`, in
+your policy. OpenShell never changes the access of a path you list, so a
 baseline read-write path that you list as read-only stays read-only. If the
 policy has no `filesystem_policy` section, OpenShell creates one with
 `include_workdir: true`.
 
 The sandbox saves the enriched filesystem policy as a new revision, so the
-added paths appear in `openshell policy get --base`. Filesystem paths cannot be
-removed from a running sandbox, so keep the added paths when you replace the
-complete policy.
+added paths appear in `openshell policy get --base`. OpenShell can reject a
+replacement policy that removes filesystem paths, so keep the added paths when
+you replace the complete policy.
 
 The runtime also grants the workload read-only access to the sandbox's TLS CA
-certificates under `/run/openshell-supervisor-ca`. This grant is not saved to
-the stored policy.
+certificates under `/run/openshell-supervisor-ca`. This grant is not saved in
+the sandbox's policy.
 
 ### GPU Sandboxes
 
@@ -93,26 +95,28 @@ additional paths when the corresponding GPU device is present:
 
 CUDA writes thread names under `/proc` during initialization, so GPU enrichment
 moves `/proc` from read-only to read-write. OpenShell adds each path only when
-it exists in the workload. These paths apply at runtime and are not saved to
-the stored policy.
+it exists in the workload. These paths apply at runtime and are not saved in
+the sandbox's policy.
 
 ### Protected Paths
 
-On current Linux isolation paths, a mandatory Landlock baseline protects the
-private `/.openshell` hierarchy and requires Landlock ABI v3. Your filesystem
-policy is applied on top of that baseline and can narrow access, but it cannot
-expose `/.openshell`. The `best_effort` compatibility setting does not disable
-this protection or allow a kernel without ABI v3.
+On Docker, Podman, Kubernetes, and VM sandboxes, a mandatory Landlock baseline
+protects the private `/.openshell` directory and requires Landlock ABI v3. Your
+filesystem policy is applied on top of that baseline and can narrow access, but
+it cannot expose `/.openshell`. The `best_effort` compatibility setting does not
+disable this protection or allow a kernel without ABI v3.
 
 ## Inspect the Selected Policy
 
-Inspect the sandbox's base policy and the gateway's effective representation:
+To see which policy a sandbox uses, print its base and effective policies.
+While a global policy is active, both commands show the global policy:
 
 ```shell
 openshell policy get <sandbox> --base
 openshell policy get <sandbox> --full
 ```
 
-`--full` shows gateway composition, not an attestation of the restrictions
-already installed in a running kernel process. Use sandbox readiness, revision
-status, request checks, and runtime logs to verify activation.
+Neither view includes the paths that OpenShell grants only at runtime, such as
+the CA certificate and GPU paths. To confirm what a running sandbox enforces,
+check the revision status with `openshell policy list <sandbox>` and test
+requests.

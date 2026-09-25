@@ -32,8 +32,8 @@ network_middlewares: { ... }
 | `network_policies` | map | No | Live | Which binaries can reach which network endpoints. |
 | `network_middlewares` | map | No | Live | Middleware applied to allowed traffic. |
 
-Startup fields take effect when a sandbox starts. Live fields can change while it
-runs. Refer to [How Changes Take
+Startup fields take effect when a sandbox starts. Live fields can change while
+it runs. Refer to [How Changes Take
 Effect](/sandboxes/manage-policies#how-changes-take-effect).
 
 ## Filesystem Policy
@@ -46,12 +46,12 @@ Effect](/sandboxes/manage-policies#how-changes-take-effect).
 
 When `filesystem_policy` is omitted, `include_workdir` is `true`. When
 `filesystem_policy` is present, `include_workdir` defaults to `false`. Paths
-that are not listed are inaccessible, apart from the baseline paths described in
-[Default Policy](/reference/default-policy).
+that are not listed are inaccessible. When the effective policy has at least one
+network rule, OpenShell also adds the baseline paths described in [Default
+Policy](/reference/default-policy#baseline-filesystem-paths).
 
 Each path must be absolute, must not contain `..`, and must not exceed 4096
-characters. `read_write` cannot contain overly broad paths such as `/`. A
-policy can list at most 256 paths.
+bytes. `read_write` cannot contain `/`. A policy can list at most 256 paths.
 
 ```yaml showLineNumbers={false}
 filesystem_policy:
@@ -67,8 +67,8 @@ filesystem_policy:
 | `compatibility` | string | `best_effort` | `best_effort` or `hard_requirement` |
 
 Both values skip individual paths that are missing or that the workload cannot
-open. They differ when no path can be applied or the kernel cannot apply the
-rules:
+open. They differ when none of the listed paths can be applied, or when Landlock
+fails to enforce the policy's rules:
 
 | Value | Behavior |
 |---|---|
@@ -83,13 +83,15 @@ and skipped.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `run_as_user` | string | Driver default | User name or UID for the workload. |
-| `run_as_group` | string | Driver default | Group name or GID for the workload. |
+| `run_as_user` | string | Driver default | `sandbox` or a numeric UID for the workload. |
+| `run_as_group` | string | Driver default | `sandbox` or a numeric GID for the workload. |
 
-A value must be `sandbox` or a numeric ID from `1` through `4294967294`.
-OpenShell rejects root. Each field is independent, so you can set one and let
-the compute driver choose the other. Docker and Podman default to the image's
-`USER`.
+A numeric ID must be from `1` through `4294967294`, so OpenShell rejects root.
+Each field is independent, so you can set one and let the compute driver choose
+the other. Only Docker and Podman apply these fields, and only from the policy
+that you pass when you create the sandbox. Without them, Docker and Podman use
+the image's `USER`. Kubernetes and VM sandboxes run as the identity configured
+for their driver.
 
 ```yaml showLineNumbers={false}
 process:
@@ -109,6 +111,9 @@ for examples, refer to [Network Rules](/sandboxes/network-rules).
 | `endpoints` | list of endpoint objects | No | Destinations the rule allows. |
 | `binaries` | list of binary objects | No | Executables the rule applies to. An empty list matches no binary. |
 
+Rule keys cannot start with `_provider_`, which OpenShell reserves for rules
+that providers contribute.
+
 ### Endpoint Object
 
 Endpoint fields fall into four groups.
@@ -117,24 +122,35 @@ Endpoint fields fall into four groups.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `host` | string | Conditional | Hostname or IP address. A `*` or `**` wildcard is allowed only in the first DNS label, such as `*.example.com`. |
+| `host` | string | Conditional | Hostname, IP address, or wildcard pattern, such as `*.example.com`. |
 | `port` | integer | Conditional | TCP port. Set `port` or `ports`. |
-| `ports` | list of integers | Conditional | TCP ports. Takes precedence over `port`. |
+| `ports` | list of integers | Conditional | TCP ports. Use instead of `port`, not with it. |
 | `path` | string | No | Path glob that selects among inspected endpoints on the same host and port. The most specific match wins. |
 | `allowed_ips` | list of strings | No | IP addresses or CIDR ranges that resolved addresses must fall within. |
 
+A wildcard host must have at least three DNS labels. `*` can appear within the
+first label, such as `*-api.example.com`, or as a whole later label, such as
+`api.*.example.com`. `**` is allowed only as the whole first label.
+
 An endpoint can omit `host` only when it sets `allowed_ips`. Exact hostnames can
-reach the private addresses they resolve to. Wildcard and hostless endpoints can
-reach private addresses only through `allowed_ips`. Loopback, link-local, and
-unspecified addresses, including cloud metadata addresses, are always blocked,
-and `allowed_ips` entries that overlap them are rejected.
+reach the private addresses they resolve to, unless the endpoint comes from an
+approved policy advisor proposal. Wildcard and hostless endpoints can reach
+private addresses only through `allowed_ips`.
+
+Loopback, link-local, and unspecified addresses, including the cloud metadata
+address `169.254.169.254`, are always blocked. `openshell policy update` rejects
+an `allowed_ips` entry that overlaps them, and in a complete policy such an
+entry blocks every connection to the endpoint. OpenShell also blocks the
+Kubernetes and etcd control-plane ports 2379, 2380, 6443, 10250, and 10255 on
+endpoints that use an exact hostname, an IP address, or `allowed_ips`. A rule
+for `host.openshell.internal` can still reach services on the gateway host.
 
 #### Inspection Fields
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `protocol` | string | None | `rest`, `websocket`, `graphql`, `mcp`, or `json-rpc` for request inspection, or `tcp` for a native TCP connection. Refer to [Connection and Request Checks](/sandboxes/network-rules#connection-and-request-checks). |
-| `tls` | string | Automatic | `skip` relays traffic without terminating TLS. Use it only on endpoints without `protocol`. |
+| `tls` | string | Automatic | `skip` relays traffic without terminating TLS, so OpenShell cannot inspect it. Do not use it with a request protocol. |
 | `enforcement` | string | `audit` | `enforce` blocks requests that break the endpoint's rules. `audit` logs them and allows the request. |
 | `access` | string | None | Access preset: `read-only`, `read-write`, or `full`. Refer to [Access Presets](#access-presets). |
 | `rules` | list | None | Allow rules. |
@@ -170,6 +186,8 @@ network_policies:
         access: full
         credential_binding:
           provider: work-gcp
+    binaries:
+      - path: /usr/bin/curl
 ```
 
 #### Protocol Options
@@ -177,12 +195,12 @@ network_policies:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `persisted_queries` | string | `deny` | GraphQL hash-only queries: `deny` or `allow_registered`. |
-| `graphql_persisted_queries` | map | None | Trusted persisted-query registry, keyed by hash or saved-query ID. Required with `allow_registered`. |
+| `graphql_persisted_queries` | map | None | Trusted persisted-query registry, keyed by hash or saved-query ID. With `allow_registered`, OpenShell denies hash-only queries that are not in the registry. |
 | `graphql_max_body_bytes` | integer | `65536` | Maximum GraphQL request body size for inspection. |
 | `mcp.versions` | list of strings | `["2025-11-25"]` | Allowed MCP revisions. Refer to [MCP Version Selection](#mcp-version-selection). |
 | `mcp.max_body_bytes` | integer | `65536` | Maximum MCP request body size for inspection. |
 | `mcp.strict_tool_names` | bool | `true` | Requires tool names to match `^[A-Za-z0-9_.-]{1,128}$`. |
-| `mcp.allow_all_known_mcp_methods` | bool | `false` | When `true`, an endpoint without `rules` allows all MCP methods and tools except those that deny rules match, and rules can omit `method`. Refer to [MCP Rules](#mcp-rules). |
+| `mcp.allow_all_known_mcp_methods` | bool | `false` | When `true`, the endpoint allows every MCP method except those that deny rules match. If rules name specific tools, `tools/call` is limited to those tools. Rules can omit `method`. Refer to [MCP Rules](#mcp-rules). |
 | `json_rpc.max_body_bytes` | integer | `65536` | Maximum JSON-RPC request body size for inspection. |
 
 #### Endpoint Constraints
@@ -194,13 +212,13 @@ OpenShell rejects an endpoint that breaks these rules:
   unless an MCP endpoint sets `mcp.allow_all_known_mcp_methods: true`.
 - `deny_rules` require `protocol`, and require `rules` or `access` on endpoints
   other than MCP.
-- `rules` and `deny_rules` cannot be empty lists, and `rules` must contain at
-  least one allow rule.
 - `protocol: tcp` requires a hostname and a port. It accepts no request fields,
   such as `path`, `enforcement`, `access`, `rules`, credential rewriting or
   signing, or protocol options.
-- Endpoints that share a host and port must use the same `tls` and
-  `allowed_ips` values.
+- Endpoints whose hosts can match the same name on the same port, including
+  through wildcards, must use the same `tls` and `allowed_ips` values.
+  Inspected endpoints that can match the same request must also agree on
+  `protocol`, `enforcement`, and credential settings.
 
 Without `protocol`, `access` and `rules` have no effect.
 
@@ -218,8 +236,9 @@ endpoints do not.
 ### Allow and Deny Rules
 
 Each entry in `rules` wraps its matcher fields in `allow`. Each entry in
-`deny_rules` lists the matcher fields directly. A request that matches any deny
-rule is blocked, regardless of the allow rules or access preset.
+`deny_rules` lists the matcher fields directly. With `enforcement: enforce`, a
+request that matches any deny rule is blocked, regardless of the allow rules or
+access preset.
 
 ```yaml showLineNumbers={false}
 rules:
@@ -251,8 +270,8 @@ rules:
       method: GET
       path: /api/v1/download
       query:
-        version:
-          any: ["1.*", "2.*"]
+        platform:
+          any: ["linux-*", "darwin-*"]
 deny_rules:
   - method: "*"
     path: "/repos/*/*/rulesets"
@@ -272,10 +291,10 @@ OpenShell does not inspect binary frames or messages from the server.
 rules:
   - allow:
       method: GET
-      path: /v1/realtime/**
+      path: /v1/realtime
   - allow:
       method: WEBSOCKET_TEXT
-      path: /v1/realtime/**
+      path: /v1/realtime
 deny_rules:
   - method: WEBSOCKET_TEXT
     path: /v1/admin/**
@@ -285,7 +304,7 @@ deny_rules:
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `operation_type` | string | Yes | `query`, `mutation`, `subscription`, or `*`. |
+| `operation_type` | string | Yes | `query`, `mutation`, or `subscription`. To allow every operation type, use `access: full`. |
 | `operation_name` | string | No | Operation name glob. |
 | `fields` | list of strings | No | Top-level field globs. |
 
@@ -354,8 +373,10 @@ mcp:
   versions: ["2025-03-26", "2025-11-25"]
 ```
 
-OpenShell reads the revision from each request's `MCP-Protocol-Version` header,
-or uses `2025-03-26` when the header is absent. A duplicate, empty, or
+OpenShell does not check the revision of a single `initialize` request, because
+the client negotiates the revision in that request. For other requests,
+OpenShell reads the revision from the `MCP-Protocol-Version` header, or uses
+`2025-03-26` when the header is absent. A duplicate, empty, or
 unsupported header value returns `400`, and a supported revision that the
 endpoint does not allow returns `403`. For a client that requires an unsupported
 revision, omit `protocol` and `mcp` to allow its traffic without MCP inspection.
@@ -380,14 +401,14 @@ deny_rules:
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `path` | string | Yes | Executable path or glob, such as `/usr/bin/curl` or `/sandbox/.venv/bin/*`. |
+| `path` | string | Yes | Executable path or glob, such as `/usr/bin/curl` or `/usr/lib/jvm/*/bin/java`. |
 
 A binary matches the executable that opens the connection or any of its parent
-processes. Scripts run as their interpreter, so list `/usr/bin/python3` for a
-Python script. OpenShell resolves symlinks in exact paths but not in globs.
-OpenShell records each executable's checksum when a rule first allows it, and
-denies later connections if the file changes. Refer to [Binary
-Matching](/sandboxes/network-rules#binary-matching).
+processes. Scripts run as their interpreter, so list the interpreter, such as
+`/usr/bin/python3.12`, for a Python script. List the executable's real path, not
+a symlink to it. OpenShell records a hash of each executable the first time it
+takes part in a connection, and denies later connections if the file changes.
+Refer to [Binary Matching](/sandboxes/network-rules#binary-matching).
 
 ## Network Middleware
 
@@ -404,7 +425,7 @@ network rules allow, in ascending `order`.
 | `on_error` | string | No | `fail_closed` blocks traffic when the middleware fails. `fail_open` skips it. Defaults to `fail_closed`. |
 | `name` | string | No | Display name. Defaults to the key. |
 
-Host patterns use the same wildcards as endpoint hosts, up to 32 patterns per
+Host patterns match the same way as endpoint hosts, up to 32 patterns per
 configuration. A `fail_closed` configuration cannot apply to an endpoint with
 `tls: skip`. Refer to [Supervisor Middleware](/extensibility/supervisor-middleware).
 
@@ -425,10 +446,10 @@ network_middlewares:
 
 | Matcher | Case-sensitive | Wildcards |
 |---|---|---|
-| Endpoint `host` and middleware hosts | No | `*` matches one DNS label, and `**` matches one or more labels. |
+| Endpoint `host` and middleware hosts | No | `*` matches characters within one DNS label, and `**` matches one or more labels. |
 | Binary `path` | Yes | `*` matches within one path segment, and `**` matches across segments. |
 | REST and WebSocket `path` | Yes | `*` matches within one path segment, and `**` matches across segments. `?` matches one character, and bracket classes such as `[0-9]` are supported. `/repos/**` does not match `/repos`. |
-| Query values | Yes | `*` matches any characters. |
+| Query values and MCP tool names | Yes | `*` matches any characters except `.`, and `**` matches any characters. |
 
 ## Full Example
 

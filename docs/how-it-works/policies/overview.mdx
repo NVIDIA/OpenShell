@@ -14,22 +14,23 @@ which user they run as, which network destinations each binary can reach, and
 which requests it can send. OpenShell denies anything the policy does not allow.
 
 This page explains how policies work. To try one in a running sandbox, follow
-[Write Your First Sandbox Network Policy](/get-started/tutorials/first-network-policy).
-To create and change policies, refer to
-[Manage Sandbox Policies](/sandboxes/manage-policies).
+[Write Your First Sandbox Network
+Policy](/get-started/tutorials/first-network-policy). To create and change
+policies, refer to [Manage Sandbox Policies](/sandboxes/manage-policies).
 
 ## What a Policy Controls
 
-A policy file has up to five top-level sections. Each section controls a
-different part of the sandbox and takes effect at a specific time:
+A policy file sets `version: 1` and has up to five other top-level sections.
+Each section controls a different part of the sandbox and takes effect at a
+specific time:
 
 | Section | Controls | Enforced by | Takes effect |
 |---|---|---|---|
 | `filesystem_policy` | Paths that sandbox processes can read, or read and write. | Landlock LSM in the kernel. | At sandbox startup. |
-| `landlock` | Whether an unsupported kernel or an inaccessible path stops the sandbox from starting. | Sandbox startup checks. | At sandbox startup. |
-| `process` | User and group that sandbox processes run as. | Identity change before the workload starts. | At sandbox startup. |
+| `landlock` | Whether the sandbox still starts, without your filesystem rules, if OpenShell cannot apply them. | Sandbox runtime. | At sandbox startup. |
+| `process` | User and group that sandbox processes run as. | Docker and Podman, when they create the sandbox. | At sandbox creation. |
 | `network_policies` | Destinations each binary can reach, and the requests it can send. | Sandbox network proxy. | While the sandbox runs. |
-| `network_middlewares` | Additional inspection or transformation of allowed network traffic. | Sandbox network proxy. | While the sandbox runs. |
+| `network_middlewares` | Additional inspection, transformation, or blocking of traffic that network rules allow. | Sandbox network proxy. | While the sandbox runs. |
 
 Filesystem, Landlock, and process settings are fixed once the sandbox starts.
 Network rules and middleware can change while it runs, as described in [How
@@ -76,9 +77,9 @@ Policy](/sandboxes/manage-policies#inspect-the-current-policy) shows both views.
 ### Global Policy
 
 A gateway administrator can apply one policy to every sandbox on the gateway.
-The global policy replaces each sandbox's policy. It is not a ceiling
-intersected with existing grants. While it is active, sandbox policy changes are
-blocked and provider-contributed network rules are suppressed. Deleting the
+The global policy replaces each sandbox's own policy rather than limiting it.
+While it is active, OpenShell blocks sandbox policy changes and proposal
+approvals, and suppresses provider-contributed network rules. Deleting the
 global policy restores normal policy selection and provider rules. Refer to
 [Apply a Global
 Policy](/sandboxes/manage-policies#apply-a-global-policy) for the
