@@ -123,7 +123,7 @@ if [[ ! -x "$snap_install_hook" ]]; then
   echo "FAIL: Snap install hook must be executable" >&2
   exit 1
 fi
-assert_contains "$snap_install_hook" '[openshell.gateway.mtls_auth]'
+assert_contains "$snap_install_hook" 'compute_driver = "docker"'
 if [[ ! -x "$(dirname "$snap_install_hook")/post-refresh" ]]; then
   echo "FAIL: Snap post-refresh hook must be executable" >&2
   exit 1

@@ -490,6 +490,40 @@ if ! grep -Fq "without client authentication" "$err"; then
   exit 1
 fi
 
+assert_snap_listener_scheme() {
+  local name=$1
+  local https_ok=$2
+  local grpc_status=$3
+  local expected=$4
+  local actual
+
+  actual="$(
+    as_root() { "$@"; }
+    curl() {
+      case " $* " in
+        *" --cert "*) [ "$https_ok" = "1" ] ;;
+        *) return 1 ;;
+      esac
+    }
+    snap_legacy_grpc_health_status() { printf '%s' "$grpc_status"; }
+    sleep() { :; }
+    info() { :; }
+    dump_local_gateway_diagnostics() { :; }
+    error() { printf 'timeout\n'; exit 0; }
+    OPENSHELL_INSTALL_GATEWAY_TIMEOUT=2
+    wait_for_snap_gateway_listener 2>/dev/null
+    printf '%s\n' "${SNAP_GATEWAY_SCHEME:-none}"
+  )"
+  if [ "$actual" != "$expected" ]; then
+    echo "FAIL: ${name}: expected ${expected}, got ${actual}" >&2
+    exit 1
+  fi
+}
+
+assert_snap_listener_scheme "mTLS gateway accepts the client bundle" 1 404 https
+assert_snap_listener_scheme "legacy gateway answers plaintext gRPC" 0 200 http
+assert_snap_listener_scheme "plaintext service routing is not a legacy gateway" 0 404 timeout
+
 snap_tls_src="${tmpdir}/snap-tls"
 mkdir -p "${snap_tls_src}/client"
 printf 'ca\n' >"${snap_tls_src}/ca.crt"

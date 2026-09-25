@@ -4,8 +4,13 @@
 
 # Bootstrap the snap gateway config. Operator-owned configs are never touched,
 # except that the exact config written by earlier snap revisions, which allowed
-# unauthenticated local access, is replaced with the mTLS default. The
-# post-refresh hook runs this script too so existing installs are migrated.
+# unauthenticated local access, is replaced with the default. The post-refresh
+# hook runs this script too so existing installs are migrated.
+#
+# The default pins the Docker driver and leaves user auth unset: with the
+# wrapper's local TLS bundle, the gateway requires client certificates and
+# enables mTLS user auth automatically. Setting mtls_auth explicitly would fail
+# config preflight, which runs before the local TLS defaults are applied.
 
 set -eu
 
@@ -41,9 +46,7 @@ cat >"$temporary_file" <<'CONFIG'
 version = 2
 
 [openshell.gateway]
-
-[openshell.gateway.mtls_auth]
-enabled = true
+compute_driver = "docker"
 CONFIG
 
 if [ "$replace" = true ]; then

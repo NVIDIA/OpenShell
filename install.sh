@@ -1331,24 +1331,30 @@ register_snap_gateway() {
 }
 
 # Wait for the snap gateway and record its scheme in SNAP_GATEWAY_SCHEME.
-# Current revisions serve mTLS; earlier revisions serve plaintext HTTP. Probe
-# HTTPS first because a TLS gateway also answers plaintext loopback requests
-# for sandbox service routing.
+# Current revisions require a client certificate during the TLS handshake, so
+# probe HTTPS with the root-owned client bundle. Earlier revisions serve
+# plaintext gRPC; a TLS gateway also answers plaintext loopback HTTP for
+# sandbox service routing, so only a successful plaintext gRPC Health call
+# identifies a legacy gateway.
 wait_for_snap_gateway_listener() {
   _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
   _last_output=""
+  _tls_dir="${OPENSHELL_SNAP_TLS_DIR:-/var/snap/openshell/common/tls}"
   _probe_url="https://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
 
   info "waiting for local gateway listener to become reachable..."
   while [ "$_elapsed" -lt "$_timeout" ]; do
-    # The probe only checks reachability; the CLI verifies the gateway CA.
-    if _last_output="$(curl -sS -k --max-time 2 -o /dev/null "$_probe_url" 2>&1)"; then
+    if _last_output="$(as_root curl -sS --max-time 2 \
+      --cacert "${_tls_dir}/ca.crt" \
+      --cert "${_tls_dir}/client/tls.crt" \
+      --key "${_tls_dir}/client/tls.key" \
+      -o /dev/null "$_probe_url" 2>&1)"; then
       SNAP_GATEWAY_SCHEME=https
       info "local gateway listener is reachable"
       return 0
     fi
-    if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:${LOCAL_GATEWAY_PORT}/" >/dev/null 2>&1; then
+    if [ "$(snap_legacy_grpc_health_status)" = "200" ]; then
       SNAP_GATEWAY_SCHEME=http
       info "local gateway listener is reachable"
       return 0
@@ -1360,6 +1366,16 @@ wait_for_snap_gateway_listener() {
   [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
   dump_local_gateway_diagnostics
   error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
+}
+
+# Print the HTTP status of an empty plaintext gRPC Health call.
+snap_legacy_grpc_health_status() {
+  printf '\000\000\000\000\000' |
+    curl -s --max-time 2 --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
+      -X POST -H 'content-type: application/grpc' -H 'te: trailers' \
+      --data-binary @- \
+      "http://127.0.0.1:${LOCAL_GATEWAY_PORT}/openshell.v1.OpenShell/Health" 2>/dev/null ||
+    true
 }
 
 install_linux_snap() {
