@@ -26,6 +26,43 @@ openshell status
 
 To install a specific release, set `OPENSHELL_VERSION` to a release tag. Release artifacts are also on the [GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
 
+## Prerelease and Development Builds
+
+Use a prerelease candidate to evaluate an upcoming release, or the rolling development build to test the latest commit on `main`. These builds may change before the next stable release. The matching documentation is published in the [development channel](https://docs.nvidia.com/openshell/dev/index.html).
+
+Prerelease packages are retained as GitHub Actions artifacts for 90 days and require an authenticated [GitHub CLI](https://cli.github.com/) session. The `pre` alias installs the latest prerelease:
+
+```shell
+gh auth login
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
+  OPENSHELL_VERSION=pre sh
+```
+
+The installer checks prerelease tags from newest to oldest, selects an unexpired artifact from a successful release run for the current platform, and downloads only that artifact. Installed packages keep the candidate's exact version, such as `0.1.0-pre.3`. Prerelease tags do not create entries on the GitHub Releases page. On Linux, prereleases and explicit release tags use Debian or RPM packages even if `snap` is installed.
+
+The rolling [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) does not require GitHub authentication:
+
+```shell
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | \
+  OPENSHELL_VERSION=dev sh
+```
+
+For Kubernetes, select the corresponding Helm chart version. Helm chart versions omit the leading `v` from release tags:
+
+```shell
+# Pin an exact candidate
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version 0.1.0-pre.3
+
+# Rolling development build
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version 0.0.0-dev
+```
+
+Prerelease charts use exact `<version>-pre.N` versions. Development charts are also published as immutable `0.0.0-dev.<commit-sha>` versions when you need to pin a specific commit.
+
 ## Supported Runtimes
 
 The local gateway auto-detects an available runtime. To pin one, set `compute_driver` in the gateway TOML file. See [Sandbox Runtimes](/how-it-works/sandboxes/runtimes).
