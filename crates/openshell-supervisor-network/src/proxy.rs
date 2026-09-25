@@ -10,7 +10,7 @@ mod relay;
 use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use crate::policy_dns::PolicyEndpointId;
 use crate::policy_dns::{MappingLookup, MappingLookupError, ResolvedEndpointStore};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
