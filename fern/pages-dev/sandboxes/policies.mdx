@@ -120,7 +120,7 @@ Matching entries run once each by ascending `order`; lower values run first, and
 
 `on_error` defaults to `fail_closed`. Use `fail_open` only when skipping a selected stage that fails is acceptable. For WebSocket streams, a broken fail-open stage is disabled for the rest of that connection and OpenShell emits a state-change finding. A host-matched attachment joins only operation chains advertised by its implementation. An HTTP-only attachment may inspect the WebSocket upgrade GET, but post-upgrade messages pass with informational `binding_not_selected` coverage under either error mode. Binary messages also pass without middleware inspection and produce `unsupported_message_type` coverage for active WebSocket stages. Upstream-to-client messages remain uninspected. Policy validation rejects a fail-closed selector that can cover a `tls: skip` endpoint. An all-`fail_open` match may cover the endpoint; the supervisor bypasses the middleware and emits a detection finding.
 
-See [Supervisor Middleware](/extensibility/supervisor-middleware) for registration, chain ordering, body limits, failure behavior, and operations.
+See [Supervisor Middleware](/extensibility/supervisor-middleware) for an introduction, or [Supervisor Middleware Configuration](/extensibility/supervisor-middleware/configure) for registration, ordering, failure behavior, and operations.
 
 ## Baseline Filesystem Paths
 

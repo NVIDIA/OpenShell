@@ -72,10 +72,20 @@ navigation:
   slug: extensibility
   contents:
   - page: "Overview"
+    path: extensibility/overview.mdx
+  - page: "Protocol Negotiation"
     path: extensibility/extension-negotiation.mdx
-  - page: "Middleware"
-    path: extensibility/supervisor-middleware.mdx
-  - page: "Interceptors"
+  - page: "Authentication"
+    path: extensibility/extension-authentication.mdx
+  - section: "Supervisor Middleware"
+    slug: supervisor-middleware
+    path: extensibility/supervisor-middleware/index.mdx
+    contents:
+    - page: "Configuration"
+      path: extensibility/supervisor-middleware/configure.mdx
+    - page: "Supported Operations"
+      path: extensibility/supervisor-middleware/operations.mdx
+  - page: "Gateway Interceptors"
     path: extensibility/gateway-interceptors.mdx
   - page: "Drivers"
     path: extensibility/drivers.mdx

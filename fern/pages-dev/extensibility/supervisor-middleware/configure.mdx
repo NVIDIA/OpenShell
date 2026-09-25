@@ -1,0 +1,199 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Supervisor Middleware Configuration"
+sidebar-title: "Configuration"
+slug: "extensibility/supervisor-middleware/configure"
+description: "Attach supervisor middleware to sandbox traffic, register your own middleware services, and observe middleware decisions."
+keywords: "Supervisor Middleware, Configuration, Network Policy, Operations, OCSF, Logging"
+---
+
+Register your middleware service in gateway configuration, then attach it to destination hosts in sandbox policy. This page also covers ordering, failure behavior, service lifecycle, and observability. Built-in middleware needs only a policy entry.
+
+## Use Your Own Middleware Service
+
+A middleware service is a gRPC server that implements the supervisor middleware protocol. The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) implements request, response, and WebSocket checks in one service, and includes a policy and a local launcher.
+
+To use your own service:
+
+1. Start the service where both the gateway and sandbox supervisors can reach it.
+2. Register it in gateway configuration.
+3. Restart the gateway.
+4. Attach it in sandbox policy by setting `middleware` to the registration `name`.
+
+Register the service in gateway TOML:
+
+```toml
+[[openshell.supervisor.middleware]]
+name = "content-guard"
+grpc_endpoint = "https://content-guard.example:50051"
+tls_ca_cert_path = "/path/to/content-guard-ca.pem"
+max_payload_bytes = 262144
+timeout = "500ms"
+```
+
+<ParamField path="name" type="string" required={true}>
+  Unique name that policies use to attach the service. The `openshell/` prefix is reserved for built-ins.
+</ParamField>
+
+<ParamField path="grpc_endpoint" type="string" required={true}>
+  Service address reachable from the gateway and sandbox supervisors.
+</ParamField>
+
+<ParamField path="max_payload_bytes" type="integer" required={true}>
+  Largest request body, response body, or WebSocket message the service inspects. Must be at most 4 MiB and no larger than the service advertises.
+</ParamField>
+
+<ParamField path="timeout" type="string" default="500ms">
+  Time limit for `Describe`, `ValidateConfig`, and individual evaluations or stream exchanges. Use an integer followed by `ms` or `s`, from `10ms` through `30s`. A binding may advertise a shorter evaluation timeout. Accepted HTTP response and WebSocket streams have no connection-wide deadline.
+</ParamField>
+
+<ParamField path="tls_ca_cert_path" type="string">
+  Private CA for the service certificate. Without it, OpenShell uses platform trust roots.
+</ParamField>
+
+<ParamField path="audience" type="string" default="urn:openshell:extension:middleware:<name>">
+  Token audience. Refer to [Extension Authentication](/extensibility/extension-authentication).
+</ParamField>
+
+<ParamField path="allow_insecure_transport" type="boolean" default="false">
+  Allows a plaintext `http://` endpoint with no authentication. Use it for local development or on a network that already authenticates callers.
+</ParamField>
+
+At startup, the gateway contacts every registered service to read its capabilities and verify [protocol compatibility](/extensibility/extension-negotiation). The gateway does not start if a service is unavailable or incompatible. [Gateway Configuration](/reference/gateway-config#supervisor-middleware-services) describes the full TOML context.
+
+When the gateway has JWT signing configured, OpenShell authenticates every call to your service with a short-lived token. [Extension Authentication](/extensibility/extension-authentication) describes how your service validates it.
+
+## Attach Middleware in Policy
+
+Add entries to the top-level `network_middlewares` map in sandbox policy. Each entry selects destination hosts and names the middleware to run for them:
+
+<Tabs>
+<Tab title="Middleware service">
+
+Attach a [registered service](#use-your-own-middleware-service) by its registration name. Your service defines and validates the `config` object:
+
+```yaml showLineNumbers={false}
+network_middlewares:
+  content-guard:
+    middleware: content-guard
+    config:
+      mode: redact
+      terms: ["internal-only"]
+      replacement: "[FILTERED]"
+    endpoints:
+      include: ["api.example.com"]
+```
+
+</Tab>
+<Tab title="Multiple middleware">
+
+Run two middleware for the same hosts. `regex-demo` runs before `content-guard` because it has the lower `order`, and neither runs for `trusted.example.com`:
+
+```yaml showLineNumbers={false}
+network_middlewares:
+  regex-demo:
+    middleware: openshell/regex
+    order: 10
+    endpoints:
+      include: ["*.example.com"]
+      exclude: ["trusted.example.com"]
+  content-guard:
+    name: Content guard
+    middleware: content-guard
+    order: 20
+    endpoints:
+      include: ["*.example.com"]
+      exclude: ["trusted.example.com"]
+```
+
+</Tab>
+<Tab title="Built-in">
+
+Attach the built-in `openshell/regex` middleware to one host:
+
+```yaml showLineNumbers={false}
+network_middlewares:
+  regex-demo:
+    middleware: openshell/regex
+    endpoints:
+      include: ["api.example.com"]
+```
+
+<Note>
+
+`openshell/regex` is a regex redactor used for demonstration only. It lets you try middleware without running your own service. It replaces text that matches a fixed `sk-` pattern in UTF-8 HTTP bodies and outgoing WebSocket text messages, and the pattern is not configurable. Do not rely on it to detect or remove sensitive data.
+
+</Note>
+
+</Tab>
+</Tabs>
+
+### Entry Fields
+
+The map key, such as `content-guard`, is the entry's stable identity in logs. Each entry accepts these fields:
+
+<ParamField path="middleware" type="string" required={true}>
+  A built-in middleware name, such as `openshell/regex`, or the `name` of a registered service.
+</ParamField>
+
+<ParamField path="endpoints.include" type="string[]" required={true}>
+  Destination hosts to run the middleware for. Uses the same host patterns as network policy endpoints.
+</ParamField>
+
+<ParamField path="endpoints.exclude" type="string[]">
+  Destination hosts to skip. Takes precedence over `include`.
+</ParamField>
+
+<ParamField path="order" type="integer" default="0">
+  Position in the chain when several entries match the same host. Lower values run first. Values must be unique within a policy, so set them explicitly when a policy has more than one entry.
+</ParamField>
+
+<ParamField path="on_error" type="'fail_closed' | 'fail_open'" default="fail_closed">
+  What happens when the middleware fails. Refer to [Choose Failure Behavior](#choose-failure-behavior).
+</ParamField>
+
+<ParamField path="config" type="object">
+  Configuration passed to the middleware. The middleware defines and validates its format.
+</ParamField>
+
+<ParamField path="name" type="string">
+  Display name. Defaults to the map key.
+</ParamField>
+
+[Policy Schema](/reference/policy-schema#network-middleware) lists every field and limit.
+
+## Choose Failure Behavior
+
+Middleware fails when it cannot complete its check, for example when its service is unavailable, times out, returns an invalid result, or receives a payload over its limit. By default, OpenShell blocks the affected request, response, or WebSocket connection. The `on_error` field on a policy entry controls this behavior.
+
+<Warning>
+
+`fail_open` skips failed middleware and lets the traffic continue. Avoid it unless availability matters more than enforcement for that traffic. Future releases may remove it. OpenShell emits a detection finding each time it skips middleware.
+
+</Warning>
+
+A denial from middleware always blocks traffic, regardless of `on_error`. Middleware decisions also stay enforced when the endpoint uses `enforcement: audit`. To observe traffic without blocking it, have your middleware allow the traffic and report findings.
+
+`on_error` does not extend what middleware can inspect. The [current limitations](/extensibility/supervisor-middleware#current-limitations) apply under both settings. With the default behavior, an entry cannot select a `tls: skip` endpoint, because OpenShell cannot inspect that traffic.
+
+## Operate Middleware Services
+
+Middleware services sit on the request path of every sandbox that uses them. Plan their availability accordingly:
+
+- Start registered services before the gateway, and restart the gateway after changing registrations.
+- Keep services available when creating or updating policies. The gateway asks the service to validate its `config` before it accepts a policy.
+- Keep services reachable from sandbox supervisors, which call them directly for each request.
+
+When a running sandbox receives a configuration change, its supervisor validates the new middleware setup before using it. If validation fails, the supervisor keeps its previous setup and emits a configuration failure event.
+
+## Observe Middleware Decisions
+
+OpenShell records middleware activity in its [OCSF logs](/observability/logging):
+
+- Each invocation records the policy entry, middleware name, decision, whether it changed the traffic, and any failure.
+- Failed middleware emits a detection finding, whether OpenShell blocks the traffic or skips the middleware.
+- Coverage events record traffic that selected middleware could not inspect, such as WebSocket binary messages.
+- Configuration changes emit state-change events on success and failure.
+
+For denials and findings, OpenShell logs the middleware name and a validated reason code or finding label. It does not log free-form text from your service. [OCSF JSON Export](/observability/ocsf-json-export) describes how to send these events to other systems.
