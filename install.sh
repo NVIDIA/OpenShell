@@ -61,21 +61,24 @@ ENVIRONMENT VARIABLES:
     OPENSHELL_ACK_BREAKING_UPGRADE
                         Set to 1 only after backing up and cleaning up a
                         pre-v0.0.37 or non-snap installation.
+    OPENSHELL_INSTALL_SNAP
+                        Set to 1 to install the OpenShell snap on Linux. The
+                        snap gateway allows unauthenticated local access.
 
 NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
     from ${GITHUB_URL}/releases/latest.
 
-    On Linux, the installer uses the OpenShell snap when the snap command is
-    available and OPENSHELL_VERSION is unset or dev. Snap installs use
-    latest/stable by default and latest/edge for dev. Explicit release tags
-    and prereleases use Debian or RPM packages. The OpenShell snap requires a
+    Linux installs the Debian package on amd64/arm64 or the RPM packages on
+    x86_64/aarch64, depending on the host package manager.
+
+    The installer uses the OpenShell snap only when OPENSHELL_INSTALL_SNAP=1 is
+    set or an OpenShell snap is already installed, the snap command is
+    available, and OPENSHELL_VERSION is unset or dev. Snap installs use
+    latest/stable by default and latest/edge for dev. The snap gateway allows
+    unauthenticated access from any local user. The OpenShell snap requires a
     running Docker Engine installed from a system package or Docker's package
     repository. The Docker snap is not currently compatible with OpenShell.
-
-    For explicit versions or without snap, Linux installs the Debian package
-    on amd64/arm64 or the RPM packages on x86_64/aarch64, depending on the
-    host package manager.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF
@@ -657,10 +660,18 @@ local_gateway_endpoint() {
   esac
 }
 
+openshell_snap_installed() {
+  snap list openshell >/dev/null 2>&1
+}
+
+# The snap gateway runs as root without client authentication, so new installs
+# use it only on explicit opt-in. Existing snap installs keep refreshing rather
+# than gaining a second gateway on the same port.
 linux_package_method() {
   case "${OPENSHELL_VERSION:-}" in
     '' | dev)
-      if has_cmd snap; then
+      if has_cmd snap \
+        && { [ "${OPENSHELL_INSTALL_SNAP:-0}" = "1" ] || openshell_snap_installed; }; then
         echo "snap"
         return 0
       fi
@@ -1339,6 +1350,8 @@ Install Docker Engine from a system package or Docker's package repository, then
   fi
   info "using existing Docker installation"
   wait_for_docker_daemon
+
+  warn "the OpenShell snap gateway allows unauthenticated access from any local user or process"
 
   _channel="$(openshell_snap_channel)"
   if snap list openshell >/dev/null 2>&1; then

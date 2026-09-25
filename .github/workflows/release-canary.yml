@@ -193,6 +193,8 @@ jobs:
 
   ubuntu-snap-system-docker:
     name: Ubuntu Snap with system Docker
+    env:
+      OPENSHELL_INSTALL_SNAP: "1"
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -260,6 +262,8 @@ jobs:
 
   ubuntu-snap-docker-preflight:
     name: Ubuntu Snap Docker preflight
+    env:
+      OPENSHELL_INSTALL_SNAP: "1"
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
