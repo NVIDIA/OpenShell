@@ -340,18 +340,20 @@ def ordered_entries(
 ) -> list[VersionEntry]:
     by_slug = {entry.slug: entry for entry in existing}
     by_slug[updated.slug] = updated
-    existing_order = [entry.slug for entry in existing if entry.slug != updated.slug]
+    pinned = [by_slug[slug] for slug in ("latest", "dev") if slug in by_slug]
 
-    order: list[str] = []
-    for slug in ("latest", "dev"):
-        if slug in by_slug:
-            order.append(slug)
-    for slug in existing_order:
-        if slug not in order and slug in by_slug:
-            order.append(slug)
-    if updated.slug not in order:
-        order.append(updated.slug)
-    return [by_slug[slug] for slug in order]
+    versioned: list[tuple[Version, VersionEntry]] = []
+    other: list[VersionEntry] = []
+    for entry in by_slug.values():
+        if entry.slug in {"latest", "dev"}:
+            continue
+        try:
+            versioned.append((parse_release_version(entry.slug), entry))
+        except ValueError:
+            other.append(entry)
+
+    versioned.sort(key=lambda item: item[0], reverse=True)
+    return pinned + [entry for _, entry in versioned] + other
 
 
 def render_versions(entries: list[VersionEntry]) -> list[YamlMapping]:
