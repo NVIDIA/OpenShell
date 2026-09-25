@@ -566,15 +566,23 @@ pub async fn run_networking(
     // classify translated addresses by their embedded IPv4 address.
     configure_nat64(nat64_prefixes).await;
 
+    // One decision for every policy DNS runtime this supervisor starts.
+    let ipv6_egress = crate::policy_dns::Ipv6EgressDecision::resolve(
+        policy_dns_ipv6_egress,
+        crate::policy_dns::DefaultRoutes::read(),
+    );
+    #[cfg(target_os = "linux")]
+    let policy_dns_active = network_mediation_source.is_some() || transparent_runtime.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let policy_dns_active = network_mediation_source.is_some();
+    if policy_dns_active {
+        ocsf_emit!(ipv6_egress.event());
+    }
+
     let mediated_policy_dns = if let Some(source) = network_mediation_source.clone() {
         let engine = opa_engine
             .cloned()
             .ok_or_else(|| miette::miette!("Mediated DNS requires an OPA engine"))?;
-        let ipv6_egress = crate::policy_dns::Ipv6EgressDecision::resolve(
-            policy_dns_ipv6_egress,
-            crate::policy_dns::DefaultRoutes::read(),
-        );
-        ocsf_emit!(ipv6_egress.event());
         Some(crate::policy_dns::PolicyDnsRuntime::start_mediated(
             engine,
             source,
@@ -662,7 +670,7 @@ pub async fn run_networking(
             runtime.dns_udp,
             runtime.dns_tcp,
             trusted_gateway,
-            runtime.config,
+            runtime.config.with_ipv6_egress(ipv6_egress.enabled),
             policy_dns_engine_ready_rx,
         )?;
         let transparent = crate::proxy::TransparentTcpHandle::start(
