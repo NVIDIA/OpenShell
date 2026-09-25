@@ -141,7 +141,15 @@ def test_resolve_display_name() -> None:
     assert sdw.resolve_display_name("dev", "dev", "main", "Custom") == "Custom"
 
 
-def test_parse_and_render_versions_removes_legacy_badges() -> None:
+def test_resolve_availability() -> None:
+    assert sdw.resolve_availability("") is None
+    assert sdw.resolve_availability("beta") == "beta"
+    assert sdw.resolve_availability("deprecated") == "deprecated"
+    with pytest.raises(ValueError):
+        sdw.resolve_availability("alpha")
+
+
+def test_parse_and_render_versions_preserves_version_settings() -> None:
     raw_versions = [
         {
             "display-name": "v0.0.36",
@@ -159,17 +167,11 @@ def test_parse_and_render_versions_removes_legacy_badges() -> None:
             "v0.0.36",
             "v0.0.36",
             "./versions/v0.0.36.yml",
+            "deprecated",
             {"message": "Upgrade to the latest version."},
         )
     ]
-    assert sdw.render_versions(entries) == [
-        {
-            "display-name": "v0.0.36",
-            "path": "./versions/v0.0.36.yml",
-            "slug": "v0.0.36",
-            "announcement": {"message": "Upgrade to the latest version."},
-        }
-    ]
+    assert sdw.render_versions(entries) == raw_versions
 
 
 def test_sync_global_announcement_applies_source_config(tmp_path: Path) -> None:
@@ -392,6 +394,7 @@ def test_sync_docs_scopes_version_announcements_to_updated_channel(
             release_version="0.0.116",
             version_slug="",
             display_name="Latest (v0.0.116)",
+            availability="",
         )
     )
     (source / "fern" / "docs.yml").write_text(
@@ -420,6 +423,7 @@ def test_sync_docs_scopes_version_announcements_to_updated_channel(
             release_version="0.0.117.dev56",
             version_slug="",
             display_name="Dev",
+            availability="",
         )
     )
 
@@ -474,6 +478,7 @@ def test_sync_docs_scopes_version_announcements_to_updated_channel(
             release_version="0.1.0",
             version_slug="",
             display_name="Latest (v0.1.0)",
+            availability="",
         )
     )
 
@@ -482,7 +487,9 @@ def test_sync_docs_scopes_version_announcements_to_updated_channel(
     assert versions[1]["announcement"] == {"message": "OpenShell 0.1.0 is coming soon."}
 
 
-def test_sync_docs_removes_existing_version_badges(tmp_path: Path) -> None:
+def test_sync_docs_clears_updated_badge_and_preserves_other_badges(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "source"
     website = tmp_path / "docs-website"
     _make_source_tree(source)
@@ -493,11 +500,17 @@ def test_sync_docs_removes_existing_version_badges(tmp_path: Path) -> None:
             {
                 "versions": [
                     {
+                        "display-name": "Dev",
+                        "path": "./versions/dev.yml",
+                        "slug": "dev",
+                        "availability": "beta",
+                    },
+                    {
                         "display-name": "v0.0.36",
                         "path": "./versions/v0.0.36.yml",
                         "slug": "v0.0.36",
                         "availability": "deprecated",
-                    }
+                    },
                 ]
             }
         ),
@@ -515,6 +528,7 @@ def test_sync_docs_removes_existing_version_badges(tmp_path: Path) -> None:
             release_version="0.0.117.dev56",
             version_slug="",
             display_name="Dev (v0.0.117.dev56)",
+            availability="",
         )
     )
 
@@ -529,6 +543,7 @@ def test_sync_docs_removes_existing_version_badges(tmp_path: Path) -> None:
             "display-name": "v0.0.36",
             "path": "./versions/v0.0.36.yml",
             "slug": "v0.0.36",
+            "availability": "deprecated",
         },
     ]
 
@@ -582,6 +597,7 @@ def test_latest_sync_updates_legacy_snapshot_announcement(tmp_path: Path) -> Non
             release_version="0.0.116",
             version_slug="",
             display_name="Latest (v0.0.116)",
+            availability="",
         )
     )
 
@@ -617,7 +633,6 @@ def test_stable_sync_creates_immutable_version_and_promotes_latest(
                         "display-name": "Dev",
                         "path": "./versions/dev.yml",
                         "slug": "dev",
-                        "availability": "beta",
                     },
                     {
                         "display-name": "v0.0.116",
@@ -640,6 +655,7 @@ def test_stable_sync_creates_immutable_version_and_promotes_latest(
             release_version="0.2.0",
             version_slug="v0.2.0",
             display_name="",
+            availability="",
             allow_rollback=False,
         )
     )
@@ -693,6 +709,7 @@ def test_n_minus_one_sync_does_not_move_latest_backwards(tmp_path: Path) -> None
                 release_version=version,
                 version_slug=f"v{version}",
                 display_name="",
+                availability="",
                 allow_rollback=False,
             )
         )
@@ -749,6 +766,7 @@ def test_stable_sync_preserves_newer_legacy_latest_without_metadata(
             release_version="0.2.7",
             version_slug="v0.2.7",
             display_name="",
+            availability="",
             allow_rollback=False,
         )
     )
@@ -785,6 +803,7 @@ def test_dev_sync_rejects_stale_or_conflicting_updates(tmp_path: Path) -> None:
                 release_version=version,
                 version_slug="",
                 display_name=f"Dev (v{version})",
+                availability="beta",
                 allow_rollback=False,
             )
         )
@@ -819,6 +838,7 @@ def test_dev_sync_allows_explicit_rollback(tmp_path: Path) -> None:
                 release_version=version,
                 version_slug="",
                 display_name=f"Dev (v{version})",
+                availability="beta",
                 allow_rollback=allow_rollback,
             )
         )
@@ -852,6 +872,7 @@ def test_immutable_snapshot_cannot_change_source(tmp_path: Path) -> None:
         release_version="0.2.0",
         version_slug="v0.2.0",
         display_name="",
+        availability="",
         allow_rollback=False,
     )
     sdw.sync_docs(args)
@@ -885,6 +906,7 @@ def test_only_dev_refreshes_shared_fern_files(tmp_path: Path) -> None:
             release_version="0.2.1.dev1",
             version_slug="",
             display_name="Dev (v0.2.1.dev1)",
+            availability="beta",
             allow_rollback=False,
         )
     )
@@ -898,6 +920,7 @@ def test_only_dev_refreshes_shared_fern_files(tmp_path: Path) -> None:
             release_version="0.2.0",
             version_slug="v0.2.0",
             display_name="",
+            availability="",
             allow_rollback=False,
         )
     )
@@ -921,12 +944,14 @@ def test_remove_docs_drops_snapshot(tmp_path: Path) -> None:
         source_sha="release-sha",
         version_slug="v0.0.36",
         display_name="",
+        availability="deprecated",
     )
     sdw.sync_docs(base)
 
     fern = website / "fern"
     assert (fern / "pages-v0.0.36").is_dir()
     assert (fern / "versions" / "v0.0.36.yml").is_file()
+    assert read_yaml(fern / "docs.yml")["versions"][0]["availability"] == "deprecated"
 
     sdw.remove_docs(
         Namespace(
@@ -937,6 +962,7 @@ def test_remove_docs_drops_snapshot(tmp_path: Path) -> None:
             source_ref="",
             version_slug="v0.0.36",
             display_name="",
+            availability="",
         )
     )
 
@@ -963,6 +989,7 @@ def test_immutable_snapshot_uses_resolved_commit_identity(
         release_version="0.2.0" if channel == "stable" else "",
         version_slug="v0.2.0",
         display_name="",
+        availability="",
         allow_rollback=False,
     )
     sdw.sync_docs(args)
@@ -1007,6 +1034,7 @@ def test_stable_promotion_replaces_latest_page_components(tmp_path: Path) -> Non
                 release_version=version,
                 version_slug=f"v{version}",
                 display_name="",
+                availability="",
                 allow_rollback=False,
             )
         )

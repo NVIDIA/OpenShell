@@ -51,7 +51,7 @@ Release Dev waits for the development artifacts and Helm chart, then calls `.git
 
 Release Tag follows the same sequence for a non-prerelease tag after the release artifacts, SDK package, Helm chart, and wheel publication complete. One sync copies the tagged source into both the immutable `vX.Y.Z` snapshot and `latest` when the release is not older than the current version, then publishes the production site once. The version selector pins `latest` and `dev` first, followed by versioned snapshots in descending version order. Other historical entries follow in their existing order.
 
-The selector does not show availability badges. Each sync removes any existing `availability` fields from the generated version list, including the earlier `dev` Beta badge.
+The sync workflow still accepts an optional Fern availability badge, but the current Release Dev and Release Tag jobs do not request one. The next `dev` sync replaces the existing `dev` Beta badge with an unbadged entry. Other entries retain their badge setting until that entry is synced or removed.
 
 The sync and publish workflows share the `docs-website` concurrency group. This serializes writes and publication. Queued runs remain pending instead of replacing one another.
 

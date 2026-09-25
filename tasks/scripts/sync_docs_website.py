@@ -25,6 +25,7 @@ from packaging.version import InvalidVersion, Version
 
 SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 DISPLAY_VERSION_RE = re.compile(r"\bv?(\d+\.\d+\.\d+(?:[.-]?[A-Za-z0-9]+)*)\b")
+VERSION_AVAILABILITIES = {"beta", "deprecated", "ga", "stable"}
 SNAPSHOT_METADATA_FILE = ".docs-snapshots.yml"
 YamlMapping = dict[str, object]
 
@@ -34,6 +35,7 @@ class VersionEntry:
     slug: str
     display_name: str
     path: str
+    availability: str | None = None
     announcement: YamlMapping | None = None
 
 
@@ -52,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--release-version", default="")
     parser.add_argument("--version-slug", default="")
     parser.add_argument("--display-name", default="")
+    parser.add_argument("--availability", default="")
     parser.add_argument("--allow-rollback", action="store_true")
     return parser.parse_args()
 
@@ -86,6 +89,18 @@ def resolve_display_name(
     if channel == "latest":
         return f"Latest ({source_ref})" if source_ref.startswith("v") else "Latest"
     return slug
+
+
+def resolve_availability(override: str) -> str | None:
+    availability = override
+    if not availability:
+        return None
+    if availability not in VERSION_AVAILABILITIES:
+        supported = ", ".join(sorted(VERSION_AVAILABILITIES))
+        raise ValueError(
+            f"unsupported version availability {availability!r}; expected one of: {supported}"
+        )
+    return availability
 
 
 def parse_release_version(value: str) -> Version:
@@ -291,6 +306,7 @@ def parse_versions(raw_versions: object) -> list[VersionEntry]:
         slug = entry.get("slug")
         display_name = entry.get("display-name")
         path = entry.get("path")
+        availability = entry.get("availability")
         announcement = entry.get("announcement")
         if (
             isinstance(slug, str)
@@ -302,6 +318,9 @@ def parse_versions(raw_versions: object) -> list[VersionEntry]:
                     slug=slug,
                     display_name=display_name,
                     path=path,
+                    availability=availability
+                    if isinstance(availability, str)
+                    else None,
                     announcement=cast("YamlMapping", announcement)
                     if isinstance(announcement, dict)
                     else None,
@@ -339,6 +358,8 @@ def render_versions(entries: list[VersionEntry]) -> list[YamlMapping]:
             "path": entry.path,
             "slug": entry.slug,
         }
+        if entry.availability is not None:
+            item["availability"] = entry.availability
         if entry.announcement is not None:
             item["announcement"] = entry.announcement
         rendered.append(item)
@@ -460,12 +481,14 @@ def sync_docs(args: argparse.Namespace) -> None:
     release_version = clean_input(getattr(args, "release_version", ""))
     version_slug = clean_input(args.version_slug)
     display_override = clean_input(args.display_name)
+    availability_override = clean_input(args.availability)
     if channel in {"dev", "latest", "stable"} and not release_version:
         raise ValueError(
             "--release-version is required for dev, latest, and stable channels"
         )
     slug = resolve_slug(channel, version_slug)
     display_name = resolve_display_name(channel, slug, source_ref, display_override)
+    availability = resolve_availability(availability_override)
     metadata_path = target_fern / SNAPSHOT_METADATA_FILE
     snapshots = read_snapshot_metadata(metadata_path)
     docs_yml = target_fern / "docs.yml"
@@ -484,6 +507,7 @@ def sync_docs(args: argparse.Namespace) -> None:
                 slug=slug,
                 display_name=slug,
                 path=f"./versions/{slug}.yml",
+                availability=availability,
                 announcement=source_version_announcement(
                     source_fern / "docs.yml", slug
                 ),
@@ -512,6 +536,7 @@ def sync_docs(args: argparse.Namespace) -> None:
                     slug="latest",
                     display_name=display_override or f"Latest ({slug})",
                     path="./versions/latest.yml",
+                    availability=availability,
                     announcement=source_version_announcement(
                         source_fern / "docs.yml", "latest"
                     ),
@@ -553,6 +578,7 @@ def sync_docs(args: argparse.Namespace) -> None:
             slug=slug,
             display_name=display_name,
             path=f"./versions/{slug}.yml",
+            availability=availability,
             announcement=source_version_announcement(source_fern / "docs.yml", slug),
         ),
         refresh_shared=channel == "dev",
