@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Manage Sandbox Policies"
 sidebar-title: "Manage Policies"
-description: "Use the OpenShell CLI to set, inspect, change, verify, and roll back sandbox policies, apply a gateway-wide policy, and troubleshoot policy problems."
+description: "Use the OpenShell CLI to set, inspect, change, verify, and roll back sandbox policies, apply a global policy, and troubleshoot policy problems."
 keywords: "Generative AI, Cybersecurity, Policy, Sandbox, CLI, Hot Reload, Revision"
 position: 3
 ---
@@ -55,10 +55,10 @@ does not fall back to the default policy.
 
 A sandbox's policy has two views. The base policy is the policy you set for the
 sandbox. The effective policy is the policy the sandbox enforces, which is the
-base policy plus any rules that attached providers add. When an administrator
-sets a gateway-global policy, it replaces both, so the effective policy is the
-global policy. `--base` shows the base policy, and `--full` shows the effective
-policy:
+base policy plus any rules that attached providers add. When a gateway
+administrator sets a global policy, it replaces both, so the effective policy is
+the global policy. `--base` shows the base policy, and `--full` shows the
+effective policy:
 
 ```shell
 openshell policy get my-sandbox --base
@@ -218,24 +218,26 @@ repair a rejected change.
 ## Change Filesystem and Process Settings
 
 Filesystem, Landlock, and process settings take effect only when a sandbox
-starts, so changing them requires a new sandbox. To change these settings, save
-the base policy as described in [Replace the Complete
-Policy](#replace-the-complete-policy), edit it, and create a new sandbox with
-the file:
+starts, so changing them requires a new sandbox. Save the base policy as
+described in [Replace the Complete Policy](#replace-the-complete-policy), and
+edit these settings in the file.
+
+When the policy allows network access, OpenShell adds the system paths that
+sandbox processes need, so list only the paths your workload requires. [Baseline
+Filesystem Paths](/reference/default-policy#baseline-filesystem-paths) lists
+those paths.
 
 <Warning>
 Deleting a sandbox stops its processes and removes its state. Copy out anything
 you need before you delete it.
 </Warning>
 
+Delete the sandbox and create a new one with the edited file:
+
 ```shell
 openshell sandbox delete my-sandbox
 openshell sandbox create --name my-sandbox --policy ./policy.yaml
 ```
-
-When the policy allows network access, OpenShell adds the system paths that
-sandbox processes need, so list only the paths your workload requires. [Default
-Policy](/reference/default-policy) lists those paths.
 
 ## Verify a Change
 
@@ -280,10 +282,10 @@ openshell policy set my-sandbox --policy previous-base.yaml --wait
 ```
 
 Rolling back restores only the policy. It does not restore provider profiles,
-attachments, credentials, or a gateway-global policy, and the limits on
+attachments, credentials, or a global policy, and the limits on
 filesystem and process changes still apply.
 
-## Apply a Gateway-Wide Policy
+## Apply a Global Policy
 
 A gateway administrator can apply one policy to every sandbox on the gateway.
 The global policy replaces each sandbox's policy and blocks sandbox policy
@@ -361,5 +363,9 @@ openshell sandbox start my-sandbox
 
 - Use [Network Rules](/sandboxes/network-rules) for example rules you can adapt
   to common services and protocols.
+- Use the [Policy Prover](/reference/policy-prover) to check that a policy
+  grants no more access than a boundary you define.
+- Use the [Policy Advisor](/sandboxes/policy-advisor) to let an agent propose
+  the network rules it needs for your review.
 - Use the [Policy Schema Reference](/reference/policy-schema) for every field,
   default, and constraint.

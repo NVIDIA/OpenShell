@@ -357,8 +357,8 @@ mcp:
 OpenShell reads the revision from each request's `MCP-Protocol-Version` header,
 or uses `2025-03-26` when the header is absent. A duplicate, empty, or
 unsupported header value returns `400`, and a supported revision that the
-endpoint does not allow returns `403`. For a client that requires an unsupported revision, omit `protocol` and
-`mcp` to allow its traffic without MCP inspection.
+endpoint does not allow returns `403`. For a client that requires an unsupported
+revision, omit `protocol` and `mcp` to allow its traffic without MCP inspection.
 
 ### JSON-RPC Rules
 

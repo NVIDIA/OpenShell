@@ -31,6 +31,10 @@ different part of the sandbox and takes effect at a specific time:
 | `network_policies` | Destinations each binary can reach, and the requests it can send. | Sandbox network proxy. | While the sandbox runs. |
 | `network_middlewares` | Additional inspection or transformation of allowed network traffic. | Sandbox network proxy. | While the sandbox runs. |
 
+Filesystem, Landlock, and process settings are fixed once the sandbox starts.
+Network rules and middleware can change while it runs, as described in [How
+Changes Take Effect](/sandboxes/manage-policies#how-changes-take-effect).
+
 Network rules make up most of a typical policy. OpenShell denies every outbound
 connection from a sandbox unless a rule in `network_policies` allows it. Each
 rule lists the destinations it allows and the binaries that can reach them, and
@@ -38,13 +42,9 @@ can also restrict the requests those binaries send, for example to allow reading
 from an API but not writing to it. [Network Rules](/sandboxes/network-rules)
 explains how OpenShell evaluates rules and gives examples you can adapt.
 
-The startup sections are fixed once the sandbox starts. The network sections
-can change while it runs, as described in [How Changes Take
-Effect](/sandboxes/manage-policies#how-changes-take-effect). The [Policy Schema
-Reference](/reference/policy-schema)
-describes the complete file format, and [Supervisor
-Middleware](/extensibility/supervisor-middleware) explains how middleware
-processes traffic.
+The [Policy Schema Reference](/reference/policy-schema) describes every field in
+each section, and [Supervisor Middleware](/extensibility/supervisor-middleware)
+explains how middleware processes traffic.
 
 ## Where the Active Policy Comes From
 
@@ -52,7 +52,7 @@ Every sandbox runs under a policy, even when you do not supply one. When more
 than one policy is available, OpenShell uses the first applicable source in this
 order:
 
-1. A gateway-global policy set by an administrator.
+1. A global policy, which a gateway administrator applies to every sandbox.
 2. The sandbox's saved policy. At creation, `--policy` takes precedence over
    `OPENSHELL_SANDBOX_POLICY`. Later policy changes update the saved policy.
 3. A policy included in the sandbox image.
@@ -73,15 +73,15 @@ your own configuration. Inspect the effective policy when you need to know what
 the sandbox can reach. [Inspect the Current
 Policy](/sandboxes/manage-policies#inspect-the-current-policy) shows both views.
 
-### Gateway-Global Policy
+### Global Policy
 
 A gateway administrator can apply one policy to every sandbox on the gateway.
 The global policy replaces each sandbox's policy. It is not a ceiling
 intersected with existing grants. While it is active, sandbox policy changes are
 blocked and provider-contributed network rules are suppressed. Deleting the
 global policy restores normal policy selection and provider rules. Refer to
-[Apply a Gateway-Wide
-Policy](/sandboxes/manage-policies#apply-a-gateway-wide-policy) for the
+[Apply a Global
+Policy](/sandboxes/manage-policies#apply-a-global-policy) for the
 commands.
 
 ## Next Steps
@@ -90,7 +90,9 @@ commands.
   evaluates network rules and to adapt examples for common services.
 - Use [Manage Sandbox Policies](/sandboxes/manage-policies) to create, update,
   verify, and roll back policies.
-- Use [Policy Advisor](/sandboxes/policy-advisor) to let an agent propose narrow
-  network changes for your review.
+- Use the [Policy Prover](/reference/policy-prover) to check that a policy
+  grants no more access than a boundary you define.
+- Use the [Policy Advisor](/sandboxes/policy-advisor) to let an agent propose
+  narrow network rules for your review.
 - Use the [Policy Schema Reference](/reference/policy-schema) for every field,
   default, and validation rule.

@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Policy Advisor"
 sidebar-title: "Policy Advisor"
-description: "Let an agent in a sandbox propose the network rule it needs when OpenShell blocks a request, and review each proposal before it takes effect."
+description: "Let an agent in a sandbox propose the network rule it needs when OpenShell blocks a request, and control which proposals take effect."
 keywords: "Generative AI, Cybersecurity, Policy Advisor, Policy, Sandbox, policy.local, Agent Policy"
 position: 5
 ---
@@ -38,10 +38,11 @@ A proposal goes through these steps:
    path.
 3. OpenShell validates the proposal and checks it for added risk in two ways.
    The policy prover runs a proposal risk check, which compares what the
-   sandbox could reach with and without the rule. OpenShell also flags destinations that are often risky, such as
-   private network addresses and wildcard hosts. OpenShell then adds the
-   proposal and the results of both checks to the sandbox's pending proposals.
-   Refer to [Proposal Risk Check](#proposal-risk-check).
+   sandbox could reach with and without the rule. OpenShell also flags
+   destinations that are often risky, such as private network addresses and
+   wildcard hosts. OpenShell then adds the proposal and the results of both
+   checks to the sandbox's pending proposals. Refer to [Proposal Risk
+   Check](#proposal-risk-check).
 4. You approve or reject the proposal. With automatic approval turned on,
    OpenShell approves a proposal that passes its risk checks without waiting for
    you.
@@ -176,10 +177,9 @@ The policy advisor uses the [policy prover](/reference/policy-prover) to run a
 proposal risk check on every proposal. Unlike the boundary check that the
 `openshell-prover` CLI runs, it does not compare a policy with a boundary that
 you write. It compares what the sandbox can reach with and without the proposed
-rule. The check accounts for the credentials of
-attached providers and for binaries whose traffic OpenShell cannot inspect. It
-reports a finding when the rule would give a binary new access of one of these
-kinds:
+rule. The check accounts for the credentials of attached providers and for
+binaries whose traffic OpenShell cannot inspect. It reports a finding when the
+rule would give a binary new access of one of these kinds:
 
 | Finding | The proposed rule would let a binary |
 |---|---|
@@ -189,8 +189,8 @@ kinds:
 | `capability_expansion` | Use a new HTTP method at a host and port where it already uses a provider credential. |
 
 A proposal with any prover finding or flagged destination needs your review,
-even in automatic mode. When you reject a proposal, the agent receives the findings with
-your reason, so it can narrow its next attempt.
+even in automatic mode. When you reject a proposal, the agent receives the
+findings with your reason, so it can narrow its next attempt.
 
 ## What Agents Can Propose
 
@@ -263,16 +263,15 @@ The agent uses these endpoints at `http://policy.local`:
 | `GET /v1/proposals/{chunk_id}` | Returns a proposal's status: `pending`, `approved`, or `rejected`. |
 | `GET /v1/proposals/{chunk_id}/wait?timeout=300` | Waits until the proposal is approved or rejected, or until the timeout expires. |
 
+After an approval, the `/wait` response reports `policy_reloaded: true` once the
+sandbox has loaded the new rule. OpenShell closes connections opened under the
+previous rules, so the agent's retry uses the new rule.
+
 When the policy advisor is disabled, every route returns `404 feature_disabled`,
 new sandboxes do not receive the guide, and denial responses do not mention
 `policy.local`.
 
 ## Logs
-
-An approved network rule takes effect in the running sandbox without a restart.
-OpenShell closes connections opened under the previous rules, so the agent's
-retry uses the new rule. The `/wait` endpoint reports `policy_reloaded: true`
-once the sandbox has loaded the approved rule.
 
 To follow a proposal in the sandbox log, run:
 

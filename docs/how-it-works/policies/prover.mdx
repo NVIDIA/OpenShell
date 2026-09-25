@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Policy Prover"
 sidebar-title: "Policy Prover"
-description: "Understand how OpenShell uses the policy prover, and check that a policy grants no more access than a maximum policy you define."
+description: "Understand how OpenShell uses the policy prover, and check that a policy grants no more access than a boundary policy you define."
 keywords: "Generative AI, Cybersecurity, Policy, Prover, Boundary, Subagent"
 position: 4
 ---
@@ -160,9 +160,9 @@ running sandbox enforces it.
 The check currently covers five parts of a policy. Within each part, some
 comparisons depend on information that the prover does not have, such as the
 files in the sandbox image. For those comparisons, the prover returns
-`unsupported` instead of guessing. Very large policies, for example with more than 1,024 network rules
-or 4,096 endpoints across both files, return `inconclusive` with the
-`reason_code` `resource_limit`.
+`unsupported` instead of guessing. Very large policies, for example with more
+than 1,024 network rules or 4,096 endpoints across both files, return
+`inconclusive` with the `reason_code` `resource_limit`.
 
 ### Filesystem Access
 
