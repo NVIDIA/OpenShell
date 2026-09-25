@@ -29,7 +29,7 @@ network_policies:
       - { path: /usr/local/bin/claude }
 ```
 
-No `protocol`, `rules`, or `access` — the endpoint has no method or path rules, so any request to host:port from the listed binary is allowed. It is not a raw tunnel: the proxy still terminates TLS, parses HTTP strictly, and rejects requests whose authority does not match the endpoint. Use `tls: skip` only for traffic that must bypass TLS termination and HTTP parsing.
+No `protocol`, `rules`, or `access` — the endpoint has no method or path rules, so any request to host:port from the listed binary is allowed. With default TLS handling, the proxy terminates detected TLS and rejects parsed HTTP requests whose authority does not match the endpoint, but other CONNECT payloads, such as HTTP/2 prior knowledge or non-HTTP protocols, can pass through a raw relay. `tls: skip` also bypasses TLS termination and HTTP parsing.
 
 ---
 
@@ -579,7 +579,7 @@ network_policies:
       - { path: /usr/local/bin/claude }
 ```
 
-**Note**: The first policy has no `protocol` field, so it applies no method or path rules. The proxy still terminates TLS, parses each HTTP request strictly, and checks that the request authority matches the endpoint. The second policy has `protocol: rest`, so every HTTP request is also checked against the `read-only` preset.
+**Note**: The first policy has no `protocol` field, so it applies no method or path rules. With default TLS handling, the proxy still terminates detected TLS and checks the authority of the HTTP requests it parses, but other CONNECT payloads can pass through a raw relay. The second policy has `protocol: rest`, so every HTTP request is also checked against the `read-only` preset.
 
 ---
 
