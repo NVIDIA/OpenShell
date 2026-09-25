@@ -37,26 +37,7 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 openshell sandbox create --name demo
 ```
 
-The installer sets up the CLI and a local gateway. The default sandbox image is minimal Ubuntu with no agent installed. To run a real agent, follow [Run Your First Agent](https://docs.nvidia.com/openshell/latest/about/run-your-first-agent) to pick an image, attach providers, and write a policy.
-
-## Policy in Action
-
-Sandboxes start with minimal outbound access. This read-only GitHub rule lets `curl` fetch from the API but blocks writes, and applies without restarting the sandbox:
-
-```shell
-sandbox$ curl -sS https://api.github.com/zen
-curl: (56) Received HTTP code 403 from proxy after CONNECT
-
-$ openshell policy update demo --rule-name github_api --binary /usr/bin/curl \
-    --add-endpoint api.github.com:443:read-only:rest:enforce --wait
-
-sandbox$ curl -sS https://api.github.com/zen
-Anything added dilutes everything else.
-sandbox$ curl -sS -X POST https://api.github.com/repos/octocat/hello-world/issues -d '{"title":"oops"}'
-{...,"error":"policy_denied",...,"policy":"github_api",...,"rule":"POST /repos/octocat/hello-world/issues",...}
-```
-
-Walk through it in the [First Network Policy tutorial](https://docs.nvidia.com/openshell/latest/tutorials/first-network-policy), or run `bash examples/sandbox-policy-quickstart/demo.sh`.
+The installer sets up the CLI and a local gateway. The default sandbox image is minimal Ubuntu with no agent installed. To run a real agent, follow [Run Your First Agent](https://docs.nvidia.com/openshell/latest/about/run-your-first-agent): it runs OpenCode against a free OpenRouter model and shows how to approve new access as the agent needs it.
 
 ## Explore Further
 
@@ -68,7 +49,16 @@ Walk through it in the [First Network Policy tutorial](https://docs.nvidia.com/o
 - [Extensibility](https://docs.nvidia.com/openshell/latest/extensibility/overview): middleware, interceptors, and compute drivers.
 - [Tutorials](https://docs.nvidia.com/openshell/latest/tutorials/first-network-policy): step-by-step policy and agent walkthroughs.
 - [Prerelease and development builds](https://docs.nvidia.com/openshell/latest/about/installation#prerelease-and-development-builds): try an upcoming release or the latest commit on `main`.
-- Agent skills: `npx skills add NVIDIA/OpenShell` installs the public OpenShell skills for your coding agent.
+
+## Agent Skills
+
+Install the public OpenShell skills for your coding agent:
+
+```shell
+npx skills add NVIDIA/OpenShell
+```
+
+The skills teach your agent to drive the OpenShell CLI, write sandbox policies, and debug gateways and inference routing. They live in [`skills/`](skills/) and work without an OpenShell source checkout.
 
 ## SDKs
 
