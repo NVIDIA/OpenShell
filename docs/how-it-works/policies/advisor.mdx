@@ -51,9 +51,12 @@ A proposal goes through these steps:
    your reason and can submit a narrower proposal.
 
 OpenShell also drafts proposals on its own from connections that it blocks, in
-every sandbox, whether or not the policy advisor is enabled. Each draft allows
-one binary to reach one host and port. Drafts go through the same checks and
-review as proposals from the agent, and automatic approval applies to them too.
+every sandbox, whether or not the policy advisor is enabled. This includes
+connections to hostnames that no rule names. Each draft allows one binary to
+reach one host and port. Drafts go through the same checks and review as
+proposals from the agent, and automatic approval applies to them too. The
+blocked request stays denied, so retry it after OpenShell approves the draft and
+loads the new rule.
 
 When the policy advisor is enabled, OpenShell adds the following to the sandbox
 so the agent can find and use it:
@@ -65,8 +68,8 @@ so the agent can find and use it:
   already have one, `/AGENTS.md`.
 - The `policy.local` API, which the agent uses to read the current policy and
   recent denials, submit proposals, and wait for decisions. OpenShell serves it
-  at `http://policy.local`, which is reachable only from inside the sandbox.
-  Refer to [Agent API](#agent-api).
+  at `http://policy.local`, which is reachable only from inside the sandbox and
+  needs no network rule or proxy setting. Refer to [Agent API](#agent-api).
 - Instructions in the response to each denied HTTP request on an inspected
   endpoint, which point the agent to the guide and the API.
 

@@ -597,8 +597,10 @@ the same connection, because OpenShell cannot check which service a non-HTTP
 payload addresses.
 
 OpenShell answers DNS queries for the hosts in your rules with placeholder
-addresses whose TTL is at most 30 seconds. Clients must resolve the hostname
-again before reconnecting. A client that caches an address indefinitely can fail
+addresses whose TTL is at most 30 seconds. This applies to every endpoint, not
+only `protocol: tcp`. The sandbox applies no DNS search domains, so request each
+hostname exactly as your rules name it. Clients must resolve the hostname again
+before reconnecting. A client that caches an address indefinitely can fail
 after it expires, even while the endpoint remains allowed. OpenShell returns an
 empty answer to AAAA queries, so dual-stack clients must fall back to the A
 record.
