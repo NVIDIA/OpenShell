@@ -205,9 +205,11 @@ Runtime layout:
   `GLIBC_2.28`. Image defaults remain UID 0 and working directory `/`; compute
   drivers set the runtime identity and writable mounts. Docker stages private
   files with the same numeric identity as the supervisor so archive uploads
-  preserve access regardless of the base image's default user. Health probes execute
-  the supervisor binary directly. Base updates require refreshing the
-  multi-architecture digest and rebuilding the image.
+  preserve access regardless of the base image's default user. Docker and Podman
+  health checks execute the supervisor binary directly. Kubernetes uses a kubelet
+  `tcpSocket` readiness probe on supervisor port 5501 instead, so the probe does
+  not start a process in every sandbox each period. Base updates require
+  refreshing the multi-architecture digest and rebuilding the image.
 
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.

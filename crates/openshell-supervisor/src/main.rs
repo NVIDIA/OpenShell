@@ -84,6 +84,10 @@ struct Args {
     #[arg(long, env = "OPENSHELL_HEALTH_SOCKET_PATH")]
     health_socket_path: Option<PathBuf>,
 
+    /// TCP port that accepts connections only while the supervisor is ready.
+    #[arg(long, env = "OPENSHELL_HEALTH_PORT")]
+    health_port: Option<u16>,
+
     #[arg(long)]
     upstream_proxy: Option<String>,
 
@@ -234,6 +238,7 @@ fn validate_role_arguments(args: &Args) -> Result<()> {
                 || args.openshell_endpoint.is_some()
                 || args.ssh_socket_path.is_some()
                 || args.health_socket_path.is_some()
+                || args.health_port.is_some()
                 || args.main_exit_marker.is_some()
                 || args.parent_liveness_fd.is_some()
             {
@@ -439,6 +444,7 @@ fn main() -> Result<()> {
                     args.policy_data,
                     args.ssh_socket_path,
                     args.health_socket_path,
+                    args.health_port,
                     ocsf_enabled,
                     ocsf_schema_version,
                     upstream_proxy_args,

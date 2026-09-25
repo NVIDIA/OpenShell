@@ -117,7 +117,9 @@ The driver creates each sandbox generation in a fail-closed order:
    generation.
 5. Remove both scheduling gates.
 6. Publish readiness only after the supervisor attaches, confirms enforcement,
-   and registers the gateway relay.
+   and registers the gateway relay. The supervisor accepts TCP connections on
+   port 5501 only while its gateway session is ready, and the supervisor Pod's
+   `tcpSocket` readiness probe checks that port.
 
 The trusted sandbox init container copies its Secret into a memory-backed
 volume. The main container never mounts the projected Secret and removes the
@@ -149,6 +151,9 @@ This architecture requires the following cluster behavior:
 - Support for Pod scheduling gates and the safe
   `net.ipv4.ip_unprivileged_port_start=0` sysctl.
 - Administrative control of sandbox namespaces and OpenShell role labels.
+- Kubelet reachability to supervisor Pods on TCP port 5501 for readiness probes.
+  If you add a default-deny ingress policy to sandbox namespaces, allow that
+  port from the node.
 
 OpenShell actively probes the Linux primitives and validates the admitted Pod
 before starting the agent. Treat a failed probe or changed security posture as
