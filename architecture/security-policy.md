@@ -6,7 +6,7 @@ policy proxy. The gateway stores and delivers policy, but it does not make
 per-request egress decisions.
 
 For the field-by-field YAML reference, use
-[Policy Schema Reference](../docs/reference/policy-schema.mdx).
+[Policy Schema Reference](../docs/how-it-works/policies/schema.mdx).
 
 ## Policy Areas
 
@@ -434,7 +434,7 @@ reported modeled domains. See the `openshell-prover` crate README for the
 supported construction and matching patterns.
 
 This containment operation is separate from the proposal-risk queries below.
-See the [standalone policy prover documentation](../docs/reference/policy-prover.mdx)
+See the [standalone policy prover documentation](../docs/how-it-works/policies/prover.mdx)
 for installation, command behavior, model limitations, evidence, and exit codes.
 
 ## What the proposal prover decides

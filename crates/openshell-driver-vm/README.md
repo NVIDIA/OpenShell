@@ -13,7 +13,7 @@ encoded in driver JSON. GPU devices and their trusted VFIO plumbing are
 temporarily exempt from approval labels; existing GPU selection validation
 still applies. Private rootfs staging does not authorize arbitrary host paths.
 The gateway passes its common policy to its managed VM subprocess.
-See [resource admission configuration](../../docs/reference/gateway-config.mdx#external-resource-admission).
+See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission).
 
 ```mermaid
 flowchart LR

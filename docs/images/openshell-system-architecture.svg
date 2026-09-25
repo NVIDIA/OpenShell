@@ -51,9 +51,9 @@
 
   <text x="45" y="326" class="section">GATEWAY (CONTROL PLANE)</text>
   <rect x="40" y="340" width="360" height="460" rx="18" class="soft"/>
-  <rect x="85" y="390" width="290" height="90" rx="14" class="dark"/>
-  <text x="230" y="428" text-anchor="middle" style="font:700 20px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#fff">API Server</text>
-  <text x="230" y="454" text-anchor="middle" style="font:500 13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#d1d5db">API, authentication, lifecycle, relays</text>
+  <rect x="85" y="390" width="290" height="90" rx="14" class="trusted"/>
+  <text x="230" y="428" text-anchor="middle" class="label">API Server</text>
+  <text x="230" y="454" text-anchor="middle" class="small">API, authentication, lifecycle, relays</text>
   <rect x="85" y="540" width="290" height="95" rx="14" class="box"/>
   <text x="230" y="578" text-anchor="middle" class="label">Durable state</text>
   <text x="230" y="605" text-anchor="middle" class="small">sandboxes · policies · providers · settings</text>
@@ -76,36 +76,33 @@
   <line x1="565" y1="630" x2="735" y2="630" stroke="#bfdbfe" stroke-width="1.5"/>
   <text x="650" y="662" text-anchor="middle" class="small">Maintains the gateway session</text>
 
-  <rect x="880" y="390" width="315" height="310" rx="18" fill="#ffffff" stroke="#76b900" stroke-width="3" stroke-dasharray="10 7"/>
+  <rect x="880" y="390" width="315" height="270" rx="18" fill="#ffffff" stroke="#76b900" stroke-width="3" stroke-dasharray="10 7"/>
   <text x="1037" y="423" text-anchor="middle" class="tiny">SANDBOX · NETWORK ISOLATED</text>
   <text x="1037" y="442" text-anchor="middle" class="tiny">(CONTAINER · VM)</text>
   <rect x="910" y="452" width="255" height="86" rx="14" class="box"/>
   <text x="1037" y="489" text-anchor="middle" class="label">OpenShell Sandbox</text>
   <text x="1037" y="514" text-anchor="middle" class="small">process owner and syscall boundary</text>
-  <rect x="892" y="548" width="132" height="66" rx="9" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1.5"/>
-  <text x="958" y="567" text-anchor="middle" class="tiny">Child process</text>
-  <text x="958" y="586" text-anchor="middle" class="tiny">Syscall mediation</text>
-  <text x="958" y="605" text-anchor="middle" class="tiny">Binary identification</text>
-  <rect x="910" y="625" width="255" height="60" rx="14" class="dark"/>
-  <text x="1037" y="652" text-anchor="middle" style="font:700 18px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#fff">Agent</text>
-  <text x="1037" y="673" text-anchor="middle" style="font:500 13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#d1d5db">untrusted workload</text>
-  <path d="M1037 538 V625" class="line"/>
+  <rect x="910" y="570" width="255" height="60" rx="14" class="dark"/>
+  <text x="1037" y="597" text-anchor="middle" style="font:700 18px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#fff">Agent</text>
+  <text x="1037" y="618" text-anchor="middle" style="font:500 13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#d1d5db">untrusted workload</text>
+  <path d="M1037 538 V570" class="line"/>
 
   <path d="M910 495 H770" class="flow"/>
   <text x="840" y="474" text-anchor="middle" class="tiny">MEDIATED CHANNEL</text>
-  <path d="M1037 685 V690" class="blocked"/>
-  <line x1="1028" y1="691" x2="1046" y2="709" stroke="#c2413b" stroke-width="3"/>
-  <line x1="1046" y1="691" x2="1028" y2="709" stroke="#c2413b" stroke-width="3"/>
+  <path d="M1037 630 V651" class="blocked"/>
+  <line x1="1028" y1="651" x2="1046" y2="669" stroke="#c2413b" stroke-width="3"/>
+  <line x1="1046" y1="651" x2="1028" y2="669" stroke="#c2413b" stroke-width="3"/>
 
-  <rect x="880" y="720" width="315" height="65" rx="12" fill="#f2f9e8" stroke="#76b900" stroke-width="2"/>
-  <text x="1037" y="741" text-anchor="middle" class="tiny">WORKLOAD NETWORK RULE</text>
-  <text x="1037" y="763" text-anchor="middle" class="label">Deny all egress</text>
-  <text x="1037" y="782" text-anchor="middle" class="label">except to the supervisor</text>
+  <rect x="880" y="690" width="315" height="84" rx="12" class="green"/>
+  <text x="1037" y="714" text-anchor="middle" class="tiny">WORKLOAD NETWORK RULE</text>
+  <text x="1037" y="739" text-anchor="middle" class="label">Deny all egress</text>
+  <text x="1037" y="760" text-anchor="middle" class="small">except to the supervisor</text>
 
   <path d="M420 250 V286 H330 V390" class="line"/>
   <text x="438" y="279" class="tiny">gRPC / HTTP</text>
   <path d="M530 500 H420 V435 H375" class="line"/>
-  <text x="475" y="482" text-anchor="middle" class="tiny">OUTBOUND SESSION</text>
+  <text x="465" y="468" text-anchor="middle" class="tiny">OUTBOUND</text>
+  <text x="465" y="484" text-anchor="middle" class="tiny">SESSION</text>
   <path d="M375 735 H480" class="line"/>
   <text x="427" y="717" text-anchor="middle" class="tiny">PROVISION</text>
 

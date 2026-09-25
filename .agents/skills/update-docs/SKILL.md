@@ -50,20 +50,20 @@ For each relevant commit, determine which doc page(s) it affects. Use this mappi
 
 | Code area | Likely doc page(s) |
 |---|---|
-| `crates/openshell-cli/` (gateway commands) | `docs/sandboxes/manage-gateways.mdx` |
-| `crates/openshell-cli/` (sandbox commands) | `docs/sandboxes/manage-sandboxes.mdx` |
-| `crates/openshell-cli/` (provider commands) | `docs/sandboxes/manage-providers.mdx` |
+| `crates/openshell-cli/` (gateway commands) | `docs/how-it-works/gateways/overview.mdx` |
+| `crates/openshell-cli/` (sandbox commands) | `docs/how-it-works/sandboxes/overview.mdx` |
+| `crates/openshell-cli/` (provider commands) | `docs/how-it-works/providers/overview.mdx` |
 | `crates/openshell-cli/` (new top-level command) | May need a new page or `docs/reference/` entry |
-| `crates/openshell-server/src/config_file.rs` or gateway TOML parsing | `docs/reference/gateway-config.mdx` |
-| `crates/openshell-server/src/cli.rs` gateway config merge/default behavior | `docs/reference/gateway-config.mdx` |
-| `crates/openshell-driver-*/` config structs or driver defaults | `docs/reference/gateway-config.mdx`, `docs/reference/sandbox-compute-drivers.mdx` |
-| `deploy/helm/openshell/templates/gateway-config.yaml` | `docs/reference/gateway-config.mdx`, `docs/reference/sandbox-compute-drivers.mdx`, Helm docs if values change |
-| Proxy or policy code | `docs/sandboxes/policies.mdx`, `docs/reference/policy-schema.mdx` |
+| `crates/openshell-server/src/config_file.rs` or gateway TOML parsing | `docs/how-it-works/gateways/configuration.mdx` |
+| `crates/openshell-server/src/cli.rs` gateway config merge/default behavior | `docs/how-it-works/gateways/configuration.mdx` |
+| `crates/openshell-driver-*/` config structs or driver defaults | `docs/how-it-works/gateways/configuration.mdx`, `docs/how-it-works/sandboxes/runtimes.mdx` |
+| `deploy/helm/openshell/templates/gateway-config.yaml` | `docs/how-it-works/gateways/configuration.mdx`, `docs/how-it-works/sandboxes/runtimes.mdx`, Helm docs if values change |
+| Proxy or policy code | `docs/how-it-works/policies/overview.mdx`, `docs/how-it-works/policies/schema.mdx` |
 | Inference code | `docs/inference/configure.mdx` |
 | `python/` (SDK changes) | `docs/reference/` or `docs/get-started/quickstart.mdx` |
 | `proto/` (API changes) | `docs/reference/` |
-| `deploy/` (Dockerfile, Helm) | `docs/sandboxes/manage-gateways.mdx`, `docs/about/architecture.mdx` |
-| Sandbox image behavior | `docs/sandboxes/manage-sandboxes.mdx` |
+| `deploy/` (Dockerfile, Helm) | `docs/how-it-works/gateways/overview.mdx`, `docs/about/architecture.mdx` |
+| Sandbox image behavior | `docs/how-it-works/sandboxes/overview.mdx` |
 
 If a commit does not map to any existing page but introduces a user-visible concept, flag it as needing a new page.
 
@@ -135,8 +135,8 @@ After drafting all updates, present a summary to the user:
 ## Doc Updates from Commits
 
 ### Updated pages
-- `docs/sandboxes/manage-gateways.mdx`: Added `--gpu` flag documentation (from commit abc1234).
-- `docs/reference/policy-schema.mdx`: Updated network policy schema for new `tls_inspect` field (from commit def5678).
+- `docs/how-it-works/gateways/overview.mdx`: Added `--gpu` flag documentation (from commit abc1234).
+- `docs/how-it-works/policies/schema.mdx`: Updated network policy schema for new `tls_inspect` field (from commit def5678).
 
 ### New pages needed
 - None (or list any new pages created).

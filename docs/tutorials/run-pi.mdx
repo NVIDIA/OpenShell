@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Run Pi in OpenShell"
 sidebar-title: "Run Pi"
-slug: "get-started/tutorials/run-pi"
 description: "Build a Pi coding-agent image, configure Anthropic access, and run Pi inside an OpenShell sandbox."
 keywords: "Generative AI, Cybersecurity, Tutorial, Pi Coding Agent, Anthropic, Sandbox, Provider Profile"
 ---
@@ -139,8 +138,8 @@ your image. The OpenShell repository contains reviewable profile examples in
 
 Install any additional compilers, package managers, and agent tools in the
 image. Grant their filesystem and network requirements through
-[sandbox policy](/sandboxes/policies) instead of giving the workload broad
-access. Refer to [Profiles](/providers/profiles) for credential and endpoint
+[sandbox policy](/how-it-works/policies/overview) instead of giving the workload broad
+access. Refer to [Profiles](/how-it-works/providers/profiles) for credential and endpoint
 configuration.
 
 ## Verify and Troubleshoot
@@ -163,7 +162,7 @@ network or filesystem operation before updating the sandbox policy.
 ## Next Steps
 
 - To give Pi access to source control, package registries, or tool servers, add
-  the corresponding provider profiles or a reviewed [sandbox policy](/sandboxes/policies).
+  the corresponding provider profiles or a reviewed [sandbox policy](/how-it-works/policies/overview).
 - To understand image, resource, upload, and lifecycle options, refer to
-  [Sandboxes](/sandboxes/manage-sandboxes).
-- To configure another model service, refer to [Profiles](/providers/profiles).
+  [Sandboxes](/how-it-works/sandboxes/overview).
+- To configure another model service, refer to [Profiles](/how-it-works/providers/profiles).

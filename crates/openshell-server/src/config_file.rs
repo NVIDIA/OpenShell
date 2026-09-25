@@ -396,8 +396,7 @@ pub enum ConfigFileError {
     },
 }
 
-const CONFIG_MIGRATION_URL: &str =
-    "https://docs.nvidia.com/openshell/latest/reference/gateway-config#migrate-to-schema-version-2";
+const CONFIG_MIGRATION_URL: &str = "https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#migrate-to-schema-version-2";
 
 /// Stable package-preflight failure with no configuration contents attached.
 #[derive(Debug, thiserror::Error)]

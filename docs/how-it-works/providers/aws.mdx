@@ -21,8 +21,7 @@ Import the `aws` profile first; a gateway serves only the profiles you
 imported:
 
 ```shell
-curl -LsSfO https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/aws.yaml
-openshell provider profile import -f aws.yaml --global
+openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/aws.yaml --global
 ```
 
 Create a provider with AWS credentials:
@@ -50,7 +49,7 @@ To have the gateway mint and rotate STS credentials for you instead of supplying
 them statically, use the `aws` or `aws-s3` profile with the `aws_sts_assume_role`
 refresh strategy. A single `sts:AssumeRole` mints all three env vars
 (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) that the
-signer reads. See [Manage Providers](/sandboxes/manage-providers#aws-sts).
+signer reads. See [Manage Providers](/how-it-works/providers/overview#aws-sts).
 
 ## Policy Configuration
 

@@ -209,7 +209,7 @@ The following provider profile design items are not part of the current behavior
 | Policy prover integration | OpenShell does not yet run the policy prover automatically on sandbox startup or block startup based on prover findings. |
 | Refresh telemetry as OCSF events | Credential refresh logs are secret-safe gateway logs. OCSF refresh events and metrics are future work. |
 
-Use [Inference](/sandboxes/inference-routing) to attach an
+Use [Inference](/how-it-works/inference) to attach an
 inference provider and call its native endpoint.
 
 ## Provider Profiles
@@ -259,13 +259,27 @@ reviewable starting points, not platform defaults.
 Read a file's header before importing it. Each one names the client binaries it
 expects, the reference image layout those paths assume, the credential scope,
 the endpoint access it grants, and a smoke test. Several name layout-specific
-paths, such as `/sandbox/.venv` or `/usr/lib/node_modules/@openai`. Imported
-unchanged into a different image the
-profile matches nothing: the catalog still lists it, but the credential is never
-injected and the traffic is denied. Copy the file, edit `binaries` and
-`endpoints` for your image and workload, and import your copy.
+paths, such as `/sandbox/.venv` or `/usr/lib/node_modules/@openai`. If the
+profile's `binaries` and `endpoints` match your image and workload, import it
+directly from the repository:
 
-Lint a profile before importing it:
+```shell
+openshell profile lint --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/github.yaml
+openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/github.yaml --global
+```
+
+`--url` accepts one HTTP or HTTPS `.yaml`, `.yml`, or `.json` profile. It cannot
+import a directory or be combined with `-f` or `--from`. The download has a
+15-second timeout and a 1 MiB limit; URL query parameters are allowed. Review
+the source and its grants before importing; lint checks the profile but does not
+establish whether you trust it.
+
+If the paths or endpoint grants need to change, copy the profile, edit
+`binaries` and `endpoints`, then lint and import your local copy. An imported
+profile with binaries that do not match the image still appears in the catalog,
+but its credential is not injected and its traffic is denied.
+
+Lint a local profile before importing it:
 
 ```shell
 openshell profile lint -f providers/github.yaml
@@ -276,19 +290,6 @@ Import one profile file at platform scope:
 ```shell
 openshell profile import -f providers/github.yaml --global
 ```
-
-Import a published YAML or JSON profile directly from an HTTP or HTTPS URL:
-
-```shell
-openshell profile lint --url https://example.com/profiles/github.yaml
-openshell profile import --url https://example.com/profiles/github.yaml --global
-```
-
-Review profiles from remote sources before importing them. A profile can grant
-network access and bind credentials to the endpoints and binaries it declares.
-The URL path must end in `.yaml`, `.yml`, or `.json`; query parameters are allowed.
-Remote downloads have a 1 MiB size limit and a 15 second timeout. `--url` is
-mutually exclusive with `-f` and `--from`.
 
 Import all non-recursive `*.yaml`, `*.yml`, and `*.json` files from a directory:
 
@@ -341,7 +342,7 @@ The `category` field supplies the `CATEGORY` column in `openshell profile list`.
 
 ### Profile Schema
 
-Provider profile YAML and JSON use this shape. Treat this as a field map, not a profile to import verbatim. The endpoint and rule fields mirror the network policy schema used under `network_policies`. Refer to [Policy Schema Reference](/reference/policy-schema) for field semantics.
+Provider profile YAML and JSON use this shape. Treat this as a field map, not a profile to import verbatim. The endpoint and rule fields mirror the network policy schema used under `network_policies`. Refer to [Policy Schema Reference](/how-it-works/policies/schema) for field semantics.
 Use `annotations` only for non-secret metadata such as source, signature, or governance markers. OpenShell preserves annotations through profile import, export, and interceptor-managed profile snapshots.
 
 ```yaml wordWrap showLineNumbers={false}
@@ -739,7 +740,7 @@ cannot replace or delete its primary credential or any co-minted output. Use
 management. You can still update unrelated credentials, configuration, and
 credential expiry metadata.
 
-For a complete Microsoft Graph OAuth2 refresh-token walkthrough, see [Refresh Microsoft Graph Credentials with a Provider Profile](/get-started/tutorials/microsoft-graph-provider-refresh).
+For a complete Microsoft Graph OAuth2 refresh-token walkthrough, see [Refresh Microsoft Graph Credentials with a Provider Profile](/tutorials/microsoft-graph-provider-refresh).
 
 The profile YAML strategy values use underscores, while the CLI `--strategy` values use kebab-case:
 
@@ -1060,7 +1061,7 @@ An unavailable supervisor, an expired report, a failed installation, or a missin
 
 JSON and YAML output include change IDs, requested and installed revisions, timestamps, reason categories, and a result for each sandbox. Revision strings identify configurations; compare them for equality rather than numerical order. Status output excludes credential values, credential references, authorization headers, and raw installation errors.
 
-The `persisted_time`, `observed_time`, and `evaluated_time` fields use RFC 3339 timestamp strings. An absent `observed_time` means the current supervisor session has not supplied accepted evidence. API operation timestamps use protobuf `Timestamp`, and report intervals and observation lifetimes use protobuf `Duration`, following the [protobuf time representation](/reference/protobuf-time-types).
+The `persisted_time`, `observed_time`, and `evaluated_time` fields use RFC 3339 timestamp strings. An absent `observed_time` means the current supervisor session has not supplied accepted evidence. API operation timestamps use protobuf `Timestamp`, and report intervals and observation lifetimes use protobuf `Duration`, following the [protobuf time representation](/sdk/protobuf-time-types).
 
 The API's `operation` field records the common operation's historical outcome; its `operation_id` equals the receipt ID. Use the provider `state` and the wait result for current readiness. A disconnected supervisor can make the live state pending even after the operation previously applied, and a newer change can supersede the live result. Historical completion does not override those checks.
 
@@ -1080,6 +1081,6 @@ OpenShell rejects provider updates and refresh configuration when they would mak
 
 ## Next Steps
 
-- Use [Providers](/sandboxes/manage-providers) for the current provider command reference.
-- Use [Customize Sandbox Policies](/sandboxes/policies) to apply user-authored policy rules.
-- Use [Policy Schema Reference](/reference/policy-schema) for endpoint and L7 rule field details.
+- Use [Providers](/how-it-works/providers/overview) for the current provider command reference.
+- Use [Customize Sandbox Policies](/how-it-works/policies/overview) to apply user-authored policy rules.
+- Use [Policy Schema Reference](/how-it-works/policies/schema) for endpoint and L7 rule field details.

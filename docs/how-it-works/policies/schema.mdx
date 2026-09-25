@@ -76,7 +76,7 @@ Each message contains at most eight error items and 512 UTF-8 bytes, including t
 - YAML errors report a fixed parser category, with numeric line and column when the parser provides them.
 - File I/O, Rego loading, and internal policy-data failures return fixed messages.
 
-A candidate rejected during validation does not replace the active engine or advance its generation. The supervisor then applies the gateway's `policy_validation_failure_mode`; `fail_closed` can publish a quarantine generation that denies egress, while `retain_last_valid` keeps an existing valid generation active. See [Gateway Configuration](/reference/gateway-config) for that setting and startup behavior.
+A candidate rejected during validation does not replace the active engine or advance its generation. The supervisor then applies the gateway's `policy_validation_failure_mode`; `fail_closed` can publish a quarantine generation that denies egress, while `retain_last_valid` keeps an existing valid generation active. See [Gateway Configuration](/how-it-works/gateways/configuration) for that setting and startup behavior.
 
 These bounds apply to returned OPA load errors. Warnings for accepted policies, runtime request diagnostics, and gateway-authored policy parser messages have separate reporting behavior.
 
@@ -222,7 +222,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `websocket_credential_rewrite` | bool | No | When `true` on a `protocol: rest` or `protocol: websocket` endpoint, OpenShell rewrites credential placeholders in client-to-server WebSocket text messages after an allowed HTTP `101` upgrade. On provider-credentialed endpoints without `allow_uninspected_credentials`, OpenShell uses the parsed relay and rejects binary frames; text frames containing placeholders fail closed when rewrite is disabled. Defaults to `false`. |
 | `request_body_credential_rewrite` | bool | No | When `true` on a `protocol: rest` endpoint, OpenShell rewrites credential placeholders in UTF-8 `application/json`, `application/x-www-form-urlencoded`, and `text/*` request bodies before forwarding upstream. The proxy buffers at most 256 KiB and updates `Content-Length` after rewriting. For chunked requests, the limit counts framing, extensions, and trailers. When rewrite is disabled and the sandbox has provider credentials, bodies continue to stream. Authoritatively unknown placeholder keys and valid issued credentials pass unchanged, including credentials bound to the destination. Invalid or unavailable credentials, and unavailable classification metadata fail closed with `credential_placeholder_in_request_body` (HTTP 403). Candidates are limited to 4096 wire bytes. No secret is substituted. Defaults to `false`. Mutually exclusive with `credential_signing`. |
 | `allow_uninspected_credentials` | bool | No | Explicit security-sensitive opt-in that permits a provider-credentialed endpoint to use traffic paths OpenShell cannot inspect or rewrite, including L4-only and `tls: skip` tunnels. Defaults to `false`. Policy proposals that set it require explicit security-flagged approval. |
-| `credential_signing` | string | No | Proxy-side credential signing mode. When set, the proxy strips the sandbox client's `Authorization` header and re-signs with real provider credentials. Values: `sigv4` (auto-detect payload mode from client headers), `sigv4:body` (buffer and hash body, max 10 MiB), `sigv4:no_body` (unsigned payload, stream body). Mutually exclusive with `request_body_credential_rewrite`. See [AWS SigV4](/providers/aws-sigv4). |
+| `credential_signing` | string | No | Proxy-side credential signing mode. When set, the proxy strips the sandbox client's `Authorization` header and re-signs with real provider credentials. Values: `sigv4` (auto-detect payload mode from client headers), `sigv4:body` (buffer and hash body, max 10 MiB), `sigv4:no_body` (unsigned payload, stream body). Mutually exclusive with `request_body_credential_rewrite`. See [AWS SigV4](/how-it-works/providers/aws). |
 | `signing_service` | string | No | AWS service name for SigV4 signing (e.g. `bedrock`, `s3`, `sts`). Required when `credential_signing` is set. |
 | `signing_region` | string | No | AWS region override for SigV4 signing (e.g. `us-east-1`). When omitted, the region is extracted from the endpoint hostname. Required for non-standard AWS endpoints where the region cannot be inferred. |
 | `credential_binding` | object | No | Binds static credentials from an attached provider to this endpoint when that provider's profile defines no endpoints. This field is valid only in a sandbox-scoped policy. |
@@ -283,7 +283,7 @@ global policies that use this field. Network policy admission does not expand
 the credential boundary unless the endpoint explicitly supplies this binding.
 OpenShell rejects a request mismatch with HTTP 403 and
 `credential_endpoint_mismatch`. Refer to [Static Credential Endpoint
-Binding](/providers/profiles#understand-static-credential-endpoint-binding).
+Binding](/how-it-works/providers/profiles#understand-static-credential-endpoint-binding).
 
 This example allows the sandbox to reach Google Cloud Storage and binds the
 static credentials from the attached `work-gcp` provider to that endpoint:

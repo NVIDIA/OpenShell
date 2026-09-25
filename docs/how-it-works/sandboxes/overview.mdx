@@ -220,62 +220,7 @@ driver's `rootfs_tar_max_bytes`), and reclaims an unused staging slot after 30
 minutes. The cap applies to the expanded archive too: a compressed source that
 decompresses past the limit is rejected.
 
-## Reuse Workload Templates
-
-Sandbox workload templates let workspace admins define reusable runtime shapes for a workspace. A template stores the image, environment, resource requests, and driver-specific configuration that sandboxes should inherit. When you create a sandbox from a template, the create request can still attach providers, labels, and policy, but the workload comes from the named template.
-
-Create a template:
-
-```shell
-openshell sandbox template create gpu-kata \
-  --image registry.example.com/agent:latest \
-  --cpu 2 \
-  --memory 4Gi \
-  --gpu 1 \
-  --label team=runtime \
-  --env FEATURE_FLAG=on
-```
-
-Use `--gpu` without a count when the template should request the active
-driver's default GPU assignment. Use `--gpu COUNT` when the template needs a
-specific number of GPUs.
-
-Add driver-specific settings when the active compute driver needs them:
-
-```shell
-openshell sandbox template create gpu-kata \
-  --image registry.example.com/agent:latest \
-  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","node_selector":{"pool":"gpu"}}}}'
-```
-
-If you omit `--image`, the gateway applies its default sandbox image when a sandbox is created from the template. Use this when the template should only define resource, environment, or driver settings.
-
-Create a sandbox from a template:
-
-```shell
-openshell sandbox create --template gpu-kata --provider github -- claude
-```
-
-The `--template` flag cannot be combined with inline workload flags such as `--from`, `--cpu`, `--memory`, `--gpu`, `--env`, or `--driver-config-json`. Put those values on the template instead. Create-time policy and provider attachments remain part of the sandbox request, so each sandbox can keep its own access boundary.
-
-Inspect and manage templates:
-
-```shell
-openshell sandbox template list
-openshell sandbox template list --label-selector team=runtime
-openshell sandbox template get gpu-kata
-openshell sandbox template delete gpu-kata
-```
-
-Use `--all-workspaces` with `sandbox template list` when you need an admin view across workspaces:
-
-```shell
-openshell sandbox template list --all-workspaces
-```
-
-For JSON or YAML, template list output contains `templates` and
-`next_page_token` fields. Pass the returned token to `--page-token` to
-continue.
+To reuse image and resource settings across sandboxes, see [Templates](/how-it-works/sandboxes/templates).
 
 ## Default Workload Image
 
@@ -297,7 +242,7 @@ Override it with any image visible to the active compute driver:
 openshell sandbox create --from registry.example.com/agents/my-agent:1.0
 ```
 
-Refer to [Default Policy](/reference/default-policy), [Run Your First Agent](/about/run-an-agent), and the [bring-your-own-container example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container).
+Refer to [Default Policy](/how-it-works/policies/default-policy), [Run Your First Agent](/about/run-your-first-agent), and the [bring-your-own-container example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container).
 
 ## Connect to a Sandbox
 
@@ -413,7 +358,7 @@ openshell sandbox create --env API_KEY=sk-test --env DEBUG=1 -- my-agent
 
 Variables set with `--env` are available to all processes in the sandbox, including the initial command, interactive shells, and exec commands.
 
-When an `--env` key looks like a credential — a known provider variable, or a name whose underscore-separated segments include a credential word such as `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `SECRET_KEY` (for example `DB_TOKEN` or `MY_ACCESS_KEY`) — `sandbox create` prints a non-blocking warning. Matching is on whole segments, so unrelated names like `TOKENIZERS_PARALLELISM` or `PASSWORDLESS_LOGIN` do not warn. The agent inside the sandbox can read plain environment values directly, so to hide a secret from the agent, attach it through a [profile-backed provider](/providers/profiles) with `--provider` instead. Suppress the warning with `--no-credential-warnings`. Detection uses the key name only; values are never inspected or printed.
+When an `--env` key looks like a credential — a known provider variable, or a name whose underscore-separated segments include a credential word such as `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `SECRET_KEY` (for example `DB_TOKEN` or `MY_ACCESS_KEY`) — `sandbox create` prints a non-blocking warning. Matching is on whole segments, so unrelated names like `TOKENIZERS_PARALLELISM` or `PASSWORDLESS_LOGIN` do not warn. The agent inside the sandbox can read plain environment values directly, so to hide a secret from the agent, attach it through a [profile-backed provider](/how-it-works/providers/profiles) with `--provider` instead. Suppress the warning with `--no-credential-warnings`. Detection uses the key name only; values are never inspected or printed.
 
 You can also set per-command environment variables with `sandbox exec`:
 
@@ -607,7 +552,7 @@ openshell service delete my-sandbox
 ```
 
 <Note>
-Loopback gateways return local `openshell.localhost` URLs. Remote gateways return HTTPS URLs that require normal gateway authentication. For gateway service-domain configuration, refer to [Manage Gateways](/sandboxes/manage-gateways#configure-service-forwarding).
+Loopback gateways return local `openshell.localhost` URLs. Remote gateways return HTTPS URLs that require normal gateway authentication. For gateway service-domain configuration, refer to [Manage Gateways](/how-it-works/gateways/overview#configure-service-forwarding).
 </Note>
 
 ## Monitor and Debug
@@ -708,7 +653,7 @@ OpenShell Terminal combines sandbox status and live logs in a single real-time d
 openshell term
 ```
 
-Use the terminal to spot blocked connections marked `action=deny` and provider-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy or update the attached provider profile. Refer to [Policies](/sandboxes/policies) for the workflow.
+Use the terminal to spot blocked connections marked `action=deny` and provider-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy or update the attached provider profile. Refer to [Policies](/how-it-works/policies/overview) for the workflow.
 
 The dashboard has three panels stacked vertically: Gateways, Providers (or Global Settings), and Sandboxes. Navigate within a panel with `Up`/`Down` or `j`/`k`. At a list boundary the cursor overflows into the adjacent panel, skipping empty panels. Use `Tab`/`Shift+Tab` to cycle panels directly. Press `h`/`l` or `Left`/`Right` in the middle panel to switch between the Providers and Global Settings tabs.
 
@@ -846,7 +791,7 @@ The command can return while cleanup is pending. `deletion accepted` means the
 gateway started deletion; inspect the sandbox until it disappears if your next
 step requires completion. An already-absent sandbox is a successful no-op, but
 missing workspaces and authorization failures remain errors. SDK callers can
-inspect [typed deletion outcomes](/reference/api-errors#deletion-outcomes).
+inspect [typed deletion outcomes](/sdk/api-errors#deletion-outcomes).
 
 ```shell
 openshell sandbox delete my-sandbox
@@ -869,7 +814,7 @@ Every sandbox moves through a defined set of phases:
 Before workload activation, OpenShell validates the effective policy and matching
 provider configuration. A rejection keeps the workload unstarted and exposes a
 `ConfigurationInvalid` condition in `Provisioning`. Use `openshell sandbox get`
-to inspect the diagnostic, then [repair the policy or provider configuration](/sandboxes/policies#validation-failures).
+to inspect the diagnostic, then [repair the policy or provider configuration](/how-it-works/policies/overview#validation-failures).
 Management operations remain available while startup is blocked. After repair,
 the supervisor completes startup without recreating the sandbox. Starting a
 stopped sandbox repeats configuration admission before launching its workload.
@@ -927,12 +872,12 @@ not automatically restart that process.
 
 The gateway's configured compute driver determines how OpenShell creates each sandbox. The CLI workflow stays the same across drivers: you create, connect to, inspect, and delete sandboxes through the gateway API.
 
-For Docker, Podman, MicroVM, and Kubernetes behavior, refer to [Sandbox Runtimes](/reference/sandbox-compute-drivers).
+For Docker, Podman, MicroVM, and Kubernetes behavior, refer to [Sandbox Runtimes](/how-it-works/sandboxes/runtimes).
 
 ## Next Steps
 
-- To follow a complete end-to-end example, refer to the [GitHub Sandbox](/get-started/tutorials/github-sandbox) tutorial.
-- To select a workspace or understand access roles, refer to [Workspaces](/sandboxes/manage-workspaces).
-- To supply API keys or tokens, refer to [Manage Providers](/sandboxes/manage-providers).
-- To control what the agent can access, refer to [Policies](/sandboxes/policies).
+- To follow a complete end-to-end example, refer to the [GitHub Sandbox](/tutorials/github-push-access) tutorial.
+- To select a workspace or understand access roles, refer to [Workspaces](/how-it-works/workspaces).
+- To supply API keys or tokens, refer to [Manage Providers](/how-it-works/providers/overview).
+- To control what the agent can access, refer to [Policies](/how-it-works/policies/overview).
 - To use the default runtime image, refer to [Default Workload Image](#default-workload-image).

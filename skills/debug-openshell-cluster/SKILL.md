@@ -34,7 +34,7 @@ On Windows, custom binaries can include MXC independently. Registrations for
 Docker, Podman, Kubernetes, and VM are rejection stubs when included; they do
 not enable those runtimes on Windows.
 
-See the [compute driver reference](https://docs.nvidia.com/openshell/latest/reference/sandbox-compute-drivers.md)
+See the [compute driver reference](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/runtimes)
 for selective-build options and external-driver configuration.
 
 For local evaluation only, TLS may be disabled and the gateway can be reached through `http://127.0.0.1:<port>`.
@@ -47,7 +47,7 @@ For local evaluation only, TLS may be disabled and the gateway can be reached th
 - For Kubernetes: `kubectl` must target the cluster that hosts OpenShell and Helm version 3 or later must be available.
 - For Docker or Podman: the runtime socket must be reachable from the gateway host.
 
-Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation.md), [compute-driver reference](https://docs.nvidia.com/openshell/latest/reference/sandbox-compute-drivers.md), [gateway configuration reference](https://docs.nvidia.com/openshell/latest/reference/gateway-config.md), and [Kubernetes setup guide](https://docs.nvidia.com/openshell/latest/kubernetes/setup.md) as the authority for deployment and configuration behavior.
+Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation.md), [compute-driver reference](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/runtimes), [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration), and [Kubernetes setup guide](https://docs.nvidia.com/openshell/latest/kubernetes/setup.md) as the authority for deployment and configuration behavior.
 
 ## Workflow
 
@@ -225,7 +225,7 @@ If the 300-second provisioning repair window expires, the gateway records
 complete. Repairing configuration after expiry does not restart compute: wait
 for cleanup, then explicitly use `sandbox start`. Repeated rejected reports do
 not refresh the deadline, and the CLI wait timeout does not control it.
-See [policy validation and repair](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md).
+See [policy validation and repair](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview).
 The isolated supervisor requests image-policy discovery through the authenticated
 sandbox boundary before admission. The workload boundary can remain alive without
 launching the workload while configuration is repaired. An unavailable boundary

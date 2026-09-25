@@ -22,7 +22,8 @@ use std::io::IsTerminal;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const DOCS_PROVIDERS_URL: &str = "https://docs.nvidia.com/openshell/latest/sandboxes/providers-v2";
+const DOCS_PROVIDERS_URL: &str =
+    "https://docs.nvidia.com/openshell/latest/how-it-works/providers/overview";
 
 // ---------------------------------------------------------------------------
 // View types

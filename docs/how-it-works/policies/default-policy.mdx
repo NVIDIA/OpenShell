@@ -31,4 +31,4 @@ The fallback defines no network policies or provider-derived endpoints, so outbo
 
 The fallback leaves process identity selection to the compute driver. Docker and Podman honor a non-root OCI `USER`; when an image declares no user, they use numeric UID and GID `1000`. Kubernetes and MicroVM drivers apply their configured non-root identities.
 
-Use `openshell policy get <sandbox> --full` to inspect the effective policy. Refer to [Customize Sandbox Policies](/sandboxes/policies) to replace the fallback.
+Use `openshell policy get <sandbox> --full` to inspect the effective policy. Refer to [Customize Sandbox Policies](/how-it-works/policies/overview) to replace the fallback.

@@ -19,7 +19,7 @@ Caller driver config is disabled by default. Existing volumes require
 administrator-controlled approval labels; raw bind mounts have no supported
 label resolver and are denied under enforcement. GPU devices are temporarily
 exempt. Inspect labels again before launch, restart, and during reconciliation.
-See [resource admission configuration](../../docs/reference/gateway-config.mdx#external-resource-admission).
+See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission).
 
 The driver creates two containers for each sandbox:
 

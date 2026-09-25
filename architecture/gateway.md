@@ -1217,7 +1217,7 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 The TOML file is opt-in via `--config <PATH>` / `OPENSHELL_GATEWAY_CONFIG`.
 Driver implementation settings live exclusively in TOML driver tables. The
 selector is the singular `[openshell.gateway] compute_driver`; legacy
-`compute_drivers` lists are rejected. See `docs/reference/gateway-config.mdx`
+`compute_drivers` lists are rejected. See `docs/how-it-works/gateways/configuration.mdx`
 for worked per-driver examples and RFC 0003 for the full schema.
 
 Each installation has an operator-assigned gateway name. Configure it with

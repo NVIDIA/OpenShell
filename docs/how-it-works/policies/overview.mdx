@@ -8,7 +8,7 @@ keywords: "Generative AI, Cybersecurity, Policy, Network Policy, Sandbox, Securi
 position: 6
 ---
 
-Use this page to apply and iterate policy changes on running sandboxes. For a full field-by-field YAML definition, use the [Policy Schema Reference](/reference/policy-schema).
+Use this page to apply and iterate policy changes on running sandboxes. For a full field-by-field YAML definition, use the [Policy Schema Reference](/how-it-works/policies/schema).
 
 ## Policy Structure
 
@@ -67,7 +67,7 @@ When a hot reload changes rules, the supervisor publishes a new policy generatio
 | Section | Type | Description |
 |---|---|---|
 | `filesystem_policy` | Static | Controls which directories the agent can access on disk. Paths are split into `read_only` and `read_write` lists. Any path not listed in either list is inaccessible. Set `include_workdir: true` to automatically add the agent's working directory to `read_write`. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level. |
-| `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (skip individual inaccessible paths while applying remaining rules) or `hard_requirement` (fail if any path is inaccessible or the required kernel ABI is unavailable). Refer to the [Policy Schema Reference](/reference/policy-schema#landlock) for the full behavior table. |
+| `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (skip individual inaccessible paths while applying remaining rules) or `hard_requirement` (fail if any path is inaccessible or the required kernel ABI is unavailable). Refer to the [Policy Schema Reference](/how-it-works/policies/schema#landlock) for the full behavior table. |
 | `process` | Static | Optionally overrides the OS-level identity for the agent process. Explicit values must be `sandbox` or numeric UID/GID values from `1` through `4294967294`; root and the invalid identity sentinel are rejected. Docker and Podman may use named identities through per-field OCI `USER` fallback; Kubernetes uses its platform-selected numeric identity. The agent also runs with seccomp filters that block dangerous system calls. |
 | `network_policies` | Dynamic | Controls outbound traffic from the sandbox, including native model-provider endpoints. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br />Every outbound connection passes through the network supervisor, which queries the [policy engine](/about/architecture#how-a-network-request-travels) with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. Attached provider profiles can contribute endpoint and binary entries to the effective policy. <br />For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request can be checked against that endpoint's `rules` (method and path). For endpoints with `protocol: websocket`, the proxy validates the RFC 6455 upgrade and evaluates `GET` rules for the handshake plus either `WEBSOCKET_TEXT` rules for raw client text messages or GraphQL-over-WebSocket messages. Set `websocket_credential_rewrite: true` only when a WebSocket or REST compatibility endpoint must keep placeholder credentials in sandbox-owned text frames and resolve them at the OpenShell relay boundary. <br />Endpoints with `protocol: tcp` allow ordinary DNS resolution and native TCP connections without inspecting payloads. Endpoints without `protocol` retain L4 passthrough through an explicit proxy. <br />If no endpoint matches, the connection is denied. |
 | `network_middlewares` | Dynamic | Declares keyed HTTP and WebSocket middleware configs. After network and L7 policy admit a request or upgrade, OpenShell matches each config's host selectors independently and runs matching entries by their unique ascending `order` before credential injection. WebSocket-capable entries continue on complete client text messages. |
@@ -285,7 +285,7 @@ openshell sandbox provider detach <name> <provider>
 ```
 
 These are alternative repairs; choose the one that matches the intended access.
-Startup has a [300-second provisioning repair window](/sandboxes/manage-sandboxes#sandbox-lifecycle).
+Startup has a [300-second provisioning repair window](/how-it-works/sandboxes/overview#sandbox-lifecycle).
 Effective configuration changes and their first failed load reset the window;
 repeated failures do not. If it expires, the gateway records `ProvisioningTimedOut`
 and reclaims compute. Repair the configuration, wait for cleanup, then run
@@ -438,7 +438,7 @@ Static provider placeholders resolve only when the request host, port, and path
 also match an endpoint in the provider profile. A sandbox policy allow does not
 expand that binding. A mismatch returns HTTP 403 with
 `credential_endpoint_mismatch`. Refer to [Static Credential Endpoint
-Binding](/providers/profiles#understand-static-credential-endpoint-binding).
+Binding](/how-it-works/providers/profiles#understand-static-credential-endpoint-binding).
 
 For example:
 
@@ -685,7 +685,7 @@ openshell settings get <name>
 
 Check `openshell logs <name> --tail --source sandbox` for the denied host, path, and binary.
 
-For agent-authored draft updates on running sandboxes, enable [Policy Advisor](/sandboxes/policy-advisor). Policy advisor lets the sandboxed agent submit a narrow proposal through `policy.local` while a developer still approves or rejects the structured rule from outside the sandbox.
+For agent-authored draft updates on running sandboxes, enable [Policy Advisor](/how-it-works/policies/advisor). Policy advisor lets the sandboxed agent submit a narrow proposal through `policy.local` while a developer still approves or rejects the structured rule from outside the sandbox.
 
 When triaging denied requests, check:
 
@@ -701,7 +701,7 @@ Do not fix `credential_endpoint_mismatch` by widening sandbox policy. Export the
 provider profile with `openshell profile export <profile-id> -o yaml`.
 Update the custom provider profile only when the destination is an intended
 credential recipient. Refer to [Static Credential Endpoint
-Binding](/providers/profiles#understand-static-credential-endpoint-binding)
+Binding](/how-it-works/providers/profiles#understand-static-credential-endpoint-binding)
 for the complete authorization model.
 
 For small changes, prefer `openshell policy update` over rewriting the full YAML:
@@ -739,7 +739,7 @@ Endpoints without `protocol` use explicit-proxy TCP passthrough, where OpenShell
 Allow Claude and the GitHub CLI to reach `api.github.com` with separate REST and GraphQL endpoint scopes: read-only REST for general API paths, GraphQL operation inspection on `/graphql`, full REST write access for `alpha-repo`, and create/edit issues only for `bravo-repo`. Replace `<org_name>` with your GitHub org or username.
 
 <Tip>
-For an end-to-end walkthrough that combines this policy with a GitHub credential provider and sandbox creation, refer to [GitHub Sandbox](/get-started/tutorials/github-sandbox).
+For an end-to-end walkthrough that combines this policy with a GitHub credential provider and sandbox creation, refer to [GitHub Sandbox](/tutorials/github-push-access).
 
 </Tip>
 
@@ -969,6 +969,6 @@ GraphQL field names are application-specific, so treat these as starting shapes 
 
 Explore related topics:
 
-- To learn about the built-in sandbox policy, refer to [Default Policy](/reference/default-policy).
-- To view the full field-by-field YAML definition, refer to the [Policy Schema Reference](/reference/policy-schema).
-- To review the default policy breakdown, refer to [Default Policy](/reference/default-policy).
+- To learn about the built-in sandbox policy, refer to [Default Policy](/how-it-works/policies/default-policy).
+- To view the full field-by-field YAML definition, refer to the [Policy Schema Reference](/how-it-works/policies/schema).
+- To review the default policy breakdown, refer to [Default Policy](/how-it-works/policies/default-policy).

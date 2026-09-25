@@ -50,5 +50,5 @@ workload, and import your copy.
   credential is only sent to the endpoints its profile declares.
 - Run `openshell provider profile lint` before importing.
 
-See [Provider profiles](https://docs.nvidia.com/openshell/latest/providers/profiles.html) for the
+See [Provider profiles](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles) for the
 full schema.

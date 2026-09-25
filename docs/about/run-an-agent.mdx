@@ -14,31 +14,30 @@ with the agent as its main process.
 
 **1. Configure what the agent has access to.**
 
-A [provider profile](/providers/profiles) defines the credentials, service
-endpoints, and executable paths an agent may use. Import a reviewed profile,
-then [create a provider](/sandboxes/manage-providers#create-a-provider) that
-stores the credentials for one deployment of that service.
+A [provider profile](/how-it-works/providers/profiles) defines the credentials, service
+endpoints, and executable paths an agent may use. For Claude Code, review the
+[example profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/claude-code.yaml),
+including its executable paths for your image, then import it and
+[create a provider](/how-it-works/providers/overview#create-a-provider) that
+stores its credentials.
 
 ```shell
-openshell provider profile lint -f agent-provider.yaml
-openshell provider profile import -f agent-provider.yaml
+openshell profile import \
+  --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/claude-code.yaml
 
-AGENT_API_KEY=your-key \
-  openshell provider create \
-    --name model-provider \
-    --type agent-provider \
-    --from-existing
+openshell provider create \
+  --name claude-code \
+  --type claude-code \
+  --from-existing
 ```
 
-The environment variable must match a credential declared in the profile.
-OpenShell stores the real value in its credential store. The sandbox receives a
-placeholder that the supervisor resolves only for approved requests to the
-profile's endpoints.
+Set `ANTHROPIC_API_KEY` before creating the provider. OpenShell stores its
+value in the credential store.
 
 **2. Configure the sandbox image.**
 
-Build or select a [sandbox image](/sandboxes/manage-sandboxes#sandbox-images)
-containing the agent and every tool it needs:
+Build or select a [sandbox image](/how-it-works/sandboxes/overview#sandbox-images)
+containing Claude Code and every tool it needs:
 
 ```shell
 docker build -t agent:local .
@@ -50,21 +49,21 @@ deployments.
 
 The built-in fallback policy grants access to the working directory and common
 runtime paths, and denies network egress unless an attached provider contributes
-an endpoint. Create a custom [sandbox policy](/sandboxes/policies) when the
+an endpoint. Create a custom [sandbox policy](/how-it-works/policies/overview) when the
 agent needs more filesystem access, package registries, source hosts, tool
 servers, or other destinations.
 
 **3. Create the sandbox.**
 
-[Create the sandbox](/sandboxes/manage-sandboxes#create-a-sandbox), attach the
+[Create the sandbox](/how-it-works/sandboxes/overview#create-a-sandbox), attach the
 provider, and pass the agent command after `--`:
 
 ```shell
 openshell sandbox create \
   --name my-agent \
   --from agent:local \
-  --provider model-provider \
-  -- agent
+  --provider claude-code \
+  -- claude
 ```
 
 Add `--policy sandbox-policy.yaml` when the workload needs a custom policy. The
@@ -73,15 +72,15 @@ it starts remains inside the sandbox boundary.
 
 ## Examples
 
-For a complete worked example, follow [Run Pi in OpenShell](/get-started/tutorials/run-pi).
+For a complete worked example, follow [Run Pi in OpenShell](/tutorials/run-pi).
 The tutorial builds a Pi image, configures narrowly scoped Anthropic access,
 uploads a project, and starts the agent inside the sandbox boundary.
 
 ## Next Steps
 
 - For sandbox lifecycle, resources, templates, files, and connectivity, refer
-  to [Sandboxes](/sandboxes/manage-sandboxes).
+  to [Sandboxes](/how-it-works/sandboxes/overview).
 - For the restrictive fallback policy, refer to
-  [Default Policy](/reference/default-policy).
+  [Default Policy](/how-it-works/policies/default-policy).
 - For operating-system and runtime requirements, refer to the
-  [Support Matrix](/reference/support-matrix).
+  [Support Matrix](/about/support-matrix).

@@ -847,7 +847,7 @@ mod tests {
 
     #[test]
     fn published_kubernetes_example_is_valid_toml() {
-        let docs = include_str!("../../../docs/reference/gateway-config.mdx");
+        let docs = include_str!("../../../docs/how-it-works/gateways/configuration.mdx");
         let section = docs
             .split_once("### Kubernetes")
             .expect("Kubernetes documentation section")

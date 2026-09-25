@@ -177,7 +177,7 @@ In the prompt, instruct the reviewer to:
    - **Medium**: Multiple files/components, some design decisions, but well-scoped
    - **High**: Cross-cutting changes, architectural decisions needed, significant unknowns
 8. Call out risks, unknowns, and decisions that need stakeholder input.
-9. Assess **gateway config documentation impact** — if the change adds, removes, renames, or changes defaults for gateway TOML keys or driver-specific config options, the plan must include an update to `docs/reference/gateway-config.mdx`. If the change is surfaced through Helm or a compute-driver overview, also include `docs/reference/sandbox-compute-drivers.mdx` or the relevant deployment docs.
+9. Assess **gateway config documentation impact** — if the change adds, removes, renames, or changes defaults for gateway TOML keys or driver-specific config options, the plan must include an update to `docs/how-it-works/gateways/configuration.mdx`. If the change is surfaced through Helm or a compute-driver overview, also include `docs/how-it-works/sandboxes/runtimes.mdx` or the relevant deployment docs.
 10. Assess **LSM compatibility** — if the change touches process identity, `/proc` filesystem access, binary execution, or inter-process visibility, flag whether it will behave differently on hosts running SELinux (enforcing) or AppArmor. In particular, tests that fork+exec into system binaries will fail on SELinux-enforcing hosts due to cross-label `/proc/<pid>/exe` access restrictions.
 
 Perform this investigation against the current branch and current product behavior. If the issue contains earlier diagnostics, verify them rather than relying on them.
@@ -474,9 +474,9 @@ behavior or subsystem that changed.
 
 If the implementation changes gateway TOML parsing, `[openshell.gateway]`
 fields, `[openshell.drivers.<name>]` fields, driver config defaults, or Helm
-rendering of `gateway.toml`, update `docs/reference/gateway-config.mdx` in the
+rendering of `gateway.toml`, update `docs/how-it-works/gateways/configuration.mdx` in the
 same branch. If the change affects user-facing compute-driver setup, also
-update `docs/reference/sandbox-compute-drivers.mdx` or the relevant deployment
+update `docs/how-it-works/sandboxes/runtimes.mdx` or the relevant deployment
 page.
 
 Use the `sync-agent-infra` skill's maintenance map to identify related skill updates when the implementation changes behavior, commands, or development workflows. Run its full consistency check when the implementation adds, removes, or renames skills or crates; changes workflow relationships or skill coverage; modifies issue or PR templates; or changes agent cross-references. Fix any drift before committing.

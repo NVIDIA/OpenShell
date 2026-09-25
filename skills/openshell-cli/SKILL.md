@@ -34,12 +34,12 @@ This is your primary fallback. Use it freely -- the CLI's help output is authori
 
 Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published documentation for product concepts and supported workflows:
 
-- [Manage gateways](https://docs.nvidia.com/openshell/latest/sandboxes/manage-gateways.md)
-- [Manage sandboxes](https://docs.nvidia.com/openshell/latest/sandboxes/manage-sandboxes.md)
-- [Manage providers](https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers.md)
-- [Profiles](https://docs.nvidia.com/openshell/latest/providers/profiles.md)
-- [Sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
-- [Inference routing](https://docs.nvidia.com/openshell/latest/sandboxes/inference-routing.md)
+- [Manage gateways](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/overview)
+- [Manage sandboxes](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview)
+- [Manage providers](https://docs.nvidia.com/openshell/latest/how-it-works/providers/overview)
+- [Profiles](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles)
+- [Sandbox policies](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview)
+- [Inference routing](https://docs.nvidia.com/openshell/latest/how-it-works/inference)
 
 ---
 
@@ -498,7 +498,7 @@ first failed load reset that window; repeated failures do not. After
 `ProvisioningTimedOut`, inspect the retained record and cleanup status, repair
 configuration, and explicitly run `sandbox start` once cleanup completes. A CLI
 wait timeout is separate from this gateway deadline. Follow the
-published [policy repair guidance](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
+published [policy repair guidance](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview)
 and confirm current replacement/detach syntax with installed CLI help.
 
 An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit

@@ -4,7 +4,7 @@ Use this reference when the deployment registers supervisor middleware or a
 sandbox policy attaches it through `network_middlewares`. Start with gateway
 reachability and compute-platform checks in the [main skill](../SKILL.md).
 Use installed CLI help for command syntax and the published
-[gateway configuration reference](https://docs.nvidia.com/openshell/latest/reference/gateway-config.md)
+[gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration)
 for registration settings.
 
 ## Collect diagnostics

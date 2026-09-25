@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="580" viewBox="0 0 1280 580" role="img" aria-labelledby="title desc">
+  <title id="title">OpenShell Sandbox Protocol</title>
+  <desc id="desc">The trusted supervisor and the network-isolated OpenShell Sandbox share one mutually authenticated connection. Separate streams carry control, DNS, and each TCP connection. The agent reaches the supervisor only through the OpenShell Sandbox.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#579000"/>
+    </marker>
+    <style>
+      .section { font: 700 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; letter-spacing: .08em; }
+      .label { font: 700 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .small { font: 500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .tiny { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .trusted { fill: #eff6ff; stroke: #3b82f6; stroke-width: 2.5; }
+      .dark { fill: #1f2937; stroke: #111827; stroke-width: 2; }
+      .line { fill: none; stroke: #334155; stroke-width: 2.5; marker-end: url(#arrow); }
+      .flow { fill: none; stroke: #579000; stroke-width: 3; marker-start: url(#arrow-green); marker-end: url(#arrow-green); }
+      .lane { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 2; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="580" rx="20" fill="#ffffff"/>
+
+  <text x="45" y="50" class="section">TRUSTED</text>
+  <text x="622" y="50" text-anchor="middle" class="section">OPENSHELL SANDBOX PROTOCOL</text>
+  <text x="925" y="50" class="section">SANDBOX · NETWORK ISOLATED</text>
+
+  <!-- Supervisor -->
+  <rect x="40" y="105" width="260" height="290" rx="16" class="trusted"/>
+  <text x="170" y="150" text-anchor="middle" class="label">Supervisor</text>
+  <text x="170" y="174" text-anchor="middle" class="tiny">POLICY AND EGRESS</text>
+  <text x="170" y="225" text-anchor="middle" class="small">Policy evaluation</text>
+  <text x="170" y="255" text-anchor="middle" class="small">Credential injection</text>
+  <text x="170" y="285" text-anchor="middle" class="small">DNS resolution</text>
+  <text x="170" y="315" text-anchor="middle" class="small">Upstream connections</text>
+  <line x1="75" y1="340" x2="265" y2="340" stroke="#bfdbfe" stroke-width="1.5"/>
+  <text x="170" y="370" text-anchor="middle" class="small">Holds the gateway session</text>
+
+  <!-- Sandbox boundary -->
+  <rect x="920" y="70" width="320" height="440" rx="18" fill="#ffffff" stroke="#76b900" stroke-width="3" stroke-dasharray="10 7"/>
+  <rect x="945" y="105" width="270" height="290" rx="14" class="box"/>
+  <text x="1080" y="150" text-anchor="middle" class="label">OpenShell Sandbox</text>
+  <text x="1080" y="174" text-anchor="middle" class="tiny">PROCESS AND SYSCALL BOUNDARY</text>
+  <text x="1080" y="225" text-anchor="middle" class="small">Owns the agent process</text>
+  <text x="1080" y="255" text-anchor="middle" class="small">Identifies each program</text>
+  <text x="1080" y="285" text-anchor="middle" class="small">Intercepts TCP and DNS</text>
+  <text x="1080" y="315" text-anchor="middle" class="small">Freezes the agent on disconnect</text>
+  <rect x="945" y="425" width="270" height="62" rx="14" class="dark"/>
+  <text x="1080" y="453" text-anchor="middle" style="font:700 18px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#fff">Agent</text>
+  <text x="1080" y="474" text-anchor="middle" style="font:500 13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#d1d5db">untrusted workload</text>
+  <path d="M1080 395 V425" class="line"/>
+
+  <!-- Streams -->
+  <path d="M300 150 H945" class="flow"/>
+  <path d="M300 215 H945" class="flow"/>
+  <path d="M300 280 H945" class="flow"/>
+  <path d="M300 345 H945" class="flow"/>
+
+  <rect x="360" y="126" width="520" height="48" rx="12" class="lane"/>
+  <text x="385" y="156" class="label">Control</text>
+  <text x="525" y="156" class="small">attach · confirm · start · exec · signals · health</text>
+
+  <rect x="360" y="191" width="520" height="48" rx="12" class="lane"/>
+  <text x="385" y="221" class="label">DNS</text>
+  <text x="525" y="221" class="small">query and mediated response</text>
+
+  <rect x="360" y="256" width="520" height="48" rx="12" class="lane"/>
+  <text x="385" y="286" class="label">TCP stream 1</text>
+  <text x="525" y="286" class="small">destination · program identity · bytes</text>
+
+  <rect x="360" y="321" width="520" height="48" rx="12" class="lane"/>
+  <text x="385" y="351" class="label">TCP stream N</text>
+  <text x="525" y="351" class="small">independent connection and backpressure</text>
+
+  <text x="622" y="405" text-anchor="middle" class="tiny">ONE MUTUALLY AUTHENTICATED HTTP/2 CONNECTION</text>
+
+  <text x="40" y="550" class="small">Transport: Unix socket (Docker, Podman), TCP (Kubernetes), or vsock (MicroVM). Authentication and protocol behavior stay the same.</text>
+</svg>

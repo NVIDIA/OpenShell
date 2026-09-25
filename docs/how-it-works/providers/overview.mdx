@@ -14,7 +14,7 @@ Create and manage providers that supply credentials to sandboxes.
 
 <Info>
 Provider profiles define provider credentials, policy, and refresh behavior. See
-[Profiles](/providers/profiles) for the profile format and custom
+[Profiles](/how-it-works/providers/profiles) for the profile format and custom
 profile workflow.
 </Info>
 
@@ -187,7 +187,7 @@ openshell provider update my-claude --from-existing --wait --timeout 30 --output
 
 The update records which sandboxes are attached before saving the new credentials. Its result includes a change ID and outcome for each of those sandboxes. Sandboxes attached later are outside this wait. The timeout applies to the whole group; if any selected sandbox fails or times out, the command exits with an error and still reports each sandbox's outcome. When no sandboxes are attached, it reports the saved change and an empty target list.
 
-Credential refresh status tells you whether OpenShell obtained credentials. [Provider readiness](/providers/profiles#inspect-provider-readiness) tells you whether the sandbox applied the credentials, policy, and environment for new processes. It does not test access to a backend model or cancel requests already sent upstream.
+Credential refresh status tells you whether OpenShell obtained credentials. [Provider readiness](/how-it-works/providers/profiles#inspect-provider-readiness) tells you whether the sandbox applied the credentials, policy, and environment for new processes. It does not test access to a backend model or cancel requests already sent upstream.
 
 After a static credential update completes, launch a new client process to use the updated reference. An existing process keeps its revision-scoped reference; readiness does not make that old reference resolve the new value. Acknowledged detach revokes retained references and removes them from environments for future launches.
 
@@ -337,7 +337,7 @@ be resolved.
 Use `--provider` to attach providers when creating a sandbox. To change the
 providers attached to a running sandbox, use `openshell sandbox provider attach`
 and `openshell sandbox provider detach`. See
-[Profiles](/providers/profiles#attach-and-detach-providers) for details.
+[Profiles](/how-it-works/providers/profiles#attach-and-detach-providers) for details.
 
 </Info>
 
@@ -388,7 +388,7 @@ profile.
 
 Credential resolution requires the proxy to handle the request as HTTP. Raw
 `tls: skip` and non-HTTP tunnels remain opaque and do not support credential
-rewrite. Refer to [Profiles](/providers/profiles#understand-static-credential-endpoint-binding)
+rewrite. Refer to [Profiles](/how-it-works/providers/profiles#understand-static-credential-endpoint-binding)
 for endpoint matching and migration guidance.
 
 ### Supported injection locations
@@ -435,7 +435,7 @@ there returns `credential_endpoint_mismatch`.
 For another service, define the credential in its own provider profile. Put
 stable endpoints in the profile, or leave the profile endpointless and bind
 each concrete provider instance from sandbox policy. Refer to
-[Profiles](/providers/profiles#provider-profiles) for the profile workflow
+[Profiles](/how-it-works/providers/profiles#provider-profiles) for the profile workflow
 and schema.
 
 ## Available Provider Types
@@ -476,14 +476,14 @@ An OpenAI-compatible protocol does not make the `openai` profile safe for an
 arbitrary host. Baseten, Bitdeer, Groq, Ollama, LM Studio, self-hosted NIM, and
 other alternate endpoints need their own profile declaring the actual host,
 port, credential, and allowed binaries. See
-[Inference](/sandboxes/inference-routing) for complete examples
+[Inference](/how-it-works/inference) for complete examples
 and migration guidance.
 
 ## Next Steps
 
 Explore related topics:
 
-- To manage workspace access for providers, refer to [Workspaces](/sandboxes/manage-workspaces).
-- To control what the agent can access, refer to [Policies](/sandboxes/policies).
-- To use the default workload image, refer to [Sandboxes](/sandboxes/manage-sandboxes#default-workload-image).
-- To view the complete field reference for the policy YAML, refer to the [Policy Schema Reference](/reference/policy-schema).
+- To manage workspace access for providers, refer to [Workspaces](/how-it-works/workspaces).
+- To control what the agent can access, refer to [Policies](/how-it-works/policies/overview).
+- To use the default workload image, refer to [Sandboxes](/how-it-works/sandboxes/overview#default-workload-image).
+- To view the complete field reference for the policy YAML, refer to the [Policy Schema Reference](/how-it-works/policies/schema).

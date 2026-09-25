@@ -82,7 +82,7 @@ The middleware API is still evolving. Future versions will change it to make the
 
 Every middleware service implements these RPCs:
 
-- `Describe` returns the service manifest. The manifest lists the operations the service supports, with a payload limit and optional timeout for each. It also carries [protocol negotiation](/extensibility/overview#protocol-negotiation) metadata and the [expected audience](/extensibility/extension-authentication#confirm-the-audience-at-startup).
+- `Describe` returns the service manifest. The manifest lists the operations the service supports, with a payload limit and optional timeout for each. It also carries [protocol negotiation](/extensibility/overview#protocol-negotiation) metadata and the [expected audience](/extensibility/overview#confirm-the-audience-at-startup).
 - `ValidateConfig` checks the `config` object from a policy entry. The gateway calls it before it accepts a policy.
 
 The service then implements an evaluation RPC for each operation it supports, as described in [Supported Operations](/extensibility/supervisor-middleware/operations).
@@ -98,7 +98,7 @@ These guides cover the rest of the service contract:
 When OpenShell calls your service, what it receives, and what it can return for HTTP requests, HTTP responses, and WebSocket messages.
 </Card>
 
-<Card title="Extension Authentication" href="/extensibility/extension-authentication">
+<Card title="Extension Authentication" href="/extensibility/overview#authentication">
 
 How to verify that calls to your service come from your OpenShell gateway.
 </Card>

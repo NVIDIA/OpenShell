@@ -8,7 +8,7 @@ before restart and scheduling-gate release. GPU devices are temporarily exempt.
 Image-pull Secrets are operator-selected gateway configuration rather than caller
 attachments. Managed mode stages an immutable copy for each sandbox runtime
 generation.
-See [resource admission configuration](../../docs/reference/gateway-config.mdx#external-resource-admission).
+See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission).
 
 The driver uses the Kubernetes API to create, delete, fetch, and watch sandbox
 custom resources. It runs in-process with the gateway server and supports three

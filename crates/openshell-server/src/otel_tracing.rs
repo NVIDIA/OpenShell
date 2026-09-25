@@ -15,7 +15,7 @@
 //!
 //! **How** to export — sampling, batching, span limits, transport headers —
 //! is the SDK's `OTEL_*` environment surface, read as the provider is built
-//! and mirrored nowhere here. `docs/reference/gateway-config.mdx` documents
+//! and mirrored nowhere here. `docs/how-it-works/gateways/configuration.mdx` documents
 //! the variables operators are likely to want.
 //!
 //! Only traces are exported. Logs and metrics have their own surfaces (OCSF
@@ -401,7 +401,7 @@ mod tests {
             .map(|v| v.to_string())
     }
 
-    /// Documented in `docs/reference/gateway-config.mdx`: the config file wins
+    /// Documented in `docs/how-it-works/gateways/configuration.mdx`: the config file wins
     /// over `OTEL_SERVICE_NAME`, because the gateway owns its own identity
     /// when an operator has stated it explicitly.
     #[test]

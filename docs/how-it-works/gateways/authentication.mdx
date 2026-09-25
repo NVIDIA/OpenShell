@@ -7,7 +7,7 @@ keywords: "Generative AI, Cybersecurity, Gateway, Authentication, mTLS, OIDC, Op
 position: 1
 ---
 
-This page describes how the CLI resolves a gateway, authenticates with it, and where credentials are stored. For how to deploy or register gateways, refer to [Gateways](/sandboxes/manage-gateways).
+This page describes how the CLI resolves a gateway, authenticates with it, and where credentials are stored. For how to deploy or register gateways, refer to [Gateways](/how-it-works/gateways/overview).
 
 ## Gateway Resolution
 
@@ -199,7 +199,7 @@ For a headless environment, set `OPENSHELL_NO_BROWSER=1` before registering or l
 6. The gateway authorizes the gRPC method. Platform-scoped methods require the configured admin role. Workspace-scoped methods require the configured user role and a sufficient membership in the target workspace. Admin role holders satisfy user-role checks and bypass workspace membership checks.
 
 For the Platform Admin, Workspace Admin, and Workspace User permissions, refer
-to [Workspaces](/sandboxes/manage-workspaces).
+to [Workspaces](/how-it-works/workspaces).
 
 #### JWT validation
 
@@ -242,7 +242,7 @@ display name when available, identity provider, roles, and scopes. The gateway
 returns its validated identity; the CLI does not infer these values from an
 unverified local token payload. Use the `subject` value when adding the user to
 a workspace. For membership commands, refer to
-[Workspaces](/sandboxes/manage-workspaces).
+[Workspaces](/how-it-works/workspaces).
 
 ### Edge JWT (cloud gateways)
 

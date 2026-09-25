@@ -24,11 +24,13 @@ This keeps the complete access contract in one place:
 
 ## Define and Attach a Hosted Provider
 
-Start from an existing profile, review its access, and import it under a new
-ID. For example, export the NVIDIA profile:
+Start from the [NVIDIA example profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/nvidia.yaml),
+review its access, and import an edited copy under a new ID. A new gateway has
+no profiles to export. Download the example so you can add the Python paths
+used by this workload:
 
 ```shell
-openshell provider profile export nvidia -o yaml --global > nvidia-native.yaml
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/nvidia.yaml -o nvidia-native.yaml
 ```
 
 In `nvidia-native.yaml`, change `id` to `nvidia-native`, give the profile a
@@ -50,8 +52,8 @@ Lint and import the complete edited profile, then create a provider from its
 new ID:
 
 ```shell
-openshell provider profile lint -f nvidia-native.yaml
-openshell provider profile import -f nvidia-native.yaml
+openshell profile lint -f nvidia-native.yaml
+openshell profile import -f nvidia-native.yaml
 
 openshell provider create \
   --name nvidia-prod \
@@ -156,8 +158,8 @@ binaries:
 Import the profile, create an instance, and attach it:
 
 ```shell
-openshell provider profile lint -f ollama-openai.yaml
-openshell provider profile import -f ollama-openai.yaml
+openshell profile lint -f ollama-openai.yaml
+openshell profile import -f ollama-openai.yaml
 openshell provider create --name ollama --type ollama-openai
 
 openshell sandbox create \
@@ -248,10 +250,10 @@ Export the old provider type's profile, edit its ID and access contract, import
 it, and create a replacement provider from the original credential source:
 
 ```shell
-openshell provider profile export nvidia -o yaml > nvidia-native.yaml
+openshell profile export nvidia -o yaml > nvidia-native.yaml
 # Edit id, display_name, endpoints, and binaries in nvidia-native.yaml.
-openshell provider profile lint -f nvidia-native.yaml
-openshell provider profile import -f nvidia-native.yaml
+openshell profile lint -f nvidia-native.yaml
+openshell profile import -f nvidia-native.yaml
 openshell provider create \
   --name nvidia-native-prod \
   --type nvidia-native \
@@ -297,7 +299,7 @@ Special cases require additional work:
 - Host-local services need `host.openshell.internal` or a reachable LAN/service
   hostname, not `127.0.0.1` or `localhost`.
 - Google Vertex AI clients must use the native Vertex endpoint and
-  authentication behavior. See [Google](/providers/google-cloud#vertex-ai).
+  authentication behavior. See [Google](/how-it-works/providers/google#vertex-ai).
 - A bridge-fronted AWS Bedrock deployment needs a custom profile that declares
   the bridge endpoint and allowed client binaries.
 
@@ -312,7 +314,7 @@ headers, model selection, request shape, streaming, and timeout behavior.
 
 ## Next Steps
 
-- [Profiles](/providers/profiles)
-- [Providers](/sandboxes/manage-providers)
-- [Customize Sandbox Policies](/sandboxes/policies)
-- [Google](/providers/google-cloud#vertex-ai)
+- [Profiles](/how-it-works/providers/profiles)
+- [Providers](/how-it-works/providers/overview)
+- [Customize Sandbox Policies](/how-it-works/policies/overview)
+- [Google](/how-it-works/providers/google#vertex-ai)

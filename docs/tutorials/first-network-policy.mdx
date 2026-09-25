@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Write Your First Sandbox Network Policy"
 sidebar-title: "First Network Policy"
-slug: "get-started/tutorials/first-network-policy"
 description: "Learn how OpenShell network policies work by creating a sandbox, observing default-deny in action, and applying a fine-grained L7 read-only rule."
 keywords: "Generative AI, Cybersecurity, Tutorial, Policy, Network Policy, Sandbox, Security"
 ---
@@ -133,8 +132,8 @@ openshell policy set demo --policy github_readonly.yaml --wait
 This tutorial uses `curl` and `read-only` access to keep things simple. When building policies for real workloads:
 
 - To scope the policy to an agent, replace the `binaries` section with your agent's binary, such as `/usr/local/bin/claude`, instead of `curl`.
-- To grant write access, change `access: read-only` to `read-write` or add explicit `rules` for specific paths. Refer to the [Policy Schema](/reference/policy-schema).
-- To allow additional endpoints, stack multiple policies in the same file for PyPI, npm, or your internal APIs. Refer to [Policies](/sandboxes/policies) for examples.
+- To grant write access, change `access: read-only` to `read-write` or add explicit `rules` for specific paths. Refer to the [Policy Schema](/how-it-works/policies/schema).
+- To allow additional endpoints, stack multiple policies in the same file for PyPI, npm, or your internal APIs. Refer to [Policies](/how-it-works/policies/overview) for examples.
 
 </Tip>
 
@@ -208,4 +207,4 @@ bash examples/sandbox-policy-quickstart/demo.sh
 
 ## Next Steps
 
-- To walk through a full policy iteration with Claude Code, including diagnosing denials and applying fixes from outside the sandbox, refer to [GitHub Sandbox](/get-started/tutorials/github-sandbox).
+- To walk through a full policy iteration with Claude Code, including diagnosing denials and applying fixes from outside the sandbox, refer to [GitHub Sandbox](/tutorials/github-push-access).

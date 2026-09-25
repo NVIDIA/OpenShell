@@ -11,8 +11,8 @@ model. The application calls the provider's native endpoint and owns its base
 URL, model, request format, and timeout.
 
 Use installed `openshell --help` output as the authority for command syntax.
-Refer to the published [provider management guide](https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers.md)
-and [provider profile guide](https://docs.nvidia.com/openshell/latest/providers/profiles.md)
+Refer to the published [provider management guide](https://docs.nvidia.com/openshell/latest/how-it-works/providers/overview)
+and [provider profile guide](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles)
 for current behavior.
 
 ## Diagnostic Workflow

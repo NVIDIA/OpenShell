@@ -30,7 +30,7 @@ operations that write results back into workload memory — `getpeername`,
 per-message length write-backs. Outbound-oriented workloads run unchanged;
 server workloads that read the peer address on accept need a node kernel with
 `WAIT_KILLABLE_RECV` (Linux 5.19+, or a distribution backport). See the
-[support matrix](/reference/support-matrix#legacy-read-only-mode-kernels-before-linux-519)
+[support matrix](/about/support-matrix#legacy-read-only-mode-kernels-before-linux-519)
 for the full behavior; the selected mode is reported as `seccomp_listener_mode`
 in the sandbox qualification output.
 

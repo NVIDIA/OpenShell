@@ -157,7 +157,7 @@ You may need to go back and forth a few times. Keep the loop tight:
 
 ## Step 3: Read the Policy Schema
 
-Read the published [policy schema reference](https://docs.nvidia.com/openshell/latest/reference/policy-schema.md) before generating or changing a policy. Published documentation is the authority for the current schema; do not infer fields from examples in this skill.
+Read the published [policy schema reference](https://docs.nvidia.com/openshell/latest/how-it-works/policies/schema) before generating or changing a policy. Published documentation is the authority for the current schema; do not infer fields from examples in this skill.
 
 Key sections to reference:
 - **Policy Schema Reference** — top-level structure
@@ -171,7 +171,7 @@ Key sections to reference:
 
 When middleware is requested, also read the published [supervisor middleware guide](https://docs.nvidia.com/openshell/latest/extensibility/supervisor-middleware.md).
 
-For enforcement concepts and the shipped baseline, read [sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md) and the [default policy reference](https://docs.nvidia.com/openshell/latest/reference/default-policy.md). The default policy is built into the OpenShell runtime and applies when no explicit policy is supplied.
+For enforcement concepts and the shipped baseline, read [sandbox policies](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview) and the [default policy reference](https://docs.nvidia.com/openshell/latest/how-it-works/policies/default-policy). The default policy is built into the OpenShell runtime and applies when no explicit policy is supplied.
 
 Validate the intended provider combination as well as the authored policy.
 An image endpoint can become credentialed after provider composition and block
@@ -631,9 +631,9 @@ private_services:
 
 ## Additional Resources
 
-- [Policy schema](https://docs.nvidia.com/openshell/latest/reference/policy-schema.md)
-- [Sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
-- [Default policy](https://docs.nvidia.com/openshell/latest/reference/default-policy.md)
+- [Policy schema](https://docs.nvidia.com/openshell/latest/how-it-works/policies/schema)
+- [Sandbox policies](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview)
+- [Default policy](https://docs.nvidia.com/openshell/latest/how-it-works/policies/default-policy)
 - [Supervisor middleware](https://docs.nvidia.com/openshell/latest/extensibility/supervisor-middleware.md)
 - Default policy: built into the OpenShell runtime
 - For translation examples from real API docs, see [examples.md](examples.md)

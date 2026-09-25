@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Grant GitHub Push Access to a Sandboxed Agent"
 sidebar-title: "GitHub Push Access"
-slug: "get-started/tutorials/github-sandbox"
+slug: "tutorials/github-push-access"
 description: "Launch an agent with a GitHub provider, diagnose a denied push, and grant repository-scoped write access."
 keywords: "Generative AI, Cybersecurity, Tutorial, GitHub, Sandbox, Policy, Claude Code"
 ---
@@ -12,7 +12,7 @@ This tutorial shows how provider access and sandbox policy work together. You
 attach a GitHub provider that contributes read-only GitHub access, observe a
 denied push, and add a user policy that permits writes to one repository.
 
-The built-in [default policy](/reference/default-policy) does not grant network
+The built-in [default policy](/how-it-works/policies/default-policy) does not grant network
 access. Imported provider profiles contribute the endpoints and executable
 paths needed by their providers.
 
@@ -34,14 +34,15 @@ and updates policy.
 
 ## Import the Provider Profiles
 
-Download and review the Claude Code and GitHub profiles. Confirm that their
-`binaries` paths match the executables in your image, then import them:
+Review the [Claude Code profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/claude-code.yaml)
+and [GitHub profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/github.yaml).
+Confirm that their `binaries` paths match the executables in your image, then
+import them directly. If a path or endpoint grant needs to change, edit a local
+copy and import it with `-f` instead.
 
 ```shell
-curl -LsSfO https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/claude-code.yaml
-curl -LsSfO https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/github.yaml
-openshell profile import -f claude-code.yaml --global
-openshell profile import -f github.yaml --global
+openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/claude-code.yaml --global
+openshell profile import --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/github.yaml --global
 ```
 
 The gateway contains no built-in profiles. Import each profile once per gateway
@@ -218,6 +219,6 @@ openshell sandbox delete github-demo
 
 ## Next Steps
 
-- Review [Profiles](/providers/profiles) for endpoint-scoped credential placement.
-- Review [Policies](/sandboxes/policies) for incremental policy updates and policy history.
-- Review the [Policy Schema](/reference/policy-schema) for REST, GraphQL, and other protocol rules.
+- Review [Profiles](/how-it-works/providers/profiles) for endpoint-scoped credential placement.
+- Review [Policies](/how-it-works/policies/overview) for incremental policy updates and policy history.
+- Review the [Policy Schema](/how-it-works/policies/schema) for REST, GraphQL, and other protocol rules.
