@@ -46,7 +46,7 @@ fn podman_container_diagnostics(sandbox_name: &str) -> String {
             .args([
                 "inspect",
                 "--format",
-                "{{.Name}} role={{index .Config.Labels \"openshell.io/isolation-role\"}} state={{json .State}}",
+                "{{.Name}} role={{index .Config.Labels \"openshell.ai/isolation-role\"}} state={{json .State}}",
                 id,
             ])
             .output();

@@ -606,7 +606,7 @@ async fn podman_container_name_for_sandbox(
         .arg("--filter")
         .arg(format!("label=openshell.ai/sandbox-name={sandbox_name}"))
         .arg("--filter")
-        .arg("label=openshell.io/isolation-role=sandbox")
+        .arg("label=openshell.ai/isolation-role=sandbox")
         .arg("--format")
         .arg("{{.Names}}");
     apply_podman_config_env(&mut cmd);
