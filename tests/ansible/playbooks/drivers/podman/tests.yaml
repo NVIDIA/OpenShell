@@ -12,6 +12,16 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
+    - name: Detect tmachine container runtime
+      ansible.builtin.include_role:
+        name: tmachine_container_runtime
+
+    - name: Resolve the Podman reference execution context
+      ansible.builtin.set_fact:
+        podman_reference_user: "{{ 'tmachine' if tmachine_container_runtime_is_rootless else 'root' }}"
+        podman_reference_home: "{{ '/home/tmachine' if tmachine_container_runtime_is_rootless else '/root' }}"
+        podman_reference_uid: "{{ tmachine_container_runtime_tmachine_uid.stdout if tmachine_container_runtime_is_rootless else '0' }}"
+
     - name: Create Podman test directory
       become: true
       ansible.builtin.file:
@@ -78,52 +88,47 @@
         var: podman_gateway_journal.stdout_lines
       when: podman_test_result.rc != 0
 
-    - name: Resolve tmachine UID after Podman test failure
-      ansible.builtin.command:
-        argv: [id, --user, tmachine]
-      changed_when: false
-      when: podman_test_result.rc != 0
-      register: podman_tmachine_uid
-
     - name: Discover Podman containers after test failure
       become: true
-      become_user: tmachine
+      become_user: "{{ podman_reference_user }}"
       ansible.builtin.command:
         argv: [timeout, "15", podman, ps, --all, --quiet, --no-trunc]
       environment:
-        HOME: /home/tmachine
-        XDG_RUNTIME_DIR: "/run/user/{{ podman_tmachine_uid.stdout }}"
+        HOME: "{{ podman_reference_home }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_reference_uid }}"
       changed_when: false
       failed_when: false
       when: podman_test_result.rc != 0
       register: podman_failed_containers
 
-    - name: Capture rootless Podman journal after test failure
+    - name: Capture Podman journal after test failure
       become: true
-      become_user: tmachine
+      become_user: "{{ podman_reference_user }}"
       ansible.builtin.command:
-        argv: [journalctl, --user, --unit, podman.service, --no-pager, --lines, "200"]
+        argv: >-
+          {{ ['journalctl'] + (['--user'] if tmachine_container_runtime_is_rootless else [])
+             + ['--unit', 'podman.service', '--no-pager', '--lines', '200'] }}
       environment:
-        HOME: /home/tmachine
-        XDG_RUNTIME_DIR: "/run/user/{{ podman_tmachine_uid.stdout }}"
+        HOME: "{{ podman_reference_home }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_reference_uid }}"
       changed_when: false
       failed_when: false
       when: podman_test_result.rc != 0
       register: podman_service_journal
 
-    - name: Show rootless Podman journal after test failure
+    - name: Show Podman journal after test failure
       ansible.builtin.debug:
         var: podman_service_journal.stdout_lines
       when: podman_test_result.rc != 0
 
     - name: Capture Podman container inspection after test failure
       become: true
-      become_user: tmachine
+      become_user: "{{ podman_reference_user }}"
       ansible.builtin.command:
         argv: [timeout, "15", podman, inspect, "{{ item }}"]
       environment:
-        HOME: /home/tmachine
-        XDG_RUNTIME_DIR: "/run/user/{{ podman_tmachine_uid.stdout }}"
+        HOME: "{{ podman_reference_home }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_reference_uid }}"
       changed_when: false
       failed_when: false
       when: podman_test_result.rc != 0
@@ -137,12 +142,12 @@
 
     - name: Capture Podman container logs after test failure
       become: true
-      become_user: tmachine
+      become_user: "{{ podman_reference_user }}"
       ansible.builtin.command:
         argv: [timeout, "15", podman, logs, "{{ item }}"]
       environment:
-        HOME: /home/tmachine
-        XDG_RUNTIME_DIR: "/run/user/{{ podman_tmachine_uid.stdout }}"
+        HOME: "{{ podman_reference_home }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_reference_uid }}"
       changed_when: false
       failed_when: false
       when: podman_test_result.rc != 0
