@@ -328,6 +328,9 @@ server:
   # -- Enable plaintext HTTP routing for loopback sandbox service URLs on
   # TLS-enabled gateways.
   enableLoopbackServiceHttp: true
+  # -- Enable the WebSocket tunnel used by CLI/SDK clients behind an
+  # authenticated edge proxy. Leave disabled for direct gateway installs.
+  enableWebsocketTunnel: false
   # -- Posture when a candidate sandbox policy fails validation. `fail_closed`
   # deactivates the previous policy; `retain_last_valid` keeps it active.
   policyValidationFailureMode: fail_closed

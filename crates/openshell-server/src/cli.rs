@@ -257,6 +257,15 @@ struct RunArgs {
         action = ArgAction::Set
     )]
     enable_loopback_service_http: bool,
+
+    /// Enable the WebSocket tunnel for an authenticated edge proxy.
+    #[arg(
+        long,
+        env = "OPENSHELL_ENABLE_WEBSOCKET_TUNNEL",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    enable_websocket_tunnel: bool,
 }
 
 pub fn command() -> Command {
@@ -508,7 +517,8 @@ fn prepare_server_config_with_drivers(
                 .unwrap_or_default(),
         )
         .with_server_sans(args.server_sans.clone())
-        .with_loopback_service_http(args.enable_loopback_service_http);
+        .with_loopback_service_http(args.enable_loopback_service_http)
+        .with_websocket_tunnel(args.enable_websocket_tunnel);
     if let Some(sources) = file
         .as_ref()
         .and_then(|file| file.openshell.gateway.provider_profile_sources.clone())
@@ -1089,6 +1099,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.enable_loopback_service_http = enabled;
     }
+    if let Some(enabled) = file.enable_websocket_tunnel
+        && arg_defaulted(matches, "enable_websocket_tunnel")
+    {
+        args.enable_websocket_tunnel = enabled;
+    }
     if let Some(mtls_auth) = &file.mtls_auth
         && arg_defaulted(matches, "enable_mtls_auth")
     {
@@ -1438,6 +1453,30 @@ mod tests {
             Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
 
         assert!(cli.run.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn websocket_tunnel_is_disabled_by_default_and_can_be_enabled_from_file() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_ENABLE_WEBSOCKET_TUNNEL");
+        let (mut args, matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        assert!(!args.enable_websocket_tunnel);
+
+        let file = config_file_from_toml("[openshell.gateway]\nenable_websocket_tunnel = true\n");
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+        assert!(args.enable_websocket_tunnel);
+
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--enable-websocket-tunnel=false",
+        ]);
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+        assert!(!args.enable_websocket_tunnel, "CLI flag must override file");
     }
 
     #[test]

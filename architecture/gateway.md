@@ -9,7 +9,8 @@ attachments; and asks compute runtimes to create or delete sandbox workloads.
 - Authenticate clients and sandbox supervisor sessions.
 - Serve gRPC APIs for sandbox lifecycle, provider management, policy updates,
   settings, logs, watch streams, and relay forwarding.
-- Serve HTTP endpoints for health, WebSocket tunnels, and edge-auth flows.
+- Serve HTTP endpoints for health and edge-auth flows, plus the opt-in
+  WebSocket tunnel for edge-proxy deployments.
 - Persist domain objects in SQLite or Postgres.
 - Resolve endpoint-bound provider environments for sandbox supervisors.
 - Coordinate supervisor relay sessions for connect, exec, file sync, and

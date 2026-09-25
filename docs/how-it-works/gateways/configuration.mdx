@@ -149,6 +149,8 @@ policy_validation_failure_mode = "fail_closed"
 server_sans                  = ["openshell", "*.dev.openshell.localhost"]
 # Allow plaintext HTTP routing for loopback sandbox service URLs.
 enable_loopback_service_http = true
+# Serve the WebSocket tunnel for CLI clients behind an authenticating edge proxy.
+enable_websocket_tunnel = false
 
 # Set true only for local plaintext gateways or trusted TLS termination.
 disable_tls = false

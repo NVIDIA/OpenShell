@@ -57,6 +57,7 @@ data:
     disable_tls            = true
     {{- end }}
     enable_loopback_service_http = {{ .Values.server.enableLoopbackServiceHttp }}
+    enable_websocket_tunnel = {{ .Values.server.enableWebsocketTunnel }}
     {{- $sans := list -}}
     {{- if and .Values.certManager.enabled .Values.certManager.serverDnsNames }}
     {{- $sans = .Values.certManager.serverDnsNames }}

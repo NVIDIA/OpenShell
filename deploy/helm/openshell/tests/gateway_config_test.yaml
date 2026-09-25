@@ -13,6 +13,22 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: disables the WebSocket tunnel unless explicitly enabled for an edge proxy
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^enable_websocket_tunnel\s*=\s*false$'
+
+  - it: enables the WebSocket tunnel when requested
+    template: templates/gateway-config.yaml
+    set:
+      server.enableWebsocketTunnel: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^enable_websocket_tunnel\s*=\s*true$'
+
   - it: defaults to label admission with caller driver config disabled
     template: templates/gateway-config.yaml
     asserts:

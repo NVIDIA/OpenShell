@@ -1913,6 +1913,9 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::tls_test_utils::generate_test_certs_with_ca;
+    use axum::body::Body;
+    use http::{Request, StatusCode};
+    use tower::ServiceExt;
 
     fn tls_enabled_config() -> Config {
         Config::new(Some(openshell_core::TlsConfig {
@@ -2172,6 +2175,27 @@ mod tests {
             Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
             None,
         ))
+    }
+
+    #[tokio::test]
+    async fn websocket_tunnel_is_mounted_only_when_enabled() {
+        let state = test_state("127.0.0.1:17670".parse().unwrap(), true).await;
+        let response = super::http_router(state.clone())
+            .oneshot(Request::get("/_ws_tunnel").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let mut enabled = state;
+        Arc::get_mut(&mut enabled)
+            .unwrap()
+            .config
+            .enable_websocket_tunnel = true;
+        let response = super::http_router(enabled)
+            .oneshot(Request::get("/_ws_tunnel").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
     }
 
     async fn start_tls_gateway_listener(

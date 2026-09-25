@@ -194,6 +194,10 @@ pub struct Config {
     /// Gateway user authentication behavior.
     pub auth: GatewayAuthConfig,
 
+    /// Allow the WebSocket tunnel used by authenticated edge proxies.
+    /// Disabled for local gateways by default.
+    pub enable_websocket_tunnel: bool,
+
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
@@ -850,6 +854,7 @@ impl Config {
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
+            enable_websocket_tunnel: false,
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
@@ -1020,6 +1025,13 @@ impl Config {
     #[must_use]
     pub const fn with_loopback_service_http(mut self, enabled: bool) -> Self {
         self.service_routing.enable_loopback_service_http = enabled;
+        self
+    }
+
+    /// Enable the WebSocket tunnel for an authenticated edge proxy.
+    #[must_use]
+    pub const fn with_websocket_tunnel(mut self, enabled: bool) -> Self {
+        self.enable_websocket_tunnel = enabled;
         self
     }
 }

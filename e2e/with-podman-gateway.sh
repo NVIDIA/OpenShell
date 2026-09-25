@@ -856,6 +856,8 @@ GATEWAY_ARGS=(
   --health-port "${HEALTH_PORT}"
   --tls-cert "${PKI_DIR}/server/tls.crt"
   --tls-key "${PKI_DIR}/server/tls.key"
+  # edge_tunnel_e2e exercises the opt-in WebSocket tunnel.
+  --enable-websocket-tunnel true
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
   --log-level info
 )

@@ -123,7 +123,9 @@ Gateway configuration requires `[openshell] version = 2`, a singular
 `--drivers` selectors rather than silently migrating them. One valid, nonempty
 `OPENSHELL_DRIVERS` value remains a deprecated environment-only alias when the
 canonical selector is absent; the gateway selects that driver with a warning.
-Empty, invalid, comma-delimited, or conflicting values fail startup. Homebrew
+Empty, invalid, comma-delimited, or conflicting values fail startup. The
+WebSocket tunnel for edge-proxy CLI access is off unless
+`enable_websocket_tunnel = true` (`server.enableWebsocketTunnel` in Helm). Homebrew
 and RPM package startup migrates only exact package-generated v1 defaults. If
 an upgraded package still reports an unsupported version, inspect the active prefix or `~/.config/openshell/gateway.toml`; an edited v1 file must
 follow the published schema-v2 migration steps and must not be overwritten.

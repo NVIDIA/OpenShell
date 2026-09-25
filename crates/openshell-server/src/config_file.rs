@@ -132,6 +132,9 @@ pub struct GatewayFileSection {
     /// Enable plaintext HTTP routing for loopback sandbox service URLs.
     #[serde(default)]
     pub enable_loopback_service_http: Option<bool>,
+    /// Enable the WebSocket tunnel for an authenticated edge proxy.
+    #[serde(default)]
+    pub enable_websocket_tunnel: Option<bool>,
 
     // ── Sandbox client TLS ───────────────────────────────────────────────
     #[serde(default)]
