@@ -84,14 +84,17 @@ class NavCheck:
         if url != expected:
             self.issues.append(
                 f"{rel_path}: URL {url} ({how}) does not match its file path "
-                f"{expected}. Rename the file, change the nav label, or set "
-                f'frontmatter slug: "{expected.lstrip("/")}".'
+                f"{expected}. Rename the file, change the nav label, or set a "
+                "relative slug in docs/index.yml. For folder-discovered pages, "
+                f'use frontmatter slug: "{expected.lstrip("/")}".'
             )
 
     def walk(self, items: list, prefix: str) -> None:
         for item in items or []:
             if "section" in item:
                 url = prefix + "/" + item.get("slug", fern_slug(item["section"]))
+                if item.get("skip-slug"):
+                    url = prefix
                 if "path" in item:
                     rel = item["path"]
                     self.record(rel, self.page_url(rel, url), "section page")
@@ -103,7 +106,9 @@ class NavCheck:
                         f"docs/index.yml: nav page {label!r} points to missing {rel}"
                     )
                     continue
-                if "slug" in item:
+                if item.get("skip-slug"):
+                    default, how = prefix, "skip-slug"
+                elif "slug" in item:
                     default, how = prefix + "/" + item["slug"], "nav slug"
                 else:
                     default, how = (
@@ -126,6 +131,8 @@ class NavCheck:
                     + "/"
                     + item.get("slug", fern_slug(item.get("title", folder)))
                 )
+                if item.get("skip-slug"):
+                    url = prefix
                 for page in sorted((self.docs_root / folder).rglob("*.mdx")):
                     rel = page.relative_to(self.docs_root).as_posix()
                     stem = (
@@ -197,7 +204,9 @@ def run(repo_root: Path) -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        description="Check that the published docs navigation mirrors the docs folder structure."
+    )
     parser.add_argument(
         "--repo-root", type=Path, default=Path(__file__).resolve().parents[2]
     )

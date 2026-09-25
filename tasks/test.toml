@@ -31,7 +31,7 @@ run = "uv run --no-project --with pytest --with pytest-asyncio --with pyyaml pyt
 
 ["test:docs-nav"]
 description = "Test the docs navigation check"
-run = "uv run --no-project --with pytest --with pyyaml pytest tasks/scripts/check_docs_nav_test.py"
+run = "uv run --no-project --with pytest --with pytest-asyncio --with pyyaml pytest tasks/scripts/check_docs_nav_test.py"
 
 ["test:sbom"]
 description = "Run SBOM tooling tests"
