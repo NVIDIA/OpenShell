@@ -11,8 +11,9 @@ position: 2
 ![OpenShell system architecture showing a trusted supervisor separated from a network-isolated sandbox workload. The workload can connect only to the supervisor.](../images/openshell-system-architecture.svg)
 
 OpenShell separates control-plane state from sandbox enforcement. The gateway
-owns sandbox state, policy, providers, and access. A compute driver provisions
-the workload and its isolation boundary.
+owns sandbox state, policy, providers, and access, and checks proposed policy
+changes with the policy prover before they are approved. A compute driver
+provisions the workload and its isolation boundary.
 
 The trusted supervisor runs outside the workload. `openshell-sandbox` runs
 inside it, owns the agent process, and mediates its network requests. All other
@@ -29,6 +30,7 @@ gateway for configuration, credentials, logs, and interactive sessions.
 | [Isolation backend](/extensibility/isolation-backends) | Gives the supervisor one consistent way to work with any runtime: confirm the boundary, start the agent, run commands, forward connections, and see network requests. |
 | [`openshell-sandbox`](#inside-the-sandbox-boundary) | Lives inside the boundary with the agent. It owns the agent's processes, knows which program made each request, applies process controls, and forwards TCP and DNS traffic to the supervisor. |
 | [Outer network fence](/security/best-practices#deny-by-default-egress) | Denies all network egress from the workload except its protected connection to the supervisor. Each runtime builds this with its own native tools. |
+| [Policy prover](/how-it-works/policies/prover) | Runs in the gateway and checks each proposed policy change before approval. It flags changes such as new credentialed reach, new HTTP methods, or access to cloud metadata endpoints, and any finding blocks auto-approval. It also ships as the standalone `openshell-prover` command for checking a policy against a boundary in CI. |
 | [Policies](/how-it-works/policies/overview) | Describe what the agent can touch: files, processes, network destinations, API calls, and where provider credentials can go. |
 | [Providers](/how-it-works/providers/overview) | Connect a service name to a stored credential. The supervisor hands that credential out only where policy allows it. |
 
