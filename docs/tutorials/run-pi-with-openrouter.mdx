@@ -1,16 +1,15 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Run Pi in OpenShell"
-sidebar-title: "Run Pi"
-description: "Build a Pi coding-agent image, configure Anthropic access, and run Pi inside an OpenShell sandbox."
-keywords: "Generative AI, Cybersecurity, Tutorial, Pi Coding Agent, Anthropic, Sandbox, Provider Profile"
+title: "Run Pi with OpenRouter"
+description: "Build a Pi coding-agent image, configure OpenRouter access, and run Pi inside an OpenShell sandbox."
+keywords: "Generative AI, Cybersecurity, Tutorial, Pi Coding Agent, OpenRouter, Sandbox, Provider Profile"
 ---
 
 
-This tutorial runs [Pi](https://pi.dev), a terminal coding agent, with the
-Anthropic API. You will build Pi into an OCI image, configure narrowly scoped
-model access, and run it inside OpenShell.
+This tutorial runs [Pi](https://pi.dev), a terminal coding agent, with models
+from [OpenRouter](https://openrouter.ai). You will build Pi into an OCI image,
+configure narrowly scoped model access, and run it inside OpenShell.
 
 ## Build the Pi Image
 
@@ -25,7 +24,8 @@ FROM node:24-bookworm-slim
 ARG PI_VERSION=latest
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash ca-certificates git ripgrep \
+    && apt-get install -y --no-install-recommends bash ca-certificates fd-find git ripgrep \
+    && ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}"
@@ -36,6 +36,13 @@ WORKDIR /workspace
 
 ENV PI_CODING_AGENT_DIR=/tmp/pi-agent
 ```
+
+This Dockerfile adds `fd` to the packages from Pi's container guide. Pi uses
+`fd` and `ripgrep` for file search and downloads them from GitHub on first use
+if they aren't installed. The sandbox policy doesn't allow access to GitHub, so
+that download fails and Pi's file search reports
+`fd is not available and could not be downloaded`. Installing both tools in the
+image avoids the download.
 
 Build the image with the container engine used by your local gateway:
 
@@ -48,49 +55,55 @@ and substitute `localhost/pi-agent:local` in the commands below. For a remote
 gateway, push the image to a registry the gateway can pull from. Pin
 `PI_VERSION` to a reviewed release when you publish a reproducible image.
 
-## Configure Anthropic Access
+## Configure OpenRouter Access
 
-Create `pi-anthropic.yaml`. The profile permits only the Pi executable from
-this image to reach the Anthropic API. OpenShell supplies a credential
-placeholder to Pi and replaces it only on requests to the declared endpoint.
+Create `provider-openrouter.yaml`. The profile permits only the image's Node.js
+runtime, which runs Pi, to reach the OpenRouter API. OpenShell supplies a
+credential placeholder to Pi and replaces it only on requests to the declared
+endpoint.
 
 ```yaml
-id: pi-anthropic
-display_name: Pi with Anthropic
-description: Anthropic model access for the Pi coding agent
-category: agent
+id: openrouter
+display_name: OpenRouter
+description: Direct OpenRouter inference access
+category: inference
 inference_capable: true
+
 credentials:
   - name: api_key
-    description: Anthropic API key used by Pi
-    env_vars: [ANTHROPIC_API_KEY]
+    description: OpenRouter API key
+    env_vars:
+      - OPENROUTER_API_KEY
     required: true
-    auth_style: header
-    header_name: x-api-key
+    auth_style: bearer
+    header_name: authorization
+
 discovery:
-  credentials: [api_key]
+  credentials:
+    - api_key
+
 endpoints:
-  - host: api.anthropic.com
+  - host: openrouter.ai
     port: 443
     protocol: rest
     access: read-write
     enforcement: enforce
+
 binaries:
-  - /usr/local/bin/pi
-  - /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/**
+  - /usr/local/bin/node
 ```
 
 Lint and import the profile into your current workspace, then store an
-Anthropic API key in a provider:
+OpenRouter API key in a provider:
 
 ```shell
-openshell provider profile lint -f pi-anthropic.yaml
-openshell provider profile import -f pi-anthropic.yaml
+openshell profile lint -f provider-openrouter.yaml
+openshell profile import -f provider-openrouter.yaml
 
-ANTHROPIC_API_KEY=your-key \
+OPENROUTER_API_KEY=your-key \
   openshell provider create \
-    --name pi-anthropic \
-    --type pi-anthropic \
+    --name openrouter \
+    --type openrouter \
     --from-existing
 ```
 
@@ -102,12 +115,19 @@ Create the sandbox, attach the provider, and run Pi interactively:
 openshell sandbox create \
   --name pi \
   --from pi-agent:local \
-  --provider pi-anthropic \
+  --provider openrouter \
   -- pi
 ```
 
 The command after `--` is the sandbox's main process. Pi and every command it
-starts run inside the sandbox boundary. Try asking Pi:
+starts run inside the sandbox boundary.
+
+Pi starts with its default OpenRouter model. To use a different one, run
+`/model` in Pi and select any OpenRouter model from the list. OpenRouter
+typically offers some free models, marked with a `:free` suffix, that you can
+use to test the setup without spending credits.
+
+Try asking Pi:
 
 ```text
 Explain what files are available in this workspace.
@@ -119,21 +139,22 @@ To give Pi a local project, upload it before the main process starts:
 openshell sandbox create \
   --name pi-project \
   --from pi-agent:local \
-  --provider pi-anthropic \
+  --provider openrouter \
   --upload .:/workspace \
   -- pi
 ```
 
-The provider grants Pi access to `api.anthropic.com`. The built-in fallback
+The provider grants Pi access to `openrouter.ai`. The built-in fallback
 policy grants access to the working directory and standard runtime paths while
 denying all other network egress. Add a reviewed custom policy when Pi needs
 package registries, source hosts, tool servers, or other destinations.
 
 ## Adapt the Pi Workflow
 
-Pi supports multiple model providers. Create or adapt a provider profile for
-the service you use, and make its `binaries` paths match the Pi installation in
-your image. The OpenShell repository contains reviewable profile examples in
+Pi supports other model providers besides OpenRouter. To use one, create or
+adapt a provider profile for that service, and make its `binaries` paths match
+the Pi installation in your image. The OpenShell repository contains reviewable
+profile examples in
 [`providers/`](https://github.com/NVIDIA/OpenShell/tree/main/providers).
 
 Install any additional compilers, package managers, and agent tools in the
@@ -155,8 +176,8 @@ openshell logs pi --tail
 
 If `pi` is missing, confirm that the image was built with the selected local
 container engine or pushed to a registry visible to the gateway. If a model
-request is denied, confirm that the profile's `binaries` paths match
-`command -v pi` and `npm root -g` inside the image. Review any other denied
+request is denied, confirm that the profile's `binaries` path matches
+`readlink -f "$(command -v node)"` inside the image. Review any other denied
 network or filesystem operation before updating the sandbox policy.
 
 ## Next Steps
