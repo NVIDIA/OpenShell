@@ -10,25 +10,28 @@ position: 5
 
 By default, the OpenShell gateway is only reachable inside the cluster. To let CLI clients connect without a `kubectl port-forward`, expose the gateway through an ingress.
 
-OpenShell uses the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io) for ingress. The chart creates a `GRPCRoute` that routes inbound gRPC traffic to the gateway pod. You need a Gateway API implementation installed on your cluster to fulfill the `GRPCRoute`. OpenShell tests this integration with [agentgateway](https://agentgateway.dev) v1.5.0 and [Envoy Gateway](https://gateway.envoyproxy.io) v1.8.1.
+OpenShell uses the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io) for ingress. The chart creates a `GRPCRoute` that routes inbound gRPC traffic to the gateway pod. You need a Gateway API implementation installed on your cluster to fulfill the `GRPCRoute`. OpenShell tests this integration with [agentgateway](https://agentgateway.dev) and [Envoy Gateway](https://gateway.envoyproxy.io). The installation examples below pin known-good versions.
 
 ## Install agentgateway
 
-Install the standard Gateway API v1.6.2 resources, then install the pinned agentgateway charts:
+Install the standard Gateway API resources, then install the pinned agentgateway charts:
 
 ```shell
-kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/standard-install.yaml
+export OPENSHELL_GATEWAY_API_VERSION=v1.6.2
+export OPENSHELL_AGENTGATEWAY_VERSION=v1.5.0
+
+kubectl apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${OPENSHELL_GATEWAY_API_VERSION}/standard-install.yaml"
 
 helm upgrade --install agentgateway-crds \
   oci://cr.agentgateway.dev/charts/agentgateway-crds \
-  --version v1.5.0 \
+  --version "${OPENSHELL_AGENTGATEWAY_VERSION}" \
   --namespace agentgateway-system \
   --create-namespace \
   --wait
 
 helm upgrade --install agentgateway \
   oci://cr.agentgateway.dev/charts/agentgateway \
-  --version v1.5.0 \
+  --version "${OPENSHELL_AGENTGATEWAY_VERSION}" \
   --namespace agentgateway-system \
   --wait
 ```
