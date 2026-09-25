@@ -530,8 +530,10 @@ RFC's complete qualification coverage.
 The tagged release workflow calls the aggregate Security Scan after publishing
 the candidate's commit-addressed gateway, sandbox, and supervisor images. CodeQL,
 Trivy, Cargo Deny, and Actionlint/Zizmor run for every release tag; Codex Security
-also runs for pre-release tags. High or Critical findings and scanner failures
-fail qualification.
+also runs for pre-release tags. Scanner failures, Cargo Deny advisories, and
+High or Critical Codex Security findings fail qualification. CodeQL, Trivy, and
+Zizmor findings are temporarily informational while the findings accepted for
+v0.1.0 are addressed in 0.1.x releases.
 
 The `Release Qualification` job aggregates security, conformance, feature,
 Docker E2E, and VM E2E results. The currently implemented profile gates stable

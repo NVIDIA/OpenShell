@@ -103,10 +103,13 @@ Actions or call it from another workflow. All applicable children analyze the
 candidate snapshot. Cargo Deny uses its existing NVIDIA self-hosted runner and
 CI container.
 
-Tagged releases treat CodeQL, Trivy, Zizmor, Cargo Deny, and Codex Security
-findings as failures of the currently implemented qualification profile. A
-profile failure does not prevent a pre-release candidate's complete artifact
-set from being published, but it does prevent stable publication.
+Tagged releases treat Cargo Deny and Codex Security findings as failures of the
+currently implemented qualification profile. A profile failure does not prevent
+a pre-release candidate's complete artifact set from being published, but it
+does prevent stable publication. CodeQL, Trivy, and Zizmor findings are
+temporarily informational for tagged releases: the existing findings were
+reviewed and accepted for v0.1.0 and will be addressed in 0.1.x releases.
+Scanner failures still fail qualification.
 
 ```shell
 gh workflow run security-scan.yml --ref main \
