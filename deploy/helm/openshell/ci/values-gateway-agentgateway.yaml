@@ -1,13 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Attach OpenShell's GRPCRoute to the shared agentgateway Gateway installed by
-# tasks/scripts/agentgateway-k8s-setup.sh. Keeping the proxy Gateway in a
-# separate namespace avoids a name collision with OpenShell's Service.
+# Create a dedicated agentgateway Gateway and GRPCRoute in the OpenShell
+# namespace. Agentgateway names its generated proxy Service after the Gateway,
+# so the Gateway must use a name distinct from the OpenShell Service.
 grpcRoute:
   enabled: true
   gateway:
-    create: false
+    create: true
+    className: agentgateway
     name: openshell-ingress
-    namespace: agentgateway-system
-    sectionName: grpc

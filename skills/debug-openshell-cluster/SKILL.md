@@ -593,22 +593,20 @@ Gateway proxy reports `TLS error: Secret is not supplied by SDS` or similar
 backend TLS errors, the ConfigMap CA likely does not match the server
 certificate CA — verify both are from the same issuer.
 
-For agentgateway HTTPS through a ListenerSet, inspect the shared Gateway's
-`allowedListeners`, the namespace-local certificate Secret, and both attachment
-statuses. The ListenerSet should be `Accepted` and `Programmed`; its GRPCRoute
-parent should be `Accepted` with resolved references:
+For agentgateway HTTPS, inspect the chart-created Gateway, its generated proxy
+Service, the certificate Secret, and the GRPCRoute attachment. The Gateway
+should be `Accepted` and `Programmed`; its GRPCRoute parent should be `Accepted`
+with resolved references:
 
 ```bash
-kubectl -n agentgateway-system get gateway openshell-ingress -o yaml
-kubectl -n openshell get listenerset openshell-tls -o yaml
+kubectl -n openshell get gateway openshell-ingress -o yaml
 kubectl -n openshell get grpcroute openshell -o yaml
 kubectl -n openshell get secret openshell-ingress-tls
-kubectl -n agentgateway-system get service openshell-ingress -o yaml
+kubectl -n openshell get service openshell-ingress -o yaml
 ```
 
-A rejected ListenerSet usually means the shared Gateway does not authorize its
-namespace. An unresolved certificate reference means the TLS Secret is absent
-from the ListenerSet namespace or has the wrong type. With frontend termination,
+An unresolved certificate reference means the TLS Secret is absent from the
+Gateway namespace or has the wrong type. With frontend termination,
 `server.disableTls` must be true; when `BackendTLSPolicy` is enabled for backend
 re-encryption, keep gateway-pod TLS enabled and disable client mTLS.
 
@@ -949,7 +947,8 @@ credential failures.
 | Sandbox remains `Stopping` or `Starting` | Driver stop/start failed, retained resource is missing, or a fresh supervisor has not connected | Gateway and driver logs; `docker inspect`, `podman inspect`, Agent Sandbox status/PVC, or VM state marker and launcher process |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
 | Gateway API resources fail with `the server could not find the requested resource` | Optional Gateway API resources were applied without the standard Gateway API CRDs | Install the CRDs and a controller such as agentgateway or Envoy Gateway before enabling `grpcRoute` |
-| `GRPCRoute` is not accepted | The parent Gateway or listener name is wrong, or a cross-namespace Gateway does not allow the route | Inspect `kubectl get gatewayclass,gateway,grpcroute -A`; verify `grpcRoute.gateway.name`, `namespace`, and `sectionName`, plus the listener's `allowedRoutes` policy |
+| `GRPCRoute` is not accepted | The parent Gateway name is wrong, or a cross-namespace Gateway does not allow the route | Inspect `kubectl get gatewayclass,gateway,grpcroute -A`; verify `grpcRoute.gateway.name` and `namespace`, plus the listener's `allowedRoutes` policy |
+| Agentgateway does not create its proxy Service | The chart-created Gateway reused the OpenShell Service name | Set `grpcRoute.gateway.name` to a distinct name such as `openshell-ingress`; the chart rejects this collision for agentgateway |
 | HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | The Gateway controller terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so the controller forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
 | HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at the Gateway, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |
 | External server `Certificate` never becomes Ready with `certManager.serverIssuerRef` set | ACME issuer rejected internal-only SANs, a loopback IP, or a `commonName` absent from the SANs | `kubectl -n openshell describe certificate openshell-server-external`; confirm `certManager.serverDnsNames` lists only real, externally-resolvable hostnames |

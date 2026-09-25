@@ -585,16 +585,13 @@ grpcRoute:
     # Set to false and provide name/namespace to attach to a pre-existing Gateway.
     create: false
     # -- GatewayClass to reference when gateway.create is true. Envoy Gateway
-    # uses "eg"; set another installed GatewayClass as needed.
+    # uses "eg"; agentgateway uses "agentgateway".
     className: "eg"
     # -- Name of the Gateway resource. Defaults to the chart fullname.
     name: ""
     # -- Namespace of the Gateway referenced by the GRPCRoute parentRef.
     # Defaults to the release namespace.
     namespace: ""
-    # -- Listener name to select on the referenced Gateway. Leave empty to let
-    # the controller select a compatible listener.
-    sectionName: ""
     # Listener settings (only used when gateway.create is true).
     listener:
       # -- Listener port for the generated Gateway resource. Use 443 with protocol HTTPS.
@@ -614,36 +611,6 @@ grpcRoute:
         # in the Gateway's namespace. May reference a cert-manager-issued Secret
         # or the existing openshell-server-tls Secret (its SANs must include the
         # external hostname).
-        certificateRefs: []
-  # Optional Gateway API ListenerSet for adding an OpenShell-owned listener to
-  # a shared, platform-managed Gateway. ListenerSet is an Extended-support
-  # Gateway API feature and is not enabled by default.
-  listenerSet:
-    # -- Attach the GRPCRoute to a ListenerSet instead of directly to the
-    # Gateway configured above.
-    enabled: false
-    # -- Create the ListenerSet in the Helm release namespace. Set to false to
-    # attach to a pre-existing ListenerSet in that namespace.
-    create: true
-    # -- ListenerSet name. When empty, defaults to the chart-generated resource
-    # fullname with a `-listeners` suffix.
-    name: ""
-    listener:
-      # -- Listener name selected by the GRPCRoute parent reference.
-      name: grpc-tls
-      # -- Optional hostname matched by the ListenerSet listener.
-      hostname: ""
-      # -- Listener port.
-      port: 443
-      # -- Listener protocol: HTTP or HTTPS.
-      protocol: HTTPS
-      # -- "Same" restricts attached routes to the ListenerSet namespace;
-      # "All" allows routes from any namespace.
-      allowedRoutes: Same
-      tls:
-        # -- certificateRefs for an HTTPS ListenerSet listener. Each entry
-        # needs a `name` pointing at a kubernetes.io/tls Secret in the Helm
-        # release namespace.
         certificateRefs: []
   # BackendTLSPolicy for end-to-end TLS between the Gateway proxy and the
   # OpenShell gateway pod. When enabled, the Gateway proxy terminates

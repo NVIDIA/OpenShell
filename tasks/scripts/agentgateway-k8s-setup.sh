@@ -4,7 +4,6 @@
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ACTION="${1:-install}"
 KUBE_CONTEXT="${OPENSHELL_AGENTGATEWAY_KUBE_CONTEXT:-}"
 NAMESPACE="agentgateway-system"
@@ -13,7 +12,6 @@ AGENTGATEWAY_VERSION="${OPENSHELL_AGENTGATEWAY_VERSION:-v1.5.0}"
 AGENTGATEWAY_CHART="${OPENSHELL_AGENTGATEWAY_CHART:-oci://cr.agentgateway.dev/charts/agentgateway}"
 AGENTGATEWAY_CRDS_CHART="${OPENSHELL_AGENTGATEWAY_CRDS_CHART:-oci://cr.agentgateway.dev/charts/agentgateway-crds}"
 GATEWAY_API_VERSION="${OPENSHELL_GATEWAY_API_VERSION:-v1.6.2}"
-MANIFEST="${ROOT}/deploy/kube/manifests/agentgateway-openshell.yaml"
 
 kubectl_args=()
 helm_args=()
@@ -38,11 +36,8 @@ case "${ACTION}" in
       --namespace "${NAMESPACE}" \
       --wait --timeout 5m
 
-    kubectl "${kubectl_args[@]}" apply -f "${MANIFEST}"
     ;;
   delete)
-    kubectl "${kubectl_args[@]}" delete -f "${MANIFEST}" \
-      --ignore-not-found --wait=false
     helm "${helm_args[@]}" uninstall "${RELEASE_NAME}" \
       --namespace "${NAMESPACE}" --wait --timeout 60s 2>/dev/null || true
     helm "${helm_args[@]}" uninstall "${RELEASE_NAME}-crds" \

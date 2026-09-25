@@ -481,7 +481,7 @@ jobs:
       gateway-controller: agentgateway
       conformance-artifact-prefix: openshell-conformance
 
-  kubernetes-agentgateway-shared-tls-e2e:
+  kubernetes-agentgateway-tls-e2e:
     needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
     permissions:
@@ -491,8 +491,8 @@ jobs:
     uses: ./.github/workflows/e2e-kubernetes-test.yml
     with:
       image-tag: ${{ github.sha }}
-      job-name: Kubernetes agentgateway shared TLS E2E
-      e2e-task: e2e:kubernetes:agentgateway-shared-tls
+      job-name: Kubernetes agentgateway TLS E2E
+      e2e-task: e2e:kubernetes:agentgateway-tls
       gateway-controller: agentgateway
       conformance-artifact-prefix: openshell-conformance
 
@@ -506,7 +506,7 @@ jobs:
     uses: ./.github/workflows/e2e-kubernetes-test.yml
     with:
       image-tag: ${{ github.sha }}
-      job-name: Kubernetes agentgateway shared backend TLS E2E
+      job-name: Kubernetes agentgateway backend TLS E2E
       e2e-task: e2e:kubernetes:agentgateway-backend-tls
       gateway-controller: agentgateway
       conformance-artifact-prefix: openshell-conformance
@@ -567,7 +567,7 @@ jobs:
 
   kubernetes-ha-e2e-result:
     name: Kubernetes HA E2E result
-    needs: [pr_metadata, kubernetes-ha-e2e, kubernetes-agentgateway-e2e, kubernetes-agentgateway-ha-e2e, kubernetes-agentgateway-shared-tls-e2e, kubernetes-agentgateway-backend-tls-e2e]
+    needs: [pr_metadata, kubernetes-ha-e2e, kubernetes-agentgateway-e2e, kubernetes-agentgateway-ha-e2e, kubernetes-agentgateway-tls-e2e, kubernetes-agentgateway-backend-tls-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
     runs-on: ubuntu-latest
     steps:

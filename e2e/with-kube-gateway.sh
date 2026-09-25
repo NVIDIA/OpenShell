@@ -59,9 +59,9 @@
 #   route the test through that controller. The default, `none`, port-forwards
 #   directly to the OpenShell Service. OPENSHELL_E2E_KUBE_USE_ENVOY remains a
 #   compatibility alias for `envoy`.
-#   Set OPENSHELL_E2E_KUBE_GATEWAY_TLS=1 with agentgateway to add an HTTPS
-#   ListenerSet, provision a short-lived test certificate, and exercise the
-#   same data-plane Service over verified TLS.
+#   Set OPENSHELL_E2E_KUBE_GATEWAY_TLS=1 with agentgateway to configure an HTTPS
+#   listener on its chart-created Gateway, provision a short-lived test
+#   certificate, and exercise the data-plane Service over verified TLS.
 #   Set OPENSHELL_E2E_KUBE_GATEWAY_BACKEND_TLS=1 as well to keep TLS enabled on
 #   the OpenShell pod and validate agentgateway re-encryption through a
 #   BackendTLSPolicy.
@@ -121,7 +121,6 @@ ENVOY_CHART_VERSION="${OPENSHELL_E2E_ENVOY_VERSION:-v1.7.2}"
 ENVOY_GATEWAY_MANIFEST="${ROOT}/deploy/kube/manifests/envoy-gateway-openshell.yaml"
 ENVOY_HELM_INSTALLED=0
 ENVOY_GATEWAY_CONFIG_APPLIED=0
-AGENTGATEWAY_NAMESPACE="agentgateway-system"
 AGENTGATEWAY_GATEWAY_NAME="openshell-ingress"
 AGENTGATEWAY_HELM_INSTALLED=0
 AGENTGATEWAY_TLS="${OPENSHELL_E2E_KUBE_GATEWAY_TLS:-0}"
@@ -394,32 +393,32 @@ wait_for_envoy_service() {
 
 wait_for_agentgateway_service() {
   for _ in $(seq 1 60); do
-    if kctl -n "${AGENTGATEWAY_NAMESPACE}" get service \
+    if kctl -n "${NAMESPACE}" get service \
       "${AGENTGATEWAY_GATEWAY_NAME}" >/dev/null 2>&1 \
-      && kctl -n "${AGENTGATEWAY_NAMESPACE}" wait --for=condition=Ready pod \
+      && kctl -n "${NAMESPACE}" wait --for=condition=Ready pod \
         -l "gateway.networking.k8s.io/gateway-name=${AGENTGATEWAY_GATEWAY_NAME}" \
         --timeout=5s >/dev/null 2>&1; then
-      printf '%s/%s\n' "${AGENTGATEWAY_NAMESPACE}" "${AGENTGATEWAY_GATEWAY_NAME}"
+      printf '%s/%s\n' "${NAMESPACE}" "${AGENTGATEWAY_GATEWAY_NAME}"
       return 0
     fi
     sleep 2
   done
 
   echo "ERROR: agentgateway proxy Service ${AGENTGATEWAY_GATEWAY_NAME} was not ready." >&2
-  kctl -n "${AGENTGATEWAY_NAMESPACE}" get gateway,service,pod -o wide >&2 || true
+  kctl -n "${NAMESPACE}" get gateway,service,pod -o wide >&2 || true
   kctl -n "${NAMESPACE}" get grpcroute -o yaml >&2 || true
   return 1
 }
 
-wait_for_agentgateway_listenerset() {
+wait_for_agentgateway_gateway() {
   local accepted=""
   local programmed=""
 
   for _ in $(seq 1 60); do
-    accepted="$(kctl -n "${NAMESPACE}" get listenerset openshell-tls \
+    accepted="$(kctl -n "${NAMESPACE}" get gateway "${AGENTGATEWAY_GATEWAY_NAME}" \
       -o jsonpath='{range .status.conditions[?(@.type=="Accepted")]}{.status}{end}' \
       2>/dev/null || true)"
-    programmed="$(kctl -n "${NAMESPACE}" get listenerset openshell-tls \
+    programmed="$(kctl -n "${NAMESPACE}" get gateway "${AGENTGATEWAY_GATEWAY_NAME}" \
       -o jsonpath='{range .status.conditions[?(@.type=="Programmed")]}{.status}{end}' \
       2>/dev/null || true)"
     if [[ "${accepted}" == *True* && "${programmed}" == *True* ]]; then
@@ -428,9 +427,8 @@ wait_for_agentgateway_listenerset() {
     sleep 2
   done
 
-  echo "ERROR: ListenerSet ${NAMESPACE}/openshell-tls was not programmed." >&2
-  kctl -n "${NAMESPACE}" get listenerset openshell-tls -o yaml >&2 || true
-  kctl -n "${AGENTGATEWAY_NAMESPACE}" get gateway "${AGENTGATEWAY_GATEWAY_NAME}" -o yaml >&2 || true
+  echo "ERROR: agentgateway Gateway ${NAMESPACE}/${AGENTGATEWAY_GATEWAY_NAME} was not programmed." >&2
+  kctl -n "${NAMESPACE}" get gateway "${AGENTGATEWAY_GATEWAY_NAME}" -o yaml >&2 || true
   return 1
 }
 
@@ -777,10 +775,7 @@ cleanup() {
       echo "=== end gateway debug output ==="
       if use_agentgateway_tls; then
         echo "=== agentgateway TLS ingress state ==="
-        kctl -n "${NAMESPACE}" get gateway,listenerset,grpcroute,backendtlspolicy,service,pod -o yaml 2>&1 || true
-        if ! use_agentgateway_dedicated; then
-          kctl -n "${AGENTGATEWAY_NAMESPACE}" get gateway,service,pod -o yaml 2>&1 || true
-        fi
+        kctl -n "${NAMESPACE}" get gateway,grpcroute,backendtlspolicy,service,pod -o yaml 2>&1 || true
         echo "=== agentgateway TLS Secret metadata ==="
         kctl -n "${NAMESPACE}" get secret "${AGENTGATEWAY_TLS_SECRET}" \
           -o jsonpath='{.metadata.namespace}/{.metadata.name}{" type="}{.type}{"\n"}' \
@@ -1663,7 +1658,7 @@ elif use_agentgateway; then
   if use_agentgateway_backend_tls; then
     helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway-agentgateway-backend-tls.yaml")
   elif use_agentgateway_tls; then
-    helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway-agentgateway-shared-tls.yaml")
+    helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway-agentgateway-tls.yaml")
   else
     helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway-agentgateway.yaml")
   fi
@@ -1723,8 +1718,8 @@ else
   HELM_INSTALLED=1
 
   if [ "${GATEWAY_CONTROLLER}" != "none" ]; then
-    if use_agentgateway_tls; then
-      wait_for_agentgateway_listenerset || exit 1
+    if use_agentgateway; then
+      wait_for_agentgateway_gateway || exit 1
     fi
     if use_agentgateway_backend_tls; then
       wait_for_agentgateway_backend_tls || exit 1

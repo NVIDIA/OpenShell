@@ -235,14 +235,14 @@ env = { OPENSHELL_E2E_KUBE_GATEWAY_CONTROLLER = "agentgateway" }
 depends = ["e2e:conformance:build"]
 run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
 
-["e2e:kubernetes:agentgateway-shared-tls"]
-description = "Run Kubernetes conformance and SSH forwarding over an HTTPS ListenerSet on the shared agentgateway Gateway"
+["e2e:kubernetes:agentgateway-tls"]
+description = "Run Kubernetes conformance and SSH forwarding over a dedicated agentgateway Gateway with an HTTPS listener"
 env = { OPENSHELL_E2E_KUBE_GATEWAY_CONTROLLER = "agentgateway", OPENSHELL_E2E_KUBE_GATEWAY_TLS = "1", OPENSHELL_E2E_KUBE_TEST = "port_forward", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e" }
 depends = ["e2e:conformance:build"]
 run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:kubernetes:agentgateway-backend-tls"]
-description = "Run Kubernetes conformance through the shared agentgateway Gateway with frontend termination and backend TLS re-encryption"
+description = "Run Kubernetes conformance through a dedicated agentgateway Gateway with frontend termination and backend TLS re-encryption"
 env = { OPENSHELL_E2E_KUBE_GATEWAY_CONTROLLER = "agentgateway", OPENSHELL_E2E_KUBE_GATEWAY_TLS = "1", OPENSHELL_E2E_KUBE_GATEWAY_BACKEND_TLS = "1", OPENSHELL_E2E_KUBERNETES_FEATURES = "" }
 depends = ["e2e:conformance:build"]
 run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"

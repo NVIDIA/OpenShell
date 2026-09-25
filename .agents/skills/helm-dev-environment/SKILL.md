@@ -285,27 +285,26 @@ The task creates an external PostgreSQL fixture, enables the chart `GRPCRoute`,
 and runs the full Kubernetes e2e suite, including
 `kubernetes_ha_rebalancing`. The Envoy selection installs Envoy Gateway and
 applies `deploy/kube/manifests/envoy-gateway-openshell.yaml`; the agentgateway
-selection installs the pinned agentgateway release and its shared `Gateway`.
+selection installs the pinned agentgateway release while the OpenShell chart
+creates its dedicated `Gateway`.
 This coverage validates sandbox create/watch and exec through the selected
 proxy while gateway replicas scale up, scale down, and rotate. It also keeps a
 long-running sandbox alive and runs upload/download operations while gateway
 pods roll, so file sync exercises the same relay retry path as interactive
 sessions.
 
-Use `mise run e2e:kubernetes:agentgateway-shared-tls` to add an OpenShell-owned HTTPS
-`ListenerSet` to the shared agentgateway `Gateway`, provision a short-lived
-certificate, and run CLI conformance plus the focused Rust `port_forward` test
-through the verified HTTPS listener. This covers status and sandbox lifecycle
-operations as well as SSH relay setup and TCP data transfer without the broad
-suite's unrelated host fixtures. The shared Gateway must allow ListenerSets
-from the `openshell` namespace; `deploy/kube/manifests/agentgateway-openshell.yaml`
-configures that selector.
+Use `mise run e2e:kubernetes:agentgateway-tls` to configure HTTPS directly on
+the chart-created agentgateway `Gateway`, provision a short-lived certificate,
+and run CLI conformance plus the focused Rust `port_forward` test through the
+verified HTTPS listener. This covers status and sandbox lifecycle operations as
+well as SSH relay setup and TCP data transfer without the broad suite's
+unrelated host fixtures.
 
-Use `mise run e2e:kubernetes:agentgateway-backend-tls` to exercise the same
-frontend HTTPS ListenerSet on the shared Gateway while keeping TLS enabled on
-the OpenShell pod. The task waits for the standard `BackendTLSPolicy` to be
-accepted and its references resolved, then runs CLI conformance through
-agentgateway's re-encrypted backend connection.
+Use `mise run e2e:kubernetes:agentgateway-backend-tls` to exercise the dedicated
+Gateway's HTTPS listener while keeping TLS enabled on the OpenShell pod. The
+task waits for the standard `BackendTLSPolicy` to be accepted and its references
+resolved, then runs CLI conformance through agentgateway's re-encrypted backend
+connection.
 
 For transport diagnostics on an ephemeral k3d cluster, set
 `OPENSHELL_E2E_KUBE_DIRECT_GATEWAY_PORT` to reach agentgateway TLS through the
@@ -482,9 +481,9 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-skaffold.yaml` | Dev overrides (image pull policy, TLS disabled for local Skaffold) |
 | `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
-| `deploy/helm/openshell/ci/values-gateway-agentgateway.yaml` | agentgateway GRPCRoute overlay |
-| `deploy/helm/openshell/ci/values-gateway-agentgateway-shared-tls.yaml` | shared agentgateway HTTPS ListenerSet + GRPCRoute overlay |
-| `deploy/helm/openshell/ci/values-gateway-agentgateway-backend-tls.yaml` | shared agentgateway frontend and backend TLS overlay |
+| `deploy/helm/openshell/ci/values-gateway-agentgateway.yaml` | dedicated agentgateway Gateway + GRPCRoute overlay |
+| `deploy/helm/openshell/ci/values-gateway-agentgateway-tls.yaml` | dedicated agentgateway HTTPS Gateway overlay |
+| `deploy/helm/openshell/ci/values-gateway-agentgateway-backend-tls.yaml` | dedicated agentgateway frontend and backend TLS overlay |
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
 | `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
@@ -492,6 +491,5 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |
 | `deploy/helm/openshell/ci/values-credential-driver-vault.yaml` | Vault credential-driver validation overlay with HTTPS and private-CA trust |
 | `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass and BackendTrafficPolicy for Envoy Gateway (`mise run helm:gateway:apply`) |
-| `deploy/kube/manifests/agentgateway-openshell.yaml` | Shared Gateway for agentgateway |
 | `tasks/scripts/helm-k3s-local.sh` | k3d cluster create/delete/start/stop/status |
 | `tasks/scripts/keycloak-k8s-setup.sh` | Keycloak deploy, realm import, and development TLS trust anchor |

@@ -1,22 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Terminate frontend TLS at an OpenShell-owned ListenerSet on the shared
-# agentgateway Gateway, then re-encrypt traffic to the OpenShell gateway pod.
-# The frontend TLS Secret must exist in the Helm release namespace. The chart's
-# certgen hook creates the backend server certificate and CA ConfigMap.
+# Terminate frontend TLS at a dedicated agentgateway Gateway, then re-encrypt
+# traffic to the OpenShell gateway pod. The frontend TLS Secret must exist in
+# the Helm release namespace. The chart's certgen hook creates the backend
+# server certificate and CA ConfigMap.
 grpcRoute:
   enabled: true
   gateway:
-    create: false
-    name: openshell-ingress
-    namespace: agentgateway-system
-  listenerSet:
-    enabled: true
     create: true
-    name: openshell-tls
+    className: agentgateway
+    name: openshell-ingress
     listener:
-      name: grpc-tls
       port: 443
       protocol: HTTPS
       allowedRoutes: Same
