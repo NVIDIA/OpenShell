@@ -94,6 +94,11 @@ path = "tests/podman_host_gateway.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
+name = "podman_preflight"
+path = "tests/podman_preflight.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
 name = "podman_corporate_proxy"
 path = "tests/podman_corporate_proxy.rs"
 required-features = ["e2e-podman"]
@@ -101,6 +106,11 @@ required-features = ["e2e-podman"]
 [[test]]
 name = "podman_oci_identity"
 path = "tests/podman_oci_identity.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
+name = "podman_resource_limits"
+path = "tests/podman_resource_limits.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
