@@ -4016,6 +4016,7 @@ dependencies = [
  "openshell-server",
  "openshell-tui",
  "owo-colors",
+ "prost",
  "prost-types",
  "rcgen",
  "reqwest 0.12.28",

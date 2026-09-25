@@ -64,6 +64,7 @@ use openshell_core::proto::{
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
+use prost::Message;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{ErrorKind, IsTerminal, Read, Write};
@@ -1800,6 +1801,8 @@ fn local_terminal_size() -> Option<(u32, u32)> {
         .map(|(cols, rows)| (u32::from(cols), u32::from(rows)))
 }
 
+const MAX_EXEC_REQUEST_BYTES: usize = 1024 * 1024;
+
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
 ///
 /// Returns the remote command's exit code, or an error if the event stream
@@ -1846,9 +1849,47 @@ pub async fn sandbox_exec_grpc(
     let stdin_is_terminal = std::io::stdin().is_terminal();
     let tty = tty_override.unwrap_or_else(|| stdin_is_terminal && std::io::stdout().is_terminal());
 
-    // The unary request has a 1 MiB encoded-message limit. Stream piped input
-    // in bounded frames, including for commands that do not request a PTY.
-    if tty || !stdin_is_terminal {
+    // Preserve unary exec for small pipes, including older gateways whose
+    // interactive RPC closes the SSH channel when stdin reaches EOF. Read no
+    // more than one decoder window before switching to bounded streaming.
+    let stdin_prefix = if stdin_is_terminal {
+        Vec::new()
+    } else {
+        tokio::task::spawn_blocking(|| {
+            let mut prefix = Vec::new();
+            std::io::stdin()
+                .take(MAX_EXEC_REQUEST_BYTES as u64)
+                .read_to_end(&mut prefix)
+                .into_diagnostic()?;
+            Ok::<_, miette::Report>(prefix)
+        })
+        .await
+        .into_diagnostic()??
+    };
+
+    let mut request = ExecSandboxRequest {
+        request_id: String::new(),
+        sandbox: name.to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            workspace.to_string(),
+        )),
+        command: command.to_vec(),
+        workdir: workdir.unwrap_or_default().to_string(),
+        environment: environment.clone(),
+        execution_timeout: proto_execution_timeout(timeout_seconds)?,
+        stdin: stdin_prefix,
+        tty,
+        cols: 0,
+        rows: 0,
+        no_login_shell,
+    };
+
+    if !tty && stdin_is_terminal && request.encoded_len() > MAX_EXEC_REQUEST_BYTES {
+        return Err(miette::miette!(
+            "exec request exceeds the gateway's 1 MiB message limit"
+        ));
+    }
+    if tty || request.encoded_len() > MAX_EXEC_REQUEST_BYTES {
         return sandbox_exec_streaming_grpc(
             client,
             &sandbox,
@@ -1859,34 +1900,14 @@ pub async fn sandbox_exec_grpc(
             no_login_shell,
             tty,
             stdin_is_terminal,
+            std::mem::take(&mut request.stdin),
         )
         .await;
     }
 
-    let (cols, rows) = if tty {
-        local_terminal_size().unwrap_or_default()
-    } else {
-        (0, 0)
-    };
-
     // Make the streaming gRPC call.
     let mut stream = client
-        .exec_sandbox(ExecSandboxRequest {
-            request_id: String::new(),
-            sandbox: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                workspace.to_string(),
-            )),
-            command: command.to_vec(),
-            workdir: workdir.unwrap_or_default().to_string(),
-            environment: environment.clone(),
-            execution_timeout: proto_execution_timeout(timeout_seconds)?,
-            stdin: Vec::new(),
-            tty,
-            cols,
-            rows,
-            no_login_shell,
-        })
+        .exec_sandbox(request)
         .await
         .into_diagnostic()?
         .into_inner();
@@ -2265,6 +2286,7 @@ async fn sandbox_exec_streaming_grpc(
     no_login_shell: bool,
     tty: bool,
     stdin_is_terminal: bool,
+    stdin_prefix: Vec<u8>,
 ) -> Result<i32> {
     #[cfg(unix)]
     use openshell_core::proto::ExecSandboxWindowResize;
@@ -2321,24 +2343,42 @@ async fn sandbox_exec_streaming_grpc(
     // thread blocked on stdin.read(). The thread exits when the channel
     // closes (blocking_send returns Err) or stdin hits EOF.
     let stdin_tx = input_tx.clone();
+    let (stdin_result_tx, mut stdin_result_rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
         let mut buf = [0u8; 4096];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if stdin_tx
-                        .blocking_send(ExecSandboxInput {
-                            payload: Some(exec_sandbox_input::Payload::Stdin(buf[..n].to_vec())),
-                        })
-                        .is_err()
-                    {
-                        break;
+        let result = (|| {
+            for chunk in stdin_prefix.chunks(buf.len()) {
+                if stdin_tx
+                    .blocking_send(ExecSandboxInput {
+                        payload: Some(exec_sandbox_input::Payload::Stdin(chunk.to_vec())),
+                    })
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) => return Ok(()),
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                    Ok(n) => {
+                        if stdin_tx
+                            .blocking_send(ExecSandboxInput {
+                                payload: Some(exec_sandbox_input::Payload::Stdin(
+                                    buf[..n].to_vec(),
+                                )),
+                            })
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
                     }
                 }
             }
-        }
+        })();
+        let _ = stdin_result_tx.send(result);
     });
 
     // SIGWINCH handler: forward terminal resize events.
@@ -2379,7 +2419,17 @@ async fn sandbox_exec_streaming_grpc(
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
 
-    while let Some(event) = stream.next().await {
+    let mut stdin_reader_done = false;
+    loop {
+        let event = tokio::select! {
+            result = &mut stdin_result_rx, if !stdin_reader_done => {
+                stdin_reader_done = true;
+                result.into_diagnostic()?.into_diagnostic()?;
+                continue;
+            }
+            event = stream.next() => event,
+        };
+        let Some(event) = event else { break };
         let event = event.into_diagnostic()?;
         match event.payload {
             Some(exec_sandbox_event::Payload::Stdout(out)) => {
@@ -2403,6 +2453,10 @@ async fn sandbox_exec_streaming_grpc(
 
     // Drop the raw mode guard to restore the terminal before returning.
     drop(raw_guard);
+
+    if !stdin_reader_done && let Ok(result) = stdin_result_rx.try_recv() {
+        result.into_diagnostic()?;
+    }
 
     // A stream that closes without an Exit event means we never observed the
     // command's outcome. Treat it as a relay failure rather than reporting a

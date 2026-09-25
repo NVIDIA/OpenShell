@@ -1111,8 +1111,10 @@ as normal EOF. The input and output pumps are owned by the exec operation, so
 timeout or response abandonment cannot leave a detached stdin task behind.
 The pumps share polling fairly, and request processing yields cooperatively even
 for ignored resize messages, so sustained input cannot monopolize the operation.
-The CLI uses this stream for piped stdin with or without a PTY, keeping each
-message below the gateway's decoder limit and closing the input side at pipe EOF.
+The CLI keeps piped input in the unary request when the complete encoded
+request fits the gateway's decoder limit, preserving compatibility with older
+gateways. Larger input uses this stream with bounded frames, with or without a
+PTY, and closes the input side at pipe EOF.
 
 Go and TypeScript interactive-exec helpers distinguish process exit from stream
 completion. They consume the final gRPC status before reporting success and retain

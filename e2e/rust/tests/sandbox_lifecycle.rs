@@ -224,7 +224,7 @@ async fn piped_exec_stdin_crosses_grpc_message_limit() {
         .await
         .expect("create sandbox for streamed stdin");
 
-    for size in [1_048_576, 4_194_304] {
+    for size in [5, 1_048_576, 4_194_304] {
         let mut command = openshell_cmd();
         command
             .args([
@@ -261,6 +261,30 @@ async fn piped_exec_stdin_crosses_grpc_message_limit() {
             String::from_utf8_lossy(&output.stdout).trim(),
             size.to_string()
         );
+    }
+
+    #[cfg(unix)]
+    {
+        let directory = std::fs::File::open("/").expect("open directory as stdin");
+        let mut command = openshell_cmd();
+        let output = command
+            .args([
+                "sandbox",
+                "exec",
+                "--name",
+                &sandbox.name,
+                "--no-tty",
+                "--no-login-shell",
+                "--",
+                "wc",
+                "-c",
+            ])
+            .stdin(Stdio::from(directory))
+            .output()
+            .await
+            .expect("run exec with unreadable stdin");
+        assert!(!output.status.success(), "stdin read error was ignored");
+        assert!(output.stdout.is_empty());
     }
 
     sandbox.cleanup().await;
