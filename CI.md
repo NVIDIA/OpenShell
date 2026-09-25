@@ -40,6 +40,21 @@ The GitHub ruleset should require the `OpenShell / ...` statuses published by
 `Required CI Gates` plus the direct `OpenShell / Trivy Changes` result, not the
 push-triggered workflow jobs themselves.
 
+### Run only the policy advisor conformance tests
+
+Manually dispatch `Integration Tests` on the candidate branch with an
+`artifact-run-id` from a build of the same commit. Set `category` to
+`policy-advisor` and `test-matrix` to:
+
+```json
+[{"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"policy-advisor"}]
+```
+
+This runs the `mechanistic-proposal` and `policy-local` conformance tests in the
+installed-artifact suite. The artifact run must contain the candidate CLI and
+gateway binaries and runtime images. This manual run does not replace the
+required PR E2E gate.
+
 ## Informational security reports
 
 Security workflow compute runs directly on GitHub-hosted runners instead of

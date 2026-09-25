@@ -59,6 +59,8 @@
           - --workspace-remap
           - /var/lib/openshell-conformance/tests
           - --no-capture
+          - --filterset
+          - "{{ conformance_filter | default('all()') }}"
       environment:
         OPENSHELL_BIN: "{{ openshell_cli.stdout }}"
       register: conformance_result

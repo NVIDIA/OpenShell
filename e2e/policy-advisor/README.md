@@ -55,17 +55,23 @@ contents write on the repository. The test auto-resolves the token from
 
 ## Conformance coverage
 
-The `policy-advisor` conformance group checks mechanistic draft generation and
-uses `policy.local` to inspect policy, submit a narrow permission request, and
-read the resulting proposal. Run the group against a configured gateway with
-`--openshell-bin` pointing to the CLI under test:
+The `mechanistic-proposal` and `policy-local` conformance scenarios check draft
+generation and use `policy.local` to inspect policy, submit a narrow permission
+request, and read the resulting proposal. Run them against a configured gateway
+with `--openshell-bin` pointing to the CLI under test:
 
 ```bash
-openshell-conformance run --group policy-advisor --openshell-bin target/debug/openshell
+openshell-conformance run mechanistic-proposal policy-local --openshell-bin target/debug/openshell
 ```
 
-Run `openshell-conformance list` to see each scenario and its group. You can
-also run either scenario by name.
+Run `openshell-conformance list` to see all scenario names. A manual
+`Integration Tests` workflow run can select the `policy-advisor` testsuite to
+run only these two scenarios against an installed candidate. Set
+`artifact-run-id` to the candidate build's workflow run ID and `test-matrix` to:
+
+```json
+[{"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"policy-advisor"}]
+```
 
 The GitHub write test above and the regressions below still exercise distinct
 proposal review, approval, and hot-reload behavior.

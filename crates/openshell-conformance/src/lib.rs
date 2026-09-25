@@ -33,10 +33,6 @@ pub use scenarios::{
 pub struct Scenario {
     pub name: &'static str,
     pub description: &'static str,
-    /// Named set for running related scenarios together.
-    pub group: &'static str,
-    /// Whether a bare `run` should select this scenario.
-    pub default: bool,
     run: for<'a> fn(&'a mut OpenShellRunner) -> ScenarioFuture<'a>,
 }
 

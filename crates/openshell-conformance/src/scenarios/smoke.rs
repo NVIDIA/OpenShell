@@ -32,8 +32,6 @@ struct SandboxListPage {
 pub const SMOKE_SCENARIO: Scenario = Scenario {
     name: "smoke",
     description: "Create, inspect, execute in, and delete a base sandbox.",
-    group: "core",
-    default: true,
     run: run_smoke,
 };
 

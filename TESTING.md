@@ -181,10 +181,11 @@ lifecycle management, output parsing, and cleanup.
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
-- CLI conformance (`openshell-conformance`) - named `core` and `policy-advisor`
-  groups. The policy advisor group checks mechanistic drafts and the sandbox-local
-  API, including agent-authored permission requests. Driver E2E wrappers run
-  both groups; the installed-artifact conformance suite runs their scenarios.
+- CLI conformance (`openshell-conformance`) - named scenarios for lifecycle,
+  mechanistic drafts, and the sandbox-local API, including agent-authored
+  permission requests. Driver E2E wrappers run every scenario. The
+  installed-artifact conformance suite runs all scenarios and offers a focused
+  `policy-advisor` testsuite for manual integration runs.
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
   `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
   the selected deployment.

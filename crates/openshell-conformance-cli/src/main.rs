@@ -28,13 +28,10 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         output: OutputFormat,
     },
-    /// Run default scenarios, named scenarios, or a named group.
+    /// Run all registered scenarios, or named scenarios.
     Run {
-        /// Scenario names. Omit to run default scenarios.
+        /// Scenario names. Omit to run every registered scenario.
         scenarios: Vec<String>,
-        /// Run every scenario in this group, including opt-in scenarios.
-        #[arg(long)]
-        group: Option<String>,
         /// Explicit path to the `OpenShell` CLI. Defaults to `openshell` on PATH.
         #[arg(long)]
         openshell_bin: Option<PathBuf>,
@@ -53,8 +50,6 @@ enum OutputFormat {
 struct ScenarioDescription<'a> {
     name: &'a str,
     description: &'a str,
-    group: &'a str,
-    default: bool,
 }
 
 #[derive(Serialize)]
@@ -86,10 +81,9 @@ async fn execute(cli: Cli) -> Result<(), String> {
         Command::List { output } => list(output),
         Command::Run {
             scenarios: requested,
-            group,
             openshell_bin,
             output,
-        } => run(&requested, group.as_deref(), openshell_bin, output).await,
+        } => run(&requested, openshell_bin, output).await,
     }
 }
 
@@ -97,17 +91,7 @@ fn list(output: OutputFormat) -> Result<(), String> {
     match output {
         OutputFormat::Text => {
             for candidate in scenarios() {
-                println!(
-                    "{:<24} {:<16} {:<8} {}",
-                    candidate.name,
-                    candidate.group,
-                    if candidate.default {
-                        "default"
-                    } else {
-                        "opt-in"
-                    },
-                    candidate.description
-                );
+                println!("{:<24} {}", candidate.name, candidate.description);
             }
         }
         OutputFormat::Json => {
@@ -116,8 +100,6 @@ fn list(output: OutputFormat) -> Result<(), String> {
                 .map(|candidate| ScenarioDescription {
                     name: candidate.name,
                     description: candidate.description,
-                    group: candidate.group,
-                    default: candidate.default,
                 })
                 .collect::<Vec<_>>();
             println!(
@@ -131,11 +113,10 @@ fn list(output: OutputFormat) -> Result<(), String> {
 
 async fn run(
     requested: &[String],
-    group: Option<&str>,
     binary: Option<PathBuf>,
     output: OutputFormat,
 ) -> Result<(), String> {
-    let selected = select_scenarios(requested, group)?;
+    let selected = select_scenarios(requested)?;
     let mut results = Vec::with_capacity(selected.len());
     for candidate in selected {
         results.push(run_scenario(candidate, binary.as_ref()).await);
@@ -210,30 +191,9 @@ fn render_results(
     }
 }
 
-fn select_scenarios(
-    requested: &[String],
-    group: Option<&str>,
-) -> Result<Vec<&'static Scenario>, String> {
-    if let Some(group) = group {
-        if !requested.is_empty() {
-            return Err("pass either scenario names or --group".to_string());
-        }
-        let selected = scenarios()
-            .iter()
-            .filter(|candidate| candidate.group == group)
-            .collect::<Vec<_>>();
-        if selected.is_empty() {
-            return Err(format!(
-                "unknown group '{group}'; run `openshell-conformance list`"
-            ));
-        }
-        return Ok(selected);
-    }
+fn select_scenarios(requested: &[String]) -> Result<Vec<&'static Scenario>, String> {
     if requested.is_empty() {
-        return Ok(scenarios()
-            .iter()
-            .filter(|candidate| candidate.default)
-            .collect());
+        return Ok(scenarios().iter().collect());
     }
     requested
         .iter()
@@ -252,37 +212,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selects_default_scenarios() {
+    fn selects_all_scenarios_by_default() {
         assert_eq!(
-            select_scenarios(&[], None).expect("select defaults").len(),
-            scenarios()
-                .iter()
-                .filter(|candidate| candidate.default)
-                .count()
-        );
-        assert!(
-            !select_scenarios(&[], None)
-                .unwrap()
-                .iter()
-                .any(|scenario| scenario.name == "policy-local")
+            select_scenarios(&[]).expect("select all").len(),
+            scenarios().len()
         );
     }
 
     #[test]
     fn selects_named_scenario() {
-        let selected = select_scenarios(&["smoke".to_string()], None).expect("select smoke");
+        let selected = select_scenarios(&["smoke".to_string()]).expect("select smoke");
         assert_eq!(selected[0].name, "smoke");
     }
 
     #[test]
     fn unknown_scenario_has_actionable_diagnostic() {
-        let error = select_scenarios(&["missing".to_string()], None).expect_err("unknown scenario");
+        let error = select_scenarios(&["missing".to_string()]).expect_err("unknown scenario");
         assert!(error.contains("openshell-conformance list"));
     }
 
     #[test]
-    fn selects_policy_advisor_group_including_opt_in_scenario() {
-        let selected = select_scenarios(&[], Some("policy-advisor")).unwrap();
+    fn selects_named_policy_scenarios() {
+        let selected = select_scenarios(&[
+            "mechanistic-proposal".to_string(),
+            "policy-local".to_string(),
+        ])
+        .unwrap();
         assert_eq!(
             selected
                 .iter()
@@ -290,12 +245,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["mechanistic-proposal", "policy-local"]
         );
-        assert!(
-            select_scenarios(&["smoke".to_string()], Some("policy-advisor"))
-                .unwrap_err()
-                .contains("either scenario names or --group")
-        );
-        assert!(select_scenarios(&[], Some("missing")).is_err());
     }
 
     #[test]
