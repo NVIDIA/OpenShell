@@ -7,6 +7,9 @@ on:
       - "fern/**"
       - "mise.toml"
       - "tasks/docs.toml"
+      - "tasks/test.toml"
+      - "tasks/scripts/check_docs_nav.py"
+      - "tasks/scripts/check_docs_nav_test.py"
       - ".github/workflows/branch-docs.yml"
       - ".github/workflows/release-tag.yml"
 
@@ -46,6 +49,18 @@ jobs:
       - name: Validate docs
         working-directory: ./fern
         run: fern check
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          version: "0.10.12"
+          python-version: "3.13"
+
+      - name: Test docs navigation check
+        run: uv run --no-project --with pytest --with pytest-asyncio --with pyyaml pytest tasks/scripts/check_docs_nav_test.py
+
+      - name: Check docs navigation matches file paths
+        run: uv run tasks/scripts/check_docs_nav.py
 
       - name: Generate preview URL
         if: ${{ steps.fern-preview.outputs.enabled == 'true' }}

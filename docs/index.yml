@@ -9,14 +9,14 @@ navigation:
 - section: "About NVIDIA OpenShell"
   slug: about
   contents:
-  - page: "Why OpenShell"
+  - page: "Overview"
     path: about/overview.mdx
   - page: "Architecture"
     path: about/architecture.mdx
   - page: "Installation"
     path: about/installation.mdx
   - page: "Run Your First Agent"
-    path: about/run-an-agent.mdx
+    path: about/run-your-first-agent.mdx
   - page: "Support Matrix"
     path: about/support-matrix.mdx
 - section: "How It Works"
@@ -95,13 +95,14 @@ navigation:
   title: "Kubernetes"
 - section: "Tutorials"
   slug: tutorials
+  path: tutorials/index.mdx
   contents:
   - page: "Run Pi"
     path: tutorials/run-pi.mdx
   - page: "First Network Policy"
     path: tutorials/first-network-policy.mdx
   - page: "GitHub Push Access"
-    path: tutorials/github-sandbox.mdx
+    path: tutorials/github-push-access.mdx
   - page: "Microsoft Graph Provider Refresh"
     path: tutorials/microsoft-graph-provider-refresh.mdx
 - section: "SDK Reference"
@@ -115,6 +116,7 @@ navigation:
     path: sdk/python.mdx
   - page: "TypeScript"
     path: sdk/typescript.mdx
+    slug: typescript
   - page: "API Errors"
     path: sdk/api-errors.mdx
   - page: "Protobuf Time Types"

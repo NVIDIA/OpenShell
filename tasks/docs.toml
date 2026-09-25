@@ -5,7 +5,7 @@
 
 ["docs"]
 description = "Validate Fern documentation"
-depends = ["docs:build:strict"]
+depends = ["docs:build:strict", "docs:nav"]
 
 ["docs:deps"]
 description = "Resolve Fern CLI for docs tasks"
@@ -22,6 +22,10 @@ FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
 cd fern
 npx --yes "fern-api@${FERN_VERSION}" check
 """
+
+["docs:nav"]
+description = "Check that docs page URLs match their file paths"
+run = "uv run tasks/scripts/check_docs_nav.py"
 
 ["docs:serve"]
 description = "Serve Fern docs locally"
