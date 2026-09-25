@@ -163,7 +163,8 @@ struct RunArgs {
     oidc_issuer: Option<String>,
 
     /// Path to a PEM CA bundle for an OIDC issuer signed by a private CA.
-    /// The certificates augment platform trust roots for OIDC requests only.
+    /// Must be a regular file no larger than 1 MiB. The certificates augment
+    /// platform trust roots for OIDC requests only.
     #[arg(long, env = "OPENSHELL_OIDC_CA_BUNDLE")]
     oidc_ca_bundle: Option<PathBuf>,
 

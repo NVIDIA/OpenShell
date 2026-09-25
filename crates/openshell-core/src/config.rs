@@ -334,9 +334,9 @@ pub struct OidcConfig {
     /// OIDC issuer URL (e.g., `https://idp.example.com/realms/openshell`).
     pub issuer: String,
 
-    /// Optional PEM CA bundle for an issuer signed by a private CA. These
-    /// certificates augment the platform trust roots for OIDC discovery and
-    /// JWKS requests only.
+    /// Optional PEM CA bundle for an issuer signed by a private CA. It must be
+    /// a regular file no larger than 1 MiB. These certificates augment the
+    /// platform trust roots for OIDC discovery and JWKS requests only.
     #[serde(default)]
     pub ca_bundle: Option<PathBuf>,
 
