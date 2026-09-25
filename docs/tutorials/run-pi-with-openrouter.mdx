@@ -7,11 +7,13 @@ keywords: "Generative AI, Cybersecurity, Tutorial, Pi Coding Agent, OpenRouter, 
 ---
 
 This tutorial runs [Pi](https://pi.dev), a terminal coding agent, inside an
-OpenShell sandbox. Pi gets its models from [OpenRouter](https://openrouter.ai),
-which offers models from many providers through one API key.
+OpenShell sandbox. Pi works with many model providers out of the box. This
+tutorial uses [OpenRouter](https://openrouter.ai), which lets you use models
+from many companies with one API key.
 
-You build a Pi image, give the sandbox access to OpenRouter, and start Pi. The
-sandbox lets Pi reach OpenRouter and blocks all other network access. Pi never
+You will build a Pi image, give the sandbox access to OpenRouter, and start Pi
+inside it. Along the way, you'll see how OpenShell keeps Pi contained. The
+sandbox lets Pi reach OpenRouter but nothing else on the network, and Pi never
 sees your real API key.
 
 ## Prerequisites
@@ -48,13 +50,14 @@ WORKDIR /workspace
 ENV PI_CODING_AGENT_DIR=/tmp/pi-agent
 ```
 
-Two details matter for running in a sandbox:
+This Dockerfile adds two things to Pi's container guide, because the sandbox
+limits what Pi can reach:
 
-- The image installs `fd` and `ripgrep`. Pi uses them to search files, and if
-  they're missing it tries to download them from GitHub the first time it
-  needs them. The sandbox blocks that download, so the image includes them.
-- `PI_CODING_AGENT_DIR` keeps Pi's settings and sessions in `/tmp`, one of the
-  few places the sandbox lets Pi write.
+- It installs `fd`. Pi uses `fd` and `ripgrep` to search files, and it
+  downloads them from GitHub the first time it needs them if they're missing.
+  The sandbox blocks that download, so the image includes both.
+- It sets `PI_CODING_AGENT_DIR` so Pi keeps its settings and sessions in
+  `/tmp`, one of the few places the sandbox lets Pi write.
 
 Build the image:
 
