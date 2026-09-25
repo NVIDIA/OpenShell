@@ -163,6 +163,7 @@ guest_tls_cert          = "/etc/openshell/certs/client.pem"
 guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 
 # Optional gRPC rate limit. Both values must be positive to enable the limit.
+# Reflection queries use a separate counter with the same count and window.
 # Set either value to 0, or omit both, to disable rate limiting.
 grpc_rate_limit_requests       = 120
 grpc_rate_limit_window_seconds = 60

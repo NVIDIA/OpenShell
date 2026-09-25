@@ -170,9 +170,16 @@ Marking an RPC as `sandbox` or `dual` makes it callable by an authenticated
 sandbox principal on the primary listener. Review such changes as
 authorization-surface changes.
 
+The primary listener serves the gRPC reflection v1 protocol without application
+authentication. It advertises only the public `openshell.v1.OpenShell` service.
+TLS and client-certificate requirements still apply at the transport layer.
+Callback-only listeners reject reflection before authentication.
+
 Operators can configure a gateway-wide gRPC request rate limit. The limit is
 applied only to gRPC API traffic after protocol multiplexing; health, metrics,
 and local sandbox-service HTTP routes are not rate limited by this control.
+Reflection has an independent counter with the same configured count and
+window, charged once for every query carried by its bidirectional stream.
 
 Gateway interceptors run in one middleware layer on the `openshell.v1.OpenShell`
 gRPC service after authentication and before tonic dispatches to individual
