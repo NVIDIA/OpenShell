@@ -24,13 +24,13 @@ openshell sandbox create --name my-sandbox --policy ./policy.yaml
 
 The rest of this page refers to this sandbox as `my-sandbox`. If you omit the
 sandbox name from an `openshell policy` command, the CLI uses the sandbox you
-used most recently.
+most recently created, connected to, or ran a command in, and prints its name.
 
 To use the same file for every sandbox you create, set
 `OPENSHELL_SANDBOX_POLICY` instead of passing `--policy`:
 
 ```shell
-export OPENSHELL_SANDBOX_POLICY=./policy.yaml
+export OPENSHELL_SANDBOX_POLICY="$PWD/policy.yaml"
 openshell sandbox create --name my-sandbox
 ```
 
@@ -54,11 +54,10 @@ does not fall back to the default policy.
 ## Inspect the Current Policy
 
 A sandbox's policy has two views. The base policy is the policy you set for the
-sandbox. The effective policy is the policy the sandbox enforces, which is the
-base policy plus any rules that attached providers add. When a gateway
-administrator sets a global policy, it replaces both, so the effective policy is
-the global policy. `--base` shows the base policy, and `--full` shows the
-effective policy:
+sandbox. The effective policy is the base policy plus any rules that attached
+providers add, and the sandbox enforces it once the latest revision loads. While
+a global policy is active, both views show the global policy. `--base` shows the
+base policy, and `--full` shows the effective policy:
 
 ```shell
 openshell policy get my-sandbox --base
@@ -99,14 +98,17 @@ openshell policy update my-sandbox \
   --wait
 ```
 
-The endpoint sets the host and port, then the request rules. `read-only` allows
-`GET`, `HEAD`, and `OPTIONS` requests, `rest` turns on HTTP request inspection,
-and `enforce` blocks every other request. The `--binary` path must match the
-executable inside the sandbox.
+The endpoint value lists the host, port, access preset, protocol, and
+enforcement mode. `read-only` allows `GET`, `HEAD`, and `OPTIONS` requests,
+`rest` turns on HTTP request inspection, and `enforce` blocks every other
+request. The `--binary` value must be the real path of the executable inside the
+sandbox, as described in [Binary
+Matching](/sandboxes/network-rules#binary-matching).
 
 To allow another kind of request on an existing rule, add an allow rule. Name
-the rule and repeat its complete binary list from the base policy, so the
-command changes only that rule:
+the rule with `--rule-name`, and list every binary in the rule with `--binary`.
+The command fails if the list does not match the rule's binaries, so a new
+permission cannot reach a binary you did not name:
 
 ```shell
 openshell policy update my-sandbox \
@@ -116,25 +118,27 @@ openshell policy update my-sandbox \
   --wait
 ```
 
-`--rule-name` refers to the rule's key under `network_policies`, which can
-differ from its `name` field. Use `--add-deny` the same way to block a request.
-To remove the rule:
+Because this endpoint uses the `read-only` preset, OpenShell first replaces the
+preset with equivalent explicit rules, then adds yours. `--rule-name` refers to
+the rule's key under `network_policies`, which can differ from its `name` field.
+Use `--add-deny` the same way to block a request. To remove the rule:
 
 ```shell
 openshell policy update my-sandbox --remove-rule github_readonly --wait
 ```
 
 To preview a change without applying it, replace `--wait` with `--dry-run`. A
-preview does not guarantee that the sandbox will accept the change. Preview
-`--remove-endpoint` in particular, because it removes the destination from every
-rule that lists it.
+preview does not guarantee that the sandbox will accept the change.
+`--remove-endpoint` removes a destination from every rule in the base policy
+that lists it, and deletes rules that are left without endpoints. Rules that
+providers add keep the destination.
 
 ## Replace the Complete Policy
 
 `openshell policy set` replaces the whole policy. Use it for changes that
-`policy update` cannot make, such as middleware, GraphQL, MCP, or JSON-RPC rules,
-`tls: skip`, or credential settings. The new file replaces every section, so
-start from the current base policy.
+`policy update` cannot make, such as middleware, GraphQL, MCP, or JSON-RPC
+rules, `tls: skip`, credential bindings, or request signing. The new file
+replaces every section, so start from the current base policy.
 
 <Tabs>
 <Tab title="Edit YAML">
@@ -178,9 +182,9 @@ The next section describes how each part of the new policy takes effect.
 
 ## How Changes Take Effect
 
-When you apply a change with `openshell policy update` or `openshell policy set`,
-the network sections of the policy take effect in the running sandbox. The
-startup sections do not:
+When you apply a change with `openshell policy update` or
+`openshell policy set`, the network sections of the policy take effect in the
+running sandbox. The startup sections do not:
 
 | Change | Effect on a running sandbox | Required action |
 |---|---|---|
@@ -188,7 +192,7 @@ startup sections do not:
 | Middleware in `network_middlewares` | You can add, remove, or reconfigure built-in middleware and external services already registered with the gateway. | Apply the change with `openshell policy set`. |
 | External middleware registration | Policy changes cannot register a service or change its gateway connection settings. | Update the gateway configuration and restart the gateway. |
 | Added filesystem paths | The saved policy can change, but the running workload keeps its existing filesystem permissions. | Recreate the sandbox. |
-| Removed filesystem paths, or changed workdir, Landlock, or process settings | OpenShell rejects the change after the workload starts. | Recreate the sandbox. |
+| Removed filesystem paths, or changed `include_workdir`, Landlock, or process settings | OpenShell rejects the change after the workload starts. | Recreate the sandbox. |
 
 When new network rules take effect, OpenShell closes connections that were
 opened under the previous rules, including HTTP keep-alive connections, tunnels,
@@ -209,11 +213,12 @@ flowchart TD
 
 The sandbox validates the revision again because it also accounts for provider
 rules and other changes that arrive at the same time. If the sandbox cannot load
-a revision, the gateway's `policy_validation_failure_mode` setting decides what
-happens. With `fail_closed`, the default, the sandbox blocks network traffic
-until you submit a valid policy. With `retain_last_valid`, the last valid policy
-stays active. [A Change Fails to Load](#a-change-fails-to-load) explains how to
-repair a rejected change.
+a revision, the `policy_validation_failure_mode` option in the [gateway
+configuration](/reference/gateway-config#full-example) decides what happens.
+With `fail_closed`, the default, the sandbox blocks network traffic until you
+submit a valid policy. With `retain_last_valid`, the last valid policy stays
+active. [A Change Fails to Load](#a-change-fails-to-load) explains how to repair
+a rejected change.
 
 ## Change Filesystem and Process Settings
 
@@ -238,6 +243,10 @@ Delete the sandbox and create a new one with the edited file:
 openshell sandbox delete my-sandbox
 openshell sandbox create --name my-sandbox --policy ./policy.yaml
 ```
+
+If the delete command reports that cleanup is pending, wait until
+`openshell sandbox get my-sandbox` no longer finds the sandbox before you create
+the new one.
 
 ## Verify a Change
 
@@ -299,25 +308,30 @@ role:
 | View global policy history. | `openshell policy list --global` |
 | Remove the global policy and restore normal policy selection. | `openshell policy delete --global` |
 
-A global policy takes effect immediately. The set and delete commands ask for
-confirmation, because each one changes the network access of every sandbox on
-the gateway. Deleting the global policy fails if a sandbox's own policy and
-provider rules would be invalid once restored.
+The set and delete commands ask for confirmation, because each one changes the
+network access of every sandbox on the gateway. Running sandboxes load a new
+global policy at their next configuration check, within about 10 seconds.
+`--wait` is not available for global policies, so test traffic in a sandbox to
+confirm a change. After you delete the global policy, `policy get --global`
+still shows the last one, with the status `Superseded`. Deleting the global
+policy fails if a sandbox's own policy and provider rules would be invalid once
+restored.
 
 ## Troubleshoot
 
 ### A Request Is Denied
 
-OpenShell logs every denied connection and request with the destination, the
-binary, and the reason. Check the sandbox log first:
+OpenShell logs each denied connection with the destination, binary, and reason,
+and each denied request with its method, path, and reason. Check the sandbox log
+first:
 
 ```shell
 openshell logs my-sandbox --since 10m --source sandbox
 ```
 
-Policy events are INFO-level log records, so do not filter the log with
-`--level warn`. Compare the logged binary and destination with the effective
-policy, and use the error code in the response to find the cause:
+Do not filter this log with `--level warn`, which hides policy events. Compare
+the logged binary and destination with the effective policy, and use the error
+code in the response to find the cause:
 
 | Error | Cause | What to check |
 |---|---|---|
@@ -329,18 +343,22 @@ policy, and use the error code in the response to find the cause:
 ### A Change Fails to Load
 
 `openshell policy list my-sandbox` shows a revision that the sandbox rejected as
-`Failed`, with the error. What happens to network access depends on the failure
-mode described in [How Changes Take Effect](#how-changes-take-effect). With the
-default, `fail_closed`, the sandbox blocks network traffic until a valid policy
-loads. Fix the error and submit the policy again, or [roll back to an earlier
+`Failed`, with a shortened error. Run
+`openshell policy get my-sandbox --rev <N>` to see the full error. What happens
+to network access depends on the failure mode described in [How Changes Take
+Effect](#how-changes-take-effect). With the default, `fail_closed`, the sandbox
+blocks network traffic until a valid policy loads. Fix the error and submit the
+policy again, or [roll back to an earlier
 revision](#roll-back-to-an-earlier-revision).
 
 ### A New Sandbox Stays in Provisioning
 
-If a new sandbox's policy or provider configuration is invalid, including an
-invalid image policy, the sandbox stays in `Provisioning` with a
-`ConfigurationInvalid` condition and its workload does not start. Check the
-diagnostic:
+`openshell sandbox create` rejects an invalid policy file. If a new sandbox's
+configuration fails when it starts, for example because its image policy is
+invalid or its providers conflict, the sandbox stays in `Provisioning` and its
+workload does not start. Its `ConfigurationReady` condition shows the reason
+`ConfigurationInvalid`. Check the diagnostic, and for an invalid image policy,
+check the sandbox log for the specific error:
 
 ```shell
 openshell sandbox get my-sandbox --output json
