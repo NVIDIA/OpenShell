@@ -44,11 +44,88 @@ async fn accept_mediated_dns(source: Arc<NetworkMediationSource>) -> PendingDnsQ
     }
 }
 
+/// Whether policy DNS answers AAAA queries with synthetic IPv6 addresses.
+///
+/// When IPv6 egress is disabled, AAAA queries receive an empty successful
+/// answer without an upstream query so dual-stack clients fall back to A.
+/// That fallback cannot help on IPv6-only hosts (for example NAT64/DNS64
+/// networks), where the trusted resolver returns no A records at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PolicyDnsIpv6Egress {
+    /// Enable IPv6 answers only when the supervisor network namespace has an
+    /// IPv6 default route and no IPv4 default route.
+    #[default]
+    Auto,
+    /// Always resolve AAAA queries through the trusted resolver.
+    Enabled,
+    /// Never resolve AAAA queries; answer them with NOERROR/NODATA.
+    Disabled,
+}
+
+impl PolicyDnsIpv6Egress {
+    /// Resolve the mode to a concrete decision for this supervisor.
+    #[must_use]
+    pub fn resolve(self) -> bool {
+        match self {
+            Self::Enabled => true,
+            Self::Disabled => false,
+            Self::Auto => ipv6_only_default_route(
+                std::fs::read_to_string("/proc/net/route").ok().as_deref(),
+                std::fs::read_to_string("/proc/net/ipv6_route")
+                    .ok()
+                    .as_deref(),
+            ),
+        }
+    }
+}
+
+const RTF_UP: u32 = 0x0001;
+const RTF_REJECT: u32 = 0x0200;
+
+/// Report whether the routing tables describe an IPv6-only uplink. An
+/// unreadable table keeps the IPv4-only default.
+fn ipv6_only_default_route(ipv4_routes: Option<&str>, ipv6_routes: Option<&str>) -> bool {
+    let (Some(ipv4_routes), Some(ipv6_routes)) = (ipv4_routes, ipv6_routes) else {
+        return false;
+    };
+    !has_ipv4_default_route(ipv4_routes) && has_ipv6_default_route(ipv6_routes)
+}
+
+/// Parse `/proc/net/route` for a usable `0.0.0.0/0` route.
+fn has_ipv4_default_route(table: &str) -> bool {
+    table.lines().skip(1).any(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        fields.len() >= 8
+            && fields[1] == "00000000"
+            && fields[7] == "00000000"
+            && route_flags_usable(fields[3])
+    })
+}
+
+/// Parse `/proc/net/ipv6_route` for a usable `::/0` route. The kernel lists
+/// an unreachable `::/0` entry on `lo`, which is not an uplink.
+fn has_ipv6_default_route(table: &str) -> bool {
+    table.lines().any(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        fields.len() >= 10
+            && fields[0].bytes().all(|byte| byte == b'0')
+            && fields[0].len() == 32
+            && fields[1] == "00"
+            && fields[9] != "lo"
+            && route_flags_usable(fields[8])
+    })
+}
+
+fn route_flags_usable(flags: &str) -> bool {
+    u32::from_str_radix(flags, 16).is_ok_and(|flags| flags & RTF_UP != 0 && flags & RTF_REJECT == 0)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PolicyDnsRuntimeConfig {
     pub(crate) ipv4_cidr: ipnet::Ipv4Net,
     pub(crate) ipv6_cidr: ipnet::Ipv6Net,
     pools: SyntheticPools,
+    ipv6_egress: bool,
 }
 
 impl PolicyDnsRuntimeConfig {
@@ -82,7 +159,16 @@ impl PolicyDnsRuntimeConfig {
             ipv4_cidr,
             ipv6_cidr,
             pools,
+            ipv6_egress: false,
         })
+    }
+
+    /// Answer AAAA queries from the synthetic IPv6 pool instead of returning
+    /// NOERROR/NODATA.
+    #[must_use]
+    pub(crate) fn with_ipv6_egress(mut self, enabled: bool) -> Self {
+        self.ipv6_egress = enabled;
+        self
     }
 }
 
@@ -102,6 +188,7 @@ impl PolicyDnsRuntime {
         mut engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
         let upstream = trusted_resolver_from_resolv_conf()?;
+        let ipv6_egress = config.ipv6_egress;
         let store = Arc::new(ResolvedEndpointStore::new(
             StoreConfig::new(config.pools, MAX_MAPPINGS)
                 .map_err(|error| miette::miette!(error.to_string()))?,
@@ -133,10 +220,12 @@ impl PolicyDnsRuntime {
                     let timing = query.timing.clone();
                     let response = match query.transport {
                         DnsTransport::Udp => {
-                            wire::handle_udp_query_with_ipv6(&service, &query.message, false).await
+                            wire::handle_udp_query_with_ipv6(&service, &query.message, ipv6_egress)
+                                .await
                         }
                         DnsTransport::Tcp => {
-                            wire::handle_tcp_query_with_ipv6(&service, &query.message, false).await
+                            wire::handle_tcp_query_with_ipv6(&service, &query.message, ipv6_egress)
+                                .await
                         }
                     }
                     .map_err(|error| {
@@ -175,7 +264,11 @@ impl PolicyDnsRuntime {
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
                 .state(StateId::Enabled, "ready")
-                .message("Policy DNS connected to isolation boundary")
+                .unmapped("ipv6_egress", ipv6_egress)
+                .message(format!(
+                    "Policy DNS connected to isolation boundary (IPv6 egress {})",
+                    if ipv6_egress { "enabled" } else { "disabled" }
+                ))
                 .build()
         );
         Ok(Self {
@@ -193,6 +286,7 @@ impl PolicyDnsRuntime {
         engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
         let upstream = trusted_resolver_from_resolv_conf()?;
+        let ipv6_egress = config.ipv6_egress;
         let store = Arc::new(ResolvedEndpointStore::new(
             StoreConfig::new(config.pools, MAX_MAPPINGS)
                 .map_err(|error| miette::miette!(error.to_string()))?,
@@ -226,11 +320,10 @@ impl PolicyDnsRuntime {
                 let udp = udp.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    // Docker and Podman do not currently prove usable IPv6
-                    // egress. Return NOERROR/NODATA for AAAA so dual-stack
-                    // clients can fall back to the usable IPv4 path.
+                    // Without IPv6 egress, AAAA receives NOERROR/NODATA so
+                    // dual-stack clients fall back to the usable IPv4 path.
                     if let Ok(response) =
-                        wire::handle_udp_query_with_ipv6(&service, &request, false).await
+                        wire::handle_udp_query_with_ipv6(&service, &request, ipv6_egress).await
                     {
                         let _ = udp.send_to(&response, peer).await;
                     }
@@ -266,7 +359,7 @@ impl PolicyDnsRuntime {
                             return;
                         }
                         let Ok(response) =
-                            wire::handle_tcp_query_with_ipv6(&service, &frame, false).await
+                            wire::handle_tcp_query_with_ipv6(&service, &frame, ipv6_egress).await
                         else {
                             return;
                         };
@@ -291,6 +384,7 @@ impl PolicyDnsRuntime {
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
                 .state(StateId::Enabled, "ready")
+                .unmapped("ipv6_egress", ipv6_egress)
                 .message(format!("Policy DNS listening on {address}"))
                 .build()
         );
@@ -413,6 +507,74 @@ mod tests {
         for address in [first.ipv4_cidr.network(), second.ipv4_cidr.broadcast()] {
             assert!(parent.contains(&address));
         }
+    }
+
+    const IPV4_ROUTE_HEADER: &str =
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n";
+    const IPV4_DEFAULT_ROUTE: &str =
+        "eth0\t00000000\t0100A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n";
+    const IPV4_SUBNET_ROUTE: &str =
+        "eth0\t0000A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n";
+    const IPV6_DEFAULT_ROUTE: &str = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003     eth0\n";
+    const IPV6_LOOPBACK_UNREACHABLE: &str = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo\n";
+    const IPV6_SUBNET_ROUTE: &str = "20010db8000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0\n";
+
+    #[test]
+    fn explicit_ipv6_egress_modes_ignore_routing_tables() {
+        assert!(PolicyDnsIpv6Egress::Enabled.resolve());
+        assert!(!PolicyDnsIpv6Egress::Disabled.resolve());
+        assert_eq!(PolicyDnsIpv6Egress::default(), PolicyDnsIpv6Egress::Auto);
+    }
+
+    #[test]
+    fn auto_ipv6_egress_enables_only_ipv6_only_uplinks() {
+        let ipv4_without_default = format!("{IPV4_ROUTE_HEADER}{IPV4_SUBNET_ROUTE}");
+        let ipv4_with_default = format!("{IPV4_ROUTE_HEADER}{IPV4_DEFAULT_ROUTE}");
+        let ipv6_with_default = format!("{IPV6_SUBNET_ROUTE}{IPV6_DEFAULT_ROUTE}");
+
+        // IPv6-only (NAT64/DNS64) uplink.
+        assert!(ipv6_only_default_route(
+            Some(&ipv4_without_default),
+            Some(&ipv6_with_default)
+        ));
+        assert!(ipv6_only_default_route(
+            Some(IPV4_ROUTE_HEADER),
+            Some(IPV6_DEFAULT_ROUTE)
+        ));
+        // Dual-stack keeps the IPv4 fallback behavior.
+        assert!(!ipv6_only_default_route(
+            Some(&ipv4_with_default),
+            Some(&ipv6_with_default)
+        ));
+        // IPv4-only, and the kernel's unreachable ::/0 entry on lo.
+        assert!(!ipv6_only_default_route(
+            Some(&ipv4_with_default),
+            Some(IPV6_LOOPBACK_UNREACHABLE)
+        ));
+        assert!(!ipv6_only_default_route(
+            Some(IPV4_ROUTE_HEADER),
+            Some(&format!("{IPV6_SUBNET_ROUTE}{IPV6_LOOPBACK_UNREACHABLE}"))
+        ));
+        // Unreadable tables keep the IPv4-only default.
+        assert!(!ipv6_only_default_route(None, Some(IPV6_DEFAULT_ROUTE)));
+        assert!(!ipv6_only_default_route(Some(IPV4_ROUTE_HEADER), None));
+    }
+
+    #[test]
+    fn down_or_reject_default_routes_are_not_uplinks() {
+        let down_ipv4 = format!(
+            "{IPV4_ROUTE_HEADER}eth0\t00000000\t0100A8C0\t0002\t0\t0\t100\t00000000\t0\t0\t0\n"
+        );
+        assert!(!has_ipv4_default_route(&down_ipv4));
+        let reject_ipv6 = IPV6_DEFAULT_ROUTE.replace("00000003", "00000201");
+        assert!(!has_ipv6_default_route(&reject_ipv6));
+    }
+
+    #[test]
+    fn runtime_config_keeps_ipv6_egress_disabled_by_default() {
+        let config = PolicyDnsRuntimeConfig::for_epoch(3).unwrap();
+        assert!(!config.ipv6_egress);
+        assert!(config.with_ipv6_egress(true).ipv6_egress);
     }
 
     #[test]

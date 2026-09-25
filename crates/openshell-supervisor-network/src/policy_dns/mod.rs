@@ -25,6 +25,7 @@ mod wire;
 
 pub(crate) use name::NormalizedName;
 pub(crate) use resolver::{AddressFamily, SocketTrustedResolver, TrustedAnswer, TrustedResolver};
+pub use runtime::PolicyDnsIpv6Egress;
 pub(crate) use runtime::{PolicyDnsRuntime, PolicyDnsRuntimeConfig};
 pub(crate) use store::{
     MappingLookup, MappingLookupError, PolicyEndpointId, PublishError, PublishRequest,

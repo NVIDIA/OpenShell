@@ -9325,6 +9325,115 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn staged_transparent_open_dials_pinned_ipv6_for_synthetic_ipv6() {
+        use crate::policy_dns::{
+            AddressFamily, NormalizedName, PolicyEndpointId, PublishRequest, ResolvedEndpointStore,
+            ResolvedPortContract, StoreConfig, SyntheticPools,
+        };
+
+        let engine = OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            r#"
+network_policies:
+  allowed:
+    name: allowed
+    endpoints:
+      - host: api.example.com
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#,
+        )
+        .unwrap();
+        let pools = SyntheticPools::new(
+            Ipv4Addr::new(198, 18, 0, 1)..=Ipv4Addr::new(198, 18, 0, 1),
+            "fd00:1::1".parse::<Ipv6Addr>().unwrap()..="fd00:1::1".parse::<Ipv6Addr>().unwrap(),
+        )
+        .unwrap();
+        let store = Arc::new(ResolvedEndpointStore::new(
+            StoreConfig::new(pools, 2).unwrap(),
+        ));
+        // A NAT64/DNS64 answer for an IPv4-only upstream.
+        let upstream: IpAddr = "64:ff9b::cb00:7107".parse().unwrap();
+        let record = store
+            .publish(
+                PublishRequest {
+                    normalized_name: NormalizedName::parse("api.example.com").unwrap(),
+                    family: AddressFamily::Ipv6,
+                    allocation_identity: [7; 32],
+                    policy_generation: engine.current_generation(),
+                    ttl: std::time::Duration::from_secs(30),
+                    contracts: vec![ResolvedPortContract {
+                        endpoint_id: PolicyEndpointId {
+                            policy_name: "allowed".to_string(),
+                            endpoint_index: 0,
+                        },
+                        port: 443,
+                        destination_plan: build_pinned_validation_plan(vec![upstream]).unwrap(),
+                        pinned_addresses: vec![upstream],
+                    }],
+                },
+                engine.current_generation(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        assert!(record.synthetic_address.is_ipv6());
+
+        let (stream, _peer) = tokio::io::duplex(64);
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        let pending = PendingTcpOpen {
+            stream: Box::new(stream),
+            binary_identity: Ok(ContractBinaryIdentity {
+                executable: ContractExecutableIdentity {
+                    path: PathBuf::from("/usr/bin/curl"),
+                    digest: Some("00".repeat(32).parse().unwrap()),
+                },
+                ancestors: Vec::new(),
+                cmdline_paths: Vec::new(),
+            }),
+            destination: SocketAddr::new(record.synthetic_address, 443),
+            socket: Some(
+                openshell_isolation_interface::contract::NetworkSocketMetadata {
+                    socket_cookie: 7,
+                    nonblocking: false,
+                    process_generation: 1,
+                },
+            ),
+            policy_generation: engine.current_generation(),
+            timing: MediationTiming::default(),
+            decision,
+        };
+
+        let accepted = preauthorize_transparent_open(
+            pending,
+            Some(&store),
+            &engine,
+            &BinaryIdentityCache::new(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("synthetic IPv6 destination is authorized");
+        assert_eq!(completion.await.unwrap(), TcpOpenDecision::RelayReady);
+        let (_, connector) = accepted
+            .3
+            .and_then(|open| open.authorization)
+            .expect("transparent authorization");
+        assert_eq!(connector.addrs(), [SocketAddr::new(upstream, 443)]);
+    }
+
+    #[tokio::test]
     async fn staged_transparent_open_reports_invalid_identity_as_unavailable() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),

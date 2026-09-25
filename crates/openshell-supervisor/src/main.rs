@@ -48,6 +48,29 @@ enum SupervisorRole {
     NetworkProxy,
 }
 
+/// AAAA handling for mediated policy DNS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum PolicyDnsIpv6EgressArg {
+    /// Answer AAAA only when the supervisor has an IPv6 default route and no
+    /// IPv4 default route.
+    #[default]
+    Auto,
+    /// Always answer AAAA from the synthetic IPv6 pool.
+    Enabled,
+    /// Always answer AAAA with an empty NOERROR response.
+    Disabled,
+}
+
+impl From<PolicyDnsIpv6EgressArg> for openshell_supervisor_network::run::PolicyDnsIpv6Egress {
+    fn from(value: PolicyDnsIpv6EgressArg) -> Self {
+        match value {
+            PolicyDnsIpv6EgressArg::Auto => Self::Auto,
+            PolicyDnsIpv6EgressArg::Enabled => Self::Enabled,
+            PolicyDnsIpv6EgressArg::Disabled => Self::Disabled,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "openshell-supervisor health")]
 struct HealthArgs {
@@ -219,6 +242,10 @@ struct Args {
     /// applies regardless of whether a corporate proxy is configured.
     #[arg(long)]
     additional_ca_bundle: Option<String>,
+
+    /// Driver-selected AAAA handling for mediated policy DNS.
+    #[arg(long, value_enum, default_value_t)]
+    policy_dns_ipv6_egress: PolicyDnsIpv6EgressArg,
 
     #[arg(long)]
     backend_descriptor_file: Option<PathBuf>,
@@ -679,6 +706,7 @@ fn main() -> Result<()> {
                     shared_ssh_socket: openshell_supervisor::shared_ssh_socket_from_env(),
                     upstream_proxy_args,
                     additional_ca_bundle: args.additional_ca_bundle,
+                    policy_dns_ipv6_egress: args.policy_dns_ipv6_egress.into(),
                     backend_descriptor,
                     auth_bundle,
                     admitted_isolation_backend: Some(admitted_backend),
@@ -1393,6 +1421,36 @@ mod tests {
         .expect("network-proxy arguments");
         assert_eq!(args.role, SupervisorRole::NetworkProxy);
         assert!(validate_role_arguments(&args).is_ok());
+    }
+
+    #[test]
+    fn policy_dns_ipv6_egress_defaults_to_auto_and_accepts_overrides() {
+        let args = Args::try_parse_from(["openshell-supervisor"]).expect("parse defaults");
+        assert_eq!(args.policy_dns_ipv6_egress, PolicyDnsIpv6EgressArg::Auto);
+        for (value, expected) in [
+            (
+                "enabled",
+                openshell_supervisor_network::run::PolicyDnsIpv6Egress::Enabled,
+            ),
+            (
+                "disabled",
+                openshell_supervisor_network::run::PolicyDnsIpv6Egress::Disabled,
+            ),
+        ] {
+            let args =
+                Args::try_parse_from(["openshell-supervisor", "--policy-dns-ipv6-egress", value])
+                    .expect("policy DNS IPv6 egress argument");
+            assert_eq!(
+                openshell_supervisor_network::run::PolicyDnsIpv6Egress::from(
+                    args.policy_dns_ipv6_egress
+                ),
+                expected
+            );
+        }
+        assert!(
+            Args::try_parse_from(["openshell-supervisor", "--policy-dns-ipv6-egress", "yes"])
+                .is_err()
+        );
     }
 
     #[test]

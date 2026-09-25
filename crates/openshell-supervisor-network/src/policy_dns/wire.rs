@@ -341,6 +341,47 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     }
 
     #[tokio::test]
+    async fn runtime_with_ipv6_egress_resolves_aaaa_to_synthetic_ipv6() {
+        let service = service();
+        let query = request("db.example.", RecordType::AAAA);
+        let mut frame = Vec::with_capacity(query.len() + 2);
+        frame.extend_from_slice(&u16::try_from(query.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(&query);
+        for wire in [
+            handle_udp_query_with_ipv6(&service, &query, true)
+                .await
+                .unwrap(),
+            handle_tcp_query_with_ipv6(&service, &frame, true)
+                .await
+                .unwrap()[2..]
+                .to_vec(),
+        ] {
+            let response = Message::from_vec(&wire).unwrap();
+            assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+            let RData::AAAA(AAAA(address)) = response.answers[0].data else {
+                panic!("expected an AAAA answer");
+            };
+            let pool =
+                "fd00:1::1".parse::<Ipv6Addr>().unwrap()..="fd00:1::4".parse::<Ipv6Addr>().unwrap();
+            assert!(pool.contains(&address));
+            let mapping = service
+                .store()
+                .lookup(
+                    IpAddr::V6(address),
+                    5432,
+                    service.policy.current_generation(),
+                    Instant::now(),
+                )
+                .unwrap();
+            assert_eq!(
+                mapping.pinned_addresses(),
+                ["2001:4860:4860::8888".parse::<IpAddr>().unwrap()]
+            );
+        }
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn unsupported_type_is_not_implemented_and_malformed_tcp_is_rejected() {
         let service = service();
         let wire = handle_udp_query(&service, &request("db.example.", RecordType::TXT))
