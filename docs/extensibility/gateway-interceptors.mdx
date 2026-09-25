@@ -49,7 +49,7 @@ An interceptor implements the `openshell.gateway_interceptor.v1.GatewayIntercept
 - `Evaluate` handles one selected operation phase.
 - `SnapshotProviderProfiles` optionally returns a provider profile catalog.
 
-`DescribeRequest` carries gateway protocol metadata, and `InterceptorManifest.extension` returns the interceptor's protocol and implementation metadata. The gateway rejects missing metadata, incompatible majors, and unmet required capabilities before it accepts bindings. See [Extension Protocol Negotiation](/extensibility/extension-negotiation).
+`DescribeRequest` carries gateway protocol metadata, and `InterceptorManifest.extension` returns the interceptor's protocol and implementation metadata. The gateway rejects missing metadata, incompatible majors, and unmet required capabilities before it accepts bindings. See [Extension Protocol Negotiation](/extensibility/overview#protocol-negotiation).
 
 Each `InterceptorEvaluation` identifies the configured interceptor, manifest binding, public OpenShell service and method, authenticated principal, and active phase. The phase determines whether the payload contains a proposed operation, optional current state, or committed response.
 

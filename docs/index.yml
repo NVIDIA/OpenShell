@@ -12,7 +12,7 @@ navigation:
   - page: "Why OpenShell"
     path: about/overview.mdx
   - page: "Architecture"
-    path: about/how-it-works.mdx
+    path: about/architecture.mdx
   - page: "Installation"
     path: about/installation.mdx
   - page: "Run Your First Agent"
@@ -73,8 +73,6 @@ navigation:
   contents:
   - page: "Overview"
     path: extensibility/overview.mdx
-  - page: "Protocol Negotiation"
-    path: extensibility/extension-negotiation.mdx
   - page: "Authentication"
     path: extensibility/extension-authentication.mdx
   - section: "Supervisor Middleware"
@@ -98,6 +96,8 @@ navigation:
 - section: "Tutorials"
   slug: tutorials
   contents:
+  - page: "Run Pi"
+    path: get-started/tutorials/run-pi.mdx
   - page: "First Network Policy"
     path: get-started/tutorials/first-network-policy.mdx
   - page: "GitHub Push Access"

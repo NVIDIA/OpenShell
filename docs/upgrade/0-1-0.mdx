@@ -7,9 +7,16 @@ description: "Prepare OpenShell operators and users for the breaking changes in 
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Upgrade, Migration"
 ---
 
-Upgrading from OpenShell 0.0.x to 0.1.0? Start with the section that matches how you use the platform.
+<Warning>
+Local OpenShell 0.0.x installations cannot be upgraded in place. Clean up the
+old runtime and [uninstall the existing package](/about/installation#uninstall-openshell)
+before installing OpenShell 0.1.0.
+</Warning>
 
-Each item links to the pull request that defines the change.
+OpenShell 0.1.0 introduces breaking changes for deployments, sandboxes, policies, APIs, and SDKs. Review the changes that apply to your role before upgrading:
+
+- [Operators](#operators): Plan the rollout, migrate configuration and credentials, and update custom extensions.
+- [End users](#end-users): Update sandbox workflows, policies, API clients, and SDK integrations.
 
 ## Operators
 
@@ -61,7 +68,7 @@ If you run OpenShell for a team, start here.
 
 - **Install the workspace chart in operator-managed namespaces.** In operator workspace mode, the gateway receives Secret permissions only from the `openshell-workspace` chart. Install the matching chart release in every operator-managed namespace; without it, sandbox bootstrap fails ([PR #3616](https://github.com/NVIDIA/OpenShell/pull/3616)).
 
-- **Implement extension protocol negotiation.** Custom compute drivers, credential drivers, gateway interceptors, and middleware must exchange `PeerMetadata`, use protocol `1.0`, and advertise their family base capability. Upgrade both peers together. See [Extension Protocol Negotiation](/extensibility/extension-negotiation) and [PR #3352](https://github.com/NVIDIA/OpenShell/pull/3352).
+- **Implement extension protocol negotiation.** Custom compute drivers, credential drivers, gateway interceptors, and middleware must exchange `PeerMetadata`, use protocol `1.0`, and advertise their family base capability. Upgrade both peers together. See [Extension Protocol Negotiation](/extensibility/overview#protocol-negotiation) and [PR #3352](https://github.com/NVIDIA/OpenShell/pull/3352).
 
 - **Remove compute-driver callback-listener negotiation.** Regenerate custom compute-driver bindings and connect supervisors to the operator-configured primary gateway endpoint ([PR #3365](https://github.com/NVIDIA/OpenShell/pull/3365)).
 

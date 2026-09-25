@@ -29,19 +29,6 @@ You can also download release artifacts directly from the [OpenShell GitHub Rele
 
 Use `openshell status` to confirm the CLI can reach the gateway.
 
-## Release Cadence
-
-OpenShell publishes stable versions as coordinated release sets. The default
-installer selects the newest stable release, and the `latest` documentation
-channel follows that release. Use the same version of the gateway, compute and
-credential drivers, supervisors, CLI, and SDK clients together.
-
-Between stable releases, numbered prereleases such as `0.1.0-pre.3` provide
-evaluation checkpoints. Rolling development builds track successful releases
-from `main` and use versions such as `0.0.0-dev.<commit-sha>`. Prerelease and
-development builds may change before the next stable release; their matching
-documentation is published in the `dev` channel.
-
 ## Supported Runtimes
 
 OpenShell supports several sandbox runtimes. Package-managed gateways leave the
@@ -202,6 +189,45 @@ sudo systemctl restart snap.openshell.gateway
 Rerunning `install.sh` explicitly refreshes the snap and restarts the gateway so
 the refreshed binary is active when installation completes. That restart
 interrupts active sandbox sessions.
+
+## Uninstall OpenShell
+
+Stop the local gateway and remove its package with the commands for your
+installation.
+
+### Homebrew
+
+```shell
+brew services stop nvidia/openshell/openshell
+brew uninstall nvidia/openshell/openshell
+rm -rf "$(brew --prefix)/var/openshell"
+```
+
+### Debian and Ubuntu
+
+```shell
+systemctl --user disable --now openshell-gateway
+sudo apt remove openshell
+rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/openshell"
+```
+
+### Fedora and RHEL
+
+```shell
+systemctl --user disable --now openshell-gateway
+sudo dnf remove openshell-gateway openshell-prover openshell
+rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/openshell"
+```
+
+### Snap
+
+```shell
+sudo snap remove --purge openshell
+```
+
+These commands remove the package and its standard gateway state. Remove any
+custom configuration or database selected through `OPENSHELL_GATEWAY_CONFIG`
+or `OPENSHELL_DB_URL` separately.
 
 ## Kubernetes
 

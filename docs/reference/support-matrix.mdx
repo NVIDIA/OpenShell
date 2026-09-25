@@ -8,6 +8,36 @@ position: 5
 
 This page lists the host platform, compute driver, software, runtime, and kernel requirements for running OpenShell.
 
+## Releases
+
+OpenShell publishes dev, pre-release, and stable builds for different stages of
+the release cycle. Use a stable release for production deployments.
+
+| Release | Publication | Intended use |
+|---|---|---|
+| Dev | Built from every commit to `main` that passes normal CI. The floating `dev` alias points to the newest build. | Testing upcoming functionality. Dev builds enable development features and have not passed release qualification. |
+| Pre-release | Built nightly when `main` has changed and normal CI passes. Versions use the form `X.Y.Z-pre.N`. | Validating the immutable artifact set proposed for the next stable release. Pre-releases use the stable feature set but may not have passed qualification. |
+| Stable | Promoted from a pre-release that passes conformance, upgrade, API compatibility, artifact, and security checks. Versions use the form `X.Y.Z`. | Production use within this support matrix. |
+
+Tagged stable releases generally go out every week. OpenShell targets Tuesday
+publication when there are changes and every blocking qualification check
+passes. A security release may ship sooner.
+
+Stable APIs and other Stable interfaces remain backward-compatible across
+patch releases. Patch releases can contain fixes and additive functionality. A
+breaking change to a Stable interface requires a minor release with notice and
+migration guidance. Interfaces marked Experimental may change or be removed in
+a patch release.
+
+OpenShell provides security and critical reliability updates for the latest
+minor release and the previous minor release, also called N-1. Support applies
+to the newest patch on each maintained minor line. Update to that patch to
+receive fixes; OpenShell does not issue fixes for every older patch. Maintenance
+updates do not backport features.
+
+Refer to [RFC 0014](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0014-release-stability/README.md)
+for the complete release and compatibility policy.
+
 ## Supported Platforms
 
 OpenShell publishes multi-architecture gateway images for `linux/amd64` and `linux/arm64`. The CLI, policy prover, package-managed gateway, and standalone gateway binary are supported on the following host platforms:
@@ -34,6 +64,35 @@ OpenShell publishes standalone `openshell-gateway` release assets for manual dow
 These artifacts are attached to GitHub releases. Kubernetes deployments should use the Helm chart and the published gateway image.
 
 On Linux, `openshell-gateway` requires glibc 2.28 or newer. Compatible systems include, for example, Ubuntu 20.04+, RHEL 8+, Rocky Linux 8+, Amazon Linux 2023+, and Fedora 32+.
+
+## Sandbox Runtime Binary
+
+`openshell-sandbox` is the trusted workload-side runtime binary. It runs inside
+the sandbox boundary, starts and owns the agent process tree, observes
+executable identity, and sends mediated TCP and DNS operations to the
+supervisor. It does not hold provider credentials or open upstream connections;
+those responsibilities remain with the supervisor outside the workload
+boundary.
+
+OpenShell publishes static musl builds for the Linux architectures supported by
+the sandbox runtime:
+
+| Platform | Artifact pattern |
+|---|---|
+| Linux x86_64 (amd64) | `openshell-sandbox-x86_64-unknown-linux-musl.tar.gz` |
+| Linux aarch64 (arm64) | `openshell-sandbox-aarch64-unknown-linux-musl.tar.gz` |
+
+The static binary does not depend on the agent image's libc. Each stable release
+also publishes `openshell-sandbox-checksums-sha256.txt` for the standalone
+archives.
+
+Supported runtimes deliver this binary automatically and separately from the
+agent image. Docker and Podman stage it into the workload, Kubernetes uses the
+trusted sandbox runtime image, and the VM runtime embeds it in the guest
+rootfs. Most users do not invoke the binary directly. Use the standalone
+archives when integrating a runtime or preparing artifacts for an air-gapped
+environment, and keep the sandbox binary aligned with the rest of the OpenShell
+release.
 
 ## Standalone Policy Prover
 
@@ -83,6 +142,7 @@ change the default, and users can select an explicit image with `--from`.
 | Image | Reference | Pulled When |
 |---|---|---|
 | Gateway | `ghcr.io/nvidia/openshell/gateway:latest` | Helm chart install or upgrade, or standalone container deployment |
+| Sandbox runtime | `ghcr.io/nvidia/openshell/sandbox:latest` | A supported runtime stages `openshell-sandbox` into a workload boundary |
 | Default workload | `nvcr.io/nvidia/base/ubuntu:24.04` | First sandbox creation unless preloaded or overridden |
 
 The Helm chart in `deploy/helm/openshell` deploys the gateway workload, service account, service, optional persistent storage, and network policy for Kubernetes. It defaults to a StatefulSet for SQLite-backed installs and can render a Deployment for external database-backed installs.
