@@ -9,8 +9,9 @@
 # least-privilege control that decides which processes may reach the endpoints
 # below, so it has to name the paths in *your* image.
 #
-# Client binaries:   curl.
-# Reference layout:  curl at /usr/bin/curl or /usr/local/bin/curl. Add the SDK
+# Client binaries:   curl and OpenCode.
+# Reference layout:  curl at /usr/bin/curl or /usr/local/bin/curl; OpenCode at
+#                    /usr/local/bin/opencode, as in ghcr.io/anomalyco/opencode. Add the SDK
 #                    interpreter (for example /usr/bin/python3) if the workload
 #                    calls the API through a library instead of curl.
 # Credential scope:  ANTHROPIC_API_KEY, sent as the x-api-key header to
@@ -40,4 +41,4 @@ endpoints:
     protocol: rest
     access: read-write
     enforcement: enforce
-binaries: [/usr/bin/curl, /usr/local/bin/curl]
+binaries: [/usr/bin/curl, /usr/local/bin/curl, /usr/local/bin/opencode]
