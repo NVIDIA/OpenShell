@@ -126,9 +126,9 @@ description = "Apply the Envoy GatewayClass manifest (run after helm:skaffold:ru
 run = "kubectl apply -f deploy/kube/manifests/envoy-gateway-openshell.yaml"
 
 ["helm:agentgateway:install"]
-description = "Install pinned Gateway API CRDs, agentgateway, and the shared OpenShell Gateway"
+description = "Install pinned Gateway API CRDs and agentgateway"
 run = "tasks/scripts/agentgateway-k8s-setup.sh install"
 
 ["helm:agentgateway:delete"]
-description = "Remove the shared OpenShell Gateway and agentgateway releases"
+description = "Remove the agentgateway releases"
 run = "tasks/scripts/agentgateway-k8s-setup.sh delete"

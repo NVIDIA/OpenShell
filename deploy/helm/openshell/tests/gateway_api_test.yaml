@@ -5,36 +5,11 @@ suite: Gateway API resources
 templates:
   - templates/gateway.yaml
   - templates/grpcroute.yaml
-  - templates/listenerset.yaml
 release:
   name: openshell
   namespace: openshell
 
 tests:
-  - it: attaches a GRPCRoute to a named listener on a shared agentgateway Gateway
-    template: templates/grpcroute.yaml
-    set:
-      grpcRoute.enabled: true
-      grpcRoute.gateway.create: false
-      grpcRoute.gateway.name: openshell-ingress
-      grpcRoute.gateway.namespace: agentgateway-system
-      grpcRoute.gateway.sectionName: grpc
-    asserts:
-      - equal:
-          path: spec.parentRefs[0]
-          value:
-            name: openshell-ingress
-            namespace: agentgateway-system
-            sectionName: grpc
-
-  - it: omits the listener name when sectionName is empty
-    template: templates/grpcroute.yaml
-    set:
-      grpcRoute.enabled: true
-    asserts:
-      - notExists:
-          path: spec.parentRefs[0].sectionName
-
   - it: keeps Envoy Gateway as the default class for chart-created Gateways
     template: templates/gateway.yaml
     set:
@@ -45,80 +20,79 @@ tests:
           path: spec.gatewayClassName
           value: eg
 
-  - it: does not create a ListenerSet by default
-    template: templates/listenerset.yaml
-    asserts:
-      - hasDocuments:
-          count: 0
-
-  - it: adds an HTTPS ListenerSet to a shared agentgateway Gateway
-    template: templates/listenerset.yaml
+  - it: creates a dedicated Gateway for agentgateway
+    template: templates/gateway.yaml
     set:
-      server.disableTls: true
       grpcRoute.enabled: true
+      grpcRoute.gateway.create: true
+      grpcRoute.gateway.className: agentgateway
       grpcRoute.gateway.name: openshell-ingress
-      grpcRoute.gateway.namespace: agentgateway-system
-      grpcRoute.listenerSet.enabled: true
-      grpcRoute.listenerSet.name: openshell-tls
-      grpcRoute.listenerSet.listener.name: grpc-tls
-      grpcRoute.listenerSet.listener.tls.certificateRefs[0].name: openshell-ingress-tls
     asserts:
       - equal:
-          path: spec.parentRef
-          value:
-            group: gateway.networking.k8s.io
-            kind: Gateway
-            name: openshell-ingress
-            namespace: agentgateway-system
+          path: metadata.name
+          value: openshell-ingress
+      - equal:
+          path: spec.gatewayClassName
+          value: agentgateway
       - equal:
           path: spec.listeners[0].protocol
-          value: HTTPS
-      - equal:
-          path: spec.listeners[0].tls.certificateRefs[0].name
-          value: openshell-ingress-tls
-      - equal:
-          path: spec.listeners[0].allowedRoutes.namespaces.from
-          value: Same
+          value: HTTP
 
-  - it: attaches the GRPCRoute to the ListenerSet HTTPS listener
+  - it: attaches the GRPCRoute to the named agentgateway Gateway
     template: templates/grpcroute.yaml
     set:
-      server.disableTls: true
       grpcRoute.enabled: true
+      grpcRoute.gateway.create: true
+      grpcRoute.gateway.className: agentgateway
       grpcRoute.gateway.name: openshell-ingress
-      grpcRoute.gateway.namespace: agentgateway-system
-      grpcRoute.listenerSet.enabled: true
-      grpcRoute.listenerSet.name: openshell-tls
-      grpcRoute.listenerSet.listener.name: grpc-tls
-      grpcRoute.listenerSet.listener.tls.certificateRefs[0].name: openshell-ingress-tls
     asserts:
       - equal:
           path: spec.parentRefs[0]
           value:
-            name: openshell-tls
-            group: gateway.networking.k8s.io
-            kind: ListenerSet
+            name: openshell-ingress
             namespace: openshell
-            sectionName: grpc-tls
 
-  - it: rejects a ListenerSet with a chart-created Gateway
-    template: templates/listenerset.yaml
+  - it: rejects an agentgateway Gateway that collides with the OpenShell Service
+    template: templates/gateway.yaml
     set:
       grpcRoute.enabled: true
       grpcRoute.gateway.create: true
-      grpcRoute.listenerSet.enabled: true
+      grpcRoute.gateway.className: agentgateway
     asserts:
       - failedTemplate:
-          errorMessage: "grpcRoute.listenerSet cannot be used with grpcRoute.gateway.create=true; attach it to a shared Gateway"
+          errorMessage: "grpcRoute.gateway.name must differ from the OpenShell Service name when grpcRoute.gateway.className=agentgateway; set a distinct name such as openshell-ingress"
 
-  - it: requires a certificate for an HTTPS ListenerSet
-    template: templates/listenerset.yaml
+  - it: creates a dedicated HTTPS Gateway for agentgateway
+    template: templates/gateway.yaml
     set:
       server.disableTls: true
       grpcRoute.enabled: true
+      grpcRoute.gateway.create: true
+      grpcRoute.gateway.className: agentgateway
       grpcRoute.gateway.name: openshell-ingress
-      grpcRoute.gateway.namespace: agentgateway-system
-      grpcRoute.listenerSet.enabled: true
+      grpcRoute.gateway.listener.port: 443
+      grpcRoute.gateway.listener.protocol: HTTPS
+      grpcRoute.gateway.listener.tls.certificateRefs[0].name: openshell-ingress-tls
+    asserts:
+      - equal:
+          path: spec.listeners[0].protocol
+          value: HTTPS
+      - equal:
+          path: spec.listeners[0].port
+          value: 443
+      - equal:
+          path: spec.listeners[0].tls.certificateRefs[0].name
+          value: openshell-ingress-tls
+
+  - it: requires a certificate for a dedicated HTTPS Gateway
+    template: templates/gateway.yaml
+    set:
+      server.disableTls: true
+      grpcRoute.enabled: true
+      grpcRoute.gateway.create: true
+      grpcRoute.gateway.className: agentgateway
+      grpcRoute.gateway.name: openshell-ingress
+      grpcRoute.gateway.listener.protocol: HTTPS
     asserts:
       - failedTemplate:
-          errorMessage: "grpcRoute.listenerSet.listener.tls.certificateRefs is required when grpcRoute.listenerSet.listener.protocol is HTTPS"
+          errorMessage: "grpcRoute.gateway.listener.tls.certificateRefs is required when grpcRoute.gateway.listener.protocol is HTTPS"
