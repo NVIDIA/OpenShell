@@ -111,6 +111,50 @@ async fn delete_sandbox(name: &str) {
     let _ = cmd.status().await;
 }
 
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn sandbox_exec_large_output_is_complete() {
+    const BYTES: usize = 8 * 1024 * 1024;
+    let mut sandbox = SandboxGuard::create(&[])
+        .await
+        .expect("create sandbox for large output");
+
+    for stderr in [false, true] {
+        let script = if stderr {
+            format!("yes A | head -c {BYTES} >&2")
+        } else {
+            format!("yes A | head -c {BYTES}")
+        };
+        let mut command = openshell_cmd();
+        command
+            .args([
+                "sandbox",
+                "exec",
+                "--name",
+                &sandbox.name,
+                "--no-tty",
+                "--no-login-shell",
+                "--",
+                "sh",
+                "-c",
+                &script,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+            .await
+            .expect("large exec output timed out")
+            .expect("run large exec output");
+        assert!(output.status.success(), "large exec exited unsuccessfully");
+        let bytes = if stderr { output.stderr } else { output.stdout };
+        assert_eq!(bytes.len(), BYTES, "exec output was truncated");
+        assert!(bytes.chunks_exact(2).all(|pair| pair == b"A\n"));
+    }
+
+    sandbox.cleanup().await;
+}
+
 async fn run_sandbox_lifecycle_command(operation: &str, name: &str) -> String {
     let mut cmd = openshell_cmd();
     cmd.args(["sandbox", operation, name])

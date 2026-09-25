@@ -3218,16 +3218,17 @@ fn exec_ssh_client_config() -> russh::client::Config {
     }
 }
 
-/// Treat channel EOF before an exit status as relay failure, not exit code 1.
-fn exec_loop_result(exit_code: Option<i32>) -> Result<i32, Status> {
-    exit_code.map_or_else(
-        || {
-            Err(Status::unavailable(
-                "exec relay closed before the command reported an exit status",
-            ))
-        },
-        Ok,
-    )
+/// Require both the command status and channel close before reporting success.
+fn exec_loop_result(exit_code: Option<i32>, close_seen: bool) -> Result<i32, Status> {
+    match (exit_code, close_seen) {
+        (Some(code), true) => Ok(code),
+        (None, _) => Err(Status::unavailable(
+            "exec relay closed before the command reported an exit status",
+        )),
+        (Some(_), false) => Err(Status::unavailable(
+            "exec relay closed before the SSH channel finished",
+        )),
+    }
 }
 
 fn build_remote_exec_command(req: &ExecSandboxRequest) -> Result<String, String> {
@@ -3576,6 +3577,7 @@ async fn run_interactive_exec_with_russh(
 
     let output = async {
         let mut exit_code: Option<i32> = None;
+        let mut close_seen = false;
         loop {
             // Bound the post-ExitStatus wait against a lost Close.
             let msg = if exit_code.is_some() {
@@ -3618,12 +3620,15 @@ async fn run_interactive_exec_with_russh(
                     let converted = i32::try_from(exit_status).unwrap_or(i32::MAX);
                     exit_code = Some(converted);
                 }
-                ChannelMsg::Close => break,
+                ChannelMsg::Close => {
+                    close_seen = true;
+                    break;
+                }
                 _ => {}
             }
         }
 
-        exec_loop_result(exit_code)
+        exec_loop_result(exit_code, close_seen)
     };
 
     let result = {
@@ -3802,6 +3807,7 @@ async fn run_exec_with_russh(
         .map_err(|e| Status::internal(format!("failed to close ssh stdin: {e}")))?;
 
     let mut exit_code: Option<i32> = None;
+    let mut close_seen = false;
     loop {
         // Bound the post-ExitStatus wait against a lost Close.
         let msg = if exit_code.is_some() {
@@ -3842,7 +3848,10 @@ async fn run_exec_with_russh(
                 let converted = i32::try_from(exit_status).unwrap_or(i32::MAX);
                 exit_code = Some(converted);
             }
-            ChannelMsg::Close => break,
+            ChannelMsg::Close => {
+                close_seen = true;
+                break;
+            }
             _ => {}
         }
     }
@@ -3852,7 +3861,7 @@ async fn run_exec_with_russh(
         .disconnect(russh::Disconnect::ByApplication, "exec complete", "en")
         .await;
 
-    exec_loop_result(exit_code)
+    exec_loop_result(exit_code, close_seen)
 }
 
 // ---------------------------------------------------------------------------
@@ -3863,6 +3872,13 @@ async fn run_exec_with_russh(
 mod tests {
     use super::*;
     use crate::compute::NoopTestDriver;
+
+    #[test]
+    fn exec_requires_ssh_channel_close_after_exit_status() {
+        assert_eq!(exec_loop_result(Some(0), true).unwrap(), 0);
+        assert!(exec_loop_result(Some(0), false).is_err());
+        assert!(exec_loop_result(None, true).is_err());
+    }
     use crate::grpc::test_support::{
         authed_request, test_server_state, test_server_state_with_compute_driver,
         test_server_state_with_driver,

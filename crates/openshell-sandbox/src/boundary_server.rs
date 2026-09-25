@@ -1448,6 +1448,9 @@ mod linux {
 
     impl MainAttachment {
         fn exit_status(&self, fallback_code: i32) -> ExitStatusWire {
+            if self.session.output_failed() {
+                return ExitStatusWire::Exited(74);
+            }
             match &self.status {
                 AttachmentStatus::Main(process) => process
                     .exit_status()
@@ -3052,6 +3055,21 @@ mod linux {
                         .map_err(|error| format!("write main process exit: {error}"));
                 }
                 Err(error) => {
+                    if matches!(&attachment.status, AttachmentStatus::Exec(_)) {
+                        tracing::warn!(
+                            skipped_chunks = error.skipped,
+                            "exec output could not be delivered intact"
+                        );
+                        let message = b"openshell: exec output could not be delivered intact\n";
+                        let _ =
+                            write_stream_frame(&mut *writer.lock().await, STREAM_STDERR, message)
+                                .await;
+                        let status = serde_json::to_vec(&ExitStatusWire::Exited(74))
+                            .map_err(|error| format!("encode exec output failure: {error}"))?;
+                        break write_stream_frame(&mut *writer.lock().await, STREAM_EXIT, &status)
+                            .await
+                            .map_err(|error| format!("write exec output failure: {error}"));
+                    }
                     tracing::warn!(
                         skipped_chunks = error.skipped,
                         "main process attachment resumed after dropping retained output"

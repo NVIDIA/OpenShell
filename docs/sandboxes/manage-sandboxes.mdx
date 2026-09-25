@@ -358,6 +358,9 @@ echo "hello" | openshell sandbox exec -n my-sandbox -- cat
 ```
 
 The command's exit code is propagated to the CLI, so `exec` works in scripts that check return codes.
+Large stdout and stderr streams are delivered before a successful exit. If an
+output attachment cannot keep up or stops making progress, `exec` fails instead
+of reporting success with incomplete output.
 
 Run an interactive shell with a TTY:
 

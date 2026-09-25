@@ -52,26 +52,40 @@ struct OutputLogState {
     events: VecDeque<SequencedOutput>,
     retained_bytes: usize,
     next_sequence: u64,
+    consumed_through: u64,
 }
 
 #[derive(Debug)]
 struct OutputLog {
     state: Mutex<OutputLogState>,
     version: watch::Sender<u64>,
+    /// Exec output must not discard bytes while its consumer is slow.
+    lossless: bool,
+    space_version: watch::Sender<u64>,
+    failed: AtomicBool,
     terminal_reported: AtomicBool,
     terminal_reported_notify: Notify,
 }
 
 impl OutputLog {
     fn new() -> Arc<Self> {
+        Self::with_lossless(false)
+    }
+
+    fn with_lossless(lossless: bool) -> Arc<Self> {
         let (version, _) = watch::channel(0);
+        let (space_version, _) = watch::channel(0);
         Arc::new(Self {
             state: Mutex::new(OutputLogState {
                 events: VecDeque::new(),
                 retained_bytes: 0,
                 next_sequence: 0,
+                consumed_through: 0,
             }),
             version,
+            lossless,
+            space_version,
+            failed: AtomicBool::new(false),
             terminal_reported: AtomicBool::new(false),
             terminal_reported_notify: Notify::new(),
         })
@@ -98,13 +112,78 @@ impl OutputLog {
         self.version.send_replace(version);
     }
 
+    /// Bound memory by making the process reader wait for the attachment.
+    /// A stalled or absent attachment eventually fails the exec rather than
+    /// allowing a successful result with missing output.
+    async fn publish_lossless(&self, event: MainOutput) -> bool {
+        const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        self.publish_lossless_with_timeout(event, STALL_TIMEOUT)
+            .await
+    }
+
+    async fn publish_lossless_with_timeout(
+        &self,
+        event: MainOutput,
+        stall_timeout: std::time::Duration,
+    ) -> bool {
+        let mut space = self.space_version.subscribe();
+        loop {
+            let _ = space.borrow_and_update();
+            if self.failed.load(Ordering::Acquire) {
+                return false;
+            }
+            let published = {
+                let mut state = self.state.lock().expect("main output log lock poisoned");
+                while state.retained_bytes + event.len() > OUTPUT_BUFFER_BYTES
+                    && state
+                        .events
+                        .front()
+                        .is_some_and(|front| front.sequence < state.consumed_through)
+                {
+                    let removed = state.events.pop_front().expect("front was checked");
+                    state.retained_bytes -= removed.event.len();
+                }
+                if state.retained_bytes + event.len() > OUTPUT_BUFFER_BYTES {
+                    None
+                } else {
+                    let sequence = state.next_sequence;
+                    state.next_sequence = state
+                        .next_sequence
+                        .checked_add(1)
+                        .expect("main output sequence exhausted");
+                    state.retained_bytes += event.len();
+                    state.events.push_back(SequencedOutput {
+                        sequence,
+                        event: event.clone(),
+                    });
+                    Some(state.next_sequence)
+                }
+            };
+            if let Some(version) = published {
+                self.version.send_replace(version);
+                return true;
+            }
+            if tokio::time::timeout(stall_timeout, space.changed())
+                .await
+                .is_err()
+            {
+                self.failed.store(true, Ordering::Release);
+                self.space_version.send_modify(|version| *version += 1);
+                return false;
+            }
+        }
+    }
+
     fn subscribe(self: &Arc<Self>) -> MainOutputCursor {
         let version = self.version.subscribe();
-        let state = self.state.lock().expect("main output log lock poisoned");
+        let mut state = self.state.lock().expect("main output log lock poisoned");
         let next_sequence = state
             .events
             .front()
             .map_or(state.next_sequence, |retained| retained.sequence);
+        if self.lossless {
+            state.consumed_through = next_sequence;
+        }
         drop(state);
         MainOutputCursor {
             output: Arc::clone(self),
@@ -142,8 +221,11 @@ pub struct MainOutputCursor {
 impl MainOutputCursor {
     pub async fn recv(&mut self) -> Result<MainOutput, MainOutputLagged> {
         loop {
+            if self.output.lossless && self.output.failed.load(Ordering::Acquire) {
+                return Err(MainOutputLagged { skipped: 0 });
+            }
             let next = {
-                let state = self
+                let mut state = self
                     .output
                     .state
                     .lock()
@@ -169,6 +251,12 @@ impl MainOutputCursor {
                         .event
                         .clone();
                     self.next_sequence += 1;
+                    if self.output.lossless {
+                        state.consumed_through = self.next_sequence;
+                        self.output
+                            .space_version
+                            .send_modify(|version| *version += 1);
+                    }
                     Some(event)
                 }
             };
@@ -327,7 +415,7 @@ impl MainSession {
             pid: 0,
             terminal: terminal_mode,
             input: MainInputSender { sender: input },
-            output: OutputLog::new(),
+            output: OutputLog::with_lossless(true),
             input_owner: Mutex::new(None),
             input_closed: AtomicBool::new(false),
             next_owner: AtomicU64::new(1),
@@ -351,8 +439,17 @@ impl MainSession {
             loop {
                 match stdout.read(&mut buffer).await {
                     Ok(0) | Err(_) => break,
-                    Ok(read) => stdout_session
-                        .publish(MainOutput::Stdout(Bytes::copy_from_slice(&buffer[..read]))),
+                    Ok(read) => {
+                        if !stdout_session
+                            .output
+                            .publish_lossless(MainOutput::Stdout(Bytes::copy_from_slice(
+                                &buffer[..read],
+                            )))
+                            .await
+                        {
+                            break;
+                        }
+                    }
                 }
             }
             stdout_session.reader_finished();
@@ -364,8 +461,17 @@ impl MainSession {
                 loop {
                     match stderr.read(&mut buffer).await {
                         Ok(0) | Err(_) => break,
-                        Ok(read) => stderr_session
-                            .publish(MainOutput::Stderr(Bytes::copy_from_slice(&buffer[..read]))),
+                        Ok(read) => {
+                            if !stderr_session
+                                .output
+                                .publish_lossless(MainOutput::Stderr(Bytes::copy_from_slice(
+                                    &buffer[..read],
+                                )))
+                                .await
+                            {
+                                break;
+                            }
+                        }
                     }
                 }
                 stderr_session.reader_finished();
@@ -527,8 +633,40 @@ impl MainSession {
         attachment_expected: bool,
         timeout: std::time::Duration,
     ) -> bool {
-        let _ = tokio::time::timeout(timeout, self.wait_for_output_readers()).await;
-        self.complete_finish(exit_code, attachment_expected)
+        if self.output.lossless {
+            // Keep waiting while the consumer makes progress. Only an idle
+            // attachment is allowed to time out, and that result is a failure.
+            let mut space = self.output.space_version.subscribe();
+            loop {
+                let _ = space.borrow_and_update();
+                if self.readers_remaining.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                tokio::select! {
+                    () = self.readers_done.notified() => {},
+                    result = tokio::time::timeout(timeout, space.changed()) => {
+                        if result.is_err() {
+                            self.output.failed.store(true, Ordering::Release);
+                            self.output.space_version.send_modify(|version| *version += 1);
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            let _ = tokio::time::timeout(timeout, self.wait_for_output_readers()).await;
+        }
+        let code = if self.output.failed.load(Ordering::Acquire) {
+            74
+        } else {
+            exit_code
+        };
+        self.complete_finish(code, attachment_expected)
+    }
+
+    #[must_use]
+    pub fn output_failed(&self) -> bool {
+        self.output.failed.load(Ordering::Acquire)
     }
 
     async fn wait_for_output_readers(&self) {
@@ -1022,6 +1160,72 @@ mod tests {
             output.recv().await.expect("resume at oldest retained event"),
             MainOutput::Stdout(data) if data.len() == chunk.len()
         ));
+    }
+
+    #[tokio::test]
+    async fn exec_output_waits_for_a_slow_subscriber_without_dropping_bytes() {
+        let log = OutputLog::with_lossless(true);
+        let chunk = Bytes::from(vec![b'x'; 4096]);
+        let writer_log = log.clone();
+        let writer = tokio::spawn(async move {
+            for _ in 0..(4 * OUTPUT_BUFFER_BYTES / chunk.len()) {
+                assert!(
+                    writer_log
+                        .publish_lossless(MainOutput::Stdout(chunk.clone()))
+                        .await
+                );
+            }
+        });
+
+        // Let the producer fill the bounded queue before attaching a reader.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!writer.is_finished());
+        let mut reader = log.subscribe();
+        let read = async {
+            let mut total = 0;
+            while total < 4 * OUTPUT_BUFFER_BYTES {
+                match reader
+                    .recv()
+                    .await
+                    .expect("exec output must not be skipped")
+                {
+                    MainOutput::Stdout(data) => {
+                        assert!(data.iter().all(|byte| *byte == b'x'));
+                        total += data.len();
+                        tokio::task::yield_now().await;
+                    }
+                    other => panic!("unexpected output: {other:?}"),
+                }
+            }
+            total
+        };
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+            .await
+            .expect("lossless output stalled");
+        writer.await.expect("writer failed");
+        assert_eq!(bytes, 4 * OUTPUT_BUFFER_BYTES);
+        assert!(!log.failed.load(Ordering::Acquire));
+        let mut replay = log.subscribe();
+        assert!(matches!(
+            replay.recv().await.expect("recent exec output remains available"),
+            MainOutput::Stdout(data) if data == b"x".repeat(4096)
+        ));
+    }
+
+    #[tokio::test]
+    async fn exec_output_stall_is_reported_as_failure() {
+        let log = OutputLog::with_lossless(true);
+        let event = MainOutput::Stdout(Bytes::from(vec![b'x'; 4096]));
+        for _ in 0..(OUTPUT_BUFFER_BYTES / 4096) {
+            assert!(log.publish_lossless(event.clone()).await);
+        }
+        // An attachment that never consumes output must not permit a success.
+        assert!(
+            !log.publish_lossless_with_timeout(event, std::time::Duration::from_millis(10))
+                .await
+        );
+        let mut reader = log.subscribe();
+        assert!(reader.recv().await.is_err());
     }
 
     #[tokio::test]

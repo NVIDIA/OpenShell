@@ -140,6 +140,10 @@ While an exec handle is retained, independent waits return its stable exit or
 signal status, whether or not an output attachment is open or the main process
 has exited. Waiting never holds the exec registry lock, so other operations can
 still signal or attach to the process.
+Exec output uses a bounded queue that backpressures the process reader until its
+attachment consumes the bytes. If the attachment stops making progress, the
+sandbox reports an output failure instead of publishing a successful exit with
+missing bytes. Canonical main-process output retains its bounded replay log.
 
 ## Isolation Layers
 
