@@ -11,8 +11,8 @@ position: 2
 ![OpenShell system architecture showing a trusted supervisor separated from a network-isolated sandbox workload. The workload can connect only to the supervisor.](../images/openshell-system-architecture.svg)
 
 OpenShell separates control-plane state from sandbox enforcement. The gateway
-owns sandbox state, policy, providers, and access, and checks proposed policy
-changes with the policy prover before they are approved. A compute driver
+owns sandbox state, policy, providers, and access, and uses formal verification
+to evaluate proposed policy changes before they are approved. A compute driver
 provisions the workload and its isolation boundary.
 
 The trusted supervisor runs outside the workload. `openshell-sandbox` runs
