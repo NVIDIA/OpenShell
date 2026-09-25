@@ -17,6 +17,17 @@ version = 2
 
 [openshell.gateway]
 
+[openshell.gateway.mtls_auth]
+enabled = true
+EOF
+
+legacy="${work}/legacy.toml"
+cat >"$legacy" <<'EOF'
+[openshell]
+version = 2
+
+[openshell.gateway]
+
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
 EOF
@@ -33,6 +44,38 @@ printf '\noperator setting = true\n' >>"$common/gateway.toml"
 cp "$common/gateway.toml" "${work}/operator-before"
 SNAP_COMMON="$common" "$hook"
 cmp -s "${work}/operator-before" "$common/gateway.toml"
+
+common="${work}/legacy"
+mkdir -p "$common"
+cp "$legacy" "$common/gateway.toml"
+chmod 644 "$common/gateway.toml"
+SNAP_COMMON="$common" "$hook"
+if ! cmp -s "$expected" "$common/gateway.toml"; then
+  echo "FAIL: install hook must migrate the legacy unauthenticated config" >&2
+  exit 1
+fi
+if [[ -z $(find "$common/gateway.toml" -perm 600) ]]; then
+  echo "FAIL: migrated config must be mode 0600" >&2
+  exit 1
+fi
+
+common="${work}/legacy-edited"
+mkdir -p "$common"
+cp "$legacy" "$common/gateway.toml"
+printf '\n# operator note\n' >>"$common/gateway.toml"
+cp "$common/gateway.toml" "${work}/legacy-edited-before"
+SNAP_COMMON="$common" "$hook"
+cmp -s "${work}/legacy-edited-before" "$common/gateway.toml"
+
+common="${work}/post-refresh"
+mkdir -p "$common" "${work}/snap/meta/hooks"
+cp "$hook" "${work}/snap/meta/hooks/install"
+cp "$legacy" "$common/gateway.toml"
+SNAP="${work}/snap" SNAP_COMMON="$common" "${hook_dir}/post-refresh"
+if ! cmp -s "$expected" "$common/gateway.toml"; then
+  echo "FAIL: post-refresh hook must migrate the legacy unauthenticated config" >&2
+  exit 1
+fi
 
 common="${work}/broken-link"
 mkdir -p "$common"

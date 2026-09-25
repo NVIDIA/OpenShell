@@ -123,7 +123,12 @@ if [[ ! -x "$snap_install_hook" ]]; then
   echo "FAIL: Snap install hook must be executable" >&2
   exit 1
 fi
-assert_contains "$snap_install_hook" 'allow_unauthenticated_users = true'
+assert_contains "$snap_install_hook" '[openshell.gateway.mtls_auth]'
+if [[ ! -x "$(dirname "$snap_install_hook")/post-refresh" ]]; then
+  echo "FAIL: Snap post-refresh hook must be executable" >&2
+  exit 1
+fi
+assert_not_contains "$ROOT/tasks/scripts/snap-gateway-wrapper.sh" 'OPENSHELL_DISABLE_TLS'
 bash "$ROOT/tasks/scripts/test-snap-install-hook.sh" "$snap_install_hook"
 assert_not_contains "$snap_install_docs" "snap connect openshell:home"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network"

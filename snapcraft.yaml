@@ -29,11 +29,18 @@ description: |
          sudo systemctl reset-failed snap.openshell.gateway.service
          sudo snap restart openshell.gateway
 
-    2. Verify the gateway and register it locally:
+    2. Give your user the gateway client certificate and register the gateway.
+       The gateway requires mTLS; only users holding this certificate can use
+       it, so copy it only for trusted users:
 
          snap services openshell.gateway
+         d=~/snap/openshell/common/.local/state/openshell/tls
+         mkdir -p -m 700 "$d/client"
+         sudo cat /var/snap/openshell/common/tls/ca.crt > "$d/ca.crt"
+         sudo cat /var/snap/openshell/common/tls/client/tls.crt > "$d/client/tls.crt"
+         (umask 077; sudo cat /var/snap/openshell/common/tls/client/tls.key > "$d/client/tls.key")
+         openshell gateway add https://127.0.0.1:17670 --local --name openshell
          openshell status
-         openshell gateway add http://127.0.0.1:17670 --local --name openshell-gateway
 
     After a snap refresh, restart the gateway to pick up the new revision:
 
@@ -92,13 +99,13 @@ apps:
     # during snap refreshes, which would kill active sandbox sessions.
     # Operators must manually restart the service after a refresh if needed.
     refresh-mode: endure
-    # Snapd runs this daemon as root, so ordinary CLI users cannot read the
-    # client certificate generated in root-owned snap state. The wrapper sets
-    # OPENSHELL_DISABLE_TLS=true for the loopback-only listener and uses
-    # $SNAP_COMMON/gateway.db. Before startup it bootstraps package-managed
-    # credentials and validates the selected operator-provided config without
-    # creating or rewriting it. A nonempty OPENSHELL_GATEWAY_CONFIG takes
-    # precedence over gateway.toml.
+    # Snapd runs this daemon as root. The wrapper serves TLS from the bundle
+    # generated in $SNAP_COMMON/tls, and the default config requires client
+    # certificates; the installer copies the client bundle to the target
+    # user. The wrapper uses $SNAP_COMMON/gateway.db. Before startup it
+    # bootstraps package-managed credentials and validates the selected
+    # operator-provided config without creating or rewriting it. A nonempty
+    # OPENSHELL_GATEWAY_CONFIG takes precedence over gateway.toml.
     environment:
       XDG_DATA_HOME: "$SNAP_COMMON"
       XDG_RUNTIME_DIR: "$SNAP_COMMON"

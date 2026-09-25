@@ -232,6 +232,9 @@ jobs:
           sudo snap connections openshell | grep -E '^docker +openshell:docker +:docker +'
           openshell --version
           sudo snap services openshell
+          sudo journalctl -b -u snap.openshell.gateway.service --no-pager |
+            grep -F "mTLS user authentication enabled"
+          openshell gateway list | grep -F "https://127.0.0.1:17670"
           openshell status
 
       - name: Create and exercise a sandbox

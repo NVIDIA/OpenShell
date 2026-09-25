@@ -1220,6 +1220,9 @@ openshell_snap_channel() {
   esac
 }
 
+# Fallback for snap revisions that predate the install hook, which serve
+# plaintext HTTP. Current revisions create an mTLS config in their install
+# hook, and their post-refresh hook migrates this legacy default.
 ensure_snap_gateway_config() {
   _config_file="${1:-/var/snap/openshell/common/gateway.toml}"
 
@@ -1280,9 +1283,32 @@ wait_for_docker_daemon() {
   error "Docker daemon did not become reachable within ${_timeout}s"
 }
 
+# Copy the snap gateway's client bundle into the target user's snap state
+# directory, where `openshell gateway add --local` imports it. Root only reads
+# the source files; the target user writes the copies into their own home.
+copy_snap_client_bundle() {
+  _src="${OPENSHELL_SNAP_TLS_DIR:-/var/snap/openshell/common/tls}"
+  _dst="${TARGET_HOME}/snap/openshell/common/.local/state/openshell/tls"
+
+  as_target_user mkdir -p "${_dst}/client"
+  as_target_user chmod 700 "$_dst" "${_dst}/client"
+  for _file in ca.crt client/tls.crt client/tls.key; do
+    as_root cat "${_src}/${_file}" |
+      as_target_user sh -c 'umask 077; cat >"$1"' sh "${_dst}/${_file}"
+  done
+}
+
 register_snap_gateway() {
   _register_bin="${OPENSHELL_REGISTER_BIN:-/snap/bin/openshell}"
-  _endpoint="http://127.0.0.1:${LOCAL_GATEWAY_PORT}"
+  _scheme="${SNAP_GATEWAY_SCHEME:-https}"
+  _endpoint="${_scheme}://127.0.0.1:${LOCAL_GATEWAY_PORT}"
+
+  if [ "$_scheme" = "https" ]; then
+    info "copying the gateway client certificate for ${TARGET_USER}..."
+    copy_snap_client_bundle
+  else
+    warn "this OpenShell snap revision serves plaintext HTTP without client authentication; any local user can operate the gateway"
+  fi
 
   if _add_output="$(as_target_user "$_register_bin" gateway add "$_endpoint" --local --name openshell 2>&1)"; then
     [ -z "$_add_output" ] || print_gateway_add_output "$_add_output"
@@ -1304,15 +1330,26 @@ register_snap_gateway() {
   esac
 }
 
+# Wait for the snap gateway and record its scheme in SNAP_GATEWAY_SCHEME.
+# Current revisions serve mTLS; earlier revisions serve plaintext HTTP. Probe
+# HTTPS first because a TLS gateway also answers plaintext loopback requests
+# for sandbox service routing.
 wait_for_snap_gateway_listener() {
   _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
   _last_output=""
-  _probe_url="http://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+  _probe_url="https://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
 
   info "waiting for local gateway listener to become reachable..."
   while [ "$_elapsed" -lt "$_timeout" ]; do
-    if _last_output="$(curl -sS --max-time 2 -o /dev/null "$_probe_url" 2>&1)"; then
+    # The probe only checks reachability; the CLI verifies the gateway CA.
+    if _last_output="$(curl -sS -k --max-time 2 -o /dev/null "$_probe_url" 2>&1)"; then
+      SNAP_GATEWAY_SCHEME=https
+      info "local gateway listener is reachable"
+      return 0
+    fi
+    if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:${LOCAL_GATEWAY_PORT}/" >/dev/null 2>&1; then
+      SNAP_GATEWAY_SCHEME=http
       info "local gateway listener is reachable"
       return 0
     fi
@@ -1354,9 +1391,9 @@ Install Docker Engine from a system package or Docker's package repository, then
   as_root snap restart openshell.gateway
 
   info "installed OpenShell snap from ${_channel}"
+  wait_for_snap_gateway_listener
   info "registering local gateway as ${TARGET_USER}..."
   register_snap_gateway
-  wait_for_snap_gateway_listener
   OPENSHELL_REGISTER_BIN="/snap/bin/openshell"
   wait_for_local_gateway_status
 }

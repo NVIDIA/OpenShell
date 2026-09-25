@@ -1,0 +1,6 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Migrate the legacy unauthenticated default config to mTLS on refresh.
+exec "${SNAP}/meta/hooks/install"

@@ -295,8 +295,8 @@ assert_snap_install_flow \
 root:snap install openshell --channel=latest/stable
 ensure:gateway-config
 root:snap restart openshell.gateway
-register:gateway
 wait:gateway-listener
+register:gateway
 wait:gateway-status"
 
 assert_snap_install_flow \
@@ -306,8 +306,8 @@ assert_snap_install_flow \
 root:snap refresh openshell --channel=latest/stable
 ensure:gateway-config
 root:snap restart openshell.gateway
-register:gateway
 wait:gateway-listener
+register:gateway
 wait:gateway-status"
 
 assert_snap_install_rejected() {
@@ -450,17 +450,71 @@ registration_calls_file="${tmpdir}/registration-calls"
 : >"$registration_calls_file"
 if ! (
   as_target_user() { printf 'target:%s\n' "$*" >>"$registration_calls_file"; }
+  copy_snap_client_bundle() { printf 'copy:client-bundle\n' >>"$registration_calls_file"; }
   print_gateway_add_output() { :; }
-  register_snap_gateway
+  info() { :; }
+  TARGET_USER=test-user
+  SNAP_GATEWAY_SCHEME=https register_snap_gateway
 ) >"$out" 2>"$err"; then
   echo "FAIL: Snap gateway registration should succeed" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 registration_calls="$(cat "$registration_calls_file")"
-if [ "$registration_calls" != "target:/snap/bin/openshell gateway add http://127.0.0.1:17670 --local --name openshell" ]; then
-  echo "FAIL: Snap gateway registration must use the Snap CLI as the target user" >&2
+if [ "$registration_calls" != "copy:client-bundle
+target:/snap/bin/openshell gateway add https://127.0.0.1:17670 --local --name openshell" ]; then
+  echo "FAIL: mTLS Snap gateway registration must copy the client bundle and use HTTPS" >&2
   printf '%s\n' "$registration_calls" >&2
+  exit 1
+fi
+
+: >"$registration_calls_file"
+if ! (
+  as_target_user() { printf 'target:%s\n' "$*" >>"$registration_calls_file"; }
+  copy_snap_client_bundle() { printf 'copy:client-bundle\n' >>"$registration_calls_file"; }
+  print_gateway_add_output() { :; }
+  SNAP_GATEWAY_SCHEME=http register_snap_gateway
+) >"$out" 2>"$err"; then
+  echo "FAIL: legacy plaintext Snap gateway registration should succeed" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+registration_calls="$(cat "$registration_calls_file")"
+if [ "$registration_calls" != "target:/snap/bin/openshell gateway add http://127.0.0.1:17670 --local --name openshell" ]; then
+  echo "FAIL: legacy Snap gateway registration must use HTTP without copying certificates" >&2
+  printf '%s\n' "$registration_calls" >&2
+  exit 1
+fi
+if ! grep -Fq "without client authentication" "$err"; then
+  echo "FAIL: legacy Snap gateway registration must warn about unauthenticated access" >&2
+  exit 1
+fi
+
+snap_tls_src="${tmpdir}/snap-tls"
+mkdir -p "${snap_tls_src}/client"
+printf 'ca\n' >"${snap_tls_src}/ca.crt"
+printf 'cert\n' >"${snap_tls_src}/client/tls.crt"
+printf 'key\n' >"${snap_tls_src}/client/tls.key"
+snap_user_home="${tmpdir}/snap-user-home"
+(
+  as_root() { "$@"; }
+  as_target_user() { "$@"; }
+  TARGET_HOME="$snap_user_home"
+  OPENSHELL_SNAP_TLS_DIR="$snap_tls_src" copy_snap_client_bundle
+)
+snap_user_tls="${snap_user_home}/snap/openshell/common/.local/state/openshell/tls"
+for file in ca.crt client/tls.crt client/tls.key; do
+  if ! cmp -s "${snap_tls_src}/${file}" "${snap_user_tls}/${file}"; then
+    echo "FAIL: Snap client bundle copy missing ${file}" >&2
+    exit 1
+  fi
+  if [[ -z $(find "${snap_user_tls}/${file}" -perm 600) ]]; then
+    echo "FAIL: Snap client bundle ${file} must be mode 0600" >&2
+    exit 1
+  fi
+done
+if [[ -z $(find "$snap_user_tls" -maxdepth 0 -perm 700) ]]; then
+  echo "FAIL: Snap client bundle directory must be mode 0700" >&2
   exit 1
 fi
 
