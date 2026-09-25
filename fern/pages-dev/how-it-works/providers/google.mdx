@@ -164,6 +164,10 @@ The metadata emulator serves tokens with the `cloud-platform` OAuth2 scope,
 which grants access to any GCP API the underlying service account has IAM
 permissions for. Add the target API hosts to your sandbox network policy:
 
+Attach `my-gcp` to the sandbox first. Because the `google-cloud` profile has no
+endpoints, each API endpoint must bind to that provider instance. Without the
+binding, OpenShell withholds its access token from the sandbox.
+
 ```yaml
 network_policies:
   gcp_apis:
@@ -174,6 +178,8 @@ network_policies:
         protocol: rest
         access: read-write
         enforcement: enforce
+        credential_binding:
+          provider: my-gcp
     binaries:
       - { path: /usr/bin/curl }
       - { path: /usr/bin/node }
@@ -181,16 +187,13 @@ network_policies:
       - { path: "/sandbox/.venv/**" }
 ```
 
-Or update a live sandbox directly:
+For a running sandbox, export its base policy. Remove the metadata header above
+the `---` line, add the endpoint and binaries shown above, then apply the file:
 
 ```shell
-openshell policy update my-sandbox \
-  --add-endpoint "*.googleapis.com:443:read-write:rest:enforce" \
-  --binary "/usr/bin/curl" \
-  --binary "/usr/bin/node" \
-  --binary "/sandbox/.uv/python/**" \
-  --binary "/sandbox/.venv/**" \
-  --wait
+openshell policy get my-sandbox --base > sandbox-policy.yaml
+# Edit sandbox-policy.yaml to add the gcp_apis rule shown above.
+openshell policy set my-sandbox --policy sandbox-policy.yaml --wait
 ```
 
 ## Network Policy

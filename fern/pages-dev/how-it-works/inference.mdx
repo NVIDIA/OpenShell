@@ -83,7 +83,7 @@ client = OpenAI(
 )
 
 response = client.responses.create(
-    model="nvidia/nemotron-3-nano-30b-a3b",
+    model="nvidia/nemotron-3-super-120b-a12b",
     input="Hello!",
 )
 print(response.output_text)
@@ -103,24 +103,26 @@ starting templates you copy and adapt, not as defaults.
 ## Attach a Provider to a Running Sandbox
 
 ```shell
-openshell sandbox provider attach inference-demo nvidia-prod
+openshell sandbox provider attach inference-demo nvidia-prod --wait
 openshell sandbox provider list inference-demo
 ```
 
-Running sandboxes poll for provider and effective-policy changes. Launch a new
-process after attachment so it receives the new credential placeholder:
+Running sandboxes poll for provider and effective-policy changes. `--wait`
+confirms the sandbox has applied the attachment. Launch a new process so it
+receives the new credential placeholder:
 
 ```shell
-openshell sandbox exec inference-demo -- python app.py
+openshell sandbox exec --name inference-demo -- python app.py
 ```
 
 An already-running process does not gain new environment variables. Credential
-rotation and detach still take effect immediately at placeholder resolution.
+rotation and detach take effect once the sandbox applies the provider change.
+Use `--wait` to confirm that change before relying on it.
 
 Detach the provider to revoke its policy and credential access:
 
 ```shell
-openshell sandbox provider detach inference-demo nvidia-prod
+openshell sandbox provider detach inference-demo nvidia-prod --wait
 ```
 
 ## Use a Custom or Self-hosted Endpoint
@@ -238,7 +240,7 @@ Earlier releases configured one shared route:
 openshell provider create --name nvidia-prod --type nvidia --from-existing
 openshell inference set \
   --provider nvidia-prod \
-  --model nvidia/nemotron-3-nano-30b-a3b \
+  --model nvidia/nemotron-3-super-120b-a12b \
   --timeout 300
 ```
 
@@ -259,7 +261,7 @@ openshell provider create \
   --name nvidia-native-prod \
   --type nvidia-native \
   --from-existing
-openshell sandbox provider attach inference-demo nvidia-native-prod
+openshell sandbox provider attach inference-demo nvidia-native-prod --wait
 ```
 
 OpenShell does not export stored credential values or change a provider's

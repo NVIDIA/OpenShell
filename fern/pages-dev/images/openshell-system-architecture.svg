@@ -3,7 +3,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="760" viewBox="0 0 1280 760" role="img" aria-labelledby="title desc">
   <title id="title">OpenShell system architecture</title>
-  <desc id="desc">User interfaces connect to the gateway. The OpenShell Runtime places a trusted supervisor separately from a network-isolated sandbox workload. The workload's only allowed network path is its mediated connection to the supervisor, which connects to approved external services.</desc>
+  <desc id="desc">User interfaces connect to the gateway, which uses the policy prover to formally verify proposed policy changes before approval. The OpenShell Runtime places a trusted supervisor separately from a network-isolated sandbox workload. The workload's only allowed network path is its mediated connection to the supervisor, which connects to approved external services.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
@@ -51,17 +51,21 @@
 
   <text x="45" y="326" class="section">GATEWAY (CONTROL PLANE)</text>
   <rect x="40" y="340" width="360" height="460" rx="18" class="soft"/>
-  <rect x="85" y="390" width="290" height="90" rx="14" class="trusted"/>
-  <text x="230" y="428" text-anchor="middle" class="label">API Server</text>
-  <text x="230" y="454" text-anchor="middle" class="small">API, authentication, lifecycle, relays</text>
-  <rect x="85" y="540" width="290" height="95" rx="14" class="box"/>
-  <text x="230" y="578" text-anchor="middle" class="label">Durable state</text>
-  <text x="230" y="605" text-anchor="middle" class="small">sandboxes · policies · providers · settings</text>
-  <rect x="85" y="690" width="290" height="90" rx="14" class="green"/>
-  <text x="230" y="727" text-anchor="middle" class="label">Compute driver</text>
-  <text x="230" y="754" text-anchor="middle" class="small">places and fences each sandbox</text>
-  <path d="M230 480 V540" class="line"/>
-  <path d="M230 635 V690" class="line"/>
+  <rect x="85" y="380" width="290" height="70" rx="14" class="trusted"/>
+  <text x="230" y="410" text-anchor="middle" class="label">API Server</text>
+  <text x="230" y="434" text-anchor="middle" class="small">API, authentication, lifecycle, relays</text>
+  <rect x="85" y="490" width="290" height="70" rx="14" class="box"/>
+  <text x="230" y="520" text-anchor="middle" class="label">Policy prover</text>
+  <text x="230" y="544" text-anchor="middle" class="small">formal verification of policy changes</text>
+  <rect x="85" y="600" width="290" height="70" rx="14" class="box"/>
+  <text x="230" y="630" text-anchor="middle" class="label">Durable state</text>
+  <text x="230" y="654" text-anchor="middle" class="small">sandboxes · policies · providers · settings</text>
+  <rect x="85" y="710" width="290" height="70" rx="14" class="green"/>
+  <text x="230" y="740" text-anchor="middle" class="label">Compute driver</text>
+  <text x="230" y="764" text-anchor="middle" class="small">places and fences each sandbox</text>
+  <path d="M230 450 V490" class="line"/>
+  <path d="M85 415 H60 V635 H85" class="line"/>
+  <path d="M230 670 V710" class="line"/>
 
   <text x="485" y="326" class="section">OPENSHELL RUNTIME (DATA PLANE)</text>
   <rect x="480" y="340" width="760" height="460" rx="18" fill="#f8fafc" stroke="#94a3b8" stroke-width="2" stroke-dasharray="10 7"/>
@@ -98,7 +102,7 @@
   <text x="1037" y="739" text-anchor="middle" class="label">Deny all egress</text>
   <text x="1037" y="760" text-anchor="middle" class="small">except to the supervisor</text>
 
-  <path d="M420 250 V286 H330 V390" class="line"/>
+  <path d="M420 250 V286 H330 V380" class="line"/>
   <text x="438" y="279" class="tiny">gRPC / HTTP</text>
   <path d="M530 500 H420 V435 H375" class="line"/>
   <text x="465" y="468" text-anchor="middle" class="tiny">OUTBOUND</text>

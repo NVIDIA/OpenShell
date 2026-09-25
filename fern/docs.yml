@@ -55,7 +55,6 @@ versions:
 - display-name: Dev
   path: ./versions/dev.yml
   slug: dev
-  availability: beta
   announcement:
     message: '<span style="display: block; padding: 0.375rem 0; text-align: left;"><strong>New
       in OpenShell 0.1.0:</strong> a stable release cadence, new isolation primitives,

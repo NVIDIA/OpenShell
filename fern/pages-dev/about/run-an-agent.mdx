@@ -15,41 +15,36 @@ with the agent as its main process.
 **1. Configure what the agent has access to.**
 
 A [provider profile](/how-it-works/providers/profiles) defines the credentials, service
-endpoints, and executable paths an agent may use. For Claude Code, review the
-[example profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/claude-code.yaml),
-including its executable paths for your image, then import it and
-[create a provider](/how-it-works/providers/overview#create-a-provider) that
-stores its credentials.
+endpoints, and executable paths an agent may use.
+
+This example runs OpenCode
+against OpenRouter. Review the
+[example profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/openrouter.yaml),
+which allows `/usr/local/bin/opencode` to reach `openrouter.ai`, then import
+it and [create a provider](/how-it-works/providers/overview#create-a-provider)
+that stores its credentials.
 
 ```shell
 openshell profile import \
-  --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/claude-code.yaml
+  --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/openrouter.yaml
 
 openshell provider create \
-  --name claude-code \
-  --type claude-code \
+  --name openrouter \
+  --type openrouter \
   --from-existing
 ```
 
-Set `ANTHROPIC_API_KEY` before creating the provider. OpenShell stores its
-value in the credential store.
+Set `OPENROUTER_API_KEY` before creating the provider. OpenShell stores its
+value in the credential store and sends it only to `openrouter.ai`.
 
-**2. Configure the sandbox image.**
+**2. Choose the sandbox image.**
 
-Build or select a [sandbox image](/how-it-works/sandboxes/overview#sandbox-images)
-containing Claude Code and every tool it needs:
+Use any [sandbox image](/how-it-works/sandboxes/overview#sandbox-images) that
+contains the agent and every tool it needs.
 
-```shell
-docker build -t agent:local .
-```
+In this example, the OpenCode image installs `opencode` at `/usr/local/bin/opencode`.
 
-For a remote gateway, push the image to a registry that the gateway can pull
-from. Use an explicit version instead of a mutable tag for reproducible
-deployments.
-
-The built-in fallback policy grants access to the working directory and common
-runtime paths, and denies network egress unless an attached provider contributes
-an endpoint. Create a custom [sandbox policy](/how-it-works/policies/overview) when the
+Create a custom [sandbox policy](/how-it-works/policies/overview) when the
 agent needs more filesystem access, package registries, source hosts, tool
 servers, or other destinations.
 
@@ -61,14 +56,48 @@ provider, and pass the agent command after `--`:
 ```shell
 openshell sandbox create \
   --name my-agent \
-  --from agent:local \
-  --provider claude-code \
-  -- claude
+  --from ghcr.io/anomalyco/opencode:latest \
+  --provider openrouter \
+  -- opencode -m openrouter/nvidia/nemotron-3.5-lightning:free
 ```
 
-Add `--policy sandbox-policy.yaml` when the workload needs a custom policy. The
-command after `--` becomes the sandbox's main process, and every child process
-it starts remains inside the sandbox boundary.
+OpenCode detects the OpenRouter credential and starts with the model passed to
+`-m`. This example uses a free model, so it works without OpenRouter credits.
+Choose any model from `opencode models openrouter`.
+
+For more control over what the agent can access, refer to
+[Policies](/how-it-works/policies/overview).
+
+**4. Grant more access as the agent needs it.**
+
+When the agent reaches a destination that policy does not allow, OpenShell
+denies the request and drafts a rule for it. The
+[policy advisor](/how-it-works/policies/advisor)'s mechanistic mapper groups
+recent denials by host, port, and calling program, then submits a narrow
+proposal to the gateway. The gateway checks each proposal with the
+[policy prover](/how-it-works/policies/prover) before you review it.
+
+List pending proposals from the host:
+
+```shell
+openshell rule get my-agent --status pending
+```
+
+Approve a proposal when its rule matches the access you intend to grant, or
+reject it with a reason:
+
+```shell
+openshell rule approve my-agent --chunk-id <chunk-id>
+
+openshell rule reject my-agent \
+  --chunk-id <chunk-id> \
+  --reason "Not needed for this task."
+```
+
+Approved rules hot-reload into the running sandbox without a restart, so the
+agent can retry the request. To let the agent propose its own narrower rules,
+or to approve proposals automatically when the prover finds no new risk, refer
+to [Policy Advisor](/how-it-works/policies/advisor).
 
 ## Examples
 
