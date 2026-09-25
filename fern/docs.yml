@@ -89,8 +89,6 @@ redirects:
     destination: "/openshell/dev/about/run-an-agent"
   - source: "/openshell/latest/sandboxes/providers-v2"
     destination: "/openshell/latest/how-it-works/providers/profiles"
-  - source: "/openshell/dev/tutorials/run-pi"
-    destination: "/openshell/dev/tutorials/run-pi-with-openrouter"
   # Paths are relative to the site root; subpath prefix matches instances + custom-domain.
   # Legacy HTML URLs used .../path/to/page/index.html; Fern canonical URLs omit index.html.
   # List explicit /index.html routes before :path*/index.html so empty path segments do not
