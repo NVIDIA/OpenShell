@@ -147,11 +147,17 @@ endpoints:
 binaries:
   - /usr/bin/curl
   - /usr/local/bin/curl
-  - /usr/bin/python3
-  - /usr/local/bin/python
+  - /usr/bin/python3.*
+  - /usr/local/bin/python3.*
   - /sandbox/.uv/python/**
   - /sandbox/.venv/**
 ```
+
+OpenShell matches the real path of each executable, not a symlink such as
+`/usr/bin/python3`, so the profile uses globs that match versioned interpreters
+such as `/usr/bin/python3.12`. To find an interpreter's real path, run
+`readlink -f /usr/bin/python3` inside the sandbox, and adjust `binaries` to
+match the executables in your image.
 
 Import the profile, create an instance, and attach it:
 

@@ -19,7 +19,17 @@ Install OpenShell with a single command:
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
-The script detects your operating system and installs the OpenShell CLI, standalone policy prover, and gateway. On Linux, it installs from the Snap Store when `snap` is available and `OPENSHELL_VERSION` is unset or `dev`. Explicit release tags and prereleases use the native Debian or RPM package. It then starts the local gateway server so you can begin creating sandboxes.
+The script detects your operating system and installs the OpenShell CLI and
+gateway. On Linux, it installs from the Snap Store when `snap` is available and
+`OPENSHELL_VERSION` is unset or `dev`. Explicit release tags and prereleases use
+the native Debian or RPM package. It then starts the local gateway server so you
+can begin creating sandboxes.
+
+The Homebrew, Debian, and RPM packages also install the `openshell-prover` CLI,
+which runs the [policy prover](/reference/policy-prover). The snap package does
+not include it, so on a snap installation, download the `openshell-prover`
+archive for your platform from the [OpenShell
+releases](https://github.com/NVIDIA/OpenShell/releases).
 
 Snap installs use `latest/stable` by default and `latest/edge` when
 `OPENSHELL_VERSION=dev`. Set `OPENSHELL_VERSION` to a release tag to install

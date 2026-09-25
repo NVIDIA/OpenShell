@@ -131,20 +131,24 @@ A complete narrow REST-inspected rule looks like this:
 
 Auto-approval is opt-in via the `proposal_approval_mode` setting,
 managed through the standard settings model. Reviewers set it at the
-gateway scope (fleet-wide) with `openshell settings set --global
-proposal_approval_mode auto` or at the sandbox scope with `openshell
-settings set <name> proposal_approval_mode auto`. The CLI's `openshell
-sandbox create --approval-mode auto` is a shorthand that writes the
-sandbox-scoped setting at create time. Gateway scope wins when both are
-set; the default (no setting) is `"manual"`.
+gateway scope (fleet-wide) or at the sandbox scope:
+
+```shell
+openshell settings set --global --key proposal_approval_mode --value auto
+openshell settings set <name> --key proposal_approval_mode --value auto
+```
+
+The CLI's `openshell sandbox create --approval-mode auto` is a shorthand
+that writes the sandbox-scoped setting at create time. Gateway scope wins
+when both are set; the default (no setting) is `"manual"`.
 
 When auto-approval is enabled and the prover finds nothing new, the
 gateway approves the chunk with actor `system:auto` and the
-`CONFIG:APPROVED` audit event carries `auto=true`, `source=<mode>`,
-`prover_delta=empty`, and `resolved_from=<gateway|sandbox>`. The
-agent's `/wait` returns approved in ~1 second. When the prover does
-find something — or the setting is `"manual"`/unset — the chunk lands
-in `pending` for human review.
+`CONFIG:APPROVED` audit event carries `auto:true`,
+`source:<mechanistic|agent_authored>`, `prover_delta:empty`, and
+`resolved_from:<gateway|sandbox>`. The agent's `/wait` returns approved
+in ~1 second. When the prover does find something — or the setting is
+`"manual"`/unset — the chunk lands in `pending` for human review.
 
 The prover answers four formal questions about each proposed change.
 Each "yes" answer is its own categorical finding — there is no
@@ -217,13 +221,9 @@ The new submission wins by structural overlap.
 - If pushing with `git` fails, that is a separate L4 or protocol-specific
   path from GitHub REST API access. Propose it separately.
 
-## Local logs (read-only)
+## Logs
 
-Two local files complement the API and are useful when debugging policy
-behavior:
-
-- `/var/log/openshell.YYYY-MM-DD.log` — shorthand log of sandbox activity.
-  This is what `/v1/denials` reads from.
-- `/var/log/openshell-ocsf.YYYY-MM-DD.log` — full OCSF JSON events, only
-  written when the `ocsf_json_enabled` setting is on. Not used by
-  `/v1/denials`; useful for SIEM ingestion.
+The OpenShell supervisor runs outside this sandbox and keeps the sandbox
+activity logs, such as `/var/log/openshell.YYYY-MM-DD.log`, in its own
+filesystem. You cannot read those files from inside the sandbox. Use
+`GET /v1/denials` for recent denials.

@@ -18,9 +18,13 @@ grants lack a trusted label resolver and are unavailable with admission enabled.
 See [External Resource Admission](gateway-config#external-resource-admission)
 for configuration, migration, and the explicit unsafe opt-out.
 
-Most compute drivers run the OpenShell supervisor inside the sandbox workload.
-The supervisor launches the agent process, applies policy, routes egress through
-the proxy, injects configured credentials, and maintains the gateway session.
+The Docker, Podman, MicroVM, and Kubernetes drivers run the OpenShell supervisor
+outside the sandbox workload, in a separate container, Pod, or host process.
+Inside the workload, `openshell-sandbox` applies filesystem and system call
+restrictions and launches the agent process. The supervisor evaluates network
+policy, routes egress through its proxy, injects configured credentials, and
+maintains the gateway session.
+
 A driver may instead set `driver_reports_runtime_readiness`. In that mode,
 driver-reported readiness does not require a supervisor session. The canonical
 create-time policy is part of `DriverSandboxSpec`; a driver that enforces policy

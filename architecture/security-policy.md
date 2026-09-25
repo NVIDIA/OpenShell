@@ -316,9 +316,10 @@ through the proposal loop instead of treating the denial as terminal.
    gateway reuses the persisted prover result. If it changed, the gateway
    persists the refreshed candidate and requires a fresh review instead of
    applying it. Decode, prover, merge, provider-composition, or credential
-   failures leave the chunk pending with an application error. The audit event uses `CONFIG:APPROVED` and carries
-   `auto=true`, `source=<mode>`, `prover_delta=empty`, and
-   `resolved_from=<gateway|sandbox>` as unmapped fields, with message text
+   failures leave the chunk pending with an application error. The audit
+   event uses `CONFIG:APPROVED` and carries `auto:true`,
+   `source:<mechanistic|agent_authored>`, `prover_delta:empty`, and
+   `resolved_from:<gateway|sandbox>` as unmapped fields, with message text
    `"auto-approved: no new prover findings"` — never `safe`. The opt-in gate
    preserves OpenShell's default-deny posture: with no setting at either
    scope, every proposal lands in `pending` for human review, even

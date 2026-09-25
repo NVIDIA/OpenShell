@@ -310,16 +310,20 @@ without keep-alive), the relay flushes and shuts down downstream writes before
 ending the exchange, including TLS close notification. Response middleware
 preserves this lifetime rule; persistent responses remain eligible for reuse.
 
-An explicit `protocol: tcp` endpoint with a valid DNS hostname opts into native
-DNS and transparent TCP when the selected runtime advertises that substrate.
-Hostless `allowed_ips` and literal-IP selectors remain available only to the
-legacy explicit-proxy path when `protocol` is omitted. The shared supervisor
-answers only eligible DNS names, returns an epoch-scoped synthetic address, and
-publishes the expiring name, endpoint, ports, policy generation, and validated
-real addresses as one correlation. A connection to that synthetic address is
-captured before the bypass fence, mapped back to its workload process, authorized
-through the same egress pipeline, and dialed only through the pinned addresses.
-Omitted protocol endpoints retain explicit-proxy behavior.
+The supervisor answers a DNS name only when a policy endpoint with concrete
+ports has a host that matches it, whatever the endpoint's protocol. It returns
+an epoch-scoped synthetic address and publishes the expiring name, endpoint,
+ports, policy generation, and validated real addresses as one correlation. For
+each external TCP `connect` that the sandbox broker captures, the supervisor
+maps a synthetic destination back to its name, or uses a literal destination IP
+as the host, authorizes the open through the same egress pipeline, and replays
+it as a virtual CONNECT. Relay selection then matches an explicit CONNECT:
+unless the endpoint sets `tls: skip`, the supervisor terminates detected TLS,
+sends HTTP through the HTTP relays, and uses the raw byte relay for other
+payloads, or fails closed when the endpoint requires request inspection.
+Upstream dials use only the pinned validated addresses. A `protocol: tcp`
+endpoint therefore adds no request rules but does not bypass TLS handling. It
+must use a DNS hostname rather than an IP literal or hostless `allowed_ips`.
 
 Provider credential placeholders are resolved through the live provider state
 for each HTTP request, after destination and L7 policy admission. A static
