@@ -48,7 +48,7 @@ Port mappings created at cluster time (cannot be changed without recreating):
 | Host port | Target | Used by |
 |-----------|--------|---------|
 | `8080` | Port `80` via k3d load balancer | Gateway API controller LoadBalancer service (for example, Envoy Gateway or agentgateway) |
-| Optional | Port `443` via k3d load balancer | Direct agentgateway TLS E2E diagnostics |
+| Optional | Port `443` via k3d load balancer | Gateway API controller HTTPS listener diagnostics |
 
 Override with env vars before running `helm:k3s:create`:
 - `HELM_K3S_LB_HOST_PORT` (default: `8080`)
