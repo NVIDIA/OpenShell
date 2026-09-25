@@ -34,17 +34,18 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/nvi
 ```
 
 In `nvidia-native.yaml`, change `id` to `nvidia-native`, give the profile a
-distinct `display_name`, and set `binaries` to the paths that may call the API.
-Keep the credential and endpoint definitions you intend to grant. For a Python
-workload, the edited fields can look like:
+distinct `display_name`, and set `binaries` to the executables that may call the
+API, as described in [Binary
+Matching](/how-it-works/policies/network-rules#binary-matching). Keep the
+credential and endpoint definitions you intend to grant. For a Python workload,
+the edited fields can look like:
 
 ```yaml
 id: nvidia-native
 display_name: NVIDIA Native API
 binaries:
-  - /usr/bin/python3
-  - /usr/bin/python3.13
-  - /usr/local/bin/python
+  - /usr/bin/python3.*
+  - /usr/local/bin/python3.*
   - /sandbox/.venv/**
 ```
 
@@ -316,5 +317,5 @@ headers, model selection, request shape, streaming, and timeout behavior.
 
 - [Profiles](/how-it-works/providers/profiles)
 - [Providers](/how-it-works/providers/overview)
-- [Customize Sandbox Policies](/how-it-works/policies/overview)
+- [Sandbox Policies](/how-it-works/policies/overview)
 - [Google](/how-it-works/providers/google#vertex-ai)

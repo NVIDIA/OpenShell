@@ -108,34 +108,41 @@ not grant the missing network authority.
 In terminal 2, inspect recent sandbox logs:
 
 ```shell
-openshell logs github-demo --level warn --since 5m
+openshell logs github-demo --since 5m --source sandbox
 ```
 
 You should see a denial for a request resembling this one:
 
 ```text
-action=deny dst_host=github.com dst_port=443 binary=/usr/bin/git l7_action=POST l7_target=/<org>/<repo>.git/git-receive-pack
+[1775014140.412] [sandbox] [OCSF ] [ocsf] HTTP:POST [MED] DENIED POST http://github.com:443/<org>/<repo>.git/git-receive-pack [policy:_provider_my_github engine:l7] [reason:L7_REQUEST deny POST github.com:443/<org>/<repo>.git/git-receive-pack reason=POST /<org>/<repo>.git/git-receive-pack not permitted by policy]
 ```
+
+`_provider_my_github` is the rule that OpenShell composes from the attached
+`my-github` provider. Policy events are INFO-level log records, so do not filter
+them out with `--level warn`.
 
 You can also run `openshell term` to inspect policy decisions in the terminal
 dashboard.
 
 ## Create a Repository-Scoped Policy
 
-Create `github-push.yaml`. Replace `<org>` and `<repo>`, and adjust `binaries`
-to match your image:
+`policy set` replaces the complete base policy, so start from the sandbox's
+current one. In terminal 2, print it:
+
+```shell
+openshell policy get github-demo --base
+```
+
+The command prints revision details followed by the policy. Save only the policy
+YAML as `github-push.yaml`. Keep its filesystem, Landlock, and process settings
+unchanged, because OpenShell rejects removed filesystem paths and changed
+Landlock or process settings on a running sandbox.
+
+Add these entries under `network_policies`, creating the section if it is
+missing. Replace `<org>` and `<repo>`, and adjust `binaries` to match your
+image:
 
 ```yaml
-version: 1
-
-filesystem_policy:
-  include_workdir: true
-  read_only: [/usr, /lib, /proc, /dev/urandom, /etc, /var/log]
-  read_write: [/tmp, /dev/null]
-
-landlock:
-  compatibility: best_effort
-
 network_policies:
   github_repository_push:
     name: github-repository-push
@@ -179,10 +186,6 @@ repository. The second lets `gh` use REST operations scoped to the same
 repository. The attached GitHub provider continues to supply credential
 placement and its broader read-only rules.
 
-The filesystem and Landlock sections preserve the fallback policy's static
-settings because `policy set` replaces the complete user-authored base policy.
-Process identity remains omitted so the compute driver can select it.
-
 ## Apply the Policy
 
 Apply the policy and wait for the new revision to load:
@@ -220,5 +223,5 @@ openshell sandbox delete github-demo
 ## Next Steps
 
 - Review [Profiles](/how-it-works/providers/profiles) for endpoint-scoped credential placement.
-- Review [Policies](/how-it-works/policies/overview) for incremental policy updates and policy history.
+- Review [Manage Sandbox Policies](/how-it-works/policies/manage-policies) for incremental policy updates and policy history.
 - Review the [Policy Schema](/how-it-works/policies/schema) for REST, GraphQL, and other protocol rules.

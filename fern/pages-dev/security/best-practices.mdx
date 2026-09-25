@@ -97,10 +97,10 @@ The `protocol` field on an endpoint controls whether the proxy inspects individu
 
 | Aspect | Detail |
 |---|---|
-| Default | Endpoints without a `protocol` field use L4-only enforcement: the proxy checks host, port, and binary, then relays the TCP stream without inspecting payloads. Provider-credentialed endpoints reject this mode unless an operator explicitly opts in. |
+| Default | Endpoints without a `protocol` field apply no request rules. The proxy checks host, port, and binary, still terminates TLS and parses HTTP requests, and requires the request authority to match the destination, but it allows any HTTP method and path. Non-HTTP traffic is relayed without inspection. `protocol: tcp` endpoints also apply no request rules, and `tls: skip` endpoints relay traffic without terminating TLS. Provider-credentialed endpoints reject uninspected modes unless an operator explicitly opts in. |
 | What you can change | Add `protocol: rest` to enable per-request HTTP method/path inspection, `protocol: websocket` to inspect RFC 6455 upgrade handshakes and client text messages, or `protocol: graphql` to inspect GraphQL-over-HTTP operation type, operation name, and root fields. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket messages. Pair inspected protocols with `rules` or access presets (`full`, `read-only`, `read-write`). REST endpoints that need credential placeholders in supported text request bodies can set `request_body_credential_rewrite: true`. Set `allow_uninspected_credentials: true` only as an explicit exception for credentialed traffic that cannot use an inspected path. |
-| Risk if relaxed | L4-only endpoints allow the agent to send any data through the tunnel after the initial connection is permitted. The proxy cannot see HTTP methods, paths, or GraphQL operations. Adding `access: full` with L7 inspection enables observability but permits all inspected actions. |
-| Recommendation | Use `protocol: rest` with specific `rules` for APIs where intent is encoded in method and path. Add `request_body_credential_rewrite: true` only for REST APIs that require OpenShell-managed credentials in UTF-8 JSON, form, or text request bodies. Use `protocol: graphql` for GraphQL-over-HTTP APIs where destructive operations are body-encoded. Use `protocol: websocket` for RFC 6455 endpoints, with explicit `GET` and `WEBSOCKET_TEXT` rules for raw text protocols or explicit GraphQL operation rules for GraphQL-over-WebSocket. Prefer `access: read-only` or explicit allowlists, and deny hash-only persisted queries unless you maintain a trusted registry. Omit `protocol` for non-HTTP protocols. For WebSocket endpoints that must carry placeholder credentials in client text frames, add `websocket_credential_rewrite: true`. |
+| Risk if relaxed | Endpoints without request rules allow the agent to send any request or data to the destination after the connection is permitted. The proxy does not restrict HTTP methods, paths, or GraphQL operations. Adding `access: full` with L7 inspection enables observability but permits all inspected actions. |
+| Recommendation | Use `protocol: rest` with specific `rules` for APIs where intent is encoded in method and path. Add `request_body_credential_rewrite: true` only for REST APIs that require OpenShell-managed credentials in UTF-8 JSON, form, or text request bodies. Use `protocol: graphql` for GraphQL-over-HTTP APIs where destructive operations are body-encoded. Use `protocol: websocket` for RFC 6455 endpoints, with explicit `GET` and `WEBSOCKET_TEXT` rules for raw text protocols or explicit GraphQL operation rules for GraphQL-over-WebSocket. Prefer `access: read-only` or explicit allowlists, and deny hash-only persisted queries unless you maintain a trusted registry. Use `protocol: tcp` for native non-HTTP clients such as databases, and refer to [Allow Native TCP](/how-it-works/policies/network-rules#allow-native-tcp) for when to add `tls: skip`. For WebSocket endpoints that must carry placeholder credentials in client text frames, add `websocket_credential_rewrite: true`. |
 
 ### Enforcement Mode (`audit` vs `enforce`)
 
@@ -132,7 +132,7 @@ After OPA policy allows a connection, the proxy resolves DNS and rejects undecla
 
 | Aspect | Detail |
 |---|---|
-| Default | The proxy blocks private IPs for undeclared, wildcard, hostless, and policy-advisor-proposed endpoints. Exact hostnames declared in user policy may resolve to private RFC 1918 addresses. Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), and unspecified (`0.0.0.0`) addresses are always blocked and cannot be overridden with `allowed_ips`. |
+| Default | The proxy blocks private IPs for undeclared, wildcard, and hostless endpoints, and for endpoints added through the policy advisor. Exact hostnames declared in user policy may resolve to private RFC 1918 addresses. Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), and unspecified (`0.0.0.0`) addresses are always blocked and cannot be overridden with `allowed_ips`. |
 | What you can change | Declare a known internal service as an exact `host` endpoint, or add `allowed_ips` (CIDR notation) to an endpoint to permit specific private IP ranges for wildcard or hostless policies. On Linux, the proxy consults the sandbox's `/etc/hosts` before DNS, so Kubernetes `hostAliases` can make LAN-only hostnames resolvable. Policies with `allowed_ips` entries that overlap loopback, link-local, or unspecified addresses fail to load with a clear validation error. |
 | Risk if relaxed | Without SSRF protection, a misconfigured policy could allow the agent to reach cloud metadata services (`169.254.169.254`), internal databases, or other infrastructure endpoints through DNS rebinding. |
 | Recommendation | Prefer exact hostname endpoints for stable internal services. Use `allowed_ips` when you need hostless or wildcard authorization, and scope the CIDR as narrowly as possible (for example, `10.0.5.20/32` for a single host). Loopback, link-local, and unspecified addresses are always blocked regardless of `allowed_ips`. `hostAliases` change resolution, not authorization: `host: searxng.local` with `/etc/hosts` mapping to `192.168.1.105` is trusted only when that exact hostname is declared by user policy. The policy advisor does not propose rules for always-blocked destinations and still requires a separate `allowed_ips` edit for private-IP endpoints. |
@@ -181,7 +181,7 @@ The policy separates filesystem paths into read-only and read-write groups.
 
 | Aspect | Detail |
 |---|---|
-| Default | System paths (`/usr`, `/lib`, `/etc`, `/var/log`) are read-only. The resolved working directory and `/tmp` are read-write. `/app` is conditionally included if it exists. |
+| Default | System paths (`/usr`, `/lib`, `/etc`, `/var/log`) are read-only. The resolved working directory and `/tmp` are read-write. List any other path your workload needs, such as `/app`. |
 | What you can change | Add or remove paths in `filesystem_policy.read_only` and `filesystem_policy.read_write`. |
 | Risk if relaxed | Making system paths writable lets the agent replace binaries, modify TLS trust stores, or change DNS resolution. Validation rejects broad read-write paths (like `/`). |
 | Recommendation | Keep system paths read-only. If the agent needs additional writable space, add a specific subdirectory. |
@@ -286,7 +286,7 @@ The following patterns weaken security without providing meaningful benefit.
 
 | Mistake | Why it matters | What to do instead |
 |---------|---------------|-------------------|
-| Omitting an inspected protocol on REST or WebSocket API endpoints | Without `protocol: rest` or `protocol: websocket`, the proxy uses L4-only enforcement. It allows the TCP stream through after checking host, port, and binary, but cannot inspect individual HTTP requests or WebSocket text messages. | Add `protocol: rest` or `protocol: websocket` with specific `rules` to enable method and path control. |
+| Omitting an inspected protocol on REST or WebSocket API endpoints | Without `protocol: rest` or `protocol: websocket`, the proxy applies no request rules. It allows any HTTP method and path after checking host, port, and binary, and does not inspect WebSocket text messages. | Add `protocol: rest` or `protocol: websocket` with specific `rules` to enable method and path control. |
 | Using `access: full` when finer rules would suffice | `access: full` with `protocol: rest` or `protocol: websocket` enables inspection but allows all methods and paths for that protocol. | Use `access: read-only` or explicit `rules` to restrict what the agent can do at the L7 level. |
 | Adding endpoints permanently when operator approval would suffice | Adding endpoints to the policy YAML makes them permanently reachable across all instances. | Use operator approval. Approved endpoints persist within the sandbox instance but reset on re-creation. |
 | Using broad binary globs | A glob like `/**` allows any binary to reach the endpoint, defeating binary-scoped enforcement. | Scope globs to specific directories (for example, `/sandbox/.vscode-server/**`). |
@@ -296,7 +296,8 @@ The following patterns weaken security without providing meaningful benefit.
 
 ## Related Topics
 
-- [Policies](/how-it-works/policies/overview) for applying and iterating on sandbox policies.
+- [Sandbox Policies](/how-it-works/policies/overview) for how policies are evaluated and applied.
+- [Manage Sandbox Policies](/how-it-works/policies/manage-policies) for applying and iterating on sandbox policies.
 - [Policy Schema](/how-it-works/policies/schema) for the full field-by-field YAML reference.
 - [Default Policy](/how-it-works/policies/default-policy) for the built-in default policy breakdown.
 - [Gateway Auth](/how-it-works/gateways/authentication) for gateway authentication details.

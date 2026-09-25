@@ -1,43 +1,63 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Standalone Policy Prover"
-sidebar-title: "Prover"
-description: "Install and use the standalone OpenShell policy prover to check a local candidate policy against a managed boundary."
-keywords: "Generative AI, Cybersecurity, Policy, Prover, Boundary, Containment, CI"
+title: "Policy Prover"
+sidebar-title: "Policy Prover"
+description: "Understand how OpenShell uses the policy prover, and check that a policy grants no more access than a boundary policy you define."
+keywords: "Generative AI, Cybersecurity, Policy, Prover, Boundary, Subagent"
 position: 4
 ---
 
-`openshell-prover` checks whether the authority in a local candidate policy is
-contained within a local boundary policy. The command reads files from the host
-and does not connect to an OpenShell gateway.
+The policy prover is OpenShell's policy verification engine. It uses an SMT
+solver to check whether policies satisfy specified properties, such as staying
+within an allowed access boundary. Its guarantees apply to the policy features
+and behavior represented by its model. OpenShell is actively extending the model
+to cover more policy features.
 
-The candidate must be the fully composed effective policy after the proposed
-change, including any provider-contributed authority. The boundary is an
-operator-owned ceiling. It does not grant authority by itself.
+OpenShell uses the prover for two types of checks:
 
-## Install the Prover
+- A boundary check verifies that a policy allows no access beyond a boundary
+  policy, which defines the most access allowed in an environment.
+- A proposal risk check verifies that a proposed network rule adds no risky
+  access compared with the sandbox's current policy, such as access to cloud
+  metadata addresses or new destinations for provider credentials.
 
-The standard OpenShell installer includes `openshell-prover`:
+You run a boundary check with the `openshell-prover` CLI, which is primarily
+intended for agents. For example, a parent agent can check that a policy it
+writes for a subagent stays within the parent's own maximum allowed policy. A
+proposal risk check runs automatically each time an agent proposes a network
+rule through the [policy advisor](/how-it-works/policies/advisor).
 
-```shell
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
-openshell-prover --version
-```
+The two checks answer different questions, so passing one does not imply
+passing the other. A proposed rule that passes the proposal risk check can still
+exceed your boundary, and a policy that passes the boundary check can still
+contain access that the proposal risk check would flag.
 
-The prover remains independent of the gateway at runtime. If you only need the
-standalone binary, use the artifacts listed in the
-[Support Matrix](/about/support-matrix#standalone-policy-prover). These
-artifacts and `openshell-prover-checksums-sha256.txt` are attached to
-[OpenShell releases](https://github.com/NVIDIA/OpenShell/releases).
+This page covers the boundary check. To learn about the proposal risk check,
+refer to [Policy Advisor](/how-it-works/policies/advisor).
 
-The release archive includes the solver linkage required by the executable.
-It does not require the main `openshell` command, a gateway configuration, or
-a separate Z3 installation.
+## Run a Boundary Check
 
-## Check a Policy Boundary
+A boundary check compares the policy you are testing, called the candidate, with
+a boundary policy that you write. The boundary is usually the most access that
+an environment allows, such as an enterprise's maximum policy for its agents. If
+the candidate allows something the boundary does not, the prover shows an
+example.
 
-Create `boundary.yaml` with this boundary policy:
+The check covers filesystem access, process identity, Landlock settings, network
+connections, and REST requests. If a policy uses anything else, such as GraphQL
+or MCP rules, the prover reports that it cannot check the policy instead of
+ignoring those rules. [What the Boundary Check
+Covers](#what-the-boundary-check-covers) describes each part and its limits.
+
+The Homebrew, Debian, and RPM packages install the `openshell-prover` CLI. The
+snap package does not include it, so on a snap installation, download the
+`openshell-prover` archive for your platform from the [OpenShell
+releases](https://github.com/NVIDIA/OpenShell/releases). The CLI reads policy
+files on your machine, does not need a gateway, and does not apply or approve
+policies.
+
+Create `boundary.yaml`, a boundary that allows reading `/usr` and `/etc`:
 
 ```yaml
 version: 1
@@ -47,7 +67,7 @@ filesystem_policy:
     - /etc
 ```
 
-Create `candidate.yaml` with this contained candidate:
+Create `candidate.yaml`, a candidate that allows reading only `/usr`:
 
 ```yaml
 version: 1
@@ -56,16 +76,22 @@ filesystem_policy:
     - /usr
 ```
 
-Run the check:
+Check the candidate against the boundary:
 
 ```shell
 openshell-prover check candidate.yaml --boundary boundary.yaml
 ```
 
-A contained candidate prints `result: within_boundary` and exits with status `0`.
-To see an exceeding result and its counterexample, replace `candidate.yaml`
-with a policy that grants writes to `/tmp`. The boundary grants no write
-access:
+The candidate allows less than the boundary, so the check passes:
+
+```text
+result: within_boundary
+coverage: domains=filesystem,network_l4,network_rest,process,landlock
+```
+
+The `coverage` line lists the parts of a policy that the prover can check. Now
+change the candidate so that it also allows writing to `/tmp`, which the
+boundary does not allow:
 
 ```yaml
 version: 1
@@ -76,196 +102,130 @@ filesystem_policy:
     - /tmp
 ```
 
-```shell
-openshell-prover check candidate.yaml --boundary boundary.yaml
+Run the same command again. The check fails, and the `counterexample` line
+shows access that the candidate allows but the boundary does not:
+
+```text
+result: exceeds_boundary
+coverage: domains=filesystem,network_l4,network_rest,process,landlock
+counterexample: filesystem write /tmp
 ```
 
-To check the current effective policy of an existing sandbox, export it without
-display metadata:
+### Check a Sandbox's Policy
+
+To check the policy that a sandbox enforces, save its effective policy and use
+it as the candidate:
 
 ```shell
 openshell sandbox get my-sandbox --policy-only > candidate.yaml
 openshell-prover check candidate.yaml --boundary boundary.yaml
 ```
 
-This export includes provider-contributed rules. For a proposed change that is
-not active, supply the complete post-change effective policy. The standalone
-prover does not compose a base policy with provider rules.
+The effective policy includes rules from attached providers, so the check
+includes network access that providers add. The prover does not add provider
+rules itself.
+To check a change before you apply it, give the prover the complete effective
+policy as it would be after the change.
 
-Use JSON when a script consumes the result:
+## Read the Result
 
-```shell
-openshell-prover check candidate.yaml \
-  --boundary boundary.yaml \
-  --output json
-```
+The prover reports one of these results:
 
-The JSON object includes the result, exit code, input paths, schema version,
-prover version, and modeled domains. `schema_version` versions the JSON contract,
-`prover_version` identifies the implementation that produced the result, and
-`coverage.domains` is the machine-readable declaration of modeled policy
-domains. An exceeding result also includes a typed counterexample. Automation
-should use `result` and `reason_code` instead of parsing the human-readable
-explanation.
-
-| Field | When populated |
-|---|---|
-| `counterexample` | An object for `exceeds_boundary`; otherwise `null`. |
-| `reason_code` | A stable identifier for an emitted `error`, `unsupported`, or `inconclusive` result; otherwise `null`. |
-| `reason` | A human-readable explanation paired with `reason_code`; otherwise `null`. |
-
-The `counterexample.domain` field selects one of these objects:
-
-| Domain | Fields |
-|---|---|
-| `filesystem` | `access` (`read` or `write`) and `path`. |
-| `process` | `field` (`run_as_user` or `run_as_group`), `boundary`, and `candidate`. |
-| `landlock` | `boundary` and `candidate` compatibility modes. |
-| `network` | `binary`, `ancestor_binary`, `binary_identity_required`, `host`, `destination_ip`, `trusted_gateway`, `port`, `protocol`, `method`, and `path`. |
-
-Network `binary` and `ancestor_binary` values are `null` when binary identity
-enforcement is disabled. `method` and `path` are `null` for L4 witnesses.
-`trusted_gateway: true` means the witness uses a recognized host-gateway alias
-with a runtime-provided trusted gateway binding; `false` uses ordinary
-destination validation.
-
-The stable reason codes are `invalid_input`, `unsupported_policy_shape`,
-`unresolved_workdir`, `unresolved_binary_path`,
-`unresolved_filesystem_path`, `solver_timeout`, `solver_unknown`,
-`resource_limit`, `invalid_witness`, and `cancelled`.
-
-The solver has a finite 10-second default budget. Set a different positive
-budget with an integer followed by `ms`, `s`, or `m`:
-
-```shell
-openshell-prover check candidate.yaml \
-  --boundary boundary.yaml \
-  --timeout 30s \
-  --output json
-```
-
-## Exit Codes
-
-| Exit | Result | Meaning |
+| Result | Exit code | Meaning |
 |---|---|---|
-| `0` | `within_boundary` | Containment was established for the reported modeled domains. |
-| `1` | `exceeds_boundary` | The candidate exceeds the boundary; inspect the counterexample. |
-| `2` | `error` | Arguments, input files, policy syntax, or command execution prevented a valid check. |
-| `3` | `unsupported` or `inconclusive` | The model cannot soundly cover the policy shape, or the solver did not reach a determination. |
-| `130` | `inconclusive` when graceful handling completes | The user interrupted the command with Ctrl-C on Unix; a second or very early interruption may prevent output. |
+| `within_boundary` | `0` | The candidate allows nothing beyond the boundary in the parts of the policy that the prover checks. |
+| `exceeds_boundary` | `1` | The candidate allows access that the boundary does not. The counterexample shows one example. |
+| `error` | `2` | The prover could not run the check, for example because a file is missing or a policy is invalid. |
+| `unsupported` | `3` | A policy uses something the prover cannot check. The reason explains what. |
+| `inconclusive` | `3` | The prover could not finish, for example because it ran out of time or the policies are too large. |
 
-Only exit `0` means the verification succeeded. Treat unsupported and
-inconclusive results as failures in CI.
+Only `within_boundary` means that the check passed. Treat every other result as
+a failure. For example, a candidate with a GraphQL rule returns:
 
-## Interpretation and Limits
+```text
+result: unsupported
+coverage: domains=filesystem,network_l4,network_rest,process,landlock
+reason: candidate policy rule 'g' uses protocol 'graphql'; only L4 TCP and REST are modeled
+```
 
-The containment check covers filesystem paths, process identity settings,
-Landlock compatibility requirements, L4 destination authority, and enforced
-REST method and path authority, including explicit REST denies. The result
-object reports the policy domains modeled by each check. Policies that use
-recognized authority outside that coverage return `unsupported` rather than
-silently ignoring it.
+For agents and scripts, add `--output json`. Read the `result` and
+`reason_code` fields instead of parsing the text output. `reason_code` is a
+stable identifier, such as `unsupported_policy_shape` or `solver_timeout`. Also
+check that `coverage.domains` includes every part of the policy that you rely
+on. Run `openshell-prover check --help` for all options, including `--timeout`,
+which changes the default 10-second time limit.
 
-Both inputs use the same bounded YAML/JSON parser and authored policy schema as
-OpenShell. Unknown fields, duplicate keys, malformed field types, and unsupported
-managed `metadata` or `review` annotations return `error` with
-`reason_code: invalid_input` and exit `2`. Schema-valid controls outside the
-containment model return `unsupported` and exit `3`.
+## What the Boundary Check Covers
 
-The prover applies aggregate limits across the candidate and boundary before
-semantic shape validation: 1,024 network rules, 4,096 endpoints, 4,096 binary
-selectors, 65,536 authored port entries, 4,096 `allowed_ips` entries, 16,384
-REST rules, 4 KiB per modeled pattern, and 1 MiB of modeled pattern text.
-Exceeding any limit returns `inconclusive` with `reason_code: resource_limit`.
-A cancellation already requested at preflight takes precedence over that
-result; otherwise a resource limit takes precedence over unsupported
-policy-shape diagnostics. This ordering keeps validation work bounded for
-checked-in CI inputs.
+A passing result means that the candidate allows nothing beyond the boundary in
+the parts of the policy that the prover checks. It does not mean that the policy
+is as narrow as it could be, that it is safe for a particular task, or that a
+running sandbox enforces it.
 
-### Process and Landlock settings
+The check currently covers five parts of a policy. Within each part, some
+comparisons depend on information that the prover does not have, such as the
+files in the sandbox image. For those comparisons, the prover returns
+`unsupported` instead of guessing. Very large policies, for example with more
+than 1,024 network rules or 4,096 endpoints across both files, return
+`inconclusive` with the `reason_code` `resource_limit`.
 
-Matching supported `run_as_user` and `run_as_group` values do not expand the
-configuration. Changing an explicit non-root identity to `root` or `0` returns
-`exceeds_boundary` with the field and both values. Other identity changes return
-`unsupported`; the command does not resolve accounts from a sandbox image.
-These comparisons assume consistent identity resolution and execution settings.
-They do not prove permission relationships between arbitrary Linux accounts.
+### Filesystem Access
 
-Landlock `hard_requirement` may not become `best_effort`. That change returns
-`exceeds_boundary`. Keeping the same mode or strengthening it to
-`hard_requirement` passes this part of the check. This compares the requested
-requirement, not whether a target kernel successfully installed Landlock
-restrictions.
+The prover compares read and write access path by path, so both policies must
+list the same paths. The candidate can remove a path that the boundary lists or
+change it from read-write to read-only, and a boundary entry for `/` covers
+every path. If the boundary grants no access of a kind, such as no write access
+at all, any candidate path with that access exceeds the boundary.
 
-### Destination IP restrictions
+Comparing different paths returns `unsupported`, even when one path is inside
+the other. For example, a candidate that allows writing to `/tmp/cache` under a
+boundary that allows writing to `/tmp` returns `unsupported`, because a symlink
+in the sandbox image could make `/tmp/cache` point outside `/tmp`. A policy
+whose result depends on the sandbox's working directory also returns
+`unsupported`.
 
-The network action includes an IPv4 or IPv6 destination address. CIDR entries
-in `allowed_ips` are modeled together with host, port, executable, and REST
-restrictions; network counterexamples include `destination_ip`. An empty IP
-list follows the runtime's destination rules and is not a universal allowlist.
-The check does not resolve DNS on the host running the CLI.
+### Process Identity
 
-Policies whose potentially overlapping endpoints select different destination
-restrictions remain unsupported because the runtime uses the selected
-endpoint's address filter. The prover conservatively treats wildcard host
-selectors on a shared port as potentially overlapping, including when their
-literal suffixes differ. CIDR unions within a supported endpoint are checked by
-the solver. Unsupported IP-literal wildcard selectors and ranges rejected by
-the runtime also cannot produce a successful proof.
+The prover compares `run_as_user` and `run_as_group`. Matching values pass, and
+a change from a non-root identity to root exceeds the boundary. Any other
+change, such as from UID `1500` to `1600`, returns `unsupported`, because the
+prover cannot look up accounts in the sandbox image.
 
-Consumers must inspect `coverage.domains` and require every domain relevant to
-their authorization decision. A successful result applies only to those
-reported domains and the documented assumptions.
+### Landlock
 
-### Remaining limits
+The prover compares the `compatibility` setting. Keeping the setting or changing
+it to `hard_requirement` passes, and changing `hard_requirement` to
+`best_effort` exceeds the boundary. The prover compares the settings, not what
+a kernel enforces.
 
-Network binary selectors, endpoint host and path selectors, and REST allow and
-deny method and path selectors must use ASCII literals in both the candidate and
-boundary. A non-ASCII literal in one of these fields returns `unsupported` with
-`reason_code: unsupported_policy_shape`, including when it appears only in a
-deny. Embedded NUL bytes in these fields are also unsupported. This is a
-prover-model limitation, not a general policy validation rule: filesystem paths
-and unrelated policy text retain their existing Unicode behavior. ASCII
-wildcard selectors still cover non-ASCII runtime values matched by the policy
-engine.
+### Network Connections
 
-Containment means `Allowed(candidate)` is a subset of `Allowed(boundary)` under
-the reported model. It does not establish least privilege, automatic approval
-eligibility, semantic safety, or equivalence to a running sandbox's kernel
-state. In particular:
+The prover compares which binaries can reach which hosts, ports, and destination
+addresses, including `allowed_ips` ranges. It checks each policy both with and
+without binary identity enforcement, because a sandbox runtime can turn
+enforcement off. It does not resolve hostnames.
 
-- The command does not fetch the current sandbox policy or compose provider
-  rules. The caller must supply the effective candidate.
-- The command does not apply, approve, or persist a policy.
-- Environment-dependent authority, such as an unresolved image workdir,
-  returns `unsupported` when the result depends on that missing context.
-- Binary comparisons that can change when an image resolves an exact selector
-  through a symlink return `unsupported`. This covers exact candidate grants
-  under boundary globs and exact boundary denies replaced by candidate globs.
-  Use matching exact canonical paths when possible.
-- Policies with overlapping L4 and enforced REST endpoints return
-  `unsupported` because inspection selection depends on the complete set of
-  matching runtime endpoint configurations.
-- Network containment checks both supported runtime configurations: binary
-  identity enforcement enabled and disabled. When enabled, grants and denies
-  match the executable or an ancestor identity. Network counterexamples report
-  the configuration and identities that expose the additional authority.
-- REST containment witnesses use canonical request methods and paths.
-- If a solver string cannot be decoded and validated faithfully, the command
-  returns `inconclusive` with `reason_code: invalid_witness` instead of emitting
-  a counterexample.
-- Both files are interpreted in the same sandbox filesystem namespace and
-  mount model, with stable path resolution when enforcement rules are created.
-  The CLI does not resolve sandbox paths against the host.
-- Filesystem containment supports removing grants and reducing write grants to
-  read-only grants at matching paths. A boundary grant for `/` also covers other
-  paths for the same access. Comparisons between different paths otherwise
-  return `unsupported` with `reason_code: unresolved_filesystem_path`: a lexical
-  child can resolve outside its parent through a symlink, and unrelated paths
-  can resolve to the same object. This includes narrowing `/tmp` to `/tmp/cache`.
-  If the boundary grants no access of the requested kind, adding that access
-  returns `exceeds_boundary`.
+The prover returns `unsupported` in these cases:
 
-Use the [Policy Schema Reference](/how-it-works/policies/schema) for the full policy
-language. A successful prover result covers only the policy domains reported in
-its evidence.
+- The candidate lists an exact binary path that the boundary covers only with a
+  glob, such as `/usr/bin/curl` under `/usr/bin/*`. A symlink in the sandbox
+  image could make the exact path refer to an executable outside the glob. Use
+  the same exact paths in both policies when you can.
+- Endpoints on the same port set different `allowed_ips`, and their hosts are
+  the same or one of them is a wildcard. The prover treats a wildcard host as
+  overlapping every host on its port.
+- An exact host and a wildcard host share a port and neither sets
+  `allowed_ips`, such as `github.com` and `*.githubusercontent.com` on port 443.
+- An endpoint omits `host`, sets both `port` and `ports`, or uses an IPv6
+  address as its host.
+- A host, path, method, or binary contains non-ASCII characters.
+
+### REST Requests
+
+The prover compares method and path allow and deny rules on endpoints with
+`protocol: rest`. These endpoints must use `enforcement: enforce`. An endpoint
+in audit mode returns `unsupported`, because it does not block requests. A host
+and port that has both a REST endpoint and an endpoint without request rules
+also returns `unsupported`, as do REST rules that match query parameters or use
+`?` or bracket expressions in paths. Other request protocols, such as WebSocket,
+GraphQL, MCP, and JSON-RPC, return `unsupported`.
