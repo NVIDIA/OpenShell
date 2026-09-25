@@ -6302,6 +6302,7 @@ mod tests {
                 "google-vertex-ai",
                 "nvidia",
                 "openai",
+                "openrouter",
                 "pypi"
             ]
         );

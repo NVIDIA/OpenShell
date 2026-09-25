@@ -18,24 +18,24 @@ A [provider profile](/how-it-works/providers/profiles) defines the credentials, 
 endpoints, and executable paths an agent may use.
 
 This example runs OpenCode
-against Anthropic. Review the
-[example profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/anthropic.yaml),
-which allows `/usr/local/bin/opencode` to reach `api.anthropic.com`, then import
+against OpenRouter. Review the
+[example profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/openrouter.yaml),
+which allows `/usr/local/bin/opencode` to reach `openrouter.ai`, then import
 it and [create a provider](/how-it-works/providers/overview#create-a-provider)
 that stores its credentials.
 
 ```shell
 openshell profile import \
-  --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/anthropic.yaml
+  --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/openrouter.yaml
 
 openshell provider create \
-  --name anthropic \
-  --type anthropic \
+  --name openrouter \
+  --type openrouter \
   --from-existing
 ```
 
-Set `ANTHROPIC_API_KEY` before creating the provider. OpenShell stores its
-value in the credential store and sends it only to `api.anthropic.com`.
+Set `OPENROUTER_API_KEY` before creating the provider. OpenShell stores its
+value in the credential store and sends it only to `openrouter.ai`.
 
 **2. Choose the sandbox image.**
 
@@ -57,9 +57,12 @@ provider, and pass the agent command after `--`:
 openshell sandbox create \
   --name my-agent \
   --from ghcr.io/anomalyco/opencode:latest \
-  --provider anthropic \
-  -- opencode
+  --provider openrouter \
+  -- opencode -m openrouter/anthropic/claude-sonnet-4.5
 ```
+
+OpenCode detects the OpenRouter credential and starts with the model passed to
+`-m`. Choose any model from `opencode models openrouter`.
 
 For more control over what the agent can access, refer to
 [Policies](/how-it-works/policies/overview).
