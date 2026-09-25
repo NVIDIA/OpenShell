@@ -107,18 +107,14 @@ not grant the missing network authority.
 In terminal 2, inspect recent sandbox logs:
 
 ```shell
-openshell logs github-demo --since 5m --source sandbox
+openshell logs github-demo --level warn --since 5m
 ```
 
 You should see a denial for a request resembling this one:
 
 ```text
-[1775014140.412] [sandbox] [OCSF ] [ocsf] HTTP:POST [MED] DENIED POST http://github.com:443/<org>/<repo>.git/git-receive-pack [policy:_provider_my_github engine:l7] [reason:L7_REQUEST deny POST github.com:443/<org>/<repo>.git/git-receive-pack reason=POST /<org>/<repo>.git/git-receive-pack not permitted by policy]
+action=deny dst_host=github.com dst_port=443 binary=/usr/bin/git l7_action=POST l7_target=/<org>/<repo>.git/git-receive-pack
 ```
-
-The GitHub provider's rule, `_provider_my_github`, allows connections to
-`github.com` but not push requests. Do not filter this log with `--level warn`,
-which hides policy events.
 
 You can also run `openshell term` to inspect policy decisions in the terminal
 dashboard.
