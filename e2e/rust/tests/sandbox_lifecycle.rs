@@ -152,6 +152,68 @@ async fn sandbox_exec_large_output_is_complete() {
         assert!(bytes.chunks_exact(2).all(|pair| pair == b"A\n"));
     }
 
+    let mut early_exit = openshell_cmd();
+    let mut early_child = early_exit
+        .args([
+            "sandbox",
+            "exec",
+            "--name",
+            &sandbox.name,
+            "--no-tty",
+            "--no-login-shell",
+            "--",
+            "head",
+            "-n1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start early-exit exec");
+    let mut input = b"first\n".to_vec();
+    input.extend(vec![b'x'; 128 * 1024]);
+    let write_result = early_child
+        .stdin
+        .take()
+        .expect("early-exit stdin")
+        .write_all(&input)
+        .await;
+    if let Err(error) = write_result {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+    let early_output =
+        tokio::time::timeout(Duration::from_secs(30), early_child.wait_with_output())
+            .await
+            .expect("early-exit exec timed out")
+            .expect("wait for early-exit exec");
+    assert!(early_output.status.success(), "early-exit exec failed");
+    assert_eq!(early_output.stdout, b"first\n");
+
+    let mut command = openshell_cmd();
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        command
+            .args([
+                "sandbox",
+                "exec",
+                "--name",
+                &sandbox.name,
+                "--no-tty",
+                "--no-login-shell",
+                "--",
+                "sh",
+                "-c",
+                "sleep 5 & echo ok",
+            ])
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("exec with background pipe holder timed out")
+    .expect("run exec with background pipe holder");
+    assert!(output.status.success(), "unexpected output failure");
+    assert_eq!(output.stdout, b"ok\n");
+
     sandbox.cleanup().await;
 }
 

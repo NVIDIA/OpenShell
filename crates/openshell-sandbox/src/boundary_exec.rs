@@ -117,6 +117,7 @@ impl LocalBoundaryExec {
             stdout: Box::new(stdout),
             stderr: Some(Box::new(stderr)),
             terminal: None,
+            output_status: None,
         })
     }
 
@@ -290,6 +291,7 @@ impl LocalBoundaryExec {
                 stdout,
                 stderr,
                 terminal: None,
+                output_status: None,
             }),
             process,
             armed: true,
@@ -386,6 +388,7 @@ impl LocalBoundaryExec {
                 stdout: Box::new(tokio::fs::File::from_std(output)),
                 stderr: None,
                 terminal: Some(terminal),
+                output_status: None,
             }),
             process,
             armed: true,

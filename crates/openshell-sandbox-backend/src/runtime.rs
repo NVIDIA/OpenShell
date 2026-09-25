@@ -35,8 +35,8 @@ use tokio::net::UnixStream;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::boundary_protocol::{
-    AgentSpecWire, DnsQueryResultWire, ExecSpecWire, MAX_CONTROL_FRAME_BYTES, Request,
-    RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT, STREAM_STDERR, STREAM_STDIN,
+    AgentSpecWire, DnsQueryResultWire, ExecSpecWire, ExitStatusWire, MAX_CONTROL_FRAME_BYTES,
+    Request, RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT, STREAM_STDERR, STREAM_STDIN,
     STREAM_STDIN_CLOSED, STREAM_STDOUT, SandboxPolicyWire, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTransport, SignalWire, decode_frame, encode_frame,
     read_stream_frame, validate_resource_claims, write_stream_frame,
@@ -549,6 +549,7 @@ async fn open_process_attachment(
         network_reader,
         stdout_pump,
         stderr_pump,
+        None,
     ));
     let terminal: Option<Arc<dyn BoundaryTerminal>> = if has_terminal {
         let terminal: Arc<dyn BoundaryTerminal> = Arc::new(RemoteTerminal { client, process_id });
@@ -574,22 +575,29 @@ async fn pump_process_responses(
     mut network: tokio::io::ReadHalf<BoundaryDuplexStream>,
     mut stdout: tokio::io::DuplexStream,
     mut stderr: tokio::io::DuplexStream,
+    completion: Option<tokio::sync::oneshot::Sender<BoundaryExitStatus>>,
 ) {
-    loop {
+    let status = loop {
         match read_stream_frame(&mut network).await {
             Ok(Some((STREAM_STDOUT, payload))) => {
                 if stdout.write_all(&payload).await.is_err() {
-                    return;
+                    break BoundaryExitStatus::Exited(74);
                 }
             }
             Ok(Some((STREAM_STDERR, payload))) => {
                 if stderr.write_all(&payload).await.is_err() {
-                    return;
+                    break BoundaryExitStatus::Exited(74);
                 }
             }
-            Ok(Some((STREAM_EXIT, _)) | None) | Err(_) => return,
-            Ok(Some((_channel, _))) => return,
+            Ok(Some((STREAM_EXIT, payload))) => {
+                break serde_json::from_slice::<ExitStatusWire>(&payload)
+                    .map_or(BoundaryExitStatus::Exited(74), Into::into);
+            }
+            Ok(None | Some(_)) | Err(_) => break BoundaryExitStatus::Exited(74),
         }
+    };
+    if let Some(completion) = completion {
+        let _ = completion.send(status);
     }
 }
 
@@ -770,11 +778,13 @@ async fn open_exec_session(
     let (stdin, stdin_pump) = tokio::io::duplex(64 * 1024);
     let (stdout, stdout_pump) = tokio::io::duplex(64 * 1024);
     let (stderr, stderr_pump) = tokio::io::duplex(64 * 1024);
+    let (output_status_tx, output_status_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(pump_exec_input(stdin_pump, network_writer));
     tokio::spawn(pump_process_responses(
         network_reader,
         stdout_pump,
         stderr_pump,
+        Some(output_status_tx),
     ));
 
     let process: Arc<dyn BoundaryProcess> = Arc::new(RemoteExecProcess {
@@ -795,6 +805,7 @@ async fn open_exec_session(
         stdout,
         stderr,
         terminal,
+        output_status: Some(output_status_rx),
     })
 }
 
@@ -3139,7 +3150,7 @@ mod tests {
             tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer(&"a".repeat(32)),
         ));
-        let session = open_exec_session(
+        let mut session = open_exec_session(
             client,
             ExecSpec {
                 program: "/bin/true".to_string(),
@@ -3155,9 +3166,15 @@ mod tests {
         .unwrap();
         // The test peer closes its I/O stream without an exit frame. Neither
         // that loss nor a dropped reader can invalidate the process handle.
+        let output_status = session.output_status.take().unwrap();
         drop(session.stdin);
         drop(session.stdout);
         drop(session.stderr);
+        assert_eq!(
+            output_status.await.unwrap(),
+            BoundaryExitStatus::Exited(74),
+            "missing stream exit must fail even when the process exits cleanly"
+        );
         let attachment = session.process.attach().await.unwrap();
         drop(attachment);
         for _ in 0..2 {
@@ -3167,6 +3184,34 @@ mod tests {
             );
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn exec_output_completion_preserves_failure_status() {
+        let (network, mut peer) = tokio::io::duplex(1024);
+        let network: BoundaryDuplexStream = Box::new(network);
+        let (reader, _writer) = tokio::io::split(network);
+        let (stdout, mut output) = tokio::io::duplex(1024);
+        let (stderr, _error_output) = tokio::io::duplex(1024);
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let pump = tokio::spawn(pump_process_responses(
+            reader,
+            stdout,
+            stderr,
+            Some(completion_tx),
+        ));
+        write_stream_frame(&mut peer, STREAM_STDOUT, b"hello")
+            .await
+            .unwrap();
+        let status = serde_json::to_vec(&ExitStatusWire::Exited(74)).unwrap();
+        write_stream_frame(&mut peer, STREAM_EXIT, &status)
+            .await
+            .unwrap();
+        let mut bytes = [0; 5];
+        output.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"hello");
+        assert_eq!(completion_rx.await.unwrap(), BoundaryExitStatus::Exited(74));
+        pump.await.unwrap();
     }
 
     struct TestTlsIo(BoundaryDuplexStream);

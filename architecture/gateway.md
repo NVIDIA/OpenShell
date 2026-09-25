@@ -1099,6 +1099,9 @@ channel and returns the exec with an error. Once a command reports its exit
 status, the gateway also bounds how long it waits for the trailing channel close.
 An exec relay reports success only after receiving both the SSH exit status and
 channel close; a missing close is a transport error even when the exit status is zero.
+The supervisor derives that SSH exit status from the boundary output stream's
+terminal frame after draining stdout and stderr, so an output delivery failure
+cannot be masked by a successful process wait.
 
 Interactive exec treats normal request-stream EOF as the end of stdin and resize
 input. The gateway sends SSH EOF while keeping the output channel open until

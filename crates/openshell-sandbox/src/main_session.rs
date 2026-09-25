@@ -63,6 +63,8 @@ struct OutputLog {
     lossless: bool,
     space_version: watch::Sender<u64>,
     failed: AtomicBool,
+    post_exit: AtomicBool,
+    subscribers: AtomicUsize,
     terminal_reported: AtomicBool,
     terminal_reported_notify: Notify,
 }
@@ -86,6 +88,8 @@ impl OutputLog {
             lossless,
             space_version,
             failed: AtomicBool::new(false),
+            post_exit: AtomicBool::new(false),
+            subscribers: AtomicUsize::new(0),
             terminal_reported: AtomicBool::new(false),
             terminal_reported_notify: Notify::new(),
         })
@@ -116,9 +120,24 @@ impl OutputLog {
     /// A stalled or absent attachment eventually fails the exec rather than
     /// allowing a successful result with missing output.
     async fn publish_lossless(&self, event: MainOutput) -> bool {
-        const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-        self.publish_lossless_with_timeout(event, STALL_TIMEOUT)
+        self.publish_lossless_with_timeout(event, Self::STALL_TIMEOUT)
             .await
+    }
+
+    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    fn fail(&self) {
+        self.failed.store(true, Ordering::Release);
+        self.space_version.send_modify(|version| *version += 1);
+    }
+
+    fn stop_retaining_after_exit(&self) {
+        let state = self.state.lock().expect("main output log lock poisoned");
+        let changed = !self.post_exit.swap(true, Ordering::AcqRel);
+        drop(state);
+        if changed {
+            self.space_version.send_modify(|version| *version += 1);
+        }
     }
 
     async fn publish_lossless_with_timeout(
@@ -126,6 +145,11 @@ impl OutputLog {
         event: MainOutput,
         stall_timeout: std::time::Duration,
     ) -> bool {
+        // A descendant may keep the inherited pipe open after its parent
+        // exits. Drain that pipe without retaining unbounded post-exit output.
+        if self.post_exit.load(Ordering::Acquire) {
+            return true;
+        }
         let mut space = self.space_version.subscribe();
         loop {
             let _ = space.borrow_and_update();
@@ -163,12 +187,16 @@ impl OutputLog {
                 self.version.send_replace(version);
                 return true;
             }
-            if tokio::time::timeout(stall_timeout, space.changed())
-                .await
-                .is_err()
-            {
-                self.failed.store(true, Ordering::Release);
-                self.space_version.send_modify(|version| *version += 1);
+            let timed_out = if self.subscribers.load(Ordering::Acquire) == 0 {
+                tokio::time::timeout(stall_timeout, space.changed())
+                    .await
+                    .is_err()
+            } else {
+                let _ = space.changed().await;
+                false
+            };
+            if timed_out && self.subscribers.load(Ordering::Acquire) == 0 {
+                self.fail();
                 return false;
             }
         }
@@ -183,8 +211,12 @@ impl OutputLog {
             .map_or(state.next_sequence, |retained| retained.sequence);
         if self.lossless {
             state.consumed_through = next_sequence;
+            self.subscribers.fetch_add(1, Ordering::AcqRel);
         }
         drop(state);
+        if self.lossless {
+            self.space_version.send_modify(|version| *version += 1);
+        }
         MainOutputCursor {
             output: Arc::clone(self),
             next_sequence,
@@ -216,6 +248,17 @@ pub struct MainOutputCursor {
     output: Arc<OutputLog>,
     next_sequence: u64,
     version: watch::Receiver<u64>,
+}
+
+impl Drop for MainOutputCursor {
+    fn drop(&mut self) {
+        if self.output.lossless {
+            self.output.subscribers.fetch_sub(1, Ordering::AcqRel);
+            self.output
+                .space_version
+                .send_modify(|version| *version += 1);
+        }
+    }
 }
 
 impl MainOutputCursor {
@@ -312,7 +355,7 @@ pub struct MainSession {
 }
 
 impl MainSession {
-    const REMOTE_OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const REMOTE_OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     #[cfg(test)]
     pub fn inert() -> Arc<Self> {
         let (input, _input_rx) = tokio::sync::mpsc::channel(64);
@@ -446,7 +489,11 @@ impl MainSession {
                                 &buffer[..read],
                             )))
                             .await
+                            && !stdout_session.output.post_exit.load(Ordering::Acquire)
                         {
+                            if let Some(process) = stdout_session.boundary_process.as_ref() {
+                                let _ = process.terminate().await;
+                            }
                             break;
                         }
                     }
@@ -468,7 +515,11 @@ impl MainSession {
                                     &buffer[..read],
                                 )))
                                 .await
+                                && !stderr_session.output.post_exit.load(Ordering::Acquire)
                             {
+                                if let Some(process) = stderr_session.boundary_process.as_ref() {
+                                    let _ = process.terminate().await;
+                                }
                                 break;
                             }
                         }
@@ -634,24 +685,15 @@ impl MainSession {
         timeout: std::time::Duration,
     ) -> bool {
         if self.output.lossless {
-            // Keep waiting while the consumer makes progress. Only an idle
-            // attachment is allowed to time out, and that result is a failure.
-            let mut space = self.output.space_version.subscribe();
-            loop {
-                let _ = space.borrow_and_update();
-                if self.readers_remaining.load(Ordering::Acquire) == 0 {
-                    break;
-                }
-                tokio::select! {
-                    () = self.readers_done.notified() => {},
-                    result = tokio::time::timeout(timeout, space.changed()) => {
-                        if result.is_err() {
-                            self.output.failed.store(true, Ordering::Release);
-                            self.output.space_version.send_modify(|version| *version += 1);
-                            break;
-                        }
-                    }
-                }
+            // The pipe can contain parent bytes after the process exits. If
+            // descendants keep it open beyond the drain deadline, report a
+            // delivery failure rather than guessing where parent output ends.
+            if tokio::time::timeout(timeout, self.wait_for_output_readers())
+                .await
+                .is_err()
+            {
+                self.output.stop_retaining_after_exit();
+                self.output.fail();
             }
         } else {
             let _ = tokio::time::timeout(timeout, self.wait_for_output_readers()).await;
@@ -671,6 +713,8 @@ impl MainSession {
 
     async fn wait_for_output_readers(&self) {
         let notified = self.readers_done.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if self.readers_remaining.load(Ordering::Acquire) != 0 {
             notified.await;
         }
@@ -1104,6 +1148,171 @@ mod tests {
                 .expect("terminal status after bounded drain"),
             MainOutput::Exit(19)
         ));
+    }
+
+    #[tokio::test]
+    async fn lossless_finish_keeps_parent_status_when_output_pipe_closes() {
+        let mut session = MainSession::inert();
+        let inner = Arc::get_mut(&mut session).expect("sole test session reference");
+        inner.output = OutputLog::with_lossless(true);
+        inner.readers_remaining.store(1, Ordering::Release);
+        let mut output = session.subscribe();
+        assert!(
+            session
+                .output
+                .publish_lossless(MainOutput::Stdout(Bytes::from_static(b"ok\n")))
+                .await
+        );
+        assert!(matches!(
+            output.recv().await.unwrap(),
+            MainOutput::Stdout(data) if data == b"ok\n"[..]
+        ));
+        session.reader_finished();
+
+        session
+            .finish_remote_with_timeout(0, false, std::time::Duration::from_millis(10))
+            .await;
+        assert!(!session.output_failed());
+        assert!(matches!(output.recv().await.unwrap(), MainOutput::Exit(0)));
+    }
+
+    #[tokio::test]
+    async fn lossless_finish_preserves_pending_output_for_paused_reader() {
+        let mut session = MainSession::inert();
+        let inner = Arc::get_mut(&mut session).expect("sole test session reference");
+        inner.output = OutputLog::with_lossless(true);
+        inner.readers_remaining.store(1, Ordering::Release);
+        let mut output = session.subscribe();
+        assert!(
+            session
+                .output
+                .publish_lossless(MainOutput::Stdout(Bytes::from_static(b"pending")))
+                .await
+        );
+        session.reader_finished();
+        let wait_session = session.clone();
+        let finish = tokio::spawn(async move {
+            wait_session
+                .finish_remote_with_timeout(0, false, std::time::Duration::from_millis(10))
+                .await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), finish)
+            .await
+            .expect("paused reader must not extend the drain indefinitely")
+            .unwrap();
+        assert!(matches!(
+            output.recv().await.unwrap(),
+            MainOutput::Stdout(data) if data == b"pending"[..]
+        ));
+        assert!(!session.output_failed());
+        assert!(matches!(output.recv().await.unwrap(), MainOutput::Exit(0)));
+    }
+
+    #[tokio::test]
+    async fn lossless_finish_fails_when_descendant_keeps_writing() {
+        let mut session = MainSession::inert();
+        let inner = Arc::get_mut(&mut session).expect("sole test session reference");
+        inner.output = OutputLog::with_lossless(true);
+        inner.readers_remaining.store(1, Ordering::Release);
+        let mut output = session.subscribe();
+        let writer_log = session.output.clone();
+        let writer = tokio::spawn(async move {
+            loop {
+                assert!(
+                    writer_log
+                        .publish_lossless(MainOutput::Stdout(Bytes::from_static(b"tick\n")))
+                        .await
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+        let reader = tokio::spawn(async move {
+            loop {
+                match output.recv().await {
+                    Ok(MainOutput::Exit(code)) => return code,
+                    Err(_) => return 74,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            session.finish_remote_with_timeout(0, false, std::time::Duration::from_millis(30)),
+        )
+        .await
+        .expect("descendant output must not extend the drain deadline");
+        assert_eq!(reader.await.unwrap(), 74);
+        writer.abort();
+        assert!(session.output_failed());
+    }
+
+    #[tokio::test]
+    async fn lossless_failed_exec_ignores_later_descendant_output() {
+        let mut session = MainSession::inert();
+        let inner = Arc::get_mut(&mut session).expect("sole test session reference");
+        inner.output = OutputLog::with_lossless(true);
+        inner.readers_remaining.store(1, Ordering::Release);
+        let mut output = session.subscribe();
+        session
+            .finish_remote_with_timeout(0, false, std::time::Duration::from_millis(10))
+            .await;
+        assert!(output.recv().await.is_err());
+        drop(output);
+        let window = session.output_window();
+        for _ in 0..(2 * OUTPUT_BUFFER_BYTES / 4096) {
+            assert!(
+                session
+                    .output
+                    .publish_lossless(MainOutput::Stdout(Bytes::from(vec![b'x'; 4096])))
+                    .await
+            );
+        }
+        assert_eq!(session.output_window(), window);
+        assert!(session.output_failed());
+    }
+
+    #[tokio::test]
+    async fn lossless_finish_drains_large_output_before_success() {
+        let mut session = MainSession::inert();
+        let inner = Arc::get_mut(&mut session).expect("sole test session reference");
+        inner.output = OutputLog::with_lossless(true);
+        inner.readers_remaining.store(1, Ordering::Release);
+        let mut output = session.subscribe();
+        let writer_log = session.output.clone();
+        let writer_session = session.clone();
+        let writer = tokio::spawn(async move {
+            for _ in 0..(2 * OUTPUT_BUFFER_BYTES / 4096) {
+                assert!(
+                    writer_log
+                        .publish_lossless(MainOutput::Stdout(Bytes::from(vec![b'x'; 4096])))
+                        .await
+                );
+            }
+            writer_session.reader_finished();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let finish_session = session.clone();
+        let finish = tokio::spawn(async move {
+            finish_session
+                .finish_remote_with_timeout(0, false, std::time::Duration::from_secs(5))
+                .await;
+        });
+        let mut bytes = 0;
+        loop {
+            match output.recv().await.unwrap() {
+                MainOutput::Stdout(data) => {
+                    bytes += data.len();
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                MainOutput::Exit(0) => break,
+                other => panic!("unexpected output: {other:?}"),
+            }
+        }
+        writer.await.unwrap();
+        finish.await.unwrap();
+        assert_eq!(bytes, 2 * OUTPUT_BUFFER_BYTES);
+        assert!(!session.output_failed());
     }
 
     #[tokio::test]

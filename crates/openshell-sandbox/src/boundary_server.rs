@@ -2079,6 +2079,7 @@ mod linux {
                 stdout,
                 stderr,
                 terminal,
+                output_status: _,
             } = session;
             let Some(stdin) = stdin else {
                 return Err(guest_error(
@@ -3005,15 +3006,14 @@ mod linux {
             while let Some((channel, payload)) = read_stream_frame(&mut reader).await? {
                 match channel {
                     STREAM_STDIN => {
-                        let Some(input) = input.as_ref() else {
-                            return Err(io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                "main process stdin already closed",
-                            ));
-                        };
-                        input.send(payload).await.map_err(|_| {
-                            io::Error::new(io::ErrorKind::BrokenPipe, "main process stdin closed")
-                        })?;
+                        // A process may close stdin before the client has
+                        // finished sending it. Keep relaying stdout, stderr,
+                        // and the final status after that write fails.
+                        if let Some(sender) = input.as_ref()
+                            && sender.send(payload).await.is_err()
+                        {
+                            input.take();
+                        }
                     }
                     // Keep reading after stdin closes so transport EOF still
                     // releases this control process's attachment lease.

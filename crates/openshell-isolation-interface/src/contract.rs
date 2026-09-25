@@ -716,6 +716,9 @@ pub struct ExecSession {
     pub stderr: Option<BoundaryOutput>,
     /// PTY control, present when a terminal was requested.
     pub terminal: Option<Arc<dyn BoundaryTerminal>>,
+    /// Final status of the attached output stream, including delivery failure.
+    /// The process handle's stable wait status remains independent of attachment.
+    pub output_status: Option<oneshot::Receiver<BoundaryExitStatus>>,
 }
 
 /// What to run inside the boundary via [`BoundaryExec`].

@@ -141,9 +141,15 @@ signal status, whether or not an output attachment is open or the main process
 has exited. Waiting never holds the exec registry lock, so other operations can
 still signal or attach to the process.
 Exec output uses a bounded queue that backpressures the process reader until its
-attachment consumes the bytes. If the attachment stops making progress, the
-sandbox reports an output failure instead of publishing a successful exit with
-missing bytes. Canonical main-process output retains its bounded replay log.
+attachment consumes the bytes. An attached reader can apply backpressure
+without losing bytes; an absent reader that leaves the queue full eventually
+fails the exec and terminates its process. The final stream status carries
+delivery failures separately from the process handle's stable wait result.
+After the exec parent exits, output drains until its pipes close. If a
+descendant keeps a pipe open beyond 30 seconds, the exec reports an output
+delivery failure and drains later writes without retaining them. This avoids
+guessing which bytes belong to the parent.
+Canonical main-process output retains its bounded replay log.
 
 ## Isolation Layers
 

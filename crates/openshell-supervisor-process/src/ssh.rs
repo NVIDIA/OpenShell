@@ -986,6 +986,7 @@ impl SshHandler {
             .ok_or_else(|| anyhow::anyhow!("exec on unknown channel {channel:?}"))?;
         state.process = Some(exec.process.clone());
         state.terminal = exec.terminal.take();
+        let output_status = exec.output_status.take();
 
         if let Some(mut stdin) = exec.stdin.take() {
             let (sender, receiver) = mpsc::channel::<Vec<u8>>();
@@ -1030,19 +1031,30 @@ impl SshHandler {
             })
         });
         tokio::spawn(async move {
-            let status = exec.process.wait().await;
-            let _ = stdout_task.await;
-            if let Some(task) = stderr_task {
-                let _ = task.await;
-            }
+            let status = if let Some(output_status) = output_status {
+                // The boundary stream's final status includes output delivery
+                // failure. Process wait alone reports only the child's exit.
+                let _ = stdout_task.await;
+                if let Some(task) = stderr_task {
+                    let _ = task.await;
+                }
+                output_status.await.ok()
+            } else {
+                let status = exec.process.wait().await.ok();
+                let _ = stdout_task.await;
+                if let Some(task) = stderr_task {
+                    let _ = task.await;
+                }
+                status
+            };
             let code = match status {
-                Ok(openshell_isolation_interface::contract::BoundaryExitStatus::Exited(code)) => {
+                Some(openshell_isolation_interface::contract::BoundaryExitStatus::Exited(code)) => {
                     code.max(0).cast_unsigned()
                 }
-                Ok(openshell_isolation_interface::contract::BoundaryExitStatus::Signaled(
+                Some(openshell_isolation_interface::contract::BoundaryExitStatus::Signaled(
                     signal,
                 )) => (128_i32.saturating_add(signal)).max(0).cast_unsigned(),
-                Err(_) => 1,
+                None => 74,
             };
             let _ = handle.eof(channel).await;
             let _ = handle.exit_status_request(channel, code).await;
