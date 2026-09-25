@@ -271,6 +271,9 @@ pub struct VmDriverConfig {
     /// Corporate forward proxy settings delivered to the guest init script.
     #[serde(flatten)]
     pub upstream_proxy: UpstreamProxyConfig,
+    /// Policy DNS IPv6 egress mode and NAT64 prefixes for host control.
+    #[serde(flatten)]
+    pub ipv6_egress: openshell_core::SupervisorIpv6EgressConfig,
     /// Gateway-host PEM CA bundle staged into the guest overlay for the
     /// corporate proxy and TLS-intercepted server certificates.
     pub proxy_ca_bundle: Option<PathBuf>,
@@ -350,6 +353,7 @@ impl std::fmt::Debug for VmDriverConfig {
                 "proxy_ca_bundle_configured",
                 &self.proxy_ca_bundle.is_some(),
             )
+            .field("ipv6_egress", &self.ipv6_egress)
             .field(
                 "provider_spiffe_workload_api_tcp_endpoint_configured",
                 &self.provider_spiffe_workload_api_tcp_endpoint.is_some(),
@@ -388,6 +392,7 @@ impl Default for VmDriverConfig {
             guest_tls_cert: None,
             guest_tls_key: None,
             upstream_proxy: UpstreamProxyConfig::default(),
+            ipv6_egress: openshell_core::SupervisorIpv6EgressConfig::default(),
             proxy_ca_bundle: None,
             provider_spiffe_workload_api_tcp_endpoint: None,
             provider_spiffe_allow_guest_tcp: false,
@@ -415,6 +420,7 @@ impl VmDriverConfig {
 
     pub fn validate_runtime_security_config(&self) -> Result<(), String> {
         self.upstream_proxy.validate()?;
+        self.ipv6_egress.validate()?;
         if let Some(path) = self.proxy_ca_bundle.as_ref() {
             if path.as_os_str().is_empty() {
                 return Err("proxy_ca_bundle must not be empty when set".to_string());
@@ -939,6 +945,7 @@ impl VmDriver {
             .arg("--workdir")
             .arg("/sandbox")
             .args(upstream_proxy_args)
+            .args(self.config.ipv6_egress.supervisor_args())
             .env(
                 openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND,
                 DRIVER_ADMITTED_BACKEND,
@@ -10970,6 +10977,33 @@ mod tests {
                 && rendered.contains("proxy_auth_file_configured: true"),
             "presence of each must still be visible for debugging: {rendered}"
         );
+    }
+
+    #[test]
+    fn ipv6_egress_settings_parse_validate_and_render_supervisor_args() {
+        let mut value = serde_json::to_value(proxy_config(None, None, None)).unwrap();
+        value["policy_dns_ipv6_egress"] = "enabled".into();
+        value["nat64_prefixes"] = serde_json::json!(["2001:db8:64::/96"]);
+        let config: VmDriverConfig =
+            serde_json::from_value(value).expect("VM driver config parses flattened keys");
+        config.validate_runtime_security_config().unwrap();
+        assert_eq!(
+            config.ipv6_egress.supervisor_args(),
+            [
+                "--policy-dns-ipv6-egress",
+                "enabled",
+                "--nat64-prefix",
+                "2001:db8:64::/96"
+            ]
+        );
+        let invalid = VmDriverConfig {
+            ipv6_egress: openshell_core::SupervisorIpv6EgressConfig {
+                nat64_prefixes: vec!["2001:db8::/33".to_string()],
+                ..Default::default()
+            },
+            ..proxy_config(None, None, None)
+        };
+        assert!(invalid.validate_runtime_security_config().is_err());
     }
 
     #[test]

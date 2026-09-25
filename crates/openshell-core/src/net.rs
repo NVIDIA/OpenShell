@@ -19,6 +19,8 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::net::TcpStream;
 
+pub mod nat64;
+
 /// Check if a hostname is a known cloud metadata hostname that resolves to an
 /// always-blocked metadata service.
 ///
@@ -72,6 +74,10 @@ pub fn is_always_blocked_ip(ip: IpAddr) -> bool {
             // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return v4.is_loopback() || v4.is_unspecified();
+            }
+            // A NAT64 address reaches its embedded IPv4 address.
+            if let Some(v4) = nat64::embedded_ipv4(v6) {
+                return is_always_blocked_ip(IpAddr::V4(v4));
             }
             false
         }
@@ -157,6 +163,24 @@ pub fn is_always_blocked_net(net: IpNet) -> bool {
                 return true;
             }
 
+            // The same ranges behind the NAT64 well-known prefix.
+            if nat64::WELL_KNOWN_PREFIX
+                .embedded_ipv4(network)
+                .is_some_and(|v4| is_always_blocked_ip(IpAddr::V4(v4)))
+            {
+                return true;
+            }
+            if [
+                Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 8),
+                Ipv4Net::new_assert(Ipv4Addr::new(169, 254, 0, 0), 16),
+                Ipv4Net::new_assert(Ipv4Addr::UNSPECIFIED, 32),
+            ]
+            .into_iter()
+            .any(|blocked| ipv6_nets_intersect(v6net, ipv4_net_to_nat64_wkp(blocked)))
+            {
+                return true;
+            }
+
             false
         }
     }
@@ -199,6 +223,12 @@ fn ipv4_net_to_mapped_ipv6(net: Ipv4Net) -> Ipv6Net {
     Ipv6Net::new_assert(net.network().to_ipv6_mapped(), 96_u8 + net.prefix_len())
 }
 
+fn ipv4_net_to_nat64_wkp(net: Ipv4Net) -> Ipv6Net {
+    let mut octets = nat64::WELL_KNOWN_PREFIX.net().network().octets();
+    octets[12..].copy_from_slice(&net.network().octets());
+    Ipv6Net::new_assert(Ipv6Addr::from(octets), 96_u8 + net.prefix_len())
+}
+
 /// Check if an IP address is internal (loopback, private RFC 1918, link-local,
 /// or unspecified).
 ///
@@ -227,8 +257,30 @@ pub fn is_internal_ip(ip: IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_internal_v4(v4);
             }
-            false
+            // A NAT64 address reaches its embedded IPv4 address.
+            if let Some(v4) = nat64::embedded_ipv4(v6) {
+                return is_internal_v4(v4);
+            }
+            // 64:ff9b:1::/48 is local-use translation space (RFC 8215) and
+            // not globally reachable; without a registered prefix its
+            // embedding is unknown.
+            nat64::LOCAL_USE_NET.contains(&v6)
         }
+    }
+}
+
+/// Check whether an `allowed_ips` entry covers `ip`.
+///
+/// A NAT64 address also matches through the IPv4 address it embeds, so
+/// `10.0.0.0/8` covers the DNS64 answer `64:ff9b::a00:5` exactly as it covers
+/// `10.0.0.5`. Callers apply the always-blocked check first.
+pub fn allowed_net_contains(net: &IpNet, ip: IpAddr) -> bool {
+    if net.contains(&ip) {
+        return true;
+    }
+    match ip {
+        IpAddr::V6(v6) => nat64::embedded_ipv4(v6).is_some_and(|v4| net.contains(&IpAddr::V4(v4))),
+        IpAddr::V4(_) => false,
     }
 }
 
@@ -245,9 +297,11 @@ pub fn is_internal_net(net: IpNet) -> bool {
             .any(|internal| ipv4_nets_intersect(net, *internal)),
         IpNet::V6(net) => {
             ipv6_nets_intersect(net, IPV6_ULA_NET)
-                || NON_HARD_INTERNAL_V4_NETS
-                    .iter()
-                    .any(|internal| ipv6_nets_intersect(net, ipv4_net_to_mapped_ipv6(*internal)))
+                || ipv6_nets_intersect(net, nat64::LOCAL_USE_NET)
+                || NON_HARD_INTERNAL_V4_NETS.iter().any(|internal| {
+                    ipv6_nets_intersect(net, ipv4_net_to_mapped_ipv6(*internal))
+                        || ipv6_nets_intersect(net, ipv4_net_to_nat64_wkp(*internal))
+                })
         }
     }
 }
@@ -752,5 +806,96 @@ mod tests {
             .await
             .expect("connect");
         assert!(stream.nodelay().expect("query TCP_NODELAY"));
+    }
+
+    // -- NAT64 --
+
+    #[test]
+    fn nat64_well_known_prefix_follows_ipv4_classification() {
+        let wkp = |v4: Ipv4Addr| {
+            let mut octets = nat64::WELL_KNOWN_PREFIX.net().network().octets();
+            octets[12..].copy_from_slice(&v4.octets());
+            IpAddr::V6(Ipv6Addr::from(octets))
+        };
+        for v4 in [
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(169, 254, 169, 254),
+            Ipv4Addr::UNSPECIFIED,
+        ] {
+            assert!(is_always_blocked_ip(wkp(v4)), "{v4}");
+            assert!(is_internal_ip(wkp(v4)), "{v4}");
+        }
+        for v4 in [
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(172, 16, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(198, 18, 0, 1),
+            Ipv4Addr::new(192, 0, 2, 1),
+        ] {
+            assert!(is_internal_ip(wkp(v4)), "{v4}");
+            assert!(!is_always_blocked_ip(wkp(v4)), "{v4}");
+        }
+        let public = wkp(Ipv4Addr::new(140, 82, 112, 3));
+        assert!(!is_internal_ip(public));
+        assert!(!is_always_blocked_ip(public));
+    }
+
+    #[test]
+    fn nat64_registered_network_prefix_follows_ipv4_classification() {
+        // Only this test registers this documentation prefix.
+        let prefix = nat64::Nat64Prefix::new("2001:db8:6464::/48".parse().unwrap()).unwrap();
+        let loopback: IpAddr = "2001:db8:6464:7f00:1::".parse().unwrap();
+        let private: IpAddr = "2001:db8:6464:a00:1::".parse().unwrap();
+        let public: IpAddr = "2001:db8:6464:8c52:7003::".parse().unwrap();
+        assert!(
+            !is_internal_ip(private),
+            "unregistered prefixes are plain IPv6"
+        );
+        nat64::register_network_prefix(prefix);
+        assert!(is_always_blocked_ip(loopback));
+        assert!(is_internal_ip(private));
+        assert!(!is_always_blocked_ip(private));
+        assert!(!is_internal_ip(public));
+    }
+
+    #[test]
+    fn nat64_local_use_range_is_internal_without_a_registered_prefix() {
+        assert!(is_internal_ip("64:ff9b:1::8c52:7003".parse().unwrap()));
+        assert!(!is_always_blocked_ip(
+            "64:ff9b:1::8c52:7003".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn nat64_well_known_cidrs_follow_ipv4_net_classification() {
+        let net = |raw: &str| raw.parse::<IpNet>().unwrap();
+        assert!(is_always_blocked_net(net("64:ff9b::/96")));
+        assert!(is_always_blocked_net(net("64:ff9b::7f00:0/104")));
+        assert!(is_always_blocked_net(net("64:ff9b::a9fe:a9fe/128")));
+        assert!(!is_always_blocked_net(net("64:ff9b::a00:0/104")));
+        assert!(is_internal_net(net("64:ff9b::a00:0/104")));
+        assert!(is_internal_net(net("64:ff9b:1::/64")));
+        assert!(!is_internal_net(net("64:ff9b::8c52:7000/120")));
+    }
+
+    #[test]
+    fn nat64_answers_match_allowed_ipv4_networks() {
+        let net: IpNet = "10.0.0.0/8".parse().unwrap();
+        assert!(allowed_net_contains(&net, "10.0.0.5".parse().unwrap()));
+        assert!(allowed_net_contains(
+            &net,
+            "64:ff9b::a00:5".parse().unwrap()
+        ));
+        assert!(!allowed_net_contains(
+            &net,
+            "64:ff9b::b00:5".parse().unwrap()
+        ));
+        assert!(!allowed_net_contains(
+            &net,
+            "2001:db8::a00:5".parse().unwrap()
+        ));
+        let v6: IpNet = "2001:db8::/32".parse().unwrap();
+        assert!(allowed_net_contains(&v6, "2001:db8::1".parse().unwrap()));
     }
 }

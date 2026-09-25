@@ -662,6 +662,20 @@ Each example is a complete TOML file for one compute driver. The examples repeat
 
 Kubernetes configurations set `namespace`, `service_account_name`, and `enable_user_namespaces` in `[openshell.drivers.kubernetes]`. Docker configurations use `sandbox_label`; the legacy `sandbox_namespace` key is rejected.
 
+### IPv6 Egress and NAT64
+
+The Kubernetes, Docker, Podman, and MicroVM driver tables accept two keys that the driver passes to each supervisor on its command line:
+
+- `policy_dns_ipv6_egress` sets how mediated policy DNS answers AAAA queries: `auto` (default), `enabled`, or `disabled`. `auto` answers AAAA only when the supervisor network namespace has an IPv6 default route and no IPv4 default route. `disabled` answers AAAA with an empty response so dual-stack clients fall back to IPv4.
+- `nat64_prefixes` lists the NAT64 prefixes of the sandbox network as RFC 6052 CIDRs (`/32`, `/40`, `/48`, `/56`, `/64`, or `/96`). The supervisor applies the IPv4 SSRF rules to the IPv4 address embedded in any destination inside these prefixes. It always recognizes the well-known prefix `64:ff9b::/96` and also discovers the network prefix through `ipv4only.arpa` (RFC 7050), so set this key when the network uses a prefix that discovery cannot find.
+
+The gateway rejects an unknown mode or a malformed prefix at startup.
+
+```toml
+policy_dns_ipv6_egress = "auto"
+nat64_prefixes         = ["2001:db8:64::/96"]
+```
+
 ### Kubernetes
 
 The gateway runs as a Pod and creates sandbox Pods in another namespace. mTLS material for sandboxes is delivered through a Kubernetes Secret rather than host-side file paths.
@@ -748,6 +762,9 @@ supervisor_image_pull_policy   = "if_not_present"
 # and its TLS stack, so a full merged trust bundle wastes the sandbox
 # boundary's control-frame budget on duplicated roots.
 # proxy_ca_bundle              = "/etc/openshell-tls/proxy-ca/ca.crt"
+# Policy DNS AAAA handling and NAT64 prefixes; see IPv6 Egress and NAT64.
+# policy_dns_ipv6_egress       = "auto"
+# nat64_prefixes               = ["2001:db8:64::/96"]
 # Required in raw gateway TOML because `namespace` identifies sandbox
 # placement, not the gateway Service. Helm renders this from the release's
 # gateway Service name and namespace.
@@ -894,6 +911,9 @@ no_proxy = ".svc.cluster.local,10.0.0.0/8"
 # Optional root-owned host file containing user:pass. An http:// proxy also
 # requires proxy_auth_allow_insecure = true as an explicit acknowledgement.
 proxy_auth_file = "/etc/openshell/secrets/proxy-auth"
+# Policy DNS AAAA handling and NAT64 prefixes; see IPv6 Egress and NAT64.
+# policy_dns_ipv6_egress = "auto"
+# nat64_prefixes = ["2001:db8:64::/96"]
 # Project a host Unix Workload API socket into the supervisor for provider
 # token exchange. The socket parent must be a dedicated absolute directory.
 provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
@@ -1040,6 +1060,9 @@ health_check_interval_secs = 10
 # proxy_connect_by_hostname = true
 # Corporate CA trusted for an https:// proxy and TLS-intercepting proxies.
 # proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
+# Policy DNS AAAA handling and NAT64 prefixes; see IPv6 Egress and NAT64.
+# policy_dns_ipv6_egress    = "auto"
+# nat64_prefixes            = ["2001:db8:64::/96"]
 # Project a host Workload API Unix socket into the supervisor, or use an
 # explicit container-reachable TCP endpoint, for provider token exchange.
 # provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
@@ -1126,6 +1149,10 @@ overlay_disk_mib = 4096
 # Gateway-host PEM bundle trusted for an https:// proxy and for server
 # certificates re-signed by a TLS-intercepting proxy. Requires https_proxy.
 # proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
+# Policy DNS AAAA handling and NAT64 prefixes for the host-side supervisors;
+# see IPv6 Egress and NAT64.
+# policy_dns_ipv6_egress    = "auto"
+# nat64_prefixes            = ["2001:db8:64::/96"]
 # VM guests cannot mount a host Workload API Unix socket. Configure only a
 # separately operated guest-reachable TCP listener and explicitly acknowledge
 # the exposure; host-only sockets are never exposed automatically.

@@ -17,15 +17,19 @@
     reason = "the policy DNS boundary retains metrics and helpers for later runtime integrations"
 )]
 
+mod egress;
 mod name;
 mod resolver;
 mod runtime;
 mod store;
 mod wire;
 
+pub(crate) use egress::{DefaultRoutes, Ipv6EgressDecision, Nat64Setup};
 pub(crate) use name::NormalizedName;
 pub(crate) use resolver::{AddressFamily, SocketTrustedResolver, TrustedAnswer, TrustedResolver};
-pub(crate) use runtime::{PolicyDnsRuntime, PolicyDnsRuntimeConfig};
+pub(crate) use runtime::{
+    PolicyDnsRuntime, PolicyDnsRuntimeConfig, trusted_resolver_from_resolv_conf,
+};
 pub(crate) use store::{
     MappingLookup, MappingLookupError, PolicyEndpointId, PublishError, PublishRequest,
     ResolvedEndpointRecord, ResolvedEndpointStore, ResolvedPortContract, StoreConfig,

@@ -156,6 +156,19 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_UPSTREAM_PROXY_CA_BUNDLE")]
     upstream_proxy_ca_bundle: Option<PathBuf>,
 
+    /// AAAA handling for the host supervisors' mediated policy DNS: `auto`,
+    /// `enabled` or `disabled`.
+    #[arg(long, env = "OPENSHELL_VM_POLICY_DNS_IPV6_EGRESS")]
+    policy_dns_ipv6_egress: Option<openshell_core::PolicyDnsIpv6Egress>,
+
+    /// NAT64 prefix (RFC 6052 CIDR) of the host network. Repeatable.
+    #[arg(
+        long = "nat64-prefix",
+        env = "OPENSHELL_VM_NAT64_PREFIXES",
+        value_delimiter = ','
+    )]
+    nat64_prefixes: Vec<String>,
+
     /// Guest-reachable SPIFFE Workload API endpoint (`tcp:IP:port`).
     #[arg(
         long = "provider-spiffe-workload-api-tcp-endpoint",
@@ -306,6 +319,10 @@ async fn main() -> Result<()> {
             proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname.then_some(true),
         },
         proxy_ca_bundle: args.upstream_proxy_ca_bundle.clone(),
+        ipv6_egress: openshell_core::SupervisorIpv6EgressConfig {
+            policy_dns_ipv6_egress: args.policy_dns_ipv6_egress,
+            nat64_prefixes: args.nat64_prefixes.clone(),
+        },
         provider_spiffe_workload_api_tcp_endpoint: args
             .provider_spiffe_workload_api_tcp_endpoint
             .clone(),
@@ -736,6 +753,29 @@ mod tests {
         assert_eq!(
             args.upstream_proxy_ca_bundle.as_deref(),
             Some(PathBuf::from("/etc/openshell/tls/proxy-ca.pem").as_path())
+        );
+    }
+
+    #[test]
+    fn ipv6_egress_flags_parse_with_supervisor_names() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--policy-dns-ipv6-egress",
+            "enabled",
+            "--nat64-prefix",
+            "64:ff9b:1::/96",
+            "--nat64-prefix",
+            "2001:db8:64::/96",
+        ]);
+        assert_eq!(
+            args.policy_dns_ipv6_egress,
+            Some(openshell_core::PolicyDnsIpv6Egress::Enabled)
+        );
+        assert_eq!(args.nat64_prefixes, ["64:ff9b:1::/96", "2001:db8:64::/96"]);
+        assert!(
+            Args::parse_from(["openshell-driver-vm"])
+                .nat64_prefixes
+                .is_empty()
         );
     }
 

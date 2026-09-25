@@ -1173,6 +1173,7 @@ fn build_base_spec(
         driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string(),
     ];
     command.extend(upstream_proxy_cli_args(config));
+    command.extend(config.ipv6_egress_config().supervisor_args());
 
     let container_spec = ContainerSpec {
         name,
@@ -2593,6 +2594,36 @@ mod tests {
                 "{key} must not be populated from operator proxy config"
             );
         }
+    }
+
+    #[test]
+    fn container_spec_passes_ipv6_egress_settings_on_supervisor_argv() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        let command = spec_command(&build_container_spec(&sandbox, &config));
+        assert!(
+            !command
+                .iter()
+                .any(|a| a == "--policy-dns-ipv6-egress" || a == "--nat64-prefix"),
+            "no IPv6 egress flags without operator config: {command:?}"
+        );
+
+        config.policy_dns_ipv6_egress = Some(openshell_core::PolicyDnsIpv6Egress::Disabled);
+        config.nat64_prefixes = vec!["64:ff9b:1::/96".to_string()];
+        let command = spec_command(&build_container_spec(&sandbox, &config));
+        let idx = command
+            .iter()
+            .position(|a| a == "--policy-dns-ipv6-egress")
+            .expect("IPv6 egress flag present");
+        assert_eq!(command.get(idx + 1).map(String::as_str), Some("disabled"));
+        let idx = command
+            .iter()
+            .position(|a| a == "--nat64-prefix")
+            .expect("NAT64 prefix flag present");
+        assert_eq!(
+            command.get(idx + 1).map(String::as_str),
+            Some("64:ff9b:1::/96")
+        );
     }
 
     #[test]

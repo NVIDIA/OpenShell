@@ -285,6 +285,28 @@ descriptor-owner snapshot proves who sent an already queued query. Consumers
 must not use this unavailable identity to grant binary-specific access. TCP
 connection authorization still uses decision-time binary identity.
 
+AAAA queries receive NOERROR/NODATA unless IPv6 egress is enabled. The
+driver-owned `--policy-dns-ipv6-egress` flag (driver config
+`policy_dns_ipv6_egress`) selects `auto` (default), `enabled`, or `disabled`;
+`auto` enables IPv6 answers only when the supervisor network namespace has an
+IPv6 default route and no IPv4 default route, so dual-stack and IPv4-only
+hosts keep the A-record fallback. An unreadable routing table resolves `auto`
+to disabled. IPv6 answers come from the epoch-scoped synthetic IPv6 pool and
+are pinned and dialed like IPv4 answers. The supervisor records the requested
+mode, the result, the detected IPv4/IPv6 default routes, and a route state
+(`ipv6_only`, `dual_stack`, `ipv4_only`, `no_default_route`,
+`route_table_unavailable`) in an OCSF configuration event.
+
+SSRF classification treats an address inside a NAT64 prefix as the IPv4
+address it embeds (RFC 6052), in both the policy DNS answer filter and the
+CONNECT path, so a DNS64 answer cannot reach an address the IPv4 rules block.
+The well-known prefix `64:ff9b::/96` is always recognized, and the unassigned
+remainder of the local-use range `64:ff9b:1::/48` is internal. Operators set
+network-specific prefixes with the driver config `nat64_prefixes`
+(`--nat64-prefix`); the supervisor also discovers the network's prefix from
+`ipv4only.arpa` (RFC 7050) at startup. Prefixes are registered before any
+egress path starts and are never removed.
+
 The sandbox retains only bounded DNS socket-admission records, consumes TCP
 records on accept, and reclaims closed UDP records when capacity is reached.
 The kernel delivers replies from the configured nameserver address, including

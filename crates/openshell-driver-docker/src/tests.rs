@@ -197,6 +197,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
         enable_bind_mounts: false,
         upstream_proxy: UpstreamProxyConfig::default(),
+        ipv6_egress: SupervisorIpv6EgressConfig::default(),
         provider_spiffe_workload_api_socket: None,
         app_armor_profile: Some(AppArmorProfile::Unconfined),
     }
@@ -1164,6 +1165,37 @@ fn repository_e2e_docker_configuration_uses_the_supported_schema() {
 
     assert_eq!(config.image_pull_policy, ImagePullPolicy::IfNotPresent);
     assert_eq!(config.sandbox_label, "openshell-e2e");
+}
+
+#[test]
+fn docker_config_passes_ipv6_egress_settings_to_the_supervisor() {
+    let config: DockerComputeConfig = toml::from_str(
+        r#"
+https_proxy = "http://proxy.example:3128"
+policy_dns_ipv6_egress = "enabled"
+nat64_prefixes = ["2001:db8:64::/96"]
+"#,
+    )
+    .expect("Docker driver config parses");
+    assert_eq!(
+        config.upstream_proxy.https_proxy.as_deref(),
+        Some("http://proxy.example:3128")
+    );
+    assert_eq!(
+        config.ipv6_egress.supervisor_args(),
+        [
+            "--policy-dns-ipv6-egress",
+            "enabled",
+            "--nat64-prefix",
+            "2001:db8:64::/96"
+        ]
+    );
+    let bind: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    config.validate_configuration(bind).unwrap();
+
+    let invalid: DockerComputeConfig =
+        toml::from_str(r#"nat64_prefixes = ["2001:db8::/80"]"#).unwrap();
+    assert!(invalid.validate_configuration(bind).is_err());
 }
 
 #[test]

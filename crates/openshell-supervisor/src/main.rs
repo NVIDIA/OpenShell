@@ -28,6 +28,33 @@ enum SupervisorRole {
     NetworkProxy,
 }
 
+/// AAAA handling for mediated policy DNS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum PolicyDnsIpv6EgressArg {
+    /// Answer AAAA only when the supervisor has an IPv6 default route and no
+    /// IPv4 default route.
+    #[default]
+    Auto,
+    /// Always answer AAAA from the synthetic IPv6 pool.
+    Enabled,
+    /// Always answer AAAA with an empty NOERROR response.
+    Disabled,
+}
+
+impl From<PolicyDnsIpv6EgressArg> for openshell_supervisor_network::run::PolicyDnsIpv6Egress {
+    fn from(value: PolicyDnsIpv6EgressArg) -> Self {
+        match value {
+            PolicyDnsIpv6EgressArg::Auto => Self::Auto,
+            PolicyDnsIpv6EgressArg::Enabled => Self::Enabled,
+            PolicyDnsIpv6EgressArg::Disabled => Self::Disabled,
+        }
+    }
+}
+
+fn parse_nat64_prefix(raw: &str) -> Result<openshell_supervisor_network::run::Nat64Prefix, String> {
+    raw.parse()
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "openshell-supervisor health")]
 struct HealthArgs {
@@ -105,6 +132,17 @@ struct Args {
 
     #[arg(long)]
     upstream_proxy_ca_bundle: Option<String>,
+
+    /// Driver-selected AAAA handling for mediated policy DNS.
+    #[arg(long, value_enum, default_value_t)]
+    policy_dns_ipv6_egress: PolicyDnsIpv6EgressArg,
+
+    /// NAT64 prefix (RFC 6052) used by the sandbox network. Repeatable.
+    /// Addresses inside it are classified by their embedded IPv4 address for
+    /// SSRF checks, in addition to `64:ff9b::/96` and the prefix discovered
+    /// through `ipv4only.arpa`.
+    #[arg(long = "nat64-prefix", value_parser = parse_nat64_prefix)]
+    nat64_prefixes: Vec<openshell_supervisor_network::run::Nat64Prefix>,
 
     #[arg(long)]
     backend_descriptor_file: Option<PathBuf>,
@@ -442,6 +480,8 @@ fn main() -> Result<()> {
                     ocsf_enabled,
                     ocsf_schema_version,
                     upstream_proxy_args,
+                    args.policy_dns_ipv6_egress.into(),
+                    args.nat64_prefixes,
                     backend_descriptor,
                     auth_bundle,
                     admitted_isolation_backend,
@@ -463,6 +503,7 @@ fn main() -> Result<()> {
                     policy_data,
                     args.tls_dir,
                     upstream_proxy_args,
+                    args.nat64_prefixes,
                 )
                 .await
             }
@@ -523,6 +564,67 @@ mod tests {
         .expect("network-proxy arguments");
         assert_eq!(args.role, SupervisorRole::NetworkProxy);
         assert!(validate_role_arguments(&args).is_ok());
+    }
+
+    #[test]
+    fn policy_dns_ipv6_egress_defaults_to_auto_and_accepts_overrides() {
+        let args = Args::try_parse_from(["openshell-supervisor"]).expect("parse defaults");
+        assert_eq!(args.policy_dns_ipv6_egress, PolicyDnsIpv6EgressArg::Auto);
+        for (value, expected) in [
+            (
+                "enabled",
+                openshell_supervisor_network::run::PolicyDnsIpv6Egress::Enabled,
+            ),
+            (
+                "disabled",
+                openshell_supervisor_network::run::PolicyDnsIpv6Egress::Disabled,
+            ),
+        ] {
+            let args =
+                Args::try_parse_from(["openshell-supervisor", "--policy-dns-ipv6-egress", value])
+                    .expect("policy DNS IPv6 egress argument");
+            assert_eq!(
+                openshell_supervisor_network::run::PolicyDnsIpv6Egress::from(
+                    args.policy_dns_ipv6_egress
+                ),
+                expected
+            );
+        }
+        assert!(
+            Args::try_parse_from(["openshell-supervisor", "--policy-dns-ipv6-egress", "yes"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn nat64_prefixes_are_repeatable_and_validated() {
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--nat64-prefix",
+            "64:ff9b:1::/96",
+            "--nat64-prefix",
+            "2001:db8:122:344::/64",
+        ])
+        .expect("NAT64 prefixes");
+        assert_eq!(
+            args.nat64_prefixes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["64:ff9b:1::/96", "2001:db8:122:344::/64"]
+        );
+        assert!(
+            Args::try_parse_from(["openshell-supervisor"])
+                .unwrap()
+                .nat64_prefixes
+                .is_empty()
+        );
+        for bad in ["2001:db8::/80", "10.0.0.0/8", "nope"] {
+            assert!(
+                Args::try_parse_from(["openshell-supervisor", "--nat64-prefix", bad]).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

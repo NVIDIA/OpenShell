@@ -233,6 +233,7 @@ pub fn supervisor_pod(
     proxy_auth_allow_insecure: bool,
     proxy_connect_by_hostname: bool,
     upstream_proxy_ca_bundle_staged: bool,
+    ipv6_egress_args: &[String],
     provider_spiffe_socket_path: Option<&str>,
     owner: OwnerReference,
 ) -> Result<Pod, String> {
@@ -361,6 +362,7 @@ pub fn supervisor_pod(
             UPSTREAM_PROXY_CA_BUNDLE_PATH.to_string(),
         ]);
     }
+    command.extend(ipv6_egress_args.iter().cloned());
     if let Some((secret_name, secret_key)) = proxy_auth_secret {
         let auth_path = Path::new(openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH);
         let mount_path = auth_path
@@ -826,6 +828,7 @@ mod tests {
             false,
             false,
             false,
+            &[],
             None,
             owner(),
         )
@@ -920,6 +923,7 @@ mod tests {
             false,
             false,
             false,
+            &[],
             None,
             owner(),
         )
@@ -1150,10 +1154,64 @@ mod tests {
             false,
             false,
             staged,
+            &[],
             None,
             owner(),
         )
         .expect("render supervisor Pod")
+    }
+
+    #[test]
+    fn supervisor_pod_passes_ipv6_egress_arguments() {
+        let args = openshell_core::SupervisorIpv6EgressConfig {
+            policy_dns_ipv6_egress: Some(openshell_core::PolicyDnsIpv6Egress::Disabled),
+            nat64_prefixes: vec!["2001:db8:64::/96".to_string()],
+        }
+        .supervisor_args();
+        let pod = supervisor_pod(
+            "sandbox",
+            &SandboxRuntimeNames::new("pair"),
+            "pair",
+            "demo",
+            "gateway",
+            "supervisor:latest",
+            None,
+            "sandbox-sa",
+            1000,
+            1000,
+            &[],
+            "https://gateway:8080",
+            SupervisorClientTls::Secret("client-tls"),
+            "{}",
+            "info",
+            600,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            &args,
+            None,
+            owner(),
+        )
+        .expect("render supervisor Pod");
+        let command = pod.spec.as_ref().expect("Pod spec").containers[0]
+            .command
+            .as_ref()
+            .expect("supervisor command");
+        assert!(
+            command
+                .windows(2)
+                .any(|pair| pair == ["--policy-dns-ipv6-egress", "disabled"]),
+            "{command:?}"
+        );
+        assert!(
+            command
+                .windows(2)
+                .any(|pair| pair == ["--nat64-prefix", "2001:db8:64::/96"]),
+            "{command:?}"
+        );
     }
 
     #[test]

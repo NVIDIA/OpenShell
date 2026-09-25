@@ -243,6 +243,12 @@ pub struct KubernetesComputeConfig {
     /// Only meaningful with `https_proxy` set; the bundle must exist and
     /// contain at least one usable trust anchor.
     pub proxy_ca_bundle: Option<String>,
+    /// AAAA handling for the supervisor's mediated policy DNS (`auto`,
+    /// `enabled` or `disabled`). Unset means the supervisor default, `auto`.
+    pub policy_dns_ipv6_egress: Option<openshell_core::PolicyDnsIpv6Egress>,
+    /// NAT64 prefixes (RFC 6052) of the cluster network. The supervisor
+    /// classifies addresses inside them by their embedded IPv4 address.
+    pub nat64_prefixes: Vec<String>,
     pub grpc_endpoint: String,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
@@ -348,6 +354,8 @@ impl Default for KubernetesComputeConfig {
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
             proxy_ca_bundle: None,
+            policy_dns_ipv6_egress: None,
+            nat64_prefixes: Vec::new(),
             grpc_endpoint: String::new(),
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             client_tls_secret_name: String::new(),
@@ -371,7 +379,17 @@ impl KubernetesComputeConfig {
         self.validate_provider_spiffe_workload_api_socket_path()?;
         self.validate_sandbox_identity_config()?;
         self.validate_proxy_uid()?;
-        self.validate_upstream_proxy_config()
+        self.validate_upstream_proxy_config()?;
+        self.ipv6_egress_config().validate()
+    }
+
+    /// Supervisor IPv6 egress settings in their shared form.
+    #[must_use]
+    pub fn ipv6_egress_config(&self) -> openshell_core::SupervisorIpv6EgressConfig {
+        openshell_core::SupervisorIpv6EgressConfig {
+            policy_dns_ipv6_egress: self.policy_dns_ipv6_egress,
+            nat64_prefixes: self.nat64_prefixes.clone(),
+        }
     }
 
     /// Clamp `sa_token_ttl_secs` into the `[MIN_SA_TOKEN_TTL_SECS,
@@ -1201,6 +1219,32 @@ mod tests {
             ..KubernetesComputeConfig::default()
         };
         assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn toml_deserializes_and_validates_ipv6_egress_settings() {
+        let cfg: KubernetesComputeConfig = toml::from_str(
+            r#"
+                policy_dns_ipv6_egress = "enabled"
+                nat64_prefixes = ["64:ff9b:1::/96"]
+            "#,
+        )
+        .expect("config parses");
+        assert_eq!(
+            cfg.ipv6_egress_config().supervisor_args(),
+            [
+                "--policy-dns-ipv6-egress",
+                "enabled",
+                "--nat64-prefix",
+                "64:ff9b:1::/96"
+            ]
+        );
+        assert!(cfg.ipv6_egress_config().validate().is_ok());
+        let bad = KubernetesComputeConfig {
+            nat64_prefixes: vec!["64:ff9b:1::/100".to_string()],
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(bad.validate_configuration().is_err());
     }
 
     #[test]

@@ -166,6 +166,15 @@ struct Args {
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_CA_BUNDLE")]
     proxy_ca_bundle: Option<String>,
 
+    /// AAAA handling for the supervisor's mediated policy DNS: `auto`,
+    /// `enabled` or `disabled`.
+    #[arg(long, env = "OPENSHELL_POLICY_DNS_IPV6_EGRESS")]
+    policy_dns_ipv6_egress: Option<openshell_core::PolicyDnsIpv6Egress>,
+
+    /// NAT64 prefixes (RFC 6052 CIDRs) of the cluster network.
+    #[arg(long, env = "OPENSHELL_NAT64_PREFIXES", value_delimiter = ',')]
+    nat64_prefixes: Vec<String>,
+
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
@@ -272,6 +281,8 @@ async fn main() -> Result<()> {
             proxy_auth_allow_insecure: args.proxy_auth_allow_insecure.then_some(true),
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
             proxy_ca_bundle: args.proxy_ca_bundle,
+            policy_dns_ipv6_egress: args.policy_dns_ipv6_egress,
+            nat64_prefixes: args.nat64_prefixes,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
             ssh_socket_path: args.sandbox_ssh_socket_path,
             client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),

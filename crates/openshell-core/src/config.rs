@@ -781,6 +781,105 @@ impl UpstreamProxyConfig {
     }
 }
 
+/// AAAA handling for the supervisor's mediated policy DNS.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyDnsIpv6Egress {
+    /// Answer AAAA only when the supervisor network namespace has an IPv6
+    /// default route and no IPv4 default route.
+    #[default]
+    Auto,
+    /// Always resolve AAAA through the trusted resolver.
+    Enabled,
+    /// Never resolve AAAA; answer with NOERROR/NODATA.
+    Disabled,
+}
+
+impl PolicyDnsIpv6Egress {
+    /// The value used in configuration and on the supervisor command line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+impl fmt::Display for PolicyDnsIpv6Egress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for PolicyDnsIpv6Egress {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "enabled" => Ok(Self::Enabled),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(format!(
+                "unknown policy_dns_ipv6_egress '{other}'; expected 'auto', 'enabled' or 'disabled'"
+            )),
+        }
+    }
+}
+
+/// Supervisor IPv6 egress settings shared by compute drivers.
+///
+/// Like [`UpstreamProxyConfig`], this type is `flatten`ed by driver tables.
+/// The values travel to the supervisor on argv, which sandbox environment
+/// cannot influence.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SupervisorIpv6EgressConfig {
+    /// AAAA handling for mediated policy DNS. Unset means the supervisor
+    /// default, `auto`.
+    pub policy_dns_ipv6_egress: Option<PolicyDnsIpv6Egress>,
+    /// NAT64 prefixes (RFC 6052) used by the sandbox network, for example
+    /// `64:ff9b:1::/96` or a network-specific `/96`. Addresses inside them
+    /// are classified by their embedded IPv4 address for SSRF checks. The
+    /// well-known prefix `64:ff9b::/96` is always recognized; the supervisor
+    /// also discovers the network's prefix through `ipv4only.arpa` (RFC 7050).
+    pub nat64_prefixes: Vec<String>,
+}
+
+impl SupervisorIpv6EgressConfig {
+    /// Validate prefix syntax and RFC 6052 lengths.
+    pub fn validate(&self) -> Result<(), String> {
+        self.parsed_nat64_prefixes().map(|_| ())
+    }
+
+    /// Parse the configured NAT64 prefixes.
+    pub fn parsed_nat64_prefixes(&self) -> Result<Vec<crate::net::nat64::Nat64Prefix>, String> {
+        self.nat64_prefixes
+            .iter()
+            .map(|raw| {
+                raw.parse::<crate::net::nat64::Nat64Prefix>()
+                    .map_err(|error| format!("nat64_prefixes: {error}"))
+            })
+            .collect()
+    }
+
+    /// Supervisor arguments for these settings. Call [`Self::validate`]
+    /// first; invalid prefixes are passed through for the supervisor to
+    /// reject.
+    #[must_use]
+    pub fn supervisor_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(mode) = self.policy_dns_ipv6_egress {
+            args.extend(["--policy-dns-ipv6-egress".to_string(), mode.to_string()]);
+        }
+        for prefix in &self.nat64_prefixes {
+            args.extend(["--nat64-prefix".to_string(), prefix.trim().to_string()]);
+        }
+        args
+    }
+}
+
 /// Gateway-minted sandbox JWT configuration.
 ///
 /// Points the gateway at the Ed25519 signing key (produced by `certgen`)
@@ -1106,8 +1205,9 @@ mod tests {
     use super::{
         AppArmorProfile, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
         GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
-        GatewayProviderProfileSourceConfig, ImagePullPolicy, PolicyValidationFailureMode,
-        UpstreamProxyConfig, default_sandbox_pids_limit, normalize_compute_driver_name,
+        GatewayProviderProfileSourceConfig, ImagePullPolicy, PolicyDnsIpv6Egress,
+        PolicyValidationFailureMode, SupervisorIpv6EgressConfig, UpstreamProxyConfig,
+        default_sandbox_pids_limit, normalize_compute_driver_name,
     };
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -1333,6 +1433,45 @@ mod tests {
                 "{invalid} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn supervisor_ipv6_egress_config_parses_and_builds_supervisor_args() {
+        let config: SupervisorIpv6EgressConfig = serde_json::from_str(
+            r#"{"policy_dns_ipv6_egress":"enabled","nat64_prefixes":["64:ff9b:1::/96","2001:db8:122:344::/64"]}"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.supervisor_args(),
+            [
+                "--policy-dns-ipv6-egress",
+                "enabled",
+                "--nat64-prefix",
+                "64:ff9b:1::/96",
+                "--nat64-prefix",
+                "2001:db8:122:344::/64",
+            ]
+        );
+        assert!(
+            SupervisorIpv6EgressConfig::default()
+                .supervisor_args()
+                .is_empty()
+        );
+        for bad in ["10.0.0.0/8", "2001:db8::/80", "nonsense"] {
+            let config = SupervisorIpv6EgressConfig {
+                nat64_prefixes: vec![bad.to_string()],
+                ..Default::default()
+            };
+            assert!(config.validate().is_err(), "{bad}");
+        }
+        assert!(
+            serde_json::from_str::<SupervisorIpv6EgressConfig>(
+                r#"{"policy_dns_ipv6_egress":"yes"}"#
+            )
+            .is_err()
+        );
+        assert_eq!("disabled".parse(), Ok(PolicyDnsIpv6Egress::Disabled));
     }
 
     #[test]
