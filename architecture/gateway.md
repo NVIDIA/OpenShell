@@ -1132,10 +1132,15 @@ controls through an extended interface.
 
 `ForwardTcp` is the client-facing byte stream for SSH and service forwarding.
 The first frame is a `TcpForwardInit` that carries the workspace-scoped sandbox
-name, an authorization token from `CreateSshSession`, and an explicit target:
-`target.ssh` for the sandbox SSH socket or `target.tcp` for a loopback service
-inside the sandbox. The gateway validates the token and sandbox readiness,
-sends a targeted `RelayOpen` to the supervisor, then bridges
+name and an explicit target: `target.ssh` for the sandbox SSH socket or
+`target.tcp` for a loopback service inside the sandbox. The gateway authorizes
+the caller's principal against the sandbox's workspace on every stream. SSH
+targets additionally require the `authorization_token` issued by
+`CreateSshSession`, because the process that opens them is an ssh
+`ProxyCommand` that holds nothing else. TCP targets carry no token, so a
+service forward costs no store access per connection and only the in-memory
+per-sandbox connection cap applies. The gateway then checks sandbox readiness,
+sends a targeted `RelayOpen` to the supervisor, and bridges
 `TcpForwardFrame::Data` to `RelayFrame::Data` until either side closes.
 
 Browser service URLs use the same supervisor relay path after host-based

@@ -2570,14 +2570,20 @@ impl Drop for ForwardConnectionGuard {
     fn drop(&mut self) {
         if let Some(token) = self.token.as_deref() {
             decrement_ssh_connection_count(&self.state.ssh_connections_by_token, token);
-            decrement_ssh_connection_count(
-                &self.state.ssh_connections_by_sandbox,
-                &self.sandbox_id,
-            );
         }
+        decrement_ssh_connection_count(&self.state.ssh_connections_by_sandbox, &self.sandbox_id);
     }
 }
 
+/// Reserve a relay slot for one `ForwardTcp` stream.
+///
+/// `target.tcp` streams are authorized by the caller's gateway principal, which
+/// `handle_forward_tcp` has already checked against the sandbox's workspace, so
+/// they carry no session token and touch no store: the only per-connection
+/// state is the in-memory per-sandbox connection count. `target.ssh` streams
+/// keep requiring the `CreateSshSession` token because the process that opens
+/// them is an ssh `ProxyCommand` that holds nothing else. A token supplied with
+/// a TCP target (older clients) is still validated and counted per token.
 async fn acquire_forward_connection_guard(
     state: &Arc<ServerState>,
     init: &TcpForwardInit,
@@ -2586,9 +2592,17 @@ async fn acquire_forward_connection_guard(
     let sandbox_id = sandbox.object_id().to_string();
     let token = init.authorization_token.trim();
     if token.is_empty() {
-        return Err(Status::unauthenticated(
-            "authorization_token is required for ForwardTcp",
-        ));
+        if !matches!(init.target, Some(tcp_forward_init::Target::Tcp(_))) {
+            return Err(Status::unauthenticated(
+                "authorization_token is required for SSH targets",
+            ));
+        }
+        acquire_sandbox_connection_slot(&state.ssh_connections_by_sandbox, &sandbox_id)?;
+        return Ok(ForwardConnectionGuard {
+            state: state.clone(),
+            token: None,
+            sandbox_id,
+        });
     }
 
     validate_ssh_forward_token(state, token, &sandbox_id).await?;
@@ -2602,7 +2616,7 @@ async fn acquire_forward_connection_guard(
     Ok(ForwardConnectionGuard {
         state: state.clone(),
         token: Some(token.to_string()),
-        sandbox_id: sandbox_id.clone(),
+        sandbox_id,
     })
 }
 
@@ -2634,15 +2648,15 @@ async fn validate_ssh_forward_token(
     Ok(())
 }
 
+const MAX_CONNECTIONS_PER_TOKEN: u32 = 3;
+const MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
+
 fn acquire_ssh_connection_slots(
     token_counts: &std::sync::Mutex<HashMap<String, u32>>,
     sandbox_counts: &std::sync::Mutex<HashMap<String, u32>>,
     token: &str,
     sandbox_id: &str,
 ) -> Result<(), Status> {
-    const MAX_CONNECTIONS_PER_TOKEN: u32 = 3;
-    const MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
-
     {
         let mut counts = token_counts.lock().unwrap();
         let count = counts.entry(token.to_string()).or_insert(0);
@@ -2654,18 +2668,28 @@ fn acquire_ssh_connection_slots(
         *count += 1;
     }
 
-    {
-        let mut counts = sandbox_counts.lock().unwrap();
-        let count = counts.entry(sandbox_id.to_string()).or_insert(0);
-        if *count >= MAX_CONNECTIONS_PER_SANDBOX {
-            decrement_ssh_connection_count(token_counts, token);
-            return Err(Status::resource_exhausted(
-                "sandbox SSH connection limit reached",
-            ));
-        }
-        *count += 1;
+    if let Err(status) = acquire_sandbox_connection_slot(sandbox_counts, sandbox_id) {
+        decrement_ssh_connection_count(token_counts, token);
+        return Err(status);
     }
 
+    Ok(())
+}
+
+/// Reserve one of the per-sandbox relay slots shared by SSH sessions and
+/// service forwards.
+fn acquire_sandbox_connection_slot(
+    sandbox_counts: &std::sync::Mutex<HashMap<String, u32>>,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    let mut counts = sandbox_counts.lock().unwrap();
+    let count = counts.entry(sandbox_id.to_string()).or_insert(0);
+    if *count >= MAX_CONNECTIONS_PER_SANDBOX {
+        return Err(Status::resource_exhausted(
+            "sandbox SSH connection limit reached",
+        ));
+    }
+    *count += 1;
     Ok(())
 }
 
@@ -4132,6 +4156,135 @@ mod tests {
             cmd.contains("'print('\"'\"'one'\"'\"')\r\nprint('\"'\"'two'\"'\"')'"),
             "CR/LF with embedded single quotes must compose correctly: {cmd}"
         );
+    }
+
+    fn forward_init(target: tcp_forward_init::Target, token: &str) -> TcpForwardInit {
+        TcpForwardInit {
+            sandbox: "sbx".to_string(),
+            workspace: String::new(),
+            service_id: String::new(),
+            target: Some(target),
+            authorization_token: token.to_string(),
+        }
+    }
+
+    fn loopback_tcp_target() -> tcp_forward_init::Target {
+        tcp_forward_init::Target::Tcp(TcpRelayTarget {
+            host: "127.0.0.1".to_string(),
+            port: 8080,
+        })
+    }
+
+    fn sandbox_connection_count(state: &ServerState, sandbox_id: &str) -> u32 {
+        state
+            .ssh_connections_by_sandbox
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn tcp_forward_without_token_is_admitted_on_the_principal_alone() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("fwd", Vec::new());
+
+        let guard = acquire_forward_connection_guard(
+            &state,
+            &forward_init(loopback_tcp_target(), ""),
+            &sandbox,
+        )
+        .await
+        .expect("tcp forward without a session token");
+
+        assert!(
+            guard.token.is_none(),
+            "no per-token accounting without a token"
+        );
+        assert!(state.ssh_connections_by_token.lock().unwrap().is_empty());
+        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 1);
+        drop(guard);
+        assert_eq!(
+            sandbox_connection_count(&state, sandbox.object_id()),
+            0,
+            "dropping the guard releases the sandbox slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_forward_without_token_is_rejected() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("fwd", Vec::new());
+
+        let err = acquire_forward_connection_guard(
+            &state,
+            &forward_init(tcp_forward_init::Target::Ssh(SshRelayTarget::default()), ""),
+            &sandbox,
+        )
+        .await
+        .err()
+        .expect("ssh targets keep requiring the session token");
+
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert_eq!(
+            err.message(),
+            "authorization_token is required for SSH targets"
+        );
+        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_forward_with_unknown_token_is_still_rejected() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("fwd", Vec::new());
+
+        let err = acquire_forward_connection_guard(
+            &state,
+            &forward_init(loopback_tcp_target(), "not-a-session"),
+            &sandbox,
+        )
+        .await
+        .err()
+        .expect("a supplied token is always validated");
+
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert_eq!(err.message(), "SSH session token not found");
+        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_forwards_without_token_share_the_per_sandbox_connection_cap() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("fwd", Vec::new());
+        let init = forward_init(loopback_tcp_target(), "");
+
+        let mut guards = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_SANDBOX {
+            guards.push(
+                acquire_forward_connection_guard(&state, &init, &sandbox)
+                    .await
+                    .expect("within the per-sandbox cap"),
+            );
+        }
+        let err = acquire_forward_connection_guard(&state, &init, &sandbox)
+            .await
+            .err()
+            .expect("cap reached");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(err.message(), "sandbox SSH connection limit reached");
+        assert_eq!(
+            sandbox_connection_count(&state, sandbox.object_id()),
+            MAX_CONNECTIONS_PER_SANDBOX
+        );
+
+        guards.pop();
+        let guard = acquire_forward_connection_guard(&state, &init, &sandbox)
+            .await
+            .expect("slot freed by a closed connection");
+        drop(guard);
+        drop(guards);
+        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
     }
 
     #[test]

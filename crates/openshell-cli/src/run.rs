@@ -2000,6 +2000,9 @@ pub async fn service_forward_tcp(
     let sandbox_name = name.to_string();
     let sandbox_workspace = workspace.to_string();
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::channel::<String>(1);
+    // Set once this forward learns that the gateway predates principal-authorized
+    // TCP forwards and still requires a `CreateSshSession` token per connection.
+    let legacy_session_tokens = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut health_check = tokio::time::interval(Duration::from_secs(2));
     health_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -2023,21 +2026,8 @@ pub async fn service_forward_tcp(
                 let target_host = target_host.to_string();
                 let service_id = format!("service-forward:{name}:{target_host}:{target_port}");
                 let fatal_tx = fatal_tx.clone();
+                let legacy_session_tokens = legacy_session_tokens.clone();
                 tokio::spawn(async move {
-                    let token = match create_forward_session_token(
-                        &mut client,
-                        &sandbox_name,
-                        &sandbox_workspace,
-                    ).await {
-                        Ok(token) => token,
-                        Err(err) => {
-                            tracing::warn!(peer = %peer, error = %err, "service forward session creation failed");
-                            if err.fatal {
-                                let _ = fatal_tx.send(err.message).await;
-                            }
-                            return;
-                        }
-                    };
                     if let Err(err) = forward_one_tcp_connection(
                         &mut client,
                         socket,
@@ -2046,7 +2036,7 @@ pub async fn service_forward_tcp(
                         target_host,
                         target_port,
                         service_id,
-                        token.clone(),
+                        legacy_session_tokens,
                     )
                     .await
                     {
@@ -2055,9 +2045,6 @@ pub async fn service_forward_tcp(
                             let _ = fatal_tx.send(err.message).await;
                         }
                     }
-                    let _ = client
-                        .revoke_ssh_session(RevokeSshSessionRequest { allow_missing: true, token })
-                        .await;
                 });
             }
         }
@@ -2079,6 +2066,14 @@ async fn create_forward_session_token(
         .await
         .map_err(ForwardTcpConnectionError::from_status)?;
     Ok(response.into_inner().token)
+}
+
+/// Older gateways reject a token-less `ForwardTcp` init with this
+/// `Unauthenticated` status; newer ones authorize TCP targets on the caller's
+/// principal and only demand a token for SSH targets.
+fn forward_requires_session_token(status: &Status) -> bool {
+    status.code() == Code::Unauthenticated
+        && status.message().contains("authorization_token is required")
 }
 
 async fn fetch_ready_sandbox_for_forward(
@@ -2182,37 +2177,120 @@ async fn forward_one_tcp_connection(
     target_host: String,
     target_port: u16,
     service_id: String,
-    authorization_token: String,
+    legacy_session_tokens: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::result::Result<(), ForwardTcpConnectionError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut init = TcpForwardInit {
+        sandbox: sandbox_name.clone(),
+        workspace: workspace.clone(),
+        service_id,
+        target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
+            host: target_host,
+            port: u32::from(target_port),
+        })),
+        // The gateway authorizes TCP forwards on this client's credentials for
+        // every stream, so no per-connection session token is minted unless the
+        // gateway turns out to predate that (`forward_requires_session_token`),
+        // which this forward remembers in `legacy_session_tokens`.
+        authorization_token: String::new(),
+    };
+
+    let mut session_token = None;
+    if legacy_session_tokens.load(std::sync::atomic::Ordering::Relaxed) {
+        match create_forward_session_token(client, &sandbox_name, &workspace).await {
+            Ok(token) => {
+                init.authorization_token.clone_from(&token);
+                session_token = Some(token);
+            }
+            Err(err) => {
+                drain_and_shutdown_local_socket(socket).await;
+                return Err(err);
+            }
+        }
+    }
+
+    let opened = match open_forward_tcp_stream(client, init.clone()).await {
+        Ok(opened) => opened,
+        Err(status) if session_token.is_none() && forward_requires_session_token(&status) => {
+            tracing::info!(
+                "gateway requires an SSH session token per forwarded connection; \
+                 minting one per connection for the rest of this forward"
+            );
+            legacy_session_tokens.store(true, std::sync::atomic::Ordering::Relaxed);
+            let token = match create_forward_session_token(client, &sandbox_name, &workspace).await
+            {
+                Ok(token) => token,
+                Err(err) => {
+                    drain_and_shutdown_local_socket(socket).await;
+                    return Err(err);
+                }
+            };
+            init.authorization_token.clone_from(&token);
+            session_token = Some(token);
+            match open_forward_tcp_stream(client, init).await {
+                Ok(opened) => opened,
+                Err(status) => {
+                    drain_and_shutdown_local_socket(socket).await;
+                    revoke_forward_session_token(client, session_token).await;
+                    return Err(ForwardTcpConnectionError::from_status(status));
+                }
+            }
+        }
+        Err(status) => {
+            drain_and_shutdown_local_socket(socket).await;
+            revoke_forward_session_token(client, session_token).await;
+            return Err(ForwardTcpConnectionError::from_status(status));
+        }
+    };
+
+    let result = bridge_local_socket_to_forward_stream(socket, opened).await;
+    revoke_forward_session_token(client, session_token).await;
+    result
+}
+
+/// An open `ForwardTcp` stream: the sender for local-to-gateway frames and the
+/// gateway-to-local response stream.
+type OpenForwardTcpStream = (
+    tokio::sync::mpsc::Sender<TcpForwardFrame>,
+    tonic::Streaming<TcpForwardFrame>,
+);
+
+async fn open_forward_tcp_stream(
+    client: &mut crate::tls::GrpcClient,
+    init: TcpForwardInit,
+) -> std::result::Result<OpenForwardTcpStream, Status> {
     use tokio_stream::wrappers::ReceiverStream;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
     tx.send(TcpForwardFrame {
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
-            TcpForwardInit {
-                sandbox: sandbox_name,
-                workspace: workspace.clone(),
-                service_id,
-                target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
-                    host: target_host,
-                    port: u32::from(target_port),
-                })),
-                authorization_token,
-            },
+            init,
         )),
     })
     .await
-    .map_err(|_| ForwardTcpConnectionError::transient("failed to initialize forward stream"))?;
+    .map_err(|_| Status::internal("failed to initialize forward stream"))?;
+    let response = client
+        .forward_tcp(ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+    Ok((tx, response))
+}
 
-    let mut response = match client.forward_tcp(ReceiverStream::new(rx)).await {
-        Ok(response) => response.into_inner(),
-        Err(status) => {
-            let err = ForwardTcpConnectionError::from_status(status);
-            drain_and_shutdown_local_socket(socket).await;
-            return Err(err);
-        }
-    };
+async fn revoke_forward_session_token(client: &mut crate::tls::GrpcClient, token: Option<String>) {
+    if let Some(token) = token {
+        let _ = client
+            .revoke_ssh_session(RevokeSshSessionRequest {
+                allow_missing: true,
+                token,
+            })
+            .await;
+    }
+}
+
+async fn bridge_local_socket_to_forward_stream(
+    socket: tokio::net::TcpStream,
+    (tx, mut response): OpenForwardTcpStream,
+) -> std::result::Result<(), ForwardTcpConnectionError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (mut local_read, mut local_write) = socket.into_split();
 
@@ -6402,8 +6480,8 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 mod tests {
     use super::{
         PolicyGetView, ProvisioningStep, build_sandbox_resource_limits, format_endpoint,
-        format_log_line, git_sync_files, has_main_process_result, parse_cli_setting_value,
-        parse_credential_expiry_cli_value, parse_driver_config_json,
+        format_log_line, forward_requires_session_token, git_sync_files, has_main_process_result,
+        parse_cli_setting_value, parse_credential_expiry_cli_value, parse_driver_config_json,
         parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
         proto_execution_timeout, provisioning_timeout_message, ready_false_condition_message,
         resolve_from, rootfs_tar_sources_supported_for_gateway, sandbox_should_persist,
@@ -8051,5 +8129,18 @@ mod tests {
         let message = "NET:OPEN [MED] DENIED /usr/bin/curl(4711) -> api.example.com:443";
         let log = log_line("OCSF", "ocsf", message, "sandbox", &[]);
         assert!(format_log_line(&log).ends_with(message));
+    }
+
+    #[test]
+    fn forward_requires_session_token_matches_only_the_legacy_gateway_error() {
+        assert!(forward_requires_session_token(&Status::unauthenticated(
+            "authorization_token is required for ForwardTcp"
+        )));
+        assert!(!forward_requires_session_token(&Status::unauthenticated(
+            "SSH session token not found"
+        )));
+        assert!(!forward_requires_session_token(&Status::permission_denied(
+            "authorization_token is required for ForwardTcp"
+        )));
     }
 }
