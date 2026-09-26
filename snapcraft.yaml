@@ -42,13 +42,6 @@ description: |
          openshell gateway add https://127.0.0.1:17670 --local --name openshell
          openshell status
 
-    On refresh, configs that explicitly enable plaintext or unauthenticated
-    access are replaced with the secure default. The gateway restarts
-    automatically during refresh to apply the new revision and config. This
-    interrupts active sandbox sessions. Users registered against the old HTTP
-    endpoint must remove that gateway registration and repeat step 2, or
-    rerun install.sh.
-
 base: core24
 grade: stable
 confinement: strict
