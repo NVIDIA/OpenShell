@@ -2,11 +2,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Replace insecure gateway configs on refresh, then restart the gateway so the
-# new config takes effect even when the previous revision used
-# refresh-mode: endure and kept its plaintext gateway running.
+# Replace insecure gateway configs on refresh. Revisions that used
+# refresh-mode: endure leave their plaintext gateway running through the
+# refresh, so restart it to apply the new config. With refresh-mode: restart,
+# snapd has already stopped the gateway and starts it after this hook; a
+# second restart would only interrupt sandboxes again.
 
 set -eu
 
+gateway="${SNAP_INSTANCE_NAME}.gateway"
+
 "${SNAP}/meta/hooks/install"
-snapctl restart "${SNAP_INSTANCE_NAME}.gateway"
+if snapctl services "$gateway" | awk 'NR == 2 { exit $3 != "active" }'; then
+	snapctl restart "$gateway"
+fi
