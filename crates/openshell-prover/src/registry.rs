@@ -100,15 +100,6 @@ pub struct BinaryProtocol {
     pub actions: Vec<BinaryAction>,
 }
 
-impl BinaryProtocol {
-    /// Whether any action in this protocol is a write or destructive action.
-    pub fn can_write(&self) -> bool {
-        self.actions
-            .iter()
-            .any(|a| matches!(a.action_type, ActionType::Write | ActionType::Destructive))
-    }
-}
-
 /// Capability descriptor for a single binary.
 #[derive(Debug, Clone)]
 pub struct BinaryCapability {
@@ -125,29 +116,6 @@ impl BinaryCapability {
     /// Whether any protocol bypasses L7 inspection.
     pub fn bypasses_l7(&self) -> bool {
         self.protocols.iter().any(|p| p.bypasses_l7)
-    }
-
-    /// Whether the binary can perform write actions.
-    pub fn can_write(&self) -> bool {
-        self.protocols.iter().any(BinaryProtocol::can_write) || self.can_construct_http
-    }
-
-    /// Short mechanisms by which this binary can write.
-    pub fn write_mechanisms(&self) -> Vec<String> {
-        let mut mechanisms = Vec::new();
-        for p in &self.protocols {
-            if p.can_write() {
-                for a in &p.actions {
-                    if matches!(a.action_type, ActionType::Write | ActionType::Destructive) {
-                        mechanisms.push(format!("{}: {}", p.name, a.name));
-                    }
-                }
-            }
-        }
-        if self.can_construct_http {
-            mechanisms.push("arbitrary HTTP request construction".to_owned());
-        }
-        mechanisms
     }
 }
 
