@@ -137,13 +137,16 @@ reach the private addresses they resolve to, unless the endpoint comes from an
 approved policy advisor proposal. Wildcard and hostless endpoints can reach
 private addresses only through `allowed_ips`.
 
-Loopback, link-local, and unspecified addresses, including the cloud metadata
-address `169.254.169.254`, are always blocked. `openshell policy update` rejects
-an `allowed_ips` entry that overlaps them, and in a complete policy such an
-entry blocks every connection to the endpoint. OpenShell also blocks the
-Kubernetes and etcd control-plane ports 2379, 2380, 6443, 10250, and 10255 on
-endpoints that use an exact hostname, an IP address, or `allowed_ips`. A rule
-for `host.openshell.internal` can still reach services on the gateway host.
+Network policy never authorizes an outbound endpoint whose destination is
+loopback, link-local, or unspecified, including the cloud metadata address
+`169.254.169.254`. This does not prevent a workload from connecting to a
+sandbox-local service listening on loopback. `openshell policy update` rejects
+an `allowed_ips` entry that overlaps the blocked ranges, and in a complete
+policy such an entry blocks every connection to the endpoint. OpenShell also
+blocks the Kubernetes and etcd control-plane ports 2379, 2380, 6443, 10250,
+and 10255 on endpoints that use an exact hostname, an IP address, or
+`allowed_ips`. A rule for `host.openshell.internal` can still reach services on
+the gateway host.
 
 #### Inspection Fields
 

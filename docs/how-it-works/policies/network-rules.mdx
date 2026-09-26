@@ -353,8 +353,11 @@ OpenShell blocks connections to private network addresses by default to prevent
 server-side request forgery (SSRF). An endpoint with an exact hostname can still
 reach the private addresses that its hostname resolves to, unless the endpoint
 comes from an approved [policy advisor](/how-it-works/policies/advisor)
-proposal. Loopback, link-local, and unspecified addresses, including the cloud
-metadata address `169.254.169.254`, are always blocked.
+proposal. Network policy never authorizes an outbound endpoint whose destination
+is loopback, link-local, or unspecified, including the cloud metadata address
+`169.254.169.254`. This restriction does not apply to sandbox-local loopback
+connections: a workload can reach a service listening on `127.0.0.1` in the
+same sandbox.
 
 Use `allowed_ips` to limit the addresses an endpoint can reach, or to let a
 wildcard host such as `*.internal.example` reach private addresses. This rule
