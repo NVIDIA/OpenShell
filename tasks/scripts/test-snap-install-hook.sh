@@ -99,9 +99,21 @@ common="${work}/post-refresh"
 mkdir -p "$common" "${work}/snap/meta/hooks"
 cp "$hook" "${work}/snap/meta/hooks/install"
 cp "${work}/legacy-edited-before" "$common/gateway.toml"
-SNAP="${work}/snap" SNAP_COMMON="$common" "${hook_dir}/post-refresh"
+mkdir -p "${work}/bin"
+cat >"${work}/bin/snapctl" <<EOF
+#!/bin/sh
+printf '%s\\n' "\$*" >>"${work}/snapctl.log"
+EOF
+chmod 755 "${work}/bin/snapctl"
+PATH="${work}/bin:$PATH" SNAP="${work}/snap" SNAP_COMMON="$common" \
+  SNAP_INSTANCE_NAME=openshell "${hook_dir}/post-refresh"
 if ! cmp -s "$expected" "$common/gateway.toml"; then
   echo "FAIL: post-refresh hook must migrate an edited insecure config" >&2
+  exit 1
+fi
+if [[ $(cat "${work}/snapctl.log") != "restart openshell.gateway" ]]; then
+  echo "FAIL: post-refresh hook must restart the gateway" >&2
+  cat "${work}/snapctl.log" >&2
   exit 1
 fi
 
