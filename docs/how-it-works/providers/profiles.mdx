@@ -827,7 +827,11 @@ openshell provider refresh status my-graph
 ```
 
 The status table includes `RECOVERY` and `FAILURE_CODE`. Clients should use the
-structured recovery action rather than parsing `LAST_ERROR`. For example,
+structured recovery action rather than parsing `LAST_ERROR`. Token endpoints
+that return an OAuth error body with an HTTP 2xx status (Slack's
+`oauth.v2.access`, for example) are classified the same way as RFC 6749
+error responses; issuer-specific error names are folded onto the closest
+`FAILURE_CODE` and preserved in the provider error subtype. For example,
 `oauth_invalid_grant` with recovery action `reauthorize` means the user must
 complete OAuth authorization again; `oauth_invalid_client` with
 `fix_configuration` means changing the user login alone will not repair the
