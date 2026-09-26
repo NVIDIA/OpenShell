@@ -1,0 +1,111 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Accessing Logs"
+description: "How to view sandbox logs through the CLI, TUI, and directly on the sandbox filesystem."
+keywords: "Generative AI, Cybersecurity, Logging, CLI, TUI, Observability"
+---
+
+OpenShell provides three ways to access sandbox logs: the CLI, the TUI, and direct filesystem access inside the sandbox.
+
+## CLI
+
+Use `openshell logs` to stream logs from a running sandbox:
+
+```shell
+openshell logs smoke-l4 --source sandbox
+```
+
+The CLI receives logs from the gateway over gRPC. Each line includes a timestamp, source, level, and message:
+
+```text
+[1775014132.118] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/curl(58) -> api.github.com:443 [policy:github_api engine:opa]
+[1775014132.190] [sandbox] [OCSF ] [ocsf] HTTP:GET [INFO] ALLOWED GET http://api.github.com/zen [policy:github_api]
+[1775014132.690] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(64) -> httpbin.org:443 [policy:- engine:opa]
+[1775014113.058] [sandbox] [INFO ] [openshell_sandbox] Starting sandbox
+```
+
+OCSF structured events show `OCSF` as the level. Standard tracing events show `INFO`, `WARN`, or `ERROR`.
+
+Gateway-originated policy mutations also appear in this stream. When the gateway merges `openshell policy update` operations or approves or removes draft policy chunks, it emits `gateway` `OCSF` `CONFIG:*` lines for the affected sandbox so you can see the exact logical change that produced a new policy revision.
+
+## TUI
+
+The TUI dashboard displays sandbox logs in real time. Logs appear in the log panel with the same format as the CLI.
+
+## Gateway Log Storage
+
+The sandbox pushes logs to the gateway over gRPC in real time. The gateway stores a bounded buffer of recent log lines per sandbox. This buffer is not persisted to disk and is lost when the gateway restarts.
+
+For durable log storage, use the log files inside the sandbox or enable [OCSF JSON export](/observability/ocsf-json-export) and ship the JSONL files to an external log aggregator.
+
+## Loss Awareness and Resume
+
+The watch stream behind `openshell logs` is loss-aware. Each resumable event (log line or platform event) carries an opaque `cursor` token. Status snapshots and warnings carry an empty cursor.
+
+Do not parse a cursor. The only supported operation is comparing two cursors observed on the same stream and keeping the greater one as the resume point. That comparison is a plain string comparison in any language.
+
+The gateway distinguishes recoverable from unrecoverable loss:
+
+- **Recoverable lag.** When a consumer falls behind and the gateway skips ahead in its buffer, the stream emits a warning event and keeps running. The warning is the signal that events were skipped.
+- **Unrecoverable gap.** When a client reconnects and asks to resume after a cursor the gateway has already trimmed from its buffer, the stream ends with an `OUT_OF_RANGE` status. The client should restart observation and, if it needs the missing lines, read them from the log files inside the sandbox.
+
+A cursor is bound to the cursor space that issued it. A gateway restart, teardown of the sandbox's buffers, or a reconnect that lands on a different gateway replica starts a new space, and cursors from the previous one no longer refer to anything. The gateway rejects them with `OUT_OF_RANGE` instead of treating them as caught up — which would silently suppress the new space's events. A malformed cursor is rejected with `INVALID_ARGUMENT`.
+
+`OUT_OF_RANGE` is terminal for that cursor. Restart the watch with an empty resume cursor; retrying the same one fails identically.
+
+On reconnect, a client passes the highest cursor it processed as the resume point. The gateway replays only events after that cursor — logs and platform events merged in order — then resumes live delivery. The handoff from replay to live delivery is exact: an event buffered while the stream was reopening is delivered once, never twice. It is not a guarantee that nothing was lost — a warning event or an `OUT_OF_RANGE` status still reports loss, both before and after a reconnect.
+
+The gateway merges the log and platform event sources before emitting, so events normally arrive in ascending cursor order. That applies to the buffered tail you receive when the stream opens, to a replay after a resume, and to live delivery. The gateway does not delay an event to wait for a lower cursor that has not been published yet, so a cursor can still arrive late under concurrent publication. Track the highest cursor seen as the resume point rather than the last one received.
+
+## Direct Filesystem Access
+
+Start an independent shell with `sandbox exec` to read log files directly:
+
+```text
+openshell sandbox exec --name my-sandbox --tty -- /bin/bash -l
+sandbox@my-sandbox:~$ cat /var/log/openshell.2026-04-01.log
+```
+
+Or run a one-off command without an interactive shell:
+
+```shell
+openshell sandbox exec --name my-sandbox -- cat /var/log/openshell.2026-04-01.log
+```
+
+`sandbox connect` attaches to the sandbox's existing canonical main process; it
+does not start a new shell.
+
+The log files inside the sandbox contain the complete record, including events that the gRPC push channel can drop under load. The push channel is bounded and drops events rather than blocking.
+
+## Filtering by Event Type
+
+The shorthand format is designed for `grep`. Some useful patterns:
+
+```shell
+# All denied connections
+grep "DENIED\|BLOCKED" /var/log/openshell.*.log
+
+# All network events
+grep "OCSF NET:" /var/log/openshell.*.log
+
+# All L7 enforcement decisions
+grep "OCSF HTTP:" /var/log/openshell.*.log
+
+# Security findings only
+grep "OCSF FINDING:" /var/log/openshell.*.log
+
+# Policy changes
+grep "OCSF CONFIG:" /var/log/openshell.*.log
+
+# All OCSF events, excluding standard tracing
+grep "^.* OCSF " /var/log/openshell.*.log
+
+# Events at medium severity or above
+grep "\[MED\]\|\[HIGH\]\|\[CRIT\]\|\[FATAL\]" /var/log/openshell.*.log
+```
+
+## Next Steps
+
+- Learn how the [log formats](/observability/logging) work and how to read the shorthand.
+- [Enable OCSF JSON export](/observability/ocsf-json-export) for machine-readable structured output.

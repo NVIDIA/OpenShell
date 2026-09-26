@@ -1,0 +1,615 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Network Rules"
+sidebar-title: "Network Rules"
+description: "Understand how OpenShell evaluates network rules, and adapt examples for REST APIs, package registries, internal services, WebSocket, GraphQL, MCP, and native TCP."
+keywords: "Generative AI, Cybersecurity, Policy, Network, REST, TCP, WebSocket, GraphQL, MCP, PyPI, npm"
+position: 2
+---
+
+Network rules control which destinations each binary in a sandbox can reach, and
+which requests it can send. They make up most of a typical policy. This page
+explains how OpenShell evaluates network rules, then gives example rules for
+common services and protocols that you can adapt.
+
+## How Network Rules Work
+
+OpenShell checks every outbound connection from a sandbox against the
+`network_policies` section of its policy, and denies any connection that no rule
+allows.
+
+### Rule Structure
+
+Each entry in `network_policies` is a rule. The entry's key is the rule's name,
+and the rule contains two lists. `endpoints` lists the destinations the rule
+allows, and `binaries` lists the executables that can connect to them. A rule
+allows every listed binary to reach every listed endpoint.
+
+For example, this rule is named `example_api` and lists two binaries and two
+endpoints:
+
+```yaml
+network_policies:
+  example_api:
+    endpoints:
+      - host: api.example.com
+        port: 443
+      - host: uploads.example.com
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+      - path: /usr/bin/wget
+```
+
+The rule allows these four combinations:
+
+| Binary | Endpoint |
+|---|---|
+| `/usr/bin/curl` | `api.example.com:443` |
+| `/usr/bin/curl` | `uploads.example.com:443` |
+| `/usr/bin/wget` | `api.example.com:443` |
+| `/usr/bin/wget` | `uploads.example.com:443` |
+
+If `wget` should reach only `api.example.com`, put that binary and endpoint in a
+separate rule.
+
+### Binary Matching
+
+When you write a network rule, list the path of the executable that opens the
+connection. This is not always the command you run. For example, `pip` is a
+Python script, so the process that connects to PyPI is the Python interpreter,
+and a rule for `pip install` must list the interpreter, not `/usr/bin/pip`.
+
+OpenShell identifies each process by the real path of its executable, as the
+kernel reports it, so list real paths rather than symlinks. For example, on
+Ubuntu 24.04, `/usr/bin/python3` is a symlink to `/usr/bin/python3.12`. To find
+the real path, run `readlink -f` on the path inside the sandbox. When OpenShell
+denies a connection, the sandbox log shows the path it identified. [Allow PyPI
+Downloads](#allow-pypi-downloads) and [Allow npm Installs](#allow-npm-installs)
+show rules that list interpreters.
+
+A rule also applies to processes that a listed binary starts. For example, if a
+rule lists an agent's executable, tools that the agent launches can use the rule
+too. A rule with an empty `binaries` list matches no binary and allows nothing.
+
+OpenShell records a hash of each executable the first time it takes part in a
+connection, and denies later connections if the file at that path changes.
+
+### Connection and Request Checks
+
+OpenShell checks network traffic in two stages:
+
+1. When a binary opens a connection, OpenShell checks the destination host and
+   port and the binary against your rules. If no rule matches, OpenShell denies
+   the connection.
+2. If the matching endpoint sets a request protocol, such as `rest`, OpenShell
+   also reads each request sent over the connection and checks it against the
+   endpoint's request rules.
+   For example, with `protocol: rest`, a rule can allow `GET` requests to an API
+   while blocking `POST` and `DELETE` requests.
+
+The second stage is called request inspection, and an endpoint that uses it is
+an inspected endpoint. The `protocol` field selects what OpenShell inspects:
+
+| `protocol` | What OpenShell checks in each request | Example |
+|---|---|---|
+| `rest` | HTTP method, path, and query parameters. | [REST](#allow-read-only-api-access) |
+| `websocket` | The WebSocket upgrade request and each text message the client sends. | [WebSocket](#allow-websocket-messages) |
+| `graphql` | GraphQL operation type, operation name, and top-level fields. | [GraphQL](#allow-graphql-operations) |
+| `mcp` | MCP method and tool name. | [MCP](#allow-mcp-tools) |
+| `json-rpc` | JSON-RPC method name. | [JSON-RPC rules](/how-it-works/policies/schema#json-rpc-rules) |
+| `tcp` | No request rules. Use it for clients that speak a protocol other than HTTP, such as databases. | [Native TCP](#allow-native-tcp) |
+| Omitted | No request rules. | -- |
+
+When `protocol` is omitted, OpenShell allows any method and path. Unless the
+endpoint sets `tls: skip`, it still terminates TLS and rejects HTTP requests
+that are addressed to another host or have malformed paths, such as paths that
+contain `%2F`. It relays traffic that is neither TLS nor HTTP without inspecting
+it. For a protocol in which the server sends first, such as SMTP, set
+`tls: skip`.
+
+Use an inspected endpoint when the request, not only the destination,
+determines the risk, such as allowing reads but not writes on an API.
+
+### Enforcement
+
+The `enforcement` field on an inspected endpoint decides what happens when a
+request breaks the endpoint's request rules:
+
+- `enforce` blocks the request. An HTTP client receives an OpenShell
+  `policy_denied` response.
+- `audit` allows the request and logs the violation. This is the default.
+
+Audit mode applies only to the endpoint's allow and deny rules. OpenShell still
+rejects requests that it cannot process safely, such as malformed requests and
+requests addressed to another host.
+
+Use `audit` to see what a new rule would block before you enforce it. Apply the
+rule with `enforcement: audit`, run your workload, then look for violation
+events in the sandbox log:
+
+```shell
+openshell logs my-sandbox --since 5m --source sandbox
+```
+
+Do not filter this log with `--level warn`, which hides policy events. When the
+log shows only the violations you expect, switch the endpoint to `enforce`,
+because an endpoint in audit mode does not block requests that break its rules.
+
+### Overlapping Rules
+
+Network rules are not an ordered firewall list. Several rules can match the same
+connection or request, and every matching rule adds the access it allows. A
+matching deny rule takes precedence over any allow, regardless of where either
+appears in the file. If one matching rule inspects requests and another does
+not, OpenShell inspects the connection, and the rule without `protocol` adds no
+request access. Endpoints that can match the same host and port must also agree
+on settings such as `tls` and `allowed_ips`, or OpenShell rejects the policy.
+
+For example, suppose one rule allows `GET /repos/**` on a host and another rule
+for the same host, port, and binary denies `GET /repos/private/**`. OpenShell
+denies requests under `/repos/private/`. When you restrict access, review every
+rule that could allow the request, including rules that providers contribute.
+[Allow Specific Methods and Paths](#allow-specific-methods-and-paths) shows a
+deny rule.
+
+### Network Access and Credentials
+
+A network rule that allows traffic to a destination does not allow OpenShell to
+send provider credentials there. OpenShell supplies a provider's credentials
+only to the destinations that the provider's profile or an explicit credential
+binding allows. When a request fails a credential check, correct the provider
+binding instead of widening the network rule. Refer to [Provider
+Profiles](/how-it-works/providers/profiles) for profile endpoints, and to
+[Credential Fields](/how-it-works/policies/schema#credential-fields) for
+explicit bindings.
+
+## Examples
+
+The following rules cover common services and protocols. Replace the example
+hosts, paths, and binaries with your own values, and make sure the sandbox
+contains the client executable.
+
+When a single `openshell policy update` command can create a rule, the example
+shows it. Otherwise, add the YAML under the `network_policies` section of a
+complete policy file and apply it with `openshell policy set`, as described in
+[Replace the Complete
+Policy](/how-it-works/policies/manage-policies#replace-the-complete-policy).
+After you apply a rule, [verify the
+change](/how-it-works/policies/manage-policies#verify-a-change) before testing
+traffic.
+
+### Allow Read-Only API Access
+
+Use this rule when a binary needs to read from an HTTP API but must not change
+anything. The `read-only` preset permits `GET`, `HEAD`, and `OPTIONS`.
+
+<Tabs>
+<Tab title="CLI">
+
+```shell
+openshell policy update my-sandbox \
+  --rule-name github_readonly \
+  --binary /usr/bin/curl \
+  --add-endpoint api.github.com:443:read-only:rest:enforce \
+  --wait
+```
+
+</Tab>
+<Tab title="YAML">
+
+```yaml
+github_readonly:
+  endpoints:
+    - host: api.github.com
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+  binaries:
+    - path: /usr/bin/curl
+```
+
+</Tab>
+</Tabs>
+
+Verify an allowed `GET` and a denied `POST`:
+
+```shell
+openshell sandbox exec -n my-sandbox --no-login-shell -- \
+  /usr/bin/curl --silent --show-error --fail \
+  https://api.github.com/zen
+openshell sandbox exec -n my-sandbox --no-login-shell -- \
+  /usr/bin/curl --silent --show-error \
+  --request POST https://api.github.com/zen
+```
+
+The `POST` must return an OpenShell `policy_denied` response. `read-only` is an
+HTTP method preset, not a guarantee that an upstream `GET` has no side effect.
+
+### Allow Specific Methods and Paths
+
+Use explicit `rules` instead of an access preset when a binary needs specific
+methods or paths, and `deny_rules` to block exceptions within them. This rule
+lets the GitHub CLI make any API request for one repository, except requests to
+its webhooks, which could send repository events to another destination. Replace
+`<org>` and `<repo>`, and keep only the executable paths used by your image:
+
+```yaml
+github_repository_api:
+  endpoints:
+    - host: api.github.com
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      rules:
+        - allow:
+            method: "*"
+            path: "/repos/<org>/<repo>/**"
+      deny_rules:
+        - method: "*"
+          path: "/repos/<org>/<repo>/hooks"
+        - method: "*"
+          path: "/repos/<org>/<repo>/hooks/**"
+  binaries:
+    - path: /usr/bin/gh
+    - path: /usr/local/bin/gh
+```
+
+In request paths, `*` matches within one path segment, and `**` written as a
+whole segment matches across segments, so `/repos/<org>/<repo>/**` covers every
+path under the repository but not `/repos/<org>/<repo>` itself. The deny rules
+list the webhooks path and everything under it separately for the same reason.
+The allow rule grants every HTTP method under the repository path, including
+writes, so narrow it if the agent needs only specific operations. It does not
+cover Git transport or GraphQL requests. To add a deny rule to an existing rule
+without a complete policy file, use `openshell policy update` with `--add-deny`,
+as described in [Add or Remove Network
+Access](/how-it-works/policies/manage-policies#add-or-remove-network-access).
+
+Apply the rule with a GitHub provider attached. Its profile must permit
+credential use at `api.github.com`, and the token must authorize the repository
+operations. Verify that `gh api repos/<org>/<repo>/issues` succeeds and that
+`gh api repos/<org>/<repo>/hooks` returns an OpenShell denial. For a complete
+Git push example, see [Grant GitHub Push Access to a Sandboxed
+Agent](/tutorials/github-push-access).
+
+### Allow PyPI Downloads
+
+Package managers download packages with `GET` requests, so a read-only REST rule
+allows installs while blocking uploads. `pip` is a Python script, so the rule
+lists the real path of the Python interpreter, and any Python program in the
+sandbox can use it. This rule lets `pip` and `uv` install packages from PyPI:
+
+```yaml
+pypi:
+  endpoints:
+    - host: pypi.org
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+    - host: files.pythonhosted.org
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+  binaries:
+    - path: /usr/bin/python3.12
+    - path: /usr/local/bin/uv
+```
+
+`/usr/bin/python3.12` is the interpreter on Ubuntu 24.04. To find yours, run
+`readlink -f /usr/bin/python3` inside the sandbox. If your image uses another
+interpreter, such as a uv-managed Python, list its real path or a glob that
+matches it, such as `/sandbox/.uv/python/*/bin/python3*`. For a private package
+index, replace the hosts with your index's hosts.
+
+For a sandbox with `pip` installed, verify that a download succeeds:
+
+```shell
+openshell sandbox exec -n my-sandbox --no-login-shell -- \
+  /usr/bin/python3 -m pip download --no-deps --dest /tmp/pypi-check requests
+```
+
+### Allow npm Installs
+
+Like `pip`, `npm` is a script, so the rule lists the Node.js interpreter. This
+rule lets `npm` install packages from the public npm registry. It lists
+`/usr/bin/node`, but official Node.js images install `node` at
+`/usr/local/bin/node`, so adjust the path for your image:
+
+```yaml
+npm_registry:
+  endpoints:
+    - host: registry.npmjs.org
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+      allow_encoded_slash: true
+  binaries:
+    - path: /usr/bin/node
+```
+
+npm requests scoped packages, such as `@types/node`, with an encoded slash in
+the path. OpenShell rejects `%2F` in request paths unless the endpoint sets
+`allow_encoded_slash: true`. npm also sends its security audit as a `POST`
+request, which the read-only preset denies. Run `npm install --no-audit`, or
+replace `access: read-only` with explicit rules that also allow the audit's
+`POST` requests. An endpoint cannot combine `access` and `rules`.
+
+Verify that a scoped package lookup succeeds:
+
+```shell
+openshell sandbox exec -n my-sandbox --no-login-shell -- \
+  /usr/bin/npm view @types/node version
+```
+
+### Restrict Destination Addresses
+
+OpenShell blocks connections to private network addresses by default to prevent
+server-side request forgery (SSRF). An endpoint with an exact hostname can still
+reach the private addresses that its hostname resolves to, unless the endpoint
+comes from an approved [policy advisor](/how-it-works/policies/advisor)
+proposal. Loopback, link-local, and unspecified addresses, including the cloud
+metadata address `169.254.169.254`, are always blocked.
+
+Use `allowed_ips` to limit the addresses an endpoint can reach, or to let a
+wildcard host such as `*.internal.example` reach private addresses. This rule
+allows read-only access to an internal API only at addresses in `10.20.0.0/16`:
+
+<Tabs>
+<Tab title="CLI">
+
+```shell
+openshell policy update my-sandbox \
+  --rule-name internal_api \
+  --binary /usr/bin/curl \
+  --add-endpoint 'api.internal.example:443:read-only:rest:enforce:allowed-ip=10.20.0.0/16' \
+  --wait
+```
+
+</Tab>
+<Tab title="YAML">
+
+```yaml
+internal_api:
+  endpoints:
+    - host: api.internal.example
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+      allowed_ips:
+        - 10.20.0.0/16
+  binaries:
+    - path: /usr/bin/curl
+```
+
+</Tab>
+</Tabs>
+
+When an endpoint sets `allowed_ips`, every address its hostname resolves to must
+fall within the list, including public addresses. Account for DNS rotation and
+service failover before pinning addresses. All endpoints that share a host and
+port must use the same `allowed_ips` list.
+
+Verify that a request to the service succeeds. If it is denied, the sandbox log
+shows the resolved address and reason. Review both the hostname and the address
+instead of broadening the range when an address changes.
+
+### Allow WebSocket Messages
+
+Use `protocol: websocket` to control WebSocket connections and the messages
+that clients send over them. This template requires `/usr/bin/node` and a
+WebSocket service you control. It permits the `/v1/realtime` upgrade and client
+text messages on that upgraded path, while denying `/v1/admin/**`:
+
+```yaml
+realtime:
+  endpoints:
+    - host: realtime.example.com
+      port: 443
+      protocol: websocket
+      enforcement: enforce
+      rules:
+        - allow:
+            method: GET
+            path: /v1/realtime
+        - allow:
+            method: WEBSOCKET_TEXT
+            path: /v1/realtime
+      deny_rules:
+        - method: "*"
+          path: /v1/admin/**
+  binaries:
+    - path: /usr/bin/node
+```
+
+Use your Node client to test a successful upgrade and text message on
+`/v1/realtime`, and a denied upgrade or message on `/v1/admin/**`. The path on a
+`WEBSOCKET_TEXT` rule is the original upgrade path, not text-frame content.
+
+OpenShell inspects complete client text messages. It does not inspect binary
+frames or messages from the server. If the endpoint carries provider
+credentials, OpenShell closes the connection with close code `1008` when the
+client sends a binary frame, because it cannot check the frame for credentials.
+Set `allow_uninspected_credentials: true` to relay binary frames anyway. Set
+`websocket_credential_rewrite: true` only when client text messages contain
+OpenShell credential placeholders that must be resolved.
+
+When new network rules take effect, OpenShell closes open WebSocket connections,
+so the client must reconnect. The client might receive close code `1012`, or the
+connection might close without a close frame.
+
+### Allow GraphQL Operations
+
+Use `protocol: graphql` to allow or deny GraphQL operations. APIs such as
+GitHub serve REST and GraphQL on the same host. A REST rule sees every GraphQL
+request as `POST /graphql`, so it cannot tell a query from a mutation. Give each
+API its own endpoint in one rule, and use the endpoint `path` field to send
+`/graphql` requests to the GraphQL rules. This rule allows read-only REST
+requests, GraphQL queries, and the `createIssue` mutation:
+
+```yaml
+github_api:
+  endpoints:
+    - host: api.github.com
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+    - host: api.github.com
+      port: 443
+      path: /graphql
+      protocol: graphql
+      enforcement: enforce
+      rules:
+        - allow:
+            operation_type: query
+        - allow:
+            operation_type: mutation
+            fields: [createIssue]
+  binaries:
+    - path: /usr/bin/gh
+```
+
+OpenShell selects the endpoint whose `path` most specifically matches the
+request, so requests to `/graphql` use the GraphQL rules and all other paths use
+the REST rules. An endpoint without `path` matches all paths. Endpoints that
+share a host and port must agree on `tls` and `allowed_ips`.
+
+For allow rules, every top-level field in an operation must match. A malformed
+or disallowed operation denies an entire batched request. GraphQL field names
+are application-specific, so review them against the service's schema before
+you rely on them. For deny rules, persisted queries, and GraphQL over WebSocket,
+refer to [GraphQL Rules](/how-it-works/policies/schema#graphql-rules).
+
+With a GitHub provider attached, verify a REST read with `gh api zen` and a
+query with `gh api graphql -f query='{ viewer { login } }'`, then confirm that a
+mutation other than `createIssue` returns an OpenShell denial.
+
+### Allow MCP Tools
+
+Use `protocol: mcp` for sandbox-to-server MCP Streamable HTTP requests. This
+template requires an MCP client that runs on the Python interpreter at
+`/usr/bin/python3.12`, and a Streamable HTTP server you control. It allows
+initialization, tool discovery, and `read_status`, while denying
+`delete_resource`:
+
+```yaml
+mcp_server:
+  endpoints:
+    - host: mcp.example.com
+      port: 443
+      path: /mcp
+      protocol: mcp
+      enforcement: enforce
+      rules:
+        - allow:
+            method: initialize
+        - allow:
+            method: notifications/initialized
+        - allow:
+            method: tools/list
+        - allow:
+            method: tools/call
+            tool: read_status
+      deny_rules:
+        - method: tools/call
+          tool: delete_resource
+  binaries:
+    - path: /usr/bin/python3.12
+```
+
+Verify initialization and `read_status` before confirming that `delete_resource`
+returns a policy denial. Tool argument matching is not supported, so an allowed
+tool can receive any arguments accepted by the server.
+
+Omitting `mcp.versions` allows only the `2025-11-25` revision. To support an
+older server, list the exact revisions it needs, as described in [MCP Version
+Selection](/how-it-works/policies/schema#mcp-version-selection). Server
+responses and SSE messages are relayed without MCP policy parsing. Do not put an
+MCP endpoint on the same host and port as an endpoint that uses a different
+protocol. `openshell policy update` rejects this combination.
+
+### Allow Native TCP
+
+Use `protocol: tcp` for a client that speaks a protocol other than HTTP, such
+as a database client. OpenShell checks the hostname, port, and executable but
+applies no request rules, so prefer an inspected protocol whenever the client
+supports one.
+
+On Debian and Ubuntu, `/usr/bin/psql` is a wrapper script that starts
+`/usr/lib/postgresql/<version>/bin/psql`, so this rule lists that path with a
+glob:
+
+<Tabs>
+<Tab title="CLI">
+
+```shell
+openshell policy update my-sandbox \
+  --rule-name postgres \
+  --binary '/usr/lib/postgresql/*/bin/psql' \
+  --add-endpoint db.internal.example:5432::tcp \
+  --wait
+```
+
+</Tab>
+<Tab title="YAML">
+
+```yaml
+postgres:
+  endpoints:
+    - host: db.internal.example
+      port: 5432
+      protocol: tcp
+  binaries:
+    - path: /usr/lib/postgresql/*/bin/psql
+```
+
+</Tab>
+</Tabs>
+
+Do not add `access`, `enforcement`, request rules, or credential-rewrite fields
+to a TCP endpoint. Verify that `psql` reaches the server, then verify that
+another binary or port is denied at the connection boundary. Use a client
+command that fails before application authentication when the rule is absent. A
+database authentication error can show that the TCP connection reached the
+server, but it does not prove that database credentials are correct.
+
+OpenShell prepares DNS and TCP handling when the sandbox starts, so you can add
+a TCP endpoint to a running sandbox without recreating it.
+
+Set `tls: skip` so that OpenShell relays the connection without examining it
+when the client starts TLS as soon as it connects, when the client must complete
+TLS itself, for example to present a client certificate, or when the server
+sends first, as with SMTP, IMAP, and MySQL. Clients that send first and
+negotiate TLS within their protocol, such as `psql`, do not need it. Refer to
+[Inspection Fields](/how-it-works/policies/schema#inspection-fields).
+
+Prefer exact hostnames. A wildcard authorizes DNS queries for every matching
+name, which can expose a DNS-label exfiltration channel. An allowed hostname on
+shared infrastructure can also reach other tenants or virtual services behind
+the same connection, because OpenShell cannot check which service a non-HTTP
+payload addresses.
+
+OpenShell answers DNS queries for the hosts in your rules with placeholder
+addresses whose TTL is at most 30 seconds. This applies to every endpoint, not
+only `protocol: tcp`. The sandbox applies no DNS search domains, so request each
+hostname exactly as your rules name it. Clients must resolve the hostname again
+before reconnecting. A client that caches an address indefinitely can fail
+after it expires, even while the endpoint remains allowed. OpenShell returns an
+empty answer to AAAA queries, so dual-stack clients must fall back to the A
+record.
+
+## Next Steps
+
+- Use [Manage Sandbox Policies](/how-it-works/policies/manage-policies) to
+  apply, verify, and roll back policy changes.
+- Use the [Policy Schema Reference](/how-it-works/policies/schema) for protocol
+  defaults, field constraints, and matcher semantics.
+- Use [Troubleshoot](/how-it-works/policies/manage-policies#troubleshoot) when a
+  request is denied unexpectedly.

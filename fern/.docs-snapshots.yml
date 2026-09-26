@@ -4,9 +4,9 @@ snapshots:
     source-sha: 4ce767fc0cadad773c398e15109c0286f4b7aa30
     version: 0.1.1
   latest:
-    source-ref: 496ebba293f5cc2bb2753444dddd534f0b4aeb6a
-    source-sha: 496ebba293f5cc2bb2753444dddd534f0b4aeb6a
-    version: 0.1.0
+    source-ref: 4ce767fc0cadad773c398e15109c0286f4b7aa30
+    source-sha: 4ce767fc0cadad773c398e15109c0286f4b7aa30
+    version: 0.1.1
   v0.1.0:
     source-ref: 496ebba293f5cc2bb2753444dddd534f0b4aeb6a
     source-sha: 496ebba293f5cc2bb2753444dddd534f0b4aeb6a
@@ -15,3 +15,7 @@ snapshots:
     source-ref: d00f1fdf0c616a4a0debc9e5c0464ffd93175021
     source-sha: d00f1fdf0c616a4a0debc9e5c0464ffd93175021
     version: 0.0.116
+  v0.1.1:
+    source-ref: 4ce767fc0cadad773c398e15109c0286f4b7aa30
+    source-sha: 4ce767fc0cadad773c398e15109c0286f4b7aa30
+    version: 0.1.1
