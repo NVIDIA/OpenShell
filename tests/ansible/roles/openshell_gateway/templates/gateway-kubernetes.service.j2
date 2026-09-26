@@ -1,0 +1,10 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. #}
+{# SPDX-License-Identifier: Apache-2.0 #}
+{% extends "gateway.service.j2" %}
+{% block unit %}
+Requires=k3s.service
+After=k3s.service
+{% endblock %}
+{% block service %}
+Environment=KUBECONFIG={{ kubeconfig }}
+{% endblock %}

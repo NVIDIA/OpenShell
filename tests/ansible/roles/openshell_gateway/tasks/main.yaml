@@ -4,6 +4,7 @@
 ---
 - name: Detect container runtime
   ansible.builtin.include_tasks: detect.yaml
+  when: openshell_gateway_driver is not defined
 
 - name: Create OpenShell state directory
   become: true
@@ -21,6 +22,10 @@
 - name: Prepare Podman gateway
   ansible.builtin.include_tasks: podman.yaml
   when: openshell_gateway_driver == "podman"
+
+- name: Prepare Kubernetes gateway
+  ansible.builtin.include_tasks: kubernetes.yaml
+  when: openshell_gateway_driver == "kubernetes"
 
 - name: Create OpenShell configuration directory
   become: true

@@ -280,6 +280,27 @@ independent from binary or package installation and lets multiple installers
 reuse the same prepared setup disk. The `none` installer skips OpenShell
 installation and boots the prepared environment directly.
 
+The `ubuntu-k3s` environment provisions a pinned k3s release on Ubuntu 24.04
+and requires the API and node to report Ready before installation begins. It
+passes a guest-local kubeconfig path and namespace as environment values to
+the independent `kubernetes-binaries` installer and the shared `conformance`
+testsuite. That installer imports the candidate sandbox and supervisor images
+into k3s and starts the candidate gateway with the Kubernetes driver. The
+kubeconfig stays inside the guest with mode `0600` and is never an artifact.
+Unlike Docker and Podman environments, this environment runs setup and
+installation on a disposable overlay disk, so cluster state and credentials
+cannot enter the reusable setup or install caches. Failed runs collect bounded,
+redacted systemd, k3s, Kubernetes, gateway, and sandbox state before removing
+the guest; CI uploads that diagnostic record as an artifact. Kubernetes
+diagnostic requests have individual timeouts, and completed sections stream
+directly to the artifact so an overall collection timeout retains earlier evidence.
+
+Run the Kubernetes composition locally after staging the candidate inputs:
+
+```shell
+nix run .#tmachine -- test ubuntu-k3s kubernetes-binaries conformance
+```
+
 ### Interactive tmachine shell
 
 The test command is `tmachine test <environment> <installer> <testsuite>`. The
@@ -301,7 +322,7 @@ nix run .#tmachine -- test ubuntu-docker-rootful deb shell
 
 Exit the SSH session to shut down and discard the disposable guest.
 
-The `tests/tmachine` setup and install caches include a digest of the
+For cached environments, the `tests/tmachine` setup and install caches include a digest of the
 entire directory containing `ANSIBLE_CONFIG`, including local roles, task
 includes, templates, inventory, and requirements. The digest uses sorted
 relative paths, file contents, and executable permissions; source symlinks
@@ -311,6 +332,9 @@ include named artifact inputs. The top-level `.roles` directory is excluded:
 Galaxy release pins in `requirements.yaml` are treated as immutable, including
 any transitive dependency pins. Cache misses with Galaxy enabled reinstall
 the required roles and their dependencies before running playbooks.
+Cache publication requires a graceful guest shutdown. A forced termination
+still cleans up a disposable guest, but fails cache creation so an unclean disk
+cannot become a reusable setup or install layer.
 
 The `tests/artifacts.nix` helpers build the CLI, conformance CLI, and sandbox
 with musl, and the gateway and supervisor with GNU. Image assembly stages

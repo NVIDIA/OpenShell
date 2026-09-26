@@ -44,6 +44,22 @@ let
         };
       }
       {
+        name = "ubuntu-k3s";
+        machine = "ubuntu";
+        ephemeral = true;
+        variables = {
+          kubeconfig = "/home/tmachine/.kube/config";
+          kubernetes_namespace = "openshell";
+        };
+        setup = {
+          use_galaxy = false;
+          playbooks = [
+            "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/k3s.yaml"
+          ];
+        };
+      }
+      {
         name = "fedora-podman-rootful";
         machine = "fedora";
         setup = {
@@ -98,6 +114,20 @@ let
         ];
         inputs = {
           openshell_deb = "../artifacts/packages/openshell.deb";
+          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+        };
+      }
+      {
+        name = "kubernetes-binaries";
+        use_galaxy = false;
+        playbooks = [
+          "ansible/playbooks/openshell.yaml"
+          "ansible/playbooks/gateway-kubernetes.yaml"
+        ];
+        inputs = {
+          openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
+          openshell_gateway_binary = "../artifacts/binaries/${gnuTarget}/openshell-gateway";
           openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
           openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
         };

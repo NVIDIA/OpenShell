@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Download pinned Agent Sandbox controller manifest
+  become: true
+  ansible.builtin.get_url:
+    url: https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.3/sandbox.yaml
+    dest: /var/lib/openshell/agent-sandbox.yaml
+    checksum: sha256:725fafdabe6aac202a89dc57f1cfe0e2e92f3164c8c2bd343fffca52f7039d96
+    mode: "0644"
+
+- name: Install Agent Sandbox CRDs and controller
+  ansible.builtin.command:
+    argv:
+      - k3s
+      - kubectl
+      - apply
+      - -f
+      - /var/lib/openshell/agent-sandbox.yaml
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  changed_when: true
+
+- name: Wait for Agent Sandbox controller
+  ansible.builtin.command:
+    argv:
+      - k3s
+      - kubectl
+      - -n
+      - agent-sandbox-system
+      - rollout
+      - status
+      - deployment/agent-sandbox-controller
+      - --timeout=300s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  changed_when: false
+
+- name: Create OpenShell sandbox namespace
+  ansible.builtin.command:
+    argv:
+      - k3s
+      - kubectl
+      - create
+      - namespace
+      - "{{ kubernetes_namespace }}"
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+- name: Copy candidate runtime images
+  become: true
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "/var/lib/openshell/{{ item.name }}.tar"
+    owner: tmachine
+    group: tmachine
+    mode: "0600"
+  loop:
+    - name: sandbox
+      src: "{{ openshell_sandbox_image }}"
+    - name: supervisor
+      src: "{{ openshell_supervisor_image }}"
+
+- name: Import candidate runtime images into k3s
+  become: true
+  ansible.builtin.command:
+    argv:
+      - k3s
+      - ctr
+      - -n
+      - k8s.io
+      - images
+      - import
+      - "/var/lib/openshell/{{ item }}.tar"
+  loop:
+    - sandbox
+    - supervisor

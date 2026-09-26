@@ -1,0 +1,16 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. #}
+{# SPDX-License-Identifier: Apache-2.0 #}
+{% extends "gateway.toml.j2" %}
+{% block driver %}
+[openshell.drivers.kubernetes]
+namespace = "{{ kubernetes_namespace }}"
+workspace_mode = "shared"
+grpc_endpoint = "http://{{ openshell_gateway_guest_ip }}:17670"
+sandbox_runtime_image = "docker.io/openshell/sandbox:tmachine"
+sandbox_runtime_image_pull_policy = "Never"
+supervisor_image = "docker.io/openshell/supervisor:tmachine"
+supervisor_image_pull_policy = "Never"
+
+[openshell.drivers.kubernetes.sandbox_runtime]
+network_policy_enforced = true
+{% endblock %}
