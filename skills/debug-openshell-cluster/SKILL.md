@@ -421,17 +421,85 @@ kubectl -n <namespace> get deployment,service,pod -l app.kubernetes.io/name=<pos
 kubectl -n <namespace> logs deployment/<postgres-workload> --tail=200
 ```
 
-Multi-replica gateways serialize cross-object sandbox and provider mutations
-with a PostgreSQL advisory lock. If those RPCs stall while ordinary reads and
-health checks remain responsive, inspect long-running database sessions and
-advisory-lock waiters. Do not print the database URI or Secret contents into
-logs:
+Gateways that use an external PostgreSQL database guard cross-object
+mutations with PostgreSQL advisory locks at three levels: one global key, one
+key per workspace, and one key per sandbox, each taken shared or exclusive.
+Sandbox operations on different sandboxes do not wait on each other's locks;
+provider and workspace-profile changes block sandbox operations in their
+workspace; gateway-global policy and settings changes block everything. Each
+replica takes its advisory locks on a dedicated pool of 4 PostgreSQL
+connections, one per guard, so at most 4 guarded operations per replica hold
+or wait for PostgreSQL locks at once. A guard that waits on a PostgreSQL lock
+keeps its connection while it waits, so contention on one key can fill the
+pool and make unrelated guarded operations on that replica queue for a
+connection, within the same 10-second limit.
+
+A lock wait longer than 10 seconds returns `UNAVAILABLE` with reason
+`MUTATION_LOCK_TIMEOUT` and the message "... timed out waiting for a
+concurrent mutation; retry the request", logs
+`mutation lock acquisition timed out` with `scope`, `waited_ms`, and `detail`
+fields, and increments `openshell_server_mutation_lock_timeouts_total`. The
+`detail` field says where the wait stopped:
+
+- `waiting for a local mutation lock`: another operation on the same replica
+  holds a conflicting key.
+- `waiting for a mutation lock connection`: all 4 lock-pool connections of that
+  replica were in use. `pg_locks` shows no row for the timed-out operation.
+  Look for the pod's granted or waiting advisory-lock rows by `client_addr`,
+  and find the holder they wait on.
+- `waiting for a PostgreSQL advisory lock`, or PostgreSQL's own
+  `canceling statement due to lock timeout`: a conflicting key is held on
+  another connection, usually by another replica or by an older gateway during
+  an upgrade. `pg_locks` shows the holder and the waiters.
+
+A gateway log line `timed out returning PostgreSQL mutation lock connection;
+discarded connection` means returning a lock session stalled for 5 seconds and
+the gateway dropped it; that slot stays busy for up to those 5 seconds. The
+warning does not identify the PostgreSQL backend. Healthy guards also hold
+idle advisory-lock sessions while validation and writes use separate data
+connections. Neither an idle duration nor a matching `client_addr` proves
+that a holder is orphaned, even when it blocks a timed-out request.
+
+Before using `SELECT pg_terminate_backend(<pid>)`, conclusively map that
+backend to its owning gateway process and confirm that process has stopped
+or can no longer write. If the owner is still running, stop it first and
+verify its exit; draining or failing readiness alone is insufficient. Killing
+its lock session while it can still write removes exclusion from an active
+mutation. Recheck the backend PID and `backend_start` before terminating the
+confirmed orphan: pod IPs and PIDs can be reused, and a database proxy can
+hide several gateways behind one `client_addr`. If ownership cannot be
+established, investigate connectivity instead of choosing a backend by IP or
+idle state. Setting PostgreSQL
+`tcp_keepalives_idle`, `tcp_keepalives_interval`, and `tcp_keepalives_count`
+(for example 60, 10, and 6) bounds how long such sessions survive.
+
+If mutations stall or time out while reads and health checks work, inspect
+advisory-lock holders and waiters. Do not print the database URI or Secret
+contents into logs:
 
 ```sql
-SELECT pid, granted, waitstart
-FROM pg_locks
-WHERE locktype = 'advisory';
+SELECT l.pid, l.mode, l.granted, l.waitstart, l.classid, l.objid,
+       a.client_addr, a.backend_start, a.state,
+       now() - a.state_change AS in_state_for
+FROM pg_locks l
+JOIN pg_stat_activity a USING (pid)
+WHERE l.locktype = 'advisory'
+ORDER BY l.granted, l.waitstart;
 ```
+
+Gateways hold these locks at session level outside any transaction, so a
+holder (`granted = t`) usually shows `state = idle`. It still holds the lock,
+and `in_state_for` approximates how long. `client_addr` is the holding
+gateway pod's IP, or the pooler's IP when a connection pooler sits in between.
+
+The global key appears as `classid = 1330660686` and `objid = 1397247052`
+(key `0x4F50454E53484C4C`). Older gateways during a rolling upgrade take that
+key exclusively for every guarded mutation, so mutations can queue behind
+them until the rollout finishes.
+
+If a client following a sandbox through one replica misses changes made
+through another replica, check that replica's logs for `sandbox watch poller`
+warnings and its `openshell_server_sandbox_watch_poll_errors_total` counter.
 
 For multi-replica gateway installs, supervisor and client session traffic may
 be served by a non-owner gateway replica and relayed to the current supervisor
@@ -468,6 +536,60 @@ name and load the chart CA plus client identity from
 `OPENSHELL_PEER_TLS_KEY_FILE`. If peer calls fail during TLS negotiation, verify
 the `peer-client-tls` volume exists, those files are readable, and the server
 certificate includes the name in `OPENSHELL_PEER_TLS_SERVER_NAME`.
+
+Gateway pods that use an external PostgreSQL database budget 25 seconds for
+supervisor drain and cleanup: a 3-second propagation delay, closes spread
+over at most 12 seconds, then up to 10 seconds of session cleanup. This does
+not bound other compute-driver cleanup or final trace export; allow for those
+when sizing the termination grace period. Gateways on the default SQLite
+database skip the drain. A lone replica on PostgreSQL, such as a single-replica StatefulSet,
+still drains even though no other replica takes its sessions, so it takes up to
+15 seconds longer to stop. A StatefulSet starts the replacement pod only after
+the old one exits, so its sandboxes stay unreachable up to 15 seconds longer
+on every restart, and supervisors in reconnect backoff can take up to 30 more
+seconds, their maximum retry delay, after the new pod is ready. A drain that
+ran to completion logs
+"Draining supervisor sessions before stopping the gateway listener" and then
+"Supervisor session drain finished; stopping gateway listener". If the second
+line is missing, the termination grace period cut the drain short. Check the
+grace period, the drain, and per-pod capacity:
+
+```bash
+kubectl -n openshell get "${GATEWAY_DEPLOYMENT}" \
+  -o jsonpath='{.spec.template.spec.terminationGracePeriodSeconds}{"\n"}'
+kubectl -n openshell logs <terminating-gateway-pod> -c openshell-gateway --tail=200 \
+  | grep -E 'Draining supervisor sessions|Supervisor session drain finished|mutation lock acquisition timed out'
+for pod in $(kubectl -n openshell get pod \
+    -l app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell \
+    -o jsonpath='{range .items[?(@.spec.containers[0].name=="openshell-gateway")]}{.metadata.name}{" "}{end}'); do
+  echo "${pod}"
+  kubectl get --raw "/api/v1/namespaces/openshell/pods/${pod}:9090/proxy/metrics" \
+    | grep -E '^openshell_server_(supervisor_sessions|draining|relay_pending|relay_rejected_total|mutation_lock_timeouts_total)'
+done
+kubectl -n openshell get hpa
+kubectl -n openshell describe hpa openshell
+```
+
+The JSONPath filter keeps only pods whose first container is the gateway
+(`openshell-gateway`). It skips certificate hook Job pods, which older charts
+labeled like gateway pods. The metrics port is `service.metricsPort` (default
+`9090`). Read a stopping pod's logs while it is terminating, because a deleted
+pod's logs are gone.
+
+The API server proxy connects to each pod from the control plane. A
+NetworkPolicy that accepts the metrics port only from a monitoring namespace
+blocks it unless the policy also allows the control plane. In that case,
+read one pod at a time through `kubectl port-forward`, which reaches the pod
+through the kubelet and is not blocked by NetworkPolicy:
+
+```bash
+kubectl -n openshell port-forward pod/<gateway-pod> 9090:9090 >/dev/null &
+pf_pid=$!
+sleep 2
+curl -s http://localhost:9090/metrics \
+  | grep -E '^openshell_server_(supervisor_sessions|draining|relay_pending|relay_rejected_total|mutation_lock_timeouts_total)'
+kill "${pf_pid}"
+```
 
 Check required Helm deployment secrets:
 
@@ -912,6 +1034,15 @@ credential failures.
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
+| Sandboxes switch to `Provisioning` for a second or two during a gateway rollout, and new exec, SSH, or forward requests to them fail with `FAILED_PRECONDITION` `sandbox is not ready` (service URLs return `412`) | Expected: the stopping replica moved their supervisor sessions, and requests during the move fail the readiness check. A reconnect that takes more than a few seconds can also show the `Ready` condition as `DependenciesNotReady` while the workload keeps running | Retry. The sandboxes should return to `Ready`; if not, check Service endpoints, gateway logs, and `openshell_server_supervisor_sessions` per pod |
+| Exec or forwarding to older sandboxes fails for up to 30 seconds during rollouts | Supervisors from earlier releases wait longer between reconnect attempts | Recreate those sandboxes to pick up the current supervisor |
+| Gateway pod exits with code 137 during a rollout, or its log has "Draining supervisor sessions" without "Supervisor session drain finished" | `podLifecycle.terminationGracePeriodSeconds` is shorter than the drain (often 5 after `helm upgrade --reuse-values`) | Workload `terminationGracePeriodSeconds`; set it to 30 |
+| A single-replica gateway on PostgreSQL takes up to 15 seconds longer to stop, and a single-replica StatefulSet leaves sandboxes unreachable that much longer on every restart, with some supervisors reconnecting up to 30 seconds after the new pod is ready | Expected: every gateway on an external PostgreSQL database drains, even when no other replica can take its sessions, a StatefulSet starts the replacement pod only after the old one exits, and supervisors back off (up to 30 seconds between attempts) while no replica is ready | None; the drain adds at most 15 seconds and the backoff at most 30 seconds after the new pod is ready. Run more than one replica to keep sandboxes reachable during restarts |
+| Many sandboxes take longer than 15 seconds to reconnect during a rollout | A draining replica held more sessions than the others can absorb without lock queuing (about 500) | `openshell_server_supervisor_sessions` per pod before the rollout, `openshell_server_mutation_lock_wait_seconds`; add replicas |
+| Mutating RPCs return `UNAVAILABLE` with "timed out waiting for a concurrent mutation" | Advisory-lock contention, a full 4-connection lock pool on one replica, a slow PostgreSQL, or older gateways still running during an upgrade | `openshell_server_mutation_lock_timeouts_total`, the `detail` field of `mutation lock acquisition timed out` in gateway logs, the `pg_locks` query in Step 6 |
+| `helm upgrade` fails with an `autoscaling.*` message | HPA values invalid: missing `resources.requests` (or `resources.limits`), `maxReplicas` above 1 without `server.externalDbSecret` (or on a StatefulSet without `workload.allowMultiReplicaStatefulSet`), no metric target, or min/max out of order. "`minReplicas` and `maxReplicas` are not set" means `--reuse-values` kept a release without the chart's autoscaling defaults | Fix the values named in the error; upgrade with `--reset-then-reuse-values` instead of `--reuse-values` |
+| HPA shows `<unknown>` targets | No metrics-server for CPU/memory, or the metrics adapter does not serve the custom metric | `kubectl -n openshell describe hpa openshell`, `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1` |
+| One replica holds most sessions after a rollout | Expected: sessions stay where they reconnected | `openshell_server_supervisor_sessions` per pod; it fades as sandboxes are recreated |
 | OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `podSecurityContext`/`securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `podSecurityContext: null` and clear `securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
 | OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | The `openshell-sandbox` service account lacks the privileged SCC it needs | `oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell`; remove with `remove-scc-from-user` when done |
 | OpenShift self-hosted Vault/OpenBao credential store pod never schedules (waits time out with `no matching resources found`) | The store's Helm chart pins `runAsUser`/`fsGroup`/seccomp, which restricted-v2 rejects, so the StatefulSet controller never creates the pod | Deploy the store's chart in its OpenShift mode (`--set global.openshift=true` for the OpenBao/Vault chart) so the namespace SCC assigns a compliant security context — no manual SCC grant needed |

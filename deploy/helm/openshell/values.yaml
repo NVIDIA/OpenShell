@@ -192,8 +192,55 @@ agentSandbox:
 
 # Pod restart behavior and health probe tuning.
 podLifecycle:
-  # -- Grace period, in seconds, before Kubernetes terminates the gateway pod.
-  terminationGracePeriodSeconds: 5
+  # -- Grace period, in seconds, before Kubernetes kills the gateway pod after
+  # SIGTERM. A gateway that uses an external PostgreSQL database
+  # (server.externalDbSecret) moves its supervisor sessions to the other
+  # replicas during this window. The drain is sized to finish within 30
+  # seconds; lower values cut it short. Gateways on the default SQLite database
+  # exit as soon as shutdown cleanup finishes.
+  terminationGracePeriodSeconds: 30
+
+# Optional HorizontalPodAutoscaler (autoscaling/v2) for the gateway workload.
+# When enabled, the Deployment or StatefulSet omits spec.replicas and the HPA
+# owns the replica count; replicaCount is ignored. Multi-replica limits
+# (server.externalDbSecret, and workload.allowMultiReplicaStatefulSet for a
+# StatefulSet) apply to maxReplicas. Scaling out does not move established
+# supervisor sessions; read the High Availability guide before choosing metrics.
+# The workload can drop to one replica when you enable this on an existing
+# release, until the HPA scales it back up; read the chart README before you
+# upgrade.
+autoscaling:
+  # -- Render a HorizontalPodAutoscaler and stop rendering spec.replicas.
+  enabled: false
+  # -- Minimum gateway replicas. Use 2 or more to survive a pod failure.
+  minReplicas: 2
+  # -- Maximum gateway replicas. Each replica opens its own PostgreSQL
+  # connection pools; size the database for this count.
+  maxReplicas: 4
+  # -- Target average CPU utilization, as a percentage of
+  # resources.requests.cpu. Set to null to disable. Requires
+  # resources.requests.cpu, or resources.limits.cpu, which Kubernetes copies
+  # into the request.
+  targetCPUUtilizationPercentage: 80
+  # -- (int) Target average memory utilization, as a percentage of
+  # resources.requests.memory. Null disables it. Requires
+  # resources.requests.memory, or resources.limits.memory, which Kubernetes
+  # copies into the request.
+  targetMemoryUtilizationPercentage: null
+  # -- Additional autoscaling/v2 MetricSpec entries appended verbatim, such as
+  # Pods metrics served by prometheus-adapter.
+  metrics: []
+  # -- HPA scaling behavior. Scale-down drains supervisor sessions, so the
+  # default removes at most one replica every two minutes after a
+  # five-minute stabilization window. Helm merges maps: set
+  # autoscaling.behavior.scaleDown to null to drop the default.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
 
 probes:
   startup:

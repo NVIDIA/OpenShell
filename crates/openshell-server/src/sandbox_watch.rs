@@ -5,12 +5,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use metrics::{counter, gauge, histogram};
 use openshell_core::proto::SandboxStreamWarning;
 use tokio::sync::{broadcast, watch};
 
-use crate::persistence::Store;
+use crate::gateway_metrics;
+use crate::persistence::{ObjectType, PersistenceResult, Store};
 use openshell_core::proto::Sandbox;
 
 /// How often [`spawn_store_poller`] rechecks watched sandboxes for writes made
@@ -78,11 +80,148 @@ impl SandboxWatchBus {
     }
 }
 
+/// Source of authoritative sandbox resource versions for the cross-replica
+/// watch poller. [`Store`] is the production implementation; tests supply
+/// fakes that count lookups and inject failures.
+trait SandboxVersionSource: Sync {
+    /// Current `resource_version` of each listed sandbox that exists. Missing
+    /// sandboxes are absent from the map.
+    fn sandbox_versions(
+        &self,
+        ids: &[String],
+    ) -> impl Future<Output = PersistenceResult<HashMap<String, u64>>> + Send;
+}
+
+impl SandboxVersionSource for Store {
+    async fn sandbox_versions(&self, ids: &[String]) -> PersistenceResult<HashMap<String, u64>> {
+        self.get_resource_versions(Sandbox::object_type(), ids)
+            .await
+    }
+}
+
+/// State the poller carries between ticks.
+#[derive(Debug, Default)]
+struct PollerState {
+    /// Last observed version per actively watched sandbox. `None` records a
+    /// sandbox that was missing (deleted) at the last successful lookup.
+    known_versions: HashMap<String, Option<u64>>,
+    /// Consecutive ticks whose lookup failed. Only the first failure of a
+    /// streak is logged as a warning.
+    consecutive_failures: u32,
+}
+
+/// What one poller tick did. Returned for tests; the loop ignores it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PollOutcome {
+    /// Watched sandboxes included in this tick's lookup.
+    polled: usize,
+    /// Sandboxes whose local watchers were notified.
+    notified: usize,
+    /// Whether the lookup failed. Known versions were left untouched.
+    failed: bool,
+}
+
+/// Run one poller tick.
+async fn poll_once<S: SandboxVersionSource>(
+    source: &S,
+    bus: &SandboxWatchBus,
+    state: &mut PollerState,
+) -> PollOutcome {
+    let active = bus.active_sandbox_ids();
+    state
+        .known_versions
+        .retain(|sandbox_id, _| active.contains(sandbox_id));
+    gauge!(gateway_metrics::SANDBOX_WATCH_POLLED_SANDBOXES)
+        .set(gateway_metrics::count_as_f64(active.len()));
+    if active.is_empty() {
+        return PollOutcome::default();
+    }
+    check_versions(source, bus, state, active.into_iter().collect()).await
+}
+
+#[tracing::instrument(
+    name = "sandbox_watch",
+    skip_all,
+    fields(
+        otel.name = "sandbox_watch.poll",
+        otel.status_code = tracing::field::Empty,
+        watched_count = ids.len(),
+        notified_count = tracing::field::Empty,
+    )
+)]
+async fn check_versions<S: SandboxVersionSource>(
+    source: &S,
+    bus: &SandboxWatchBus,
+    state: &mut PollerState,
+    ids: Vec<String>,
+) -> PollOutcome {
+    let started = Instant::now();
+    let result = source.sandbox_versions(&ids).await;
+    histogram!(gateway_metrics::SANDBOX_WATCH_POLL_DURATION_SECONDS)
+        .record(started.elapsed().as_secs_f64());
+
+    let versions = match result {
+        Ok(versions) => versions,
+        Err(err) => {
+            crate::otel_tracing::mark_error(&tracing::Span::current());
+            counter!(gateway_metrics::SANDBOX_WATCH_POLL_ERRORS_TOTAL).increment(1);
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            if state.consecutive_failures == 1 {
+                tracing::warn!(
+                    watched_count = ids.len(),
+                    error = %err,
+                    "sandbox watch poller: failed to read persisted sandbox versions; retrying every interval"
+                );
+            }
+            // Keep known versions so the next successful tick still sees
+            // every change and deletion made during the outage.
+            return PollOutcome {
+                polled: ids.len(),
+                notified: 0,
+                failed: true,
+            };
+        }
+    };
+    if state.consecutive_failures > 0 {
+        tracing::info!(
+            failed_ticks = state.consecutive_failures,
+            "sandbox watch poller: persisted sandbox version reads recovered"
+        );
+        state.consecutive_failures = 0;
+    }
+
+    let polled = ids.len();
+    let mut notified = 0_usize;
+    for sandbox_id in ids {
+        let current = versions.get(&sandbox_id).copied();
+        // A first observation always notifies: WatchSandbox subscribes before
+        // reading its snapshot, and only this catches a remote write between
+        // those two steps.
+        let changed = state
+            .known_versions
+            .get(&sandbox_id)
+            .is_none_or(|previous| *previous != current);
+        if changed {
+            bus.notify(&sandbox_id);
+            notified += 1;
+        }
+        state.known_versions.insert(sandbox_id, current);
+    }
+    tracing::Span::current().record("notified_count", notified);
+    PollOutcome {
+        polled,
+        notified,
+        failed: false,
+    }
+}
+
 /// Poll persisted sandbox resource versions once per gateway and notify the
 /// existing in-memory watch bus when another replica changes a record.
 ///
-/// The poller performs at most one lookup per actively watched sandbox per
-/// interval, regardless of how many clients are watching that sandbox.
+/// Each tick makes one batched lookup of the id and `resource_version` of
+/// every actively watched sandbox, regardless of how many clients watch it.
+/// The store issues one statement per `RESOURCE_VERSION_BATCH_SIZE` ids and
+/// reads no payloads.
 pub fn spawn_store_poller(
     store: Arc<Store>,
     bus: SandboxWatchBus,
@@ -90,7 +229,7 @@ pub fn spawn_store_poller(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
-        let mut known_versions: HashMap<String, Option<u64>> = HashMap::new();
+        let mut state = PollerState::default();
         let mut timer = tokio::time::interval(interval);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -102,31 +241,7 @@ pub fn spawn_store_poller(
                     }
                 }
                 _ = timer.tick() => {
-                    let active = bus.active_sandbox_ids();
-                    known_versions.retain(|sandbox_id, _| active.contains(sandbox_id));
-
-                    for sandbox_id in active {
-                        let current = match store.get_message::<Sandbox>(&sandbox_id).await {
-                            Ok(sandbox) => sandbox.map(|sandbox| {
-                                sandbox.metadata.as_ref().map_or(0, |metadata| metadata.resource_version)
-                            }),
-                            Err(err) => {
-                                tracing::warn!(
-                                    sandbox_id,
-                                    error = %err,
-                                    "sandbox watch poller: failed to read persisted sandbox"
-                                );
-                                continue;
-                            }
-                        };
-
-                        let changed = known_versions
-                            .insert(sandbox_id.clone(), current)
-                            .is_none_or(|previous| previous != current);
-                        if changed {
-                            bus.notify(&sandbox_id);
-                        }
-                    }
+                    poll_once(store.as_ref(), &bus, &mut state).await;
                 }
             }
         }
@@ -157,7 +272,9 @@ pub fn lag_warning_event(n: u64) -> openshell_core::proto::SandboxStreamEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::{PersistenceError, RESOURCE_VERSION_BATCH_SIZE, WriteCondition};
     use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[test]
     fn sandbox_watch_bus_remove_cleans_up() {
@@ -280,5 +397,438 @@ mod tests {
             .unwrap();
 
         shutdown_tx.send(true).unwrap();
+    }
+
+    /// In-memory version source with injectable failures.
+    #[derive(Default)]
+    struct FakeSource {
+        versions: Mutex<HashMap<String, u64>>,
+        fail: AtomicBool,
+        calls: AtomicUsize,
+        last_ids: Mutex<Vec<String>>,
+    }
+
+    impl FakeSource {
+        fn with_versions(entries: &[(&str, u64)]) -> Self {
+            let source = Self::default();
+            for (id, version) in entries {
+                source.set(id, *version);
+            }
+            source
+        }
+
+        fn set(&self, id: &str, version: u64) {
+            self.versions
+                .lock()
+                .unwrap()
+                .insert(id.to_string(), version);
+        }
+
+        fn remove(&self, id: &str) {
+            self.versions.lock().unwrap().remove(id);
+        }
+
+        fn set_failing(&self, failing: bool) {
+            self.fail.store(failing, Ordering::Relaxed);
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+
+        fn last_ids_sorted(&self) -> Vec<String> {
+            let mut ids = self.last_ids.lock().unwrap().clone();
+            ids.sort();
+            ids
+        }
+    }
+
+    impl SandboxVersionSource for FakeSource {
+        async fn sandbox_versions(
+            &self,
+            ids: &[String],
+        ) -> PersistenceResult<HashMap<String, u64>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            ids.clone_into(&mut self.last_ids.lock().unwrap());
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(PersistenceError::Database(
+                    "injected lookup failure".to_string(),
+                ));
+            }
+            let versions = self.versions.lock().unwrap();
+            Ok(ids
+                .iter()
+                .filter_map(|id| versions.get(id).map(|version| (id.clone(), *version)))
+                .collect())
+        }
+    }
+
+    /// Wraps a real store and counts poller lookups.
+    struct CountingSource<'a> {
+        store: &'a Store,
+        calls: AtomicUsize,
+        request_sizes: Mutex<Vec<usize>>,
+    }
+
+    impl<'a> CountingSource<'a> {
+        const fn new(store: &'a Store) -> Self {
+            Self {
+                store,
+                calls: AtomicUsize::new(0),
+                request_sizes: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+
+        fn request_sizes(&self) -> Vec<usize> {
+            self.request_sizes.lock().unwrap().clone()
+        }
+    }
+
+    impl SandboxVersionSource for CountingSource<'_> {
+        async fn sandbox_versions(
+            &self,
+            ids: &[String],
+        ) -> PersistenceResult<HashMap<String, u64>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.request_sizes.lock().unwrap().push(ids.len());
+            self.store.sandbox_versions(ids).await
+        }
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<()>) -> usize {
+        let mut received = 0;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        received
+    }
+
+    async fn put_sandbox_row(store: &Store, idx: usize) {
+        store
+            .put(
+                "sandbox",
+                &format!("sb-{idx}"),
+                &format!("sandbox-{idx}"),
+                "default",
+                b"payload",
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn bump_sandbox_row(store: &Store, idx: usize) {
+        store
+            .put_if(
+                "sandbox",
+                &format!("sb-{idx}"),
+                &format!("sandbox-{idx}"),
+                "default",
+                b"payload-2",
+                None,
+                WriteCondition::MatchResourceVersion(1),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn poll_once_uses_one_store_lookup_for_large_watch_set() {
+        const WATCHED: usize = 5_000;
+        const { assert!(WATCHED > 4 * RESOURCE_VERSION_BATCH_SIZE) };
+
+        let store = crate::persistence::test_store().await;
+        let bus = SandboxWatchBus::new();
+        let mut receivers = Vec::with_capacity(WATCHED);
+        for idx in 0..WATCHED {
+            put_sandbox_row(&store, idx).await;
+            receivers.push(bus.subscribe(&format!("sb-{idx}")));
+        }
+        let source = CountingSource::new(&store);
+        let mut state = PollerState::default();
+
+        let outcome = poll_once(&source, &bus, &mut state).await;
+        assert_eq!(
+            outcome,
+            PollOutcome {
+                polled: WATCHED,
+                notified: WATCHED,
+                failed: false,
+            }
+        );
+        assert_eq!(source.calls(), 1);
+        assert_eq!(source.request_sizes(), vec![WATCHED]);
+        assert!(receivers.iter_mut().all(|rx| drain(rx) == 1));
+
+        let outcome = poll_once(&source, &bus, &mut state).await;
+        assert_eq!(outcome.notified, 0);
+        assert_eq!(source.calls(), 2);
+        assert!(receivers.iter_mut().all(|rx| drain(rx) == 0));
+
+        let changed = [0, 2_500, WATCHED - 1];
+        for idx in changed {
+            bump_sandbox_row(&store, idx).await;
+        }
+        let outcome = poll_once(&source, &bus, &mut state).await;
+        assert_eq!(outcome.notified, 3);
+        assert_eq!(source.calls(), 3);
+        for (idx, rx) in receivers.iter_mut().enumerate() {
+            let expected = usize::from(changed.contains(&idx));
+            assert_eq!(drain(rx), expected, "sb-{idx}");
+        }
+
+        assert!(store.delete("sandbox", "sb-7").await.unwrap());
+        let outcome = poll_once(&source, &bus, &mut state).await;
+        assert_eq!(outcome.notified, 1);
+        assert_eq!(source.calls(), 4);
+        for (idx, rx) in receivers.iter_mut().enumerate() {
+            assert_eq!(drain(rx), usize::from(idx == 7), "sb-{idx}");
+        }
+        assert_eq!(state.known_versions["sb-7"], None);
+
+        let outcome = poll_once(&source, &bus, &mut state).await;
+        assert_eq!(outcome.notified, 0);
+        assert_eq!(source.calls(), 5);
+        assert_eq!(source.request_sizes(), vec![WATCHED; 5]);
+    }
+
+    #[tokio::test]
+    async fn poll_once_notifies_first_observation_change_and_disappearance() {
+        let source = FakeSource::with_versions(&[("sb-1", 1)]);
+        let bus = SandboxWatchBus::new();
+        let mut present = bus.subscribe("sb-1");
+        let mut never = bus.subscribe("sb-never");
+        let mut state = PollerState::default();
+
+        // A first observation notifies whether or not the sandbox exists.
+        assert_eq!(poll_once(&source, &bus, &mut state).await.notified, 2);
+        assert_eq!((drain(&mut present), drain(&mut never)), (1, 1));
+
+        assert_eq!(poll_once(&source, &bus, &mut state).await.notified, 0);
+
+        source.set("sb-1", 2);
+        assert_eq!(poll_once(&source, &bus, &mut state).await.notified, 1);
+        assert_eq!((drain(&mut present), drain(&mut never)), (1, 0));
+
+        source.remove("sb-1");
+        assert_eq!(poll_once(&source, &bus, &mut state).await.notified, 1);
+        assert_eq!((drain(&mut present), drain(&mut never)), (1, 0));
+
+        assert_eq!(poll_once(&source, &bus, &mut state).await.notified, 0);
+        assert_eq!(
+            state.known_versions,
+            HashMap::from([("sb-1".to_string(), None), ("sb-never".to_string(), None)])
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_once_skips_lookup_when_nothing_is_watched() {
+        let source = FakeSource::with_versions(&[("sb-1", 1)]);
+        let bus = SandboxWatchBus::new();
+        drop(bus.subscribe("sb-1"));
+        let mut state = PollerState::default();
+
+        assert_eq!(
+            poll_once(&source, &bus, &mut state).await,
+            PollOutcome::default()
+        );
+        assert_eq!(source.calls(), 0);
+        assert!(state.known_versions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn poll_once_prunes_unwatched_and_renotifies_rewatched_sandboxes() {
+        let source = FakeSource::with_versions(&[("sb-1", 1), ("sb-2", 1)]);
+        let bus = SandboxWatchBus::new();
+        let mut first = bus.subscribe("sb-1");
+        let second = bus.subscribe("sb-2");
+        let mut state = PollerState::default();
+
+        assert_eq!(poll_once(&source, &bus, &mut state).await.notified, 2);
+        drain(&mut first);
+
+        drop(second);
+        assert_eq!(poll_once(&source, &bus, &mut state).await.notified, 0);
+        assert_eq!(source.last_ids_sorted(), vec!["sb-1".to_string()]);
+        assert_eq!(
+            state.known_versions.keys().collect::<Vec<_>>(),
+            vec!["sb-1"]
+        );
+
+        // The version did not change, but a re-watched sandbox is a first
+        // observation again.
+        let mut second = bus.subscribe("sb-2");
+        assert_eq!(poll_once(&source, &bus, &mut state).await.notified, 1);
+        assert_eq!((drain(&mut first), drain(&mut second)), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn poll_once_keeps_known_versions_when_lookup_fails() {
+        let source = FakeSource::with_versions(&[("sb-1", 1), ("sb-2", 1)]);
+        let bus = SandboxWatchBus::new();
+        let mut receivers = vec![bus.subscribe("sb-1"), bus.subscribe("sb-2")];
+        let mut state = PollerState::default();
+
+        assert_eq!(poll_once(&source, &bus, &mut state).await.notified, 2);
+        assert!(receivers.iter_mut().all(|rx| drain(rx) == 1));
+
+        source.set_failing(true);
+        source.set("sb-1", 2);
+        source.remove("sb-2");
+        receivers.push(bus.subscribe("sb-3"));
+        source.set("sb-3", 1);
+
+        assert_eq!(
+            poll_once(&source, &bus, &mut state).await,
+            PollOutcome {
+                polled: 3,
+                notified: 0,
+                failed: true,
+            }
+        );
+        let before_outage =
+            HashMap::from([("sb-1".to_string(), Some(1)), ("sb-2".to_string(), Some(1))]);
+        assert_eq!(state.known_versions, before_outage);
+        assert_eq!(state.consecutive_failures, 1);
+        assert!(receivers.iter_mut().all(|rx| drain(rx) == 0));
+
+        assert!(poll_once(&source, &bus, &mut state).await.failed);
+        assert_eq!(state.consecutive_failures, 2);
+        assert_eq!(state.known_versions, before_outage);
+
+        source.set_failing(false);
+        let outcome = poll_once(&source, &bus, &mut state).await;
+        assert_eq!(
+            outcome,
+            PollOutcome {
+                polled: 3,
+                notified: 3,
+                failed: false,
+            }
+        );
+        assert_eq!(state.consecutive_failures, 0);
+        assert!(receivers.iter_mut().all(|rx| drain(rx) == 1));
+        assert_eq!(
+            state.known_versions,
+            HashMap::from([
+                ("sb-1".to_string(), Some(2)),
+                ("sb-2".to_string(), None),
+                ("sb-3".to_string(), Some(1)),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_once_records_watch_metrics() {
+        let capture = gateway_metrics::MetricsCapture::install();
+        let source = FakeSource::with_versions(&[("sb-1", 1), ("sb-2", 1), ("sb-3", 1)]);
+        let bus = SandboxWatchBus::new();
+        let receivers = vec![
+            bus.subscribe("sb-1"),
+            bus.subscribe("sb-2"),
+            bus.subscribe("sb-3"),
+        ];
+        let mut state = PollerState::default();
+
+        assert!(!poll_once(&source, &bus, &mut state).await.failed);
+        assert_eq!(
+            capture.value("openshell_server_sandbox_watch_polled_sandboxes"),
+            Some(3)
+        );
+        source.set_failing(true);
+        assert!(poll_once(&source, &bus, &mut state).await.failed);
+        drop(receivers);
+        assert_eq!(
+            poll_once(&source, &bus, &mut state).await,
+            PollOutcome::default()
+        );
+
+        assert_eq!(
+            capture.value("openshell_server_sandbox_watch_polled_sandboxes"),
+            Some(0)
+        );
+        assert_eq!(
+            capture.value("openshell_server_sandbox_watch_poll_errors_total"),
+            Some(1)
+        );
+        // The empty tick issued no lookup, so it records no duration.
+        assert_eq!(
+            capture.value("openshell_server_sandbox_watch_poll_duration_seconds_count"),
+            Some(2)
+        );
+        assert!(
+            capture
+                .render()
+                .contains("openshell_server_sandbox_watch_poll_duration_seconds_bucket{le="),
+            "the watch poll duration is a bucketed histogram"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_poller_observes_writes_from_another_replica() {
+        let schema = crate::persistence::test_postgres::TestSchema::create("watch").await;
+        // Separate pools on one schema, like two gateway replicas.
+        let replica_a = schema.connect_store().await;
+        let replica_b = Arc::new(schema.connect_store().await);
+        let watched = RESOURCE_VERSION_BATCH_SIZE + 5;
+        let bus = SandboxWatchBus::new();
+        let mut receivers = Vec::with_capacity(watched);
+        for idx in 0..watched {
+            put_sandbox_row(&replica_a, idx).await;
+            receivers.push(bus.subscribe(&format!("sb-{idx}")));
+        }
+
+        let source = CountingSource::new(replica_b.as_ref());
+        let mut state = PollerState::default();
+        let outcome = poll_once(&source, &bus, &mut state).await;
+        assert_eq!(outcome.notified, watched);
+        assert_eq!(source.calls(), 1);
+        assert!(receivers.iter_mut().all(|rx| drain(rx) == 1));
+
+        // HashSet order decides which lookup batch each change lands in; the
+        // store contract test pins cross-batch reads.
+        let last = watched - 1;
+        bump_sandbox_row(&replica_a, 0).await;
+        bump_sandbox_row(&replica_a, last).await;
+        assert!(replica_a.delete("sandbox", "sb-1").await.unwrap());
+        let outcome = poll_once(&source, &bus, &mut state).await;
+        assert_eq!(outcome.notified, 3);
+        for (idx, rx) in receivers.iter_mut().enumerate() {
+            let expected = usize::from([0, 1, last].contains(&idx));
+            assert_eq!(drain(rx), expected, "sb-{idx}");
+        }
+        assert_eq!(state.known_versions["sb-1"], None);
+        assert_eq!(state.known_versions["sb-0"], Some(2));
+        assert_eq!(poll_once(&source, &bus, &mut state).await.notified, 0);
+        assert_eq!(source.calls(), 3);
+
+        // The real loop delivers a remote write to a local watcher.
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        spawn_store_poller(
+            replica_b.clone(),
+            bus.clone(),
+            Duration::from_millis(20),
+            shutdown_rx,
+        );
+        let mut rx = bus.subscribe("sb-2");
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("poller should publish its initial observation")
+            .unwrap();
+        bump_sandbox_row(&replica_a, 2).await;
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("poller should observe a write made through another store")
+            .unwrap();
+        shutdown_tx.send(true).unwrap();
+
+        replica_a.close().await;
+        replica_b.close().await;
+        schema.drop_schema().await;
     }
 }

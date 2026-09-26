@@ -22,6 +22,7 @@ mod config_update_operation;
 mod credentials;
 mod defaults;
 mod gateway_listener;
+mod gateway_metrics;
 mod grpc;
 mod http;
 mod middleware;
@@ -51,7 +52,6 @@ mod tracing_setup;
 mod watch_cursor;
 mod ws_tunnel;
 
-use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{Config, Error, ObjectLabels, Result};
@@ -285,12 +285,6 @@ pub struct ServerState {
     /// Active SSH tunnel connection counts per sandbox id.
     pub ssh_connections_by_sandbox: Mutex<HashMap<String, u32>>,
 
-    /// Serializes settings mutations (global and sandbox) to prevent
-    /// read-modify-write races. Held for the duration of any setting
-    /// set/delete operation, including the precedence check on sandbox
-    /// mutations that reads global state.
-    pub settings_mutex: tokio::sync::Mutex<()>,
-
     /// Registry of active supervisor sessions and pending relay channels.
     ///
     /// Stored as `Arc` so compiled compute drivers can be constructed before
@@ -429,7 +423,6 @@ impl ServerState {
             telemetry: telemetry::TelemetryState::new(),
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
-            settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
             replica_id,
@@ -521,6 +514,7 @@ pub(crate) async fn run_server(
         legacy_compute_driver_env_seen: _,
     } = startup;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (draining_tx, draining_rx) = watch::channel(false);
 
     auth::descriptor_authz::init()
         .map_err(|error| Error::config(format!("invalid gRPC authorization metadata: {error}")))?;
@@ -877,10 +871,10 @@ pub(crate) async fn run_server(
             ))
         })?;
         info!(address = %health_bind_address, "Health server listening");
-        // `health_router` returns immediately; the listener serves
+        // `health_router_with_drain` returns immediately; the listener serves
         // `Initializing → 503` until the background monitor publishes the
         // first real probe outcome, so the endpoint is always responsive.
-        let router = health_router(store.clone());
+        let router = http::health_router_with_drain(store.clone(), draining_rx.clone());
         tokio::spawn(async move {
             if let Err(e) = axum::serve(health_listener, router.into_make_service()).await {
                 error!("Health server error: {e}");
@@ -892,9 +886,9 @@ pub(crate) async fn run_server(
 
     // Bind the Prometheus metrics endpoint on a dedicated port when configured.
     if let Some(metrics_bind_address) = config.metrics_bind_address {
-        let prometheus_handle = PrometheusBuilder::new()
-            .install_recorder()
-            .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+        let prometheus_handle =
+            gateway_metrics::install_global_recorder(supervisor_session::RELAY_CAPACITY)
+                .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
         let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
             Error::transport(format!(
                 "failed to bind metrics port {metrics_bind_address}: {e}",
@@ -998,6 +992,8 @@ pub(crate) async fn run_server(
     info!("Shutdown signal received; stopping gateway");
     state.gateway_shutting_down.store(true, Ordering::Release);
     state.supervisor_sessions.close_admission();
+    draining_tx.send_replace(true);
+    drain_supervisor_sessions(&state.supervisor_sessions, peer_routing_expected).await;
     let _ = shutdown_tx.send(true);
 
     if let Err(err) = listener_task.await {
@@ -1009,7 +1005,7 @@ pub(crate) async fn run_server(
     // record. Drain it even when compute cleanup failed before exiting Tokio.
     let session_cleanup = state
         .supervisor_sessions
-        .shutdown(Duration::from_secs(10))
+        .shutdown(supervisor_session::SESSION_CLEANUP_TIMEOUT)
         .await;
     if let Err(err) = &session_cleanup {
         warn!(error = %err, "Gateway supervisor session cleanup incomplete");
@@ -1197,6 +1193,35 @@ fn spawn_gateway_connection(
             }
         });
     }
+}
+
+/// Close supervisor sessions on a paced schedule while the gateway listener
+/// keeps accepting, so each supervisor reconnects to another replica, peers
+/// can still reach sessions that have not moved yet, and lagged supervisor
+/// dials get `UNAVAILABLE` quickly. Only gateways with peer routing drain:
+/// elsewhere no peer can reach these sessions, so shutdown continues at once.
+async fn drain_supervisor_sessions(
+    sessions: &supervisor_session::SupervisorSessionRegistry,
+    peer_routing_expected: bool,
+) {
+    if !peer_routing_expected {
+        return;
+    }
+    gateway_metrics::set_draining(true);
+    let started = tokio::time::Instant::now();
+    info!(
+        sessions = sessions.session_count(),
+        propagation_delay_ms = supervisor_session::DRAIN_PROPAGATION_DELAY.as_millis(),
+        max_close_window_ms = supervisor_session::DRAIN_CLOSE_WINDOW.as_millis(),
+        "Draining supervisor sessions before stopping the gateway listener"
+    );
+    let summary = supervisor_session::drain_for_shutdown(sessions).await;
+    info!(
+        planned = summary.planned,
+        signaled = summary.signaled,
+        elapsed_ms = started.elapsed().as_millis(),
+        "Supervisor session drain finished; stopping gateway listener"
+    );
 }
 
 async fn shutdown_signal() {
@@ -1893,9 +1918,11 @@ mod tests {
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
         MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
         bind_gateway_listener, classify_initial_bytes, configured_compute_driver,
-        extension_token_ttl, is_benign_tls_handshake_failure, mint_gateway_extension_credential,
-        serve_gateway_listener, validate_peer_endpoint_scheme,
+        drain_supervisor_sessions, extension_token_ttl, is_benign_tls_handshake_failure,
+        mint_gateway_extension_credential, serve_gateway_listener, validate_peer_endpoint_scheme,
     };
+    use crate::gateway_metrics::{MetricsCapture, describe_and_initialize};
+    use crate::supervisor_session::{LocalSessionRoute, RELAY_CAPACITY};
     use openshell_core::{
         Config,
         proto::{HealthRequest, open_shell_client::OpenShellClient},
@@ -1910,7 +1937,8 @@ mod tests {
     use tempfile::{TempDir, tempdir};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::watch;
+    use tokio::sync::oneshot::error::TryRecvError;
+    use tokio::sync::{mpsc, oneshot, watch};
 
     use crate::tls_test_utils::generate_test_certs_with_ca;
     use axum::body::Body;
@@ -1949,6 +1977,60 @@ mod tests {
         let config = Config::new(None);
         assert!(config.tls.is_none());
         validate_peer_endpoint_scheme(&config, "http://10.0.0.1:8080").unwrap();
+    }
+
+    /// A registry with one Ready session for `sbx`, and that session's
+    /// shutdown receiver.
+    fn registry_with_one_session() -> (
+        crate::supervisor_session::SupervisorSessionRegistry,
+        oneshot::Receiver<()>,
+    ) {
+        let registry = crate::supervisor_session::SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        registry.register("sbx".into(), "s1".into(), tx, shutdown_tx);
+        (registry, shutdown_rx)
+    }
+
+    #[tokio::test]
+    async fn drain_supervisor_sessions_skips_gateways_without_peer_routing() {
+        let metrics = MetricsCapture::install();
+        describe_and_initialize(RELAY_CAPACITY);
+        let (registry, mut shutdown_rx) = registry_with_one_session();
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            drain_supervisor_sessions(&registry, false),
+        )
+        .await
+        .expect("a gateway without peer routing must not wait for a drain");
+
+        assert!(matches!(shutdown_rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(registry.has_session("sbx"));
+        assert_eq!(metrics.value("openshell_server_draining"), Some(0));
+    }
+
+    #[tokio::test]
+    async fn drain_supervisor_sessions_serves_through_propagation_delay_when_peer_routed() {
+        let metrics = MetricsCapture::install();
+        describe_and_initialize(RELAY_CAPACITY);
+        let (registry, mut shutdown_rx) = registry_with_one_session();
+
+        let drain = drain_supervisor_sessions(&registry, true);
+        tokio::pin!(drain);
+        tokio::time::timeout(Duration::from_millis(250), &mut drain)
+            .await
+            .expect_err("a peer-routed gateway holds its sessions for the propagation delay");
+
+        assert_eq!(metrics.value("openshell_server_draining"), Some(1));
+        assert!(
+            matches!(shutdown_rx.try_recv(), Err(TryRecvError::Empty)),
+            "sessions keep serving until the propagation delay ends"
+        );
+        assert_eq!(
+            registry.local_session_route("sbx"),
+            LocalSessionRoute::Ready
+        );
     }
 
     static DETECTION_PROBE_ORDER: LazyLock<Mutex<Vec<&'static str>>> =

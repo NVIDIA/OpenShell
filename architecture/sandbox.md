@@ -794,9 +794,12 @@ record and restartable storage survive cleanup, including for ephemeral creates.
 Explicit start is blocked while cleanup is pending, then creates a fresh attempt
 using the latest configuration. Configuration edits alone never restart an
 expired sandbox. Legacy provisioning records receive one persisted rollout
-window. Cross-object configuration serialization uses the gateway's existing
-single-writer guard; enabling concurrent configuration writers still requires
-the database-backed invariant work tracked by #1255.
+window. Configuration writers take the hierarchical mutation guard described in
+`architecture/gateway.md`: sandbox-scoped writes hold their sandbox key,
+provider and workspace-profile writes hold their workspace key, and global
+policy and settings hold the global key. The deadline scan holds the same keys
+process-locally (global and workspace shared, sandbox exclusive) and relies on
+compare-and-swap across replicas.
 
 Docker startup health remains unready during policy quarantine. A failed probe
 does not terminate a live provisioning supervisor; the gateway deadline owns

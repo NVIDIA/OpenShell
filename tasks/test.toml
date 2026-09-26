@@ -104,6 +104,11 @@ run = [
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-precommit native"
 hide = true
 
+["test:rust:postgres"]
+description = "Run PostgreSQL-backed openshell-server tests against OPENSHELL_TEST_POSTGRES_URL or a disposable Docker/Podman PostgreSQL container"
+run = "tasks/scripts/run-postgres-tests.sh"
+run_windows = "echo Skipping test:rust:postgres: PostgreSQL integration tests need a Linux or macOS container engine."
+
 ["test:python"]
 description = "Run Python tests"
 depends = ["python:proto"]

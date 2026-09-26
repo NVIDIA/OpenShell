@@ -226,6 +226,9 @@ tests:
       - equal:
           path: kind
           value: StatefulSet
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 30
 
   - it: treats a null workload map as the default StatefulSet
     template: templates/statefulset.yaml
@@ -1079,6 +1082,9 @@ tests:
       - equal:
           path: spec.replicas
           value: 2
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 30
       - contains:
           path: spec.template.spec.containers[0].env
           content:

@@ -37,6 +37,50 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Reconnect delay policy for the gateway control session.
+///
+/// The ceiling doubles after every failed attempt and returns to
+/// [`INITIAL_BACKOFF`] once the gateway accepted the attempt that just ended,
+/// so a long-lived sandbox reconnects within about a second when its gateway
+/// replica drains. Delays use equal jitter, `[ceiling / 2, ceiling]`, so
+/// sessions closed together do not redial in lockstep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReconnectBackoff {
+    ceiling: Duration,
+}
+
+impl Default for ReconnectBackoff {
+    fn default() -> Self {
+        Self {
+            ceiling: INITIAL_BACKOFF,
+        }
+    }
+}
+
+impl ReconnectBackoff {
+    /// Delay before the next attempt. `accepted` reports whether the attempt
+    /// that just ended received `SessionAccepted`; `unit_sample` is uniform in
+    /// `[0, 1)`.
+    fn next_delay(&mut self, accepted: bool, unit_sample: f64) -> Duration {
+        if accepted {
+            self.ceiling = INITIAL_BACKOFF;
+        }
+        let delay = equal_jitter(self.ceiling, unit_sample);
+        self.ceiling = self.ceiling.saturating_mul(2).min(MAX_BACKOFF);
+        delay
+    }
+}
+
+fn equal_jitter(ceiling: Duration, unit_sample: f64) -> Duration {
+    let sample = if unit_sample.is_finite() {
+        unit_sample.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let half = ceiling / 2;
+    half + half.mul_f64(sample)
+}
+
 /// Runtime identity and status channel shared with a supervisor session task.
 pub struct SessionRuntimeContext {
     /// Identifies the local supervisor process across gateway reconnects.
@@ -354,7 +398,7 @@ struct SessionConfig {
 }
 
 async fn run_session_loop(config: SessionConfig) {
-    let mut backoff = INITIAL_BACKOFF;
+    let mut backoff = ReconnectBackoff::default();
     let mut attempt: u64 = 0;
 
     loop {
@@ -364,9 +408,11 @@ async fn run_session_loop(config: SessionConfig) {
         if let Some(updates) = &config.session_id_updates {
             updates.send_replace(None);
         }
+        // `ready_tx` turns true only after SessionAccepted (run_single_session),
+        // so its previous value says whether the gateway accepted this attempt.
+        let accepted = config.ready_tx.send_replace(false);
         match result {
             Ok(()) => {
-                config.ready_tx.send_replace(false);
                 let event = session_closed_event(
                     openshell_ocsf::ctx::ctx(),
                     &config.endpoint,
@@ -376,7 +422,6 @@ async fn run_session_loop(config: SessionConfig) {
                 break;
             }
             Err(e) => {
-                config.ready_tx.send_replace(false);
                 let event = session_failed_event(
                     openshell_ocsf::ctx::ctx(),
                     &config.endpoint,
@@ -384,8 +429,14 @@ async fn run_session_loop(config: SessionConfig) {
                     &e.to_string(),
                 );
                 ocsf_emit!(event);
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                let delay = backoff.next_delay(accepted, rand::random::<f64>());
+                debug!(
+                    attempt,
+                    accepted,
+                    retry_after_ms = delay.as_millis(),
+                    "supervisor session: reconnecting after backoff"
+                );
+                tokio::time::sleep(delay).await;
             }
         }
     }
@@ -1199,5 +1250,45 @@ mod ocsf_event_tests {
         };
         assert!(err.to_string().contains("peer PID mismatch"));
         accept_task.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backoff_doubles_to_max_without_acceptance() {
+        let mut backoff = ReconnectBackoff::default();
+        let delays: Vec<Duration> = (0..7).map(|_| backoff.next_delay(false, 1.0)).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs));
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_after_accepted_session() {
+        let mut backoff = ReconnectBackoff::default();
+        for _ in 0..6 {
+            backoff.next_delay(false, 1.0);
+        }
+        assert_eq!(backoff.next_delay(true, 1.0), Duration::from_secs(1));
+        assert_eq!(backoff.next_delay(false, 1.0), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn equal_jitter_stays_between_half_and_full_ceiling() {
+        let ceiling = Duration::from_secs(2);
+        assert_eq!(equal_jitter(ceiling, 0.0), Duration::from_secs(1));
+        assert_eq!(equal_jitter(ceiling, 0.5), Duration::from_millis(1500));
+        assert_eq!(equal_jitter(ceiling, 1.0), Duration::from_secs(2));
+        assert_eq!(equal_jitter(ceiling, f64::NAN), Duration::from_secs(2));
+        assert_eq!(equal_jitter(ceiling, -3.0), Duration::from_secs(1));
+
+        for _ in 0..1000 {
+            let delay = ReconnectBackoff::default().next_delay(true, rand::random());
+            assert!(
+                (Duration::from_millis(500)..=Duration::from_secs(1)).contains(&delay),
+                "delay {delay:?} outside [500ms, 1s]"
+            );
+        }
     }
 }

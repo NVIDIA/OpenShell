@@ -3,12 +3,15 @@
 
 #![cfg(feature = "e2e-kubernetes-ha")]
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use futures_util::future::try_join_all;
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::port::{find_free_port, wait_for_port};
@@ -21,6 +24,34 @@ static KUBE_HA_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new
 
 const HA_SYNC_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
 const HA_SYNC_TIMEOUT: Duration = Duration::from_secs(600);
+
+const HA_REDISTRIBUTION_SANDBOXES: usize = 4;
+/// Overall budget for the rollout test. It stays below the 600 s nextest
+/// terminate-after limit so a slow step fails with its own diagnostics
+/// instead of a bare timeout.
+const HA_REDISTRIBUTION_TEST_BUDGET: Duration = Duration::from_secs(540);
+// Per-step caps; each step also stops at the overall deadline.
+const HA_REDISTRIBUTION_CREATE_TIMEOUT: Duration = Duration::from_secs(180);
+const HA_SESSION_ACCOUNTING_TIMEOUT: Duration = Duration::from_secs(90);
+const HA_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(180);
+/// Old pods can still be draining after `rollout status` returns; the drain
+/// plus cleanup takes at most 25 s.
+const HA_DRAIN_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// A drained gateway pod leaves the pod list within that 25 s bound plus pod
+/// teardown and one poll. A pod still listed after this long overran the
+/// bound or was killed at the end of its 30 s termination grace period.
+const HA_DRAIN_EXIT_BOUND: Duration = Duration::from_secs(28);
+const HA_READY_PODS_TIMEOUT: Duration = Duration::from_secs(120);
+const HA_EXEC_TIMEOUT: Duration = Duration::from_secs(180);
+/// Bounds the wait for a scaled-down pod's sandboxes to report Ready again.
+const HA_SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Bounds one metrics scrape or sandbox listing, so a hung call cannot run
+/// past a step deadline.
+const HA_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+const SUPERVISOR_SESSIONS_METRIC: &str = "openshell_server_supervisor_sessions";
+const DRAINING_METRIC: &str = "openshell_server_draining";
+const RELAY_PENDING_CAPACITY_METRIC: &str = "openshell_server_relay_pending_capacity";
+const RELAY_PENDING_CAPACITY: u64 = 256;
 
 #[derive(Clone)]
 struct KubeTarget {
@@ -140,7 +171,16 @@ impl KubeTarget {
     }
 
     async fn wait_for_gateway_pods(&self, expected: usize) -> Result<Vec<String>, String> {
-        let deadline = Instant::now() + Duration::from_secs(240);
+        self.wait_for_gateway_pods_until(expected, Instant::now() + Duration::from_secs(240))
+            .await
+    }
+
+    async fn wait_for_gateway_pods_until(
+        &self,
+        expected: usize,
+        deadline: Instant,
+    ) -> Result<Vec<String>, String> {
+        let budget = deadline.saturating_duration_since(Instant::now());
         let mut last = String::new();
 
         while Instant::now() < deadline {
@@ -162,14 +202,28 @@ impl KubeTarget {
         }
 
         Err(format!(
-            "gateway pods did not reach expected ready count {expected} within 240s; last={last}"
+            "gateway pods did not reach expected ready count {expected} within {budget:?}; last={last}"
         ))
     }
 
     async fn gateway_pods(&self) -> Result<Vec<GatewayPod>, String> {
+        Ok(self
+            .gateway_pod_states()
+            .await?
+            .into_iter()
+            .filter(|pod| !pod.terminating)
+            .collect())
+    }
+
+    /// Every gateway pod, including pods that are terminating.
+    async fn gateway_pod_states(&self) -> Result<Vec<GatewayPod>, String> {
         let selector = format!("app.kubernetes.io/instance={}", self.release);
+        // Bound each poll so a stalled API server cannot push a step past its
+        // deadline.
+        let request_timeout = format!("--request-timeout={}s", HA_QUERY_TIMEOUT.as_secs());
         let json = self
             .kubectl(&[
+                &request_timeout,
                 "-n",
                 &self.namespace,
                 "get",
@@ -188,9 +242,6 @@ impl KubeTarget {
 
         let mut pods = Vec::new();
         for item in items {
-            if !item["metadata"]["deletionTimestamp"].is_null() {
-                continue;
-            }
             let Some(name) = item["metadata"]["name"].as_str() else {
                 continue;
             };
@@ -202,20 +253,351 @@ impl KubeTarget {
                             && condition["status"].as_str() == Some("True")
                     })
                 });
+            let metrics_port = item["spec"]["containers"]
+                .as_array()
+                .and_then(|containers| {
+                    containers
+                        .iter()
+                        .filter_map(|container| container["ports"].as_array())
+                        .flatten()
+                        .find(|port| port["name"].as_str() == Some("metrics"))
+                })
+                .and_then(|port| port["containerPort"].as_u64())
+                .and_then(|port| u16::try_from(port).ok());
             pods.push(GatewayPod {
                 name: name.to_string(),
                 ready,
+                terminating: !item["metadata"]["deletionTimestamp"].is_null(),
+                metrics_port,
             });
         }
         pods.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(pods)
     }
+
+    /// Run `kubectl get --raw` and return stdout only, so stderr warnings
+    /// cannot corrupt the response body.
+    async fn kubectl_raw(&self, path: &str) -> Result<String, String> {
+        let request_timeout = format!("--request-timeout={}s", HA_QUERY_TIMEOUT.as_secs());
+        let output = Command::new("kubectl")
+            .arg("--context")
+            .arg(&self.context)
+            .args([request_timeout.as_str(), "get", "--raw", path])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|err| format!("failed to spawn kubectl get --raw {path}: {err}"))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "kubectl get --raw {path} failed with exit {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        String::from_utf8(output.stdout)
+            .map_err(|err| format!("kubectl get --raw {path} returned non-UTF-8 output: {err}"))
+    }
+
+    /// Fetch `/metrics` through the API server's pod proxy, which reaches the
+    /// plain-HTTP metrics listener without a port-forward.
+    async fn scrape_gateway_metrics(&self, pod: &GatewayPod) -> Result<String, String> {
+        let port = pod.metrics_port.ok_or_else(|| {
+            format!(
+                "gateway pod {} has no container port named metrics",
+                pod.name
+            )
+        })?;
+        self.kubectl_raw(&format!(
+            "/api/v1/namespaces/{}/pods/{}:{port}/proxy/metrics",
+            self.namespace, pod.name
+        ))
+        .await
+    }
+
+    /// No terminating gateway pod, exactly `expected_pods` ready pods, and
+    /// every `required` sandbox in phase Ready. Returns the pods and the full
+    /// phase map.
+    async fn gateway_settled_once(
+        &self,
+        expected_pods: usize,
+        required: &[String],
+    ) -> Result<(Vec<GatewayPod>, BTreeMap<String, String>), String> {
+        let pods = self.gateway_pod_states().await?;
+        if pods.len() != expected_pods || pods.iter().any(|pod| pod.terminating || !pod.ready) {
+            return Err(format!(
+                "expected {expected_pods} ready gateway pods and none terminating; pods={:?}",
+                pods.iter()
+                    .map(|pod| format!(
+                        "{} ready={} terminating={}",
+                        pod.name, pod.ready, pod.terminating
+                    ))
+                    .collect::<Vec<_>>()
+            ));
+        }
+
+        let phases = sandbox_phases().await?;
+        let not_ready: Vec<String> = required
+            .iter()
+            .filter(|name| phases.get(*name).map(String::as_str) != Some("Ready"))
+            .map(|name| {
+                format!(
+                    "{name}={}",
+                    phases.get(name).map_or("missing", String::as_str)
+                )
+            })
+            .collect();
+        if !not_ready.is_empty() {
+            return Err(format!(
+                "sandboxes not Ready: {not_ready:?}; phases={phases:?}"
+            ));
+        }
+        Ok((pods, phases))
+    }
+
+    async fn wait_for_gateway_settled(
+        &self,
+        expected_pods: usize,
+        required: &[String],
+        deadline: Instant,
+    ) -> Result<(), String> {
+        poll_until(
+            deadline,
+            "gateway pods and sandboxes did not settle",
+            move || self.gateway_settled_once(expected_pods, required),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Settled gateway, and on every pod: the relay capacity gauge, draining
+    /// at 0, and supervisor sessions that add up to the Ready sandbox count.
+    async fn session_accounting_once(
+        &self,
+        expected_pods: usize,
+        required: &[String],
+    ) -> Result<SessionAccounting, String> {
+        let (pods, phases) = self.gateway_settled_once(expected_pods, required).await?;
+        let mut sessions_by_pod = BTreeMap::new();
+        for pod in &pods {
+            let metrics = self.scrape_gateway_metrics(pod).await?;
+            let capacity = prometheus_count(&metrics, RELAY_PENDING_CAPACITY_METRIC)?;
+            if capacity != RELAY_PENDING_CAPACITY {
+                return Err(format!(
+                    "{RELAY_PENDING_CAPACITY_METRIC} on {} is {capacity}, expected {RELAY_PENDING_CAPACITY}",
+                    pod.name
+                ));
+            }
+            let draining = prometheus_count(&metrics, DRAINING_METRIC)?;
+            if draining != 0 {
+                return Err(format!(
+                    "{DRAINING_METRIC} on ready pod {} is {draining}",
+                    pod.name
+                ));
+            }
+            sessions_by_pod.insert(
+                pod.name.clone(),
+                prometheus_count(&metrics, SUPERVISOR_SESSIONS_METRIC)?,
+            );
+        }
+
+        let ready = phases.values().filter(|phase| *phase == "Ready").count();
+        let ready_sandboxes = u64::try_from(ready).unwrap_or(u64::MAX);
+        let sessions: u64 = sessions_by_pod.values().sum();
+        if sessions != ready_sandboxes {
+            return Err(format!(
+                "supervisor sessions {sessions_by_pod:?} add up to {sessions}, but {ready_sandboxes} sandboxes are Ready; phases={phases:?}"
+            ));
+        }
+        Ok(SessionAccounting {
+            sessions_by_pod,
+            ready_sandboxes,
+        })
+    }
+
+    async fn wait_for_session_accounting(
+        &self,
+        expected_pods: usize,
+        required: &[String],
+        deadline: Instant,
+    ) -> Result<SessionAccounting, String> {
+        poll_until(
+            deadline.min(Instant::now() + HA_SESSION_ACCOUNTING_TIMEOUT),
+            "supervisor session gauges did not account for every Ready sandbox",
+            move || self.session_accounting_once(expected_pods, required),
+        )
+        .await
+    }
+
+    /// Run `kubectl rollout restart` on the gateway and wait until the
+    /// rollout finished and no old pod is left, recording which terminating
+    /// pods reported `openshell_server_draining` 1 and how long each stayed
+    /// terminating. `rollout status` returns while old pods may still drain,
+    /// because terminating pods do not count toward Deployment status.
+    async fn restart_gateway_and_observe_drain(
+        &self,
+        deadline: Instant,
+    ) -> Result<RolloutObservation, String> {
+        let resource = self.gateway_workload_resource().await?;
+        self.kubectl(&["-n", &self.namespace, "rollout", "restart", &resource])
+            .await?;
+
+        let status_timeout = format!(
+            "--timeout={}s",
+            step_budget(deadline, HA_ROLLOUT_TIMEOUT).as_secs().max(1)
+        );
+        let status_args = [
+            "-n",
+            &self.namespace,
+            "rollout",
+            "status",
+            &resource,
+            &status_timeout,
+        ];
+        let status = self.kubectl(&status_args);
+        tokio::pin!(status);
+
+        let until = deadline.min(Instant::now() + HA_ROLLOUT_TIMEOUT + HA_DRAIN_EXIT_TIMEOUT);
+        let mut observation = RolloutObservation::default();
+        let mut status_done = false;
+        // Pods still listed as terminating, each with the end of the first
+        // listing that showed it terminating.
+        let mut first_seen: BTreeMap<String, Instant> = BTreeMap::new();
+        loop {
+            if Instant::now() >= until {
+                return Err(format!(
+                    "rollout status finished={status_done}; pods still terminating={:?}; {observation:?}",
+                    first_seen.keys().collect::<Vec<_>>()
+                ));
+            }
+            if status_done {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            } else {
+                tokio::select! {
+                    result = &mut status => {
+                        result.map_err(|err| format!("{err}\n{observation:?}"))?;
+                        status_done = true;
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
+            }
+
+            let listing_started = Instant::now();
+            // Pods churn during a rollout; retry on the next tick.
+            let Ok(pods) = self.gateway_pod_states().await else {
+                continue;
+            };
+            let listed_at = Instant::now();
+            let terminating: Vec<&GatewayPod> = pods.iter().filter(|pod| pod.terminating).collect();
+            let names: Vec<&str> = terminating.iter().map(|pod| pod.name.as_str()).collect();
+            record_terminating_pods(
+                &mut first_seen,
+                &mut observation.exit_times,
+                &names,
+                listing_started,
+                listed_at,
+            );
+            for pod in terminating {
+                observation.terminating.insert(pod.name.clone());
+                // The process may already have exited; only a positive
+                // reading counts. Stop scraping a pod after one, which keeps
+                // each poll short and its exit time accurate.
+                if !observation.draining.contains(&pod.name)
+                    && self
+                        .scrape_gateway_metrics(pod)
+                        .await
+                        .is_ok_and(|metrics| prometheus_count(&metrics, DRAINING_METRIC) == Ok(1))
+                {
+                    observation.draining.insert(pod.name.clone());
+                }
+            }
+            if status_done && first_seen.is_empty() {
+                return Ok(observation);
+            }
+        }
+    }
+
+    /// Unwrap a step result, or panic with its error followed by a snapshot of
+    /// the gateway pods and sandboxes.
+    async fn check<T>(&self, what: &str, result: Result<T, String>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => panic!("{what}: {err}\n{}", self.diagnostics().await),
+        }
+    }
+
+    /// Best-effort snapshot for failure messages: each gateway pod with its
+    /// state and session and draining gauges, then every sandbox phase.
+    async fn diagnostics(&self) -> String {
+        let mut out = String::from("cluster snapshot:");
+        match self.gateway_pod_states().await {
+            Ok(pods) => {
+                for pod in &pods {
+                    let gauges = match self.scrape_gateway_metrics(pod).await {
+                        Ok(metrics) => {
+                            let gauge = |metric| {
+                                prometheus_count(&metrics, metric)
+                                    .map_or_else(|err| err, |value| value.to_string())
+                            };
+                            format!(
+                                "sessions={} draining={}",
+                                gauge(SUPERVISOR_SESSIONS_METRIC),
+                                gauge(DRAINING_METRIC)
+                            )
+                        }
+                        Err(err) => format!("metrics unavailable: {err}"),
+                    };
+                    let _ = write!(
+                        out,
+                        "\n  gateway pod {} ready={} terminating={} {gauges}",
+                        pod.name, pod.ready, pod.terminating
+                    );
+                }
+            }
+            Err(err) => {
+                let _ = write!(out, "\n  gateway pods unavailable: {err}");
+            }
+        }
+        match sandbox_phases().await {
+            Ok(phases) => {
+                let _ = write!(out, "\n  sandbox phases: {phases:?}");
+            }
+            Err(err) => {
+                let _ = write!(out, "\n  sandbox phases unavailable: {err}");
+            }
+        }
+        out
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct GatewayPod {
     name: String,
     ready: bool,
+    /// `metadata.deletionTimestamp` is set.
+    terminating: bool,
+    /// `containerPort` of the container port named `metrics`.
+    metrics_port: Option<u16>,
+}
+
+#[derive(Debug)]
+struct SessionAccounting {
+    sessions_by_pod: BTreeMap<String, u64>,
+    ready_sandboxes: u64,
+}
+
+#[derive(Debug, Default)]
+struct RolloutObservation {
+    terminating: BTreeSet<String>,
+    draining: BTreeSet<String>,
+    /// For each pod seen terminating: from the end of the first listing that
+    /// showed it terminating to the start of the first listing without it. A
+    /// late first sighting only shortens this; the last poll adds at most
+    /// one poll interval.
+    exit_times: BTreeMap<String, Duration>,
 }
 
 struct PortForward {
@@ -371,6 +753,146 @@ async fn assert_exec_through_all_pods(
     Ok(())
 }
 
+/// `name -> phase` for every sandbox in the CLI's workspace.
+async fn sandbox_phases() -> Result<BTreeMap<String, String>, String> {
+    let mut cmd = openshell_cmd();
+    // The session gauge counts every workspace, so list every workspace too.
+    cmd.args(["sandbox", "list", "--all-workspaces", "--output", "json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = tokio::time::timeout(HA_QUERY_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| format!("sandbox list did not finish within {HA_QUERY_TIMEOUT:?}"))?
+        .map_err(|err| format!("failed to spawn openshell sandbox list: {err}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        return Err(format!(
+            "sandbox list failed with exit {:?}:\n{stdout}{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let json = stdout.find('{').map_or("", |start| &stdout[start..]);
+    let value = serde_json::from_str::<Value>(json)
+        .map_err(|err| format!("failed to parse sandbox list JSON: {err}\n{stdout}"))?;
+    if value["next_page_token"]
+        .as_str()
+        .is_some_and(|token| !token.is_empty())
+    {
+        return Err(format!(
+            "sandbox list returned more than one page; the check needs every sandbox:\n{stdout}"
+        ));
+    }
+    let sandboxes = value["sandboxes"]
+        .as_array()
+        .ok_or_else(|| format!("sandbox list JSON missing sandboxes array: {value}"))?;
+
+    Ok(sandboxes
+        .iter()
+        .filter_map(|sandbox| {
+            Some((
+                sandbox["name"].as_str()?.to_string(),
+                sandbox["phase"].as_str()?.to_string(),
+            ))
+        })
+        .collect())
+}
+
+/// Value of an unlabelled sample in Prometheus text exposition output.
+fn prometheus_sample(text: &str, metric: &str) -> Option<f64> {
+    text.lines()
+        .filter(|line| !line.starts_with('#'))
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            if fields.next()? != metric {
+                return None;
+            }
+            fields.next()?.parse::<f64>().ok()
+        })
+}
+
+fn prometheus_count(text: &str, metric: &str) -> Result<u64, String> {
+    let value = prometheus_sample(text, metric)
+        .ok_or_else(|| format!("metric {metric} missing from /metrics"))?;
+    if value < 0.0 || value.fract() != 0.0 {
+        return Err(format!("metric {metric} is not a count: {value}"));
+    }
+    format!("{value:.0}")
+        .parse::<u64>()
+        .map_err(|err| format!("metric {metric} value {value}: {err}"))
+}
+
+/// Record one successful pod listing. A pod newly listed as terminating is
+/// timed from `listed_at`, the end of the listing. A timed pod missing from
+/// the listing left after the previous one, so its time up to
+/// `listing_started` moves to `exit_times`.
+fn record_terminating_pods(
+    first_seen: &mut BTreeMap<String, Instant>,
+    exit_times: &mut BTreeMap<String, Duration>,
+    terminating: &[&str],
+    listing_started: Instant,
+    listed_at: Instant,
+) {
+    first_seen.retain(|name, seen| {
+        let listed = terminating.contains(&name.as_str());
+        if !listed {
+            exit_times.insert(
+                name.clone(),
+                listing_started.saturating_duration_since(*seen),
+            );
+        }
+        listed
+    });
+    for name in terminating {
+        if !exit_times.contains_key(*name) {
+            first_seen.entry((*name).to_string()).or_insert(listed_at);
+        }
+    }
+}
+
+/// Time left before `deadline`, capped at `step`.
+fn step_budget(deadline: Instant, step: Duration) -> Duration {
+    deadline.saturating_duration_since(Instant::now()).min(step)
+}
+
+/// Run one step under `min(step, time left)`, naming the step on timeout.
+async fn within<T>(
+    deadline: Instant,
+    step: Duration,
+    what: &str,
+    fut: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let budget = step_budget(deadline, step);
+    tokio::time::timeout(budget, fut)
+        .await
+        .map_err(|_| format!("{what} did not finish within {budget:?}"))?
+}
+
+/// Run `attempt` at least once, then every 2 s until it succeeds or `until`
+/// passes. The error names `what` and carries the last failure.
+async fn poll_until<T, Fut>(
+    until: Instant,
+    what: &str,
+    mut attempt: impl FnMut() -> Fut,
+) -> Result<T, String>
+where
+    Fut: Future<Output = Result<T, String>>,
+{
+    let budget = until.saturating_duration_since(Instant::now());
+    let interval = Duration::from_secs(2);
+    loop {
+        let last = match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(err) => err,
+        };
+        if Instant::now() + interval >= until {
+            return Err(format!("{what} within {budget:?}; last: {last}"));
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
 fn write_deterministic_payload(path: &Path, size: usize) {
     let mut file = fs::File::create(path).expect("create HA sync payload");
     let mut offset = 0usize;
@@ -514,6 +1036,15 @@ async fn sandbox_exec_rebalances_across_gateway_scale_and_rollout() {
         .wait_for_gateway_pods(2)
         .await
         .expect("gateway should scale back to two ready replicas");
+    // The removed pod drains after `rollout status` returns, and new execs
+    // fail while the moved sandbox briefly reports Provisioning.
+    kube.wait_for_gateway_settled(
+        2,
+        &[sandbox.name.clone()],
+        Instant::now() + HA_SETTLE_TIMEOUT,
+    )
+    .await
+    .expect("the removed gateway pod should finish draining and the sandbox should be Ready again");
     assert_exec_through_all_pods(&kube, &pods, &sandbox.name, "scale-down")
         .await
         .expect("exec should work through every gateway pod after scale-down");
@@ -624,4 +1155,192 @@ async fn sandbox_file_sync_survives_gateway_pod_rolls() {
     assert_eq!(marker, "ha-sync-marker", "downloaded marker mismatch");
 
     sandbox.cleanup().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one rollout scenario, each step with its own deadline
+async fn supervisor_sessions_redistribute_across_gateway_pod_rolls() {
+    let _test_lock = KUBE_HA_TEST_LOCK.lock().await;
+    let kube = KubeTarget::from_env();
+    let deadline = Instant::now() + HA_REDISTRIBUTION_TEST_BUDGET;
+
+    let scaled = within(
+        deadline,
+        HA_ROLLOUT_TIMEOUT,
+        "scale gateway to two replicas",
+        kube.scale_gateway(2),
+    )
+    .await;
+    kube.check(
+        "gateway should run two HA replicas before the rollout",
+        scaled,
+    )
+    .await;
+    let old_pods = kube
+        .wait_for_gateway_pods_until(2, deadline.min(Instant::now() + HA_READY_PODS_TIMEOUT))
+        .await;
+    let old_pods = kube
+        .check("two ready gateway replicas before the rollout", old_pods)
+        .await;
+
+    let created = within(
+        deadline,
+        HA_REDISTRIBUTION_CREATE_TIMEOUT,
+        "create sandboxes through the configured gateway",
+        try_join_all((0..HA_REDISTRIBUTION_SANDBOXES).map(|idx| async move {
+            let phase = format!("redistribute-{idx}");
+            create_sandbox_through_configured_gateway(&phase).await
+        })),
+    )
+    .await;
+    let mut sandboxes = kube
+        .check("create sandboxes through the configured gateway", created)
+        .await;
+    let names: Vec<String> = sandboxes
+        .iter()
+        .map(|sandbox| sandbox.name.clone())
+        .collect();
+
+    let before = kube.wait_for_session_accounting(2, &names, deadline).await;
+    let before = kube
+        .check(
+            "session gauges should account for every Ready sandbox before the rollout",
+            before,
+        )
+        .await;
+    eprintln!(
+        "supervisor sessions before rollout: {:?} for {} Ready sandboxes",
+        before.sessions_by_pod, before.ready_sandboxes
+    );
+
+    let observation = kube.restart_gateway_and_observe_drain(deadline).await;
+    let observation = kube.check("gateway rollout restart", observation).await;
+    eprintln!(
+        "gateway pods terminating during rollout: {:?}; draining: {:?}; left after: {:?}",
+        observation.terminating, observation.draining, observation.exit_times
+    );
+    assert!(
+        !observation.draining.is_empty(),
+        "expected {DRAINING_METRIC}=1 on a terminating gateway pod; terminating pods seen: {:?}",
+        observation.terminating
+    );
+    assert!(
+        observation
+            .draining
+            .iter()
+            .all(|pod| old_pods.contains(pod)),
+        "only replaced pods should drain; old={old_pods:?} draining={:?}",
+        observation.draining
+    );
+    // The gauge flips before any session closes, so only the exit time tells
+    // a finished drain from a kill at the end of the grace period.
+    assert!(
+        observation
+            .exit_times
+            .values()
+            .all(|elapsed| *elapsed <= HA_DRAIN_EXIT_BOUND),
+        "every terminating gateway pod should leave within {HA_DRAIN_EXIT_BOUND:?}; a longer stay means the drain overran its 25 s bound or the 30 s grace period cut it off; left after: {:?}",
+        observation.exit_times
+    );
+
+    let new_pods = kube
+        .wait_for_gateway_pods_until(2, deadline.min(Instant::now() + HA_READY_PODS_TIMEOUT))
+        .await;
+    let new_pods = kube
+        .check("two ready gateway replicas after the rollout", new_pods)
+        .await;
+    assert!(
+        new_pods.iter().all(|pod| !old_pods.contains(pod)),
+        "rollout restart should replace every gateway pod; old={old_pods:?} new={new_pods:?}"
+    );
+
+    // Exec runs only after this settles: new execs fail with
+    // FAILED_PRECONDITION while a moved sandbox reports Provisioning.
+    let after = kube.wait_for_session_accounting(2, &names, deadline).await;
+    let after = kube
+        .check(
+            "every sandbox should be Ready with exactly one supervisor session on the new pods",
+            after,
+        )
+        .await;
+    eprintln!(
+        "supervisor sessions after rollout: {:?} for {} Ready sandboxes",
+        after.sessions_by_pod, after.ready_sandboxes
+    );
+
+    let exec = within(
+        deadline,
+        HA_EXEC_TIMEOUT,
+        "exec through every new gateway pod",
+        async {
+            for (idx, sandbox) in sandboxes.iter().enumerate() {
+                let phase = format!("redistribute-{idx}");
+                assert_exec_through_all_pods(&kube, &new_pods, &sandbox.name, &phase)
+                    .await
+                    .map_err(|err| {
+                        format!(
+                            "exec through every new gateway pod for {}: {err}",
+                            sandbox.name
+                        )
+                    })?;
+                let marker = format!("ha-redistribute-client-{idx}");
+                exec_through_configured_gateway(&sandbox.name, &marker)
+                    .await
+                    .map_err(|err| {
+                        format!(
+                            "exec through the configured gateway for {}: {err}",
+                            sandbox.name
+                        )
+                    })?;
+            }
+            Ok(())
+        },
+    )
+    .await;
+    kube.check("exec after the rollout", exec).await;
+
+    for sandbox in &mut sandboxes {
+        sandbox.cleanup().await;
+    }
+}
+
+#[test]
+fn prometheus_count_reads_unlabelled_samples_only() {
+    let text = "# TYPE openshell_server_supervisor_sessions gauge\n\
+                openshell_server_supervisor_sessions 3\n\
+                openshell_server_supervisor_sessions_total 9\n\
+                openshell_server_relay_rejected_total{reason=\"global_capacity\"} 1\n";
+    assert_eq!(
+        prometheus_count(text, "openshell_server_supervisor_sessions"),
+        Ok(3)
+    );
+    assert!(prometheus_count(text, "openshell_server_relay_rejected_total").is_err());
+    assert!(prometheus_count(text, "openshell_server_missing").is_err());
+}
+
+#[test]
+fn terminating_pod_exit_time_runs_from_first_sighting_to_first_listing_without_it() {
+    let start = Instant::now();
+    let at = |secs| start + Duration::from_secs(secs);
+    let mut first_seen = BTreeMap::new();
+    let mut exit_times = BTreeMap::new();
+
+    record_terminating_pods(&mut first_seen, &mut exit_times, &["old-a"], at(0), at(1));
+    record_terminating_pods(
+        &mut first_seen,
+        &mut exit_times,
+        &["old-a", "old-b"],
+        at(2),
+        at(3),
+    );
+    record_terminating_pods(&mut first_seen, &mut exit_times, &["old-b"], at(10), at(11));
+    assert_eq!(
+        exit_times,
+        BTreeMap::from([("old-a".to_string(), Duration::from_secs(9))])
+    );
+    assert_eq!(first_seen, BTreeMap::from([("old-b".to_string(), at(3))]));
+
+    record_terminating_pods(&mut first_seen, &mut exit_times, &[], at(40), at(41));
+    assert_eq!(exit_times.get("old-b"), Some(&Duration::from_secs(37)));
+    assert!(first_seen.is_empty());
 }

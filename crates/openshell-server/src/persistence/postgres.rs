@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::mutation_lock::{
+    LockMode, MUTATION_LOCK_POOL_MAX_CONNECTIONS, MUTATION_LOCK_TIMEOUT,
+    MUTATION_LOCK_TIMEOUT_SETTING, MutationLockSet,
+};
 use super::{
     DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
     PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
@@ -17,6 +21,8 @@ use prost::Message;
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, PgPool, Postgres, QueryBuilder, Row};
+use std::collections::HashMap;
+use std::time::Duration;
 
 static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
@@ -28,39 +34,160 @@ pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
         .map(|migration| migration.sql.as_ref())
 }
 
-use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
+use super::{
+    DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE,
+    RESOURCE_VERSION_BATCH_SIZE,
+};
 
 #[derive(Debug, Clone)]
 pub struct PostgresStore {
     pool: PgPool,
+    /// Dedicated connections for session-level mutation advisory locks.
+    lock_pool: PgPool,
 }
 
-// Stable cluster-wide key for serializing sandbox/provider cross-object
-// mutations. The bytes spell "OPENSHLL" and stay within PostgreSQL's signed
-// 64-bit advisory-lock key space.
-const CROSS_OBJECT_ADVISORY_LOCK_KEY: i64 = 0x4f50_454e_5348_4c4c;
+/// How long the client waits past the caller's deadline for a lock statement.
+///
+/// Each statement sets `lock_timeout` to the remaining deadline, so
+/// `PostgreSQL` ends the wait on time; this timer only catches a stalled
+/// connection.
+const LOCK_STATEMENT_CLIENT_GRACE: Duration = Duration::from_millis(500);
 
-// Bounds the wait for the cross-object lock. The holder only validates and
-// writes, so a wait this long means a stuck replica; failing beats blocking
-// every sandbox and provider mutation in the fleet indefinitely.
-const CROSS_OBJECT_ADVISORY_LOCK_TIMEOUT: &str = "10s";
+/// Bound the complete pool return, including the unlock hook and `SQLx`'s ping.
+/// A stalled connection must not retain a lock-pool permit indefinitely.
+pub(super) const LOCK_CONNECTION_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Holds the mutation advisory locks of one acquisition.
+///
+/// Returned to the lock pool on drop; `after_release` runs
+/// `pg_advisory_unlock_all()` before reuse. The entire return is bounded by
+/// [`LOCK_CONNECTION_RELEASE_TIMEOUT`]. An acquisition that `PostgreSQL`
+/// times out (`55P03`) is returned the same way. A cancelled or otherwise failed
+/// acquisition closes its session instead (see [`PendingLockConnection`]).
 pub(super) struct PostgresAdvisoryLockGuard {
-    // `close_on_drop` is set before this guard is constructed. Closing the
-    // dedicated session releases the session-level advisory lock even when a
-    // request is cancelled or returns early.
-    _connection: PoolConnection<Postgres>,
+    connection: PoolConnection<Postgres>,
+}
+
+impl Drop for PostgresAdvisoryLockGuard {
+    fn drop(&mut self) {
+        return_lock_connection(&mut self.connection);
+    }
+}
+
+fn return_lock_connection(connection: &mut PoolConnection<Postgres>) {
+    // SQLx transfers the connection and pool permit into this owned future
+    // immediately. Dropping it on timeout closes the socket and releases the
+    // permit, including when the unlock hook succeeded but the final ping stalls.
+    // This relies on sqlx-core 0.9's doc-hidden `PoolConnection::return_to_pool`;
+    // rerun the `postgres_mutation_lock_stalled_release_*` test on any sqlx bump.
+    let returning = connection.return_to_pool();
+    tokio::spawn(async move {
+        if tokio::time::timeout(LOCK_CONNECTION_RELEASE_TIMEOUT, returning)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "timed out returning PostgreSQL mutation lock connection; discarded connection"
+            );
+        }
+    });
+}
+
+#[cfg(test)]
+impl PostgresAdvisoryLockGuard {
+    /// Backend process id of the session that holds the locks.
+    pub(super) async fn backend_pid(&mut self) -> i32 {
+        let Self { connection } = self;
+        sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut **connection)
+            .await
+            .expect("read the lock session's backend pid")
+    }
+}
+
+/// A lock-pool connection whose acquisition is still in progress.
+///
+/// Dropping it closes the session, which releases every advisory lock the
+/// backend holds once its current statement ends. A backend blocked on a lock
+/// does not notice the closed socket, so each lock statement carries its own
+/// `lock_timeout` to bound that wait by the caller's deadline.
+struct PendingLockConnection(Option<PoolConnection<Postgres>>);
+
+impl PendingLockConnection {
+    fn connection(&mut self) -> &mut PoolConnection<Postgres> {
+        self.0
+            .as_mut()
+            .expect("pending lock connection is present until disarmed")
+    }
+
+    /// Keep the session: every lock was acquired.
+    fn into_connection(mut self) -> PoolConnection<Postgres> {
+        self.0
+            .take()
+            .expect("pending lock connection is present until disarmed")
+    }
+
+    /// Return the healthy session to the pool, whose `after_release` unlocks
+    /// any keys it already holds.
+    fn release(mut self) {
+        if let Some(mut connection) = self.0.take() {
+            return_lock_connection(&mut connection);
+        }
+    }
+}
+
+impl Drop for PendingLockConnection {
+    fn drop(&mut self) {
+        if let Some(connection) = self.0.as_mut() {
+            connection.close_on_drop();
+        }
+    }
 }
 
 impl PostgresStore {
     pub async fn connect(url: &str) -> PersistenceResult<Self> {
+        Self::connect_with_lock_pool_size(url, MUTATION_LOCK_POOL_MAX_CONNECTIONS).await
+    }
+
+    pub(super) async fn connect_with_lock_pool_size(
+        url: &str,
+        lock_pool_size: u32,
+    ) -> PersistenceResult<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(10)
             .connect(url)
             .await
             .map_err(|e| map_db_error(&e))?;
+        let lock_pool = PgPoolOptions::new()
+            .max_connections(lock_pool_size)
+            .min_connections(0)
+            // Backstop only; callers bound the acquire by their own deadline.
+            .acquire_timeout(MUTATION_LOCK_TIMEOUT)
+            .after_connect(|connection, _metadata| {
+                Box::pin(async move {
+                    // Backstop only: every lock statement sets the remaining
+                    // deadline of its own acquisition.
+                    sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+                        .bind(MUTATION_LOCK_TIMEOUT_SETTING)
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .after_release(|connection, _metadata| {
+                Box::pin(async move {
+                    // Scrub every returned lock connection. On error sqlx closes
+                    // it, and the backend exit releases whatever it held.
+                    sqlx::query("SELECT pg_advisory_unlock_all()")
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(true)
+                })
+            })
+            .connect_lazy(url)
+            .map_err(|e| map_db_error(&e))?;
 
-        Ok(Self { pool })
+        Ok(Self { pool, lock_pool })
     }
 
     pub async fn migrate(&self) -> PersistenceResult<()> {
@@ -114,32 +241,97 @@ impl PostgresStore {
         conn.ping().await.map_err(|e| map_db_error(&e))
     }
 
-    pub(super) async fn acquire_cross_object_lock(
+    /// Acquire `locks` as session-level advisory locks, in ascending key
+    /// order, on one lock-pool connection.
+    ///
+    /// Fails with [`PersistenceError::LockTimeout`] when the connection or a
+    /// lock is not available by `deadline`.
+    pub(super) async fn acquire_mutation_locks(
         &self,
+        locks: &MutationLockSet,
+        deadline: tokio::time::Instant,
     ) -> PersistenceResult<PostgresAdvisoryLockGuard> {
-        let mut connection = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
-        connection.close_on_drop();
-        sqlx::query("SELECT set_config('lock_timeout', $1, false)")
-            .bind(CROSS_OBJECT_ADVISORY_LOCK_TIMEOUT)
-            .execute(&mut *connection)
-            .await
-            .map_err(|e| map_db_error(&e))?;
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(CROSS_OBJECT_ADVISORY_LOCK_KEY)
-            .execute(&mut *connection)
-            .await
-            .map_err(|e| map_db_error(&e))?;
+        let connection = match tokio::time::timeout_at(deadline, self.lock_pool.acquire()).await {
+            Err(_) | Ok(Err(sqlx::Error::PoolTimedOut)) => {
+                return Err(PersistenceError::LockTimeout(
+                    "waiting for a mutation lock connection".into(),
+                ));
+            }
+            Ok(Err(error)) => return Err(map_db_error(&error)),
+            Ok(Ok(connection)) => connection,
+        };
+        let mut pending = PendingLockConnection(Some(connection));
+        for (key, mode) in locks.iter() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining < Duration::from_millis(1) {
+                // Nothing waits server-side; `after_release` unlocks the keys
+                // taken so far.
+                pending.release();
+                return Err(PersistenceError::LockTimeout(
+                    "waiting for a PostgreSQL advisory lock".into(),
+                ));
+            }
+            // `set_config` and the lock run in one statement. A CTE that calls
+            // a volatile function is never inlined, and the outer projection
+            // needs its row, so `lock_timeout` is set before the lock wait
+            // starts. PostgreSQL then abandons the wait at the caller's
+            // deadline even if this future is cancelled and the socket closed.
+            let sql = match mode {
+                LockMode::Shared => {
+                    "WITH timeout AS (SELECT set_config('lock_timeout', $1, false)) \
+                     SELECT pg_advisory_lock_shared($2) FROM timeout"
+                }
+                LockMode::Exclusive => {
+                    "WITH timeout AS (SELECT set_config('lock_timeout', $1, false)) \
+                     SELECT pg_advisory_lock($2) FROM timeout"
+                }
+            };
+            let statement = sqlx::query(sql)
+                .bind(format!("{}ms", remaining.as_millis()))
+                .bind(key)
+                .execute(&mut **pending.connection());
+            match tokio::time::timeout_at(deadline + LOCK_STATEMENT_CLIENT_GRACE, statement).await {
+                Err(_) => {
+                    return Err(PersistenceError::LockTimeout(
+                        "waiting for a PostgreSQL advisory lock".into(),
+                    ));
+                }
+                Ok(Err(error)) => {
+                    let error = map_db_error(&error);
+                    if matches!(error, PersistenceError::LockTimeout(_)) {
+                        // Healthy session: return it; `after_release` unlocks
+                        // the keys already held.
+                        pending.release();
+                    }
+                    return Err(error);
+                }
+                Ok(Ok(_)) => {}
+            }
+        }
         Ok(PostgresAdvisoryLockGuard {
-            _connection: connection,
+            connection: pending.into_connection(),
         })
     }
 
-    /// Test support only: close the underlying connection pool.
+    /// Connections the lock pool holds, idle or in use.
+    #[cfg(test)]
+    pub(super) fn lock_pool_size(&self) -> u32 {
+        self.lock_pool.size()
+    }
+
+    /// Lock-pool connections that are connected and ready for reuse.
+    #[cfg(test)]
+    pub(super) fn lock_pool_idle(&self) -> usize {
+        self.lock_pool.num_idle()
+    }
+
+    /// Test support only: close the underlying connection pools.
     ///
-    /// Do not call from runtime code; this tears down the active pool.
+    /// Do not call from runtime code; this tears down the active pools.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn close(&self) {
         self.pool.close().await;
+        self.lock_pool.close().await;
     }
 
     pub async fn put(
@@ -587,6 +779,36 @@ WHERE object_type = $1 AND workspace = $2 AND name = $3
         Ok(deleted)
     }
 
+    pub async fn get_resource_versions(
+        &self,
+        object_type: &str,
+        ids: &[String],
+    ) -> PersistenceResult<HashMap<String, u64>> {
+        let mut versions = HashMap::with_capacity(ids.len());
+        for ids in ids.chunks(RESOURCE_VERSION_BATCH_SIZE) {
+            // The chunk binds as one TEXT[] parameter, so every chunk length
+            // shares one prepared statement and uses the primary-key index.
+            let rows = sqlx::query(
+                "SELECT id, resource_version FROM objects WHERE object_type = $1 AND id = ANY($2)",
+            )
+            .bind(object_type)
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+            for row in rows {
+                let id: String = row.try_get("id").map_err(|e| map_db_error(&e))?;
+                let resource_version: i64 = row
+                    .try_get("resource_version")
+                    .map_err(|e| map_db_error(&e))?;
+                // Same normalization as row_to_object_record, so the poller
+                // compares exactly what get_message would have returned.
+                versions.insert(id, resource_version.max(1).cast_unsigned());
+            }
+        }
+        Ok(versions)
+    }
+
     pub async fn count_in_workspace(
         &self,
         object_type: &str,
@@ -672,30 +894,6 @@ LIMIT $3 OFFSET $4
         Ok(rows.into_iter().map(row_to_object_record).collect())
     }
 
-    pub async fn list_by_type(
-        &self,
-        object_type: &str,
-        limit: u32,
-        offset: u32,
-    ) -> PersistenceResult<Vec<ObjectRecord>> {
-        let rows = sqlx::query(
-            r"
-SELECT object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version
-FROM objects
-WHERE object_type = $1
-ORDER BY created_at_ms ASC, name ASC, workspace ASC, id ASC
-LIMIT $2 OFFSET $3
-",
-        )
-        .bind(object_type)
-        .bind(i64::from(limit))
-        .bind(i64::from(offset))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| map_db_error(&e))?;
-
-        Ok(rows.into_iter().map(row_to_object_record).collect())
-    }
     pub async fn list_after(
         &self,
         object_type: &str,
@@ -1017,7 +1215,7 @@ LIMIT $3 OFFSET $4
             load_error: None,
             created_at_ms: now_ms,
             loaded_at_ms: None,
-            provenance: std::collections::HashMap::default(),
+            provenance: HashMap::default(),
         };
         let wrapped_payload = policy_payload_from_record(&record)?;
 

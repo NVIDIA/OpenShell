@@ -12,7 +12,8 @@
 //!   `503 Service Unavailable` when the latest background check failed.
 //!   Handler latency is sub-millisecond: the database is never pinged from
 //!   inside the request path, so the response cannot race the kubelet's
-//!   probe timeout.
+//!   probe timeout. Once gateway shutdown begins it returns `503` with
+//!   status `draining`, whatever the database state.
 //! - `/health` — Alias of `/readyz` for external monitors
 //!   that conventionally probe `/health`.
 
@@ -34,6 +35,7 @@ use crate::readiness::{DatabaseHealthMonitor, HealthError, HealthState};
 
 const STATUS_HEALTHY: &str = "healthy";
 const STATUS_UNHEALTHY: &str = "unhealthy";
+const STATUS_DRAINING: &str = "draining";
 const DATABASE_INITIALIZING_ERROR: &str = "readiness monitor still initializing";
 const DATABASE_UNAVAILABLE_ERROR: &str = "database unavailable";
 const DATABASE_TIMEOUT_ERROR: &str = "database health check timed out";
@@ -41,6 +43,9 @@ const DATABASE_TIMEOUT_ERROR: &str = "database health check timed out";
 #[derive(Clone)]
 struct HealthRouterState {
     health: watch::Receiver<HealthState>,
+    /// Flips to `true` at gateway shutdown. Readiness then reports `503`
+    /// regardless of database health; liveness is unaffected.
+    draining: watch::Receiver<bool>,
 }
 
 /// Per-dependency check entry exposed under `checks` in the JSON payload.
@@ -67,7 +72,9 @@ pub struct HealthChecks {
 /// Readiness response payload.
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
-    /// Overall status: `"healthy"` if every dependency is healthy.
+    /// Overall status: `"healthy"`, `"unhealthy"`, or `"draining"`. It is
+    /// `"healthy"` only when every dependency is healthy and the gateway is
+    /// not shutting down.
     pub status: &'static str,
 
     /// Service version.
@@ -82,32 +89,30 @@ async fn healthz() -> impl IntoResponse {
     StatusCode::OK
 }
 
-/// Kubernetes readiness probe — reflects the cached background DB state.
+/// Kubernetes readiness probe — reflects the cached background DB state and
+/// the gateway draining signal.
 async fn readyz(State(state): State<Arc<HealthRouterState>>) -> impl IntoResponse {
-    render_response(&state.health.borrow())
+    render_response(&state.health.borrow(), *state.draining.borrow())
 }
 
 /// Convenience alias of [`readyz`] for monitors that probe `/health`.
 async fn health(State(state): State<Arc<HealthRouterState>>) -> impl IntoResponse {
-    render_response(&state.health.borrow())
+    render_response(&state.health.borrow(), *state.draining.borrow())
 }
 
-fn render_response(state: &HealthState) -> (StatusCode, Json<HealthResponse>) {
+fn render_response(state: &HealthState, draining: bool) -> (StatusCode, Json<HealthResponse>) {
     let database = render_database(state);
-    let healthy = state.is_healthy();
+    let (status, code) = if draining {
+        (STATUS_DRAINING, StatusCode::SERVICE_UNAVAILABLE)
+    } else if state.is_healthy() {
+        (STATUS_HEALTHY, StatusCode::OK)
+    } else {
+        (STATUS_UNHEALTHY, StatusCode::SERVICE_UNAVAILABLE)
+    };
     let response = HealthResponse {
-        status: if healthy {
-            STATUS_HEALTHY
-        } else {
-            STATUS_UNHEALTHY
-        },
+        status,
         version: openshell_core::VERSION,
         checks: HealthChecks { database },
-    };
-    let code = if healthy {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
     };
     (code, Json(response))
 }
@@ -152,12 +157,35 @@ pub fn health_router(store: Arc<Store>) -> Router {
     health_router_from_receiver(monitor.subscribe())
 }
 
+/// Like [`health_router`], with readiness forced to `draining` once
+/// `draining` is `true`.
+pub fn health_router_with_drain(store: Arc<Store>, draining: watch::Receiver<bool>) -> Router {
+    let monitor = DatabaseHealthMonitor::spawn(store);
+    health_router_from_parts(monitor.subscribe(), draining)
+}
+
 /// Build the health router from an existing monitor receiver.
 ///
 /// Crate-internal: used by [`health_router`] and by tests that drive the
 /// `HealthState` directly without spinning up the polling task.
 pub fn health_router_from_receiver(receiver: watch::Receiver<HealthState>) -> Router {
-    let state = Arc::new(HealthRouterState { health: receiver });
+    health_router_from_parts(receiver, not_draining())
+}
+
+/// A draining signal that never flips. The sender is dropped on purpose;
+/// `borrow()` keeps returning `false`.
+fn not_draining() -> watch::Receiver<bool> {
+    watch::channel(false).1
+}
+
+fn health_router_from_parts(
+    health_state: watch::Receiver<HealthState>,
+    draining: watch::Receiver<bool>,
+) -> Router {
+    let state = Arc::new(HealthRouterState {
+        health: health_state,
+        draining,
+    });
 
     Router::new()
         .route("/health", get(health))
@@ -473,6 +501,18 @@ mod readiness_tests {
         health_router_from_receiver(rx)
     }
 
+    /// Like [`router_with_state`], with the draining signal supplied by the
+    /// caller so a test can hold the sender and flip it.
+    fn router_with_state_and_drain(state: HealthState, draining: watch::Receiver<bool>) -> Router {
+        let (_tx, rx) = watch::channel(state);
+        health_router_from_parts(rx, draining)
+    }
+
+    /// A draining signal that is already `true`.
+    fn draining_signal() -> watch::Receiver<bool> {
+        watch::channel(true).1
+    }
+
     #[tokio::test]
     async fn healthz_is_minimal_and_does_not_touch_the_database() {
         // Liveness must succeed even when the database is unreachable —
@@ -564,5 +604,55 @@ mod readiness_tests {
             body["checks"]["database"]["latency_ms"].is_null(),
             "timeout state has no completed-call latency"
         );
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_draining_even_when_database_is_healthy() {
+        let router =
+            router_with_state_and_drain(HealthState::Healthy { latency_ms: 1 }, draining_signal());
+        let (status, body) = get(router, "/readyz").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "draining");
+        assert_eq!(body["checks"]["database"]["status"], "healthy");
+    }
+
+    #[tokio::test]
+    async fn health_alias_reports_draining() {
+        // Draining takes precedence over an unhealthy database, while the
+        // database check still reports its own state.
+        let router = router_with_state_and_drain(
+            HealthState::Unhealthy(HealthError::Timeout),
+            draining_signal(),
+        );
+        let (status, body) = get(router, "/health").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "draining");
+        assert_eq!(body["checks"]["database"]["status"], "unhealthy");
+    }
+
+    #[tokio::test]
+    async fn healthz_stays_ok_while_draining() {
+        // A draining gateway is still a live process; only readiness changes.
+        let router =
+            router_with_state_and_drain(HealthState::Healthy { latency_ms: 1 }, draining_signal());
+        let (status, body) = get(router, "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_null(), "healthz must return an empty body");
+    }
+
+    #[tokio::test]
+    async fn readyz_flips_to_draining_when_signal_changes() {
+        let (draining_tx, draining_rx) = watch::channel(false);
+        let router =
+            router_with_state_and_drain(HealthState::Healthy { latency_ms: 1 }, draining_rx);
+
+        let (status, body) = get(router.clone(), "/readyz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "healthy");
+
+        draining_tx.send_replace(true);
+        let (status, body) = get(router, "/readyz").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "draining");
     }
 }

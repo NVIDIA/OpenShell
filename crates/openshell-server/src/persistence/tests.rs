@@ -804,6 +804,130 @@ async fn delete_many_is_bounded_idempotent_and_type_scoped() {
     assert!(store.get("provider", "other-type").await.unwrap().is_some());
 }
 
+/// Shared by the `SQLite` and `PostgreSQL` tests: spans two lookup batches,
+/// mixes in missing, other-type and duplicate ids, and checks that versions
+/// follow updates and deletions.
+async fn assert_get_resource_versions_contract(store: &Store) {
+    let batch = super::RESOURCE_VERSION_BATCH_SIZE;
+    let mut ids = Vec::new();
+    for idx in 0..(batch + 12) {
+        let id = format!("sandbox-{idx}");
+        store
+            .put(
+                "sandbox",
+                &id,
+                &format!("name-{idx}"),
+                "default",
+                b"payload",
+                None,
+            )
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    store
+        .put(
+            "provider",
+            "other-type",
+            "other-type",
+            "default",
+            b"payload",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut queried = ids.clone();
+    queried.extend([
+        "missing".to_string(),
+        "other-type".to_string(),
+        "sandbox-0".to_string(),
+    ]);
+    let versions = store
+        .get_resource_versions("sandbox", &queried)
+        .await
+        .unwrap();
+    assert_eq!(versions.len(), batch + 12);
+    for id in &ids {
+        let record = store.get("sandbox", id).await.unwrap().unwrap();
+        assert_eq!(versions[id], record.resource_version, "{id}");
+        assert_eq!(versions[id], 1, "{id}");
+    }
+    assert!(!versions.contains_key("missing"));
+    assert!(!versions.contains_key("other-type"));
+
+    // `chunks` follows input order, so these land in the first and second batch.
+    for idx in [0, batch] {
+        store
+            .put_if(
+                "sandbox",
+                &format!("sandbox-{idx}"),
+                &format!("name-{idx}"),
+                "default",
+                b"payload-2",
+                None,
+                super::WriteCondition::MatchResourceVersion(1),
+            )
+            .await
+            .unwrap();
+    }
+    let versions = store.get_resource_versions("sandbox", &ids).await.unwrap();
+    assert_eq!(versions["sandbox-0"], 2);
+    assert_eq!(versions[&format!("sandbox-{batch}")], 2);
+    assert_eq!(versions["sandbox-1"], 1);
+
+    assert!(store.delete("sandbox", "sandbox-1").await.unwrap());
+    let versions = store.get_resource_versions("sandbox", &ids).await.unwrap();
+    assert!(!versions.contains_key("sandbox-1"));
+    assert_eq!(versions.len(), batch + 11);
+
+    let versions = store
+        .get_resource_versions(
+            "provider",
+            &["other-type".to_string(), "sandbox-0".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        versions,
+        StdHashMap::from([("other-type".to_string(), 1_u64)])
+    );
+
+    assert!(
+        store
+            .get_resource_versions("sandbox", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // More ids than SQLite accepts as bound variables in one statement (32766),
+    // so an unchunked lookup fails with "too many SQL variables".
+    let mut many: Vec<String> = (0..40_000).map(|i| format!("missing-{i}")).collect();
+    many.push("sandbox-0".to_string());
+    let versions = store.get_resource_versions("sandbox", &many).await.unwrap();
+    assert_eq!(
+        versions,
+        StdHashMap::from([("sandbox-0".to_string(), 2_u64)])
+    );
+}
+
+#[tokio::test]
+async fn get_resource_versions_is_batched_type_scoped_and_omits_missing() {
+    let store = test_store().await;
+    assert_get_resource_versions_contract(&store).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_get_resource_versions_binds_text_array_across_batches() {
+    let schema = super::test_postgres::TestSchema::create("rv").await;
+    let store = schema.connect_store().await;
+    assert_get_resource_versions_contract(&store).await;
+    store.close().await;
+    schema.drop_schema().await;
+}
+
 #[tokio::test]
 async fn file_backed_sqlite_bulk_delete_allows_concurrent_control_reads() {
     use std::sync::Arc;

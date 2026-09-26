@@ -81,6 +81,7 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
 - [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - CI overlay for multi-replica external PostgreSQL testing
+- [`ci/values-autoscaling.yaml`](ci/values-autoscaling.yaml) - CI overlay for rendering the optional gateway HorizontalPodAutoscaler
 - [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
 - [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
 
@@ -166,6 +167,35 @@ server verification and mTLS. The client verifies the stable gateway Service
 DNS name while connecting directly to the owning pod. Custom TLS Secrets must
 include that Service DNS name in the server certificate and provide the CA and
 client credentials configured by `server.tls`.
+
+Gateway pods get 30 seconds to stop (`podLifecycle.terminationGracePeriodSeconds`).
+A gateway that uses an external PostgreSQL database (`server.externalDbSecret`)
+uses that time to hand its supervisor sessions to the other replicas before it
+exits. Keep the value at 30 or higher, and pass it explicitly when you upgrade
+with `--reuse-values`, which keeps the previous release's value.
+
+Set `autoscaling.enabled=true` to render an `autoscaling/v2`
+HorizontalPodAutoscaler for the gateway workload. The Deployment or
+StatefulSet then omits `spec.replicas`, and the chart applies its
+multi-replica checks to `autoscaling.maxReplicas`. CPU and memory targets
+need a matching `resources.requests` entry, or a `resources.limits` entry,
+which Kubernetes copies into the request. Add custom metrics from a metrics
+adapter with `autoscaling.metrics`. See the
+[High Availability guide](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability)
+for the metrics to scale and alert on.
+
+Enabling autoscaling on an existing release removes `spec.replicas` from the
+workload in that upgrade. Kubernetes can reset the workload to one replica
+until the HPA scales it back to at least `autoscaling.minReplicas`, which
+drains supervisor sessions from the other gateway pods. Enable autoscaling
+when you install the chart, or during a maintenance window. On an existing
+release, upgrade with `--reset-then-reuse-values`. `--reuse-values` keeps the
+previous chart version's defaults, which lack the autoscaling values,
+including the scale-down `behavior`, when that release predates them. For background, refer to
+[Migrating Deployments and StatefulSets to horizontal autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#migrating-deployments-and-statefulsets-to-horizontal-autoscaling).
+Disabling autoscaling renders `spec.replicas` from `replicaCount` again,
+which defaults to 1, so set `replicaCount` to the replica count you want in
+that upgrade.
 
 ## Secret bootstrap
 

@@ -26,6 +26,10 @@ kubernetes-ha = { max-threads = 1 }
 [[profile.e2e-kubernetes.overrides]]
 filter = "test(/gateway_(scale_and_rollout|pod_rolls)$/)"
 test-group = "kubernetes-ha"
+# Each rolled gateway pod drains its supervisor sessions for up to the 30s
+# termination grace period, so these tests get ten minutes, matching
+# HA_SYNC_TIMEOUT in kubernetes_ha_rebalancing.rs.
+slow-timeout = { period = "60s", terminate-after = 10 }
 
 # Relative to the profile store dir (`e2e/rust/target/nextest/e2e-kubernetes/`).
 [profile.e2e-kubernetes.junit]

@@ -14,6 +14,7 @@ use crate::auth::workspace_authz::{
     AuthorizedWorkspaceScope, MinWorkspaceRole, authorize_list_workspace_selector,
     authorize_sandbox_workspace, authorize_workspace,
 };
+use crate::compute::MutationScope;
 use crate::pagination::Pagination;
 use crate::persistence::{
     ObjectLabels, ObjectListQuery, ObjectType, WriteCondition, generate_name,
@@ -488,9 +489,9 @@ async fn handle_create_sandbox_inner(
     } else {
         request.name.clone()
     };
-    let (sandbox_lifecycle_guard, sandbox_sync_guard) = state
+    let (sandbox_lifecycle_guard, mutation_guard) = state
         .compute
-        .sandbox_create_guards(&id)
+        .sandbox_create_guards(&workspace, &id)
         .await
         .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
 
@@ -649,7 +650,7 @@ async fn handle_create_sandbox_inner(
         launch_authentication,
         await_main_process_attachment,
         sandbox_lifecycle_guard,
-        sandbox_sync_guard,
+        mutation_guard,
     ))
     .await?;
 
@@ -1297,10 +1298,14 @@ pub(super) async fn handle_attach_sandbox_provider(
     if let Some(probe) = attach_wait_probe {
         probe.notify_one();
     }
-    let _sandbox_sync_guard =
-        state.compute.sandbox_sync_guard().await.map_err(|err| {
-            super::persistence_error_to_status(err, "acquire sandbox mutation lock")
-        })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(
+            sandbox.object_workspace(),
+            sandbox.object_id(),
+        ))
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
     let provider_record = get_provider_record(state.store.as_ref(), &workspace, &request.provider)
         .await
         .map_err(|err| {
@@ -1470,10 +1475,14 @@ pub(super) async fn handle_detach_sandbox_provider(
         )));
     }
 
-    let _sandbox_sync_guard =
-        state.compute.sandbox_sync_guard().await.map_err(|err| {
-            super::persistence_error_to_status(err, "acquire sandbox mutation lock")
-        })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(
+            sandbox.object_workspace(),
+            sandbox.object_id(),
+        ))
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
     let sandbox_name = sandbox.object_name().to_string();
     let sandbox_id = sandbox
         .metadata
@@ -5401,8 +5410,13 @@ mod tests {
         state.store.put_message(&original).await.unwrap();
 
         // Hold the global guard so the handler can resolve the original ID and
-        // acquire its delete gate, but cannot yet revalidate or mutate it.
-        let global_guard = state.compute.sandbox_sync_guard().await.unwrap();
+        // acquire its delete gate, but cannot yet take the sandbox's local
+        // lifecycle lock (shared global key) to revalidate or mutate it.
+        let global_guard = state
+            .compute
+            .mutation_guard(MutationScope::Global)
+            .await
+            .unwrap();
         let delete_state = state.clone();
         let delete = tokio::spawn(async move {
             handle_delete_sandbox_inner(
@@ -5581,6 +5595,91 @@ mod tests {
             .unwrap()
             .providers;
         assert_eq!(providers, vec!["work-github"]);
+    }
+
+    fn attach_request(sandbox: &str, provider: &str) -> Request<AttachSandboxProviderRequest> {
+        authed_request(AttachSandboxProviderRequest {
+            request_id: String::new(),
+            sandbox: sandbox.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+            provider: provider.to_string(),
+            expected_resource_version: 0,
+        })
+    }
+
+    #[tokio::test]
+    async fn attach_provider_does_not_wait_for_unrelated_sandbox_guard() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+        let unrelated = test_sandbox("unrelated", Vec::new());
+        state.store.put_message(&unrelated).await.unwrap();
+        let unrelated_guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", unrelated.object_id()))
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_attach_sandbox_provider(&state, attach_request("work", "work-github")),
+        )
+        .await
+        .expect("attach should not wait for an unrelated sandbox mutation")
+        .expect("attach should succeed")
+        .into_inner();
+        assert!(response.attached);
+        drop(unrelated_guard);
+    }
+
+    #[tokio::test]
+    async fn attach_provider_waits_for_workspace_guard() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+        let workspace_guard = state
+            .compute
+            .mutation_guard(MutationScope::Workspace("default"))
+            .await
+            .unwrap();
+
+        let task_state = state.clone();
+        let mut attach = tokio::spawn(async move {
+            handle_attach_sandbox_provider(&task_state, attach_request("work", "work-github")).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut attach)
+                .await
+                .is_err(),
+            "attach should wait for a provider writer in its workspace"
+        );
+        drop(workspace_guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), attach)
+            .await
+            .expect("attach should finish after the workspace guard is released")
+            .expect("join attach task")
+            .expect("attach should succeed")
+            .into_inner();
+        assert!(response.attached);
     }
 
     #[tokio::test]
@@ -6997,7 +7096,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_sandbox_with_providers_waits_for_sandbox_sync_guard() {
+    async fn create_sandbox_with_providers_waits_for_workspace_mutation_guard() {
         let state = test_server_state().await;
         state
             .store
@@ -7005,7 +7104,13 @@ mod tests {
             .await
             .unwrap();
 
-        let guard = state.compute.sandbox_sync_guard().await.unwrap();
+        // A provider writer in the workspace excludes creates that validate
+        // against its providers.
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::Workspace("default"))
+            .await
+            .unwrap();
         let task_state = state.clone();
         let task = tokio::spawn(async move {
             handle_create_sandbox(
@@ -7033,7 +7138,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(
             !task.is_finished(),
-            "sandbox create with initial providers should wait for sandbox sync guard"
+            "sandbox create with initial providers should wait for the workspace mutation guard"
         );
         drop(guard);
 

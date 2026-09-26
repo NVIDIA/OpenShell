@@ -416,10 +416,44 @@ validates the current supervisor session and keeps the in-memory evidence; a
 non-owner never accepts evidence from a stale local session or projects a
 remote session as disconnected.
 
-Nothing redistributes established sessions, so after a rolling restart the last
-surviving replica holds most sessions and a new replica serves none until
-sandboxes reconnect. That skew decays only as sandboxes churn. Client traffic
-stays correct throughout because a non-owner relays to the owner.
+Planned shutdown moves ownership instead of waiting for churn. On SIGTERM a
+gateway closes supervisor admission and reports `draining` on `/readyz`. A
+gateway that uses an external PostgreSQL database and advertises a peer
+endpoint (every Helm chart install on an external database: Deployment pods
+advertise their pod IP and StatefulSet pods their stable DNS name) then keeps
+its listener open for a 3-second propagation delay, so endpoint removal
+reaches kube-proxy and ingress, and closes its supervisor sessions at most 100 ms apart within 12
+seconds. Peers keep following the durable owner record, which changes only
+when a session is closed and reconnects elsewhere. Until its turn, a session keeps serving relays and
+heartbeats. Each supervisor redials the gateway Service, lands on a ready
+replica, and publishes ownership there. Supervisors reset their reconnect
+backoff after an accepted session and jitter failed retries, so a drained
+session normally reconnects within about a second. The old replica demotes the
+sandbox to `Provisioning` when it closes the session, so for that second new
+exec, SSH, and forward requests fail the readiness check with
+`FAILED_PRECONDITION`; requests already routed wait up to 15 seconds for the
+supervisor. A new session receives relay requests only after the gateway has
+sent `SessionAccepted`, and a draining owner answers peer relays for sessions
+it no longer holds with `UNAVAILABLE` at once so the requester re-reads
+ownership. Up to 120 sessions close one every 100 ms; above that the close rate
+is the session count divided by 12 seconds. Each reconnect takes one or two
+short mutation locks on the receiving replicas, so the mutation-lock pool
+bounds how many sessions a replica can drain without queuing. Other gateways
+skip the drain. A lone replica, such as a single-replica StatefulSet, has no
+peer to receive its sessions, so its drain adds up to 15 seconds to shutdown;
+a StatefulSet creates the replacement only after the old pod exits, so the
+restart outage grows by the same amount. Supervisors keep backing off while no
+replica is ready, so some reconnect up to one maximum backoff interval (30
+seconds) after the replacement is ready. Skipping the drain needs a view of
+live replicas, which the gateway does not have yet.
+
+The drain decides when sessions leave, not where they land. Reconnects go to
+whichever replicas are ready at that moment, so a two-replica surge rollout
+leaves the first replacement pod with most sessions (about 62/38), and pod
+deletion, StatefulSet updates, and scale-out leave new replicas nearly empty
+until sandboxes churn. Connect-time placement and rebalancing are future work.
+Client traffic stays correct throughout because a non-owner relays to the
+owner.
 
 File upload and download use tar-over-SSH through the same relay path. A gateway
 pod termination drops the active SSH proxy byte stream, so the CLI retries the
@@ -435,18 +469,56 @@ also trust the chart CA, present the chart-generated client certificate for
 mTLS, and verify the stable gateway Service DNS name even when connecting to a
 Deployment pod IP.
 
-`WatchSandbox` uses the local update bus for same-replica writes. On
-multi-replica backends one shared poller per gateway observes resource-version
-changes made by other replicas and feeds that bus for all local watchers,
-avoiding a database poll per client stream. SQLite deployments do not run the
-poller because they are single-replica and the local bus already sees every
-write.
+Each replica exports per-replica capacity signals on its metrics listener:
+held supervisor sessions, draining state, pending relays against the fixed
+limits of 256 per replica and 32 per sandbox, relay rejections and expiries,
+outbound peer RPC outcomes and latency, mutation-lock waits and timeouts, and
+watch-poller cost. Session and pending-relay gauges are held by the registry
+entries themselves, so every removal path keeps them exact, and peer request
+metrics record the owner's status before relay failures are reported to
+clients as `UNAVAILABLE`. Labels are bounded; no metric carries a sandbox,
+channel, endpoint, or replica identifier, because the scrape target already
+identifies the replica.
 
-Mutations whose invariants span sandbox, provider-profile, policy, or provider
-records take a process-local mutex and a shared PostgreSQL advisory lock. The
-database session remains dedicated to the request and closes when the guard is
-dropped, which releases the lock on normal completion, cancellation, or error.
-SQLite deployments use only the local mutex because they are single-replica.
+`WatchSandbox` uses the local update bus for same-replica writes. Every
+PostgreSQL-backed gateway, even with a single replica, runs one shared poller
+that observes writes made by other replicas and feeds that bus for all local
+watchers. Every second it reads the id and `resource_version` of each sandbox
+that has a local watcher in one store call, with one statement per 1000 ids
+and no payload reads, so database load follows the number of distinct watched
+sandboxes on the replica rather than the number of client streams. It
+notifies watchers when it first observes a sandbox, when the version changes,
+and when the row disappears. A failed read keeps the last known versions and
+retries on the next tick. SQLite deployments do not run the poller because
+they are single-replica and the local bus already sees every write.
+
+Mutations whose invariants span sandbox, provider, provider-profile, policy, or
+settings records take a hierarchical mutation guard. It names a global key, one
+key per workspace, and one key per sandbox, each held shared or exclusive.
+Global policy and settings updates and platform-scope profile changes hold the
+global key exclusively. Provider and workspace-scoped profile mutations hold
+the global key shared and their workspace key exclusively. Sandbox-scoped
+mutations, including every supervisor report, hold the global and workspace
+keys shared and their sandbox key exclusively. Unrelated sandboxes proceed
+concurrently, and a provider change still excludes every sandbox mutation in
+its workspace. Each replica takes the keys in a process-local lock table first,
+then, on PostgreSQL, as session-level advisory locks in ascending key order on
+one connection from a dedicated four-connection lock pool. Returning that
+connection runs `pg_advisory_unlock_all()`. The complete return, including its
+health check, is bounded at five seconds; a stalled connection is discarded
+and its pool slot released. A cancelled acquisition closes its session.
+Acquisition is bounded at 10 seconds, PostgreSQL enforces the
+remaining deadline on every lock wait, and a timeout fails with `UNAVAILABLE`.
+The global key is the legacy cross-object key, so a replica from an earlier
+release, which holds it exclusively for every mutation, still excludes new
+replicas during a rolling upgrade. Lifecycle, driver-watch, and reconcile paths
+take only process-local keys, the global key shared and their sandbox key
+exclusively, and rely on compare-and-swap across replicas. Provisioning-deadline
+reconciliation also holds its workspace key shared, because it re-derives
+configuration from provider and profile records. SQLite deployments use only
+the local table. Startup endpoint-status reconciliation takes each candidate's
+full sandbox-scoped guard, up to four at a time, and never holds a guard across
+the whole scan.
 
 ## API Surface
 
@@ -937,13 +1009,13 @@ coverage:
 | Provider | `MustCreate` | `update_message_cas` | `list_messages` |
 | ProviderProfile | `MustCreate` | `MatchResourceVersion` | `list_messages` |
 | SandboxPolicy | scoped versioning | scoped versioning | scoped query |
-| Settings | `Mutex`-guarded | `Mutex`-guarded | single-row |
+| Settings | mutation-guarded | mutation-guarded | single-row |
 
-Global settings updates use a Tokio `Mutex` to serialize multi-step
-validation within a single gateway process, with CAS on the underlying
-persistence write as defense in depth. In an HA deployment with multiple
-gateways, the Mutex alone would be insufficient. Sandbox-scoped settings
-rely entirely on CAS without a Mutex.
+Global settings and policy updates hold the global mutation key exclusively,
+and sandbox-scoped settings updates hold their sandbox key with the global key
+shared. The precedence check between a sandbox setting and a globally managed
+key therefore cannot interleave with a global change on any replica. Settings
+writes also use CAS as defense in depth.
 
 The `resource_version` is surfaced to clients through `ObjectMeta` in proto
 responses. Provider profiles are the exception: custom profile get/list/export
@@ -953,13 +1025,14 @@ requests also carry an explicit target profile ID; the payload ID must match the
 target so an edited export cannot overwrite a different profile. Database
 migrations backfill existing rows with version 1.
 
-Provider profile imports, updates, and deletes hold the sandbox synchronization
-guard while checking attached-sandbox dynamic token grant ambiguity or in-use
-state and writing the profile record. Sandbox creation with initial providers and
-sandbox provider attach/detach use the same guard, so gateway replicas cannot
-interleave a profile mutation with a sandbox provider-set mutation that would
-leave an ambiguous final dynamic-token state or a deleted custom profile that is
-still referenced by a sandbox.
+Provider profile imports, updates, and deletes hold their workspace mutation
+key exclusively (the global key for platform-scope profiles) while checking
+attached-sandbox dynamic token grant ambiguity or in-use state and writing the
+profile record. Sandbox creation with initial providers and sandbox provider
+attach/detach hold the same workspace key shared plus their sandbox key, so
+gateway replicas cannot interleave a profile mutation with a sandbox
+provider-set mutation that would leave an ambiguous final dynamic-token state or
+a deleted custom profile that is still referenced by a sandbox.
 
 Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The
@@ -1082,14 +1155,23 @@ The same relay pattern backs interactive SSH, command execution, file sync, and
 local service forwarding. The gateway tracks live sessions in memory and
 persists session records so tokens can expire or be revoked.
 
-Graceful gateway shutdown closes supervisor-session admission before stopping
-local compute. It then signals the remaining control sessions to exit and waits
-up to ten seconds for their cleanup, including conditional deletion of persisted
-ownership. Pending connection setup and sessions already removed from the live
-registry remain tracked until cleanup finishes. This lets a replacement
-supervisor claim ownership immediately after restart without deleting a newer
-replica's claim. An incomplete drain is reported as a shutdown error. Closing
-these control sessions does not stop Kubernetes-owned workloads.
+Graceful gateway shutdown first closes supervisor-session admission and reports
+`draining` from readiness on every gateway. A gateway that uses an external
+PostgreSQL database and advertises a peer endpoint then drains its sessions
+with the listener still open (see HA Supervisor Ownership): 3 seconds of
+propagation delay, then paced closes within 12 seconds. Other gateways skip
+the drain. The gateway then stops its listener and local compute, signals the
+remaining control sessions to exit, and waits up to ten seconds for their
+cleanup, including conditional deletion of persisted ownership. Pending
+connection setup and sessions already removed from the live registry remain
+tracked until cleanup finishes. This lets a replacement supervisor claim
+ownership immediately after restart without deleting a newer replica's claim.
+An incomplete cleanup is reported as a shutdown error. The drain schedule and
+session cleanup budgets total 25 seconds, leaving margin in the chart's
+30-second termination grace period for the built-in Kubernetes driver.
+Compute-driver cleanup and the final OTLP trace flush are outside those
+budgets, so they are not an overall process-exit deadline. Closing these
+control sessions does not stop Kubernetes-owned workloads.
 
 Relay liveness has two backstops so a reset supervisor session cannot leave a
 request parked forever. The gateway runs server-side HTTP/2 keepalive on
@@ -1269,11 +1351,11 @@ and that span continues incoming W3C trace context when present or starts a new
 trace otherwise. It is named for the RPC and carries the request ID that also
 appears in the gateway's logs — the identifier that lets an operator pivot
 between a trace and its log lines. Store and compute-driver spans become
-children of the request span. Reconciliation, provider refresh, and
-driver-watch loops create their own operation spans because they have no
-inbound request to provide a parent. gRPC status is recorded when response
-trailers arrive. Gateway spans carry resource attributes for the gateway
-identity and configured compute driver.
+children of the request span. Reconciliation, provider refresh, the
+cross-replica watch poller, and driver-watch loops create their own operation
+spans because they have no inbound request to provide a parent. gRPC status is
+recorded when response trailers arrive. Gateway spans carry resource attributes
+for the gateway identity and configured compute driver.
 
 The gateway forwards OTLP configuration, its configured gateway name, and W3C
 trace context to managed external drivers. Built-in drivers use dedicated

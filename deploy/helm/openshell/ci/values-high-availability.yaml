@@ -11,3 +11,8 @@ workload:
 
 server:
   externalDbSecret: openshell-ha-pg
+
+# Match the chart default so the e2e drain runs with the production grace
+# period, even if the default changes.
+podLifecycle:
+  terminationGracePeriodSeconds: 30

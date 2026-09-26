@@ -27,6 +27,9 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
+use crate::gateway_metrics::{
+    self, GaugeSlot, PeerRequestTimer, PeerRpc, RelayCapacity, RelayRejection,
+};
 use crate::grpc::provider_readiness::ProviderReadinessEvidence;
 use crate::persistence::ObjectId;
 use crate::supervisor_owner::{OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwnerIndex};
@@ -48,6 +51,33 @@ const MAX_PENDING_RELAYS: usize = 256;
 /// consume the entire global budget. Sits above the SSH-tunnel per-sandbox
 /// cap (20) so tunnel-specific limits still fire first for that caller.
 const MAX_PENDING_RELAYS_PER_SANDBOX: usize = 32;
+/// The relay caps above, published as capacity gauges when the metrics recorder is installed.
+pub(crate) const RELAY_CAPACITY: RelayCapacity = RelayCapacity {
+    global: MAX_PENDING_RELAYS,
+    per_sandbox: MAX_PENDING_RELAYS_PER_SANDBOX,
+};
+/// Serve normally this long after SIGTERM before closing sessions, so endpoint
+/// removal reaches kube-proxy and ingress and reconnects land on other replicas.
+pub(crate) const DRAIN_PROPAGATION_DELAY: Duration = Duration::from_secs(3);
+/// Upper bound on the paced session-close window.
+pub(crate) const DRAIN_CLOSE_WINDOW: Duration = Duration::from_secs(12);
+/// Largest gap between two paced closes. Small drains finish in
+/// `sessions x 100ms` instead of stretching to the window.
+pub(crate) const DRAIN_MAX_CLOSE_INTERVAL: Duration = Duration::from_millis(100);
+/// Final wait for supervisor session ownership cleanup during shutdown.
+pub(crate) const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// The drain and session cleanup budgets fit the chart's default 30s grace
+/// with margin. Compute-driver cleanup and the OTLP flush are outside this sum.
+const GATEWAY_SHUTDOWN_BUDGET: Duration = Duration::from_secs(25);
+const _: () = assert!(
+    DRAIN_PROPAGATION_DELAY.as_millis()
+        + DRAIN_CLOSE_WINDOW.as_millis()
+        + SESSION_CLEANUP_TIMEOUT.as_millis()
+        <= GATEWAY_SHUTDOWN_BUDGET.as_millis(),
+    "gateway drain plus cleanup must fit the shutdown budget"
+);
+/// How long an owner waits for a local session before failing a peer relay.
+const PEER_RELAY_SESSION_WAIT: Duration = Duration::from_secs(5);
 const PEER_TLS_CA_FILE_ENV: &str = "OPENSHELL_PEER_TLS_CA_FILE";
 const PEER_TLS_CERT_FILE_ENV: &str = "OPENSHELL_PEER_TLS_CERT_FILE";
 const PEER_TLS_KEY_FILE_ENV: &str = "OPENSHELL_PEER_TLS_KEY_FILE";
@@ -274,12 +304,19 @@ struct LiveSession {
     /// removing a session that has since been superseded by a reconnect.
     session_id: String,
     tx: mpsc::Sender<GatewayMessage>,
-    /// Fires when this session is superseded by a reconnect so the old session
-    /// task can exit promptly — dropping its own `tx` clone and closing the
-    /// outbound stream. Without this, a concurrent `open_relay` that grabbed
-    /// the old session's `tx` just before supersede could still enqueue a
-    /// `RelayOpen` onto the stale stream and sit until the relay timeout.
-    shutdown: oneshot::Sender<()>,
+    /// Fires on supersede, lifecycle disconnect, or a drain slot so the
+    /// session task can exit promptly — dropping its own `tx` clone and
+    /// closing the outbound stream. Without this, a concurrent `open_relay`
+    /// that grabbed the old session's `tx` just before supersede could still
+    /// enqueue a `RelayOpen` onto the stale stream and sit until the relay
+    /// timeout. A drain slot takes it and leaves the entry registered, so
+    /// `None` means the session is closing for a drain.
+    shutdown: Option<oneshot::Sender<()>>,
+    /// True while `RelayOpen` may be queued on `tx`: set after `SessionAccepted`
+    /// is queued (so the supervisor always reads it first) and cleared when a
+    /// drain closes the session. `has_session` ignores it; compute readiness
+    /// (`compute::supervisor_session_ready`) must keep seeing the session.
+    accepts_relays: bool,
     /// Set after the supervisor confirms that every expected foreground
     /// attachment has closed and terminal output delivery is complete.
     terminal_delivery_finalized: bool,
@@ -297,6 +334,9 @@ struct LiveSession {
     provider_readiness: Option<ProviderReadinessEvidence>,
     #[allow(dead_code)]
     connected_at: Instant,
+    /// This session's share of `openshell_server_supervisor_sessions`, released when the entry
+    /// leaves the registry by any path (supersede, remove, disconnect, cleanup).
+    _gauge_slot: GaugeSlot,
 }
 
 /// Idempotency state for tool server endpoint-status reports from one live supervisor.
@@ -311,6 +351,28 @@ pub(crate) struct EndpointReportCursor {
     /// Digest of the accepted request, used to reject a different body that
     /// reuses an already committed sequence number.
     pub(crate) report_digest: [u8; 32],
+}
+
+/// Whether this replica can route a relay to its local session for a sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalSessionRoute {
+    /// No session for the sandbox on this replica.
+    Absent,
+    /// Registered but not accepting relays yet (before `SessionAccepted`), or
+    /// any more (drain close in progress).
+    Settling,
+    /// `RelayOpen` can be queued now.
+    Ready,
+}
+
+/// Counts from a paced drain, for logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrainSummary {
+    /// Sessions registered when the drain took its snapshot, after the
+    /// propagation delay.
+    pub(crate) planned: usize,
+    /// Sessions signaled at their slot. The rest had already ended or were replaced.
+    pub(crate) signaled: usize,
 }
 
 /// Holds a oneshot sender that will deliver the upgraded relay stream or a
@@ -336,6 +398,8 @@ struct PendingRelay {
     sandbox_id: String,
     relay_open: RelayOpen,
     created_at: Instant,
+    /// This relay's share of `openshell_server_relay_pending`.
+    _gauge_slot: GaugeSlot,
 }
 
 #[derive(Debug)]
@@ -377,6 +441,16 @@ impl SupervisorSessionRegistry {
         self.admission_closed.store(true, Ordering::Release);
     }
 
+    /// True once shutdown has closed admission: no new session can register.
+    pub(crate) fn admission_closed(&self) -> bool {
+        self.admission_closed.load(Ordering::Acquire)
+    }
+
+    /// Number of registered sessions, including ones still being accepted.
+    pub(crate) fn session_count(&self) -> usize {
+        self.sessions.lock().unwrap().len()
+    }
+
     /// Close control sessions and wait for tracked ownership cleanup. Call
     /// after compute shutdown so supervisors can finish normal stop reporting.
     pub(crate) async fn shutdown(&self, timeout: Duration) -> Result<(), String> {
@@ -390,17 +464,118 @@ impl SupervisorSessionRegistry {
             })
     }
 
-    /// Register a live supervisor session for the given sandbox.
+    /// Close every current session on a fixed schedule so its supervisor
+    /// reconnects to another replica. Each session serves relays and
+    /// heartbeats until its slot and stays registered until its own task runs
+    /// the normal cleanup (owner release, disconnect bookkeeping).
+    pub(crate) async fn drain_sessions(
+        &self,
+        window: Duration,
+        max_interval: Duration,
+    ) -> DrainSummary {
+        let targets = self.drain_targets();
+        let interval = drain_close_interval(targets.len(), window, max_interval);
+        let start = tokio::time::Instant::now();
+        let mut signaled = 0;
+        for (slot, (sandbox_id, session_id)) in targets.iter().enumerate() {
+            let offset = interval.saturating_mul(u32::try_from(slot).unwrap_or(u32::MAX));
+            tokio::time::sleep_until(start + offset).await;
+            if self.close_for_drain(sandbox_id, session_id) {
+                signaled += 1;
+            }
+        }
+        DrainSummary {
+            planned: targets.len(),
+            signaled,
+        }
+    }
+
+    /// Snapshot of `(sandbox_id, session_id)` pairs sorted by sandbox id. The
+    /// order carries no priority; sorting keeps tests deterministic.
+    fn drain_targets(&self) -> Vec<(String, String)> {
+        let mut targets: Vec<(String, String)> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(sandbox_id, session)| (sandbox_id.clone(), session.session_id.clone()))
+            .collect();
+        targets.sort_unstable();
+        targets
+    }
+
+    /// Signal one session to end for a drain without removing it, and stop
+    /// routing new relays to it. Returns `false` when it already ended, was
+    /// replaced, or was already signaled.
+    fn close_for_drain(&self, sandbox_id: &str, session_id: &str) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions
+            .get_mut(sandbox_id)
+            .filter(|session| session.session_id == session_id)
+        else {
+            return false;
+        };
+        session.accepts_relays = false;
+        session
+            .shutdown
+            .take()
+            .is_some_and(|shutdown| shutdown.send(()).is_ok())
+    }
+
+    /// Register a live supervisor session for the given sandbox that can
+    /// receive `RelayOpen` immediately.
     ///
     /// If a previous session exists for the same sandbox, its shutdown signal
     /// is fired so the old session task exits promptly. Returns `true` iff a
-    /// previous session was superseded.
+    /// previous session was superseded. The gateway's own `ConnectSupervisor`
+    /// path uses `register_awaiting_accept` instead.
     pub fn register(
         &self,
         sandbox_id: String,
         session_id: String,
         tx: mpsc::Sender<GatewayMessage>,
         shutdown: oneshot::Sender<()>,
+    ) -> bool {
+        self.insert_session(sandbox_id, session_id, tx, shutdown, true)
+    }
+
+    /// Register a session whose `SessionAccepted` is not queued yet.
+    ///
+    /// Relay routing skips it until `mark_accepts_relays`. Supersede handling
+    /// and the return value match `register`.
+    pub(crate) fn register_awaiting_accept(
+        &self,
+        sandbox_id: String,
+        session_id: String,
+        tx: mpsc::Sender<GatewayMessage>,
+        shutdown: oneshot::Sender<()>,
+    ) -> bool {
+        self.insert_session(sandbox_id, session_id, tx, shutdown, false)
+    }
+
+    /// Open relay routing to this session. Call only after `SessionAccepted`
+    /// and any replayed relays are queued on its sender. Returns `false` when
+    /// the session was replaced or removed, or already closed for a drain.
+    pub(crate) fn mark_accepts_relays(&self, sandbox_id: &str, session_id: &str) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions
+            .get_mut(sandbox_id)
+            .filter(|session| session.session_id == session_id && session.shutdown.is_some())
+        else {
+            return false;
+        };
+        session.accepts_relays = true;
+        true
+    }
+
+    /// Insert a session and fire the shutdown signal of the one it replaces.
+    fn insert_session(
+        &self,
+        sandbox_id: String,
+        session_id: String,
+        tx: mpsc::Sender<GatewayMessage>,
+        shutdown: oneshot::Sender<()>,
+        accepts_relays: bool,
     ) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let previous = sessions.remove(&sandbox_id);
@@ -410,18 +585,23 @@ impl SupervisorSessionRegistry {
                 sandbox_id,
                 session_id,
                 tx,
-                shutdown,
+                shutdown: Some(shutdown),
+                accepts_relays,
                 terminal_delivery_finalized: false,
                 endpoint_status_initialized: false,
                 endpoint_report_cursor: None,
                 provider_readiness: None,
                 connected_at: Instant::now(),
+                _gauge_slot: GaugeSlot::supervisor_session(),
             },
         );
         match previous {
             Some(prev) => {
-                // Best-effort — the old task may have already exited.
-                let _ = prev.shutdown.send(());
+                // Best-effort — the old task may have already exited, or a
+                // drain slot already signaled it.
+                if let Some(shutdown) = prev.shutdown {
+                    let _ = shutdown.send(());
+                }
                 true
             }
             None => false,
@@ -440,7 +620,9 @@ impl SupervisorSessionRegistry {
     pub fn disconnect(&self, sandbox_id: &str) -> bool {
         let session = self.sessions.lock().unwrap().remove(sandbox_id);
         if let Some(session) = session {
-            let _ = session.shutdown.send(());
+            if let Some(shutdown) = session.shutdown {
+                let _ = shutdown.send(());
+            }
             true
         } else {
             false
@@ -495,11 +677,29 @@ impl SupervisorSessionRegistry {
             .lock()
             .unwrap()
             .get(sandbox_id)
+            .filter(|s| s.accepts_relays)
             .map(|s| s.tx.clone())
     }
 
     pub fn has_session(&self, sandbox_id: &str) -> bool {
         self.sessions.lock().unwrap().contains_key(sandbox_id)
+    }
+
+    /// Classify the local session for relay routing. Unlike `has_session`,
+    /// this separates sessions that can take `RelayOpen` from those still
+    /// being accepted.
+    pub(crate) fn local_session_route(&self, sandbox_id: &str) -> LocalSessionRoute {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .map_or(LocalSessionRoute::Absent, |session| {
+                if session.accepts_relays {
+                    LocalSessionRoute::Ready
+                } else {
+                    LocalSessionRoute::Settling
+                }
+            })
     }
 
     pub fn terminal_delivery_finalized(&self, sandbox_id: &str) -> bool {
@@ -805,6 +1005,7 @@ impl SupervisorSessionRegistry {
         {
             let mut pending = self.pending_relays.lock().unwrap();
             if pending.len() >= MAX_PENDING_RELAYS {
+                gateway_metrics::record_relay_rejected(RelayRejection::GlobalCapacity);
                 return Err(Status::resource_exhausted(format!(
                     "gateway relay capacity reached ({MAX_PENDING_RELAYS} in flight)"
                 )));
@@ -814,6 +1015,7 @@ impl SupervisorSessionRegistry {
                 .filter(|p| p.sandbox_id == sandbox_id)
                 .count();
             if per_sandbox >= MAX_PENDING_RELAYS_PER_SANDBOX {
+                gateway_metrics::record_relay_rejected(RelayRejection::SandboxCapacity);
                 return Err(Status::resource_exhausted(format!(
                     "per-sandbox relay limit reached ({MAX_PENDING_RELAYS_PER_SANDBOX} in flight for {sandbox_id})"
                 )));
@@ -825,6 +1027,7 @@ impl SupervisorSessionRegistry {
                     sandbox_id: sandbox_id.to_string(),
                     relay_open: relay_open.clone(),
                     created_at: Instant::now(),
+                    _gauge_slot: GaugeSlot::relay_pending(),
                 },
             );
         }
@@ -843,13 +1046,19 @@ impl SupervisorSessionRegistry {
     }
 
     pub fn fail_pending_relay(&self, channel_id: &str, error: String) -> bool {
-        let pending = self.pending_relays.lock().unwrap().remove(channel_id);
-        if let Some(pending) = pending {
-            let _ = pending.sender.send(Err(Status::unavailable(error)));
-            true
-        } else {
-            false
-        }
+        // The rest of the entry, including its gauge slot, drops inside this statement while the
+        // lock is still held, so `relay_pending` never exceeds capacity.
+        let Some(sender) = self
+            .pending_relays
+            .lock()
+            .unwrap()
+            .remove(channel_id)
+            .map(|pending| pending.sender)
+        else {
+            return false;
+        };
+        let _ = sender.send(Err(Status::unavailable(error)));
+        true
     }
 
     /// Claim a pending relay channel. Called by the `/relay/{channel_id}` HTTP handler
@@ -863,7 +1072,7 @@ impl SupervisorSessionRegistry {
         channel_id: &str,
         principal: Option<&Principal>,
     ) -> Result<ClaimedRelay, Status> {
-        let pending = {
+        let (sender, sandbox_id) = {
             let mut map = self.pending_relays.lock().unwrap();
             let pending = map
                 .get(channel_id)
@@ -883,13 +1092,22 @@ impl SupervisorSessionRegistry {
                 return Err(status);
             }
 
-            if pending.created_at.elapsed() > RELAY_PENDING_TIMEOUT {
+            let waited = pending.created_at.elapsed();
+            if waited > RELAY_PENDING_TIMEOUT {
                 map.remove(channel_id);
+                gateway_metrics::record_relay_expired(1);
                 return Err(Status::deadline_exceeded("relay channel timed out"));
             }
+            gateway_metrics::record_relay_claimed(waited);
 
-            map.remove(channel_id)
-                .expect("pending relay existed before removal")
+            // The rest of the entry, including its gauge slot, drops at the end of this
+            // statement while the lock is still held, so `relay_pending` never exceeds capacity.
+            let PendingRelay {
+                sender, sandbox_id, ..
+            } = map
+                .remove(channel_id)
+                .expect("pending relay existed before removal");
+            (sender, sandbox_id)
         };
 
         // Create a duplex stream pair: one end for the gateway bridge, one for
@@ -897,20 +1115,25 @@ impl SupervisorSessionRegistry {
         let (gateway_stream, supervisor_stream) = tokio::io::duplex(64 * 1024);
 
         // Send the gateway-side stream to the waiter (exec handler or forward handler).
-        if pending.sender.send(Ok(gateway_stream)).is_err() {
+        if sender.send(Ok(gateway_stream)).is_err() {
             return Err(Status::internal("relay requester dropped"));
         }
 
         Ok(ClaimedRelay {
             stream: supervisor_stream,
-            sandbox_id: pending.sandbox_id,
+            sandbox_id,
         })
     }
 
     /// Remove all pending relays that have exceeded the timeout.
     pub fn reap_expired_relays(&self) {
-        let mut map = self.pending_relays.lock().unwrap();
-        map.retain(|_, pending| pending.created_at.elapsed() <= RELAY_PENDING_TIMEOUT);
+        let reaped = {
+            let mut map = self.pending_relays.lock().unwrap();
+            let before = map.len();
+            map.retain(|_, pending| pending.created_at.elapsed() <= RELAY_PENDING_TIMEOUT);
+            before - map.len()
+        };
+        gateway_metrics::record_relay_expired(reaped);
     }
 
     /// Clean up all state for a sandbox (session + pending relays).
@@ -938,6 +1161,38 @@ impl SupervisorSessionRegistry {
             }
         }
     }
+}
+
+/// Gap between two paced closes: the window split evenly over the sessions,
+/// capped at `max_interval`, so the last close happens before the window ends.
+fn drain_close_interval(sessions: usize, window: Duration, max_interval: Duration) -> Duration {
+    let count = u32::try_from(sessions).unwrap_or(u32::MAX).max(1);
+    (window / count).min(max_interval)
+}
+
+/// Keep serving for `propagation`, then snapshot and close sessions on a paced
+/// schedule. The snapshot is taken after the delay so setups that were in
+/// flight at SIGTERM are included. Tests call this with millisecond timings.
+pub(crate) async fn drain_with(
+    registry: &SupervisorSessionRegistry,
+    propagation: Duration,
+    window: Duration,
+    max_interval: Duration,
+) -> DrainSummary {
+    tokio::time::sleep(propagation).await;
+    registry.drain_sessions(window, max_interval).await
+}
+
+/// Shutdown drain with the production timings. The caller keeps the listener
+/// open until this returns.
+pub(crate) async fn drain_for_shutdown(registry: &SupervisorSessionRegistry) -> DrainSummary {
+    drain_with(
+        registry,
+        DRAIN_PROPAGATION_DELAY,
+        DRAIN_CLOSE_WINDOW,
+        DRAIN_MAX_CLOSE_INTERVAL,
+    )
+    .await
 }
 
 /// Spawn a background task that periodically reaps expired pending relay
@@ -1311,15 +1566,16 @@ pub(crate) async fn forward_provider_readiness_to_owner(
     request: ReportProviderReadinessRequest,
 ) -> Result<ReportProviderReadinessResponse, Status> {
     let sandbox_id = request.sandbox_id.clone();
-    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint).await?;
-    client
-        .peer_report_provider_readiness(request)
+    let mut timer = PeerRequestTimer::start(PeerRpc::ReportProviderReadiness);
+    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint)
         .await
-        .map(Response::into_inner)
-        .inspect_err(|_| {
-            state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
-            state.peer_routes.evict_owner(&sandbox_id);
-        })
+        .inspect_err(|status| timer.client_error(status))?;
+    let result = client.peer_report_provider_readiness(request).await;
+    timer.finish(&result);
+    result.map(Response::into_inner).inspect_err(|_| {
+        state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
+        state.peer_routes.evict_owner(&sandbox_id);
+    })
 }
 
 pub(crate) async fn forward_endpoint_status_to_owner(
@@ -1328,15 +1584,16 @@ pub(crate) async fn forward_endpoint_status_to_owner(
     request: ReportEndpointStatusRequest,
 ) -> Result<ReportEndpointStatusResponse, Status> {
     let sandbox_id = request.sandbox_id.clone();
-    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint).await?;
-    client
-        .peer_report_endpoint_status(request)
+    let mut timer = PeerRequestTimer::start(PeerRpc::ReportEndpointStatus);
+    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint)
         .await
-        .map(Response::into_inner)
-        .inspect_err(|_| {
-            state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
-            state.peer_routes.evict_owner(&sandbox_id);
-        })
+        .inspect_err(|status| timer.client_error(status))?;
+    let result = client.peer_report_endpoint_status(request).await;
+    timer.finish(&result);
+    result.map(Response::into_inner).inspect_err(|_| {
+        state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
+        state.peer_routes.evict_owner(&sandbox_id);
+    })
 }
 
 pub(crate) async fn forward_provider_status_query_to_owner(
@@ -1345,15 +1602,16 @@ pub(crate) async fn forward_provider_status_query_to_owner(
     sandbox_id: &str,
     request: GetSandboxProviderStatusRequest,
 ) -> Result<GetSandboxProviderStatusResponse, Status> {
-    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint).await?;
-    client
-        .peer_get_sandbox_provider_status(request)
+    let mut timer = PeerRequestTimer::start(PeerRpc::GetSandboxProviderStatus);
+    let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint)
         .await
-        .map(Response::into_inner)
-        .inspect_err(|_| {
-            state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
-            state.peer_routes.evict_owner(sandbox_id);
-        })
+        .inspect_err(|status| timer.client_error(status))?;
+    let result = client.peer_get_sandbox_provider_status(request).await;
+    timer.finish(&result);
+    result.map(Response::into_inner).inspect_err(|_| {
+        state.peer_routes.evict_channel(&owner.owner_peer_endpoint);
+        state.peer_routes.evict_owner(sandbox_id);
+    })
 }
 
 pub async fn open_routed_relay_with_target(
@@ -1394,25 +1652,40 @@ pub async fn open_routed_relay_with_message(
     let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
     let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
     loop {
-        if state.supervisor_sessions.has_session(sandbox_id) {
-            match state
-                .supervisor_sessions
-                .open_relay_with_message(sandbox_id, relay_open.clone(), Duration::ZERO)
-                .await
-            {
-                Ok(relay) => return Ok(relay),
-                Err(status) if status.code() == tonic::Code::Unavailable => {
-                    // The session can migrate after `has_session` but before
-                    // RelayOpen reaches its sender. Fall through and reread the
-                    // persisted owner instead of surfacing a handoff race.
-                    warn!(
-                        sandbox_id,
-                        error = %status,
-                        "local supervisor relay disappeared during open; resolving owner again"
-                    );
+        match state.supervisor_sessions.local_session_route(sandbox_id) {
+            LocalSessionRoute::Ready => {
+                match state
+                    .supervisor_sessions
+                    .open_relay_with_message(sandbox_id, relay_open.clone(), Duration::ZERO)
+                    .await
+                {
+                    Ok(relay) => return Ok(relay),
+                    Err(status) if status.code() == tonic::Code::Unavailable => {
+                        // The session can migrate after the route check but before
+                        // RelayOpen reaches its sender. Fall through and reread the
+                        // persisted owner instead of surfacing a handoff race.
+                        warn!(
+                            sandbox_id,
+                            error = %status,
+                            "local supervisor relay disappeared during open; resolving owner again"
+                        );
+                    }
+                    Err(status) => return Err(status),
                 }
-                Err(status) => return Err(status),
             }
+            LocalSessionRoute::Settling => {
+                // This replica holds the session but it is still being
+                // accepted, or a drain is closing it. Its owner record names
+                // this replica until the session task releases it, so wait
+                // locally instead of logging owner-mismatch retries.
+                if Instant::now() + backoff > deadline {
+                    return Err(Status::unavailable("supervisor session not connected"));
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
+                continue;
+            }
+            LocalSessionRoute::Absent => {}
         }
 
         if let Some(owner) = resolve_owner(state, &owner_index, sandbox_id).await?
@@ -1524,15 +1797,30 @@ async fn open_peer_relay(
     Ok((channel_id, relay_rx))
 }
 
+/// Open a `PeerRelay` stream to the owner replica and bridge it to a local duplex stream.
+///
+/// The peer request metrics count attempts, so the routed-relay retry loop spikes `unavailable`
+/// during rollouts. `ok` means the owner's supervisor claimed the relay (response headers
+/// arrived); later bridge failures are not counted.
 async fn connect_peer_relay(
     state: &Arc<ServerState>,
     owner_peer_endpoint: &str,
     sandbox_id: &str,
     relay_open: RelayOpen,
 ) -> Result<tokio::io::DuplexStream, Status> {
-    let token = state.peer_routes.peer_token().await?;
-    let channel = state.peer_routes.channel(owner_peer_endpoint).await?;
-    let interceptor = PeerAuthInterceptor::new(&token, &state.replica_id)?;
+    let mut timer = PeerRequestTimer::start(PeerRpc::Relay);
+    let token = state
+        .peer_routes
+        .peer_token()
+        .await
+        .inspect_err(|s| timer.client_error(s))?;
+    let channel = state
+        .peer_routes
+        .channel(owner_peer_endpoint)
+        .await
+        .inspect_err(|s| timer.client_error(s))?;
+    let interceptor = PeerAuthInterceptor::new(&token, &state.replica_id)
+        .inspect_err(|s| timer.client_error(s))?;
     let mut client = open_shell_client::OpenShellClient::with_interceptor(channel, interceptor);
 
     let (out_tx, out_rx) = mpsc::channel::<PeerRelayFrame>(16);
@@ -1545,19 +1833,31 @@ async fn connect_peer_relay(
             })),
         })
         .await
-        .map_err(|_| Status::internal("failed to initialize peer relay stream"))?;
+        .map_err(|_| Status::internal("failed to initialize peer relay stream"))
+        .inspect_err(|s| timer.client_error(s))?;
 
-    let response = client
-        .peer_relay(ReceiverStream::new(out_rx))
-        .await
-        .map_err(|err| {
-            state.peer_routes.evict_channel(owner_peer_endpoint);
-            Status::unavailable(format!("gateway peer relay RPC failed: {err}"))
-        })?;
+    let result = client.peer_relay(ReceiverStream::new(out_rx)).await;
+    // Record the owner's code before the remap below hides it as `unavailable`.
+    timer.finish(&result);
+    let response = result.map_err(|err| {
+        state.peer_routes.evict_channel(owner_peer_endpoint);
+        Status::unavailable(format!("gateway peer relay RPC failed: {err}"))
+    })?;
     let inbound = response.into_inner();
     let (gateway_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
     spawn_peer_bridge(bridge_stream, inbound, out_tx, sandbox_id.to_string());
     Ok(gateway_stream)
+}
+
+/// How long the owner waits for its local session before failing a peer
+/// relay. A draining replica admits no sessions and closes the ones it has,
+/// so waiting only delays the requester's owner re-read.
+fn peer_relay_session_wait(admission_closed: bool) -> Duration {
+    if admission_closed {
+        Duration::ZERO
+    } else {
+        PEER_RELAY_SESSION_WAIT
+    }
 }
 
 pub async fn handle_peer_relay(
@@ -1603,6 +1903,18 @@ pub async fn handle_peer_relay(
         return Err(Status::invalid_argument("relay channel_id is required"));
     }
 
+    let admission_closed = state.supervisor_sessions.admission_closed();
+    if admission_closed && !state.supervisor_sessions.has_session(&init.sandbox_id) {
+        debug!(
+            sandbox_id = %init.sandbox_id,
+            requester = %peer.replica_id,
+            "gateway peer relay: draining replica holds no session for this sandbox"
+        );
+        return Err(Status::unavailable(
+            "gateway replica is draining and holds no supervisor session for this sandbox",
+        ));
+    }
+
     info!(
         sandbox_id = %init.sandbox_id,
         channel_id = %relay_open.channel_id,
@@ -1612,7 +1924,11 @@ pub async fn handle_peer_relay(
 
     let (channel_id, relay_rx) = state
         .supervisor_sessions
-        .open_relay_with_message(&init.sandbox_id, relay_open, Duration::from_secs(5))
+        .open_relay_with_message(
+            &init.sandbox_id,
+            relay_open,
+            peer_relay_session_wait(admission_closed),
+        )
         .await?;
     let supervisor_stream = match tokio::time::timeout(Duration::from_secs(10), relay_rx).await {
         Ok(Ok(Ok(stream))) => stream,
@@ -1853,7 +2169,7 @@ async fn establish_supervisor_session(
     // Step 2: Create and register the outbound channel.
     let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let superseded = state.supervisor_sessions.register(
+    let superseded = state.supervisor_sessions.register_awaiting_accept(
         sandbox_id.clone(),
         session_id.clone(),
         tx.clone(),
@@ -1965,6 +2281,20 @@ async fn establish_supervisor_session(
             .supervisor_sessions
             .replay_pending_relays(&sandbox_id, &tx)
             .await;
+    }
+
+    // Relays may use this session only now: SessionAccepted and any replayed
+    // relays are already queued, so the supervisor never reads RelayOpen first,
+    // and relays opened during setup were not also replayed (no duplicate opens).
+    if !state
+        .supervisor_sessions
+        .mark_accepts_relays(&sandbox_id, &session_id)
+    {
+        debug!(
+            sandbox_id = %sandbox_id,
+            session_id = %session_id,
+            "supervisor session: replaced or closed before relay routing opened"
+        );
     }
 
     // Step 4: Spawn the session loop that reads inbound messages.
@@ -2107,7 +2437,12 @@ async fn run_session_loop(
                 break;
             }
             _ = &mut shutdown_rx => {
-                info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: superseded by reconnect, shutting down");
+                if state.supervisor_sessions.is_current_session(sandbox_id, session_id) {
+                    // Still registered: a drain slot, not a replacement.
+                    info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: closing for gateway drain");
+                } else {
+                    info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: superseded by reconnect, shutting down");
+                }
                 break;
             }
             msg = inbound.message() => {
@@ -2269,7 +2604,12 @@ mod tests {
     use super::*;
     use crate::auth::identity::{Identity, IdentityProvider};
     use crate::auth::principal::{SandboxIdentitySource, SandboxPrincipal, UserPrincipal};
+    use crate::gateway_metrics::MetricsCapture;
     use crate::persistence::Store;
+    use bytes::Bytes;
+    use http_body::Frame;
+    use http_body_util::{BodyExt, Empty, StreamBody};
+    use std::convert::Infallible;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn test_store() -> Arc<Store> {
@@ -2496,6 +2836,7 @@ mod tests {
                 service_id: String::new(),
             },
             created_at,
+            _gauge_slot: GaugeSlot::relay_pending(),
         }
     }
 
@@ -2697,6 +3038,41 @@ mod tests {
         assert_eq!(registry.remove_if_current("sbx", "s1"), Some(true));
     }
 
+    #[test]
+    fn session_gauge_tracks_register_supersede_and_removal() {
+        let metrics = MetricsCapture::install();
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+
+        registry.register(
+            "sbx-a".to_string(),
+            "s1".to_string(),
+            tx.clone(),
+            make_shutdown(),
+        );
+        assert_eq!(metrics.value(gateway_metrics::SUPERVISOR_SESSIONS), Some(1));
+        registry.register(
+            "sbx-a".to_string(),
+            "s2".to_string(),
+            tx.clone(),
+            make_shutdown(),
+        );
+        assert_eq!(
+            metrics.value(gateway_metrics::SUPERVISOR_SESSIONS),
+            Some(1),
+            "a supersede on the same replica nets zero"
+        );
+        registry.register("sbx-b".to_string(), "s3".to_string(), tx, make_shutdown());
+        assert_eq!(metrics.value(gateway_metrics::SUPERVISOR_SESSIONS), Some(2));
+
+        assert_eq!(registry.remove_if_current("sbx-a", "s1"), None);
+        assert_eq!(metrics.value(gateway_metrics::SUPERVISOR_SESSIONS), Some(2));
+        assert_eq!(registry.remove_if_current("sbx-a", "s2"), Some(false));
+        assert_eq!(metrics.value(gateway_metrics::SUPERVISOR_SESSIONS), Some(1));
+        assert!(registry.disconnect("sbx-b"));
+        assert_eq!(metrics.value(gateway_metrics::SUPERVISOR_SESSIONS), Some(0));
+    }
+
     // ---- open_relay: happy path and wait semantics ----
 
     #[tokio::test]
@@ -2758,6 +3134,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_relay_fails_when_session_receiver_dropped() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (tx, rx) = mpsc::channel::<GatewayMessage>(4);
         registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
@@ -2773,10 +3150,13 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unavailable);
         // The pending-relay entry must have been cleaned up on failure.
         assert!(registry.pending_relays.lock().unwrap().is_empty());
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(0));
+        assert_eq!(metrics.value(gateway_metrics::RELAY_EXPIRED_TOTAL), None);
     }
 
     #[tokio::test]
     async fn open_relay_rejects_when_global_cap_reached() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (tx, _rx) = mpsc::channel::<GatewayMessage>(8);
         registry.register(
@@ -2807,10 +3187,20 @@ mod tests {
             .expect_err("open_relay should reject once global cap is reached");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
         assert!(err.message().contains("gateway relay capacity"));
+        assert_eq!(
+            metrics.value("openshell_server_relay_rejected_total{reason=\"global_capacity\"}"),
+            Some(1)
+        );
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(256));
+        assert_eq!(
+            metrics.value("openshell_server_relay_rejected_total{reason=\"sandbox_capacity\"}"),
+            None
+        );
     }
 
     #[tokio::test]
     async fn open_relay_rejects_when_per_sandbox_cap_reached() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (tx, _rx) = mpsc::channel::<GatewayMessage>(8);
         registry.register("sbx".to_string(), "s".to_string(), tx, make_shutdown());
@@ -2832,6 +3222,11 @@ mod tests {
             .expect_err("open_relay should reject when per-sandbox cap is reached");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
         assert!(err.message().contains("per-sandbox relay limit"));
+        assert_eq!(
+            metrics.value("openshell_server_relay_rejected_total{reason=\"sandbox_capacity\"}"),
+            Some(1)
+        );
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(32));
 
         // A different sandbox still has headroom.
         let (tx2, _rx2) = mpsc::channel::<GatewayMessage>(8);
@@ -2845,6 +3240,7 @@ mod tests {
             .open_relay("sbx-other", Duration::from_millis(50))
             .await
             .expect("different sandbox should still accept new relays");
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(33));
     }
 
     #[tokio::test]
@@ -2971,6 +3367,787 @@ mod tests {
         }
     }
 
+    fn session_accepted_message(session_id: &str) -> GatewayMessage {
+        GatewayMessage {
+            payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
+                session_id: session_id.to_string(),
+                heartbeat_interval: None,
+            })),
+        }
+    }
+
+    /// Assert that `rx` holds `SessionAccepted` followed by `RelayOpen` for
+    /// `channel_id`, the order a supervisor requires.
+    async fn assert_accepted_then_relay_open(
+        rx: &mut mpsc::Receiver<GatewayMessage>,
+        channel_id: &str,
+    ) {
+        let first = rx.recv().await.expect("SessionAccepted should be queued");
+        assert!(
+            matches!(
+                first.payload,
+                Some(gateway_message::Payload::SessionAccepted(_))
+            ),
+            "expected SessionAccepted first, got {:?}",
+            first.payload
+        );
+        let second = rx.recv().await.expect("RelayOpen should be queued");
+        match second.payload {
+            Some(gateway_message::Payload::RelayOpen(open)) => {
+                assert_eq!(open.channel_id, channel_id);
+            }
+            other => panic!("expected RelayOpen after SessionAccepted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_open_waits_until_session_accepted_is_queued() {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let registry = Arc::new(SupervisorSessionRegistry::new());
+        let (tx, mut rx) = mpsc::channel::<GatewayMessage>(4);
+        assert!(!registry.register_awaiting_accept(
+            "sbx".to_string(),
+            "s1".to_string(),
+            tx.clone(),
+            make_shutdown(),
+        ));
+        // Compute readiness keeps seeing the session before it is accepted.
+        assert!(registry.has_session("sbx"));
+        assert_eq!(
+            registry.local_session_route("sbx"),
+            LocalSessionRoute::Settling
+        );
+        assert_eq!(
+            registry.local_session_route("missing"),
+            LocalSessionRoute::Absent
+        );
+
+        let relay_registry = Arc::clone(&registry);
+        let relay = tokio::spawn(async move {
+            relay_registry
+                .open_relay("sbx", Duration::from_secs(2))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "RelayOpen must not be queued before SessionAccepted"
+        );
+
+        tx.send(session_accepted_message("s1")).await.unwrap();
+        assert!(registry.mark_accepts_relays("sbx", "s1"));
+        assert_eq!(
+            registry.local_session_route("sbx"),
+            LocalSessionRoute::Ready
+        );
+
+        let (channel_id, _relay_rx) = relay
+            .await
+            .unwrap()
+            .expect("relay should open once the session accepts relays");
+        assert_accepted_then_relay_open(&mut rx, &channel_id).await;
+    }
+
+    #[test]
+    fn mark_accepts_relays_rejects_replaced_session() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx_old, _rx_old) = mpsc::channel::<GatewayMessage>(1);
+        let (tx_new, _rx_new) = mpsc::channel::<GatewayMessage>(1);
+
+        registry.register_awaiting_accept(
+            "sbx".to_string(),
+            "s-old".to_string(),
+            tx_old,
+            make_shutdown(),
+        );
+        assert!(!registry.mark_accepts_relays("sbx", "s-other"));
+        assert!(!registry.mark_accepts_relays("missing", "s-old"));
+        assert_eq!(
+            registry.local_session_route("sbx"),
+            LocalSessionRoute::Settling
+        );
+
+        assert!(registry.register_awaiting_accept(
+            "sbx".to_string(),
+            "s-new".to_string(),
+            tx_new,
+            make_shutdown(),
+        ));
+        assert!(!registry.mark_accepts_relays("sbx", "s-old"));
+        assert_eq!(
+            registry.local_session_route("sbx"),
+            LocalSessionRoute::Settling
+        );
+        assert!(registry.mark_accepts_relays("sbx", "s-new"));
+    }
+
+    #[tokio::test]
+    async fn routed_relay_does_not_send_relay_open_before_session_accepted() {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let state = crate::grpc::test_support::test_server_state().await;
+        // A fresh owner record naming another replica that has no peer
+        // endpoint, as a stale route would. Consulting it fails the relay at
+        // once, so the relay only succeeds if it waits for the local session.
+        SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .publish(
+                "sbx",
+                "s0",
+                "inst",
+                1,
+                "other-replica",
+                &local_owner_endpoint("other-replica"),
+            )
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel::<GatewayMessage>(4);
+        state.supervisor_sessions.register_awaiting_accept(
+            "sbx".to_string(),
+            "s1".to_string(),
+            tx.clone(),
+            make_shutdown(),
+        );
+
+        let relay_state = Arc::clone(&state);
+        let relay = tokio::spawn(async move {
+            open_routed_relay_with_target(
+                &relay_state,
+                "sbx",
+                relay_open::Target::Ssh(SshRelayTarget {}),
+                String::new(),
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !relay.is_finished(),
+            "routed relay must wait for the local session instead of using the owner record"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "routed RelayOpen must not be queued before SessionAccepted"
+        );
+
+        tx.send(session_accepted_message("s1")).await.unwrap();
+        assert!(state.supervisor_sessions.mark_accepts_relays("sbx", "s1"));
+
+        let (channel_id, _relay_rx) = relay
+            .await
+            .unwrap()
+            .expect("routed relay should open on the local session once accepted");
+        assert_accepted_then_relay_open(&mut rx, &channel_id).await;
+    }
+
+    #[tokio::test]
+    async fn connect_supervisor_sends_session_accepted_before_relay_open() {
+        use crate::grpc::OpenShellService;
+        use openshell_core::proto::open_shell_server::OpenShellServer;
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let state = crate::grpc::test_support::test_server_state().await;
+        state
+            .store
+            .put_message(&sandbox_record("sbx", "sandbox-one"))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = OpenShellServer::new(OpenShellService::new(Arc::clone(&state)));
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let mut client = open_shell_client::OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+
+        // Session setup registers the session, then parks in the endpoint
+        // status reset until this sandbox's mutation guard is released.
+        let sync_guard = state
+            .compute
+            .mutation_guard(crate::compute::MutationScope::sandbox("default", "sbx"))
+            .await
+            .unwrap();
+        let (outbound_tx, outbound_rx) = mpsc::channel::<SupervisorMessage>(4);
+        outbound_tx
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+                    sandbox_id: "sbx".to_string(),
+                    instance_id: "inst".to_string(),
+                    connection_epoch: 1,
+                    ..Default::default()
+                })),
+            })
+            .await
+            .unwrap();
+        let connect = tokio::spawn(async move {
+            client
+                .connect_supervisor(ReceiverStream::new(outbound_rx))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.supervisor_sessions.has_session("sbx") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("session setup should register the session");
+        assert_eq!(
+            state.supervisor_sessions.local_session_route("sbx"),
+            LocalSessionRoute::Settling
+        );
+
+        let relay_state = Arc::clone(&state);
+        let relay = tokio::spawn(async move {
+            open_routed_relay_with_target(
+                &relay_state,
+                "sbx",
+                relay_open::Target::Ssh(SshRelayTarget {}),
+                String::new(),
+                Duration::from_secs(5),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !relay.is_finished(),
+            "relay must not open while session setup is in progress"
+        );
+        drop(sync_guard);
+
+        let mut inbound = connect
+            .await
+            .unwrap()
+            .expect("ConnectSupervisor should accept the session")
+            .into_inner();
+        let (channel_id, _relay_rx) = relay
+            .await
+            .unwrap()
+            .expect("relay should open once the session is accepted");
+        let first = inbound
+            .message()
+            .await
+            .unwrap()
+            .expect("SessionAccepted should be sent");
+        assert!(
+            matches!(
+                first.payload,
+                Some(gateway_message::Payload::SessionAccepted(_))
+            ),
+            "expected SessionAccepted first, got {:?}",
+            first.payload
+        );
+        let second = inbound
+            .message()
+            .await
+            .unwrap()
+            .expect("RelayOpen should be sent");
+        match second.payload {
+            Some(gateway_message::Payload::RelayOpen(open)) => {
+                assert_eq!(open.channel_id, channel_id);
+            }
+            other => panic!("expected RelayOpen after SessionAccepted, got {other:?}"),
+        }
+
+        drop(outbound_tx);
+        server.abort();
+    }
+
+    /// Register `count` Ready sessions `sb-000`, `sb-001`, ... (sorted in slot
+    /// order) and return their shutdown receivers.
+    fn register_drain_targets(
+        registry: &SupervisorSessionRegistry,
+        count: usize,
+    ) -> Vec<oneshot::Receiver<()>> {
+        (0..count)
+            .map(|index| {
+                let (tx, _rx) = mpsc::channel::<GatewayMessage>(1);
+                let (shutdown_tx, shutdown_rx) = oneshot::channel();
+                registry.register(
+                    format!("sb-{index:03}"),
+                    format!("s-{index}"),
+                    tx,
+                    shutdown_tx,
+                );
+                shutdown_rx
+            })
+            .collect()
+    }
+
+    #[test]
+    fn drain_close_interval_scales_with_session_count() {
+        let window = Duration::from_secs(12);
+        let max_interval = Duration::from_millis(100);
+        assert_eq!(drain_close_interval(0, window, max_interval), max_interval);
+        assert_eq!(drain_close_interval(1, window, max_interval), max_interval);
+        assert_eq!(drain_close_interval(10, window, max_interval), max_interval);
+        assert_eq!(
+            drain_close_interval(120, window, max_interval),
+            max_interval
+        );
+        assert_eq!(
+            drain_close_interval(1000, window, max_interval),
+            Duration::from_millis(12)
+        );
+        assert!(drain_close_interval(usize::MAX, window, max_interval) <= max_interval);
+
+        // 10 sessions close within a second, 120 use the whole window, and the
+        // last close always lands inside the window.
+        assert_eq!(
+            drain_close_interval(10, window, max_interval) * 9,
+            Duration::from_millis(900)
+        );
+        assert_eq!(
+            drain_close_interval(120, window, max_interval) * 119,
+            Duration::from_millis(11_900)
+        );
+        for sessions in [1_usize, 10, 120, 121, 1000, 100_000] {
+            let interval = drain_close_interval(sessions, window, max_interval);
+            let last_close = interval * u32::try_from(sessions - 1).unwrap();
+            assert!(
+                last_close < window,
+                "{sessions} sessions: last close at {last_close:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_with_waits_for_propagation_then_paces_closes() {
+        let registry = SupervisorSessionRegistry::new();
+        let start = tokio::time::Instant::now();
+        let observers: Vec<_> = register_drain_targets(&registry, 4)
+            .into_iter()
+            .map(|closed| {
+                tokio::spawn(async move {
+                    closed
+                        .await
+                        .expect("the drain slot should signal the session");
+                    start.elapsed()
+                })
+            })
+            .collect();
+
+        // Δ = min(20s / 4, 50ms) = 50ms. Without the cap the slots would be 5s
+        // apart and the timeout below would trip.
+        let propagation = Duration::from_millis(50);
+        let summary = tokio::time::timeout(
+            Duration::from_secs(5),
+            drain_with(
+                &registry,
+                propagation,
+                Duration::from_secs(20),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("a four-session drain should finish quickly");
+        assert_eq!(
+            summary,
+            DrainSummary {
+                planned: 4,
+                signaled: 4
+            }
+        );
+        for (slot, observer) in (0_u32..).zip(observers) {
+            let closed_at = observer.await.unwrap();
+            let earliest = propagation + Duration::from_millis(50) * slot;
+            assert!(
+                closed_at >= earliest,
+                "slot {slot} closed at {closed_at:?}, before {earliest:?}"
+            );
+        }
+        // The entry stays for the session task's own cleanup.
+        assert!(registry.has_session("sb-000"));
+        assert_eq!(
+            registry.local_session_route("sb-000"),
+            LocalSessionRoute::Settling
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_sessions_signals_every_session_for_large_counts() {
+        let registry = SupervisorSessionRegistry::new();
+        let closed = register_drain_targets(&registry, 200);
+
+        let start = tokio::time::Instant::now();
+        // Δ = min(200ms / 200, 100ms) = 1ms. At the 100ms cap the drain would
+        // take 19.9s and trip the timeout.
+        let summary = tokio::time::timeout(
+            Duration::from_secs(5),
+            registry.drain_sessions(Duration::from_millis(200), Duration::from_millis(100)),
+        )
+        .await
+        .expect("a 1ms-paced drain of 200 sessions should finish in about 200ms");
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            summary,
+            DrainSummary {
+                planned: 200,
+                signaled: 200
+            }
+        );
+        assert!(
+            elapsed >= Duration::from_millis(199),
+            "the last of 200 slots starts at 199ms, drain took {elapsed:?}"
+        );
+        for mut receiver in closed {
+            assert!(receiver.try_recv().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_sessions_keeps_serving_sessions_until_their_slot() {
+        use tokio::sync::oneshot::error::TryRecvError;
+
+        let registry = Arc::new(SupervisorSessionRegistry::new());
+        let (first_tx, _first_rx) = mpsc::channel::<GatewayMessage>(4);
+        let (first_shutdown, first_closed) = oneshot::channel();
+        registry.register("sb-0".into(), "s-0".into(), first_tx, first_shutdown);
+        let (second_tx, mut second_rx) = mpsc::channel::<GatewayMessage>(4);
+        let (second_shutdown, mut second_closed) = oneshot::channel();
+        registry.register("sb-1".into(), "s-1".into(), second_tx, second_shutdown);
+
+        // Δ = min(20s / 2, 10s) = 10s, so the second slot is far away.
+        let drain_registry = Arc::clone(&registry);
+        let drain = tokio::spawn(async move {
+            drain_registry
+                .drain_sessions(Duration::from_secs(20), Duration::from_secs(10))
+                .await
+        });
+        first_closed
+            .await
+            .expect("the first slot should fire at once");
+        assert_eq!(
+            registry.local_session_route("sb-0"),
+            LocalSessionRoute::Settling
+        );
+
+        assert_eq!(
+            registry.local_session_route("sb-1"),
+            LocalSessionRoute::Ready
+        );
+        let (channel_id, _relay_rx) = registry
+            .open_relay("sb-1", Duration::ZERO)
+            .await
+            .expect("a session should serve relays until its slot");
+        match second_rx.recv().await.and_then(|message| message.payload) {
+            Some(gateway_message::Payload::RelayOpen(open)) => {
+                assert_eq!(open.channel_id, channel_id);
+            }
+            other => panic!("expected RelayOpen before the slot, got {other:?}"),
+        }
+        assert!(matches!(second_closed.try_recv(), Err(TryRecvError::Empty)));
+        drain.abort();
+    }
+
+    #[tokio::test]
+    async fn drain_sessions_skips_sessions_that_end_after_the_snapshot() {
+        use tokio::sync::oneshot::error::TryRecvError;
+
+        let registry = SupervisorSessionRegistry::new();
+        let _closed = register_drain_targets(&registry, 3);
+
+        let drain = registry.drain_sessions(Duration::from_millis(150), Duration::from_millis(50));
+        tokio::pin!(drain);
+        // The first poll takes the snapshot before the drain first sleeps.
+        assert!(futures_util::poll!(&mut drain).is_pending());
+        assert_eq!(registry.remove_if_current("sb-001", "s-1"), Some(false));
+        let (tx, _rx) = mpsc::channel::<GatewayMessage>(1);
+        let (replacement_shutdown, mut replacement_closed) = oneshot::channel();
+        assert!(registry.register("sb-002".into(), "s-2b".into(), tx, replacement_shutdown));
+
+        assert_eq!(
+            drain.await,
+            DrainSummary {
+                planned: 3,
+                signaled: 1
+            }
+        );
+        assert!(matches!(
+            replacement_closed.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        assert_eq!(
+            registry.local_session_route("sb-002"),
+            LocalSessionRoute::Ready
+        );
+    }
+
+    #[test]
+    fn close_for_drain_skips_sessions_that_ended_or_were_replaced() {
+        use tokio::sync::oneshot::error::TryRecvError;
+
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel::<GatewayMessage>(1);
+        let (ended_shutdown, _ended_closed) = oneshot::channel();
+        registry.register("sb-1".into(), "s-1".into(), tx.clone(), ended_shutdown);
+        assert_eq!(registry.remove_if_current("sb-1", "s-1"), Some(false));
+        assert!(!registry.close_for_drain("sb-1", "s-1"));
+
+        let (old_shutdown, _old_closed) = oneshot::channel();
+        registry.register("sb-2".into(), "s-old".into(), tx.clone(), old_shutdown);
+        let (new_shutdown, mut new_closed) = oneshot::channel();
+        assert!(registry.register("sb-2".into(), "s-new".into(), tx, new_shutdown));
+        assert!(!registry.close_for_drain("sb-2", "s-old"));
+        assert!(matches!(new_closed.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            registry.local_session_route("sb-2"),
+            LocalSessionRoute::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn close_for_drain_is_single_shot_and_stops_relay_routing() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel::<GatewayMessage>(4);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        registry.register("sbx".into(), "s1".into(), tx, shutdown_tx);
+
+        assert!(registry.close_for_drain("sbx", "s1"));
+        assert!(shutdown_rx.try_recv().is_ok());
+        assert!(
+            !registry.close_for_drain("sbx", "s1"),
+            "a session is signaled once"
+        );
+
+        let err = registry
+            .open_relay("sbx", Duration::ZERO)
+            .await
+            .expect_err("a closing session must not take new relays");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        // Compute readiness keeps seeing the session until its task cleans up.
+        assert!(registry.has_session("sbx"));
+        assert_eq!(
+            registry.local_session_route("sbx"),
+            LocalSessionRoute::Settling
+        );
+    }
+
+    #[test]
+    fn register_after_drain_close_does_not_panic() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel::<GatewayMessage>(1);
+        let (old_shutdown, _old_closed) = oneshot::channel();
+        registry.register("sbx".into(), "s-old".into(), tx.clone(), old_shutdown);
+        assert!(registry.close_for_drain("sbx", "s-old"));
+        assert!(registry.register("sbx".into(), "s-new".into(), tx.clone(), make_shutdown()));
+        assert!(registry.is_current_session("sbx", "s-new"));
+
+        let (other_shutdown, _other_closed) = oneshot::channel();
+        registry.register("sb-other".into(), "s-1".into(), tx, other_shutdown);
+        assert!(registry.close_for_drain("sb-other", "s-1"));
+        assert!(registry.disconnect("sb-other"));
+        assert!(!registry.has_session("sb-other"));
+    }
+
+    #[test]
+    fn mark_accepts_relays_rejects_drained_session() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel::<GatewayMessage>(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        registry.register_awaiting_accept("sbx".into(), "s1".into(), tx, shutdown_tx);
+
+        assert!(registry.close_for_drain("sbx", "s1"));
+        assert!(!registry.mark_accepts_relays("sbx", "s1"));
+        assert_eq!(
+            registry.local_session_route("sbx"),
+            LocalSessionRoute::Settling
+        );
+    }
+
+    #[test]
+    fn peer_relay_session_wait_is_zero_while_draining() {
+        assert_eq!(peer_relay_session_wait(true), Duration::ZERO);
+        assert_eq!(peer_relay_session_wait(false), Duration::from_secs(5));
+    }
+
+    fn peer_relay_init(sandbox_id: &str, channel_id: &str) -> PeerRelayFrame {
+        PeerRelayFrame {
+            payload: Some(peer_relay_frame::Payload::Init(PeerRelayInit {
+                sandbox_id: sandbox_id.to_string(),
+                relay_open: Some(peer_relay_open(channel_id)),
+                requester_replica_id: "replica-requester".to_string(),
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn draining_owner_fails_peer_relay_at_once_without_a_session() {
+        use crate::auth::principal::PeerPrincipal;
+        use crate::grpc::OpenShellService;
+        use openshell_core::proto::open_shell_server::OpenShellServer;
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let state = crate::grpc::test_support::test_server_state().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // Stands in for peer authentication, which runs in the multiplexer.
+        let service = OpenShellServer::with_interceptor(
+            OpenShellService::new(Arc::clone(&state)),
+            |mut request: Request<()>| {
+                request
+                    .extensions_mut()
+                    .insert(Principal::Peer(PeerPrincipal {
+                        replica_id: "replica-requester".to_string(),
+                        pod_uid: "pod-uid".to_string(),
+                    }));
+                Ok(request)
+            },
+        );
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let mut client = open_shell_client::OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+
+        state.supervisor_sessions.close_admission();
+        let started = Instant::now();
+        let err = client
+            .peer_relay(tokio_stream::iter([peer_relay_init("sbx", "ch-1")]))
+            .await
+            .expect_err("a draining replica without the session must fail the relay");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("draining"), "{err}");
+        assert!(
+            started.elapsed() < PEER_RELAY_SESSION_WAIT,
+            "the relay must fail before the normal session wait"
+        );
+
+        // A draining owner still serves the sessions it holds.
+        let (tx, mut rx) = mpsc::channel::<GatewayMessage>(4);
+        state
+            .supervisor_sessions
+            .register("sbx".into(), "s1".into(), tx, make_shutdown());
+        let relay = tokio::spawn(async move {
+            client
+                .peer_relay(tokio_stream::iter([peer_relay_init("sbx", "ch-2")]))
+                .await
+        });
+        let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the owner should queue RelayOpen on its session");
+        match message.and_then(|message| message.payload) {
+            Some(gateway_message::Payload::RelayOpen(open)) => {
+                assert_eq!(open.channel_id, "ch-2");
+            }
+            other => panic!("expected RelayOpen, got {other:?}"),
+        }
+        relay.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn drain_closes_a_connected_supervisor_session_after_its_cleanup() {
+        use crate::grpc::OpenShellService;
+        use openshell_core::proto::open_shell_server::OpenShellServer;
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        state
+            .store
+            .put_message(&sandbox_record("sbx", "sandbox-one"))
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = OpenShellServer::new(OpenShellService::new(Arc::clone(&state)));
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let mut client = open_shell_client::OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        let (outbound_tx, outbound_rx) = mpsc::channel::<SupervisorMessage>(4);
+        outbound_tx
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+                    sandbox_id: "sbx".to_string(),
+                    instance_id: "inst".to_string(),
+                    connection_epoch: 1,
+                    ..Default::default()
+                })),
+            })
+            .await
+            .unwrap();
+        let mut inbound = client
+            .connect_supervisor(ReceiverStream::new(outbound_rx))
+            .await
+            .expect("ConnectSupervisor should accept the session")
+            .into_inner();
+        let accepted = inbound.message().await.unwrap();
+        assert!(matches!(
+            accepted.and_then(|message| message.payload),
+            Some(gateway_message::Payload::SessionAccepted(_))
+        ));
+        assert_eq!(
+            state.supervisor_sessions.local_session_route("sbx"),
+            LocalSessionRoute::Ready
+        );
+        assert_eq!(
+            metrics.value("openshell_server_supervisor_sessions"),
+            Some(1)
+        );
+
+        state.supervisor_sessions.close_admission();
+        let summary = drain_with(
+            &state.supervisor_sessions,
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(
+            summary,
+            DrainSummary {
+                planned: 1,
+                signaled: 1
+            }
+        );
+
+        // The session task owns the stream sender, so the supervisor sees the
+        // end of the stream only after ownership cleanup finished.
+        let end = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+            .await
+            .expect("the stream should end after the drain slot");
+        assert!(
+            matches!(end, Ok(None)),
+            "expected a clean end of stream, got {end:?}"
+        );
+        assert!(!state.supervisor_sessions.has_session("sbx"));
+        assert!(
+            SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+                .read("sbx")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            metrics.value("openshell_server_supervisor_sessions"),
+            Some(0)
+        );
+
+        drop(outbound_tx);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn require_persisted_sandbox_rejects_missing_sandbox() {
         let store = test_store().await;
@@ -3059,6 +4236,7 @@ mod tests {
 
     #[test]
     fn claim_relay_success() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (relay_tx, _relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
@@ -3070,10 +4248,86 @@ mod tests {
         let result = registry.claim_relay("ch-1", Some(&principal));
         assert!(result.is_ok());
         assert!(!registry.pending_relays.lock().unwrap().contains_key("ch-1"));
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(0));
+        assert_eq!(
+            metrics.value("openshell_server_relay_claim_duration_seconds_count"),
+            Some(1)
+        );
+        assert_eq!(metrics.value(gateway_metrics::RELAY_EXPIRED_TOTAL), None);
+    }
+
+    /// Waker that reads `relay_pending` each time it is woken. `oneshot::Sender::send` wakes a
+    /// registered receiver synchronously, so the probe sees the gauge exactly as a waiter on
+    /// another worker thread could at that instant.
+    struct PendingGaugeProbe {
+        read: Box<dyn Fn() -> Option<i64> + Send + Sync>,
+        seen: Mutex<Vec<Option<i64>>>,
+    }
+
+    impl PendingGaugeProbe {
+        fn register<T>(metrics: &MetricsCapture, rx: &mut oneshot::Receiver<T>) -> Arc<Self> {
+            let probe = Arc::new(Self {
+                read: metrics.value_reader(gateway_metrics::RELAY_PENDING),
+                seen: Mutex::new(Vec::new()),
+            });
+            let waker = std::task::Waker::from(Arc::clone(&probe));
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(Pin::new(rx).poll(&mut cx).is_pending());
+            probe
+        }
+
+        fn seen(&self) -> Vec<Option<i64>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl std::task::Wake for PendingGaugeProbe {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.seen.lock().unwrap().push((self.read)());
+        }
+    }
+
+    #[test]
+    fn claim_relay_releases_pending_slot_before_waking_waiter() {
+        let metrics = MetricsCapture::install();
+        let registry = SupervisorSessionRegistry::new();
+        let (relay_tx, mut relay_rx) = oneshot::channel();
+        registry.pending_relays.lock().unwrap().insert(
+            "ch-1".to_string(),
+            pending_relay("sbx-test", relay_tx, Instant::now()),
+        );
+        let probe = PendingGaugeProbe::register(&metrics, &mut relay_rx);
+
+        registry
+            .claim_relay("ch-1", Some(&sandbox_principal("sbx-test")))
+            .expect("claim should succeed");
+        // The slot is released under the pending lock, before the waiter is woken, so a
+        // concurrent open can never push `relay_pending` above capacity.
+        assert_eq!(probe.seen(), vec![Some(0)]);
+    }
+
+    #[test]
+    fn fail_pending_relay_releases_pending_slot_before_waking_waiter() {
+        let metrics = MetricsCapture::install();
+        let registry = SupervisorSessionRegistry::new();
+        let (relay_tx, mut relay_rx) = oneshot::channel();
+        registry.pending_relays.lock().unwrap().insert(
+            "ch-fail".to_string(),
+            pending_relay("sbx-test", relay_tx, Instant::now()),
+        );
+        let probe = PendingGaugeProbe::register(&metrics, &mut relay_rx);
+
+        assert!(registry.fail_pending_relay("ch-fail", "target refused".to_string()));
+        assert_eq!(probe.seen(), vec![Some(0)]);
     }
 
     #[test]
     fn claim_relay_rejects_cross_sandbox_principal_without_consuming_channel() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (relay_tx, _relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
@@ -3094,6 +4348,11 @@ mod tests {
                 .contains_key("ch-cross"),
             "failed cross-sandbox claim must not consume the channel"
         );
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(1));
+        assert_eq!(
+            metrics.value("openshell_server_relay_claim_duration_seconds_count"),
+            None
+        );
     }
 
     #[test]
@@ -3113,6 +4372,7 @@ mod tests {
 
     #[tokio::test]
     async fn relay_open_failure_completes_pending_waiter() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (relay_tx, relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
@@ -3133,10 +4393,13 @@ mod tests {
         let status = result.expect_err("waiter should receive status failure");
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert_eq!(status.message(), "target refused");
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(0));
+        assert_eq!(metrics.value(gateway_metrics::RELAY_EXPIRED_TOTAL), None);
     }
 
     #[test]
     fn claim_relay_expired_returns_deadline_exceeded() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (relay_tx, _relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
@@ -3162,10 +4425,17 @@ mod tests {
                 .unwrap()
                 .contains_key("ch-old")
         );
+        assert_eq!(metrics.value(gateway_metrics::RELAY_EXPIRED_TOTAL), Some(1));
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(0));
+        assert_eq!(
+            metrics.value("openshell_server_relay_claim_duration_seconds_count"),
+            None
+        );
     }
 
     #[test]
     fn claim_relay_receiver_dropped_returns_internal() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (relay_tx, relay_rx) = oneshot::channel::<Result<tokio::io::DuplexStream, Status>>();
         drop(relay_rx); // Gateway-side waiter has given up already.
@@ -3178,6 +4448,11 @@ mod tests {
             .claim_relay("ch-1", Some(&sandbox_principal("sbx-test")))
             .expect_err("should err when receiver is gone");
         assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(
+            metrics.value("openshell_server_relay_claim_duration_seconds_count"),
+            Some(1)
+        );
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(0));
     }
 
     #[tokio::test]
@@ -3215,6 +4490,7 @@ mod tests {
 
     #[test]
     fn reap_expired_relays_removes_old_entries() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (relay_tx, _relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
@@ -3236,10 +4512,13 @@ mod tests {
                 .unwrap()
                 .contains_key("ch-old")
         );
+        assert_eq!(metrics.value(gateway_metrics::RELAY_EXPIRED_TOTAL), Some(1));
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(0));
     }
 
     #[test]
     fn reap_expired_relays_keeps_fresh_entries() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (relay_tx, _relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
@@ -3255,6 +4534,9 @@ mod tests {
                 .unwrap()
                 .contains_key("ch-fresh")
         );
+        // Reaping nothing records nothing.
+        assert_eq!(metrics.value(gateway_metrics::RELAY_EXPIRED_TOTAL), None);
+        assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(1));
     }
 
     fn owner_record(replica: &str) -> crate::supervisor_owner::OwnerRecord {
@@ -3331,6 +4613,238 @@ mod tests {
         // A cache hit must never extend the window in which a stale owner
         // looks routable; `owner_is_fresh` is what enforces the real TTL.
         assert!(OWNER_CACHE_TTL < OWNER_TTL);
+    }
+
+    // ---- peer request metrics (requester side) ----
+
+    #[derive(Clone, Copy)]
+    enum FakePeerReply {
+        Status(tonic::Code),
+        EmptyOk,
+    }
+
+    /// Minimal h2c server that answers every gRPC call the same way. It stands in for an owner
+    /// replica without implementing the full `OpenShell` service.
+    async fn spawn_fake_peer(reply: FakePeerReply) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        move |_req: http::Request<hyper::body::Incoming>| async move {
+                            Ok::<_, Infallible>(fake_peer_response(reply))
+                        },
+                    );
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn fake_peer_response(
+        reply: FakePeerReply,
+    ) -> http::Response<http_body_util::combinators::UnsyncBoxBody<Bytes, Infallible>> {
+        let builder = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/grpc");
+        match reply {
+            // Trailers-only error: tonic returns Err(status) for unary and streaming calls.
+            FakePeerReply::Status(code) => builder
+                .header("grpc-status", i32::from(code).to_string())
+                .header("grpc-message", "fake peer")
+                .body(Empty::new().boxed_unsync())
+                .unwrap(),
+            // One empty message (5-byte frame header, zero length), then grpc-status 0. This
+            // decodes as a default response for any unary RPC, and gives streaming calls an OK
+            // header.
+            FakePeerReply::EmptyOk => {
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                let frames = futures::stream::iter([
+                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(&[0, 0, 0, 0, 0]))),
+                    Ok(Frame::trailers(trailers)),
+                ]);
+                builder
+                    .body(StreamBody::new(frames).boxed_unsync())
+                    .unwrap()
+            }
+        }
+    }
+
+    fn seed_peer_token(state: &ServerState) {
+        *state.peer_routes.token.lock().unwrap() = Some(CachedPeerToken {
+            token: "test-peer-token".to_string(),
+            refresh_at: Instant::now() + Duration::from_mins(5),
+        });
+    }
+
+    fn owner_at(endpoint: &str) -> crate::supervisor_owner::OwnerRecord {
+        let mut owner = owner_record("replica-owner");
+        owner.owner_peer_endpoint = endpoint.to_string();
+        owner
+    }
+
+    fn closed_local_endpoint() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    fn peer_relay_open(channel_id: &str) -> RelayOpen {
+        RelayOpen {
+            channel_id: channel_id.to_string(),
+            target: Some(relay_open::Target::Ssh(SshRelayTarget {})),
+            service_id: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_relay_metrics_keep_owner_code_before_unavailable_remap() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = spawn_fake_peer(FakePeerReply::Status(tonic::Code::ResourceExhausted)).await;
+
+        let err = connect_peer_relay(&state, &endpoint, "sbx-peer", peer_relay_open("ch-peer"))
+            .await
+            .expect_err("the owner rejected the relay");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            metrics.value(
+                "openshell_server_peer_requests_total{rpc=\"PeerRelay\",outcome=\"rpc_error\",code=\"resource_exhausted\"}"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.value(
+                "openshell_server_peer_request_duration_seconds_count{rpc=\"PeerRelay\",outcome=\"rpc_error\"}"
+            ),
+            Some(1)
+        );
+        let rendered = metrics.render();
+        assert!(rendered.contains(
+            "openshell_server_peer_request_duration_seconds_bucket{rpc=\"PeerRelay\",outcome=\"rpc_error\",le=\"0.001\"}"
+        ));
+        assert!(
+            !state
+                .peer_routes
+                .channels
+                .lock()
+                .unwrap()
+                .contains_key(&endpoint),
+            "a failed peer relay must evict the channel"
+        );
+        let host_port = endpoint.trim_start_matches("http://");
+        assert!(
+            !rendered.contains(host_port),
+            "metrics must not carry peer endpoints"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_relay_metrics_record_ok_when_owner_accepts() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = spawn_fake_peer(FakePeerReply::EmptyOk).await;
+
+        connect_peer_relay(&state, &endpoint, "sbx-peer", peer_relay_open("ch-peer"))
+            .await
+            .expect("the owner accepted the relay");
+        assert_eq!(
+            metrics.value(
+                "openshell_server_peer_requests_total{rpc=\"PeerRelay\",outcome=\"ok\",code=\"ok\"}"
+            ),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_forward_metrics_record_client_error_when_owner_unreachable() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = closed_local_endpoint();
+
+        let err = forward_provider_status_query_to_owner(
+            &state,
+            &owner_at(&endpoint),
+            "sbx-peer",
+            GetSandboxProviderStatusRequest::default(),
+        )
+        .await
+        .expect_err("the owner is unreachable");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            metrics.value(
+                "openshell_server_peer_requests_total{rpc=\"PeerGetSandboxProviderStatus\",outcome=\"client_error\",code=\"unavailable\"}"
+            ),
+            Some(1)
+        );
+        assert!(
+            !metrics
+                .render()
+                .contains("rpc=\"PeerGetSandboxProviderStatus\",outcome=\"rpc_error\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_forward_metrics_record_owner_rpc_error_code() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = spawn_fake_peer(FakePeerReply::Status(tonic::Code::PermissionDenied)).await;
+
+        let err = forward_endpoint_status_to_owner(
+            &state,
+            &owner_at(&endpoint),
+            ReportEndpointStatusRequest {
+                sandbox_id: "sbx-peer".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("the owner rejected the report");
+        // Unary forwarders return the owner's status unchanged.
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            metrics.value(
+                "openshell_server_peer_requests_total{rpc=\"PeerReportEndpointStatus\",outcome=\"rpc_error\",code=\"permission_denied\"}"
+            ),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_forward_metrics_record_ok() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = spawn_fake_peer(FakePeerReply::EmptyOk).await;
+
+        forward_provider_readiness_to_owner(
+            &state,
+            &owner_at(&endpoint),
+            ReportProviderReadinessRequest {
+                sandbox_id: "sbx-peer".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the owner accepted the report");
+        assert_eq!(
+            metrics.value(
+                "openshell_server_peer_requests_total{rpc=\"PeerReportProviderReadiness\",outcome=\"ok\",code=\"ok\"}"
+            ),
+            Some(1)
+        );
     }
 
     #[tokio::test]

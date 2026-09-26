@@ -52,6 +52,18 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Pod labels for the certgen hook Jobs. They keep the release instance label but
+do not match openshell.selectorLabels, so gateway selectors (the workload,
+Services, HorizontalPodAutoscaler, anti-affinity, and PodDisruptionBudgets)
+never select hook pods.
+*/}}
+{{- define "openshell.certgenPodLabels" -}}
+app.kubernetes.io/name: {{ printf "%s-certgen" (include "openshell.name" . | trunc 55 | trimSuffix "-") }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: certgen
+{{- end }}
+
+{{/*
 Create the name of the service account to use
 */}}
 {{- define "openshell.serviceAccountName" -}}
@@ -325,7 +337,8 @@ Validate chart values that Helm would otherwise accept silently.
 {{- define "openshell.validateValues" -}}
 {{- $workloadKind := include "openshell.workloadKind" . -}}
 {{- $workload := .Values.workload | default dict -}}
-{{- $replicaCount := int (default 1 .Values.replicaCount) -}}
+{{- $maxReplicas := int (include "openshell.maxReplicas" .) -}}
+{{- $maxReplicasSource := include "openshell.maxReplicasSource" . -}}
 {{- if and (hasKey .Values "postgres") (kindIs "map" .Values.postgres) (hasKey .Values.postgres "enabled") -}}
 {{- fail "postgres.enabled was removed; the OpenShell chart no longer deploys PostgreSQL. Provision PostgreSQL separately and set server.externalDbSecret to a Secret containing a PostgreSQL URI." -}}
 {{- end -}}
@@ -335,11 +348,12 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if and (eq $workloadKind "deployment") (not .Values.server.externalDbSecret) -}}
 {{- fail "workload.kind=deployment requires server.externalDbSecret; use workload.kind=statefulset for the default SQLite database." -}}
 {{- end -}}
-{{- if and (gt $replicaCount 1) (not .Values.server.externalDbSecret) -}}
-{{- fail "replicaCount > 1 requires server.externalDbSecret; multiple gateway replicas cannot share the default per-pod SQLite database." -}}
+{{- include "openshell.validateAutoscaling" . -}}
+{{- if and (gt $maxReplicas 1) (not .Values.server.externalDbSecret) -}}
+{{- fail (printf "%s > 1 requires server.externalDbSecret; multiple gateway replicas cannot share the default per-pod SQLite database." $maxReplicasSource) -}}
 {{- end -}}
-{{- if and (eq $workloadKind "statefulset") (gt $replicaCount 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
-{{- fail "replicaCount > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." -}}
+{{- if and (eq $workloadKind "statefulset") (gt $maxReplicas 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
+{{- fail (printf "%s > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." $maxReplicasSource) -}}
 {{- end -}}
 {{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
 {{- if not (has $workspaceMode (list "shared" "managed" "operator")) -}}

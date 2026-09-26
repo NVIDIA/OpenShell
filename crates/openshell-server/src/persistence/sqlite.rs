@@ -19,6 +19,7 @@ use sqlx::sqlite::{
     SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
 };
 use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqlitePool};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -36,7 +37,10 @@ pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
 }
 static IN_MEMORY_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
+use super::{
+    DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE,
+    RESOURCE_VERSION_BATCH_SIZE,
+};
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
@@ -757,6 +761,38 @@ WHERE "object_type" = ?1 AND "id" = ?2
         Ok(deleted)
     }
 
+    pub async fn get_resource_versions(
+        &self,
+        object_type: &str,
+        ids: &[String],
+    ) -> PersistenceResult<HashMap<String, u64>> {
+        let mut versions = HashMap::with_capacity(ids.len());
+        for ids in ids.chunks(RESOURCE_VERSION_BATCH_SIZE) {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "SELECT id, resource_version FROM objects WHERE object_type = ",
+            );
+            query.push_bind(object_type).push(" AND id IN (");
+            let mut separated = query.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+            let rows = query
+                .build()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+            for row in rows {
+                let id: String = row.try_get("id").map_err(|e| map_db_error(&e))?;
+                let resource_version: i64 = row
+                    .try_get("resource_version")
+                    .map_err(|e| map_db_error(&e))?;
+                versions.insert(id, resource_version.max(1).cast_unsigned());
+            }
+        }
+        Ok(versions)
+    }
+
     pub async fn count_in_workspace(
         &self,
         object_type: &str,
@@ -858,30 +894,6 @@ LIMIT ?3 OFFSET ?4
         Ok(rows.into_iter().map(row_to_object_record).collect())
     }
 
-    pub async fn list_by_type(
-        &self,
-        object_type: &str,
-        limit: u32,
-        offset: u32,
-    ) -> PersistenceResult<Vec<ObjectRecord>> {
-        let rows = sqlx::query(
-            r#"
-SELECT "object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version"
-FROM "objects"
-WHERE "object_type" = ?1
-ORDER BY "created_at_ms" ASC, "name" ASC, "workspace" ASC, "id" ASC
-LIMIT ?2 OFFSET ?3
-"#,
-        )
-        .bind(object_type)
-        .bind(i64::from(limit))
-        .bind(i64::from(offset))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| map_db_error(&e))?;
-
-        Ok(rows.into_iter().map(row_to_object_record).collect())
-    }
     pub async fn list_after(
         &self,
         object_type: &str,
@@ -1247,7 +1259,7 @@ WHERE o."object_type" = "#,
             load_error: None,
             created_at_ms: now_ms,
             loaded_at_ms: None,
-            provenance: std::collections::HashMap::default(),
+            provenance: HashMap::default(),
         };
         let wrapped_payload = policy_payload_from_record(&record)?;
 

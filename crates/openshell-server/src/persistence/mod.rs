@@ -4,6 +4,7 @@
 //! Persistence layer for `OpenShell` Server.
 
 mod legacy_time_wire;
+pub mod mutation_lock;
 mod postgres;
 mod sqlite;
 
@@ -17,6 +18,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use thiserror::Error;
 
+pub use mutation_lock::{LockMode, MutationLockKey, MutationLockSet};
 pub use postgres::PostgresStore;
 pub use sqlite::SqliteStore;
 
@@ -32,6 +34,13 @@ pub type PersistenceResult<T> = Result<T, PersistenceError>;
 /// Keep this well below `SQLite`'s bind-variable limit. Backends split larger
 /// requests into independently retryable, bounded write statements.
 pub const DELETE_MANY_BATCH_SIZE: usize = 128;
+
+/// Maximum number of object ids read by one resource-version lookup statement.
+///
+/// `PostgreSQL` binds each batch as a single `TEXT[]` parameter. `SQLite`
+/// expands it into an `IN` list, so a batch plus the object-type parameter must
+/// stay below `SQLite`'s bind-variable limit (32766 in the bundled library).
+pub const RESOURCE_VERSION_BATCH_SIZE: usize = 1000;
 
 /// Persistence-layer error type.
 #[derive(Debug, Error, Clone)]
@@ -58,6 +67,10 @@ pub enum PersistenceError {
     Conflict {
         current_resource_version: Option<u64>,
     },
+    /// A mutation lock could not be acquired before its deadline. Nothing was
+    /// written; the operation is safe to retry.
+    #[error("mutation lock timeout: {0}")]
+    LockTimeout(String),
 }
 
 impl PersistenceError {
@@ -202,6 +215,21 @@ pub struct DistributedMutationGuard {
     _postgres: Option<postgres::PostgresAdvisoryLockGuard>,
 }
 
+#[cfg(test)]
+impl DistributedMutationGuard {
+    /// Backend process id of the `PostgreSQL` session holding the locks, or
+    /// `None` on `SQLite`.
+    pub(crate) async fn postgres_backend_pid(&mut self) -> Option<i32> {
+        let Self {
+            _postgres: postgres,
+        } = self;
+        match postgres {
+            Some(guard) => Some(guard.backend_pid().await),
+            None => None,
+        }
+    }
+}
+
 /// Trait for inferring an object type string from a message type.
 pub trait ObjectType {
     fn object_type() -> &'static str;
@@ -285,15 +313,20 @@ impl Store {
     /// Serialize mutations whose invariants span multiple persisted objects.
     ///
     /// `SQLite` deployments are single-replica and use only the caller's local
-    /// mutex. `PostgreSQL` deployments additionally hold a session-level
-    /// advisory lock so concurrent gateway replicas cannot validate and write
-    /// the same cross-object invariant independently.
+    /// locks. `PostgreSQL` deployments additionally hold `locks` as
+    /// session-level advisory locks, taken in ascending key order on one
+    /// connection from the dedicated lock pool, so concurrent gateway replicas
+    /// cannot validate and write the same cross-object invariant
+    /// independently. Fails with [`PersistenceError::LockTimeout`] when the
+    /// locks are not acquired by `deadline`.
     pub async fn acquire_distributed_mutation_guard(
         &self,
+        locks: &MutationLockSet,
+        deadline: tokio::time::Instant,
     ) -> PersistenceResult<DistributedMutationGuard> {
         match self {
             Self::Postgres(store) => Ok(DistributedMutationGuard {
-                _postgres: Some(store.acquire_cross_object_lock().await?),
+                _postgres: Some(store.acquire_mutation_locks(locks, deadline).await?),
             }),
             Self::Sqlite(_) => Ok(DistributedMutationGuard { _postgres: None }),
         }
@@ -594,6 +627,32 @@ impl Store {
         store_dispatch_traced!(self.delete_many(object_type, ids))
     }
 
+    /// Read the authoritative `resource_version` of each listed object without
+    /// reading or decoding payloads.
+    ///
+    /// Ids that do not exist, or that belong to another object type, are absent
+    /// from the result. Backends issue one statement per
+    /// `RESOURCE_VERSION_BATCH_SIZE` ids and none for an empty list. When `ids`
+    /// spans several batches, each batch reads its own snapshot.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(
+            otel.name = "store.get_resource_versions",
+            otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+            object_count = ids.len(),
+            batch_count = ids.len().div_ceil(RESOURCE_VERSION_BATCH_SIZE),
+        )
+    )]
+    pub async fn get_resource_versions(
+        &self,
+        object_type: &str,
+        ids: &[String],
+    ) -> PersistenceResult<HashMap<String, u64>> {
+        store_dispatch_traced!(self.get_resource_versions(object_type, ids))
+    }
+
     /// Count objects of a given type within a workspace.
     #[tracing::instrument(
         name = "store",
@@ -661,21 +720,6 @@ impl Store {
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
         store_dispatch_traced!(self.list(object_type, workspace, limit, offset))
-    }
-
-    /// List objects by type across all workspaces.
-    #[tracing::instrument(
-        name = "store",
-        skip_all,
-        fields(otel.name = "store.list_by_type", otel.status_code = tracing::field::Empty,  object_type = %object_type)
-    )]
-    pub async fn list_by_type(
-        &self,
-        object_type: &str,
-        limit: u32,
-        offset: u32,
-    ) -> PersistenceResult<Vec<ObjectRecord>> {
-        store_dispatch_traced!(self.list_by_type(object_type, limit, offset))
     }
 
     /// List workspace objects after a stable cursor, without offset drift.
@@ -1007,20 +1051,6 @@ impl Store {
             .collect()
     }
 
-    /// List and decode protobuf messages across all workspaces, hydrating
-    /// `resource_version` from the authoritative DB row.
-    pub async fn list_all_messages<T: Message + Default + ObjectType + SetResourceVersion>(
-        &self,
-        limit: u32,
-        offset: u32,
-    ) -> PersistenceResult<Vec<T>> {
-        self.list_by_type(T::object_type(), limit, offset)
-            .await?
-            .into_iter()
-            .map(decode_record)
-            .collect()
-    }
-
     /// List and decode objects that have a related membership record, with
     /// pagination. See [`Store::list_with_membership`] for details.
     pub async fn list_messages_with_membership<
@@ -1231,6 +1261,12 @@ pub fn current_time_ms() -> i64 {
 }
 
 fn map_db_error(error: &sqlx::Error) -> PersistenceError {
+    // 55P03 lock_not_available: only lock-pool sessions set `lock_timeout`.
+    if let sqlx::Error::Database(db) = error
+        && db.code().as_deref() == Some("55P03")
+    {
+        return PersistenceError::LockTimeout(db.message().to_string());
+    }
     if let sqlx::Error::Database(db) = error
         && db.is_unique_violation()
     {
@@ -1374,6 +1410,12 @@ pub async fn test_store() -> Store {
         .await
         .expect("in-memory SQLite store should connect")
 }
+
+#[cfg(test)]
+pub mod test_postgres;
+
+#[cfg(test)]
+mod mutation_lock_pg_tests;
 
 #[cfg(test)]
 mod tests;

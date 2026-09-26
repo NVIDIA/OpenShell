@@ -22,6 +22,8 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
 };
+use metrics::LocalRecorderGuard;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle, PrometheusRecorder};
 use openshell_core::proto::{
     GatewayMessage, PeerRelayFrame, RelayFrame, RelayInit, SupervisorMessage, TcpForwardFrame,
     open_shell_client::OpenShellClient,
@@ -658,6 +660,38 @@ fn register_session_with_capacity(
     rx
 }
 
+/// Captures metrics recorded on this test's thread. `#[tokio::test]` is current-thread, so the
+/// in-process gateway tasks record here too. Do not pass it into async helper fns (it is !Send).
+struct MetricsCapture {
+    handle: PrometheusHandle,
+    _guard: LocalRecorderGuard<'static>,
+}
+
+impl MetricsCapture {
+    fn install() -> Self {
+        // Leaked (test only) so the guard can borrow the recorder for 'static.
+        let recorder: &'static PrometheusRecorder =
+            Box::leak(Box::new(PrometheusBuilder::new().build_recorder()));
+        let handle = recorder.handle();
+        let guard = metrics::set_default_local_recorder(recorder);
+        Self {
+            handle,
+            _guard: guard,
+        }
+    }
+
+    fn render(&self) -> String {
+        self.handle.render()
+    }
+
+    /// Integer value of one exact series, or `None` when it was never emitted.
+    fn value(&self, series: &str) -> Option<i64> {
+        self.render()
+            .lines()
+            .find_map(|line| line.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+    }
+}
+
 /// Mock supervisor that opens a `RelayStream`, sends `Init`, then echoes every
 /// data frame it receives. Returns when the gateway drops the stream or when
 /// the supervisor's own outbound channel closes.
@@ -859,6 +893,7 @@ async fn concurrent_relays_multiplex_independently() {
 /// rather than racing the pending map into an inconsistent state.
 #[tokio::test]
 async fn open_relay_enforces_per_sandbox_cap_under_concurrent_burst() {
+    let metrics = MetricsCapture::install();
     let registry = Arc::new(SupervisorSessionRegistry::new());
     let _channel = spawn_gateway(Arc::clone(&registry)).await;
     // Oversized mpsc so the session doesn't backpressure the burst — the cap,
@@ -894,6 +929,23 @@ async fn open_relay_enforces_per_sandbox_cap_under_concurrent_burst() {
     }
     assert_eq!(ok, 32, "exactly per-sandbox cap should succeed");
     assert_eq!(exhausted, 32, "overflow should be rejected, not dropped");
+    // The successful receivers were dropped, so their entries stay pending
+    // until they are claimed or reaped.
+    assert_eq!(metrics.value("openshell_server_relay_pending"), Some(32));
+    assert_eq!(
+        metrics.value("openshell_server_relay_rejected_total{reason=\"sandbox_capacity\"}"),
+        Some(32)
+    );
+    assert_eq!(
+        metrics
+            .value("openshell_server_relay_rejected_total{reason=\"global_capacity\"}")
+            .unwrap_or(0),
+        0
+    );
+    assert_eq!(
+        metrics.value("openshell_server_supervisor_sessions"),
+        Some(1)
+    );
 
     // A different sandbox still has headroom — the per-sandbox cap doesn't
     // leak onto unrelated tenants.
@@ -902,6 +954,107 @@ async fn open_relay_enforces_per_sandbox_cap_under_concurrent_burst() {
         .open_relay("sbx-other", Duration::from_secs(1))
         .await
         .expect("other sandbox should not be affected by sbx cap");
+    assert_eq!(metrics.value("openshell_server_relay_pending"), Some(33));
+    assert_eq!(
+        metrics.value("openshell_server_supervisor_sessions"),
+        Some(2)
+    );
+}
+
+/// Bursts more `open_relay` calls than the global cap allows, spread so that
+/// no sandbox reaches its own cap, and asserts the global ceiling and its
+/// metrics.
+#[tokio::test]
+async fn open_relay_enforces_global_cap_under_concurrent_burst() {
+    let metrics = MetricsCapture::install();
+    let registry = Arc::new(SupervisorSessionRegistry::new());
+    let _channel = spawn_gateway(Arc::clone(&registry)).await;
+    let sandbox_ids: Vec<String> = (0..9).map(|i| format!("sbx-{i}")).collect();
+    let _session_rxs: Vec<_> = sandbox_ids
+        .iter()
+        .map(|id| register_session_with_capacity(&registry, id, 64))
+        .collect();
+
+    // 9 x 32 = 288 opens against a global cap of 256. No sandbox gets more
+    // than its cap of 32 attempts and the global check runs first, so exactly
+    // 32 opens hit the global cap.
+    let mut handles = Vec::with_capacity(288);
+    for id in &sandbox_ids {
+        for _ in 0..32 {
+            let r = Arc::clone(&registry);
+            let id = id.clone();
+            handles.push(tokio::spawn(async move {
+                r.open_relay(&id, Duration::from_secs(1)).await
+            }));
+        }
+    }
+
+    let mut ok = 0usize;
+    let mut exhausted = 0usize;
+    for h in handles {
+        match h.await.expect("task joined") {
+            Ok(_pair) => ok += 1,
+            Err(status) if status.code() == tonic::Code::ResourceExhausted => {
+                assert!(
+                    status.message().contains("gateway relay capacity"),
+                    "expected global capacity error message, got: {}",
+                    status.message()
+                );
+                exhausted += 1;
+            }
+            Err(other) => panic!("unexpected open_relay error: {other:?}"),
+        }
+    }
+    assert_eq!(ok, 256, "exactly the global cap should succeed");
+    assert_eq!(exhausted, 32, "overflow should be rejected, not dropped");
+
+    assert_eq!(metrics.value("openshell_server_relay_pending"), Some(256));
+    assert_eq!(
+        metrics.value("openshell_server_relay_rejected_total{reason=\"global_capacity\"}"),
+        Some(32)
+    );
+    assert_eq!(
+        metrics
+            .value("openshell_server_relay_rejected_total{reason=\"sandbox_capacity\"}")
+            .unwrap_or(0),
+        0
+    );
+    assert_eq!(
+        metrics.value("openshell_server_supervisor_sessions"),
+        Some(9)
+    );
+    let rendered = metrics.render();
+    for forbidden in ["sandbox_id=", "channel_id=", "sbx-0", "endpoint="] {
+        assert!(
+            !rendered.contains(forbidden),
+            "metric labels must not carry identifiers ({forbidden})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn relay_claim_releases_pending_slot_and_records_claim_latency() {
+    let metrics = MetricsCapture::install();
+    let registry = Arc::new(SupervisorSessionRegistry::new());
+    let channel = spawn_gateway(Arc::clone(&registry)).await;
+    let _session_rx = register_session(&registry, "sbx");
+
+    let (channel_id, relay_rx) = registry
+        .open_relay("sbx", Duration::from_secs(2))
+        .await
+        .expect("open_relay");
+    assert_eq!(metrics.value("openshell_server_relay_pending"), Some(1));
+
+    tokio::spawn(run_echo_supervisor(channel, channel_id));
+    let _relay = relay_rx.await.expect("relay result").expect("relay duplex");
+
+    // The claim releases the pending slot under the pending lock, before it
+    // wakes the waiter.
+    assert_eq!(metrics.value("openshell_server_relay_pending"), Some(0));
+    assert_eq!(
+        metrics.value("openshell_server_relay_claim_duration_seconds_count"),
+        Some(1)
+    );
 }
 
 /// Build an in-memory store sufficient for wiring `health_router` in tests

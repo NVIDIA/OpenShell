@@ -408,7 +408,11 @@ async fn global_policy_update_waits_for_endpoint_report_guard() {
         let before = load_global_settings(state.store.as_ref())
             .await
             .expect("read settings before update");
-        let guard = state.compute.sandbox_sync_guard().await.unwrap();
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", "endpoint-report-guard"))
+            .await
+            .unwrap();
         let mut pending = Box::pin(handle_update_config(&state, authed_request(update)));
 
         // Poll the actual writer while an endpoint report owns the mutation
@@ -440,6 +444,39 @@ async fn global_policy_update_waits_for_endpoint_report_guard() {
             index == 0
         );
     }
+}
+
+#[tokio::test]
+async fn report_endpoint_status_does_not_wait_for_unrelated_sandbox_guard() {
+    let sandbox_id = "endpoint-unrelated-guard";
+    let (state, mut report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
+    let unrelated_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(
+            "default",
+            "endpoint-unrelated-other",
+        ))
+        .await
+        .expect("hold an unrelated sandbox guard");
+
+    report.report_sequence = 2;
+    report.observations[0].result = EndpointResult::TransportFailed as i32;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle_report_endpoint_status(&state, with_sandbox(Request::new(report), sandbox_id)),
+    )
+    .await
+    .expect("an endpoint report must not wait for an unrelated sandbox mutation")
+    .expect("accept endpoint result");
+    let status = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("sandbox status");
+    assert_eq!(
+        status.endpoint_statuses[0].last_result,
+        EndpointResult::TransportFailed as i32
+    );
+    drop(unrelated_guard);
 }
 
 #[test]
@@ -834,6 +871,432 @@ async fn startup_reconciliation_invalidates_status_from_previous_sessions() {
         .expect("status remains present");
     assert_eq!(status.endpoint_statuses, vec![initial]);
     assert_eq!(status.conditions, vec![ready_condition()]);
+}
+
+/// Store a sandbox carrying endpoint evidence from an earlier gateway process
+/// and return the status startup reconciliation must leave behind.
+async fn seed_stale_endpoint_status(state: &ServerState, sandbox_id: &str) -> EndpointStatus {
+    let mut sandbox = test_sandbox(
+        sandbox_id,
+        sandbox_id,
+        mcp_policy_with_versions(&["2025-11-25"]),
+        Vec::new(),
+    );
+    let initial = test_initial_endpoint_status(sandbox_id, "api.example.com", "/mcp");
+    sandbox.status = Some(SandboxStatus {
+        endpoint_statuses: vec![EndpointStatus {
+            last_result: EndpointResult::HttpResponseReceived as i32,
+            last_reported_time: Some(timestamp("2026-09-05T01:01:00.000Z")),
+            ..initial.clone()
+        }],
+        conditions: vec![ready_condition()],
+        ..Default::default()
+    });
+    state
+        .store
+        .put_message(&sandbox)
+        .await
+        .expect("store prior session status");
+    initial
+}
+
+fn spawn_startup_reconciliation(
+    state: &Arc<ServerState>,
+) -> tokio::task::JoinHandle<Result<(), Status>> {
+    let state = state.clone();
+    tokio::spawn(async move { invalidate_endpoint_status_on_startup(&state).await })
+}
+
+#[tokio::test]
+async fn startup_reconciliation_does_not_hold_a_fleet_guard() {
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-startup-fleet-target";
+    let initial = seed_stale_endpoint_status(&state, sandbox_id).await;
+    let unrelated_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(
+            "default",
+            "endpoint-startup-fleet-unrelated",
+        ))
+        .await
+        .expect("hold an unrelated sandbox guard");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        invalidate_endpoint_status_on_startup(&state),
+    )
+    .await
+    .expect("startup reconciliation must not wait for an unrelated sandbox mutation")
+    .expect("startup reconciliation");
+    let status = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("status remains present");
+    assert_eq!(status.endpoint_statuses, vec![initial]);
+    drop(unrelated_guard);
+}
+
+#[tokio::test]
+async fn startup_reconciliation_skips_sandbox_deleted_while_waiting() {
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-startup-deleted";
+    seed_stale_endpoint_status(&state, sandbox_id).await;
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox("default", sandbox_id))
+        .await
+        .expect("hold the target sandbox guard");
+    let mut reconciliation = spawn_startup_reconciliation(&state);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut reconciliation)
+            .await
+            .is_err(),
+        "startup reconciliation must wait for the target sandbox guard"
+    );
+
+    // The sandbox was listed before this delete, so the reconciliation that
+    // wakes up must treat the missing row as done rather than fail startup.
+    assert!(
+        state
+            .store
+            .delete("sandbox", sandbox_id)
+            .await
+            .expect("delete sandbox")
+    );
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), reconciliation)
+        .await
+        .expect("startup reconciliation finishes after the guard is released")
+        .expect("startup reconciliation task")
+        .expect("a sandbox deleted while reconciliation waited is skipped");
+}
+
+#[tokio::test]
+async fn startup_reconciliation_rereads_under_guard() {
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-startup-reread";
+    let initial = seed_stale_endpoint_status(&state, sandbox_id).await;
+    let listed_version = stored_sandbox(&state, sandbox_id)
+        .await
+        .get_resource_version();
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox("default", sandbox_id))
+        .await
+        .expect("hold the target sandbox guard");
+    let mut reconciliation = spawn_startup_reconciliation(&state);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut reconciliation)
+            .await
+            .is_err(),
+        "startup reconciliation must wait for the target sandbox guard"
+    );
+
+    // Lifecycle writers on other replicas take no distributed guard, so the
+    // listed version can go stale while reconciliation waits.
+    let bumped = state
+        .store
+        .update_message_cas::<Sandbox, _>(sandbox_id, listed_version, |sandbox| {
+            sandbox
+                .metadata
+                .as_mut()
+                .expect("sandbox metadata")
+                .labels
+                .insert("concurrent-write".to_string(), "true".to_string());
+        })
+        .await
+        .expect("concurrent unrelated write");
+    assert!(bumped.get_resource_version() > listed_version);
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), reconciliation)
+        .await
+        .expect("startup reconciliation finishes after the guard is released")
+        .expect("startup reconciliation task")
+        .expect("startup reconciliation");
+
+    let sandbox = stored_sandbox(&state, sandbox_id).await;
+    assert!(sandbox.get_resource_version() > bumped.get_resource_version());
+    assert_eq!(
+        sandbox
+            .metadata
+            .as_ref()
+            .expect("sandbox metadata")
+            .labels
+            .get("concurrent-write")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        sandbox
+            .status
+            .expect("status remains present")
+            .endpoint_statuses,
+        vec![initial]
+    );
+}
+
+/// Assert that the evidence `seed_stale_endpoint_status` stored survived.
+async fn assert_endpoint_evidence_kept(state: &ServerState, sandbox_id: &str) {
+    let status = stored_sandbox(state, sandbox_id)
+        .await
+        .status
+        .expect("status remains present");
+    assert_eq!(
+        status.endpoint_statuses[0].last_result,
+        EndpointResult::HttpResponseReceived as i32
+    );
+    assert!(status.endpoint_statuses[0].last_reported_time.is_some());
+}
+
+#[tokio::test]
+async fn startup_reconciliation_keeps_evidence_of_a_live_owner() {
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-startup-live-owner";
+    seed_stale_endpoint_status(&state, sandbox_id).await;
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox("default", sandbox_id))
+        .await
+        .expect("hold the target sandbox guard");
+    let mut reconciliation = spawn_startup_reconciliation(&state);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut reconciliation)
+            .await
+            .is_err(),
+        "startup reconciliation must wait for the target sandbox guard"
+    );
+
+    // The supervisor connects to a peer after the unguarded owner check, so
+    // only the re-check under the guard can see it.
+    SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+        .publish(
+            sandbox_id,
+            "session",
+            "supervisor",
+            1,
+            "peer-replica",
+            "https://peer",
+        )
+        .await
+        .expect("publish a live owner on a peer");
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), reconciliation)
+        .await
+        .expect("startup reconciliation finishes after the guard is released")
+        .expect("startup reconciliation task")
+        .expect("startup reconciliation");
+    assert_endpoint_evidence_kept(&state, sandbox_id).await;
+
+    // With the owner already live, the check before the guard skips the
+    // sandbox without waiting for its mutation.
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox("default", sandbox_id))
+        .await
+        .expect("hold the target sandbox guard");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        invalidate_endpoint_status_on_startup(&state),
+    )
+    .await
+    .expect("a live owner is skipped without waiting for the sandbox guard")
+    .expect("startup reconciliation");
+    drop(guard);
+    assert_endpoint_evidence_kept(&state, sandbox_id).await;
+}
+
+#[tokio::test]
+async fn startup_reconciliation_retries_a_conflict_then_succeeds() {
+    let mut calls = 0;
+    retry_startup_reconciliation(|| {
+        calls += 1;
+        let call = calls;
+        async move {
+            Ok(if call == 1 {
+                StartupAttempt::Retry(PersistenceError::Conflict {
+                    current_resource_version: Some(2),
+                })
+            } else {
+                StartupAttempt::Done
+            })
+        }
+    })
+    .await
+    .expect("a conflict is retried");
+    assert_eq!(calls, 2);
+}
+
+#[tokio::test]
+async fn startup_reconciliation_stops_after_the_attempt_limit() {
+    let mut calls = 0;
+    let error = retry_startup_reconciliation(|| {
+        calls += 1;
+        async {
+            Ok(StartupAttempt::Retry(PersistenceError::Database(
+                "object sb not found".to_string(),
+            )))
+        }
+    })
+    .await
+    .expect_err("retries are bounded");
+    assert_eq!(error.code(), Code::Internal);
+    assert_eq!(calls, ENDPOINT_STARTUP_RECONCILIATION_ATTEMPTS);
+
+    let mut calls = 0;
+    let error = retry_startup_reconciliation(|| {
+        calls += 1;
+        async { Err(Status::unavailable("resolve supervisor owner failed")) }
+    })
+    .await
+    .expect_err("an attempt error is returned");
+    assert_eq!(error.code(), Code::Unavailable);
+    assert_eq!(calls, 1, "an attempt error is not retried");
+}
+
+/// Store accepted endpoint evidence, then end the supervisor session that
+/// reported it, as the session task does before its disconnect reset.
+async fn disconnected_sandbox_with_endpoint_result(sandbox_id: &str) -> Arc<ServerState> {
+    let (state, _report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
+    assert!(
+        state
+            .supervisor_sessions
+            .remove_if_current(sandbox_id, "session-a")
+            .is_some()
+    );
+    assert_eq!(
+        stored_sandbox(&state, sandbox_id)
+            .await
+            .status
+            .expect("sandbox status")
+            .endpoint_statuses[0]
+            .last_result,
+        EndpointResult::HttpResponseReceived as i32
+    );
+    state
+}
+
+#[tokio::test]
+async fn disconnect_reset_skips_guard_when_local_session_replaced() {
+    let sandbox_id = "endpoint-disconnect-local-replacement";
+    let state = disconnected_sandbox_with_endpoint_result(sandbox_id).await;
+    register_session(&state, sandbox_id, "session-b");
+    let before = stored_sandbox(&state, sandbox_id).await;
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::Global)
+        .await
+        .expect("hold a guard that excludes every sandbox guard");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reset_endpoint_status_after_supervisor_disconnect(&state, sandbox_id),
+    )
+    .await
+    .expect("a disconnect with a local replacement must not wait for the guard")
+    .expect("disconnect reset");
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, before);
+    drop(guard);
+}
+
+#[tokio::test]
+async fn disconnect_reset_skips_guard_when_peer_owns_session() {
+    let sandbox_id = "endpoint-disconnect-peer-owner";
+    let state = disconnected_sandbox_with_endpoint_result(sandbox_id).await;
+    SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+        .publish(
+            sandbox_id,
+            "peer-s",
+            "inst",
+            1,
+            "peer-replica",
+            "https://peer:8080",
+        )
+        .await
+        .expect("publish a live owner on a peer");
+    let before = stored_sandbox(&state, sandbox_id).await;
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::Global)
+        .await
+        .expect("hold a guard that excludes every sandbox guard");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reset_endpoint_status_after_supervisor_disconnect(&state, sandbox_id),
+    )
+    .await
+    .expect("a disconnect with a live peer owner must not wait for the guard")
+    .expect("disconnect reset");
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, before);
+    drop(guard);
+}
+
+#[tokio::test]
+async fn disconnect_reset_waits_for_guard_without_replacement() {
+    let sandbox_id = "endpoint-disconnect-no-replacement";
+    let state = disconnected_sandbox_with_endpoint_result(sandbox_id).await;
+    let before = stored_sandbox(&state, sandbox_id).await;
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::Global)
+        .await
+        .expect("hold a guard that excludes every sandbox guard");
+    let mut pending = Box::pin(reset_endpoint_status_after_supervisor_disconnect(
+        &state, sandbox_id,
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), pending.as_mut())
+            .await
+            .is_err(),
+        "a disconnect without a replacement must wait for the guard"
+    );
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, before);
+
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+        .await
+        .expect("disconnect reset finishes after the guard is released")
+        .expect("disconnect reset");
+    let status = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("status remains present");
+    assert_eq!(
+        status.endpoint_statuses[0].last_result,
+        EndpointResult::NoObservedExchange as i32
+    );
+    assert!(status.endpoint_statuses[0].last_reported_time.is_none());
+}
+
+#[tokio::test]
+async fn disconnect_reset_rechecks_for_replacement_under_guard() {
+    let sandbox_id = "endpoint-disconnect-late-replacement";
+    let state = disconnected_sandbox_with_endpoint_result(sandbox_id).await;
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::Global)
+        .await
+        .expect("hold a guard that excludes every sandbox guard");
+    let mut pending = Box::pin(reset_endpoint_status_after_supervisor_disconnect(
+        &state, sandbox_id,
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), pending.as_mut())
+            .await
+            .is_err(),
+        "a disconnect without a replacement must wait for the guard"
+    );
+
+    // The replacement registers after the unguarded check, so only the
+    // re-check under the guard can keep its evidence.
+    register_session(&state, sandbox_id, "session-b");
+    let before = stored_sandbox(&state, sandbox_id).await;
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+        .await
+        .expect("disconnect reset finishes after the guard is released")
+        .expect("disconnect reset");
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, before);
 }
 
 #[tokio::test]

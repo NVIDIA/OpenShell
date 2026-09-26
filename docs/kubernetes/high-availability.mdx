@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "High Availability"
 sidebar-title: "High Availability"
-description: "Run multiple OpenShell gateway replicas on Kubernetes with shared PostgreSQL and authenticated peer routing."
-keywords: "Generative AI, Cybersecurity, Kubernetes, High Availability, HA, Gateway, PostgreSQL, Replicas, Failover"
+description: "Run multiple OpenShell gateway replicas on Kubernetes with shared PostgreSQL, authenticated peer routing, session draining during rollouts, capacity metrics, and optional autoscaling."
+keywords: "Generative AI, Cybersecurity, Kubernetes, High Availability, HA, Gateway, PostgreSQL, Replicas, Failover, Autoscaling, HPA, Metrics, Draining"
 position: 3
 ---
 
@@ -32,6 +32,9 @@ An HA gateway deployment requires:
   database are intended for a single gateway replica.
 - An ingress or load balancer that routes clients to the gateway Service. Refer
   to [Ingress](/kubernetes/ingress) for a Gateway API configuration.
+- PostgreSQL connection capacity for every replica, including pods that are
+  starting or draining during a rollout. Refer to
+  [Size PostgreSQL Connections](#size-postgresql-connections).
 
 The Helm chart rejects `replicaCount` values above `1` unless
 `server.externalDbSecret` is set. It also rejects a multi-replica StatefulSet
@@ -82,6 +85,11 @@ topology key to a zone label when replicas must span availability zones. A
 required rule leaves a replica Pending when the cluster does not have enough
 matching failure domains; use preferred anti-affinity when scheduling the
 replica is more important than strict separation.
+
+The chart gives each gateway pod 30 seconds to stop
+(`podLifecycle.terminationGracePeriodSeconds`) so it can move its supervisor
+sessions to the other replicas. Keep that value when you customize pod
+settings.
 
 Install or upgrade OpenShell:
 
@@ -169,24 +177,205 @@ connections also use the chart's TLS materials.
 
 You do not need session affinity at the ingress or client-facing Service.
 
-## Failure and Rollout Behavior
+## Drain and Rollout Behavior
 
-When a non-owner gateway pod stops, Kubernetes removes it from ready Service
-endpoints and new requests go to another replica. Existing requests through the
-stopped pod disconnect and must be retried.
+A gateway replica that Kubernetes stops on purpose, for a rolling update, a
+scale-down, or a node drain, moves its supervisor sessions to the other
+replicas before it exits.
 
-When an owner gateway pod stops, its connected supervisors reconnect through
-the gateway Service and publish new ownership. Other replicas re-read ownership
-while waiting to relay a request. A request fails if no fresh, reachable owner
-appears before its normal deadline.
+When a gateway pod receives `SIGTERM`, the gateway takes these steps:
 
-Established streams do not move between gateway replicas. An interrupted exec,
-forwarding, or service stream must reconnect. File sync retries with a new SSH
-session instead of resuming the interrupted byte stream. Rolling updates can
-temporarily concentrate supervisor sessions on the replicas that stayed up;
-client requests remain routable through peer relay.
+1. It stops accepting new supervisor sessions and reports not ready. `/readyz`
+   and `/health` return `503` with status `draining`. `/healthz` keeps
+   returning `200`, so the liveness probe does not restart the pod during the
+   drain.
+2. It sets `openshell_server_draining` to `1` and keeps serving for 3 seconds
+   while Service endpoints, kube-proxy, and ingress controllers stop routing
+   to it. Other replicas can still relay requests to the sessions it holds.
+3. It closes its supervisor sessions one at a time, at most 100 milliseconds
+   apart and within 12 seconds. Each supervisor reconnects through the gateway
+   Service to a ready replica, usually within a second or two. A session keeps
+   serving requests until its turn.
+4. It stops its listener, waits up to 10 seconds for the remaining ownership
+   records to be released, and exits.
+
+A gateway that uses an external PostgreSQL database (`server.externalDbSecret`)
+runs all four steps, as a Deployment or as a StatefulSet. A gateway on the
+default SQLite database skips steps 2 and 3 and exits as soon as step 4
+finishes. A lone replica on PostgreSQL, such as a single-replica StatefulSet,
+has no other replica to take its sessions, so the drain adds up to 15 seconds
+to its shutdown. A StatefulSet starts the replacement pod only after the old
+one exits, so its sandboxes stay unreachable up to 15 seconds longer on every
+restart or upgrade. Supervisors retry with growing backoff while no replica is
+ready, so some can take up to 30 more seconds, their maximum retry delay, to
+reconnect after the new pod is ready.
+
+### Size the Termination Grace Period
+
+The drain schedule and supervisor-session cleanup budgets total 25 seconds,
+so the chart default of 30 seconds leaves a margin for the built-in
+Kubernetes driver. This is not an overall process-exit deadline: compute-driver
+cleanup runs separately. If you export gateway traces to an OTLP collector
+that can respond slowly, the final trace export after shutdown can take up to
+10 more seconds. Allow additional grace for driver cleanup and trace export
+when applicable.
+
+If Kubernetes kills the gateway before the drain finishes, the remaining
+supervisors reconnect all at once when the pod exits instead of one at a time,
+and their sandboxes can take longer to become reachable again.
+
+<Note>
+`helm upgrade --reuse-values` keeps the previous release's grace period, which
+was 5 seconds in earlier charts. Upgrade with `--reset-then-reuse-values`, or
+set `podLifecycle.terminationGracePeriodSeconds=30` explicitly.
+</Note>
+
+### Sessions per Replica
+
+Plan for no more than about 500 supervisor sessions (connected sandboxes) per
+gateway replica. Each reconnect takes one or two short database locks on the
+replica that receives it. A replica that drains more sessions than that hands
+them over faster than the remaining replicas can register them without
+queuing, so some sandboxes take longer to reconnect and requests to them can
+fail during the rollout.
+
+Add replicas as the number of sandboxes grows, before any replica reaches that
+count. New replicas receive only new or reconnecting sessions, so adding them
+just before a rollout does not lighten the replicas being drained. During
+rollouts, watch `openshell_server_mutation_lock_wait_seconds` and
+`openshell_server_mutation_lock_timeouts_total` with `scope="sandbox"` on the
+receiving replicas. Rising waits or any timeout mean that the replicas receive
+reconnects faster than they can absorb them.
+
+### What Clients See During a Drain
+
+Most requests continue to work while sessions move. Expect these effects:
+
+- New exec, SSH, and port-forward requests for a sandbox that is moving
+  between replicas fail with `FAILED_PRECONDITION` and the message
+  `sandbox is not ready` while the sandbox reports `Provisioning`, usually for
+  a second or two. Sandbox service URLs return `412 Precondition Failed` for
+  the same window. Retry these requests. Requests that were already routed to
+  the sandbox wait up to 15 seconds for its supervisor to reconnect, then fail
+  with `UNAVAILABLE`.
+- Exec, port-forwarding, and service streams that pass through the stopping
+  pod end when it exits and must be retried. File sync retries with a new SSH
+  session instead of resuming the interrupted transfer.
+- Each moved sandbox reports `Provisioning` between leaving one replica and
+  joining another, then returns to `Ready`. Watchers and
+  `openshell sandbox list` can show that transition. If a supervisor stays
+  disconnected for more than a few seconds, the sandbox's `Ready` condition can
+  also show `DependenciesNotReady` until the session returns. The workload
+  keeps running.
+
+<Note>
+Supervisors from earlier OpenShell releases do not reset their reconnect delay
+after a successful connection, so after several disconnects they wait up to 30
+seconds before reconnecting. A sandbox keeps the supervisor it was created
+with, so requests to older sandboxes can fail during a rollout until they
+reconnect. Recreate long-lived sandboxes after upgrading the gateway.
+</Note>
+
+### Session Balance After a Rollout
+
+The drain moves sessions off a stopping pod but does not balance them.
+Supervisors reconnect to whichever replicas are ready at that moment:
+
+- A Deployment rolling update with the default strategy leaves the first
+  replacement pod with the most sessions. With two replicas it ends up with
+  about five of every eight sessions on average.
+- Deleting or evicting a pod, or rolling a StatefulSet, moves its sessions to
+  the replicas that stay up. The replacement pod starts nearly empty.
+- Scaling out adds replicas that receive only new or reconnecting sessions.
+
+Client requests keep working because any replica relays to the owner.
+OpenShell does not yet rebalance established sessions, and the imbalance fades
+as sandboxes are recreated. Watch `openshell_server_supervisor_sessions` per
+pod to see the current distribution.
+
+### Unplanned Failures
+
+A gateway pod that is killed or loses its node cannot drain. Its supervisors
+detect the broken connection, within about 30 seconds when the node
+disappears, then reconnect through the gateway Service and replace the stale
+ownership records. Other replicas re-read ownership while they wait to relay a
+request, so a request succeeds if the supervisor reconnects before the
+request's deadline and fails otherwise. Sandboxes owned by other replicas are
+unaffected. Requests that pass through a stopped non-owner pod disconnect and
+must be retried.
+
+### Upgrade from an Earlier Release
+
+While gateways from the earlier release and the new release run together
+during the upgrade, the older replicas serialize every mutation across the
+fleet. Mutations can be slower and can briefly fail under load until the
+rollout finishes.
+
+## Monitor Capacity
+
+Each gateway replica exposes Prometheus metrics on port `9090`
+(`service.metricsPort`). Scrape every gateway pod, not the Service, because
+these signals describe one replica. Refer to
+[Gateway Metrics](/observability/gateway-metrics) for the full catalog, scrape
+configuration, and access control.
+
+| Signal | Metrics | Use |
+|---|---|---|
+| Sessions per replica | `openshell_server_supervisor_sessions` | Placement, skew, and the per-replica session plan. Do not scale on it. |
+| Draining | `openshell_server_draining` | Exclude stopping pods from per-replica views. |
+| Relay utilization | `openshell_server_relay_pending`, `openshell_server_relay_pending_capacity` | Graph it. It is transient and usually near 0, so alert on rejections instead. |
+| Relay rejections | `openshell_server_relay_rejected_total` | Alert on any increase. |
+| Peer requests | `openshell_server_peer_requests_total`, `openshell_server_peer_request_duration_seconds` | Cross-replica routing rate, failures, and latency. Spikes of `code="unavailable"` during rollouts are expected. |
+| Lock contention | `openshell_server_mutation_lock_wait_seconds`, `openshell_server_mutation_lock_timeouts_total` | Alert on any timeout. |
+| Watch cost | `openshell_server_sandbox_watch_polled_sandboxes`, `openshell_server_sandbox_watch_poll_duration_seconds`, `openshell_server_sandbox_watch_poll_errors_total` | Cross-replica `WatchSandbox` load and failed lookups. |
+
+These queries assume that Prometheus labels each series with `namespace` and
+`pod`:
+
+```promql
+# Relay capacity used on each replica. Usually near 0; graph it and alert
+# on rejections instead.
+max by (namespace, pod) (openshell_server_relay_pending / openshell_server_relay_pending_capacity)
+
+# Relays rejected for capacity. Alert on any increase.
+sum by (namespace, pod, reason) (increase(openshell_server_relay_rejected_total[5m]))
+
+# Session skew across replicas that are not draining. 1 means balanced.
+max(openshell_server_supervisor_sessions and on (namespace, pod) (openshell_server_draining == 0))
+  / clamp_min(avg(openshell_server_supervisor_sessions and on (namespace, pod) (openshell_server_draining == 0)), 1)
+
+# Failed peer requests as a share of attempts, by RPC.
+sum by (rpc) (rate(openshell_server_peer_requests_total{outcome!="ok"}[5m]))
+  / sum by (rpc) (rate(openshell_server_peer_requests_total[5m]))
+
+# 99th percentile peer request latency across the fleet.
+histogram_quantile(0.99, sum by (le, rpc) (rate(openshell_server_peer_request_duration_seconds_bucket{outcome="ok"}[5m])))
+
+# 99th percentile mutation lock wait by scope. Watch scope="sandbox" during rollouts.
+histogram_quantile(0.99, sum by (le, scope) (rate(openshell_server_mutation_lock_wait_seconds_bucket[5m])))
+
+# Mutation lock timeouts by scope. Alert on any increase.
+sum by (scope) (increase(openshell_server_mutation_lock_timeouts_total[10m]))
+
+# 99th percentile watch-poll time per replica. The poll interval is one second.
+histogram_quantile(0.99, sum by (le, pod) (rate(openshell_server_sandbox_watch_poll_duration_seconds_bucket[5m])))
+```
+
+Relay capacity is used on the replica that owns the sandbox's supervisor
+session, including relays that other replicas request through peers, so
+adding replicas does not relieve a busy owner. A relay whose client gave up
+stays counted for up to about 40 seconds, the 10-second claim timeout plus the
+30-second cleanup interval. Peer request counts include retries during
+rollouts.
 
 ## Scale the Gateway
+
+Scale the gateway by changing a fixed replica count or by letting a
+HorizontalPodAutoscaler choose one. In both cases, keep at least two ready
+replicas when availability must survive one gateway pod failure, and size
+PostgreSQL and the cluster nodes for the largest replica count.
+
+### Scale Manually
 
 Change `replicaCount` in `values-ha.yaml`, then apply the release again:
 
@@ -199,9 +388,153 @@ helm upgrade openshell \
   --wait
 ```
 
-Keep at least two ready replicas when availability must survive one gateway pod
-failure. Size PostgreSQL connection capacity and the cluster nodes for the
-selected replica count.
+### Autoscale with a HorizontalPodAutoscaler
+
+Set `autoscaling.enabled` to render an `autoscaling/v2`
+HorizontalPodAutoscaler for the gateway Deployment, or for a StatefulSet with
+`workload.allowMultiReplicaStatefulSet`. Add these values to
+`values-ha.yaml`:
+
+```yaml
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+```
+
+With autoscaling enabled, the chart stops setting `spec.replicas` and ignores
+`replicaCount`. Kubernetes computes CPU and memory utilization against the
+container request, so those targets need a matching `resources.requests`
+entry. A `resources.limits` entry also works, because Kubernetes copies a
+limit into an unset request. The chart rejects an `autoscaling.maxReplicas`
+above `1` without `server.externalDbSecret`. Each scale-down drains one
+replica, so the default behavior removes at most one pod every two minutes
+after a five-minute stabilization window. Override it with
+`autoscaling.behavior`, or set `autoscaling.behavior.scaleDown` to `null` to
+drop the default. New replicas do not take existing sessions.
+
+Check the autoscaler after you apply the release:
+
+```shell
+kubectl -n openshell get hpa openshell
+kubectl -n openshell describe hpa openshell
+```
+
+<Warning>
+Enabling autoscaling on an existing release removes `spec.replicas` from the
+workload in that upgrade. Kubernetes can reset the workload to one replica
+until the HPA scales it back to at least `autoscaling.minReplicas`, which
+drains supervisor sessions from the other gateway pods. Enable autoscaling
+when you install the chart, or during a maintenance window. On an existing
+release, upgrade with `--reset-then-reuse-values`. `--reuse-values` keeps the
+previous chart version's defaults, which lack the autoscaling values,
+including the scale-down `behavior`, when that release predates them. For background, refer to
+[Migrating Deployments and StatefulSets to horizontal autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#migrating-deployments-and-statefulsets-to-horizontal-autoscaling).
+Disabling autoscaling renders `spec.replicas` from `replicaCount` again,
+which defaults to 1, so set `replicaCount` to the replica count you want in
+that upgrade.
+</Warning>
+
+### Autoscale on Custom Metrics
+
+The HPA can also scale on a per-pod metric that a metrics adapter publishes.
+The chart passes `autoscaling.metrics` to the HPA unchanged and does not
+install Prometheus or an adapter. A custom metric needs these pieces:
+
+- Prometheus scrapes every gateway pod and labels each series with
+  `namespace` and `pod`.
+- A metrics adapter, such as prometheus-adapter, maps those labels to
+  Kubernetes resources and publishes a per-pod metric through the
+  `custom.metrics.k8s.io` API.
+- `autoscaling.metrics` references that metric as a `Pods` metric with an
+  `AverageValue` target.
+
+Scale on signals that fall when you add replicas, such as CPU utilization. Do
+not scale on supervisor sessions, relay utilization, or peer request rate. New
+replicas do not take existing sessions, relay load stays on the replica that
+owns each session, and peer traffic grows with the replica count. Alert on
+those signals instead.
+
+```yaml
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: <metric-name>
+        target:
+          type: AverageValue
+          averageValue: "100"
+```
+
+Replace `<metric-name>` with the name your adapter publishes, and set
+`averageValue` to the per-pod value at which you want another replica. Check
+that the adapter serves the metric for the gateway pods:
+
+```shell
+kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/openshell/pods/*/<metric-name>"
+```
+
+### Size PostgreSQL Connections
+
+Each gateway pod opens up to 14 PostgreSQL connections on demand, 10 for data
+access and 4 for mutation locks. The chart uses the Kubernetes default rolling
+update strategy, so a rollout adds up to 25 percent of the replica count,
+rounded up, as surge pods. Kubernetes does not count terminating pods against
+that surge, and each replaced pod can keep its connections throughout its
+termination grace period. A rollout can therefore run up to twice the replica
+count at once, and an eviction or an autoscaler scale-down during the rollout adds more
+draining pods. Set PostgreSQL `max_connections` to at least
+`(2 × replicas + surge) × 14`, which leaves one surge of margin for those
+pods, plus headroom for your other clients and administration. Use
+`autoscaling.maxReplicas` as the replica count when autoscaling is enabled.
+
+| Replicas | Surge | Minimum `max_connections` |
+|---|---|---|
+| 2 | 1 | `(4 + 1) × 14 = 70` |
+| 3 | 1 | `(6 + 1) × 14 = 98` |
+| 4 | 1 | `(8 + 1) × 14 = 126` |
+| 6 | 2 | `(12 + 2) × 14 = 196` |
+
+Three or more replicas exceed what the PostgreSQL default of 100 leaves for
+the gateway, because PostgreSQL reserves 3 connections for superusers. Raise
+`max_connections` or use a larger managed instance. Let one rollout finish
+before you start another, because each overlapping rollout adds its own
+draining pods.
+
+If a connection pooler sits between the gateway and PostgreSQL, use session
+pooling. The gateway holds session-level advisory locks, which transaction
+pooling breaks.
+
+Mutations lock only what they change. Sandbox operations lock their own
+sandbox, provider and workspace-profile changes lock their workspace, and
+gateway-global policy, settings, and platform-profile changes lock the whole
+fleet. A lock wait longer than 10 seconds returns `UNAVAILABLE` with the
+reason `MUTATION_LOCK_TIMEOUT`, and clients can retry the request. A request
+that carried a `request_id` leaves its admission unresolved, like any other
+error, so a retry with the same ID returns `REQUEST_OUTCOME_UNCERTAIN`. Observe
+resource state and reconcile effects, then send a new request with a new
+`request_id`. Refer to
+[Durable Request Admission](/sdk/api-errors#durable-request-admission).
+
+Each replica also polls PostgreSQL once per second for the sandboxes that its
+clients follow with `WatchSandbox`, for example a CLI waiting for a sandbox to
+become ready. The poll reads only sandbox IDs and versions, one query per
+1,000 watched sandboxes, and uses a connection from the data pool. Changes
+made through another replica reach those watchers within about one second.
+Track the watched set and query latency per replica with
+`openshell_server_sandbox_watch_polled_sandboxes` and
+`openshell_server_sandbox_watch_poll_duration_seconds`.
 
 ## Next Steps
 
@@ -211,3 +544,5 @@ selected replica count.
   [Managing Certificates](/kubernetes/managing-certificates).
 - To configure user authentication and authorization, refer to
   [Access Control](/kubernetes/access-control).
+- To scrape and alert on gateway metrics, refer to
+  [Gateway Metrics](/observability/gateway-metrics).

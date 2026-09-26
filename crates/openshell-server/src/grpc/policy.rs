@@ -25,6 +25,7 @@ pub use endpoint_status::{
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{MinWorkspaceRole, require_platform_admin};
+use crate::compute::MutationScope;
 use crate::pagination::Pagination;
 use crate::persistence::{
     DraftChunkRecord, ObjectId, ObjectListQuery, ObjectName, ObjectType, ObjectWorkspace,
@@ -3602,10 +3603,13 @@ async fn handle_update_config_inner(
                 "annotations are only supported for sandbox-scoped updates",
             ));
         }
-        let _settings_guard = state.settings_mutex.lock().await;
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-            super::persistence_error_to_status(error, "acquire policy mutation lock")
-        })?;
+        let _mutation_guard = state
+            .compute
+            .mutation_guard(MutationScope::Global)
+            .await
+            .map_err(|error| {
+                super::persistence_error_to_status(error, "acquire policy mutation lock")
+            })?;
 
         if has_merge_ops {
             return Err(Status::invalid_argument(
@@ -3739,7 +3743,8 @@ async fn handle_update_config_inner(
         }
 
         // Deleting global policy changes the report's effective configuration.
-        // Keep settings -> sandbox lock order for all global policy mutations.
+        // The global guard taken at the top of this branch excludes every
+        // sandbox-scoped settings, policy, and report mutation.
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
         let provider_composition_was_enabled =
             provider_policy_composition_enabled_in(&global_settings)?;
@@ -3793,10 +3798,13 @@ async fn handle_update_config_inner(
     let mut response_annotations = sandbox_metadata_annotations(&sandbox);
 
     if has_setting {
-        let _settings_guard = state.settings_mutex.lock().await;
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-            super::persistence_error_to_status(error, "acquire policy mutation lock")
-        })?;
+        let _mutation_guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox(&workspace, &sandbox_id))
+            .await
+            .map_err(|error| {
+                super::persistence_error_to_status(error, "acquire policy mutation lock")
+            })?;
 
         if key == POLICY_SETTING_KEY {
             return Err(Status::invalid_argument(
@@ -3891,9 +3899,13 @@ async fn handle_update_config_inner(
         ));
     }
 
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::persistence_error_to_status(error, "acquire policy mutation lock")
-    })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(&workspace, &sandbox_id))
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
     if has_merge_ops {
         let global_settings = load_global_settings(state.store.as_ref()).await?;
         if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
@@ -4424,9 +4436,16 @@ pub(super) async fn handle_report_sandbox_configuration(
     if reported == ConfigurationAdmissionState::Unspecified {
         return Err(Status::invalid_argument("admission state is required"));
     }
-    let _guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::persistence_error_to_status(error, "acquire configuration admission lock")
-    })?;
+    let Some(_mutation_guard) = state
+        .compute
+        .sandbox_mutation_guard_by_id(&sandbox_id)
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "acquire configuration admission lock")
+        })?
+    else {
+        return Err(Status::not_found("sandbox not found"));
+    };
     let mut sandbox = state
         .store
         .get_message::<Sandbox>(&sandbox_id)
@@ -4626,9 +4645,16 @@ pub(super) async fn handle_report_policy_status(
             .supersede_older_policies(&req.sandbox_id, version)
             .await;
 
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-            super::persistence_error_to_status(error, "acquire policy mutation lock")
-        })?;
+        let Some(_mutation_guard) = state
+            .compute
+            .sandbox_mutation_guard_by_id(&req.sandbox_id)
+            .await
+            .map_err(|error| {
+                super::persistence_error_to_status(error, "acquire policy mutation lock")
+            })?
+        else {
+            return Err(Status::not_found("sandbox not found"));
+        };
         let sandbox = state
             .store
             .get_message::<Sandbox>(&req.sandbox_id)
@@ -19913,6 +19939,52 @@ mod tests {
             "expected rejection message to echo the bad value and list allowed values; got: {}",
             err.message()
         );
+    }
+
+    #[tokio::test]
+    async fn sandbox_setting_update_does_not_wait_for_unrelated_sandbox_guard() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-setting-target",
+                "setting-target",
+                ProtoSandboxPolicy::default(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let unrelated_guard = state
+            .compute
+            .mutation_guard(MutationScope::sandbox("default", "sb-setting-unrelated"))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_update_config(
+                &state,
+                authed_request(UpdateConfigRequest {
+                    sandbox: "setting-target".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    setting_key: "ocsf_json_enabled".to_string(),
+                    setting_value: Some(SettingValue {
+                        value: Some(setting_value::Value::BoolValue(true)),
+                    }),
+                    ..Default::default()
+                }),
+            ),
+        )
+        .await
+        .expect("a sandbox setting update should not wait for an unrelated sandbox")
+        .expect("sandbox setting update succeeds");
+        let settings = load_sandbox_settings(state.store.as_ref(), "default", "setting-target")
+            .await
+            .unwrap();
+        assert!(settings.settings.contains_key("ocsf_json_enabled"));
+        drop(unrelated_guard);
     }
 
     #[tokio::test]

@@ -10,11 +10,15 @@ use super::{
     deterministic_policy_hash, load_global_settings, policy_static_credential_endpoint_bindings,
 };
 use crate::ServerState;
-use crate::persistence::{ObjectId, ObjectWorkspace};
+use crate::compute::MutationScope;
+use crate::persistence::{
+    ObjectCursor, ObjectId, ObjectListQuery, ObjectWorkspace, PersistenceError,
+};
 use crate::policy_store::PolicyStoreExt;
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 use crate::supervisor_session::EndpointReportCursor;
+use futures::TryStreamExt;
 use openshell_core::GetResourceVersion;
 use openshell_core::endpoint_status::initial_endpoint_status;
 use openshell_core::mcp::is_mcp_protocol;
@@ -30,6 +34,11 @@ use tonic::{Request, Response, Status};
 use tracing::warn;
 
 const ENDPOINT_STARTUP_RECONCILIATION_PAGE_SIZE: u32 = 100;
+/// Sandboxes reconciled at once, matching the four-connection mutation lock
+/// pool.
+const ENDPOINT_STARTUP_RECONCILIATION_CONCURRENCY: usize = 4;
+/// Guarded attempts per sandbox before a concurrent write fails startup.
+const ENDPOINT_STARTUP_RECONCILIATION_ATTEMPTS: usize = 5;
 const ENDPOINT_DISCONNECT_RETRY_INITIAL_BACKOFF: std::time::Duration =
     std::time::Duration::from_millis(100);
 const ENDPOINT_DISCONNECT_RETRY_MAX_BACKOFF: std::time::Duration =
@@ -111,9 +120,19 @@ async fn handle_report_endpoint_status_inner(
     // Session validation, configuration derivation, and persistence share the
     // sandbox mutation boundary. A newly registered supervisor can therefore
     // invalidate its predecessor before any stale report reaches the CAS.
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::super::persistence_error_to_status(error, "acquire endpoint status mutation lock")
-    })?;
+    let Some(_mutation_guard) = state
+        .compute
+        .sandbox_mutation_guard_by_id(&req.sandbox_id)
+        .await
+        .map_err(|error| {
+            super::super::persistence_error_to_status(
+                error,
+                "acquire endpoint status mutation lock",
+            )
+        })?
+    else {
+        return Err(Status::not_found("sandbox not found"));
+    };
     if !state
         .supervisor_sessions
         .is_endpoint_status_authority(&req.sandbox_id, &req.supervisor_session_id)
@@ -362,9 +381,19 @@ pub async fn reset_endpoint_status_for_supervisor_session(
     sandbox_id: &str,
     supervisor_session_id: &str,
 ) -> Result<(), Status> {
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::super::persistence_error_to_status(error, "acquire endpoint status mutation lock")
-    })?;
+    let Some(_mutation_guard) = state
+        .compute
+        .sandbox_mutation_guard_by_id(sandbox_id)
+        .await
+        .map_err(|error| {
+            super::super::persistence_error_to_status(
+                error,
+                "acquire endpoint status mutation lock",
+            )
+        })?
+    else {
+        return Err(Status::not_found("sandbox not found"));
+    };
     if !state
         .supervisor_sessions
         .is_current_session(sandbox_id, supervisor_session_id)
@@ -404,22 +433,33 @@ pub async fn reset_endpoint_status_for_supervisor_session(
 /// Reset endpoint observations after the active supervisor stream disconnects.
 ///
 /// A concurrently registered replacement owns its own pre-acknowledgement
-/// reset, so this path leaves that session's cursor alone.
+/// reset, so this path leaves that session's cursor alone. A replacement that
+/// already exists is detected before the mutation guard, so the reset does not
+/// wait behind other mutations of the sandbox.
 pub async fn reset_endpoint_status_after_supervisor_disconnect(
     state: &Arc<ServerState>,
     sandbox_id: &str,
 ) -> Result<(), Status> {
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::super::persistence_error_to_status(error, "acquire endpoint status mutation lock")
-    })?;
-    if state
-        .supervisor_sessions
-        .current_session_id(sandbox_id)
-        .is_some()
-    {
+    if disconnect_reset_is_superseded(state, sandbox_id).await? {
         return Ok(());
     }
-    if has_fresh_shared_owner(state, sandbox_id).await? {
+    let Some(_mutation_guard) = state
+        .compute
+        .sandbox_mutation_guard_by_id(sandbox_id)
+        .await
+        .map_err(|error| {
+            super::super::persistence_error_to_status(
+                error,
+                "acquire endpoint status mutation lock",
+            )
+        })?
+    else {
+        return Err(Status::not_found("sandbox not found"));
+    };
+    // Re-check under the guard: a replacement's pre-acknowledgement reset runs
+    // under the same sandbox key, and resetting after it would wipe the
+    // replacement's fresh evidence.
+    if disconnect_reset_is_superseded(state, sandbox_id).await? {
         return Ok(());
     }
     let sandbox = state
@@ -484,68 +524,153 @@ pub async fn retry_endpoint_status_after_supervisor_disconnect(
 /// Supervisor sessions are intentionally process-local. This reconciliation
 /// runs before gateway listeners are bound. A fresh shared owner preserves its
 /// evidence; records without one are reset so stale success is never served.
+///
+/// Each sandbox is reset under its own mutation guard, so other replicas keep
+/// mutating unrelated sandboxes during the scan. Keyset paging keeps the scan
+/// stable when sandboxes are deleted mid-scan.
 pub async fn invalidate_endpoint_status_on_startup(state: &Arc<ServerState>) -> Result<(), Status> {
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::super::persistence_error_to_status(
-            error,
-            "acquire endpoint status startup reconciliation lock",
-        )
-    })?;
-    let mut offset = 0;
+    let mut cursor: Option<ObjectCursor> = None;
     loop {
-        let sandboxes = state
+        let page = state
             .store
-            .list_all_messages::<Sandbox>(ENDPOINT_STARTUP_RECONCILIATION_PAGE_SIZE, offset)
+            .list_message_page::<Sandbox>(
+                ObjectListQuery::AllWorkspaces,
+                cursor.as_ref(),
+                ENDPOINT_STARTUP_RECONCILIATION_PAGE_SIZE,
+            )
             .await
             .map_err(|error| {
                 Status::internal(format!(
                     "list sandboxes for tool server endpoint-status startup reconciliation failed: {error}"
                 ))
             })?;
-        if sandboxes.is_empty() {
+        // Each future holds at most its own sandbox guard and never waits on
+        // another, so running them in one task cannot deadlock.
+        futures::stream::iter(
+            page.messages
+                .iter()
+                .filter(|sandbox| has_endpoint_status(sandbox))
+                .map(Ok::<_, Status>),
+        )
+        .try_for_each_concurrent(ENDPOINT_STARTUP_RECONCILIATION_CONCURRENCY, |candidate| {
+            invalidate_sandbox_endpoint_status_on_startup(state, candidate)
+        })
+        .await?;
+        let Some(next_cursor) = page.next_cursor else {
             return Ok(());
-        }
+        };
+        cursor = Some(next_cursor);
+    }
+}
 
-        for sandbox in &sandboxes {
-            let has_endpoint_status = sandbox
-                .status
-                .as_ref()
-                .is_some_and(|status| !status.endpoint_statuses.is_empty());
-            if !has_endpoint_status {
-                continue;
-            }
-            let sandbox_id = sandbox.object_id();
-            if has_fresh_shared_owner(state, sandbox_id).await? {
-                continue;
-            }
-            let expected_resource_version = sandbox.get_resource_version();
-            let updated = state
-                .store
-                .update_message_cas::<Sandbox, _>(
-                    sandbox_id,
-                    expected_resource_version,
-                    invalidate_endpoint_status_without_session,
-                )
-                .await
-                .map_err(|error| {
-                    super::super::persistence_error_to_status(
-                        error,
-                        "invalidate tool server endpoint status during gateway startup",
-                    )
-                })?;
-            state.sandbox_index.update_from_sandbox(&updated);
-        }
+async fn invalidate_sandbox_endpoint_status_on_startup(
+    state: &Arc<ServerState>,
+    candidate: &Sandbox,
+) -> Result<(), Status> {
+    // A live owner keeps its evidence, so it costs no guard.
+    if has_fresh_shared_owner(state, candidate.object_id()).await? {
+        return Ok(());
+    }
+    retry_startup_reconciliation(|| invalidate_sandbox_endpoint_status_once(state, candidate)).await
+}
 
-        let page_len = sandboxes.len() as u32;
-        if page_len < ENDPOINT_STARTUP_RECONCILIATION_PAGE_SIZE {
-            return Ok(());
+/// Outcome of one guarded startup-reconciliation attempt.
+enum StartupAttempt {
+    Done,
+    /// The write hit a concurrent change, a row deleted after the re-read, or
+    /// another database error; re-read and try again.
+    Retry(PersistenceError),
+}
+
+/// Run `attempt` until it is done, at most
+/// `ENDPOINT_STARTUP_RECONCILIATION_ATTEMPTS` times. An error from `attempt`
+/// is returned without a retry.
+async fn retry_startup_reconciliation<F, Fut>(mut attempt: F) -> Result<(), Status>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<StartupAttempt, Status>>,
+{
+    let mut attempts = 1;
+    loop {
+        match attempt().await? {
+            StartupAttempt::Done => return Ok(()),
+            StartupAttempt::Retry(error)
+                if attempts >= ENDPOINT_STARTUP_RECONCILIATION_ATTEMPTS =>
+            {
+                return Err(super::super::persistence_error_to_status(
+                    error,
+                    "invalidate tool server endpoint status during gateway startup",
+                ));
+            }
+            StartupAttempt::Retry(_) => attempts += 1,
         }
-        offset = offset.checked_add(page_len).ok_or_else(|| {
-            Status::internal(
-                "sandbox pagination overflow during tool server endpoint-status reconciliation",
+    }
+}
+
+async fn invalidate_sandbox_endpoint_status_once(
+    state: &Arc<ServerState>,
+    candidate: &Sandbox,
+) -> Result<StartupAttempt, Status> {
+    let sandbox_id = candidate.object_id();
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(
+            candidate.object_workspace(),
+            sandbox_id,
+        ))
+        .await
+        .map_err(|error| {
+            super::super::persistence_error_to_status(
+                error,
+                "acquire endpoint status startup reconciliation lock",
             )
         })?;
+    // A supervisor may have connected to another replica while this waited.
+    if has_fresh_shared_owner(state, sandbox_id).await? {
+        return Ok(StartupAttempt::Done);
     }
+    let Some(current) = state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+    else {
+        return Ok(StartupAttempt::Done);
+    };
+    if !has_endpoint_status(&current) {
+        return Ok(StartupAttempt::Done);
+    }
+    match state
+        .store
+        .update_message_cas::<Sandbox, _>(
+            sandbox_id,
+            current.get_resource_version(),
+            invalidate_endpoint_status_without_session,
+        )
+        .await
+    {
+        Ok(updated) => {
+            state.sandbox_index.update_from_sandbox(&updated);
+            Ok(StartupAttempt::Done)
+        }
+        // Lifecycle writers on other replicas take no distributed guard, and a
+        // delete between the re-read and the write surfaces as a database
+        // error. Retry with a fresh read after this guard drops.
+        Err(error @ (PersistenceError::Conflict { .. } | PersistenceError::Database(_))) => {
+            Ok(StartupAttempt::Retry(error))
+        }
+        Err(error) => Err(super::super::persistence_error_to_status(
+            error,
+            "invalidate tool server endpoint status during gateway startup",
+        )),
+    }
+}
+
+fn has_endpoint_status(sandbox: &Sandbox) -> bool {
+    sandbox
+        .status
+        .as_ref()
+        .is_some_and(|status| !status.endpoint_statuses.is_empty())
 }
 
 async fn has_fresh_shared_owner(
@@ -557,6 +682,22 @@ async fn has_fresh_shared_owner(
         .await
         .map(|owner| owner.is_some_and(|owner| owner.is_fresh(OWNER_TTL)))
         .map_err(|error| Status::unavailable(format!("resolve supervisor owner failed: {error}")))
+}
+
+/// True when a replacement supervisor session (local, or a fresh owner on a
+/// peer) now owns endpoint observation, so a disconnect must not reset.
+async fn disconnect_reset_is_superseded(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+) -> Result<bool, Status> {
+    if state
+        .supervisor_sessions
+        .current_session_id(sandbox_id)
+        .is_some()
+    {
+        return Ok(true);
+    }
+    has_fresh_shared_owner(state, sandbox_id).await
 }
 
 fn invalidate_endpoint_status_without_session(sandbox: &mut Sandbox) {

@@ -134,6 +134,10 @@ namespace with a `uri` key. For local manual testing, either create your own
 PostgreSQL Secret or use the e2e PostgreSQL fixture manifest in
 `e2e/kubernetes/postgres-fixture.yaml`.
 
+Gateway pods in the `high-availability` profile use external PostgreSQL, so
+they drain their supervisor sessions when deleted or rolled and can take up to
+30 seconds to terminate.
+
 For the `high-availability` profile, return to the repository root and apply the
 GatewayClass and BackendTrafficPolicy manifest after Skaffold has installed
 Envoy Gateway:
@@ -271,15 +275,23 @@ The kube e2e wrapper creates only one port-forward, to `svc/openshell`; it no
 longer forwards the unauthenticated health listener or runs a `/readyz` e2e
 target. `/readyz` remains covered by server unit/integration tests.
 
-Use `mise run e2e:kubernetes:ha-rebalancing` for full-suite HA coverage. The
-task creates an external PostgreSQL fixture, installs Envoy Gateway, applies
+Use `mise run e2e:kubernetes:ha-rebalancing` for HA coverage. The task creates
+an external PostgreSQL fixture, installs Envoy Gateway, applies
 `deploy/kube/manifests/envoy-gateway-openshell.yaml`, enables the chart
-`GRPCRoute`, and runs the full Kubernetes e2e suite, including
-`kubernetes_ha_rebalancing`. That coverage validates sandbox create/watch and
+`GRPCRoute`, and runs the CLI conformance profile and the
+`kubernetes_ha_rebalancing` tests. That coverage validates sandbox create/watch and
 exec through the Envoy proxy while gateway replicas scale up, scale down, and
 rotate. It also keeps a long-running sandbox alive and runs upload/download
 operations while gateway pods roll, so file sync exercises the same relay retry
 path as interactive sessions.
+
+`supervisor_sessions_redistribute_across_gateway_pod_rolls` restarts the
+gateway Deployment, reads `openshell_server_draining` from the terminating
+pods, and checks that the new pods' `openshell_server_supervisor_sessions` add
+up to the Ready sandbox count. It scrapes each pod through
+`kubectl get --raw /api/v1/namespaces/<ns>/pods/<pod>:9090/proxy/metrics`.
+Gateway pods take up to 30 seconds to terminate because each drains its
+sessions, and the HA tests are allowed ten minutes each.
 
 If you reuse an existing Skaffold cluster for the full kube suite, make sure the
 chart has `server.hostGatewayIP` set so sandbox pods can resolve
@@ -446,6 +458,7 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
+| `deploy/helm/openshell/ci/values-autoscaling.yaml` | Render-only overlay for the optional gateway HorizontalPodAutoscaler (helm lint and helm-unittest) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
 | `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
 | `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |

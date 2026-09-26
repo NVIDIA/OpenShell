@@ -1,0 +1,317 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gateway autoscaling
+templates:
+  - templates/hpa.yaml
+  - templates/deployment.yaml
+  - templates/statefulset.yaml
+  - templates/gateway-config.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: renders no HorizontalPodAutoscaler by default
+    template: templates/hpa.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: keeps spec.replicas on the default StatefulSet
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 1
+
+  - it: renders an autoscaling/v2 HPA targeting the Deployment from the CI overlay
+    template: templates/hpa.yaml
+    values:
+      - ../ci/values-autoscaling.yaml
+    asserts:
+      - isKind:
+          of: HorizontalPodAutoscaler
+      - isAPIVersion:
+          of: autoscaling/v2
+      - equal:
+          path: metadata.name
+          value: openshell
+      - equal:
+          path: spec.scaleTargetRef
+          value:
+            apiVersion: apps/v1
+            kind: Deployment
+            name: openshell
+      - equal:
+          path: spec.minReplicas
+          value: 2
+      - equal:
+          path: spec.maxReplicas
+          value: 4
+      - contains:
+          path: spec.metrics
+          content:
+            type: Resource
+            resource:
+              name: cpu
+              target:
+                type: Utilization
+                averageUtilization: 80
+      - contains:
+          path: spec.metrics
+          content:
+            type: Pods
+            pods:
+              metric:
+                name: openshell_grpc_requests_per_second
+              target:
+                type: AverageValue
+                averageValue: "100"
+      - equal:
+          path: spec.behavior.scaleDown.stabilizationWindowSeconds
+          value: 300
+      - equal:
+          path: spec.behavior.scaleDown.policies[0]
+          value:
+            type: Pods
+            value: 1
+            periodSeconds: 120
+
+  - it: omits spec.replicas from the Deployment when autoscaling is enabled
+    template: templates/deployment.yaml
+    values:
+      - ../ci/values-autoscaling.yaml
+    set:
+      replicaCount: 3
+    asserts:
+      - isKind:
+          of: Deployment
+      - notExists:
+          path: spec.replicas
+
+  - it: renders memory utilization only when configured
+    template: templates/hpa.yaml
+    values:
+      - ../ci/values-autoscaling.yaml
+    set:
+      autoscaling.targetMemoryUtilizationPercentage: 70
+    asserts:
+      - contains:
+          path: spec.metrics
+          content:
+            type: Resource
+            resource:
+              name: memory
+              target:
+                type: Utilization
+                averageUtilization: 70
+
+  - it: renders only custom metrics when utilization targets are disabled
+    template: templates/hpa.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      autoscaling.enabled: true
+      autoscaling.targetCPUUtilizationPercentage: null
+      autoscaling.metrics:
+        - type: Pods
+          pods:
+            metric:
+              name: openshell_grpc_requests_per_second
+            target:
+              type: AverageValue
+              averageValue: "50"
+    asserts:
+      - lengthEqual:
+          path: spec.metrics
+          count: 1
+      - equal:
+          path: spec.metrics[0].type
+          value: Pods
+
+  - it: merges a scale-up policy with the default scale-down behavior
+    template: templates/hpa.yaml
+    values:
+      - ../ci/values-autoscaling.yaml
+    set:
+      autoscaling.behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+    asserts:
+      - equal:
+          path: spec.behavior.scaleUp.stabilizationWindowSeconds
+          value: 0
+      - equal:
+          path: spec.behavior.scaleDown.stabilizationWindowSeconds
+          value: 300
+
+  - it: omits behavior when set to null
+    template: templates/hpa.yaml
+    values:
+      - ../ci/values-autoscaling.yaml
+    set:
+      autoscaling.behavior: null
+    asserts:
+      - notExists:
+          path: spec.behavior
+
+  - it: targets a multi-replica StatefulSet with the explicit override
+    template: templates/hpa.yaml
+    set:
+      server.externalDbSecret: my-pg-secret
+      workload.allowMultiReplicaStatefulSet: true
+      resources.requests.cpu: 100m
+      autoscaling.enabled: true
+    asserts:
+      - equal:
+          path: spec.scaleTargetRef.kind
+          value: StatefulSet
+
+  - it: omits spec.replicas from the StatefulSet when autoscaling is enabled
+    template: templates/statefulset.yaml
+    set:
+      server.externalDbSecret: my-pg-secret
+      workload.allowMultiReplicaStatefulSet: true
+      resources.requests.cpu: 100m
+      autoscaling.enabled: true
+    asserts:
+      - notExists:
+          path: spec.replicas
+
+  - it: treats a missing autoscaling map as disabled
+    template: templates/statefulset.yaml
+    set:
+      autoscaling: null
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 1
+
+  - it: fails when autoscaling can exceed one replica on SQLite
+    template: templates/statefulset.yaml
+    set:
+      autoscaling.enabled: true
+      resources.requests.cpu: 100m
+    asserts:
+      - failedTemplate:
+          errorPattern: "autoscaling.maxReplicas > 1 requires server.externalDbSecret"
+
+  - it: fails when autoscaling a StatefulSet without the multi-replica override
+    template: templates/statefulset.yaml
+    set:
+      autoscaling.enabled: true
+      server.externalDbSecret: my-pg-secret
+      resources.requests.cpu: 100m
+    asserts:
+      - failedTemplate:
+          errorPattern: "autoscaling.maxReplicas > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true"
+
+  - it: fails when maxReplicas is below minReplicas
+    template: templates/statefulset.yaml
+    values:
+      - ../ci/values-autoscaling.yaml
+    set:
+      autoscaling.maxReplicas: 1
+    asserts:
+      - failedTemplate:
+          errorPattern: "autoscaling.maxReplicas must be greater than or equal to autoscaling.minReplicas"
+
+  - it: fails when minReplicas is below one
+    template: templates/statefulset.yaml
+    values:
+      - ../ci/values-autoscaling.yaml
+    set:
+      autoscaling.minReplicas: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: "autoscaling.minReplicas must be at least 1"
+
+  - it: fails when no autoscaling metric is configured
+    template: templates/statefulset.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      autoscaling.enabled: true
+      autoscaling.targetCPUUtilizationPercentage: null
+    asserts:
+      - failedTemplate:
+          errorPattern: "autoscaling.enabled requires targetCPUUtilizationPercentage, targetMemoryUtilizationPercentage, or autoscaling.metrics"
+
+  - it: fails when a CPU target has no CPU request
+    template: templates/statefulset.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      autoscaling.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "autoscaling.targetCPUUtilizationPercentage requires resources.requests.cpu"
+
+  - it: fails when a memory target has no memory request
+    template: templates/statefulset.yaml
+    values:
+      - ../ci/values-autoscaling.yaml
+    set:
+      autoscaling.targetMemoryUtilizationPercentage: 70
+      resources.requests.memory: null
+    asserts:
+      - failedTemplate:
+          errorPattern: "autoscaling.targetMemoryUtilizationPercentage requires resources.requests.memory"
+
+  - it: accepts CPU and memory limits in place of requests
+    template: templates/hpa.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      autoscaling.enabled: true
+      autoscaling.targetMemoryUtilizationPercentage: 70
+      resources.limits.cpu: "1"
+      resources.limits.memory: 1Gi
+    asserts:
+      - isKind:
+          of: HorizontalPodAutoscaler
+      - contains:
+          path: spec.metrics
+          content:
+            type: Resource
+            resource:
+              name: cpu
+              target:
+                type: Utilization
+                averageUtilization: 80
+      - contains:
+          path: spec.metrics
+          content:
+            type: Resource
+            resource:
+              name: memory
+              target:
+                type: Utilization
+                averageUtilization: 70
+
+  - it: explains --reuse-values when the autoscaling defaults are missing
+    template: templates/statefulset.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      resources.requests.cpu: 100m
+      # --reuse-values from a release without autoscaling values leaves only
+      # the enabled flag that the upgrade sets.
+      autoscaling.enabled: true
+      autoscaling.minReplicas: null
+      autoscaling.maxReplicas: null
+      autoscaling.targetCPUUtilizationPercentage: null
+      autoscaling.metrics: null
+      autoscaling.behavior: null
+    asserts:
+      - failedTemplate:
+          errorPattern: "autoscaling.minReplicas and autoscaling.maxReplicas are not set.*--reset-then-reuse-values"
+
+  - it: keeps the replicaCount wording when autoscaling is disabled
+    template: templates/statefulset.yaml
+    set:
+      replicaCount: 2
+    asserts:
+      - failedTemplate:
+          errorPattern: "replicaCount > 1 requires server.externalDbSecret"

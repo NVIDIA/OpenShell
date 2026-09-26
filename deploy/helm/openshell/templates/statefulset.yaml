@@ -10,7 +10,9 @@ metadata:
     {{- include "openshell.labels" . | nindent 4 }}
 spec:
   serviceName: {{ include "openshell.peerServiceName" . }}
+  {{- if ne (include "openshell.autoscalingEnabled" .) "true" }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "openshell.selectorLabels" . | nindent 6 }}
