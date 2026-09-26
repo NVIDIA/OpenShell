@@ -64,21 +64,6 @@ printf '\n# operator note\n' >>"$common/gateway.toml"
 cp "$common/gateway.toml" "${work}/legacy-edited-before"
 SNAP_COMMON="$common" "$hook"
 cmp -s "$expected" "$common/gateway.toml"
-cmp -s "${work}/legacy-edited-before" "$common/gateway.toml.pre-mtls"
-if [[ -z $(find "$common/gateway.toml.pre-mtls" -perm 600) ]]; then
-  echo "FAIL: migrated config backup must be mode 0600" >&2
-  exit 1
-fi
-SNAP_COMMON="$common" "$hook"
-cmp -s "${work}/legacy-edited-before" "$common/gateway.toml.pre-mtls"
-cp "$legacy" "$common/gateway.toml"
-SNAP_COMMON="$common" "$hook"
-cmp -s "$expected" "$common/gateway.toml"
-cmp -s "${work}/legacy-edited-before" "$common/gateway.toml.pre-mtls"
-if [[ $(find "$common" -maxdepth 1 -name 'gateway.toml.pre-mtls.*' -type f | wc -l) -ne 1 ]]; then
-  echo "FAIL: repeated migration must preserve the existing backup" >&2
-  exit 1
-fi
 
 common="${work}/custom-insecure"
 mkdir -p "$common"
@@ -96,7 +81,6 @@ EOF
 cp "$common/gateway.toml" "${work}/custom-insecure-before"
 SNAP_COMMON="$common" "$hook"
 cmp -s "$expected" "$common/gateway.toml"
-cmp -s "${work}/custom-insecure-before" "$common/gateway.toml.pre-mtls"
 
 common="${work}/custom-secure"
 mkdir -p "$common"
@@ -111,10 +95,6 @@ EOF
 cp "$common/gateway.toml" "${work}/custom-secure-before"
 SNAP_COMMON="$common" "$hook"
 cmp -s "${work}/custom-secure-before" "$common/gateway.toml"
-if [[ -e "$common/gateway.toml.pre-mtls" ]]; then
-  echo "FAIL: secure operator config should not be backed up or replaced" >&2
-  exit 1
-fi
 
 common="${work}/post-refresh"
 mkdir -p "$common" "${work}/snap/meta/hooks"
@@ -125,7 +105,6 @@ if ! cmp -s "$expected" "$common/gateway.toml"; then
   echo "FAIL: post-refresh hook must migrate an edited insecure config" >&2
   exit 1
 fi
-cmp -s "${work}/legacy-edited-before" "$common/gateway.toml.pre-mtls"
 
 common="${work}/broken-link"
 mkdir -p "$common"
@@ -141,6 +120,11 @@ mkdir -p "$common/gateway.toml"
 SNAP_COMMON="$common" "$hook"
 if [[ ! -d "$common/gateway.toml" ]]; then
   echo "FAIL: install hook replaced an operator-owned directory" >&2
+  exit 1
+fi
+
+if [[ -n $(find "$work" -name 'gateway.toml.pre-mtls*') ]]; then
+  echo "FAIL: install hook must not keep copies of replaced configs" >&2
   exit 1
 fi
 

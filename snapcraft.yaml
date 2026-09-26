@@ -43,13 +43,11 @@ description: |
          openshell status
 
     On refresh, configs that explicitly enable plaintext or unauthenticated
-    access are replaced with the secure default. The previous file is saved at
-    /var/snap/openshell/common/gateway.toml.pre-mtls (mode 0600), or a uniquely
-    suffixed path if that backup already exists. The gateway
-    restarts automatically during refresh to apply the new revision and
-    config. This interrupts active sandbox sessions. Users registered against
-    the old HTTP endpoint must remove that gateway registration and repeat
-    step 2, or rerun install.sh.
+    access are replaced with the secure default. The gateway restarts
+    automatically during refresh to apply the new revision and config. This
+    interrupts active sandbox sessions. Users registered against the old HTTP
+    endpoint must remove that gateway registration and repeat step 2, or
+    rerun install.sh.
 
 base: core24
 grade: stable

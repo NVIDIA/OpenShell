@@ -11,16 +11,12 @@ insecure='^[[:space:]]*(allow_unauthenticated_users|disable_tls)[[:space:]]*=[[:
 
 # Keep secure operator configs, symlinks, and directories. Replace a config
 # that explicitly allows plaintext or anonymous access, even if it has other
-# edits, after saving a private backup.
+# edits.
 if [ -L "$config_file" ]; then
 	exit 0
 elif [ -f "$config_file" ]; then
 	grep -Eq "$insecure" "$config_file" || exit 0
-	backup_file="${config_file}.pre-mtls"
-	[ ! -e "$backup_file" ] || backup_file="${backup_file}.$(date +%s)"
-	umask 077
-	cp "$config_file" "$backup_file"
-	echo "openshell: replacing insecure gateway config; previous config saved at $backup_file" >&2
+	echo "openshell: replacing insecure gateway config with the mTLS default" >&2
 elif [ -e "$config_file" ]; then
 	exit 0
 fi
