@@ -20,8 +20,9 @@ use openshell_core::proto::{
     PeerRelayFrame, PeerRelayInit, ProviderReadinessObservation, RelayFrame, RelayInit, RelayOpen,
     ReportEndpointStatusRequest, ReportEndpointStatusResponse, ReportMainProcessExitRequest,
     ReportMainProcessExitResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
-    Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget, SupervisorHello, SupervisorMessage,
-    gateway_message, open_shell_client, peer_relay_frame, relay_open, supervisor_message,
+    Sandbox, SandboxPhase, SessionAccepted, SessionRedirect, SshRelayTarget, SupervisorHello,
+    SupervisorMessage, gateway_message, open_shell_client, peer_relay_frame, relay_open,
+    supervisor_message,
 };
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
@@ -1505,6 +1506,54 @@ fn owner_endpoint_is_local_only(endpoint: &str) -> bool {
     endpoint.starts_with(LOCAL_OWNER_ENDPOINT_SCHEME)
 }
 
+/// Where the ring says this sandbox belongs, when that is not this replica.
+///
+/// Returns `None` whenever this replica should serve the session itself, which
+/// covers single-replica mode, an empty ring, the ring naming this replica, and
+/// a preferred replica with no dialable peer endpoint. Falling back to local
+/// ownership keeps a stale or incomplete ring from making a sandbox
+/// unreachable.
+fn preferred_peer_redirect(state: &Arc<ServerState>, sandbox_id: &str) -> Option<SessionRedirect> {
+    if state.store.is_single_replica() {
+        return None;
+    }
+
+    let preferred = {
+        let ring = state.gateway_ring.read().ok()?;
+        ring.owner_for(sandbox_id)?.to_string()
+    };
+    let peer_endpoint = {
+        let peers = state.gateway_peers.read().ok()?;
+        peers.get(&preferred).cloned()
+    };
+
+    ring_redirect(&state.replica_id, &preferred, peer_endpoint)
+}
+
+/// Decide whether a preferred replica is worth redirecting to.
+///
+/// Split out from the lock reads so the rules are testable on their own.
+fn ring_redirect(
+    self_replica_id: &str,
+    preferred_replica_id: &str,
+    preferred_peer_endpoint: Option<String>,
+) -> Option<SessionRedirect> {
+    if preferred_replica_id == self_replica_id {
+        return None;
+    }
+    let peer_endpoint = preferred_peer_endpoint?;
+    // `local://` endpoints are placeholders used when no peer endpoint is
+    // configured, so they are not dialable from another replica.
+    if peer_endpoint.is_empty() || peer_endpoint.starts_with("local://") {
+        return None;
+    }
+
+    Some(SessionRedirect {
+        peer_endpoint,
+        owner_replica_id: preferred_replica_id.to_string(),
+    })
+}
+
 async fn open_peer_relay(
     state: &Arc<ServerState>,
     owner_peer_endpoint: String,
@@ -1795,6 +1844,30 @@ pub async fn handle_connect_supervisor(
     // Validate readiness identities before replacing a healthy session. Older
     // supervisors remain usable but cannot assert provider installation.
     let provider_readiness = ProviderReadinessEvidence::from_hello(&hello)?;
+
+    // If the ring places this sandbox on a different live replica, send the
+    // supervisor there instead of claiming ownership here. Decided before the
+    // session is tracked so a redirect never consumes a session slot, and only
+    // at connect time, so an established session is never relocated.
+    if !hello.redirected
+        && let Some(redirect) = preferred_peer_redirect(state, &sandbox_id)
+    {
+        info!(
+            sandbox_id = %sandbox_id,
+            owner_replica_id = %redirect.owner_replica_id,
+            replica_id = %state.replica_id,
+            "supervisor session: redirecting to ring-preferred replica"
+        );
+        let (tx, rx) = mpsc::channel::<Result<GatewayMessage, Status>>(1);
+        let message = GatewayMessage {
+            payload: Some(gateway_message::Payload::SessionRedirect(redirect)),
+        };
+        // Capacity 1 and a fresh receiver, so this cannot block. Dropping the
+        // sender ends the stream, which closes the supervisor's connection.
+        let _ = tx.send(Ok(message)).await;
+        drop(tx);
+        return Ok(Response::new(Box::pin(ReceiverStream::new(rx))));
+    }
 
     let session_lifetime = state.supervisor_sessions.track_session()?;
     let state = Arc::clone(state);
@@ -3348,5 +3421,33 @@ mod tests {
         let channels = cache.channels.lock().unwrap();
         assert!(!channels.contains_key("http://10.0.0.1:8080"));
         assert!(channels.contains_key("http://10.0.0.2:8080"));
+    }
+
+    // ---- ring_redirect: placement handoff rules ----
+
+    #[test]
+    fn ring_redirect_targets_the_preferred_replica() {
+        let redirect = ring_redirect("gw-0", "gw-1", Some("https://gw-1:8443".to_string()))
+            .expect("should redirect to another replica");
+        assert_eq!(redirect.owner_replica_id, "gw-1");
+        assert_eq!(redirect.peer_endpoint, "https://gw-1:8443");
+    }
+
+    #[test]
+    fn ring_redirect_serves_locally_when_this_replica_is_preferred() {
+        assert!(ring_redirect("gw-0", "gw-0", Some("https://gw-0:8443".to_string())).is_none());
+    }
+
+    /// Without a dialable address we must keep the session rather than send
+    /// the supervisor somewhere it cannot reach.
+    #[test]
+    fn ring_redirect_serves_locally_when_the_peer_endpoint_is_unknown() {
+        assert!(ring_redirect("gw-0", "gw-1", None).is_none());
+    }
+
+    #[test]
+    fn ring_redirect_serves_locally_for_placeholder_endpoints() {
+        assert!(ring_redirect("gw-0", "gw-1", Some(String::new())).is_none());
+        assert!(ring_redirect("gw-0", "gw-1", Some("local://gw-1".to_string())).is_none());
     }
 }

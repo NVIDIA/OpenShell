@@ -119,11 +119,12 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
     // Carries this branch's exec request IDs together with main's opaque watch
-    // cursor and well-known time types. These unreleased public-only fields add
-    // no messages or enums and touch no stored type, so the durable and overlap
-    // fingerprints below remain unchanged.
+    // cursor and well-known time types, plus SessionRedirect and
+    // SupervisorHello.redirected for ring-based session placement. The added
+    // message is supervisor-facing control traffic and is never stored, so the
+    // durable and overlap fingerprints below remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "8fb59b0932ec2f227fdec2d46b6204925e79595695810a247bef731ddd632594";
+        "7ba2bca6e0695d1ce2c33b0149a8d2ed3caf8599259229893b3386e006965ac5";
     const DURABLE_SCHEMA_SHA256: &str =
         "9eeaa29dfba187bff69fb7bc4f9a13a0f1d7be3f7049a38c8f0e20ce77ec7d8b";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -590,7 +591,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (304, 25),
+                (305, 25),
                 (92, 19),
                 (80, 19),
                 PUBLIC_RPC_SCHEMA_SHA256,
