@@ -281,6 +281,18 @@ rotate. It also keeps a long-running sandbox alive and runs upload/download
 operations while gateway pods roll, so file sync exercises the same relay retry
 path as interactive sessions.
 
+Set `OPENSHELL_E2E_KUBE_PRESERVE_CLUSTER=1` only for failure investigation of
+a wrapper-created ephemeral cluster. The wrapper preserves the cluster and work
+directory after success or failure and prints their locations, an inspection
+command, and separate commands to delete both resources. This option applies
+only to ephemeral k3d clusters created by the wrapper. When
+`OPENSHELL_E2E_KUBE_CONTEXT` selects an existing cluster, the wrapper leaves
+the cluster running but continues cleaning up the OpenShell release, test
+fixtures, and temporary work directory.
+The retained work directory and cluster contain temporary test credentials,
+private keys, and gateway metadata; run both printed cleanup commands after the
+investigation.
+
 If you reuse an existing Skaffold cluster for the full kube suite, make sure the
 chart has `server.hostGatewayIP` set so sandbox pods can resolve
 `host.openshell.internal` back to the test host. The e2e wrapper detects this on
