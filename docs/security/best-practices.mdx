@@ -273,9 +273,11 @@ Gateway transport uses TLS, with client certificate checks available where the d
 
 SSH connections to sandboxes travel through the gateway over the sandbox supervisor's authenticated control path. Each SSH connect call also carries a short-lived session token scoped to a specific sandbox. The sandbox never exposes an SSH port on the network. Its SSH daemon listens on a local Unix socket that only the sandbox's own supervisor process can reach.
 
+Service forwards (`openshell forward`) use the same relay path but carry no session token. The gateway authorizes each forwarded connection against the caller's gateway identity and workspace membership, and the per-sandbox connection limit applies.
+
 | Aspect | Detail |
 |---|---|
-| Default | Session tokens expire after 24 hours. Concurrent connections are limited to 10 per token and 20 per sandbox. |
+| Default | Session tokens expire after 24 hours. Concurrent connections are limited to 3 per token and 20 per sandbox. |
 | What you can change | Configure `ssh_session_ttl_secs`. Set to 0 for no expiry. |
 | Risk if relaxed | Longer TTLs or no expiry increase the window for stolen token reuse. Higher connection limits increase the blast radius of a compromised token. |
 | Recommendation | Keep the 24-hour default. Monitor connection counts through the TUI. |
