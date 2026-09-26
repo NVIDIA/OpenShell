@@ -346,23 +346,21 @@ def read_head(conn):
             return None
     return data
 
-def pipe(a, b):
-    try:
-        while True:
-            # TLS can buffer decrypted application bytes while the underlying
-            # file descriptor is no longer readable. Drain those bytes before
-            # waiting in select, or a coalesced handshake and HTTP request can
-            # stall until the client times out.
-            ready = [sock for sock in (a, b) if sock.pending() > 0]
-            if not ready:
-                ready, _, _ = select.select([a, b], [], [])
-            for sock in ready:
-                chunk = sock.recv(65536)
-                if not chunk:
-                    return
-                (b if sock is a else a).sendall(chunk)
-    except OSError:
+def relay_http(client, upstream):
+    # select() cannot safely drive SSLSocket application data: TLS control
+    # records can make the fd readable while recv() still waits for payload.
+    # This fixture serves one bodyless HTTP request per intercepted tunnel, so
+    # relay that exchange directly and let the upstream HTTP/1.0 close delimit
+    # the response.
+    request = read_head(client)
+    if request is None:
         return
+    upstream.sendall(request)
+    while True:
+        chunk = upstream.recv(65536)
+        if not chunk:
+            return
+        client.sendall(chunk)
 
 server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 server_context.load_cert_chain(chain, leaf_key)
@@ -398,7 +396,7 @@ def handle(conn):
             log('CONNECT %s mitm=client-tls-fail error=%r' % (target, err))
             return
         log('CONNECT %s mitm=ok' % target)
-        pipe(client, upstream)
+        relay_http(client, upstream)
         upstream.close()
         client.close()
     except OSError as err:
