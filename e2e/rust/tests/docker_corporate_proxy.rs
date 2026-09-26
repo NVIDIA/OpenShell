@@ -349,7 +349,13 @@ def read_head(conn):
 def pipe(a, b):
     try:
         while True:
-            ready, _, _ = select.select([a, b], [], [])
+            # TLS can buffer decrypted application bytes while the underlying
+            # file descriptor is no longer readable. Drain those bytes before
+            # waiting in select, or a coalesced handshake and HTTP request can
+            # stall until the client times out.
+            ready = [sock for sock in (a, b) if sock.pending() > 0]
+            if not ready:
+                ready, _, _ = select.select([a, b], [], [])
             for sock in ready:
                 chunk = sock.recv(65536)
                 if not chunk:
