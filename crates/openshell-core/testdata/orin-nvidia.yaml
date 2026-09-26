@@ -1,0 +1,2219 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Captured from orin-dev:/var/run/cdi/nvidia.yaml on 2026-09-17.
+# Original SHA-256: 52d0de5622e816351b256213e21f72d32b3ea4e4dbb2de68ce1afe7e13e80b36
+---
+cdiVersion: 0.7.0
+kind: nvidia.com/gpu
+devices:
+    - name: "0"
+      containerEdits:
+        deviceNodes:
+            - path: /dev/host1x-fence
+              major: 492
+              fileMode: 438
+              permissions: rwm
+            - path: /dev/nvhost-as-gpu
+              major: 505
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvhost-ctrl-gpu
+              major: 505
+              minor: 2
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvhost-ctxsw-gpu
+              major: 505
+              minor: 3
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvhost-dbg-gpu
+              major: 505
+              minor: 4
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvhost-gpu
+              major: 505
+              minor: 1
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvhost-nvsched-gpu
+              major: 505
+              minor: 9
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvhost-power-gpu
+              major: 506
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvhost-prof-ctx-gpu
+              major: 505
+              minor: 6
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvhost-prof-dev-gpu
+              major: 505
+              minor: 7
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvhost-prof-gpu
+              major: 505
+              minor: 5
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvhost-sched-gpu
+              major: 505
+              minor: 8
+              fileMode: 432
+              permissions: rwm
+            - path: /dev/nvhost-tsg-gpu
+              major: 505
+              minor: 11
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvidia0
+              major: 195
+              fileMode: 438
+              permissions: rwm
+            - path: /dev/nvidiactl
+              major: 195
+              minor: 255
+              fileMode: 438
+              permissions: rwm
+            - path: /dev/nvmap
+              major: 10
+              minor: 124
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvsciipc
+              major: 507
+              fileMode: 438
+              permissions: rwm
+            - path: /dev/v4l2-nvdec
+              major: 1
+              minor: 3
+              fileMode: 438
+              permissions: rwm
+            - path: /dev/dri/card0
+              major: 226
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/dri/renderD128
+              major: 226
+              minor: 128
+              fileMode: 432
+              permissions: rwm
+              gid: 104
+            - path: /dev/nvgpu/igpu0/as
+              major: 505
+              minor: 12
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvgpu/igpu0/channel
+              major: 505
+              minor: 13
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvgpu/igpu0/ctrl
+              major: 505
+              minor: 14
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvgpu/igpu0/ctxsw
+              major: 505
+              minor: 15
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvgpu/igpu0/dbg
+              major: 505
+              minor: 16
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvgpu/igpu0/nvsched
+              major: 505
+              minor: 21
+              fileMode: 416
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvgpu/igpu0/power
+              major: 506
+              minor: 1
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvgpu/igpu0/prof
+              major: 505
+              minor: 17
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvgpu/igpu0/prof-ctx
+              major: 505
+              minor: 18
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvgpu/igpu0/prof-dev
+              major: 505
+              minor: 19
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvgpu/igpu0/sched
+              major: 505
+              minor: 20
+              fileMode: 432
+              permissions: rwm
+            - path: /dev/nvgpu/igpu0/tsg
+              major: 505
+              minor: 23
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+        additionalGids:
+            - 44
+            - 104
+            - 995
+    - name: all
+      containerEdits:
+        deviceNodes:
+            - path: /dev/host1x-fence
+              major: 492
+              fileMode: 438
+              permissions: rwm
+            - path: /dev/nvhost-as-gpu
+              major: 505
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvhost-ctrl-gpu
+              major: 505
+              minor: 2
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvhost-ctxsw-gpu
+              major: 505
+              minor: 3
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvhost-dbg-gpu
+              major: 505
+              minor: 4
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvhost-gpu
+              major: 505
+              minor: 1
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvhost-nvsched-gpu
+              major: 505
+              minor: 9
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvhost-power-gpu
+              major: 506
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvhost-prof-ctx-gpu
+              major: 505
+              minor: 6
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvhost-prof-dev-gpu
+              major: 505
+              minor: 7
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvhost-prof-gpu
+              major: 505
+              minor: 5
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvhost-sched-gpu
+              major: 505
+              minor: 8
+              fileMode: 432
+              permissions: rwm
+            - path: /dev/nvhost-tsg-gpu
+              major: 505
+              minor: 11
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvidia0
+              major: 195
+              fileMode: 438
+              permissions: rwm
+            - path: /dev/nvidiactl
+              major: 195
+              minor: 255
+              fileMode: 438
+              permissions: rwm
+            - path: /dev/nvmap
+              major: 10
+              minor: 124
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvsciipc
+              major: 507
+              fileMode: 438
+              permissions: rwm
+            - path: /dev/v4l2-nvdec
+              major: 1
+              minor: 3
+              fileMode: 438
+              permissions: rwm
+            - path: /dev/dri/card0
+              major: 226
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/dri/renderD128
+              major: 226
+              minor: 128
+              fileMode: 432
+              permissions: rwm
+              gid: 104
+            - path: /dev/nvgpu/igpu0/as
+              major: 505
+              minor: 12
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvgpu/igpu0/channel
+              major: 505
+              minor: 13
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvgpu/igpu0/ctrl
+              major: 505
+              minor: 14
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvgpu/igpu0/ctxsw
+              major: 505
+              minor: 15
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvgpu/igpu0/dbg
+              major: 505
+              minor: 16
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvgpu/igpu0/nvsched
+              major: 505
+              minor: 21
+              fileMode: 416
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvgpu/igpu0/power
+              major: 506
+              minor: 1
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+            - path: /dev/nvgpu/igpu0/prof
+              major: 505
+              minor: 17
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvgpu/igpu0/prof-ctx
+              major: 505
+              minor: 18
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvgpu/igpu0/prof-dev
+              major: 505
+              minor: 19
+              fileMode: 432
+              permissions: rwm
+              gid: 995
+            - path: /dev/nvgpu/igpu0/sched
+              major: 505
+              minor: 20
+              fileMode: 432
+              permissions: rwm
+            - path: /dev/nvgpu/igpu0/tsg
+              major: 505
+              minor: 23
+              fileMode: 432
+              permissions: rwm
+              gid: 44
+        additionalGids:
+            - 44
+            - 104
+            - 995
+containerEdits:
+    env:
+        - NVIDIA_VISIBLE_DEVICES=void
+    hooks:
+        - hookName: createContainer
+          path: /usr/bin/nvidia-cdi-hook
+          args:
+            - nvidia-cdi-hook
+            - create-symlinks
+            - --link
+            - libcuda.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so
+            - --link
+            - libcuda.so.1.1::/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1
+            - --link
+            - libnvbufsurface.so.1.0.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvbufsurface.so
+            - --link
+            - libnvbufsurftransform.so.1.0.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvbufsurftransform.so
+            - --link
+            - libnvdsbufferpool.so.1.0.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvdsbufferpool.so
+            - --link
+            - libnvidia-allocator.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-allocator.so
+            - --link
+            - libnvidia-egl-gbm.so.1.1.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-egl-gbm.so.1
+            - --link
+            - libnvidia-egl-wayland.so.1.1.11::/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-egl-wayland.so.1
+            - --link
+            - libnvidia-kms.so.540.5.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-kms.so
+            - --link
+            - libnvidia-nvvm.so.540.5.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-nvvm.so.4
+            - --link
+            - libnvidia-ptxjitcompiler.so.540.5.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-ptxjitcompiler.so.1
+            - --link
+            - libnvidia-vksc-core.so.540.5.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-vksc-core.so
+            - --link
+            - libnvid_mapper.so.1.0.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvid_mapper.so
+            - --link
+            - libnvscibuf.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libnvscibuf.so
+            - --link
+            - libnvscicommon.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libnvscicommon.so
+            - --link
+            - libnvscistream.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libnvscistream.so
+            - --link
+            - libnvscisync.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libnvscisync.so
+            - --link
+            - libvulkansc.so.1.0.10::/usr/lib/aarch64-linux-gnu/nvidia/libvulkansc.so.1
+            - --link
+            - libvulkansc.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libvulkansc.so
+            - --link
+            - libwayland-client.so.0.22.0::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-client.so.0
+            - --link
+            - libwayland-client.so.0::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-client.so
+            - --link
+            - libwayland-cursor.so.0.22.0::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-cursor.so.0
+            - --link
+            - libwayland-cursor.so.0::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-cursor.so
+            - --link
+            - libwayland-egl.so.1.22.0::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-egl.so.1
+            - --link
+            - libwayland-egl.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-egl.so
+            - --link
+            - libwayland-server.so.0.22.0::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-server.so.0
+            - --link
+            - libwayland-server.so.0::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-server.so
+          env:
+            - NVIDIA_CTK_DEBUG=false
+        - hookName: createContainer
+          path: /usr/bin/nvidia-cdi-hook
+          args:
+            - nvidia-cdi-hook
+            - create-symlinks
+            - --link
+            - /usr/lib/aarch64-linux-gnu/nvidia/nvidia_icd.json::/etc/vulkan/icd.d/nvidia_icd.json
+            - --link
+            - ../nvidia/libnvidia-allocator.so::/usr/lib/aarch64-linux-gnu/gbm/nvidia-drm_gbm.so
+            - --link
+            - libnvidia-allocator.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-allocator.so
+            - --link
+            - ../nvidia/libnvidia-allocator.so::/usr/lib/aarch64-linux-gnu/gbm/tegra_gbm.so
+            - --link
+            - ../nvidia/libnvidia-allocator.so::/usr/lib/aarch64-linux-gnu/gbm/tegra-udrm_gbm.so
+            - --link
+            - nvidia/libcuda.so::/usr/lib/aarch64-linux-gnu/libcuda.so
+            - --link
+            - libcuda.so.1.1::/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so
+            - --link
+            - nvidia/libnvcucompat.so::/usr/lib/aarch64-linux-gnu/libnvcucompat.so
+            - --link
+            - nvidia/libnvcudla.so::/usr/lib/aarch64-linux-gnu/libnvcudla.so
+            - --link
+            - nvidia/libnvv4l2.so::/usr/lib/aarch64-linux-gnu/libv4l2.so.0.0.999999
+            - --link
+            - nvidia/libnvv4lconvert.so::/usr/lib/aarch64-linux-gnu/libv4lconvert.so.0.0.999999
+            - --link
+            - ../../../nvidia/libv4l2_nvargus.so::/usr/lib/aarch64-linux-gnu/libv4l/plugins/nv/libv4l2_nvargus.so
+            - --link
+            - ../../../nvidia/libv4l2_nvcuvidvideocodec.so::/usr/lib/aarch64-linux-gnu/libv4l/plugins/nv/libv4l2_nvcuvidvideocodec.so
+            - --link
+            - ../../../nvidia/libv4l2_nvvideocodec.so::/usr/lib/aarch64-linux-gnu/libv4l/plugins/nv/libv4l2_nvvideocodec.so
+            - --link
+            - libcuda.so.1.1::/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1
+            - --link
+            - libnvbufsurface.so.1.0.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvbufsurface.so
+            - --link
+            - libnvbufsurftransform.so.1.0.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvbufsurftransform.so
+            - --link
+            - libnvdsbufferpool.so.1.0.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvdsbufferpool.so
+            - --link
+            - libnvidia-egl-gbm.so.1.1.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-egl-gbm.so.1
+            - --link
+            - libnvidia-egl-wayland.so.1.1.11::/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-egl-wayland.so.1
+            - --link
+            - libnvidia-kms.so.540.5.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-kms.so
+            - --link
+            - libnvidia-nvvm.so.540.5.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-nvvm.so.4
+            - --link
+            - libnvidia-ptxjitcompiler.so.540.5.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-ptxjitcompiler.so.1
+            - --link
+            - libnvidia-vksc-core.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-vksc-core.so
+            - --link
+            - libnvidia-vksc-core.so.540.5.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-vksc-core.so.1
+            - --link
+            - libnvid_mapper.so.1.0.0::/usr/lib/aarch64-linux-gnu/nvidia/libnvid_mapper.so
+            - --link
+            - libnvscibuf.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libnvscibuf.so
+            - --link
+            - libnvscicommon.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libnvscicommon.so
+            - --link
+            - libnvscistream.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libnvscistream.so
+            - --link
+            - libnvscisync.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libnvscisync.so
+            - --link
+            - libnvv4l2.so::/usr/lib/aarch64-linux-gnu/nvidia/libv4l2.so.0
+            - --link
+            - libnvv4lconvert.so::/usr/lib/aarch64-linux-gnu/nvidia/libv4lconvert.so.0
+            - --link
+            - libvulkansc.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libvulkansc.so
+            - --link
+            - libvulkansc.so.1.0.10::/usr/lib/aarch64-linux-gnu/nvidia/libvulkansc.so.1
+            - --link
+            - libwayland-client.so.0::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-client.so
+            - --link
+            - libwayland-client.so.0.22.0::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-client.so.0
+            - --link
+            - libwayland-cursor.so.0::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-cursor.so
+            - --link
+            - libwayland-cursor.so.0.22.0::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-cursor.so.0
+            - --link
+            - libwayland-egl.so.1::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-egl.so
+            - --link
+            - libwayland-egl.so.1.22.0::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-egl.so.1
+            - --link
+            - libwayland-server.so.0::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-server.so
+            - --link
+            - libwayland-server.so.0.22.0::/usr/lib/aarch64-linux-gnu/nvidia/libwayland-server.so.0
+            - --link
+            - ../../../lib/aarch64-linux-gnu/tegra-egl/nvidia.json::/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+          env:
+            - NVIDIA_CTK_DEBUG=false
+        - hookName: createContainer
+          path: /usr/bin/nvidia-cdi-hook
+          args:
+            - nvidia-cdi-hook
+            - enable-cuda-compat
+            - --host-cuda-version=12.6
+            - --cuda-compat-container-root=/dev/null
+          env:
+            - NVIDIA_CTK_DEBUG=false
+        - hookName: createContainer
+          path: /usr/bin/nvidia-cdi-hook
+          args:
+            - nvidia-cdi-hook
+            - update-ldcache
+            - --folder
+            - /usr/lib/aarch64-linux-gnu/nvidia
+            - --folder
+            - /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0
+            - --folder
+            - /usr/lib/aarch64-linux-gnu/tegra-egl
+          env:
+            - NVIDIA_CTK_DEBUG=false
+    mounts:
+        - hostPath: /etc/nv_tegra_release
+          containerPath: /etc/nv_tegra_release
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /dev/dri/by-path
+          containerPath: /dev/dri/by-path
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/bin/nvidia-cuda-mps-control
+          containerPath: /usr/bin/nvidia-cuda-mps-control
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/bin/nvidia-cuda-mps-server
+          containerPath: /usr/bin/nvidia-cuda-mps-server
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/sbin/nvidia-smi
+          containerPath: /usr/sbin/nvidia-smi
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /etc/vulkansc/icd.d/nvidia_icd_vksc.json
+          containerPath: /etc/vulkansc/icd.d/nvidia_icd_vksc.json
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/ld.so.conf
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/ld.so.conf
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libGLX_nvidia.so.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libGLX_nvidia.so.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libVkLayer_json_gen.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libVkLayer_json_gen.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libVkSCLayer_khronos_validation.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libVkSCLayer_khronos_validation.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1.1
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1.1
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libjetsonpower.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libjetsonpower.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvargus.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvargus.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvargus_socketclient.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvargus_socketclient.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvargus_socketserver.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvargus_socketserver.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvbuf_fdmap.so.1.0.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvbuf_fdmap.so.1.0.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvbufsurface.so.1.0.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvbufsurface.so.1.0.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvbufsurftransform.so.1.0.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvbufsurftransform.so.1.0.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcam_imageencoder.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcam_imageencoder.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcameratools.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcameratools.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcamerautils.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcamerautils.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcamlog.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcamlog.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcamv4l2.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcamv4l2.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcapture.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcapture.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcolorutil.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcolorutil.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcucompat.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcucompat.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcudla.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcudla.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcuvidv4l2.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvcuvidv4l2.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvdc.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvdc.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvddk_2d_v2.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvddk_2d_v2.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvddk_vic.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvddk_vic.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvdecode2eglimage.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvdecode2eglimage.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvdla_runtime.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvdla_runtime.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvdsbufferpool.so.1.0.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvdsbufferpool.so.1.0.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnveventlib.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnveventlib.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvexif.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvexif.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvfnet.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvfnet.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvfnetstoredefog.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvfnetstoredefog.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvfnetstorehdfx.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvfnetstorehdfx.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvfusacap.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvfusacap.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvfusacapinterface.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvfusacapinterface.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_boot.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_boot.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_camera.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_camera.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_force.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_force.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_generic.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_generic.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_gpucompute.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_gpucompute.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_graphics.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_graphics.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_il.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_il.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_spincircle.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_spincircle.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_tbc.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_tbc.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_ui.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvgov_ui.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvid_mapper.so.1.0.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvid_mapper.so.1.0.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-allocator.so.1
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-allocator.so.1
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-egl-gbm.so.1.1.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-egl-gbm.so.1.1.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-egl-wayland.so.1.1.11
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-egl-wayland.so.1.1.11
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-eglcore.so.540.5.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-eglcore.so.540.5.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-glcore.so.540.5.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-glcore.so.540.5.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-glsi.so.540.5.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-glsi.so.540.5.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-glvkspirv.so.540.5.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-glvkspirv.so.540.5.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-gpucomp.so.540.5.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-gpucomp.so.540.5.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-kms.so.540.5.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-kms.so.540.5.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-ml.so.1
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-ml.so.1
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-nvvm.so.540.5.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-nvvm.so.540.5.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-ptxjitcompiler.so.540.5.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-ptxjitcompiler.so.540.5.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-rmapi-tegra.so.540.5.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-rmapi-tegra.so.540.5.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-rtcore.so.540.5.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-rtcore.so.540.5.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-tls.so.540.5.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-tls.so.540.5.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-vksc-core.so.540.5.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvidia-vksc-core.so.540.5.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvimp.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvimp.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvisp.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvisp.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvisp_utils.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvisp_utils.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvisppg.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvisppg.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvjpeg.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvjpeg.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia2d.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia2d.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_2d.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_2d.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_dla.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_dla.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_eglstream.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_eglstream.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_ide_parser.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_ide_parser.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_ide_sci.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_ide_sci.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_iep_sci.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_iep_sci.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_ijpd_sci.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_ijpd_sci.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_ijpe_sci.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_ijpe_sci.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_iofa_sci.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_iofa_sci.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_isp_ext.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_isp_ext.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_tensor.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedia_tensor.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedialdc.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmedialdc.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmm.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmm.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmm_contentpipe.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmm_contentpipe.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmm_parser.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmm_parser.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmm_utils.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmm_utils.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmmlite.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmmlite.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmmlite_image.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmmlite_image.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmmlite_utils.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmmlite_utils.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmmlite_video.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvmmlite_video.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvodm_imager.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvodm_imager.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvofsdk.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvofsdk.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvomx.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvomx.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvomxilclient.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvomxilclient.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvos.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvos.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvosd.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvosd.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvparser.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvparser.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvphs.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvphs.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvphsd.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvphsd.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvplayfair.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvplayfair.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvpva.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvpva.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvpva_algorithms.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvpva_algorithms.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvpvaintf.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvpvaintf.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvpvaumd.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvpvaumd.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvrm_chip.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvrm_chip.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvrm_gpu.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvrm_gpu.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvrm_host1x.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvrm_host1x.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvrm_mem.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvrm_mem.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvrm_stream.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvrm_stream.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvrm_surface.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvrm_surface.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvrm_sync.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvrm_sync.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvscf.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvscf.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvscibuf.so.1
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvscibuf.so.1
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvscicommon.so.1
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvscicommon.so.1
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvscievent.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvscievent.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvsciipc.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvsciipc.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvscistream.so.1
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvscistream.so.1
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvscisync.so.1
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvscisync.so.1
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvsocsys.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvsocsys.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvtegrahv.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvtegrahv.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvtracebuf.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvtracebuf.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvtvmr.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvtvmr.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvtvmr_2d.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvtvmr_2d.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvv4l2.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvv4l2.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvv4lconvert.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvv4lconvert.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvvic.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvvic.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvvideo.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvvideo.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvvideoencode_ppe.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libnvvideoencode_ppe.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libsensors.hal-client.nvs.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libsensors.hal-client.nvs.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libsensors.l4t.no_fusion.nvs.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libsensors.l4t.no_fusion.nvs.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libsensors_hal.nvs.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libsensors_hal.nvs.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libtegrav4l2.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libtegrav4l2.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libtegrawfd.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libtegrawfd.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libv4l2_nvargus.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libv4l2_nvargus.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libv4l2_nvcuvidvideocodec.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libv4l2_nvcuvidvideocodec.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libv4l2_nvvideocodec.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libv4l2_nvvideocodec.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libvulkansc.so.1.0.10
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libvulkansc.so.1.0.10
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libwayland-client.so.0.22.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libwayland-client.so.0.22.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libwayland-cursor.so.0.22.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libwayland-cursor.so.0.22.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libwayland-egl.so.1.22.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libwayland-egl.so.1.22.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/libwayland-server.so.0.22.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/libwayland-server.so.0.22.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/nvidia_icd.json
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/nvidia_icd.json
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/tegra-egl/ld.so.conf
+          containerPath: /usr/lib/aarch64-linux-gnu/tegra-egl/ld.so.conf
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/tegra-egl/libEGL_nvidia.so.0
+          containerPath: /usr/lib/aarch64-linux-gnu/tegra-egl/libEGL_nvidia.so.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/tegra-egl/libGLESv1_CM_nvidia.so.1
+          containerPath: /usr/lib/aarch64-linux-gnu/tegra-egl/libGLESv1_CM_nvidia.so.1
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/tegra-egl/libGLESv2_nvidia.so.2
+          containerPath: /usr/lib/aarch64-linux-gnu/tegra-egl/libGLESv2_nvidia.so.2
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/tegra-egl/nvidia.json
+          containerPath: /usr/lib/aarch64-linux-gnu/tegra-egl/nvidia.json
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/firmware/tegra23x/nvhost_nvdec050_desc_prod.bin
+          containerPath: /usr/lib/firmware/tegra23x/nvhost_nvdec050_desc_prod.bin
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/EGLWLInputEventExample
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/EGLWLInputEventExample
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/EGLWLMockNavigation
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/EGLWLMockNavigation
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/LayerManagerControl
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/LayerManagerControl
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/color-lcms.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/color-lcms.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/desktop-shell.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/desktop-shell.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/drm-backend.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/drm-backend.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/fullscreen-shell.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/fullscreen-shell.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/gl-renderer.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/gl-renderer.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/headless-backend.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/headless-backend.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/hmi-controller.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/hmi-controller.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/ivi-controller.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/ivi-controller.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/ivi-shell.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/ivi-shell.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/libilmClient.so.2.3.2
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/libilmClient.so.2.3.2
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/libilmCommon.so.2.3.2
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/libilmCommon.so.2.3.2
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/libilmControl.so.2.3.2
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/libilmControl.so.2.3.2
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/libilmInput.so.2.3.2
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/libilmInput.so.2.3.2
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/libweston-13.so.0
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/libweston-13.so.0
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/simple-weston-client
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/simple-weston-client
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/spring-tool
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/spring-tool
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/wayland-backend.so
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/wayland-backend.so
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-calibrator
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-calibrator
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-clickdot
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-clickdot
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-cliptest
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-cliptest
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-content-protection
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-content-protection
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-debug
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-debug
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-desktop-shell
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-desktop-shell
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-dnd
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-dnd
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-eventdemo
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-eventdemo
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-flower
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-flower
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-fullscreen
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-fullscreen
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-image
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-image
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-ivi-shell-user-interface
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-ivi-shell-user-interface
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-keyboard
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-keyboard
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-multi-resource
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-multi-resource
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-presentation-shm
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-presentation-shm
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-resizor
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-resizor
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-scaler
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-scaler
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-screenshooter
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-screenshooter
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-damage
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-damage
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-dmabuf-egl
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-dmabuf-egl
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-dmabuf-egldevice
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-dmabuf-egldevice
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-dmabuf-feedback
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-dmabuf-feedback
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-egl
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-egl
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-im
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-im
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-shm
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-shm
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-touch
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-simple-touch
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-smoke
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-smoke
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-stacking
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-stacking
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-subsurfaces
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-subsurfaces
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-tablet
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-tablet
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-terminal
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-terminal
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-touch-calibrator
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-touch-calibrator
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+        - hostPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-transformed
+          containerPath: /usr/lib/aarch64-linux-gnu/nvidia/weston-13.0/weston-transformed
+          options:
+            - ro
+            - nosuid
+            - nodev
+            - rbind
+            - rprivate
+
