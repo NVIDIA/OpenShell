@@ -19,11 +19,13 @@
 #                    it stays at the gateway and is never injected. Slack access
 #                    tokens live 43200 s and refresh tokens are single use, so
 #                    only the gateway should refresh them.
-# Endpoint access:   slack.com:443 with the read-write method preset (Slack Web
-#                    API methods are POST even for reads). Add `rules` for the
-#                    methods your workload needs.
+# Endpoint access:   slack.com:443 read-only (GET/HEAD/OPTIONS). Slack's read
+#                    methods accept GET with query-string arguments; the token
+#                    travels in the injected authorization header, never as a
+#                    query parameter. Writes such as chat.postMessage need an
+#                    explicit `rules` entry or a copy with `access: read-write`.
 # Smoke test:        openshell sandbox create --provider <name> -- \
-#                      curl -s -X POST https://slack.com/api/auth.test \
+#                      curl -s https://slack.com/api/auth.test \
 #                        -H "Authorization: Bearer $SLACK_USER_TOKEN"
 
 id: slack
@@ -67,12 +69,12 @@ discovery:
   credentials: [user_token]
 
 endpoints:
-  # Slack Web API methods are POST even for reads, so the read-only
-  # method preset is unusable; read-write is the minimum working preset.
+  # Slack's read methods accept GET, so the read-only preset covers reads
+  # while keeping write methods denied until a policy explicitly allows them.
   - host: slack.com
     port: 443
     protocol: rest
-    access: read-write
+    access: read-only
     enforcement: enforce
 
 binaries:
