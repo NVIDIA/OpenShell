@@ -10,25 +10,12 @@ position: 2
 
 ![OpenShell system architecture showing a trusted supervisor separated from a network-isolated sandbox workload. The workload can connect only to the supervisor.](../images/openshell-system-architecture.svg)
 
-OpenShell separates the untrusted agent workload from the components that
-enforce its policy. The gateway manages sandbox state and creates each workload
-through a compute driver.
+## How It Works
 
-## Policy Enforcement
+OpenShell governs what agents can do in two ways: it instruments the kernel to enforce policy on every file access, system call, and network connection at runtime, and it uses formal verification to check what a policy change would allow before it is applied.
 
-In the Linux workload, Landlock limits filesystem access and seccomp mediates
-network operations. `openshell-sandbox` owns the agent process, identifies the
-program behind each network request, and forwards TCP and DNS requests to the
-trusted supervisor outside the workload boundary. A separate network fence
-denies direct workload egress except through the protected supervisor channel.
-
-The supervisor checks each request against the active policy. It opens approved
-connections and adds provider credentials only to requests bound for authorized
-endpoints; the agent does not receive the real credential values. When an agent
-proposes a network rule through the [policy advisor](/how-it-works/policies/advisor),
-the gateway's [policy prover](/how-it-works/policies/prover) uses formal
-verification to check for risky new access. Findings block automatic approval
-so a person can review the change.
+- **Kernel-level enforcement.** Each agent runs in an isolated sandbox. Kernel controls confine which files it can access and which system calls it can make, and every network connection passes through a policy check before it leaves the sandbox. Agents never see real credentials; OpenShell adds them only to requests bound for approved endpoints.
+- **Formally verified policy changes.** Before a policy change is approved, OpenShell uses formal verification to flag risky new access it would grant, such as reaching a new host with credentials or calling a new API method, so those changes wait for human review.
 
 ## Gateway and Workload Creation
 
