@@ -39,6 +39,7 @@ jobs:
           - arch: aarch64
             triple: aarch64-apple-darwin
             runner: macos-15-xlarge
+            entitlements-file: crates/openshell-driver-vm/entitlements.plist
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     defaults:
@@ -106,3 +107,4 @@ jobs:
           triple: ${{ matrix.triple }}
           cargo-version: ${{ inputs['cargo-version'] }}
           supervisor-image-tag: ${{ inputs['supervisor-image-tag'] }}
+          entitlements-file: ${{ matrix.entitlements-file }}
