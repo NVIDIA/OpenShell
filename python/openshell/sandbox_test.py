@@ -10,6 +10,7 @@ import threading
 import time
 from copy import deepcopy
 from dataclasses import asdict
+from datetime import UTC
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -34,6 +35,7 @@ from openshell.sandbox import (
     SandboxTemplateClient,
     ServiceExposure,
     TlsConfig,
+    WatchLogKind,
     _atomic_replace,
     _BearerAuthInterceptor,
     _load_cluster_bearer_token,
@@ -3007,3 +3009,148 @@ def test_sandbox_session_delete_passes_workspace() -> None:
 
     assert stub.delete_request is not None
     assert _request_workspace(stub.delete_request) == "staging"
+
+
+# --- Tests for watch_logs ---
+
+
+@pytest.mark.asyncio
+async def test_watch_logs_delivers_log_event():
+    """Verify log lines are delivered with cursors."""
+    from openshell._proto import openshell_pb2
+
+    # Build a log event
+    pb_event = openshell_pb2.SandboxStreamEvent(
+        cursor="0000000001",
+        log=openshell_pb2.SandboxLogLine(
+            sandbox_id="sb-1",
+            level="INFO",
+            target="supervisor",
+            message="Started",
+            source="sandbox",
+            fields={"key": "value"},
+        ),
+    )
+
+    # Convert via converter
+    item = sandbox_module._watch_log_event_from_proto(pb_event)
+
+    assert item is not None
+    assert item.kind == WatchLogKind.LOG
+    assert item.log.message == "Started"
+    assert item.log.level == "INFO"
+    assert item.cursor == "0000000001"
+    assert item.event is None
+    assert item.warning is None
+
+
+@pytest.mark.asyncio
+async def test_watch_logs_delivers_platform_event():
+    """Verify platform events are delivered with cursors."""
+    from openshell._proto import openshell_pb2
+
+    pb_event = openshell_pb2.SandboxStreamEvent(
+        cursor="0000000002",
+        event=openshell_pb2.PlatformEvent(
+            source="kubernetes",
+            type="Normal",
+            reason="Started",
+            message="Pod running",
+            metadata={"pod": "sb-1"},
+        ),
+    )
+
+    item = sandbox_module._watch_log_event_from_proto(pb_event)
+
+    assert item is not None
+    assert item.kind == WatchLogKind.EVENT
+    assert item.event.reason == "Started"
+    assert item.event.source == "kubernetes"
+    assert item.cursor == "0000000002"
+    assert item.log is None
+    assert item.warning is None
+
+
+@pytest.mark.asyncio
+async def test_watch_logs_delivers_warning():
+    """Verify warning events have no cursor (not resumable)."""
+    from openshell._proto import openshell_pb2
+
+    pb_event = openshell_pb2.SandboxStreamEvent(
+        warning=openshell_pb2.SandboxStreamWarning(message="Dropped 5 messages"),
+    )
+
+    item = sandbox_module._watch_log_event_from_proto(pb_event)
+
+    assert item is not None
+    assert item.kind == WatchLogKind.WARNING
+    assert item.warning == "Dropped 5 messages"
+    assert item.cursor == ""  # Empty for warnings
+    assert item.log is None
+    assert item.event is None
+
+
+@pytest.mark.asyncio
+async def test_watch_logs_skips_non_resumable():
+    """Verify status snapshots and draft policies are skipped."""
+    from openshell._proto import openshell_pb2
+
+    # Status snapshot
+    pb_status = openshell_pb2.SandboxStreamEvent(
+        sandbox=openshell_pb2.Sandbox(),
+    )
+    assert sandbox_module._watch_log_event_from_proto(pb_status) is None
+
+    # Draft policy update
+    pb_draft = openshell_pb2.SandboxStreamEvent(
+        draft_policy_update=openshell_pb2.DraftPolicyUpdate(),
+    )
+    assert sandbox_module._watch_log_event_from_proto(pb_draft) is None
+
+
+@pytest.mark.asyncio
+async def test_platform_event_deep_copies_metadata():
+    """Verify metadata dict is deep-copied, not aliased."""
+    from openshell._proto import openshell_pb2
+
+    pb_event = openshell_pb2.PlatformEvent(
+        source="k8s",
+        type="Normal",
+        reason="Started",
+        message="Pod running",
+        metadata={"pod": "sb-1", "node": "worker-1"},
+    )
+
+    event = sandbox_module._platform_event_from_proto(pb_event)
+
+    # Verify metadata is a copy
+    assert event.metadata == {"pod": "sb-1", "node": "worker-1"}
+    assert event.metadata is not pb_event.metadata
+
+
+def test_timestamp_from_proto():
+    """Verify proto Timestamp converts to aware UTC datetime."""
+    from datetime import datetime
+
+    from google.protobuf.timestamp_pb2 import Timestamp
+
+    # Create timestamp: 1700000000 seconds since epoch
+    ts = Timestamp(seconds=1700000000, nanos=0)
+
+    dt = sandbox_module._timestamp_from_proto(ts)
+
+    assert isinstance(dt, datetime)
+    assert dt.tzinfo == UTC
+    assert dt.timestamp() == 1700000000.0
+
+
+def test_timestamp_from_proto_none():
+    """Verify None timestamp returns current time in UTC."""
+    from datetime import datetime
+
+    before = datetime.now(UTC)
+    dt = sandbox_module._timestamp_from_proto(None)
+    after = datetime.now(UTC)
+
+    assert dt.tzinfo == UTC
+    assert before <= dt <= after

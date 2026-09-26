@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import errno
+import functools
 import ipaddress
 import json
 import math
@@ -17,7 +19,20 @@ import threading
 import time
 from collections import namedtuple
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Generic, Never, SupportsIndex, TypeVar, cast
+from datetime import UTC, datetime
+from enum import Enum
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Generic,
+    Never,
+    SupportsIndex,
+    TypeVar,
+    cast,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 from urllib.parse import urlparse
 
 import grpc
@@ -28,7 +43,7 @@ from ._proto import (
     openshell_pb2,
     openshell_pb2_grpc,
 )
-from .errors import _error_mapping_channel
+from .errors import OutOfRangeError, _error_mapping_channel, from_grpc_error
 from .mutations import DeletionOutcome, DeletionResult
 
 _ClientCallDetailsBase = namedtuple(
@@ -532,6 +547,140 @@ class ExecResult:
 
 class SandboxError(RuntimeError):
     pass
+
+
+def _timestamp_from_proto(ts) -> datetime:
+    """Convert protobuf Timestamp to aware UTC datetime. Return current time if unset."""
+    if ts is None or ts.seconds == 0:
+        return datetime.now(UTC)
+    return ts.ToDatetime(tzinfo=UTC)
+
+
+@dataclass(frozen=True)
+class PlatformEvent:
+    """A runtime event observed for a sandbox (e.g., Kubernetes pod event)."""
+
+    timestamp: datetime
+    source: str
+    type: str
+    reason: str
+    message: str
+    metadata: dict[str, str]
+
+
+def _platform_event_from_proto(
+    pb_event: openshell_pb2.PlatformEvent,
+) -> PlatformEvent | None:
+    """Convert protobuf PlatformEvent to domain type. Return None if unset."""
+    if pb_event is None:
+        return None
+
+    return PlatformEvent(
+        timestamp=_timestamp_from_proto(pb_event.event_time),
+        source=pb_event.source,
+        type=pb_event.type,
+        reason=pb_event.reason,
+        message=pb_event.message,
+        metadata=dict(pb_event.metadata),
+    )
+
+
+@dataclass(frozen=True)
+class LogLine:
+    """One log entry from a sandbox."""
+
+    sandbox_id: str
+    timestamp: datetime
+    level: str
+    target: str
+    message: str
+    source: str
+    fields: dict[str, str]
+
+
+class WatchLogKind(Enum):
+    """Classifies items from watch_logs stream."""
+
+    LOG = "log"
+    EVENT = "event"
+    WARNING = "warning"
+
+
+@dataclass(frozen=True)
+class WatchLogEvent:
+    """One item from sandbox log/event stream with resume cursor."""
+
+    kind: WatchLogKind
+    log: LogLine | None
+    event: PlatformEvent | None
+    warning: str | None
+    cursor: str
+
+
+def _watch_log_event_from_proto(
+    pb_event: openshell_pb2.SandboxStreamEvent,
+) -> WatchLogEvent | None:
+    """Convert protobuf SandboxStreamEvent to domain WatchLogEvent. Skip non-resumable payloads."""
+    if pb_event is None:
+        return None
+
+    if pb_event.HasField("log"):
+        log_line = LogLine(
+            sandbox_id=pb_event.log.sandbox_id,
+            timestamp=_timestamp_from_proto(pb_event.log.event_time),
+            level=pb_event.log.level,
+            target=pb_event.log.target,
+            message=pb_event.log.message,
+            source=pb_event.log.source,
+            fields=dict(pb_event.log.fields),
+        )
+
+        return WatchLogEvent(
+            kind=WatchLogKind.LOG,
+            log=log_line,
+            event=None,
+            warning=None,
+            cursor=pb_event.cursor,
+        )
+
+    if pb_event.HasField("event"):
+        # Convert event (handles None case: returns None)
+        event = _platform_event_from_proto(pb_event.event)
+        if event is None:
+            return None
+
+        return WatchLogEvent(
+            kind=WatchLogKind.EVENT,
+            log=None,
+            event=event,
+            warning=None,
+            cursor=pb_event.cursor,
+        )
+
+    if pb_event.HasField("warning"):
+        # Warning has no cursor, thus not resumable
+        return WatchLogEvent(
+            kind=WatchLogKind.WARNING,
+            log=None,
+            event=None,
+            warning=pb_event.warning.message,
+            cursor="",
+        )
+
+    return None
+
+
+@dataclass(frozen=True)
+class WatchLogsOptions:
+    """Configuration for watch_logs stream."""
+
+    follow_logs: bool = True
+    follow_events: bool = False
+    log_sources: tuple[str, ...] = ()
+    log_min_level: str = ""
+    resume_after_cursor: str = ""
+    log_tail_lines: int = 0
+    event_tail: int = 0
 
 
 class SandboxSession:
@@ -1263,6 +1412,146 @@ class SandboxClient:
             env=exec_env,
             timeout_seconds=timeout_seconds,
         )
+
+    async def watch_logs(
+        self,
+        *,
+        workspace: str,
+        name: str,
+        opts: WatchLogsOptions | None = None,
+    ) -> AsyncIterator[WatchLogEvent]:
+        """Stream a sandbox's log lines and platform events with loss-aware resume.
+
+        Each delivered event carries an opaque cursor. The stream tracks the highest
+        cursor it has seen, reconnects transparently on transient errors, and asks
+        the gateway to replay only what follows that cursor — neither losing nor
+        duplicating events.
+
+        Loss is never silent:
+        - Recoverable loss (server lag): arrives as WatchLogKind.WARNING, stream continues
+        - Unrecoverable loss (cursor trimmed): raises OutOfRangeError, terminal
+
+        Args:
+            workspace: workspace name
+            name: sandbox name
+            opts: WatchLogsOptions (follow_logs, follow_events, resume_after_cursor, etc)
+                  Defaults to following logs only, from tail
+
+        Yields:
+            WatchLogEvent items (log, event, or warning)
+
+        Raises:
+            OutOfRangeError: unrecoverable gap, resume_after_cursor is gone
+            GatewayError: other gRPC errors
+            SandboxError: sandbox not found, invalid args
+
+        Example:
+            async for event in client.watch_logs(workspace="default", name="sb-1"):
+                if event.kind == WatchLogKind.LOG:
+                    print(f"[{event.log.level}] {event.log.message}")
+                elif event.kind == WatchLogKind.EVENT:
+                    print(f"Event: {event.event.reason}")
+                elif event.kind == WatchLogKind.WARNING:
+                    print(f"Warning: {event.warning}")
+        """
+
+        # Normalize options
+        if opts is None:
+            opts = WatchLogsOptions()
+
+        # Default to following logs if neither flag set
+        follow_logs = opts.follow_logs
+        follow_events = opts.follow_events
+        if not follow_logs and not follow_events:
+            follow_logs = True
+
+        # Resolve sandbox name first (fail fast if not found) — blocking call in executor
+        loop = asyncio.get_running_loop()
+        sandbox = await loop.run_in_executor(
+            None, functools.partial(self.get, workspace=workspace, name=name)
+        )
+        resolved_name = sandbox.name
+
+        # Initialize reconnect state
+        cursor = opts.resume_after_cursor
+        backoff = 0.1  # 100ms initial
+        max_backoff = 2.0  # 2s cap
+        consecutive_failures = 0
+        max_retries = 15  # Give up after 15 consecutive UNAVAILABLE
+        stream = None
+
+        # Reconnect loop
+        while True:
+            try:
+                # Build watch request
+                request = openshell_pb2.WatchSandboxRequest(
+                    sandbox=resolved_name,
+                    workspace_scope=_workspace_scope(workspace),
+                    follow_status=False,  # Don't want status snapshots
+                    follow_logs=follow_logs,
+                    follow_events=follow_events,
+                    log_tail_lines=opts.log_tail_lines,
+                    event_tail=opts.event_tail,
+                    log_sources=list(opts.log_sources),
+                    log_min_level=opts.log_min_level,
+                    resume_after_cursor=cursor,  # Resume from this cursor
+                )
+
+                # Call gRPC stream (blocking, run in executor)
+                stream = await loop.run_in_executor(
+                    None, self._stub.WatchSandbox, request
+                )
+
+                # Receive events from stream (blocking iteration, run in executor)
+                while True:
+                    pb_event = await loop.run_in_executor(None, next, stream)
+
+                    # Convert proto → domain (skip non-resumable)
+                    item = _watch_log_event_from_proto(pb_event)
+                    if item is None:
+                        continue
+
+                    # Reset backoff and failure count only after yielding resumable item
+                    backoff = 0.1
+                    consecutive_failures = 0
+
+                    # Update cursor: high-water mark (max, not last)
+                    # Live delivery reads log and event sources independently,
+                    # so arrival order ≠ cursor order. Keep max to avoid rewinding.
+                    if item.cursor > cursor:
+                        cursor = item.cursor
+
+                    # Yield to caller
+                    yield item
+
+            except OutOfRangeError:
+                # Terminal: resume cursor is gone, never retry
+                # Caller gets this exception, knows to start fresh with empty cursor
+                raise
+
+            except grpc.RpcError as e:
+                # Check if retryable (Unavailable = connection drop, gateway restart)
+                if e.code() == grpc.StatusCode.UNAVAILABLE:
+                    consecutive_failures += 1
+                    if consecutive_failures > max_retries:
+                        # Gave up after max retries, raise as GatewayError
+                        raise from_grpc_error(e) from e
+                    # Sleep with backoff, then reconnect from cursor
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
+                    continue
+                else:
+                    # Other gRPC error (PermissionDenied, NotFound, Internal, etc)
+                    # Terminal — raise as GatewayError
+                    raise from_grpc_error(e) from e
+
+            finally:
+                if stream is not None:
+                    await loop.run_in_executor(None, stream.cancel)
+                    stream = None
+
+            # If we reach here without exception, stream ended cleanly (shouldn't happen)
+            break
 
 
 class SandboxTemplateClient:

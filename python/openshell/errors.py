@@ -108,9 +108,31 @@ class GatewayError(grpc.RpcError):
         return getattr(self.raw_error, name)
 
 
+class OutOfRangeError(GatewayError):
+    """Resume cursor is gone; events after it are unrecoverable.
+
+    This error is raised when the resume_after_cursor passed to watch_logs()
+    has been trimmed from the server's buffer, making the events after it
+    unreplayable. The stream is terminal — reconnecting with the same cursor
+    will fail identically. Start a new watch with an empty resume_after_cursor.
+    """
+
+    pass
+
+
 def from_grpc_error(error: grpc.RpcError) -> GatewayError:
-    """Decode a raw RPC failure without discarding unrecognized details."""
-    return error if isinstance(error, GatewayError) else GatewayError(error)
+    """Decode a raw RPC failure without discarding unrecognized details.
+
+    Returns OutOfRangeError for unrecoverable stream losses (e.g., trimmed cursor).
+    """
+    if isinstance(error, GatewayError):
+        return error
+
+    code = getattr(error, "code", lambda: None)()
+    if code == grpc.StatusCode.OUT_OF_RANGE:
+        return OutOfRangeError(error)
+
+    return GatewayError(error)
 
 
 class _ErrorMappingStream:
