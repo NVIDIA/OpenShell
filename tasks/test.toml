@@ -224,8 +224,26 @@ depends = ["e2e:conformance:build"]
 run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:kubernetes:ha-rebalancing"]
-description = "Run the Kubernetes HA rebalancing suite through Envoy against two gateway replicas and external PostgreSQL"
-env = { OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET = "openshell-ha-pg", OPENSHELL_E2E_KUBE_EXTRA_VALUES = "deploy/helm/openshell/ci/values-high-availability.yaml", OPENSHELL_E2E_KUBE_TEST = "kubernetes_ha_rebalancing", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-host-gateway,e2e-kubernetes,e2e-kubernetes-ha", OPENSHELL_E2E_KUBE_USE_ENVOY = "1" }
+description = "Run the Kubernetes HA rebalancing suite through the selected Gateway API controller (defaults to Envoy) against two gateway replicas and external PostgreSQL"
+env = { OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET = "openshell-ha-pg", OPENSHELL_E2E_KUBE_EXTRA_VALUES = "deploy/helm/openshell/ci/values-high-availability.yaml", OPENSHELL_E2E_KUBE_TEST = "kubernetes_ha_rebalancing", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-host-gateway,e2e-kubernetes,e2e-kubernetes-ha" }
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_E2E_KUBE_GATEWAY_CONTROLLER=\"${OPENSHELL_E2E_KUBE_GATEWAY_CONTROLLER:-envoy}\" OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
+
+["e2e:kubernetes:agentgateway"]
+description = "Run Kubernetes e2e through agentgateway"
+env = { OPENSHELL_E2E_KUBE_GATEWAY_CONTROLLER = "agentgateway" }
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
+
+["e2e:kubernetes:agentgateway-tls"]
+description = "Run Kubernetes conformance and SSH forwarding over a dedicated agentgateway Gateway with an HTTPS listener"
+env = { OPENSHELL_E2E_KUBE_GATEWAY_CONTROLLER = "agentgateway", OPENSHELL_E2E_KUBE_GATEWAY_TLS = "1", OPENSHELL_E2E_KUBE_TEST = "port_forward", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e" }
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
+
+["e2e:kubernetes:agentgateway-backend-tls"]
+description = "Run Kubernetes conformance through a dedicated agentgateway Gateway with frontend termination and backend TLS re-encryption"
+env = { OPENSHELL_E2E_KUBE_GATEWAY_CONTROLLER = "agentgateway", OPENSHELL_E2E_KUBE_GATEWAY_TLS = "1", OPENSHELL_E2E_KUBE_GATEWAY_BACKEND_TLS = "1", OPENSHELL_E2E_KUBERNETES_FEATURES = "" }
 depends = ["e2e:conformance:build"]
 run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
 

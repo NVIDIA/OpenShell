@@ -77,7 +77,10 @@ Prerelease and `dev` tags are intended for testing changes ahead of a release. P
 
 See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 
-- [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - gateway-only configuration
+- [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - create a dedicated Envoy Gateway
+- [`ci/values-gateway-agentgateway.yaml`](ci/values-gateway-agentgateway.yaml) - create a dedicated agentgateway Gateway
+- [`ci/values-gateway-agentgateway-tls.yaml`](ci/values-gateway-agentgateway-tls.yaml) - create a dedicated agentgateway Gateway with an HTTPS listener
+- [`ci/values-gateway-agentgateway-backend-tls.yaml`](ci/values-gateway-agentgateway-backend-tls.yaml) - terminate frontend TLS and re-encrypt to the OpenShell pod
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
 - [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - CI overlay for multi-replica external PostgreSQL testing

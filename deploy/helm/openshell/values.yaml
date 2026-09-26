@@ -576,11 +576,8 @@ certManager:
   serverIpAddresses:
     - 127.0.0.1
 
-# Kubernetes Gateway API - HTTPRoute and Gateway resources.
-# Requires a Gateway API controller in the cluster. Install Envoy Gateway via
-# the skaffold.yaml releases or independently:
-#   helm install eg oci://docker.io/envoyproxy/gateway-helm \
-#     --version v1.4.1 -n envoy-gateway-system --create-namespace
+# Kubernetes Gateway API - GRPCRoute and Gateway resources.
+# Requires a Gateway API controller such as Envoy Gateway or agentgateway.
 grpcRoute:
   # -- Create a Gateway API GRPCRoute for the gateway service.
   enabled: false
@@ -590,7 +587,8 @@ grpcRoute:
     # -- When true, a Gateway resource is created in the release namespace.
     # Set to false and provide name/namespace to attach to a pre-existing Gateway.
     create: false
-    # -- GatewayClass to reference. Envoy Gateway installs one named "eg".
+    # -- GatewayClass to reference when gateway.create is true. Envoy Gateway
+    # uses "eg"; agentgateway uses "agentgateway".
     className: "eg"
     # -- Name of the Gateway resource. Defaults to the chart fullname.
     name: ""
@@ -602,8 +600,8 @@ grpcRoute:
       # -- Listener port for the generated Gateway resource. Use 443 with protocol HTTPS.
       port: 80
       # -- Listener protocol for the generated Gateway resource: HTTP or HTTPS.
-      # HTTPS terminates TLS at the Envoy Gateway listener; pair it with
-      # server.disableTls=true so Envoy forwards plaintext to the gateway pod,
+      # HTTPS terminates TLS at the Gateway listener; pair it with
+      # server.disableTls=true so the controller forwards plaintext to the gateway pod,
       # and use OIDC for client identity (the gateway never sees the client cert).
       protocol: HTTP
       # -- "Same" restricts attached routes to the release namespace; "All" allows any namespace.

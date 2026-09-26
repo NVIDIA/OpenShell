@@ -27,6 +27,9 @@ K3D_CLUSTER_NAME_MAX=32
 # Host port forwarded to port 80 via the k3d load balancer.
 # Used by Envoy Gateway's LoadBalancer service (values-gateway.yaml).
 HOST_LB_PORT="${HELM_K3S_LB_HOST_PORT:-8080}"
+# Optional host port forwarded to port 443 via the k3d load balancer.
+# E2E uses this to exercise ingress TLS without kubectl port-forward.
+HOST_LB_TLS_PORT="${HELM_K3S_LB_TLS_HOST_PORT:-}"
 # Preload the default sandbox image so the first sandbox create does
 # not pay the full registry pull cost inside the cluster.
 DEFAULT_SANDBOX_PRELOAD_IMAGE="nvcr.io/nvidia/base/ubuntu:24.04"
@@ -75,6 +78,7 @@ Environment:
                                Override to share a single cluster across worktrees.
   HELM_K3S_KUBECONFIG          kubeconfig file to write/merge (default: repo kubeconfig or \$KUBECONFIG)
   HELM_K3S_LB_HOST_PORT        Host port mapped to load balancer port 80 (default: 8080)
+  HELM_K3S_LB_TLS_HOST_PORT    Optional host port mapped to load balancer port 443
   HELM_K3S_PRELOAD_SANDBOX_IMAGE
                                Sandbox image to docker pull and import into k3d
                                (default: ${DEFAULT_SANDBOX_PRELOAD_IMAGE}; set empty to skip)
@@ -395,6 +399,17 @@ EOF
   fi
 
   local lb_port_map="${HOST_LB_PORT}:80@loadbalancer"
+  local -a lb_port_args=(--port "${lb_port_map}")
+
+  if [ -n "${HOST_LB_TLS_PORT}" ]; then
+    if [[ ! "${HOST_LB_TLS_PORT}" =~ ^[0-9]+$ ]] \
+       || [ "${HOST_LB_TLS_PORT}" -lt 1 ] \
+       || [ "${HOST_LB_TLS_PORT}" -gt 65535 ]; then
+      echo "error: HELM_K3S_LB_TLS_HOST_PORT must be a port from 1 through 65535." >&2
+      exit 2
+    fi
+    lb_port_args+=(--port "${HOST_LB_TLS_PORT}:443@loadbalancer")
+  fi
 
   if k3d_cluster_exists; then
     echo "k3d cluster '${CLUSTER_NAME}' already exists; ensuring it is running."
@@ -405,7 +420,7 @@ EOF
       --wait \
       --kubeconfig-update-default=false \
       --kubeconfig-switch-context=false \
-      --port "${lb_port_map}" \
+      "${lb_port_args[@]}" \
       --k3s-arg "--disable=traefik@server:0"
   fi
   merge_kubeconfig
@@ -417,6 +432,9 @@ EOF
   echo "Active context: $(k3d_context_name)"
   echo "Kubeconfig: ${KUBECONFIG_TARGET}"
   echo "Envoy Gateway LoadBalancer (port 80):  http://127.0.0.1:${HOST_LB_PORT}"
+  if [ -n "${HOST_LB_TLS_PORT}" ]; then
+    echo "Gateway API LoadBalancer (port 443): https://localhost:${HOST_LB_TLS_PORT}"
+  fi
   echo "Trace collector endpoint: http://openshell-collector.${OBSERVABILITY_NAMESPACE}.svc.cluster.local:4317"
   echo "Gateway and trace collector host access: mise run helm:k3s:forward"
 }

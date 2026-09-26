@@ -54,6 +54,20 @@
 #   installing OpenShell. This is used by HA CI so the gateway can run multiple
 #   replicas without requiring the OpenShell chart to own a database.
 #
+# Gateway API controller:
+#   Set OPENSHELL_E2E_KUBE_GATEWAY_CONTROLLER to `envoy` or `agentgateway` to
+#   route the test through that controller. The default, `none`, port-forwards
+#   directly to the OpenShell Service. OPENSHELL_E2E_KUBE_USE_ENVOY remains a
+#   compatibility alias for `envoy`.
+#   Set OPENSHELL_E2E_KUBE_GATEWAY_TLS=1 with agentgateway to configure an HTTPS
+#   listener on its chart-created Gateway, provision a short-lived test
+#   certificate, and exercise the data-plane Service over verified TLS.
+#   Set OPENSHELL_E2E_KUBE_GATEWAY_BACKEND_TLS=1 as well to keep TLS enabled on
+#   the OpenShell pod and validate agentgateway re-encryption through a
+#   BackendTLSPolicy.
+#   Set OPENSHELL_E2E_KUBE_DIRECT_GATEWAY_PORT to expose agentgateway TLS through
+#   the ephemeral k3d load balancer instead of using kubectl port-forward.
+#
 # Credential-driver fixture:
 #   Set OPENSHELL_E2E_CREDENTIAL_DRIVERS=1 to enable one credential storage
 #   backend. Set OPENSHELL_E2E_CREDENTIAL_DRIVER to `kubernetes-secrets` or
@@ -107,6 +121,68 @@ ENVOY_CHART_VERSION="${OPENSHELL_E2E_ENVOY_VERSION:-v1.7.2}"
 ENVOY_GATEWAY_MANIFEST="${ROOT}/deploy/kube/manifests/envoy-gateway-openshell.yaml"
 ENVOY_HELM_INSTALLED=0
 ENVOY_GATEWAY_CONFIG_APPLIED=0
+AGENTGATEWAY_GATEWAY_NAME="openshell-ingress"
+AGENTGATEWAY_HELM_INSTALLED=0
+AGENTGATEWAY_TLS="${OPENSHELL_E2E_KUBE_GATEWAY_TLS:-0}"
+AGENTGATEWAY_BACKEND_TLS="${OPENSHELL_E2E_KUBE_GATEWAY_BACKEND_TLS:-0}"
+AGENTGATEWAY_TLS_DIR="${WORKDIR}/agentgateway-tls"
+AGENTGATEWAY_TLS_SECRET="openshell-ingress-tls"
+DIRECT_GATEWAY_PORT="${OPENSHELL_E2E_KUBE_DIRECT_GATEWAY_PORT:-}"
+GATEWAY_CONTROLLER="${OPENSHELL_E2E_KUBE_GATEWAY_CONTROLLER:-}"
+if [ -z "${GATEWAY_CONTROLLER}" ]; then
+  case "${OPENSHELL_E2E_KUBE_USE_ENVOY:-0}" in
+    1 | true | TRUE | yes | YES) GATEWAY_CONTROLLER="envoy" ;;
+    *) GATEWAY_CONTROLLER="none" ;;
+  esac
+fi
+case "${GATEWAY_CONTROLLER}" in
+  none | envoy | agentgateway) ;;
+  *)
+    echo "ERROR: OPENSHELL_E2E_KUBE_GATEWAY_CONTROLLER must be none, envoy, or agentgateway" >&2
+    exit 2
+    ;;
+esac
+case "${AGENTGATEWAY_TLS}" in
+  0 | false | FALSE | no | NO) AGENTGATEWAY_TLS=0 ;;
+  1 | true | TRUE | yes | YES) AGENTGATEWAY_TLS=1 ;;
+  *)
+    echo "ERROR: OPENSHELL_E2E_KUBE_GATEWAY_TLS must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+case "${AGENTGATEWAY_BACKEND_TLS}" in
+  0 | false | FALSE | no | NO) AGENTGATEWAY_BACKEND_TLS=0 ;;
+  1 | true | TRUE | yes | YES) AGENTGATEWAY_BACKEND_TLS=1 ;;
+  *)
+    echo "ERROR: OPENSHELL_E2E_KUBE_GATEWAY_BACKEND_TLS must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+if [ "${AGENTGATEWAY_TLS}" = "1" ] && [ "${GATEWAY_CONTROLLER}" != "agentgateway" ]; then
+  echo "ERROR: OPENSHELL_E2E_KUBE_GATEWAY_TLS=1 requires agentgateway" >&2
+  exit 2
+fi
+if [ "${AGENTGATEWAY_BACKEND_TLS}" = "1" ] \
+   && { [ "${GATEWAY_CONTROLLER}" != "agentgateway" ] || [ "${AGENTGATEWAY_TLS}" != "1" ]; }; then
+  echo "ERROR: OPENSHELL_E2E_KUBE_GATEWAY_BACKEND_TLS=1 requires agentgateway frontend TLS" >&2
+  exit 2
+fi
+if [ -n "${DIRECT_GATEWAY_PORT}" ]; then
+  if [[ ! "${DIRECT_GATEWAY_PORT}" =~ ^[0-9]+$ ]] \
+     || [ "${DIRECT_GATEWAY_PORT}" -lt 1 ] \
+     || [ "${DIRECT_GATEWAY_PORT}" -gt 65535 ]; then
+    echo "ERROR: OPENSHELL_E2E_KUBE_DIRECT_GATEWAY_PORT must be a port from 1 through 65535" >&2
+    exit 2
+  fi
+  if [ "${GATEWAY_CONTROLLER}" != "agentgateway" ] || [ "${AGENTGATEWAY_TLS}" != "1" ]; then
+    echo "ERROR: OPENSHELL_E2E_KUBE_DIRECT_GATEWAY_PORT requires agentgateway frontend TLS" >&2
+    exit 2
+  fi
+  if [ -n "${OPENSHELL_E2E_KUBE_CONTEXT:-}" ]; then
+    echo "ERROR: OPENSHELL_E2E_KUBE_DIRECT_GATEWAY_PORT requires an ephemeral k3d cluster" >&2
+    exit 2
+  fi
+fi
 VAULT_FIXTURE_DEPLOYED=0
 VAULT_NAMESPACE="${OPENSHELL_E2E_VAULT_NAMESPACE:-openbao}"
 VAULT_RELEASE_NAME="${OPENSHELL_E2E_VAULT_RELEASE_NAME:-openbao}"
@@ -190,10 +266,73 @@ deploy_postgres_fixture() {
 }
 
 use_envoy_gateway() {
-  case "${OPENSHELL_E2E_KUBE_USE_ENVOY:-0}" in
-    1 | true | TRUE | yes | YES) return 0 ;;
-    *) return 1 ;;
-  esac
+  [ "${GATEWAY_CONTROLLER}" = "envoy" ]
+}
+
+use_agentgateway() {
+  [ "${GATEWAY_CONTROLLER}" = "agentgateway" ]
+}
+
+use_agentgateway_tls() {
+  use_agentgateway && [ "${AGENTGATEWAY_TLS}" = "1" ]
+}
+
+use_agentgateway_backend_tls() {
+  use_agentgateway_tls && [ "${AGENTGATEWAY_BACKEND_TLS}" = "1" ]
+}
+
+provision_agentgateway_tls() {
+  echo "Provisioning agentgateway frontend TLS fixture..."
+  require_cmd openssl
+  mkdir -p "${AGENTGATEWAY_TLS_DIR}/client"
+  kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+    -keyout "${AGENTGATEWAY_TLS_DIR}/ca.key" \
+    -out "${AGENTGATEWAY_TLS_DIR}/ca.crt" \
+    -subj "/CN=OpenShell agentgateway E2E CA" >/dev/null 2>&1
+
+  openssl req -newkey rsa:2048 -nodes \
+    -keyout "${AGENTGATEWAY_TLS_DIR}/server.key" \
+    -out "${AGENTGATEWAY_TLS_DIR}/server.csr" \
+    -subj "/CN=localhost" >/dev/null 2>&1
+  cat >"${AGENTGATEWAY_TLS_DIR}/server.ext" <<'EXT'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:localhost,IP:127.0.0.1
+EXT
+  openssl x509 -req -days 1 \
+    -in "${AGENTGATEWAY_TLS_DIR}/server.csr" \
+    -CA "${AGENTGATEWAY_TLS_DIR}/ca.crt" \
+    -CAkey "${AGENTGATEWAY_TLS_DIR}/ca.key" \
+    -CAcreateserial \
+    -extfile "${AGENTGATEWAY_TLS_DIR}/server.ext" \
+    -out "${AGENTGATEWAY_TLS_DIR}/server.crt" >/dev/null 2>&1
+
+  # The CLI's local TLS registration expects a complete client bundle. The
+  # HTTPS listener does not request a client certificate, but supplying a
+  # valid one keeps the registration path identical to other private-CA E2E.
+  openssl req -newkey rsa:2048 -nodes \
+    -keyout "${AGENTGATEWAY_TLS_DIR}/client/tls.key" \
+    -out "${AGENTGATEWAY_TLS_DIR}/client.csr" \
+    -subj "/CN=openshell-e2e" >/dev/null 2>&1
+  cat >"${AGENTGATEWAY_TLS_DIR}/client.ext" <<'EXT'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=clientAuth
+EXT
+  openssl x509 -req -days 1 \
+    -in "${AGENTGATEWAY_TLS_DIR}/client.csr" \
+    -CA "${AGENTGATEWAY_TLS_DIR}/ca.crt" \
+    -CAkey "${AGENTGATEWAY_TLS_DIR}/ca.key" \
+    -CAcreateserial \
+    -extfile "${AGENTGATEWAY_TLS_DIR}/client.ext" \
+    -out "${AGENTGATEWAY_TLS_DIR}/client/tls.crt" >/dev/null 2>&1
+
+  kctl -n "${NAMESPACE}" create secret tls "${AGENTGATEWAY_TLS_SECRET}" \
+    --cert="${AGENTGATEWAY_TLS_DIR}/server.crt" \
+    --key="${AGENTGATEWAY_TLS_DIR}/server.key"
 }
 
 install_envoy_gateway() {
@@ -211,6 +350,13 @@ install_envoy_gateway() {
 
   kctl apply -f "${ENVOY_GATEWAY_MANIFEST}"
   ENVOY_GATEWAY_CONFIG_APPLIED=1
+}
+
+install_agentgateway() {
+  echo "Installing agentgateway..."
+  AGENTGATEWAY_HELM_INSTALLED=1
+  OPENSHELL_AGENTGATEWAY_KUBE_CONTEXT="${KUBE_CONTEXT}" \
+    "${ROOT}/tasks/scripts/agentgateway-k8s-setup.sh" install
 }
 
 wait_for_envoy_service() {
@@ -245,6 +391,92 @@ wait_for_envoy_service() {
   return 1
 }
 
+wait_for_agentgateway_service() {
+  for _ in $(seq 1 60); do
+    if kctl -n "${NAMESPACE}" get service \
+      "${AGENTGATEWAY_GATEWAY_NAME}" >/dev/null 2>&1 \
+      && kctl -n "${NAMESPACE}" wait --for=condition=Ready pod \
+        -l "gateway.networking.k8s.io/gateway-name=${AGENTGATEWAY_GATEWAY_NAME}" \
+        --timeout=5s >/dev/null 2>&1; then
+      printf '%s/%s\n' "${NAMESPACE}" "${AGENTGATEWAY_GATEWAY_NAME}"
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "ERROR: agentgateway proxy Service ${AGENTGATEWAY_GATEWAY_NAME} was not ready." >&2
+  kctl -n "${NAMESPACE}" get gateway,service,pod -o wide >&2 || true
+  kctl -n "${NAMESPACE}" get grpcroute -o yaml >&2 || true
+  return 1
+}
+
+wait_for_agentgateway_gateway() {
+  local accepted=""
+  local programmed=""
+
+  for _ in $(seq 1 60); do
+    accepted="$(kctl -n "${NAMESPACE}" get gateway "${AGENTGATEWAY_GATEWAY_NAME}" \
+      -o jsonpath='{range .status.conditions[?(@.type=="Accepted")]}{.status}{end}' \
+      2>/dev/null || true)"
+    programmed="$(kctl -n "${NAMESPACE}" get gateway "${AGENTGATEWAY_GATEWAY_NAME}" \
+      -o jsonpath='{range .status.conditions[?(@.type=="Programmed")]}{.status}{end}' \
+      2>/dev/null || true)"
+    if [[ "${accepted}" == *True* && "${programmed}" == *True* ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "ERROR: agentgateway Gateway ${NAMESPACE}/${AGENTGATEWAY_GATEWAY_NAME} was not programmed." >&2
+  kctl -n "${NAMESPACE}" get gateway "${AGENTGATEWAY_GATEWAY_NAME}" -o yaml >&2 || true
+  return 1
+}
+
+wait_for_agentgateway_backend_tls() {
+  local accepted=""
+  local resolved=""
+
+  for _ in $(seq 1 60); do
+    accepted="$(kctl -n "${NAMESPACE}" get backendtlspolicy "${RELEASE_NAME}" \
+      -o jsonpath='{range .status.ancestors[*].conditions[?(@.type=="Accepted")]}{.status}{end}' \
+      2>/dev/null || true)"
+    resolved="$(kctl -n "${NAMESPACE}" get backendtlspolicy "${RELEASE_NAME}" \
+      -o jsonpath='{range .status.ancestors[*].conditions[?(@.type=="ResolvedRefs")]}{.status}{end}' \
+      2>/dev/null || true)"
+    if [[ "${accepted}" == *True* && "${resolved}" == *True* ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "ERROR: BackendTLSPolicy ${NAMESPACE}/${RELEASE_NAME} was not accepted." >&2
+  kctl -n "${NAMESPACE}" get backendtlspolicy "${RELEASE_NAME}" -o yaml >&2 || true
+  kctl -n "${NAMESPACE}" get configmap "${RELEASE_NAME}-backend-ca" -o yaml >&2 || true
+  return 1
+}
+
+wait_for_gateway_route() {
+  local accepted=""
+  local resolved=""
+
+  for _ in $(seq 1 60); do
+    accepted="$(kctl -n "${NAMESPACE}" get grpcroute "${RELEASE_NAME}" \
+      -o jsonpath='{range .status.parents[*].conditions[?(@.type=="Accepted")]}{.status}{end}' \
+      2>/dev/null || true)"
+    resolved="$(kctl -n "${NAMESPACE}" get grpcroute "${RELEASE_NAME}" \
+      -o jsonpath='{range .status.parents[*].conditions[?(@.type=="ResolvedRefs")]}{.status}{end}' \
+      2>/dev/null || true)"
+    if [[ "${accepted}" == *True* && "${resolved}" == *True* ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "ERROR: GRPCRoute ${NAMESPACE}/${RELEASE_NAME} was not accepted." >&2
+  kctl -n "${NAMESPACE}" get grpcroute "${RELEASE_NAME}" -o yaml >&2 || true
+  return 1
+}
+
 start_gateway_portforward() {
   local elapsed=0
   local pf_timeout=30
@@ -260,6 +492,17 @@ start_gateway_portforward() {
     target_service="${target_service_ref#*/}"
     target_port=80
     echo "Starting kubectl port-forward -n ${target_namespace} svc/${target_service} ${LOCAL_PORT}:${target_port} (Envoy Gateway)..."
+  elif use_agentgateway; then
+    target_service_ref="$(wait_for_agentgateway_service)"
+    target_namespace="${target_service_ref%%/*}"
+    target_service="${target_service_ref#*/}"
+    if use_agentgateway_tls; then
+      target_port=443
+      echo "Starting kubectl port-forward -n ${target_namespace} svc/${target_service} ${LOCAL_PORT}:${target_port} (agentgateway TLS)..."
+    else
+      target_port=80
+      echo "Starting kubectl port-forward -n ${target_namespace} svc/${target_service} ${LOCAL_PORT}:${target_port} (agentgateway)..."
+    fi
   else
     echo "Starting kubectl port-forward svc/${target_service} ${LOCAL_PORT}:${target_port}..."
   fi
@@ -274,7 +517,13 @@ start_gateway_portforward() {
       cat "${PORTFORWARD_LOG}" >&2 || true
       return 1
     fi
-    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
+    if use_agentgateway_tls; then
+      if curl -s -o /dev/null --connect-timeout 1 \
+        --cacert "${AGENTGATEWAY_TLS_DIR}/ca.crt" \
+        "https://localhost:${LOCAL_PORT}"; then
+        return 0
+      fi
+    elif curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
       return 0
     fi
     sleep 1
@@ -284,6 +533,46 @@ start_gateway_portforward() {
   echo "ERROR: port-forward did not accept TCP within ${pf_timeout}s" >&2
   cat "${PORTFORWARD_LOG}" >&2 || true
   return 1
+}
+
+start_direct_gateway() {
+  local elapsed=0
+  local timeout=60
+
+  LOCAL_PORT="${DIRECT_GATEWAY_PORT}"
+  echo "Waiting for agentgateway TLS at https://localhost:${LOCAL_PORT} through the k3d load balancer..."
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    if curl -s -o /dev/null --connect-timeout 1 \
+      --cacert "${AGENTGATEWAY_TLS_DIR}/ca.crt" \
+      "https://localhost:${LOCAL_PORT}"; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  echo "ERROR: agentgateway TLS did not become reachable through the k3d load balancer within ${timeout}s" >&2
+  return 1
+}
+
+register_gateway_endpoint() {
+  GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
+  if use_agentgateway_tls; then
+    GATEWAY_ENDPOINT="https://localhost:${LOCAL_PORT}"
+    e2e_register_mtls_gateway \
+      "${XDG_CONFIG_HOME}" \
+      "${GATEWAY_NAME}" \
+      "${GATEWAY_ENDPOINT}" \
+      "${LOCAL_PORT}" \
+      "${AGENTGATEWAY_TLS_DIR}"
+  else
+    GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
+    e2e_register_plaintext_gateway \
+      "${XDG_CONFIG_HOME}" \
+      "${GATEWAY_NAME}" \
+      "${GATEWAY_ENDPOINT}" \
+      "${LOCAL_PORT}"
+  fi
 }
 
 stop_gateway_portforward() {
@@ -484,6 +773,20 @@ cleanup() {
         -l "app.kubernetes.io/instance=${RELEASE_NAME}" --tail=200 \
         --all-containers --prefix 2>&1 || true
       echo "=== end gateway debug output ==="
+      if use_agentgateway_tls; then
+        echo "=== agentgateway TLS ingress state ==="
+        kctl -n "${NAMESPACE}" get gateway,grpcroute,backendtlspolicy,service,pod -o yaml 2>&1 || true
+        echo "=== agentgateway TLS Secret metadata ==="
+        kctl -n "${NAMESPACE}" get secret "${AGENTGATEWAY_TLS_SECRET}" \
+          -o jsonpath='{.metadata.namespace}/{.metadata.name}{" type="}{.type}{"\n"}' \
+          2>&1 || true
+        if use_agentgateway_backend_tls; then
+          echo "=== agentgateway backend TLS CA metadata ==="
+          kctl -n "${NAMESPACE}" get configmap "${RELEASE_NAME}-backend-ca" \
+            -o jsonpath='{.metadata.namespace}/{.metadata.name}{" keys="}{range $key,$value := .data}{$key}{" "}{end}{"\n"}' \
+            2>&1 || true
+        fi
+      fi
     fi
     if [ -f "${PORTFORWARD_LOG}" ]; then
       echo "=== port-forward log ==="
@@ -582,6 +885,13 @@ cleanup() {
     ENVOY_HELM_INSTALLED=0
   fi
 
+  if [ "${AGENTGATEWAY_HELM_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
+    OPENSHELL_AGENTGATEWAY_KUBE_CONTEXT="${KUBE_CONTEXT}" \
+      "${ROOT}/tasks/scripts/agentgateway-k8s-setup.sh" delete \
+      >/dev/null 2>&1 || true
+    AGENTGATEWAY_HELM_INSTALLED=0
+  fi
+
   if [ "${CLUSTER_CREATED_BY_US}" = "1" ] && [ -n "${CLUSTER_NAME}" ]; then
     if command -v k3d >/dev/null 2>&1 && k3d cluster list "${CLUSTER_NAME}" \
         >/dev/null 2>&1; then
@@ -668,18 +978,20 @@ run_scenario() {
       return
     fi
   else
-    # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
-    if ! start_gateway_portforward; then
-      scenario_record_failure "${scenario_label}" "port-forward failed"
-      return
+    # Vanilla Kubernetes: use port-forward unless an ephemeral k3d TLS
+    # load-balancer endpoint was explicitly requested.
+    if [ -n "${DIRECT_GATEWAY_PORT}" ]; then
+      if ! start_direct_gateway; then
+        scenario_record_failure "${scenario_label}" "direct gateway endpoint failed"
+        return
+      fi
+    else
+      if ! start_gateway_portforward; then
+        scenario_record_failure "${scenario_label}" "port-forward failed"
+        return
+      fi
     fi
-    GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
-    GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
-    e2e_register_plaintext_gateway \
-      "${XDG_CONFIG_HOME}" \
-      "${GATEWAY_NAME}" \
-      "${GATEWAY_ENDPOINT}" \
-      "${LOCAL_PORT}"
+    register_gateway_endpoint
   fi
 
   if ! start_health_portforward; then
@@ -911,6 +1223,7 @@ else
   echo "Creating ephemeral k3d cluster ${CLUSTER_NAME}..."
   HELM_K3S_CLUSTER_NAME="${CLUSTER_NAME}" \
   HELM_K3S_KUBECONFIG="${WORKDIR}/kubeconfig" \
+  HELM_K3S_LB_TLS_HOST_PORT="${DIRECT_GATEWAY_PORT}" \
     bash "${ROOT}/tasks/scripts/helm-k3s-local.sh" create
   CLUSTER_CREATED_BY_US=1
   export KUBECONFIG="${WORKDIR}/kubeconfig"
@@ -1341,6 +1654,18 @@ fi
 if use_envoy_gateway; then
   helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway.yaml")
   install_envoy_gateway
+elif use_agentgateway; then
+  if use_agentgateway_backend_tls; then
+    helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway-agentgateway-backend-tls.yaml")
+  elif use_agentgateway_tls; then
+    helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway-agentgateway-tls.yaml")
+  else
+    helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway-agentgateway.yaml")
+  fi
+  install_agentgateway
+  if use_agentgateway_tls; then
+    provision_agentgateway_tls
+  fi
 fi
 
 if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
@@ -1392,6 +1717,16 @@ else
     --wait --timeout 5m
   HELM_INSTALLED=1
 
+  if [ "${GATEWAY_CONTROLLER}" != "none" ]; then
+    if use_agentgateway; then
+      wait_for_agentgateway_gateway || exit 1
+    fi
+    if use_agentgateway_backend_tls; then
+      wait_for_agentgateway_backend_tls || exit 1
+    fi
+    wait_for_gateway_route || exit 1
+  fi
+
   if [ -n "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET:-}" ]; then
     kctl -n "${NAMESPACE}" create secret docker-registry \
       "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET}" \
@@ -1408,15 +1743,14 @@ else
     # SSH-relay `sandbox connect` suites work (port-forward stalls them).
     openshift_register_route_gateway || exit 1
   else
-    # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
-    start_gateway_portforward || exit 1
-    GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
-    GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
-    e2e_register_plaintext_gateway \
-      "${XDG_CONFIG_HOME}" \
-      "${GATEWAY_NAME}" \
-      "${GATEWAY_ENDPOINT}" \
-      "${LOCAL_PORT}"
+    # Vanilla Kubernetes: use port-forward unless an ephemeral k3d TLS
+    # load-balancer endpoint was explicitly requested.
+    if [ -n "${DIRECT_GATEWAY_PORT}" ]; then
+      start_direct_gateway || exit 1
+    else
+      start_gateway_portforward || exit 1
+    fi
+    register_gateway_endpoint
   fi
 
   start_health_portforward || exit 1

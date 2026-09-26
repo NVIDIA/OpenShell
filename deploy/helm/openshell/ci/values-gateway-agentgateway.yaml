@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Create a dedicated agentgateway Gateway and GRPCRoute in the OpenShell
+# namespace. Agentgateway names its generated proxy Service after the Gateway,
+# so the Gateway must use a name distinct from the OpenShell Service.
+grpcRoute:
+  enabled: true
+  gateway:
+    create: true
+    className: agentgateway
+    name: openshell-ingress

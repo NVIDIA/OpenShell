@@ -162,9 +162,13 @@ async fn ssh_session_config(
         // to 127.0.0.1 but the cluster is actually running on a remote host.
         #[allow(clippy::cast_possible_truncation)]
         let gateway_port_u16 = session.gateway_port as u16;
-        let (gateway_host, gateway_port) =
-            resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, server);
-        format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port)
+        let (gateway_scheme, gateway_host, gateway_port) = resolve_ssh_gateway(
+            &session.gateway_scheme,
+            &session.gateway_host,
+            gateway_port_u16,
+            server,
+        );
+        format_gateway_url(&gateway_scheme, &gateway_host, gateway_port)
     };
     let gateway_name = tls
         .gateway_name()
