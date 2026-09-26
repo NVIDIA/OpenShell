@@ -949,18 +949,10 @@ async fn docker_corporate_proxy_routes_approved_tls_egress() {
     // ── Run the workload ──────────────────────────────────────────────
     let (_policy, policy_path) = temp_file_with(&policy_yaml(&ports), "policy file");
     let script = workload_script(&ports);
-    let mut sandbox = SandboxGuard::create(&[
-        "--from",
-        "base",
-        "--policy",
-        &policy_path,
-        "--",
-        "python3",
-        "-c",
-        &script,
-    ])
-    .await
-    .expect("create Docker sandbox behind the corporate proxy");
+    let mut sandbox =
+        SandboxGuard::create(&["--policy", &policy_path, "--", "python3", "-c", &script])
+            .await
+            .expect("create Docker sandbox behind the corporate proxy");
 
     assert_proxied_egress(
         &sandbox.create_output,
@@ -1024,18 +1016,10 @@ async fn docker_corporate_proxy_trusts_ca_bundle_for_https_proxy() {
 
     let (_policy, policy_path) = temp_file_with(&policy_yaml(&ports), "policy file");
     let script = workload_script(&ports);
-    let mut sandbox = SandboxGuard::create(&[
-        "--from",
-        "base",
-        "--policy",
-        &policy_path,
-        "--",
-        "python3",
-        "-c",
-        &script,
-    ])
-    .await
-    .expect("create Docker sandbox behind the https corporate proxy");
+    let mut sandbox =
+        SandboxGuard::create(&["--policy", &policy_path, "--", "python3", "-c", &script])
+            .await
+            .expect("create Docker sandbox behind the https corporate proxy");
 
     let proxy_logs = proxy.logs().expect("read https proxy logs");
     assert!(
@@ -1111,18 +1095,10 @@ async fn docker_corporate_proxy_trusts_intercepted_destination_tls() {
         "interception policy file",
     );
     let script = trusted_workload_script(&ports);
-    let mut sandbox = SandboxGuard::create(&[
-        "--from",
-        "base",
-        "--policy",
-        &policy_path,
-        "--",
-        "python3",
-        "-c",
-        &script,
-    ])
-    .await
-    .expect("create Docker sandbox behind TLS-intercepting proxy");
+    let mut sandbox =
+        SandboxGuard::create(&["--policy", &policy_path, "--", "python3", "-c", &script])
+            .await
+            .expect("create Docker sandbox behind TLS-intercepting proxy");
 
     let output = &sandbox.create_output;
     let proxy_logs = proxy.logs().expect("read TLS-intercepting proxy logs");
