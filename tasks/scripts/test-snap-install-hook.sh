@@ -102,20 +102,32 @@ cp "${work}/legacy-edited-before" "$common/gateway.toml"
 mkdir -p "${work}/bin"
 cat >"${work}/bin/snapctl" <<EOF
 #!/bin/sh
+if [ "\$1" = services ]; then
+  printf 'Service  Startup  Current  Notes\\n%s  enabled  %s  -\\n' "\$2" "\$SNAPCTL_GATEWAY_STATE"
+  exit 0
+fi
 printf '%s\\n' "\$*" >>"${work}/snapctl.log"
 EOF
 chmod 755 "${work}/bin/snapctl"
-PATH="${work}/bin:$PATH" SNAP="${work}/snap" SNAP_COMMON="$common" \
-  SNAP_INSTANCE_NAME=openshell "${hook_dir}/post-refresh"
-if ! cmp -s "$expected" "$common/gateway.toml"; then
-  echo "FAIL: post-refresh hook must migrate an edited insecure config" >&2
-  exit 1
-fi
-if [[ $(cat "${work}/snapctl.log") != "restart openshell.gateway" ]]; then
-  echo "FAIL: post-refresh hook must restart the gateway" >&2
-  cat "${work}/snapctl.log" >&2
-  exit 1
-fi
+for state in active inactive; do
+  cp "${work}/legacy-edited-before" "$common/gateway.toml"
+  : >"${work}/snapctl.log"
+  PATH="${work}/bin:$PATH" SNAP="${work}/snap" SNAP_COMMON="$common" \
+    SNAP_INSTANCE_NAME=openshell SNAPCTL_GATEWAY_STATE="$state" "${hook_dir}/post-refresh"
+  if ! cmp -s "$expected" "$common/gateway.toml"; then
+    echo "FAIL: post-refresh hook must migrate an edited insecure config ($state gateway)" >&2
+    exit 1
+  fi
+  case "$state" in
+    active) want="restart openshell.gateway" ;;
+    inactive) want="" ;;
+  esac
+  if [[ $(cat "${work}/snapctl.log") != "$want" ]]; then
+    echo "FAIL: post-refresh hook with an $state gateway must run '${want:-no restart}'" >&2
+    cat "${work}/snapctl.log" >&2
+    exit 1
+  fi
+done
 
 common="${work}/broken-link"
 mkdir -p "$common"
