@@ -194,7 +194,7 @@ Common reason phrases emitted by the sandbox include:
 | Reason | Meaning |
 |---|---|
 | `no matching policy` | OPA evaluated the request and no allow rule matched. |
-| `resolves to always-blocked address` | The destination resolved to loopback, link-local, or unspecified. These ranges are always blocked, even when listed in `allowed_ips`. |
+| `resolves to always-blocked address` | An outbound policy endpoint resolved to loopback, link-local, or unspecified. Network policy cannot authorize these destinations, even when they appear in `allowed_ips`; sandbox-local loopback connections do not use this policy path. |
 | `resolves to <ip> which is not in allowed_ips, connection rejected` | The destination resolved to an IP outside the policy's `allowed_ips` allowlist. |
 | `DNS resolution failed for <host>:<port>` | The proxy could not resolve the destination. |
 | `port <n> is a blocked control-plane port, connection rejected` | The destination port matches a control-plane port (etcd, Kubernetes API, kubelet) and is always blocked. |
