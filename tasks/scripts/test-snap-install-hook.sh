@@ -63,17 +63,69 @@ cp "$legacy" "$common/gateway.toml"
 printf '\n# operator note\n' >>"$common/gateway.toml"
 cp "$common/gateway.toml" "${work}/legacy-edited-before"
 SNAP_COMMON="$common" "$hook"
-cmp -s "${work}/legacy-edited-before" "$common/gateway.toml"
+cmp -s "$expected" "$common/gateway.toml"
+cmp -s "${work}/legacy-edited-before" "$common/gateway.toml.pre-mtls"
+if [[ -z $(find "$common/gateway.toml.pre-mtls" -perm 600) ]]; then
+  echo "FAIL: migrated config backup must be mode 0600" >&2
+  exit 1
+fi
+SNAP_COMMON="$common" "$hook"
+cmp -s "${work}/legacy-edited-before" "$common/gateway.toml.pre-mtls"
+cp "$legacy" "$common/gateway.toml"
+SNAP_COMMON="$common" "$hook"
+cmp -s "$expected" "$common/gateway.toml"
+cmp -s "${work}/legacy-edited-before" "$common/gateway.toml.pre-mtls"
+if [[ $(find "$common" -maxdepth 1 -name 'gateway.toml.pre-mtls.*' -type f | wc -l) -ne 1 ]]; then
+  echo "FAIL: repeated migration must preserve the existing backup" >&2
+  exit 1
+fi
+
+common="${work}/custom-insecure"
+mkdir -p "$common"
+cat >"$common/gateway.toml" <<'EOF'
+[openshell]
+version = 2
+
+[openshell.gateway]
+compute_driver = "docker"
+disable_tls = true # old local override
+
+[openshell.gateway.auth]
+allow_unauthenticated_users = true # old local override
+EOF
+cp "$common/gateway.toml" "${work}/custom-insecure-before"
+SNAP_COMMON="$common" "$hook"
+cmp -s "$expected" "$common/gateway.toml"
+cmp -s "${work}/custom-insecure-before" "$common/gateway.toml.pre-mtls"
+
+common="${work}/custom-secure"
+mkdir -p "$common"
+cat >"$common/gateway.toml" <<'EOF'
+[openshell]
+version = 2
+
+[openshell.gateway]
+compute_driver = "docker"
+# allow_unauthenticated_users = true
+EOF
+cp "$common/gateway.toml" "${work}/custom-secure-before"
+SNAP_COMMON="$common" "$hook"
+cmp -s "${work}/custom-secure-before" "$common/gateway.toml"
+if [[ -e "$common/gateway.toml.pre-mtls" ]]; then
+  echo "FAIL: secure operator config should not be backed up or replaced" >&2
+  exit 1
+fi
 
 common="${work}/post-refresh"
 mkdir -p "$common" "${work}/snap/meta/hooks"
 cp "$hook" "${work}/snap/meta/hooks/install"
-cp "$legacy" "$common/gateway.toml"
+cp "${work}/legacy-edited-before" "$common/gateway.toml"
 SNAP="${work}/snap" SNAP_COMMON="$common" "${hook_dir}/post-refresh"
 if ! cmp -s "$expected" "$common/gateway.toml"; then
-  echo "FAIL: post-refresh hook must migrate the legacy unauthenticated config" >&2
+  echo "FAIL: post-refresh hook must migrate an edited insecure config" >&2
   exit 1
 fi
+cmp -s "${work}/legacy-edited-before" "$common/gateway.toml.pre-mtls"
 
 common="${work}/broken-link"
 mkdir -p "$common"

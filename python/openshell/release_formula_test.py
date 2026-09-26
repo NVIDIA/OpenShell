@@ -155,7 +155,11 @@ def test_snap_wrapper_uses_optional_gateway_config_without_generating_toml() -> 
         'export OPENSHELL_DB_URL="${OPENSHELL_DB_URL:-sqlite:${SNAP_COMMON}/gateway.db?mode=rwc}"'
         in wrapper
     )
-    assert 'export OPENSHELL_DISABLE_TLS="${OPENSHELL_DISABLE_TLS:-true}"' in wrapper
+    assert "OPENSHELL_DISABLE_TLS" not in wrapper
+    assert (
+        'export OPENSHELL_LOCAL_TLS_DIR="${OPENSHELL_LOCAL_TLS_DIR:-${SNAP_COMMON}/tls}"'
+        in wrapper
+    )
     assert (
         'exec "${SNAP}/bin/openshell-gateway" --config "$CANONICAL_CONFIG_FILE" "$@"'
         in wrapper

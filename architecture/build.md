@@ -336,12 +336,17 @@ artifact and verifies the release run instead of listing every repository
 artifact.
 
 Snapd runs the gateway as a root-owned system service. Its generated client
-certificates reside in root-owned snap state and are unavailable to ordinary CLI
-users, so the Snap uses plaintext loopback transport and enables unauthenticated
-local users by default. Debian and RPM packages instead run systemd user services
-and use user-owned mTLS material. Bootstrap creates the default configuration
-only when it is missing. Sandbox-to-gateway sessions remain authenticated with
-gateway-minted JWTs.
+certificates reside in root-owned snap state. The installer copies the client
+bundle into the target user's private Snap state and registers the TLS endpoint;
+direct Snap installs require the same enrollment. The install and post-refresh
+hooks replace configs that explicitly enable plaintext or unauthenticated access
+with the secure Docker default, preserving one private backup. Snap refreshes
+restart the gateway so the migrated config takes effect immediately.
+
+Debian and RPM packages instead run systemd user services with user-owned mTLS
+material. Sandbox-to-gateway sessions remain authenticated with gateway-minted
+JWTs.
+
 The Debian qualification profile keeps candidate-image overrides outside the
 operator-owned gateway configuration: it writes a harness-owned file under
 `/var/lib/openshell-qualification` and selects it through the packaged systemd

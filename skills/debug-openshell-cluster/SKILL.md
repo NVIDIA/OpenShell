@@ -72,6 +72,7 @@ Common findings:
 - `No active gateway`: register one with `openshell gateway add <endpoint>`.
 - Connection refused: gateway process is not running, service exposure is wrong, or a port-forward/proxy is not active.
 - TLS/certificate errors: the endpoint scheme or trust chain is wrong, a local mTLS bundle does not match the gateway CA, or TLS termination does not match the gateway listener.
+- A Snap refresh restarts the gateway with its migrated mTLS config. The secure Snap gateway uses `https://127.0.0.1:17670` and requires a client bundle in the user's Snap state. Check `/var/snap/openshell/common/gateway.toml.pre-mtls` for settings replaced during migration, then follow the published Snap installation steps to re-register an old HTTP client.
 - `Unauthenticated` from an edge or OIDC gateway: refresh stored credentials with `openshell gateway login [name]`, then retry. Use `gateway logout` only when intentionally clearing local credentials.
 - A direct development endpoint with a private or self-signed certificate can be isolated with `--gateway-endpoint <url> --gateway-insecure`; do not persist or recommend insecure verification for shared gateways.
 

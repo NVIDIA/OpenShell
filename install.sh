@@ -1295,6 +1295,7 @@ copy_snap_client_bundle() {
   for _file in ca.crt client/tls.crt client/tls.key; do
     as_root cat "${_src}/${_file}" |
       as_target_user sh -c 'umask 077; cat >"$1"' sh "${_dst}/${_file}"
+    as_target_user chmod 600 "${_dst}/${_file}"
   done
 }
 

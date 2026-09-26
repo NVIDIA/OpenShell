@@ -112,17 +112,27 @@ sudo snap install openshell
 
 The snap does not migrate existing Debian, RPM, or Homebrew installs. Remove any existing installation first, then rerun the script with `OPENSHELL_ACK_BREAKING_UPGRADE=1`.
 
-The gateway runs as a system service at `http://127.0.0.1:17670` and reads `/var/snap/openshell/common/gateway.toml`.
-
-<Warning>
-The snap gateway allows unauthenticated access from the local host. Any local user or process can operate it. Do not expose it beyond the local host.
-</Warning>
-
-Snap refreshes do not restart the gateway, so active sandboxes keep running. Restart it to pick up a new version:
+The gateway runs as a system service at `https://127.0.0.1:17670` and reads `/var/snap/openshell/common/gateway.toml`. It requires a client certificate. The install script copies that certificate to the installing user's Snap state and registers the gateway automatically. If you installed with `sudo snap install openshell`, give each trusted user the certificate and register the gateway from that user's account:
 
 ```shell
-sudo systemctl restart snap.openshell.gateway
+d=~/snap/openshell/common/.local/state/openshell/tls
+mkdir -p -m 700 "$d/client"
+sudo cat /var/snap/openshell/common/tls/ca.crt > "$d/ca.crt"
+sudo cat /var/snap/openshell/common/tls/client/tls.crt > "$d/client/tls.crt"
+(umask 077; sudo cat /var/snap/openshell/common/tls/client/tls.key > "$d/client/tls.key")
+chmod 700 "$d" "$d/client"
+chmod 600 "$d/ca.crt" "$d/client/tls.crt" "$d/client/tls.key"
+openshell gateway add https://127.0.0.1:17670 --local --name openshell
+openshell status
 ```
+
+Keep the client key private. Anyone who can read it can authenticate to the local gateway.
+
+On refresh, the Snap replaces any regular gateway config that explicitly enables unauthenticated access or disables TLS with the secure Docker default. Other settings in that file are not carried over. It saves the previous config at `/var/snap/openshell/common/gateway.toml.pre-mtls` with mode `0600`, or at a uniquely suffixed path if that backup already exists. The refresh log prints the actual path. Review the backup before restoring other settings; restoring its insecure settings reopens access.
+
+Snap refreshes restart the gateway to apply the migrated config immediately. This interrupts active sandbox sessions.
+
+If you previously registered the plaintext endpoint, run the certificate and HTTPS registration steps above after the refresh. Remove the old registration first with `openshell gateway remove openshell` if the name already exists. You can also rerun the install script to refresh the registration automatically.
 
 To install a locally built snap, connect its interfaces manually:
 

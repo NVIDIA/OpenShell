@@ -124,6 +124,7 @@ if [[ ! -x "$snap_install_hook" ]]; then
   exit 1
 fi
 assert_contains "$snap_install_hook" 'compute_driver = "docker"'
+assert_contains "$snapcraft" 'refresh-mode: restart'
 if [[ ! -x "$(dirname "$snap_install_hook")/post-refresh" ]]; then
   echo "FAIL: Snap post-refresh hook must be executable" >&2
   exit 1

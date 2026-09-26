@@ -2,25 +2,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Ensure the gateway is secured by default with mTLS.
+# Create the mTLS default and replace insecure configs on refresh.
 
 set -eu
 
 config_file="${SNAP_COMMON}/gateway.toml"
 
-legacy_config='[openshell]
-version = 2
-
-[openshell.gateway]
-
-[openshell.gateway.auth]
-allow_unauthenticated_users = true'
-
 replace=false
 if [ -L "$config_file" ]; then
 	exit 0
 elif [ -f "$config_file" ]; then
-	if [ "$(cat "$config_file")" != "$legacy_config" ]; then
+	# Refresh every insecure default or edited config. Keep secure operator
+	# configs intact, but do not preserve an explicit plaintext or anonymous
+	# access setting merely because the file has other edits.
+	if ! grep -Eq '^[[:space:]]*(allow_unauthenticated_users|disable_tls)[[:space:]]*=[[:space:]]*true([[:space:]#]|$)' "$config_file"; then
 		exit 0
 	fi
 	replace=true
@@ -42,6 +37,17 @@ compute_driver = "docker"
 CONFIG
 
 if [ "$replace" = true ]; then
+	# Keep one private copy for operators who need to restore other settings.
+	backup_file="${config_file}.pre-mtls"
+	backup_tmp=$(mktemp "${backup_file}.XXXXXX")
+	cp "$config_file" "$backup_tmp"
+	chmod 600 "$backup_tmp"
+	if [ ! -e "$backup_file" ] && [ ! -L "$backup_file" ] && ln "$backup_tmp" "$backup_file"; then
+		rm -f "$backup_tmp"
+	else
+		backup_file="$backup_tmp"
+	fi
+	echo "openshell: replacing insecure gateway config; previous config saved at $backup_file" >&2
 	mv -f "$temporary_file" "$config_file"
 	trap - 0 HUP INT TERM
 	exit 0

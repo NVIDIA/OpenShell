@@ -530,6 +530,9 @@ printf 'ca\n' >"${snap_tls_src}/ca.crt"
 printf 'cert\n' >"${snap_tls_src}/client/tls.crt"
 printf 'key\n' >"${snap_tls_src}/client/tls.key"
 snap_user_home="${tmpdir}/snap-user-home"
+mkdir -p "${snap_user_home}/snap/openshell/common/.local/state/openshell/tls/client"
+printf 'old key\n' >"${snap_user_home}/snap/openshell/common/.local/state/openshell/tls/client/tls.key"
+chmod 644 "${snap_user_home}/snap/openshell/common/.local/state/openshell/tls/client/tls.key"
 (
   as_root() { "$@"; }
   as_target_user() { "$@"; }
