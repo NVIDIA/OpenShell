@@ -2006,9 +2006,23 @@ message WatchSandboxRequest {
   bool follow_events = 4;
 
   // Replay the last N log lines (best-effort) before following.
+  //
+  // When both follow_logs and follow_events are set, a cursor handed back on
+  // this connect is only safe to resume from if *every* followed source can
+  // vouch it covers everything up to that point (see resume_after_cursor).
+  // If this depth and event_tail are asymmetric -- e.g. event_tail is left
+  // at its default of 0 while this sandbox has platform history -- the
+  // server withholds events from whichever source that would otherwise let
+  // a resumable cursor outrun the other source's replay, even below this
+  // limit. Symmetric depths, or a sandbox with no backlog on the shallower
+  // source, are unaffected.
   uint32 log_tail_lines = 5;
 
   // Replay the last N platform events (best-effort) before following.
+  //
+  // Has no default: 0 replays no platform events on connect. See
+  // log_tail_lines for how an asymmetric depth against that field can
+  // reduce what either source delivers on this connect.
   uint32 event_tail = 6;
 
   // Stop streaming once the sandbox reaches READY or a terminal result phase
@@ -2042,6 +2056,12 @@ message WatchSandboxRequest {
   // empty resume_after_cursor, because retrying the same token fails
   // identically. A cursor this server could not have issued is rejected with
   // INVALID_ARGUMENT.
+  //
+  // The cursor is a single opaque position shared across log and platform
+  // events; the client tracks one scalar, not one per source. When
+  // follow_logs and follow_events are both set, the server never hands out a
+  // cursor that one of the two sources cannot fully vouch for -- see
+  // log_tail_lines.
   string resume_after_cursor = 12;
 }
 

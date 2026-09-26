@@ -29,6 +29,10 @@ struct Inner {
     per_id: HashMap<String, PerSandbox>,
 }
 
+/// Result of a resumable-source replay read: the events after the requested
+/// cursor, or the gap that made them unreplayable.
+pub(crate) type ReplayResult = Result<Vec<CursoredEvent>, ResumeGap>;
+
 /// A buffered or broadcast stream event paired with its raw sequence number.
 ///
 /// The wire `SandboxStreamEvent.cursor` is an opaque token; ordering decisions
@@ -182,6 +186,39 @@ fn tail_after_impl(
     Ok(res)
 }
 
+/// Split a tail into what a bounded request returns and the coverage floor
+/// that bound leaves behind.
+///
+/// `max` may return fewer events than the tail currently retains; the ones
+/// excluded are the oldest, at the front. The floor is the *oldest* excluded
+/// event's seq -- the smallest seq this call cannot vouch for. `0` means
+/// `max` covered everything currently retained, so there's nothing this call
+/// withheld.
+///
+/// It must be the oldest, not the newest, excluded seq. This bus's own
+/// excluded set is a prefix of its own retained deque, so nothing above the
+/// newest excluded item is ever missing *from this bus* -- but a sibling
+/// bus's event can carry a seq that falls strictly between this bus's oldest
+/// and newest excluded items, since the two buses interleave in one shared
+/// seq space. A boundary drawn at the newest excluded item would let that
+/// sibling event pass as safe, when delivering it would still let a client's
+/// cursor reach past this bus's oldest withheld item on a later resume.
+///
+/// This is what lets a caller answer "is a cursor from this batch safe to
+/// resume from," which `tail_after`'s eviction-only gap check can't: a
+/// shallow request and a bus eviction both withhold events, but only the
+/// eviction leaves a trace in `last_trimmed_seq`.
+fn tail_with_floor_impl(tail: &VecDeque<CursoredEvent>, max: usize) -> (Vec<CursoredEvent>, u64) {
+    let total = tail.len();
+    let events: Vec<CursoredEvent> = tail.iter().rev().take(max).cloned().collect();
+    let floor = if events.len() >= total {
+        0
+    } else {
+        tail.front().map_or(0, |cursored| cursored.seq)
+    };
+    (events.into_iter().rev().collect(), floor)
+}
+
 impl Default for TracingLogBus {
     fn default() -> Self {
         Self::new()
@@ -265,6 +302,24 @@ impl TracingLogBus {
             .collect::<Vec<CursoredEvent>>()
     }
 
+    /// Like `tail`, but also reports the coverage floor `max` leaves behind.
+    ///
+    /// See `tail_with_floor_impl`: a cursor at or below the returned floor
+    /// isn't safe to advertise as a resume point, because `max` -- not
+    /// eviction -- is why anything at or below it is missing from this
+    /// batch.
+    pub(crate) fn tail_with_floor(
+        &self,
+        sandbox_id: &str,
+        max: usize,
+    ) -> (Vec<CursoredEvent>, u64) {
+        let inner = self.inner.lock().expect("tracing bus lock poisoned");
+        inner.per_id.get(sandbox_id).map_or_else(
+            || (Vec::new(), 0),
+            |per| tail_with_floor_impl(&per.tail, max),
+        )
+    }
+
     /// Identity and extent of this sandbox's current cursor space.
     ///
     /// `None` means nothing has been published for the sandbox, so there is no
@@ -272,18 +327,6 @@ impl TracingLogBus {
     /// so it cannot invert the documented allocator -> bus map order.
     pub(crate) fn cursor_space(&self, sandbox_id: &str) -> Option<CursorSpaceInfo> {
         self.seq.space(sandbox_id)
-    }
-
-    pub(crate) fn tail_after(
-        &self,
-        sandbox_id: &str,
-        after_seq: u64,
-    ) -> Result<Vec<CursoredEvent>, ResumeGap> {
-        let inner = self.inner.lock().expect("tracing bus lock poisoned");
-        inner.per_id.get(sandbox_id).map_or_else(
-            || Ok(Vec::new()),
-            |per| tail_after_impl(&per.tail, per.last_trimmed_seq, after_seq),
-        )
     }
 
     /// Publish a log line from an external source (e.g., sandbox push).
@@ -329,6 +372,78 @@ impl TracingLogBus {
             }
         }
     }
+
+    /// Validate a resume cursor's epoch and read both resumable buses, all
+    /// under one lock hold.
+    ///
+    /// Folding validation into the same hold as the reads is what makes this
+    /// atomic against a teardown: checking the epoch first and reading after
+    /// -- even via a single call that itself locks once internally -- still
+    /// leaves a window between the two lock acquisitions for a `remove` plus
+    /// a republish to retire the validated space and install a replacement
+    /// numbered from 1. A read landing after that would apply the old
+    /// space's seq to the replacement's buffers and find no gap, since
+    /// `tail_after` only compares numbers. Locking the cursor space before
+    /// checking the epoch -- the same lock every publish path holds across
+    /// its own tail insert -- closes that window entirely, and also makes
+    /// the two bus reads atomic against any publish on either bus, for the
+    /// same reason.
+    pub(crate) fn snapshot_after(
+        &self,
+        sandbox_id: &str,
+        expected_epoch: Uuid,
+        log_after: u64,
+        platform_after: u64,
+        want_log: bool,
+        want_platform: bool,
+    ) -> ResumeSnapshot {
+        let spaces = self.seq.lock();
+        let Some(space) = spaces.get(sandbox_id) else {
+            return ResumeSnapshot::SpaceGone;
+        };
+        if space.epoch != expected_epoch {
+            return ResumeSnapshot::SpaceGone;
+        }
+        // Right space, but ahead of anything it has issued: only a
+        // fabricated cursor gets here. Reject rather than accept a cutoff no
+        // event can ever exceed.
+        if log_after.max(platform_after) > space.next.saturating_sub(1) {
+            return ResumeSnapshot::CursorAhead;
+        }
+
+        let log = want_log.then(|| {
+            let inner = self.inner.lock().expect("tracing bus lock poisoned");
+            inner.per_id.get(sandbox_id).map_or_else(
+                || Ok(Vec::new()),
+                |per| tail_after_impl(&per.tail, per.last_trimmed_seq, log_after),
+            )
+        });
+        let platform = want_platform.then(|| {
+            let inner = self
+                .platform_event_bus
+                .inner
+                .lock()
+                .expect("platform event bus lock poisoned");
+            inner.per_id.get(sandbox_id).map_or_else(
+                || Ok(Vec::new()),
+                |per| tail_after_impl(&per.tail, per.last_trimmed_seq, platform_after),
+            )
+        });
+        ResumeSnapshot::Read(log, platform)
+    }
+}
+
+/// Outcome of [`TracingLogBus::snapshot_after`].
+pub(crate) enum ResumeSnapshot {
+    /// No cursor space exists for this sandbox, or its epoch no longer
+    /// matches the resume cursor's -- the space that issued it is gone.
+    SpaceGone,
+    /// The right space, but the cursor is ahead of anything it has issued.
+    /// Only a fabricated cursor reaches this.
+    CursorAhead,
+    /// Both requested reads succeeded at the lock hold; each is
+    /// independently either the replay or the gap that made it unreplayable.
+    Read(Option<ReplayResult>, Option<ReplayResult>),
 }
 
 #[derive(Debug, Clone)]
@@ -494,6 +609,183 @@ mod tests {
     }
 
     #[test]
+    fn tail_with_floor_impl_empty_tail_returns_zero_floor() {
+        let tail = VecDeque::new();
+        let (events, floor) = tail_with_floor_impl(&tail, 10);
+        assert!(events.is_empty());
+        assert_eq!(floor, 0);
+    }
+
+    #[test]
+    fn tail_with_floor_impl_max_covers_everything_returns_zero_floor() {
+        let tail = tail_of(1, 5);
+        let (events, floor) = tail_with_floor_impl(&tail, 5);
+        assert_eq!(cursors(&events), vec![1, 2, 3, 4, 5]);
+        assert_eq!(floor, 0);
+
+        // Asking for more than exists is the same as asking for everything.
+        let (events, floor) = tail_with_floor_impl(&tail, 99);
+        assert_eq!(cursors(&events), vec![1, 2, 3, 4, 5]);
+        assert_eq!(floor, 0);
+    }
+
+    #[test]
+    fn tail_with_floor_impl_truncated_reports_oldest_excluded_seq() {
+        let tail = tail_of(1, 5);
+        // Newest 2 returned (4, 5); 1..=3 excluded, oldest of those is 1.
+        // Must be the oldest: a sibling source's event carrying seq 2 or 3
+        // would otherwise pass a boundary drawn at 3 (the newest excluded)
+        // as safe, even though this bus hasn't vouched for anything below 3
+        // either -- only above it.
+        let (events, floor) = tail_with_floor_impl(&tail, 2);
+        assert_eq!(cursors(&events), vec![4, 5]);
+        assert_eq!(floor, 1);
+    }
+
+    #[test]
+    fn tail_with_floor_impl_zero_max_excludes_everything() {
+        let tail = tail_of(1, 5);
+        // Nothing returned; every event is excluded, so the floor is the
+        // oldest of them, 1 -- the smallest seq this bus cannot vouch for.
+        let (events, floor) = tail_with_floor_impl(&tail, 0);
+        assert!(events.is_empty());
+        assert_eq!(floor, 1);
+    }
+
+    /// `snapshot_after` must take the same lock `publish` holds across its own
+    /// tail insert, so a publish can never land between the log read and the
+    /// platform read. Proving this directly (rather than racing threads and
+    /// hoping to catch a bad interleaving) is what makes this test reliable:
+    /// hold the lock ourselves and show `snapshot_after` cannot proceed until
+    /// it is released.
+    #[test]
+    fn snapshot_after_blocks_while_cursor_space_is_locked() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-lock";
+        bus.publish_external(make_log_event(sandbox_id, "line"));
+        let epoch = bus.cursor_space(sandbox_id).expect("space exists").epoch;
+
+        let guard = bus.seq.lock();
+
+        let bus2 = bus.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            bus2.snapshot_after(sandbox_id, epoch, 0, 0, true, true);
+            done_tx.send(()).unwrap();
+        });
+
+        // Give the worker time to reach (and block on) the lock.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "snapshot_after returned without waiting for the cursor-space lock"
+        );
+
+        drop(guard);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("snapshot_after should complete once the lock is released");
+        handle.join().unwrap();
+    }
+
+    /// Baseline correctness: interleaved log/platform publishes draw from the
+    /// same cursor space, and `snapshot_after` returns each source's own
+    /// events under its own key, not merged or cross-contaminated.
+    #[test]
+    fn snapshot_after_matches_independent_tail_after_calls() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-snap";
+        bus.publish_external(make_log_event(sandbox_id, "l1")); // seq 1
+        bus.platform_event_bus.publish(
+            sandbox_id,
+            SandboxStreamEvent {
+                payload: None,
+                cursor: String::new(),
+            },
+        ); // seq 2
+        bus.publish_external(make_log_event(sandbox_id, "l2")); // seq 3
+        let epoch = bus.cursor_space(sandbox_id).expect("space exists").epoch;
+
+        let ResumeSnapshot::Read(log, platform) =
+            bus.snapshot_after(sandbox_id, epoch, 0, 0, true, true)
+        else {
+            panic!("expected a successful read");
+        };
+        assert_eq!(
+            cursors(&log.expect("followed").expect("no gap")),
+            vec![1, 3]
+        );
+        assert_eq!(
+            cursors(&platform.expect("followed").expect("no gap")),
+            vec![2]
+        );
+    }
+
+    /// A source that isn't followed isn't read at all.
+    #[test]
+    fn snapshot_after_skips_unfollowed_sources() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-skip";
+        bus.publish_external(make_log_event(sandbox_id, "l1"));
+        let epoch = bus.cursor_space(sandbox_id).expect("space exists").epoch;
+
+        let ResumeSnapshot::Read(log, platform) =
+            bus.snapshot_after(sandbox_id, epoch, 0, 0, true, false)
+        else {
+            panic!("expected a successful read");
+        };
+        assert_eq!(log.expect("followed").expect("no gap").len(), 1);
+        assert!(platform.is_none());
+    }
+
+    /// The epoch check and both bus reads happen under one lock hold, so a
+    /// teardown plus republish between them can't apply a stale epoch's
+    /// cursor to the replacement space's buffers.
+    #[test]
+    fn snapshot_after_rejects_a_cursor_from_a_retired_space() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-retired";
+        bus.publish_external(make_log_event(sandbox_id, "l1"));
+        let original_epoch = bus.cursor_space(sandbox_id).expect("space exists").epoch;
+
+        bus.remove(sandbox_id);
+        bus.publish_external(make_log_event(sandbox_id, "l1-again")); // seq 1 again, new epoch
+
+        assert!(matches!(
+            bus.snapshot_after(sandbox_id, original_epoch, 0, 0, true, false),
+            ResumeSnapshot::SpaceGone
+        ));
+    }
+
+    /// No space at all -- an unpublished or never-existent sandbox -- is the
+    /// same outcome as a retired one: there's nothing for the cursor to
+    /// address.
+    #[test]
+    fn snapshot_after_rejects_when_no_space_exists() {
+        let bus = TracingLogBus::new();
+        assert!(matches!(
+            bus.snapshot_after("nope", Uuid::nil(), 0, 0, true, false),
+            ResumeSnapshot::SpaceGone
+        ));
+    }
+
+    /// A cursor ahead of anything the space has issued -- only reachable with
+    /// a fabricated token -- is rejected rather than treated as caught up.
+    #[test]
+    fn snapshot_after_rejects_a_cursor_ahead_of_the_space() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-ahead";
+        bus.publish_external(make_log_event(sandbox_id, "l1"));
+        let epoch = bus.cursor_space(sandbox_id).expect("space exists").epoch;
+
+        assert!(matches!(
+            bus.snapshot_after(sandbox_id, epoch, 99, 0, true, false),
+            ResumeSnapshot::CursorAhead
+        ));
+    }
+
+    #[test]
     fn tail_after_impl_boundary_at_last_trimmed_is_serviceable() {
         // Bus trimmed up to seq 2, retains 3..=5. Client saw exactly 2, so
         // nothing they still need was dropped.
@@ -528,56 +820,96 @@ mod tests {
     }
 
     #[test]
-    fn tracing_log_bus_tail_after_serviceable_and_missing() {
+    fn tracing_log_bus_resume_replay_serviceable_and_missing() {
         let bus = TracingLogBus::new();
         let sandbox_id = "sb-ta";
         for _ in 0..3 {
             bus.publish_external(make_log_event(sandbox_id, "line"));
         }
+        let epoch = bus.cursor_space(sandbox_id).expect("space exists").epoch;
+
         // Cursors start at 1, so three publishes are seqs 1,2,3.
+        let ResumeSnapshot::Read(log, _) = bus.snapshot_after(sandbox_id, epoch, 0, 0, true, false)
+        else {
+            panic!("expected a successful read");
+        };
         assert_eq!(
-            cursors(&bus.tail_after(sandbox_id, 0).unwrap()),
+            cursors(&log.expect("followed").expect("no gap")),
             vec![1, 2, 3]
         );
-        assert_eq!(cursors(&bus.tail_after(sandbox_id, 2).unwrap()), vec![3]);
-        // Unknown sandbox: no entry, nothing buffered, no gap.
-        assert!(bus.tail_after("nope", 5).unwrap().is_empty());
+        let ResumeSnapshot::Read(log, _) = bus.snapshot_after(sandbox_id, epoch, 2, 0, true, false)
+        else {
+            panic!("expected a successful read");
+        };
+        assert_eq!(cursors(&log.expect("followed").expect("no gap")), vec![3]);
     }
 
     #[test]
-    fn platform_event_bus_tail_after_serviceable() {
+    fn platform_event_bus_resume_replay_serviceable() {
         let bus = TracingLogBus::new();
         let platform = &bus.platform_event_bus;
         let sandbox_id = "sb-pe";
         for _ in 0..3 {
             platform.publish(sandbox_id, stream_event(0));
         }
+        let epoch = bus.cursor_space(sandbox_id).expect("space exists").epoch;
+
         // Shared allocator, but only the platform bus published here, so its
         // seqs are 1,2,3.
+        let ResumeSnapshot::Read(_, platform_replay) =
+            bus.snapshot_after(sandbox_id, epoch, 0, 0, false, true)
+        else {
+            panic!("expected a successful read");
+        };
         assert_eq!(
-            cursors(&platform.tail_after(sandbox_id, 0).unwrap()),
+            cursors(&platform_replay.expect("followed").expect("no gap")),
             vec![1, 2, 3]
         );
+        let ResumeSnapshot::Read(_, platform_replay) =
+            bus.snapshot_after(sandbox_id, epoch, 0, 1, false, true)
+        else {
+            panic!("expected a successful read");
+        };
         assert_eq!(
-            cursors(&platform.tail_after(sandbox_id, 1).unwrap()),
+            cursors(&platform_replay.expect("followed").expect("no gap")),
             vec![2, 3]
         );
     }
 
     #[test]
-    fn shared_allocator_interleaves_cursors_across_buses() {
+    fn tracing_log_bus_tail_with_floor_reports_truncation() {
         let bus = TracingLogBus::new();
-        let sandbox_id = "sb-mix";
-        // Interleave log and platform publishes; the shared allocator gives
-        // each a unique, increasing cursor in one merged space.
-        bus.publish_external(make_log_event(sandbox_id, "a")); // seq 1
-        bus.platform_event_bus.publish(sandbox_id, stream_event(0)); // seq 2
-        bus.publish_external(make_log_event(sandbox_id, "b")); // seq 3
+        let sandbox_id = "sb-floor";
+        for _ in 0..5 {
+            bus.publish_external(make_log_event(sandbox_id, "line"));
+        }
+        let (events, floor) = bus.tail_with_floor(sandbox_id, 2);
+        assert_eq!(cursors(&events), vec![4, 5]);
+        assert_eq!(floor, 1);
 
-        let logs = cursors(&bus.tail_after(sandbox_id, 0).unwrap());
-        let events = cursors(&bus.platform_event_bus.tail_after(sandbox_id, 0).unwrap());
-        assert_eq!(logs, vec![1, 3]);
-        assert_eq!(events, vec![2]);
+        // Wide enough to cover everything: no floor.
+        let (events, floor) = bus.tail_with_floor(sandbox_id, 10);
+        assert_eq!(cursors(&events), vec![1, 2, 3, 4, 5]);
+        assert_eq!(floor, 0);
+
+        // Unknown sandbox: nothing buffered, no floor.
+        let (events, floor) = bus.tail_with_floor("nope", 10);
+        assert!(events.is_empty());
+        assert_eq!(floor, 0);
+    }
+
+    #[test]
+    fn platform_event_bus_tail_with_floor_reports_truncation() {
+        let bus = TracingLogBus::new();
+        let platform = &bus.platform_event_bus;
+        let sandbox_id = "sb-pe-floor";
+        for _ in 0..5 {
+            platform.publish(sandbox_id, stream_event(0));
+        }
+        let (events, floor) = platform.tail_with_floor(sandbox_id, 0);
+        assert!(events.is_empty());
+        // Nothing returned: floor is the oldest of everything excluded, 1.
+        assert_eq!(floor, 1);
     }
 
     #[test]
@@ -661,7 +993,9 @@ mod tests {
         assert_eq!(after_platform.highest_seq, 2);
 
         let log_cursor = &bus.tail(sandbox_id, 10)[0].event.cursor;
-        let platform_cursor = &bus.platform_event_bus.tail(sandbox_id, 10)[0].event.cursor;
+        let platform_cursor = &bus.platform_event_bus.tail_with_floor(sandbox_id, 10).0[0]
+            .event
+            .cursor;
         assert_eq!(
             WatchCursor::parse(log_cursor).expect("valid").epoch,
             WatchCursor::parse(platform_cursor).expect("valid").epoch,
@@ -848,8 +1182,9 @@ mod tests {
         }
 
         // Tail should return all events in order
-        let events = bus.tail(sandbox_id, 10);
+        let (events, floor) = bus.tail_with_floor(sandbox_id, 10);
         assert_eq!(events.len(), 5);
+        assert_eq!(floor, 0, "max covered everything retained");
 
         // Verify order (oldest first)
         for (i, cursored) in events.iter().enumerate() {
@@ -861,8 +1196,9 @@ mod tests {
         }
 
         // Tail with smaller max should return most recent events
-        let events = bus.tail(sandbox_id, 2);
+        let (events, floor) = bus.tail_with_floor(sandbox_id, 2);
         assert_eq!(events.len(), 2);
+        assert_eq!(floor, 1, "oldest excluded event is Event0 (seq 1)");
         if let Some(sandbox_stream_event::Payload::Event(ref e)) = events[0].event.payload {
             assert_eq!(e.reason, "Event3");
         }
@@ -874,8 +1210,9 @@ mod tests {
     #[test]
     fn platform_event_bus_tail_empty_sandbox() {
         let bus = PlatformEventBus::new(SeqAllocator::default());
-        let events = bus.tail("nonexistent", 10);
+        let (events, floor) = bus.tail_with_floor("nonexistent", 10);
         assert!(events.is_empty());
+        assert_eq!(floor, 0);
     }
 
     #[test]
@@ -888,10 +1225,10 @@ mod tests {
             cursor: String::new(),
         };
         bus.publish(sandbox_id, evt);
-        assert_eq!(bus.tail(sandbox_id, 10).len(), 1);
+        assert_eq!(bus.tail_with_floor(sandbox_id, 10).0.len(), 1);
 
         bus.remove(sandbox_id);
-        assert!(bus.tail(sandbox_id, 10).is_empty());
+        assert!(bus.tail_with_floor(sandbox_id, 10).0.is_empty());
     }
 }
 
@@ -958,28 +1295,17 @@ impl PlatformEventBus {
         }
     }
 
-    /// Return buffered platform events for replay to late subscribers.
-    pub(crate) fn tail(&self, sandbox_id: &str, max: usize) -> Vec<CursoredEvent> {
-        let inner = self.inner.lock().expect("platform event bus lock poisoned");
-        inner
-            .per_id
-            .get(sandbox_id)
-            .map(|d| d.tail.iter().rev().take(max).cloned().collect::<Vec<_>>())
-            .unwrap_or_default()
-            .into_iter()
-            .rev()
-            .collect()
-    }
-
-    pub(crate) fn tail_after(
+    /// Return buffered platform events and the coverage floor `max` leaves
+    /// behind. See `TracingLogBus::tail_with_floor`.
+    pub(crate) fn tail_with_floor(
         &self,
         sandbox_id: &str,
-        after_seq: u64,
-    ) -> Result<Vec<CursoredEvent>, ResumeGap> {
+        max: usize,
+    ) -> (Vec<CursoredEvent>, u64) {
         let inner = self.inner.lock().expect("platform event bus lock poisoned");
         inner.per_id.get(sandbox_id).map_or_else(
-            || Ok(Vec::new()),
-            |per| tail_after_impl(&per.tail, per.last_trimmed_seq, after_seq),
+            || (Vec::new(), 0),
+            |per| tail_with_floor_impl(&per.tail, max),
         )
     }
 
