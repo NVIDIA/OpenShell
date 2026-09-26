@@ -53,7 +53,7 @@ timeout = "500ms"
 </ParamField>
 
 <ParamField path="audience" type="string" default="urn:openshell:extension:middleware:<name>">
-  Token audience. Refer to [Extension Authentication](/extensibility/overview#authentication).
+  Token audience. Refer to [Authenticating Extensions](/extensibility/overview#authenticating-extensions).
 </ParamField>
 
 <ParamField path="allow_insecure_transport" type="boolean" default="false">
@@ -62,7 +62,7 @@ timeout = "500ms"
 
 At startup, the gateway contacts every registered service to read its capabilities and verify [protocol compatibility](/extensibility/overview#protocol-negotiation). The gateway does not start if a service is unavailable or incompatible. [Gateway Configuration](/how-it-works/gateways/configuration#supervisor-middleware-services) describes the full TOML context.
 
-When the gateway has JWT signing configured, OpenShell authenticates every call to your service with a short-lived token. [Extension Authentication](/extensibility/overview#authentication) describes how your service validates it.
+When the gateway has JWT signing configured, OpenShell authenticates every call to your service with a short-lived token. [Authenticating Extensions](/extensibility/overview#authenticating-extensions) describes how your service validates it.
 
 ## Attach Middleware in Policy
 

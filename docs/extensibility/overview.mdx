@@ -8,12 +8,20 @@ description: "Understand how OpenShell adapts to deployment-specific infrastruct
 keywords: "OpenShell Extensions, Middleware, Interceptors, Drivers, Isolation Backends, Protocol Negotiation"
 ---
 
-![OpenShell extension points across the gateway and runtime: gateway interceptors, compute and credential drivers, supervisor middleware, and isolation backends.](../images/openshell-extension-points.svg)
+![OpenShell extension points. Data plane: the sandboxed agent reaches the supervisor through the isolation backend, and supervisor middleware processes requests before they reach models and APIs. Control plane: you reach the gateway through interceptors, and gateway drivers connect it to runtimes and secret stores.](../images/openshell-extension-points.svg)
 
 Extensibility sits at the core of OpenShell. OpenShell is designed to run
 everywhere and adapt to the infrastructure, governance, and workload
 requirements of each deployment. Its extension points add deployment-specific
 behavior while preserving the same API, policy model, and security boundaries.
+
+You can extend each layer of OpenShell:
+
+- **Control plane:** Gateway interceptors govern API operations.
+- **Data plane:** Middleware processes agent traffic, and isolation backends
+  control the sandboxed workload.
+- **Infrastructure:** Drivers connect OpenShell to compute runtimes and secret
+  stores.
 
 ## Extension Points
 
@@ -42,7 +50,63 @@ Isolation backends connect the supervisor to the sandbox runtime. They provide
 a consistent contract for process launch, terminal streams, signals, status,
 and runtime-specific isolation inside the provisioned workload.
 
-## Authentication
+## Building Extensions
+
+Start with the narrowest extension point that owns the behavior you need. Keep
+control-plane governance in an interceptor, infrastructure integration in a
+driver, application traffic processing in middleware, and workload control in
+an isolation backend. Each extension uses a typed contract so OpenShell keeps
+ownership of authentication, policy enforcement, secrets, and public API
+behavior.
+
+Built-in and external implementations follow the same contracts and validation
+rules. The extension-specific pages describe their APIs, configuration, and
+security boundaries.
+
+### gRPC and Transports
+
+External extensions implement protobuf-defined gRPC services. The transport
+depends on where the extension runs and which OpenShell components must reach
+it:
+
+| Extension | Integration | Supported transport |
+| --- | --- | --- |
+| Gateway interceptor | The gateway calls the interceptor service. | TCP with `http://` or `https://`, or a local Unix domain socket with `unix://`. |
+| Supervisor middleware | The gateway discovers the service, and sandbox supervisors evaluate traffic through it. | TCP with `http://` or `https://`. The endpoint must be reachable from both the gateway and supervisors, so Unix sockets are not supported. |
+| Compute or credential driver | The gateway calls an external driver service. | A local Unix domain socket. |
+| OpenShell isolation backend | The supervisor connects to the sandbox boundary through the OpenShell Sandbox Protocol. | A private Unix socket, TLS over TCP, or virtio-vsock selected and provisioned by the compute driver. |
+
+Use Unix domain sockets when the gateway and extension share a host. Use
+`https://` when a service crosses a host or pod boundary. Plaintext `http://`
+is intended for explicitly enabled development deployments; authenticated
+network extensions use TLS and short-lived gateway-issued credentials. Refer
+to [Authenticating Extensions](#authenticating-extensions) for how services validate those credentials.
+
+The [governance interceptor example](https://github.com/NVIDIA/OpenShell/tree/main/examples/governance-interceptor)
+and [content guard middleware example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard)
+include complete gRPC services, gateway configuration, and smoke tests. For
+runtime integrations, refer to the first-party
+[Docker compute driver](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-driver-docker)
+and [VM compute driver](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-driver-vm).
+
+### Protocol Negotiation
+
+Before OpenShell uses a compute driver, credential driver, gateway interceptor,
+or supervisor middleware service, both peers exchange
+`openshell.extension.v1.PeerMetadata`. The metadata identifies the protocol and
+implementation versions, supported capabilities, and capabilities required
+from the other peer. Family-specific features remain in their typed protocols.
+
+OpenShell accepts compatible minor versions when both capability requirements
+are satisfied. It rejects different major versions, missing metadata, or an
+unmet required capability during startup. Built-in and external service
+extensions follow the same compatibility checks.
+
+Use `openshell gateway info` to inspect the negotiated extension families,
+implementation versions, protocol versions, and capabilities active on a
+gateway.
+
+## Authenticating Extensions
 
 When the gateway has JWT signing configured, OpenShell sends a short-lived bearer token with every call to a [gateway interceptor](/extensibility/gateway-interceptors) or [supervisor middleware](/extensibility/supervisor-middleware) service. Validate it to confirm the call comes from your gateway or one of its sandboxes.
 
@@ -81,59 +145,3 @@ Set `allow_insecure_transport = true` on a registration to use a plaintext `http
 - Tokens are bearer credentials: a captured token works until it expires.
 - Extension tokens share the gateway's signing key, so you can't rotate or revoke them separately.
 - mTLS client authentication and overlapping key rotation aren't available.
-
-## Building Extensions
-
-Start with the narrowest extension point that owns the behavior you need. Keep
-control-plane governance in an interceptor, infrastructure integration in a
-driver, application traffic processing in middleware, and workload control in
-an isolation backend. Each extension uses a typed contract so OpenShell keeps
-ownership of authentication, policy enforcement, secrets, and public API
-behavior.
-
-Built-in and external implementations follow the same contracts and validation
-rules. The extension-specific pages describe their APIs, configuration, and
-security boundaries.
-
-### gRPC and Transports
-
-External extensions implement protobuf-defined gRPC services. The transport
-depends on where the extension runs and which OpenShell components must reach
-it:
-
-| Extension | Integration | Supported transport |
-| --- | --- | --- |
-| Gateway interceptor | The gateway calls the interceptor service. | TCP with `http://` or `https://`, or a local Unix domain socket with `unix://`. |
-| Supervisor middleware | The gateway discovers the service, and sandbox supervisors evaluate traffic through it. | TCP with `http://` or `https://`. The endpoint must be reachable from both the gateway and supervisors, so Unix sockets are not supported. |
-| Compute or credential driver | The gateway calls an external driver service. | A local Unix domain socket. |
-| OpenShell isolation backend | The supervisor connects to the sandbox boundary through the OpenShell Sandbox Protocol. | A private Unix socket, TLS over TCP, or virtio-vsock selected and provisioned by the compute driver. |
-
-Use Unix domain sockets when the gateway and extension share a host. Use
-`https://` when a service crosses a host or pod boundary. Plaintext `http://`
-is intended for explicitly enabled development deployments; authenticated
-network extensions use TLS and short-lived gateway-issued credentials. Refer
-to [Authentication](#authentication) for how services validate those credentials.
-
-The [governance interceptor example](https://github.com/NVIDIA/OpenShell/tree/main/examples/governance-interceptor)
-and [content guard middleware example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard)
-include complete gRPC services, gateway configuration, and smoke tests. For
-runtime integrations, refer to the first-party
-[Docker compute driver](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-driver-docker)
-and [VM compute driver](https://github.com/NVIDIA/OpenShell/tree/main/crates/openshell-driver-vm).
-
-### Protocol Negotiation
-
-Before OpenShell uses a compute driver, credential driver, gateway interceptor,
-or supervisor middleware service, both peers exchange
-`openshell.extension.v1.PeerMetadata`. The metadata identifies the protocol and
-implementation versions, supported capabilities, and capabilities required
-from the other peer. Family-specific features remain in their typed protocols.
-
-OpenShell accepts compatible minor versions when both capability requirements
-are satisfied. It rejects different major versions, missing metadata, or an
-unmet required capability during startup. Built-in and external service
-extensions follow the same compatibility checks.
-
-Use `openshell gateway info` to inspect the negotiated extension families,
-implementation versions, protocol versions, and capabilities active on a
-gateway.
