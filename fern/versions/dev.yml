@@ -99,8 +99,9 @@ navigation:
 - section: Tutorials
   slug: tutorials
   contents:
-  - page: Run Pi
-    path: ../pages-dev/tutorials/run-pi.mdx
+  - page: Run Pi with OpenRouter
+    path: ../pages-dev/tutorials/run-pi-with-openrouter.mdx
+    slug: run-pi-with-openrouter
   - page: First Network Policy
     path: ../pages-dev/tutorials/first-network-policy.mdx
   - page: GitHub Push Access
