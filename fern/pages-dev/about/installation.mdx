@@ -38,7 +38,7 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
   OPENSHELL_VERSION=pre sh
 ```
 
-The installer checks prerelease tags from newest to oldest, selects an unexpired artifact from a successful release run for the current platform, and downloads only that artifact. Installed packages keep the candidate's exact version, such as `0.1.0-pre.3`. Prerelease tags do not create entries on the GitHub Releases page. On Linux, prereleases and explicit release tags use Debian or RPM packages even if `snap` is installed.
+The installer checks prerelease tags from newest to oldest, selects an unexpired artifact from a successful release run for the current platform, and downloads only that artifact. Installed packages keep the candidate's exact version, such as `0.1.0-pre.3`. Prerelease tags do not create entries on the GitHub Releases page. On Linux, prereleases and explicit release tags use Debian or RPM packages.
 
 The rolling [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) does not require GitHub authentication:
 
@@ -86,7 +86,7 @@ The gateway reads `~/.config/openshell/gateway.toml` if it exists, otherwise the
 
 ## Linux
 
-The script uses the [Snap](#snap) package when `snap` is available. Otherwise, or when you set `OPENSHELL_VERSION` to a release tag, it installs a Debian package on Debian and Ubuntu or an RPM package on Fedora and RHEL. Linux packages require glibc 2.28 or newer.
+The script installs a Debian package on Debian and Ubuntu or an RPM package on Fedora and RHEL. Set `OPENSHELL_INSTALL_METHOD=snap` to install the [Snap](#snap) package instead; hosts that already have the OpenShell snap keep refreshing it. Linux packages require glibc 2.28 or newer.
 
 The gateway runs as a systemd user service at `https://127.0.0.1:17670` and reads `~/.config/openshell/gateway.toml`.
 
@@ -110,19 +110,21 @@ The snap requires Docker Engine installed from your distribution or Docker's pac
 sudo snap install openshell
 ```
 
-The snap does not migrate existing Debian, RPM, or Homebrew installs. Remove any existing installation first, then rerun the script with `OPENSHELL_ACK_BREAKING_UPGRADE=1`.
+The snap does not migrate existing Debian, RPM, or Homebrew installs. Remove any existing installation first, then rerun the script with `OPENSHELL_INSTALL_METHOD=snap OPENSHELL_ACK_BREAKING_UPGRADE=1`.
 
-The gateway runs as a system service at `http://127.0.0.1:17670` and reads `/var/snap/openshell/common/gateway.toml`.
-
-<Warning>
-The snap gateway allows unauthenticated access from the local host. Any local user or process can operate it. Do not expose it beyond the local host.
-</Warning>
-
-Snap refreshes do not restart the gateway, so active sandboxes keep running. Restart it to pick up a new version:
+The gateway runs as a system service at `https://127.0.0.1:17670` and reads `/var/snap/openshell/common/gateway.toml`. It requires a client certificate. The install script copies that certificate to the installing user's Snap state and registers the gateway automatically. If you installed with `sudo snap install openshell`, give each trusted user the certificate and register the gateway from that user's account:
 
 ```shell
-sudo systemctl restart snap.openshell.gateway
+d=~/snap/openshell/common/.local/state/openshell/tls
+mkdir -p -m 700 "$d" "$d/client"
+sudo install -o "$USER" -m 600 /var/snap/openshell/common/tls/ca.crt "$d/"
+sudo install -o "$USER" -m 600 -t "$d/client" \
+  /var/snap/openshell/common/tls/client/tls.crt /var/snap/openshell/common/tls/client/tls.key
+openshell gateway add https://127.0.0.1:17670 --local --name openshell
+openshell status
 ```
+
+Keep the client key private.
 
 To install a locally built snap, connect its interfaces manually:
 
