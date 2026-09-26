@@ -877,16 +877,19 @@ impl ProviderTypeProfile {
 
     /// Returns the credential suitable for `--from-gcloud-adc` bootstrap, if any.
     ///
-    /// A credential qualifies when its refresh strategy is `Oauth2RefreshToken`
-    /// and its material declares the three gcloud ADC keys (`client_id`,
-    /// `client_secret`, `refresh_token`).
+    /// A credential qualifies when its refresh strategy is `Oauth2RefreshToken`,
+    /// its token endpoint is the Google token endpoint that `gcloud` ADC
+    /// refresh tokens are redeemable at, and its material declares the three
+    /// gcloud ADC keys (`client_id`, `client_secret`, `refresh_token`).
     #[must_use]
     pub fn adc_credential(&self) -> Option<&CredentialProfile> {
         const ADC_MATERIAL_KEYS: &[&str] = &["client_id", "client_secret", "refresh_token"];
+        const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
         self.credentials.iter().find(|cred| {
             cred.refresh.as_ref().is_some_and(|refresh| {
                 refresh.strategy == ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+                    && refresh.token_url == GOOGLE_TOKEN_URL
                     && ADC_MATERIAL_KEYS
                         .iter()
                         .all(|key| refresh.material.iter().any(|m| m.name == *key))
@@ -3468,7 +3471,10 @@ mod tests {
     use std::collections::HashMap;
 
     use openshell_core::mcp::{DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion};
-    use openshell_core::proto::{ProviderCredentialTokenGrantType, ProviderProfileCategory};
+    use openshell_core::proto::{
+        ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantType,
+        ProviderProfileCategory,
+    };
 
     use super::{
         DiscoveryProfile, EndpointProfile, L7AllowProfile, L7QueryMatcherProfile,
@@ -3993,6 +3999,52 @@ endpoints:
             .adc_credential()
             .expect("vertex should have an ADC credential");
         assert_eq!(adc.env_vars[0], "GOOGLE_VERTEX_AI_TOKEN");
+    }
+
+    #[test]
+    fn slack_profile_declares_rotating_user_token() {
+        let profile = example_profile("slack");
+        let proto = profile.to_proto();
+
+        assert_eq!(proto.category, ProviderProfileCategory::Messaging as i32);
+        assert_eq!(profile.credentials.len(), 1);
+        let credential = &profile.credentials[0];
+        assert_eq!(credential.name, "user_token");
+        assert_eq!(credential.env_vars, vec!["SLACK_USER_TOKEN", "SLACK_TOKEN"]);
+        assert!(credential.required);
+
+        let refresh = credential
+            .refresh
+            .as_ref()
+            .expect("slack user token should declare refresh metadata");
+        assert_eq!(
+            refresh.strategy,
+            ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+        );
+        assert_eq!(refresh.token_url, "https://slack.com/api/oauth.v2.access");
+        assert!(refresh.scopes.is_empty(), "no scope parameter on refresh");
+        assert_eq!(refresh.max_lifetime_seconds, 43_200);
+        assert!(
+            refresh.refresh_before_seconds < refresh.max_lifetime_seconds,
+            "lead time must leave a positive refresh interval"
+        );
+        let material = refresh
+            .material
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.required, entry.secret))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            material,
+            vec![
+                ("client_id", true, false),
+                ("client_secret", true, true),
+                ("refresh_token", true, true),
+            ]
+        );
+        assert!(
+            profile.adc_credential().is_none(),
+            "slack material is not gcloud ADC material"
+        );
     }
 
     #[test]
@@ -5925,7 +5977,7 @@ binaries:
         let refresh = access_key.refresh.as_ref().unwrap();
         assert_eq!(
             refresh.strategy,
-            openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+            ProviderCredentialRefreshStrategy::AwsStsAssumeRole
         );
         assert!(
             refresh
@@ -6027,7 +6079,7 @@ binaries:
     #[test]
     fn is_gateway_mintable_strategy_includes_aws_sts() {
         assert!(super::is_gateway_mintable_strategy(
-            openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+            ProviderCredentialRefreshStrategy::AwsStsAssumeRole
         ));
     }
 
