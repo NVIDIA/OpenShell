@@ -246,7 +246,7 @@ a workspace. For membership commands, refer to
 
 ### Edge JWT (cloud gateways)
 
-For gateways behind a reverse proxy that handles authentication (e.g. Cloudflare Access), the CLI uses a browser-based login flow and routes traffic through a WebSocket tunnel.
+For gateways behind a reverse proxy that handles authentication (e.g. Cloudflare Access), the CLI uses a browser-based login flow and routes traffic through a WebSocket tunnel. The tunnel is disabled by default; enable it with `enable_websocket_tunnel = true` under `[openshell.gateway]` (Helm: `server.enableWebsocketTunnel=true`).
 
 **Registration flow** (`openshell gateway add https://gateway.example.com`):
 
