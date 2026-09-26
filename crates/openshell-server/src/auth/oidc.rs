@@ -16,6 +16,7 @@ use super::principal::{Principal, UserPrincipal};
 use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use openshell_core::OidcConfig;
+use openshell_core::driver_utils::{BoundedReadError, read_regular_file_bounded};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -57,6 +58,10 @@ const KID_MISS_REFRESH_COOLDOWN: Duration = Duration::from_secs(1);
 /// deserialization while leaving ample room for large enterprise key sets.
 const OIDC_DISCOVERY_MAX_BYTES: usize = 64 * 1024;
 const JWKS_MAX_BYTES: usize = 1024 * 1024;
+
+/// Hard upper bound for an operator-supplied OIDC CA bundle. This matches the
+/// Kubernetes `ConfigMap` size limit used to supply the bundle in Helm installs.
+const OIDC_CA_BUNDLE_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Cached JWKS key set fetched from the OIDC issuer.
 ///
@@ -576,9 +581,31 @@ impl JwksCache {
     /// initial key set.
     pub async fn new(config: &OidcConfig) -> Result<Self, String> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let http = Client::builder()
+        let mut http_builder = Client::builder()
+            // A configured issuer CA augments these roots; it must not replace
+            // trust for unrelated public HTTPS endpoints used by the gateway.
+            .tls_built_in_root_certs(true)
             .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::none());
+        if let Some(ca_bundle) = config.ca_bundle.as_deref() {
+            let pem = read_oidc_ca_bundle(ca_bundle).await?;
+            let certificates = reqwest::Certificate::from_pem_bundle(&pem).map_err(|error| {
+                format!(
+                    "failed to parse OIDC CA bundle '{}': {error}",
+                    ca_bundle.display()
+                )
+            })?;
+            if certificates.is_empty() {
+                return Err(format!(
+                    "OIDC CA bundle '{}' contains no certificates",
+                    ca_bundle.display()
+                ));
+            }
+            for certificate in certificates {
+                http_builder = http_builder.add_root_certificate(certificate);
+            }
+        }
+        let http = http_builder
             .build()
             .map_err(|e| format!("failed to create HTTP client: {e}"))?;
 
@@ -868,6 +895,30 @@ impl JwksCache {
     }
 }
 
+async fn read_oidc_ca_bundle(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let path = path.to_path_buf();
+    let display_path = path.display().to_string();
+    let task_display_path = display_path.clone();
+    tokio::task::spawn_blocking(move || {
+        read_regular_file_bounded(&path, OIDC_CA_BUNDLE_MAX_BYTES).map_err(|error| match error {
+            BoundedReadError::Open(error)
+            | BoundedReadError::Stat(error)
+            | BoundedReadError::Read(error) => {
+                format!("failed to read OIDC CA bundle '{task_display_path}': {error}")
+            }
+            BoundedReadError::NotRegular => {
+                format!("OIDC CA bundle '{task_display_path}' is not a regular file")
+            }
+            BoundedReadError::TooLarge => format!(
+                "OIDC CA bundle '{task_display_path}' exceeds the \
+                 {OIDC_CA_BUNDLE_MAX_BYTES}-byte limit"
+            ),
+        })
+    })
+    .await
+    .map_err(|error| format!("failed to read OIDC CA bundle '{display_path}': {error}"))?
+}
+
 /// Authenticator that validates `Authorization: Bearer <jwt>` headers against
 /// the configured OIDC issuer.
 ///
@@ -911,6 +962,7 @@ mod tests {
     fn transport_test_config(issuer: impl Into<String>) -> OidcConfig {
         OidcConfig {
             issuer: issuer.into(),
+            ca_bundle: None,
             dangerously_allow_insecure_http: false,
             jwks_allowed_origins: Vec::new(),
             audience: "test-audience".to_string(),
@@ -930,6 +982,99 @@ mod tests {
 
         assert!(
             error.contains("must use HTTPS"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_an_empty_ca_bundle() {
+        let ca_bundle = tempfile::NamedTempFile::new().unwrap();
+        let mut config = transport_test_config("https://issuer.example.com");
+        config.ca_bundle = Some(ca_bundle.path().to_path_buf());
+
+        let error = JwksCache::new(&config)
+            .await
+            .expect_err("an empty CA bundle must fail before discovery");
+
+        assert!(
+            error.contains("contains no certificates"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_an_oversized_ca_bundle() {
+        let ca_bundle = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            ca_bundle.path(),
+            vec![b'x'; usize::try_from(OIDC_CA_BUNDLE_MAX_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        let mut config = transport_test_config("https://issuer.example.com");
+        config.ca_bundle = Some(ca_bundle.path().to_path_buf());
+
+        let error = JwksCache::new(&config)
+            .await
+            .expect_err("an oversized CA bundle must fail before discovery");
+
+        assert!(
+            error.contains("OIDC CA bundle"),
+            "unexpected error: {error}"
+        );
+        assert!(error.contains("exceeds"), "unexpected error: {error}");
+        assert!(
+            error.contains(&OIDC_CA_BUNDLE_MAX_BYTES.to_string()),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oidc_rejects_a_fifo_ca_bundle_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("oidc-ca-fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();
+        let mut config = transport_test_config("https://issuer.example.com");
+        config.ca_bundle = Some(fifo);
+
+        let start = Instant::now();
+        let error = JwksCache::new(&config)
+            .await
+            .expect_err("a FIFO CA bundle must fail before discovery");
+
+        assert!(
+            error.contains("OIDC CA bundle"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("not a regular file"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "reading a FIFO must not block"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oidc_rejects_a_device_ca_bundle() {
+        if !std::path::Path::new("/dev/zero").exists() {
+            return;
+        }
+        let mut config = transport_test_config("https://issuer.example.com");
+        config.ca_bundle = Some("/dev/zero".into());
+
+        let error = JwksCache::new(&config)
+            .await
+            .expect_err("a device CA bundle must fail before discovery");
+
+        assert!(
+            error.contains("OIDC CA bundle"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("not a regular file"),
             "unexpected error: {error}"
         );
     }
@@ -1099,13 +1244,11 @@ mod tests {
 
         // Initialization succeeds after the client receives the rotated trust
         // anchor, and both discovery and JWKS stay on the authenticated channel.
-        let client = Client::builder()
-            .add_root_certificate(reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).unwrap())
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-        let config = transport_test_config(issuer.clone());
-        let cache = JwksCache::new_with_client(&config, client)
+        let mut ca_bundle = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut ca_bundle, ca_cert.pem().as_bytes()).unwrap();
+        let mut config = transport_test_config(issuer.clone());
+        config.ca_bundle = Some(ca_bundle.path().to_path_buf());
+        let cache = JwksCache::new(&config)
             .await
             .expect("TLS discovery and JWKS should accept the rotated CA");
 
@@ -1424,6 +1567,7 @@ mod tests {
 
         JwksCache::new(&OidcConfig {
             issuer,
+            ca_bundle: None,
             dangerously_allow_insecure_http: true,
             jwks_allowed_origins: Vec::new(),
             audience: TEST_AUDIENCE.to_owned(),
@@ -1763,6 +1907,7 @@ mod tests {
         fn test_oidc_config(issuer: &str) -> OidcConfig {
             OidcConfig {
                 issuer: issuer.to_string(),
+                ca_bundle: None,
                 dangerously_allow_insecure_http: true,
                 jwks_allowed_origins: Vec::new(),
                 audience: "test-audience".to_string(),

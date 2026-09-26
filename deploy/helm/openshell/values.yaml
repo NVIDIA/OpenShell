@@ -482,7 +482,8 @@ server:
     # -- Dot-separated path to the scopes array in the JWT claims.
     scopesClaim: ""
     # -- Name of a ConfigMap containing a CA certificate bundle (key: ca.crt)
-    # for verifying the OIDC issuer's TLS certificate. Required when the
+    # for verifying the OIDC issuer's TLS certificate. These certificates
+    # augment platform trust roots for OIDC requests only. Required when the
     # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).
     caConfigMapName: ""
 

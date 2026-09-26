@@ -339,7 +339,11 @@ development TLS certificate, and publishes its trust anchor as the
 `openshell-keycloak-ca` ConfigMap in the OpenShell namespace. The command prints a
 port-forward command for acquiring tokens from the CLI. Rerunning setup rotates the
 development certificate and trust anchor; redeploy the gateway afterward so it reloads
-the mounted CA bundle.
+the mounted CA bundle. The chart renders the mount path as
+`[openshell.gateway.oidc] ca_bundle`; the gateway adds that issuer CA to native roots
+for OIDC discovery and JWKS requests without changing trust for other HTTPS clients.
+The mounted bundle must be a regular file no larger than 1 MiB; the gateway rejects
+other file types and oversized bundles during startup.
 
 Then activate OIDC in the OpenShell Helm chart:
 1. Uncomment `#- ci/values-keycloak.yaml` in `skaffold.yaml`
