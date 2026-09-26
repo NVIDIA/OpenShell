@@ -363,6 +363,7 @@ server_context.load_cert_chain(chain, leaf_key)
 upstream_context = ssl._create_unverified_context()
 
 def handle(conn):
+    target = '<unparsed>'
     try:
         head = read_head(conn)
         if head is None:
@@ -380,18 +381,22 @@ def handle(conn):
                 (dial_host(host), int(target_port)), timeout=10)
             upstream = upstream_context.wrap_socket(
                 upstream_raw, server_hostname='{HOST_ALIAS}')
-        except OSError:
-            log('CONNECT %s mitm=dial-fail' % target)
+        except OSError as err:
+            log('CONNECT %s mitm=dial-fail error=%r' % (target, err))
             conn.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n')
             return
         conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
-        client = server_context.wrap_socket(conn, server_side=True)
+        try:
+            client = server_context.wrap_socket(conn, server_side=True)
+        except OSError as err:
+            log('CONNECT %s mitm=client-tls-fail error=%r' % (target, err))
+            return
         log('CONNECT %s mitm=ok' % target)
         pipe(client, upstream)
         upstream.close()
         client.close()
-    except OSError:
-        pass
+    except OSError as err:
+        log('CONNECT %s mitm=error error=%r' % (target, err))
     finally:
         try:
             conn.close()
@@ -1107,7 +1112,8 @@ async fn docker_corporate_proxy_trusts_intercepted_destination_tls() {
     let proxy_logs = proxy.logs().expect("read TLS-intercepting proxy logs");
     assert!(
         output.contains("INSPECTED_RESULT") && output.contains(ALLOWED_MARKER),
-        "supervisor-inspected TLS should trust the corporate re-signing CA:\n{output}"
+        "supervisor-inspected TLS should trust the corporate re-signing CA:\n\
+         workload output:\n{output}\nproxy output:\n{proxy_logs}"
     );
     assert!(
         output.contains("RAW_RESULT") && output.contains(BYPASS_MARKER),
