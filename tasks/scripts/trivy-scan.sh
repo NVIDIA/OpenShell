@@ -178,23 +178,34 @@ scan_images() {
   done
 }
 
-gate() {
-  local report result findings=0
+# Print the reports the gate evaluates, one per line. Configuration is
+# consolidated first so repeated fixture findings count once.
+gate_reports() {
+  local report found=0
 
-  if [ -z "$(find "${REPORT_DIR}" -maxdepth 1 -name '*.json' -print -quit)" ]; then
+  if [ -z "$(find "${REPORT_DIR}" -maxdepth 1 -name '*.json' -print -quit 2>/dev/null)" ]; then
     echo "Error: no reports in ${REPORT_DIR}; run 'config' or 'images' first" >&2
-    exit 2
+    return 2
   fi
 
-  local reports=()
   if [ -f "${REPORT_DIR}/config-defaults.json" ]; then
     consolidate_config
-    reports+=("${REPORT_DIR}/consolidated/config.json")
+    echo "${REPORT_DIR}/consolidated/config.json"
+    found=1
   fi
   for report in "${REPORT_DIR}"/image-*.json "${REPORT_DIR}"/config-packaged-*.json; do
-    [ -f "${report}" ] && reports+=("${report}")
+    [ -f "${report}" ] || continue
+    echo "${report}"
+    found=1
   done
-  [ "${#reports[@]}" -gt 0 ] || { echo "Error: no complete scan reports" >&2; return 2; }
+  [ "${found}" -eq 1 ] || { echo "Error: no complete scan reports" >&2; return 2; }
+}
+
+gate() {
+  local report result findings=0 list
+  list="$(gate_reports)" || return $?
+  local reports=()
+  mapfile -t reports <<<"${list}"
 
   for report in "${reports[@]}"; do
     set +e
@@ -419,6 +430,9 @@ case "${1:-}" in
     require_trivy
     gate
     ;;
+  reports)
+    gate_reports
+    ;;
   prepare-sarif)
     require_trivy
     prepare_sarif
@@ -440,6 +454,7 @@ Usage:
   trivy-scan.sh config [--chart-ref <oci-ref>]...
   trivy-scan.sh images <image-ref> [<image-ref>...]
   trivy-scan.sh gate
+  trivy-scan.sh reports
   trivy-scan.sh prepare-sarif
   trivy-scan.sh gate-config-diff <baseline-reports> <candidate-reports>
   trivy-scan.sh validate-ignore

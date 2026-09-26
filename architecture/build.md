@@ -552,6 +552,13 @@ High or Critical Codex Security findings fail qualification. CodeQL, Trivy, and
 Zizmor findings are temporarily informational while the findings accepted for
 v0.1.0 are addressed in 0.1.x releases.
 
+CodeQL, Trivy, and Zizmor findings pass when a current entry in
+`security-dispositions.toml` covers them. Each scanner's enforce step runs
+`tasks/scripts/security_dispositions.py`, staged with the dispositions file from
+the workflow revision before the candidate is checked out, so a candidate
+cannot approve its own findings. Deferrals expire; uncovered or expired findings
+fail as before.
+
 The `Release Qualification` job aggregates security, conformance, feature,
 Docker E2E, and VM E2E results. The currently implemented profile gates stable
 publication, but it does not represent complete RFC 0014 qualification. For a

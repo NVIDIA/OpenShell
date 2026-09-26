@@ -132,6 +132,27 @@ jobs:
       contents: read
       security-events: write
     steps:
+      # The disposition gate comes from the workflow's own revision, so a
+      # scanned candidate cannot approve its own findings. Cone-mode sparse
+      # checkout also includes root files such as security-dispositions.toml.
+      - name: Check out the workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: workflow-revision
+          sparse-checkout: tasks/scripts
+          persist-credentials: false
+
+      - name: Stage the disposition gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$RUNNER_TEMP/dispositions"
+          cp workflow-revision/tasks/scripts/security_dispositions.py "$RUNNER_TEMP/dispositions/"
+          if [ -f workflow-revision/security-dispositions.toml ]; then
+            cp workflow-revision/security-dispositions.toml "$RUNNER_TEMP/dispositions/"
+          fi
+          rm -rf workflow-revision
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         id: checkout
         with:
@@ -170,7 +191,6 @@ jobs:
           finding_count=$(jq '
             [.[] | select(.ignored != true and .determinations.severity == "High")] | length
           ' reports/zizmor-high.json)
-          echo "high_count=$finding_count" >> "$GITHUB_OUTPUT"
           {
             echo "### Zizmor high-severity report"
             echo
@@ -214,13 +234,12 @@ jobs:
       - name: Enforce HIGH/CRITICAL threshold
         if: ${{ !cancelled() && steps.findings.outcome == 'success' }}
         env:
-          HIGH_COUNT: ${{ steps.findings.outputs.high_count }}
           FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings || false }}
+        shell: bash
         run: |
-          if [ "$HIGH_COUNT" -gt 0 ]; then
-            if [ "$FAIL_ON_FINDINGS" = "true" ]; then
-              echo "::error::Zizmor reported $HIGH_COUNT HIGH findings."
-              exit 1
-            fi
-            echo "::warning::Zizmor reported $HIGH_COUNT HIGH findings; enforcement is disabled."
-          fi
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/dispositions/security_dispositions.py" gate \
+            --scanner zizmor \
+            --fail-on-findings "$FAIL_ON_FINDINGS" \
+            --dispositions "$RUNNER_TEMP/dispositions/security-dispositions.toml" \
+            reports/zizmor-high.json
