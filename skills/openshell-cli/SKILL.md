@@ -858,6 +858,12 @@ runtime validation failure.
 
 ## Workflow 10: Service Access
 
+For protocols that send EOF before receiving a reply, use `forward service`
+and keep reading after closing the local socket's write direction. Independent
+response FIN requires support throughout the CLI/gateway/supervisor path. See
+[forwarding stream lifecycle](https://docs.nvidia.com/openshell/latest/reference/stream-lifecycle.md)
+for mixed-version fallback, deadlines, and cancellation behavior.
+
 Use `forward` for local access and `service` for a gateway-managed HTTP endpoint:
 
 ```bash

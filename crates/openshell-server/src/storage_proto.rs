@@ -118,12 +118,10 @@ mod tests {
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
-    // Carries this branch's exec request IDs together with main's opaque watch
-    // cursor and well-known time types. These unreleased public-only fields add
-    // no messages or enums and touch no stored type, so the durable and overlap
-    // fingerprints below remain unchanged.
+    // Public relay lifecycle additions do not change persisted types. The
+    // durable and overlap fingerprints below remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "8fb59b0932ec2f227fdec2d46b6204925e79595695810a247bef731ddd632594";
+        "6edd71598f22b1e99a85d63067e3b574da823d7f16f2841b092152476858f66b";
     const DURABLE_SCHEMA_SHA256: &str =
         "9eeaa29dfba187bff69fb7bc4f9a13a0f1d7be3f7049a38c8f0e20ce77ec7d8b";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -590,7 +588,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (304, 25),
+                (305, 26),
                 (92, 19),
                 (80, 19),
                 PUBLIC_RPC_SCHEMA_SHA256,

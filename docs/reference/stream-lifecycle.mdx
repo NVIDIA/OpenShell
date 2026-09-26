@@ -1,0 +1,46 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Forwarding Stream Lifecycle"
+description: "Directional closure, cancellation, and compatibility for TCP forwarding and supervisor relays."
+position: 12
+---
+
+`ForwardTcp`, `RelayStream`, and `PeerRelay` carry independent request and response byte streams. A directional close ends bytes in one direction. Cancellation aborts the whole operation.
+
+## Close input and receive output
+
+Send the initialization frame once, followed by data frames. Close the request stream to signal input EOF. Continue reading responses until the RPC finishes, including its final status. Closing input does not discard a delayed response.
+
+After initialization, an additional init, an empty or unknown payload, or a request `half_close` frame returns `INVALID_ARGUMENT`. An empty data frame remains valid. The server does not impose a new application-idle or half-closed timeout; use a deadline or cancel the RPC when you need a bound.
+
+## Negotiate response closure
+
+Advertise `stream-half-close-v1` in the init frame's `capabilities` to accept response `half_close` frames. Unknown capability strings are ignored. Supervisors advertise support in `SupervisorHello`, use the capabilities returned in `SessionAccepted`, and include that session ID with the negotiated `RelayInit`. Gateways negotiate each `PeerRelay` hop independently.
+
+A response `half_close` follows all response bytes and closes only that direction. You can continue sending input. Keep reading the RPC after that frame: success requires both directions to finish, and a later error status still fails the operation. Repeated response FIN or data after FIN is a protocol error.
+
+Gateways also require downstream support before emitting response FIN. A `PeerRelay` response confirms effective support with `openshell-stream-half-close: v1` in its initial metadata. Missing metadata or a legacy supervisor downgrades the upstream forwarding path to response EOF. This uses the existing RPC initialization, without an additional application-data handshake.
+
+`openshell forward service` translates this response frame into a write shutdown on the local TCP socket. The SSH stdio proxy retains legacy response EOF because its stdout is a process descriptor, not an independently closable socket direction. Existing SDK `Close` methods retain their meanings; this extension does not change curated SDK interfaces.
+
+## Abort a relay
+
+`RelayClose` on `ConnectSupervisor` aborts a channel owned by that sandbox and supervisor session. Its typed code distinguishes `CANCELLED`, `DEADLINE_EXCEEDED`, `INVALID_ARGUMENT`, and `UNAVAILABLE`. Unknown or unspecified codes map to `UNAVAILABLE`; the human-readable reason is diagnostic.
+
+An abort interrupts blocked I/O and can discard buffered bytes. The first observed abort wins. The data stream's final status remains authoritative; a control message that arrives after completion cannot revise it. If a transport disconnect prevents delivery of the typed reason, the transport error remains the fallback.
+
+Losing the control stream alone does not cancel established data relays. They continue until their data stream finishes or fails. A replacement control session cannot cancel channels owned by the previous session. This does not guarantee survival of a shared transport failure or gateway restart.
+
+## Compatibility and behavior changes
+
+The protobuf additions preserve existing field numbers. Servers send response FIN frames only to peers advertising support. Legacy internal relays keep draining target replies after input EOF. Forward-facing RPCs still use legacy response EOF to finish the operation, so a mixed-version path cannot preserve further requests after response EOF. Upgrade the CLI, gateways, and supervisor runtime to use independent directional closure throughout a routed connection.
+
+The following behavior changes need release review even though the wire additions are compatible:
+
+- Malformed post-init frames now fail explicitly instead of being ignored or treated as closure.
+- Relay I/O and trailer errors now reach callers instead of appearing as successful EOF.
+- `RelayClose` now cancels the owned operation instead of only recording an event.
+- Negotiated streams can remain open after one direction closes, until the other finishes or the caller cancels.
+
+There is no automatic replay of application bytes or new reconnect guarantee.
