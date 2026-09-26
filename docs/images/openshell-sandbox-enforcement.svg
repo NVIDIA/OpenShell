@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="540" viewBox="0 0 1280 540" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="420" viewBox="0 0 1280 420" role="img" aria-labelledby="title desc">
   <title id="title">OpenShell sandbox enforcement flow</title>
-  <desc id="desc">The sandbox workload and trusted supervisor are separate boundaries. All workload network egress is denied except the authenticated Sandbox Protocol connection to the supervisor.</desc>
+  <desc id="desc">The sandbox workload and trusted supervisor are separate boundaries. All workload network egress is denied except the authenticated Sandbox Protocol connection to the supervisor. The OpenShell Sandbox holds a local policy.local file that carries proposed policy changes to the supervisor's policy enforcement for review, and receives the reloaded policy back.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
@@ -21,13 +21,16 @@
       .soft { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 2; }
       .green { fill: #f2f9e8; stroke: #76b900; stroke-width: 2.5; }
       .trusted { fill: #eff6ff; stroke: #3b82f6; stroke-width: 2.5; }
+      .owned { fill: #eff6ff; stroke: #3b82f6; stroke-width: 2.5; }
       .dark { fill: #1f2937; stroke: #111827; stroke-width: 2; }
       .flow { fill: none; stroke: #579000; stroke-width: 3; marker-end: url(#arrow-green); }
       .blocked { fill: none; stroke: #c2413b; stroke-width: 2.5; stroke-dasharray: 8 7; }
+      .policy { fill: none; stroke: #475569; stroke-width: 2; stroke-dasharray: 6 6; marker-end: url(#arrow); }
+      .chip { fill: #eff6ff; stroke: #3b82f6; stroke-width: 1.5; }
     </style>
   </defs>
 
-  <rect width="1280" height="540" rx="20" fill="#ffffff"/>
+  <rect width="1280" height="420" rx="20" fill="#ffffff"/>
 
   <g transform="translate(0,-50)">
 
@@ -37,10 +40,12 @@
   <rect x="75" y="205" width="125" height="94" rx="14" class="dark"/>
   <text x="137" y="245" text-anchor="middle" style="font:700 20px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#fff">Agent</text>
   <text x="137" y="270" text-anchor="middle" style="font:500 13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#d1d5db">process</text>
-  <rect x="240" y="190" width="130" height="124" rx="14" class="box"/>
-  <text x="305" y="230" text-anchor="middle" class="label">OpenShell</text>
-  <text x="305" y="254" text-anchor="middle" class="label">Sandbox</text>
-  <text x="305" y="282" text-anchor="middle" class="small">process owner</text>
+  <rect x="240" y="190" width="130" height="124" rx="14" class="owned"/>
+  <text x="305" y="222" text-anchor="middle" class="label">OpenShell</text>
+  <text x="305" y="244" text-anchor="middle" class="label">Sandbox</text>
+  <text x="305" y="264" text-anchor="middle" class="small">process owner</text>
+  <rect x="253" y="278" width="104" height="24" rx="6" class="chip"/>
+  <text x="305" y="294" text-anchor="middle" class="tiny">policy.local</text>
   <path d="M200 252 H240" class="flow"/>
   <circle cx="220" cy="228" r="13" fill="#579000"/>
   <text x="220" y="233" text-anchor="middle" class="step">1</text>
@@ -76,6 +81,9 @@
   <text x="935" y="360" text-anchor="middle" class="small">Checks destination, binary,</text>
   <text x="935" y="381" text-anchor="middle" class="small">L7 rules, and credentials</text>
 
+  <path d="M357 290 H410 V170 H935 V190" class="policy"/>
+  <text x="670" y="163" text-anchor="middle" class="tiny">POLICY.LOCAL PROPOSE / RELOAD (ASYNC)</text>
+
   <rect x="1080" y="190" width="160" height="124" rx="14" class="box"/>
   <text x="1160" y="230" text-anchor="middle" class="label">Upstream</text>
   <text x="1160" y="254" text-anchor="middle" class="label">service</text>
@@ -83,23 +91,5 @@
   <path d="M1010 252 H1080" class="flow"/>
   <circle cx="1045" cy="228" r="13" fill="#579000"/>
   <text x="1045" y="233" text-anchor="middle" class="step">4</text>
-
-  <text x="45" y="485" class="section">LAUNCH GATE</text>
-  <line x1="150" y1="520" x2="1130" y2="520" stroke="#cbd5e1" stroke-width="4"/>
-  <g>
-    <circle cx="180" cy="520" r="20" fill="#ffffff" stroke="#64748b" stroke-width="3"/>
-    <text x="180" y="555" text-anchor="middle" class="tiny">ATTACH</text>
-    <circle cx="380" cy="520" r="20" fill="#ffffff" stroke="#64748b" stroke-width="3"/>
-    <text x="380" y="555" text-anchor="middle" class="tiny">BOUND</text>
-    <circle cx="580" cy="520" r="20" fill="#f2f9e8" stroke="#76b900" stroke-width="4"/>
-    <text x="580" y="555" text-anchor="middle" class="tiny">CONFIRMED</text>
-    <circle cx="780" cy="520" r="20" fill="#f2f9e8" stroke="#76b900" stroke-width="4"/>
-    <text x="780" y="555" text-anchor="middle" class="tiny">READY</text>
-    <circle cx="980" cy="520" r="20" fill="#76b900" stroke="#579000" stroke-width="4"/>
-    <text x="980" y="526" text-anchor="middle" class="step">✓</text>
-    <text x="980" y="555" text-anchor="middle" class="tiny">RUNNING</text>
-  </g>
-  <path d="M600 485 H950" stroke="#76b900" stroke-width="2"/>
-  <text x="775" y="477" text-anchor="middle" class="small">Agent cannot start until the boundary is confirmed</text>
   </g>
 </svg>
