@@ -107,6 +107,8 @@ const BOUNDARY_CERTIFICATE_MOUNT_PATH: &str = "/.openshell/channel/sandbox/serve
 const BOUNDARY_PRIVATE_KEY_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.key";
 const SUPERVISOR_STATE_MOUNT_PATH: &str = "/.openshell/supervisor";
 const SUPERVISOR_PROXY_AUTH_MOUNT_PATH: &str = "/.openshell/supervisor/upstream-proxy-auth";
+const SUPERVISOR_PROXY_CA_BUNDLE_MOUNT_PATH: &str =
+    "/.openshell/supervisor/upstream-proxy-ca-bundle.pem";
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
     openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
 const DRIVER_ADMITTED_BACKEND: &str = openshell_sandbox_backend::BACKEND_NAME;
@@ -218,6 +220,10 @@ pub struct DockerComputeConfig {
     #[serde(flatten)]
     pub upstream_proxy: UpstreamProxyConfig,
 
+    /// Gateway-host PEM CA bundle trusted for the corporate proxy and for
+    /// server certificates re-signed by a TLS-intercepting proxy.
+    pub proxy_ca_bundle: Option<PathBuf>,
+
     /// Host UNIX socket projected into the supervisor for provider identity.
     pub provider_spiffe_workload_api_socket: Option<PathBuf>,
 
@@ -242,6 +248,7 @@ impl DockerComputeConfig {
         validate_image_pull_policy(self.image_pull_policy)?;
         self.upstream_proxy.validate().map_err(Error::config)?;
         validate_docker_proxy_auth_file(&self.upstream_proxy)?;
+        validate_docker_proxy_ca_bundle(self)?;
         if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
             openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
                 .map_err(Error::config)?;
@@ -276,6 +283,7 @@ impl Default for DockerComputeConfig {
             sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
             enable_bind_mounts: false,
             upstream_proxy: UpstreamProxyConfig::default(),
+            proxy_ca_bundle: None,
             provider_spiffe_workload_api_socket: None,
             app_armor_profile: None,
         }
@@ -307,6 +315,7 @@ struct DockerDriverRuntimeConfig {
     sandbox_pids_limit: Option<std::num::NonZeroI64>,
     enable_bind_mounts: bool,
     upstream_proxy: UpstreamProxyConfig,
+    proxy_ca_bundle: Option<PathBuf>,
     provider_spiffe_workload_api_socket: Option<PathBuf>,
     app_armor_profile: Option<AppArmorProfile>,
 }
@@ -837,10 +846,7 @@ impl DockerComputeDriver {
         gateway_log_level: &str,
         docker_config: &DockerComputeConfig,
     ) -> CoreResult<Self> {
-        docker_config
-            .resource_admission
-            .validate()
-            .map_err(Error::config)?;
+        docker_config.validate_configuration(gateway_bind_address)?;
         let socket_path = docker_config
             .socket_path
             .clone()
@@ -873,15 +879,8 @@ impl DockerComputeDriver {
             cdi_supported,
             wsl_all_gpu_fallback_enabled,
         };
-        validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
-        validate_image_pull_policy(docker_config.image_pull_policy)?;
         validate_docker_app_armor_profile(docker_config.app_armor_profile.as_ref(), &info)?;
         let gateway_port = gateway_bind_address.port();
-        if gateway_port == 0 {
-            return Err(Error::config(
-                "docker compute driver requires a fixed non-zero gateway bind port",
-            ));
-        }
         let mut docker_config = docker_config.clone();
         if docker_config.grpc_endpoint.trim().is_empty() {
             docker_config.grpc_endpoint = default_docker_supervisor_grpc_endpoint(
@@ -947,6 +946,7 @@ impl DockerComputeDriver {
                 allow_driver_config: docker_config.allow_driver_config,
                 resource_admission: docker_config.resource_admission.clone(),
                 upstream_proxy: docker_config.upstream_proxy.clone(),
+                proxy_ca_bundle: docker_config.proxy_ca_bundle.clone(),
                 provider_spiffe_workload_api_socket: docker_config
                     .provider_spiffe_workload_api_socket
                     .clone(),
@@ -4713,9 +4713,33 @@ async fn docker_supervisor_bundle_archive(
             &contents,
         )?;
     }
+    append_docker_proxy_ca_bundle(&mut archive, config.proxy_ca_bundle.as_deref())?;
     archive
         .into_inner()
         .map_err(|error| Status::internal(format!("finish Docker supervisor archive: {error}")))
+}
+
+fn append_docker_proxy_ca_bundle(
+    archive: &mut tar::Builder<Vec<u8>>,
+    path: Option<&Path>,
+) -> Result<(), Status> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let path = path
+        .to_str()
+        .ok_or_else(|| Status::failed_precondition("proxy_ca_bundle must be valid UTF-8"))?;
+    let contents =
+        openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(path, "proxy_ca_bundle")
+            .map_err(Status::failed_precondition)?;
+    append_docker_archive_file(
+        archive,
+        "upstream-proxy-ca-bundle.pem",
+        0o644,
+        SUPERVISOR_UID,
+        SUPERVISOR_GID,
+        contents.as_bytes(),
+    )
 }
 
 async fn refresh_docker_boundary_authentication(
@@ -5120,7 +5144,10 @@ async fn spawn_docker_control_process(
         workspace_root,
         format!("--health-socket-path={SUPERVISOR_HEALTH_SOCKET_PATH}"),
     ];
-    command.extend(docker_upstream_proxy_cli_args(&config.upstream_proxy));
+    command.extend(docker_upstream_proxy_cli_args(
+        &config.upstream_proxy,
+        config.proxy_ca_bundle.is_some(),
+    ));
     let mut supervisor_mounts = vec![
         Mount {
             target: Some(BOUNDARY_MOUNT_PATH.to_string()),
@@ -5871,7 +5898,30 @@ fn validate_docker_proxy_auth_file(config: &UpstreamProxyConfig) -> CoreResult<(
     Ok(())
 }
 
-fn docker_upstream_proxy_cli_args(config: &UpstreamProxyConfig) -> Vec<String> {
+fn validate_docker_proxy_ca_bundle(config: &DockerComputeConfig) -> CoreResult<()> {
+    let Some(path) = config.proxy_ca_bundle.as_ref() else {
+        return Ok(());
+    };
+    if path.as_os_str().is_empty() {
+        return Err(Error::config("proxy_ca_bundle must not be empty when set"));
+    }
+    if config.upstream_proxy.https_proxy.is_none() {
+        return Err(Error::config(
+            "proxy_ca_bundle is set but no https_proxy is configured",
+        ));
+    }
+    let path = path
+        .to_str()
+        .ok_or_else(|| Error::config("proxy_ca_bundle must be valid UTF-8"))?;
+    openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(path, "proxy_ca_bundle")
+        .map_err(Error::config)?;
+    Ok(())
+}
+
+fn docker_upstream_proxy_cli_args(
+    config: &UpstreamProxyConfig,
+    proxy_ca_bundle_configured: bool,
+) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(url) = config.https_proxy.as_ref() {
         args.extend(["--upstream-proxy".to_string(), url.clone()]);
@@ -5890,6 +5940,12 @@ fn docker_upstream_proxy_cli_args(config: &UpstreamProxyConfig) -> Vec<String> {
     }
     if config.proxy_connect_by_hostname == Some(true) {
         args.push("--upstream-proxy-connect-by-hostname".to_string());
+    }
+    if proxy_ca_bundle_configured {
+        args.extend([
+            "--upstream-proxy-ca-bundle".to_string(),
+            SUPERVISOR_PROXY_CA_BUNDLE_MOUNT_PATH.to_string(),
+        ]);
     }
     args
 }

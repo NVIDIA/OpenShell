@@ -896,6 +896,13 @@ no_proxy = ".svc.cluster.local,10.0.0.0/8"
 # Optional root-owned host file containing user:pass. An http:// proxy also
 # requires proxy_auth_allow_insecure = true as an explicit acknowledgement.
 proxy_auth_file = "/etc/openshell/secrets/proxy-auth"
+proxy_auth_allow_insecure = false
+# Last resort for proxy ACLs that require hostname CONNECT targets. The proxy
+# then performs DNS resolution and becomes part of the effective egress boundary.
+proxy_connect_by_hostname = false
+# Operator-owned gateway-host PEM bundle trusted for an HTTPS proxy and for
+# destination certificates re-signed by a TLS-intercepting proxy.
+proxy_ca_bundle = "/etc/openshell/tls/proxy-ca.pem"
 # Project a host Unix Workload API socket into the supervisor for provider
 # token exchange. The socket parent must be a dedicated absolute directory.
 provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
@@ -903,6 +910,30 @@ provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
 
 Use `sandbox_label` for Docker configurations. The legacy
 `sandbox_namespace` key is rejected.
+
+Docker accepts `http://` and `https://` proxy URLs in explicit
+`scheme://host:port` form. `no_proxy` bypasses only the corporate proxy;
+OpenShell policy still applies. Proxy URLs cannot embed credentials. Supply a
+`user:pass` file with `proxy_auth_file`, and set
+`proxy_auth_allow_insecure = true` only to acknowledge that Basic credentials
+travel in cleartext to an `http://` proxy.
+
+`proxy_ca_bundle` requires `https_proxy`, but the configured proxy URL may use
+either scheme because a plain HTTP proxy can still intercept destination TLS.
+The file must be a readable, bounded PEM bundle containing a usable certificate
+authority. Docker validates it at gateway startup and again before each
+supervisor launch. Missing, unreadable, empty, oversized, malformed, and
+certificate-free bundles fail closed rather than falling back to default trust
+or direct egress.
+
+The gateway-host path is operator-owned and cannot be selected through sandbox
+environment, image contents, or `template.driver_config.docker`. The driver
+copies the validated contents into its supervisor-only named volume and passes
+the fixed path `/.openshell/supervisor/upstream-proxy-ca-bundle.pem` to the
+companion supervisor. The bundle extends trust for the TLS connection to an
+`https://` proxy, supervisor connections to re-signed upstream certificates,
+and the combined trust bundle exposed to workload processes. The gateway-host
+path is never mounted into or exposed to the workload container.
 
 ### Podman
 
