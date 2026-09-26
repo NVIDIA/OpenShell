@@ -125,6 +125,7 @@
           firmwarePkgs = tmachineRuntimePkgs;
         };
         artifacts = pkgs.callPackage ./tests/artifacts.nix { inherit rustToolchain toolchains; };
+        rustTasks = pkgs.callPackage ./nix/rust-tasks.nix { inherit rustToolchain toolchains; };
       in
       {
         apps = {
@@ -150,6 +151,34 @@
           };
           test-guest = testGuest.app;
           test-guest-cache = testGuest.cacheApp;
+          rust-check = {
+            type = "app";
+            program = "${rustTasks.check}/bin/openshell-rust-check";
+          };
+          cargo-lockfiles = {
+            type = "app";
+            program = "${rustTasks.lockfiles}/bin/openshell-cargo-lockfiles";
+          };
+          rust-lint = {
+            type = "app";
+            program = "${rustTasks.lint}/bin/openshell-rust-lint";
+          };
+          rust-format = {
+            type = "app";
+            program = "${rustTasks.format}/bin/openshell-rust-format";
+          };
+          rust-format-check = {
+            type = "app";
+            program = "${rustTasks.formatCheck}/bin/openshell-rust-format-check";
+          };
+          rust-deny-policy = {
+            type = "app";
+            program = "${rustTasks.denyPolicy}/bin/openshell-rust-deny-policy";
+          };
+          rust-test = {
+            type = "app";
+            program = "${rustTasks.test}/bin/openshell-rust-test";
+          };
         };
 
         packages = {

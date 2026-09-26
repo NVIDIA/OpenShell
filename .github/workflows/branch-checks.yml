@@ -87,23 +87,17 @@ jobs:
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
-    defaults:
-      run:
-        shell: nix develop .#devShells.x86_64-linux.default -c bash -euo pipefail {0}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      # Flake apps declare their own runtime tools and toolchain environment, so
+      # they do not need to run inside the broader development shell.
+      - uses: ./.github/actions/setup-nix
         with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
-        with:
-          name: openshell
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Check dependencies
-        run: cargo deny check licenses bans sources
+        run: nix run .#rust-deny-policy
 
   rust-format:
     name: Rust format
@@ -119,12 +113,7 @@ jobs:
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Format
-        shell: nix develop -c bash -euo pipefail {0}
-        run: |
-          cargo fmt --all -- --check
-          cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check
-          cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check
-          cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check
+        run: nix run .#rust-format-check
 
   cargo-lockfiles:
     name: Cargo lockfiles
@@ -140,8 +129,7 @@ jobs:
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Verify Cargo lockfiles
-        shell: nix develop -c bash -euo pipefail {0}
-        run: tasks/scripts/check-cargo-lockfiles.sh
+        run: nix run .#cargo-lockfiles
 
   rust-lint:
     name: Rust lint (${{ matrix.system }})
@@ -172,12 +160,7 @@ jobs:
           save-cache: "false"
 
       - name: Lint
-        shell: nix develop -c bash -euo pipefail {0}
-        run: |
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo clippy --locked --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
-          cargo clippy --locked --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings
-          cargo clippy --locked --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings
+        run: nix run .#rust-lint
 
   rust-test:
     name: Rust test (${{ matrix.system }})
@@ -208,12 +191,7 @@ jobs:
           save-cache: "true"
 
       - name: Test
-        shell: nix develop -c bash -euo pipefail {0}
-        env:
-          OPENSHELL_TELEMETRY_ENABLED: "false"
-        run: |
-          cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
-          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
+        run: nix run .#rust-test
 
   rust-build-modes:
     name: Rust build modes (${{ matrix.system }})
