@@ -1220,46 +1220,6 @@ openshell_snap_channel() {
   esac
 }
 
-# Fallback for snap revisions that predate the install hook, which serve
-# plaintext HTTP. Current revisions create an mTLS config in their install
-# hook, and their post-refresh hook migrates this legacy default.
-ensure_snap_gateway_config() {
-  _config_file="${1:-/var/snap/openshell/common/gateway.toml}"
-
-  as_root sh -c '
-    set -eu
-    config_file=$1
-    if [ -e "$config_file" ] || [ -L "$config_file" ]; then
-      exit 0
-    fi
-
-    config_dir=${config_file%/*}
-    mkdir -p "$config_dir"
-    umask 077
-    temporary_file=$(mktemp "${config_file}.tmp.XXXXXX")
-    trap '\''rm -f "$temporary_file"'\'' 0 HUP INT TERM
-
-    cat >"$temporary_file" <<'\''EOF'\''
-[openshell]
-version = 2
-
-[openshell.gateway]
-
-[openshell.gateway.auth]
-allow_unauthenticated_users = true
-EOF
-
-    if ! ln "$temporary_file" "$config_file"; then
-      if [ -e "$config_file" ] || [ -L "$config_file" ]; then
-        exit 0
-      fi
-      exit 1
-    fi
-    rm -f "$temporary_file"
-    trap - 0 HUP INT TERM
-  ' sh "$_config_file"
-}
-
 wait_for_docker_daemon() {
   _timeout="${OPENSHELL_INSTALL_DOCKER_TIMEOUT:-30}"
   _elapsed=0
@@ -1299,15 +1259,21 @@ copy_snap_client_bundle() {
   done
 }
 
+# Snap revisions that require mTLS ship the post-refresh hook that migrates
+# older plaintext configs.
+snap_gateway_uses_mtls() {
+  [ -e "${OPENSHELL_SNAP_DIR:-/snap/openshell/current}/meta/hooks/post-refresh" ]
+}
+
 register_snap_gateway() {
   _register_bin="${OPENSHELL_REGISTER_BIN:-/snap/bin/openshell}"
-  _scheme="${SNAP_GATEWAY_SCHEME:-https}"
-  _endpoint="${_scheme}://127.0.0.1:${LOCAL_GATEWAY_PORT}"
 
-  if [ "$_scheme" = "https" ]; then
+  if snap_gateway_uses_mtls; then
+    _endpoint="https://127.0.0.1:${LOCAL_GATEWAY_PORT}"
     info "copying the gateway client certificate for ${TARGET_USER}..."
     copy_snap_client_bundle
   else
+    _endpoint="http://127.0.0.1:${LOCAL_GATEWAY_PORT}"
     warn "this OpenShell snap revision serves plaintext HTTP without client authentication; any local user can operate the gateway"
   fi
 
@@ -1331,32 +1297,28 @@ register_snap_gateway() {
   esac
 }
 
-# Wait for the snap gateway and record its scheme in SNAP_GATEWAY_SCHEME.
-# Current revisions require a client certificate during the TLS handshake, so
-# probe HTTPS with the root-owned client bundle. Earlier revisions serve
-# plaintext gRPC; a TLS gateway also answers plaintext loopback HTTP for
-# sandbox service routing, so only a successful plaintext gRPC Health call
-# identifies a legacy gateway.
+# The mTLS gateway rejects TLS handshakes without a client certificate, so
+# probe it with the root-owned client bundle.
 wait_for_snap_gateway_listener() {
   _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
   _last_output=""
   _tls_dir="${OPENSHELL_SNAP_TLS_DIR:-/var/snap/openshell/common/tls}"
-  _probe_url="https://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+
+  if snap_gateway_uses_mtls; then
+    _probe_url="https://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+    _probe_as=as_root
+    set -- --cacert "${_tls_dir}/ca.crt" \
+      --cert "${_tls_dir}/client/tls.crt" --key "${_tls_dir}/client/tls.key"
+  else
+    _probe_url="http://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+    _probe_as=""
+    set --
+  fi
 
   info "waiting for local gateway listener to become reachable..."
   while [ "$_elapsed" -lt "$_timeout" ]; do
-    if _last_output="$(as_root curl -sS --max-time 2 \
-      --cacert "${_tls_dir}/ca.crt" \
-      --cert "${_tls_dir}/client/tls.crt" \
-      --key "${_tls_dir}/client/tls.key" \
-      -o /dev/null "$_probe_url" 2>&1)"; then
-      SNAP_GATEWAY_SCHEME=https
-      info "local gateway listener is reachable"
-      return 0
-    fi
-    if [ "$(snap_legacy_grpc_health_status)" = "200" ]; then
-      SNAP_GATEWAY_SCHEME=http
+    if _last_output="$($_probe_as curl -sS --max-time 2 "$@" -o /dev/null "$_probe_url" 2>&1)"; then
       info "local gateway listener is reachable"
       return 0
     fi
@@ -1367,16 +1329,6 @@ wait_for_snap_gateway_listener() {
   [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
   dump_local_gateway_diagnostics
   error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
-}
-
-# Print the HTTP status of an empty plaintext gRPC Health call.
-snap_legacy_grpc_health_status() {
-  printf '\000\000\000\000\000' |
-    curl -s --max-time 2 --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
-      -X POST -H 'content-type: application/grpc' -H 'te: trailers' \
-      --data-binary @- \
-      "http://127.0.0.1:${LOCAL_GATEWAY_PORT}/openshell.v1.OpenShell/Health" 2>/dev/null ||
-    true
 }
 
 install_linux_snap() {
@@ -1404,7 +1356,6 @@ Install Docker Engine from a system package or Docker's package repository, then
     as_root snap install openshell --channel="$_channel"
   fi
 
-  ensure_snap_gateway_config
   as_root snap restart openshell.gateway
 
   info "installed OpenShell snap from ${_channel}"

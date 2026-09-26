@@ -35,12 +35,10 @@ description: |
 
          snap services openshell.gateway
          d=~/snap/openshell/common/.local/state/openshell/tls
-         mkdir -p -m 700 "$d/client"
-         sudo cat /var/snap/openshell/common/tls/ca.crt > "$d/ca.crt"
-         sudo cat /var/snap/openshell/common/tls/client/tls.crt > "$d/client/tls.crt"
-         (umask 077; sudo cat /var/snap/openshell/common/tls/client/tls.key > "$d/client/tls.key")
-         chmod 700 "$d" "$d/client"
-         chmod 600 "$d/ca.crt" "$d/client/tls.crt" "$d/client/tls.key"
+         mkdir -p -m 700 "$d" "$d/client"
+         sudo install -o "$USER" -m 600 /var/snap/openshell/common/tls/ca.crt "$d/"
+         sudo install -o "$USER" -m 600 -t "$d/client" \
+           /var/snap/openshell/common/tls/client/tls.crt /var/snap/openshell/common/tls/client/tls.key
          openshell gateway add https://127.0.0.1:17670 --local --name openshell
          openshell status
 
