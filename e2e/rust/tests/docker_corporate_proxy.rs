@@ -208,12 +208,15 @@ def run(*args):
 
 run('openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
     '-keyout', ca_key, '-out', ca_crt, '-days', '1',
-    '-subj', '/CN=vm-corp-proxy-e2e-ca')
+    '-subj', '/CN=docker-corp-proxy-e2e-ca',
+    '-addext', 'basicConstraints=critical,CA:TRUE',
+    '-addext', 'keyUsage=critical,keyCertSign,cRLSign')
 
 with open(ext, 'w') as fh:
     fh.write('basicConstraints=critical,CA:FALSE\n'
              'subjectAltName=DNS:{HOST_ALIAS}\n'
-             'extendedKeyUsage=serverAuth\n')
+             'extendedKeyUsage=serverAuth\n'
+             'keyUsage=critical,digitalSignature,keyEncipherment\n')
 run('openssl', 'req', '-newkey', 'rsa:2048', '-nodes',
     '-keyout', leaf_key, '-out', leaf_csr, '-subj', '/CN={HOST_ALIAS}')
 run('openssl', 'x509', '-req', '-in', leaf_csr, '-CA', ca_crt, '-CAkey', ca_key,
