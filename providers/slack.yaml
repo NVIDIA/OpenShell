@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/slack.yaml
+#   openshell provider profile import -f providers/slack.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   curl (or your own Slack client; edit `binaries` to match).
+# Reference layout:  curl on PATH at /usr/bin or /usr/local/bin.
+# Credential scope:  a Slack user access token from an app with token rotation
+#                    enabled, as SLACK_USER_TOKEN (alias SLACK_TOKEN), sent as a
+#                    bearer authorization header to slack.com and nowhere else.
+#                    Configure the refresh material (client_id, client_secret,
+#                    refresh_token) with `openshell provider refresh configure`;
+#                    it stays at the gateway and is never injected. Slack access
+#                    tokens live 43200 s and refresh tokens are single use, so
+#                    only the gateway should refresh them.
+# Endpoint access:   slack.com:443 with the read-write method preset (Slack Web
+#                    API methods are POST even for reads). Add `rules` for the
+#                    methods your workload needs.
+# Smoke test:        openshell sandbox create --provider <name> -- \
+#                      curl -s -X POST https://slack.com/api/auth.test \
+#                        -H "Authorization: Bearer $SLACK_USER_TOKEN"
+
+id: slack
+display_name: Slack
+description: Slack Web API access with gateway-managed user token rotation
+category: messaging
+
+credentials:
+  # Rotating user token (xoxe.xoxp-...). Slack apps with token rotation
+  # enabled issue 12-hour access tokens together with a single-use refresh
+  # token on every rotation; the gateway refreshes through oauth.v2.access.
+  # Configure with `openshell provider refresh configure`.
+  - name: user_token
+    description: Slack user access token
+    env_vars: [SLACK_USER_TOKEN, SLACK_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+    refresh:
+      strategy: oauth2_refresh_token
+      token_url: https://slack.com/api/oauth.v2.access
+      # Slack access tokens live exactly 43200 seconds. The cap must match,
+      # otherwise the default 3600-second cap would schedule refreshes far
+      # too often and burn single-use refresh tokens.
+      refresh_before_seconds: 21600
+      max_lifetime_seconds: 43200
+      material:
+        - name: client_id
+          description: Slack app client ID
+          required: true
+        - name: client_secret
+          description: Slack app client secret (required by Slack on refresh)
+          required: true
+          secret: true
+        - name: refresh_token
+          description: Slack rotating refresh token (xoxe-1-...)
+          required: true
+          secret: true
+
+discovery:
+  credentials: [user_token]
+
+endpoints:
+  # Slack Web API methods are POST even for reads, so the read-only
+  # method preset is unusable; read-write is the minimum working preset.
+  - host: slack.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl

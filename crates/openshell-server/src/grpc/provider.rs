@@ -6303,7 +6303,8 @@ mod tests {
                 "nvidia",
                 "openai",
                 "openrouter",
-                "pypi"
+                "pypi",
+                "slack"
             ]
         );
 
