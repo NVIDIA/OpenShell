@@ -30,7 +30,6 @@ cat >"$temporary_file" <<'CONFIG'
 version = 2
 
 [openshell.gateway]
-compute_driver = "docker"
 CONFIG
 mv -f "$temporary_file" "$config_file"
 trap - 0 HUP INT TERM

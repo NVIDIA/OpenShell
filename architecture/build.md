@@ -341,7 +341,7 @@ certificates reside in root-owned snap state. The installer copies the client
 bundle into the target user's private Snap state and registers the TLS endpoint;
 direct Snap installs require the same enrollment. The install and post-refresh
 hooks replace configs that explicitly enable plaintext or unauthenticated access
-with the secure Docker default. Snap refreshes
+with the secure default. Snap refreshes
 restart the gateway so the migrated config takes effect immediately.
 
 Debian and RPM packages instead run systemd user services with user-owned mTLS

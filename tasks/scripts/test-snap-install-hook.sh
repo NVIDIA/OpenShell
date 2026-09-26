@@ -16,7 +16,6 @@ cat >"$expected" <<'EOF'
 version = 2
 
 [openshell.gateway]
-compute_driver = "docker"
 EOF
 
 legacy="${work}/legacy.toml"
