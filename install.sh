@@ -61,21 +61,22 @@ ENVIRONMENT VARIABLES:
     OPENSHELL_ACK_BREAKING_UPGRADE
                         Set to 1 only after backing up and cleaning up a
                         pre-v0.0.37 or non-snap installation.
+    OPENSHELL_INSTALL_METHOD
+                        Linux package to install: snap, deb, or rpm. Unset
+                        selects deb or rpm from the host package manager.
 
 NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
     from ${GITHUB_URL}/releases/latest.
 
-    On Linux, the installer uses the OpenShell snap when the snap command is
-    available and OPENSHELL_VERSION is unset or dev. Snap installs use
-    latest/stable by default and latest/edge for dev. Explicit release tags
-    and prereleases use Debian or RPM packages. The OpenShell snap requires a
-    running Docker Engine installed from a system package or Docker's package
+    Linux installs the Debian package on amd64/arm64 or the RPM packages on
+    x86_64/aarch64, depending on the host package manager. Set
+    OPENSHELL_INSTALL_METHOD=snap to install the OpenShell snap instead; hosts
+    that already have the OpenShell snap keep refreshing it. Snap installs use
+    latest/stable by default and latest/edge for dev, and do not support
+    explicit release tags or prereleases. The OpenShell snap requires a running
+    Docker Engine installed from a system package or Docker's package
     repository. The Docker snap is not currently compatible with OpenShell.
-
-    For explicit versions or without snap, Linux installs the Debian package
-    on amd64/arm64 or the RPM packages on x86_64/aarch64, depending on the
-    host package manager.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF
@@ -658,9 +659,20 @@ local_gateway_endpoint() {
 }
 
 linux_package_method() {
+  case "${OPENSHELL_INSTALL_METHOD:-}" in
+    snap | deb | rpm)
+      echo "$OPENSHELL_INSTALL_METHOD"
+      return 0
+      ;;
+    '') ;;
+    *) error "unsupported OPENSHELL_INSTALL_METHOD=${OPENSHELL_INSTALL_METHOD}; use snap, deb, or rpm" ;;
+  esac
+
+  # Keep refreshing an existing snap install instead of adding a second
+  # gateway on the same port.
   case "${OPENSHELL_VERSION:-}" in
     '' | dev)
-      if has_cmd snap; then
+      if has_cmd snap && snap list openshell >/dev/null 2>&1; then
         echo "snap"
         return 0
       fi

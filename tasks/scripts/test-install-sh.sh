@@ -100,25 +100,30 @@ assert_glibc_preflight_fails \
   "OpenShell Linux packages require glibc >= 2.28; detected musl or unsupported libc." \
   setup_ldd_musl
 
+# snap_state: 0 = no snap command, 1 = snap command only,
+# installed = the OpenShell snap is already installed.
 assert_linux_package_method() {
   local name=$1
-  local requested_version=$2
-  local snap_present=$3
-  local dpkg_present=$4
-  local rpm_present=$5
-  local expected=$6
+  local install_method=$2
+  local requested_version=$3
+  local snap_state=$4
+  local dpkg_present=$5
+  local rpm_present=$6
+  local expected=$7
   local actual
 
   actual="$(
+    export OPENSHELL_INSTALL_METHOD="$install_method"
     export OPENSHELL_VERSION="$requested_version"
     has_cmd() {
       case "$1" in
-        snap) [ "$snap_present" = "1" ] ;;
+        snap) [ "$snap_state" != "0" ] ;;
         dpkg) [ "$dpkg_present" = "1" ] ;;
         rpm) [ "$rpm_present" = "1" ] ;;
         *) return 1 ;;
       esac
     }
+    snap() { [ "$*" = "list openshell" ] && [ "$snap_state" = "installed" ]; }
     linux_package_method
   )"
   if [ "$actual" != "$expected" ]; then
@@ -127,16 +132,30 @@ assert_linux_package_method() {
   fi
 }
 
-assert_linux_package_method "snap takes precedence over deb and rpm" "" 1 1 1 snap
-assert_linux_package_method "dev uses snap" dev 1 1 1 snap
-assert_linux_package_method "pre uses deb despite snap" pre 1 1 1 deb
-assert_linux_package_method "numbered prerelease uses deb despite snap" v0.1.0-pre.3 1 1 1 deb
-assert_linux_package_method "pre uses rpm despite snap" pre 1 0 1 rpm
-assert_linux_package_method "pinned stable uses deb despite snap" v1.2.3 1 1 1 deb
-assert_linux_package_method "pinned stable uses rpm despite snap" v1.2.3 1 0 1 rpm
-assert_linux_package_method "deb is selected without snap" "" 0 1 1 deb
-assert_linux_package_method "dev uses deb without snap" dev 0 1 1 deb
-assert_linux_package_method "rpm is selected without snap or deb" "" 0 0 1 rpm
+assert_linux_package_method "deb is the default despite snap" "" "" 1 1 1 deb
+assert_linux_package_method "rpm is the default despite snap" "" "" 1 0 1 rpm
+assert_linux_package_method "dev uses deb despite snap" "" dev 1 1 1 deb
+assert_linux_package_method "snap is opt-in" snap "" 1 1 1 snap
+assert_linux_package_method "snap opt-in with dev" snap dev 1 1 1 snap
+assert_linux_package_method "explicit deb" deb "" installed 0 1 deb
+assert_linux_package_method "explicit rpm" rpm "" 1 1 1 rpm
+assert_linux_package_method "existing snap install keeps refreshing" "" "" installed 1 1 snap
+assert_linux_package_method "existing snap install keeps refreshing dev" "" dev installed 1 1 snap
+assert_linux_package_method "pre uses deb despite existing snap" "" pre installed 1 1 deb
+assert_linux_package_method "numbered prerelease uses deb despite existing snap" "" v0.1.0-pre.3 installed 1 1 deb
+assert_linux_package_method "pinned stable uses rpm despite existing snap" "" v1.2.3 installed 0 1 rpm
+assert_linux_package_method "deb is selected without snap" "" "" 0 1 1 deb
+assert_linux_package_method "rpm is selected without snap or deb" "" "" 0 0 1 rpm
+
+if (OPENSHELL_INSTALL_METHOD=flatpak linux_package_method) >"$out" 2>"$err"; then
+  echo "FAIL: unsupported OPENSHELL_INSTALL_METHOD should be rejected" >&2
+  exit 1
+fi
+if ! grep -Fq "unsupported OPENSHELL_INSTALL_METHOD=flatpak" "$err"; then
+  echo "FAIL: unsupported OPENSHELL_INSTALL_METHOD was not explained" >&2
+  cat "$err" >&2
+  exit 1
+fi
 
 if ! (
   find_existing_native_openshell_bin() { return 1; }

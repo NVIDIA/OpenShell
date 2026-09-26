@@ -138,7 +138,7 @@ assert_contains "$snap_install_docs" "snap connect openshell:docker :docker"
 assert_contains "$snap_canary" "install.sh | sh"
 assert_contains "$snap_canary" "ubuntu-snap-system-docker:"
 assert_contains "$snap_canary" "ubuntu-snap-docker-preflight:"
-assert_contains "$snap_repro" 'OPENSHELL_VERSION=dev sh "${install_script}"'
+assert_contains "$snap_repro" 'OPENSHELL_INSTALL_METHOD=snap OPENSHELL_VERSION=dev sh "${install_script}"'
 assert_contains "$snap_repro" "system-docker"
 assert_contains "$snap_repro" "missing-docker"
 assert_contains "$snap_repro" "docker-snap"

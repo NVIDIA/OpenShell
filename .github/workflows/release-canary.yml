@@ -195,6 +195,8 @@ jobs:
     name: Ubuntu Snap with system Docker
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    env:
+      OPENSHELL_INSTALL_METHOD: snap
     timeout-minutes: 20
     steps:
       - name: Install snapd
@@ -265,6 +267,8 @@ jobs:
     name: Ubuntu Snap Docker preflight
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    env:
+      OPENSHELL_INSTALL_METHOD: snap
     timeout-minutes: 20
     steps:
       - name: Install snapd

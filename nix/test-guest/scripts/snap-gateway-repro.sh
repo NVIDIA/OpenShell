@@ -99,7 +99,7 @@ for attempt in $(seq 1 "${attempts}"); do
 	echo "==> install.sh Snap ${mode} reproduction attempt ${attempt}/${attempts}"
 	if [ "${mode}" != system-docker ]; then
 		output=$(mktemp)
-		if OPENSHELL_VERSION=dev sh "${install_script}" >"${output}" 2>&1; then
+		if OPENSHELL_INSTALL_METHOD=snap OPENSHELL_VERSION=dev sh "${install_script}" >"${output}" 2>&1; then
 			echo "install.sh unexpectedly succeeded in ${mode} mode" >&2
 			cat "${output}" >&2
 			rm -f "${output}"
@@ -127,7 +127,7 @@ for attempt in $(seq 1 "${attempts}"); do
 	fi
 
 	sandbox="snap-${attempt}-$$"
-	if ! OPENSHELL_VERSION=dev sh "${install_script}" ||
+	if ! OPENSHELL_INSTALL_METHOD=snap OPENSHELL_VERSION=dev sh "${install_script}" ||
 		! sudo snap list openshell >/dev/null ||
 		! snap info openshell | grep -Eq '^tracking: +latest/edge$' ||
 		! docker_is_ready ||
