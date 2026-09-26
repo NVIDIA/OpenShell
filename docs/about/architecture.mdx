@@ -10,28 +10,50 @@ position: 2
 
 ![OpenShell system architecture showing a trusted supervisor separated from a network-isolated sandbox workload. The workload can connect only to the supervisor.](../images/openshell-system-architecture.svg)
 
-OpenShell separates control-plane state from sandbox enforcement. The gateway
-owns sandbox state, policy, providers, and access, and uses formal verification
-to evaluate proposed policy changes before they are approved. A compute driver
-provisions the workload and its isolation boundary.
+OpenShell separates the untrusted agent workload from the components that
+enforce its policy. The gateway manages sandbox state and creates each workload
+through a compute driver.
 
-The trusted supervisor runs outside the workload. `openshell-sandbox` runs
-inside it, owns the agent process, and mediates its network requests. All other
-workload egress is denied. The supervisor initiates one connection to the
-gateway for configuration, credentials, logs, and interactive sessions.
+## Policy Enforcement
+
+In the Linux workload, Landlock limits filesystem access and seccomp mediates
+network operations. `openshell-sandbox` owns the agent process, identifies the
+program behind each network request, and forwards TCP and DNS requests to the
+trusted supervisor outside the workload boundary. A separate network fence
+denies direct workload egress except through the protected supervisor channel.
+
+The supervisor checks each request against the active policy. It opens approved
+connections and adds provider credentials only to requests bound for authorized
+endpoints; the agent does not receive the real credential values. When an agent
+proposes a network rule through the [policy advisor](/how-it-works/policies/advisor),
+the gateway's [policy prover](/how-it-works/policies/prover) uses formal
+verification to check for risky new access. Findings block automatic approval
+so a person can review the change.
+
+## Gateway and Workload Creation
+
+The gateway manages access, sandbox state, policies, and providers. When you
+create a sandbox, its compute driver provisions a workload and a separate
+supervisor, establishes their protected channel, and builds the isolation
+boundary. The supervisor confirms that boundary before starting the agent.
+
+The supervisor initiates an outbound connection to the gateway for policy and
+configuration updates, credentials, logs, and interactive sessions. The same
+supervisor contract works across Docker, Podman, Kubernetes, and MicroVM
+runtimes; each driver uses its platform's tools to create the boundary.
 
 ## What Each Piece Does
 
 | Component | What it does |
 |---|---|
-| [Gateway](/how-it-works/gateways/overview) | Checks who you are and remembers everything about your sandboxes. It delivers policy and settings, attaches providers, decides who can do what, and coordinates connections into sandboxes. |
-| [Compute runtime](/how-it-works/sandboxes/runtimes) | Creates the sandbox, starts the supervisor and the workload, sets up the private channel between them, and builds the network fence. It reports status back and cleans up when the sandbox goes away. |
-| [Supervisor](#inside-the-sandbox-boundary) | Lives on the trusted side of the boundary. It checks requests against policy, supplies credentials, resolves DNS, opens approved connections, and keeps the link to the gateway alive. It works with every runtime through one [isolation backend](/extensibility/isolation-backends) interface to confirm the boundary, start the agent, run commands, forward connections, and see network requests. |
 | [OpenShell Sandbox](#inside-the-sandbox-boundary) | Lives inside the boundary with the agent. It owns the agent's processes, knows which program made each request, applies process controls, and forwards TCP and DNS traffic to the supervisor. |
 | [Outer network fence](/security/best-practices#deny-by-default-egress) | Denies all network egress from the workload except its protected connection to the supervisor. Each runtime builds this with its own native tools. |
-| [Policy prover](/how-it-works/policies/prover) | Runs in the gateway and uses formal verification to check each proposed policy change before approval. It flags changes such as new credentialed reach, new HTTP methods, or access to cloud metadata endpoints, and any finding blocks auto-approval. It also ships as the standalone `openshell-prover` command for checking a policy against a boundary in CI. |
+| [Supervisor](#inside-the-sandbox-boundary) | Lives on the trusted side of the boundary. It checks requests against policy, supplies credentials, resolves DNS, opens approved connections, and keeps the link to the gateway alive. It works with every runtime through one [isolation backend](/extensibility/isolation-backends) interface to confirm the boundary, start the agent, run commands, forward connections, and see network requests. |
 | [Policies](/how-it-works/policies/overview) | Describe what the agent can touch: files, processes, network destinations, API calls, and where provider credentials can go. |
 | [Providers](/how-it-works/providers/overview) | Connect a service name to a stored credential. The supervisor hands that credential out only where policy allows it. |
+| [Policy prover](/how-it-works/policies/prover) | Runs in the gateway and uses formal verification to check agent-proposed network rules. It flags changes such as new credentialed reach, new HTTP methods, or access to cloud metadata endpoints; any finding blocks auto-approval. It also ships as the standalone `openshell-prover` command for checking a policy against a boundary in CI. |
+| [Gateway](/how-it-works/gateways/overview) | Checks who you are and remembers everything about your sandboxes. It delivers policy and settings, attaches providers, decides who can do what, and coordinates connections into sandboxes. |
+| [Compute runtime](/how-it-works/sandboxes/runtimes) | Creates the sandbox, starts the supervisor and the workload, sets up the private channel between them, and builds the network fence. It reports status back and cleans up when the sandbox goes away. |
 
 ## Inside the Sandbox Boundary
 
