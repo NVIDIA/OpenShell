@@ -124,13 +124,7 @@ openshell gateway add https://127.0.0.1:17670 --local --name openshell
 openshell status
 ```
 
-Keep the client key private. Anyone who can read it can authenticate to the local gateway.
-
-On refresh, the Snap replaces any regular gateway config that explicitly enables unauthenticated access or disables TLS with the secure default. Other settings in that file are not carried over.
-
-Snap refreshes restart the gateway to apply the migrated config immediately. This interrupts active sandbox sessions.
-
-If you previously registered the plaintext endpoint, run the certificate and HTTPS registration steps above after the refresh. Remove the old registration first with `openshell gateway remove openshell` if the name already exists. You can also rerun the install script to refresh the registration automatically.
+Keep the client key private.
 
 To install a locally built snap, connect its interfaces manually:
 
