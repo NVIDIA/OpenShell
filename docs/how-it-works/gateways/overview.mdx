@@ -160,12 +160,14 @@ openshell status
 openshell gateway info
 ```
 
-For Docker-backed local gateways, inspect Docker and the gateway process or container started by your local workflow:
+For Docker- or Podman-backed local gateways, inspect the container runtime and the gateway process or container started by your local workflow:
 
 ```shell
 openshell doctor check
 openshell gateway list
 ```
+
+`doctor check` validates Docker when it is installed, and falls back to Podman when Docker is absent.
 
 For Kubernetes gateways, inspect the gateway workload and cluster events:
 
