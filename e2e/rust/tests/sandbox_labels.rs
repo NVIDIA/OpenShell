@@ -5,6 +5,7 @@ use std::process::Stdio;
 
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::output::{extract_field, strip_ansi};
+use openshell_e2e::harness::sandbox::SandboxGuard;
 
 fn normalize_output(output: &str) -> String {
     let stripped = strip_ansi(output).replace('\r', "");
@@ -104,14 +105,6 @@ async fn get_sandbox_details(name: &str) -> String {
     combined
 }
 
-async fn delete_sandbox(name: &str) {
-    let mut cmd = openshell_cmd();
-    cmd.args(["sandbox", "delete", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let _ = cmd.status().await;
-}
-
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // end-to-end test exercises full label lifecycle
 async fn sandbox_labels_are_stored_and_filterable() {
@@ -123,18 +116,23 @@ async fn sandbox_labels_are_stored_and_filterable() {
     let prod_frontend = format!("lbl-pf-{suffix}");
     let dev_data = format!("lbl-dd-{suffix}");
 
-    // Create sandboxes with different labels
+    // Create sandboxes with different labels. Each guard deletes its sandbox
+    // on drop, even if a later assertion panics.
     let name1 =
         create_sandbox_with_labels(&dev_backend, &[("env", "dev"), ("team", "backend")]).await;
+    let _cleanup1 = SandboxGuard::manage_existing(name1.clone());
 
     let name2 =
         create_sandbox_with_labels(&staging_backend, &[("env", "staging"), ("team", "backend")])
             .await;
+    let _cleanup2 = SandboxGuard::manage_existing(name2.clone());
 
     let name3 =
         create_sandbox_with_labels(&prod_frontend, &[("env", "prod"), ("team", "frontend")]).await;
+    let _cleanup3 = SandboxGuard::manage_existing(name3.clone());
 
     let name4 = create_sandbox_with_labels(&dev_data, &[("env", "dev"), ("team", "data")]).await;
+    let _cleanup4 = SandboxGuard::manage_existing(name4.clone());
 
     // Test 1: Verify labels are stored in sandbox metadata
     let details = get_sandbox_details(&name1).await;
@@ -228,10 +226,4 @@ async fn sandbox_labels_are_stored_and_filterable() {
         all_sandboxes.contains(&name4),
         "list without filter should include all test sandboxes"
     );
-
-    // Cleanup
-    delete_sandbox(&name1).await;
-    delete_sandbox(&name2).await;
-    delete_sandbox(&name3).await;
-    delete_sandbox(&name4).await;
 }

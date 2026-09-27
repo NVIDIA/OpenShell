@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::timeout;
 
-use super::binary::openshell_cmd;
+use super::binary::{openshell_bin, openshell_cmd};
 use super::output::{extract_field, strip_ansi};
 
 /// Tool-capable workload image used by the E2E harness.
@@ -723,27 +723,22 @@ impl Drop for SandboxGuard {
             return;
         }
 
-        // We need to run async cleanup in a sync Drop. Use block_in_place to
-        // avoid blocking the tokio runtime. This is acceptable for test code.
-        let name = self.name.clone();
-        let mut child = self.child.take();
+        // A detached thread here would get killed along with the test
+        // process before the delete command finishes, leaking the sandbox.
+        // Use a blocking std::process::Command instead, matching the
+        // ManagedCleanup pattern in workspace_namespace_managed.rs, so
+        // cleanup completes before this function returns.
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+        }
 
-        // Attempt cleanup with a new runtime if we're not inside one, or
-        // block_in_place if we are.
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("create cleanup runtime");
-            rt.block_on(async {
-                if let Some(ref mut child) = child {
-                    let _: Result<(), _> = child.kill().await;
-                    let _ = child.wait().await;
-                }
-
-                let mut cmd = openshell_cmd();
-                cmd.arg("sandbox").arg("delete").arg(&name);
-                cmd.stdout(Stdio::null()).stderr(Stdio::null());
-                let _ = cmd.status().await;
-            });
-        });
+        let _ = std::process::Command::new(openshell_bin())
+            .arg("sandbox")
+            .arg("delete")
+            .arg(&self.name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 

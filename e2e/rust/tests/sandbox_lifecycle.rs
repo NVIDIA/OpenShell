@@ -659,9 +659,10 @@ async fn canonical_main_exit_zero_completes_persistent_sandbox() {
     );
     let sandbox_name =
         extract_sandbox_name(&combined).expect("sandbox name should be present in output");
+    // Deletes the sandbox on drop, including on panic from the asserts below.
+    let _cleanup = SandboxGuard::manage_existing(sandbox_name.clone());
 
     if let Err(last_sandbox_list) = assert_sandbox_presence_eventually(&sandbox_name, true).await {
-        delete_sandbox(&sandbox_name).await;
         panic!(
             "sandbox {sandbox_name} should still exist by default after {SANDBOX_PRESENCE_TIMEOUT:?}; \
              last observed sandbox list: {last_sandbox_list:?}"
@@ -687,8 +688,6 @@ async fn canonical_main_exit_zero_completes_persistent_sandbox() {
         details.contains("Phase: Completed"),
         "expected terminal sandbox phase:\n{details}"
     );
-
-    delete_sandbox(&sandbox_name).await;
 }
 
 #[tokio::test]
@@ -721,6 +720,8 @@ async fn canonical_main_nonzero_exit_preserves_status() {
     );
     let sandbox_name =
         extract_sandbox_name(&combined).expect("sandbox name should be present in output");
+    // Deletes the sandbox on drop, including on panic from the asserts below.
+    let _cleanup = SandboxGuard::manage_existing(sandbox_name.clone());
 
     let mut get_cmd = openshell_cmd();
     get_cmd
@@ -741,7 +742,6 @@ async fn canonical_main_nonzero_exit_preserves_status() {
         details.contains("Exit Code: 7"),
         "missing exit code:\n{details}"
     );
-    delete_sandbox(&sandbox_name).await;
 }
 
 #[tokio::test]
