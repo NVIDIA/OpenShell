@@ -4256,6 +4256,139 @@ process:
         );
     }
 
+    /// The typed schema gives an absent `filesystem_policy` the platform
+    /// default, `include_workdir: true`, and gives a present but empty stanza
+    /// `include_workdir: false`. Loading the same YAML directly into OPA must
+    /// agree in both cases, and versionless OPA data must follow the same rule
+    /// for a present empty stanza.
+    #[test]
+    fn yaml_and_proto_filesystem_policy_have_include_workdir_parity() {
+        for (data, expected) in [
+            ("version: 1\n", true),
+            ("version: 1\nfilesystem_policy: {}\n", false),
+        ] {
+            let proto = openshell_policy::parse_sandbox_policy(data)
+                .expect("fixture must parse into the typed schema");
+            let proto_config = OpaEngine::from_proto(&proto)
+                .expect("engine from protobuf")
+                .query_sandbox_config()
+                .expect("config from protobuf");
+            let yaml_config = OpaEngine::from_strings(TEST_POLICY, data)
+                .expect("engine from YAML")
+                .query_sandbox_config()
+                .expect("config from YAML");
+            assert_eq!(
+                proto_config.filesystem.include_workdir, expected,
+                "typed contract for {data:?}"
+            );
+            assert_eq!(
+                yaml_config.filesystem.include_workdir, expected,
+                "raw OPA loading for {data:?}"
+            );
+        }
+
+        let versionless = OpaEngine::from_strings(TEST_POLICY, "filesystem_policy: {}\n")
+            .expect("versionless OPA data must load")
+            .query_sandbox_config()
+            .expect("config from versionless OPA data");
+        assert!(
+            !versionless.filesystem.include_workdir,
+            "raw OPA loading of a versionless empty filesystem stanza"
+        );
+    }
+
+    /// Nested values that the typed schema rejects must also be rejected when
+    /// the same policy is loaded directly into OPA, with or without a
+    /// `version` key, instead of being replaced by defaults
+    /// (`include_workdir: true`, best-effort Landlock) or dropped. Each case
+    /// has a valid twin that both paths accept, so the test cannot pass by
+    /// rejecting valid input.
+    #[test]
+    fn raw_opa_loading_rejects_nested_values_the_typed_schema_rejects() {
+        const JSON_RPC_ENDPOINT: &str = r"network_policies:
+  rpc:
+    name: rpc
+    endpoints:
+      - host: jsonrpc.parity.test
+        port: 443
+        path: /rpc
+        protocol: json-rpc
+        enforcement: enforce
+        json_rpc: JSON_RPC_OPTIONS
+        rules:
+          - allow: { method: status.get }
+    binaries:
+      - { path: /usr/bin/curl }
+";
+        // Each case is (name, invalid body, valid twin body). Bodies omit
+        // `version` so each invalid body is also loaded as versionless OPA data.
+        let cases = [
+            (
+                "string include_workdir",
+                "filesystem_policy: {include_workdir: \"false\"}\n".to_owned(),
+                "filesystem_policy: {include_workdir: false}\n".to_owned(),
+            ),
+            (
+                "non-string read_only entry",
+                "filesystem_policy: {read_only: [7]}\n".to_owned(),
+                "filesystem_policy: {read_only: [\"/usr\"]}\n".to_owned(),
+            ),
+            (
+                "unknown Landlock compatibility",
+                "landlock: {compatibility: required}\n".to_owned(),
+                "landlock: {compatibility: hard_requirement}\n".to_owned(),
+            ),
+            (
+                "explicit null json_rpc options",
+                JSON_RPC_ENDPOINT.replace("JSON_RPC_OPTIONS", "null"),
+                JSON_RPC_ENDPOINT.replace("JSON_RPC_OPTIONS", "{ max_body_bytes: 32768 }"),
+            ),
+        ];
+
+        // Check every fixture before failing, so one run reports each input the
+        // raw loader accepts instead of stopping at the first.
+        let mut accepted_by_raw_opa = Vec::new();
+        for (case, invalid, valid) in &cases {
+            let valid = format!("version: 1\n{valid}");
+            assert!(
+                openshell_policy::parse_sandbox_policy(&valid).is_ok(),
+                "typed schema must accept the valid {case} twin"
+            );
+            assert!(
+                OpaEngine::from_strings(TEST_POLICY, &valid).is_ok(),
+                "raw OPA loading must accept the valid {case} twin"
+            );
+
+            let versioned = format!("version: 1\n{invalid}");
+            assert!(
+                openshell_policy::parse_sandbox_policy(&versioned).is_err(),
+                "typed schema must reject the {case} fixture"
+            );
+            for (form, data) in [("versioned", versioned.as_str()), ("versionless", invalid)] {
+                if OpaEngine::from_strings(TEST_POLICY, data).is_ok() {
+                    accepted_by_raw_opa.push(format!("{case} ({form})"));
+                }
+            }
+        }
+
+        let hard_requirement = OpaEngine::from_strings(
+            TEST_POLICY,
+            "version: 1\nlandlock: {compatibility: hard_requirement}\n",
+        )
+        .expect("valid Landlock twin must load")
+        .query_sandbox_config()
+        .expect("config from valid Landlock twin");
+        assert!(matches!(
+            hard_requirement.landlock.compatibility,
+            LandlockCompatibility::HardRequirement
+        ));
+
+        assert!(
+            accepted_by_raw_opa.is_empty(),
+            "raw OPA loading accepted fixtures that the typed schema rejects: {accepted_by_raw_opa:?}"
+        );
+    }
+
     #[test]
     fn query_sandbox_config_extracts_filesystem() {
         let engine = test_engine();
