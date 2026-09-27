@@ -393,16 +393,17 @@ def sync_redirects(source_docs_yml: Path, target_docs_yml: Path, slug: str) -> N
 
     def redirects(data: YamlMapping) -> list[YamlMapping]:
         value = data.get("redirects", [])
+        rules = cast("list[YamlMapping]", value)
         if not isinstance(value, list) or any(
             not isinstance(rule, dict)
             or not isinstance(rule.get("source"), str)
             or not isinstance(rule.get("destination"), str)
-            for rule in value
+            for rule in rules
         ):
             raise ValueError(
                 "docs.yml redirects must be a list of source/destination mappings"
             )
-        return cast("list[YamlMapping]", value)
+        return rules
 
     def owner(rule: YamlMapping) -> str | None:
         # A versioned source owns its redirect even when it targets another
