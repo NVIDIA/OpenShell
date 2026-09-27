@@ -100,7 +100,8 @@ def test_generate_homebrew_formula_uses_channel_urls_and_exact_version(
     assert 'bind_address = "[::1]:17670"' in legacy_ipv6_config.group("contents")
     assert "gateway_config.read == legacy_empty_gateway_config_contents ||" in formula
     assert "gateway_config.read == legacy_ipv6_gateway_config_contents" in formula
-    assert "gateway_config.write gateway_config_contents" in formula
+    assert formula.count("gateway_config.write gateway_config_contents") == 1
+    assert "gateway_config.atomic_write gateway_config_contents" in formula
     assert '# compute_driver = "vm"' not in formula
     assert (
         "openshell gateway add https://localhost:17670 --local --name openshell"

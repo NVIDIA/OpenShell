@@ -226,6 +226,8 @@ The Homebrew service keeps gateway TLS under the Homebrew state directory but
 mirrors Docker sandbox client TLS into `$HOME/.local/state/openshell/homebrew/tls`
 at service start, because Docker Desktop bind mounts must use paths visible to
 the macOS user's shared home directory.
+On upgrade, the formula atomically replaces only exact package-generated
+schema-v1 gateway configs, leaving user-edited configs untouched.
 
 Local image work should use `mise` tasks rather than direct Docker commands so
 the same staging and tagging assumptions are used locally and in CI.
