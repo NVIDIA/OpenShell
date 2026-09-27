@@ -415,6 +415,19 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/trivy-changes.yml` | Blocks pull requests and merge groups that introduce new High or Critical Helm or Dockerfile misconfigurations. |
 | `.github/workflows/trivy-scan.yml` | Manual or reusable scan of supplied OCI image/chart references and deployment configuration. Findings are informational by default and can be configured to fail the workflow. |
 
+## Podman e2e test selection
+
+`e2e/rust/tests/` has 39 test targets eligible under the `e2e-podman` Cargo feature (explicit `[[test]] required-features = ["e2e-podman"]` entries in `e2e/rust/Cargo.toml`, or auto-discovered files gated by `#![cfg(feature = "e2e")]`/`#![cfg(feature = "e2e-host-gateway")]`, both implied by `e2e-podman`). Required branch CI runs a curated subset selected by the `PODMAN_CI_TESTS` array in `e2e/rust/e2e-podman.sh` (`podman-e2e` job, `branch-e2e.yml`), not the full unfiltered set.
+
+Every eligible target must be accounted for in one of:
+
+- `PODMAN_CI_TESTS` in `e2e/rust/e2e-podman.sh`.
+- A small, checked-in perf-benchmark ignore list, for targets that are manual benchmarks rather than CI-gated regressions. Every test in those files must carry `#[ignore]`.
+- A separate CI mechanism, when a target's dependencies don't fit the gateway-backed `PODMAN_CI_TESTS` harness (for example `podman_preflight`, which needs only the standalone `openshell-driver-podman` binary and runs as a chained step in the `podman-external-driver-e2e` job instead).
+- A temporary, itemized known-gaps list, each entry tied to a tracking issue, for pre-existing gaps found when this check was introduced (see #3712).
+
+`tasks/scripts/check-podman-e2e-coverage.sh` (the `podman-e2e-coverage` job in `branch-checks.yml`, and `mise run e2e:podman:coverage:check` locally) enforces this: it fails if a target is eligible but appears in none of the above, and fails if a known-gaps entry no longer belongs there. A new `e2e-podman`-eligible test file must be added to one of these lists or the check fails the PR.
+
 ## Release workflows
 
 These workflows run after merge to publish dev/tagged artifacts and verify them. They are not PR-gated.
