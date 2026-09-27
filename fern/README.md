@@ -55,13 +55,15 @@ The sync workflow still accepts an optional Fern availability badge, but the cur
 
 The sync and publish workflows share the `docs-website` concurrency group. This serializes writes and publication. Queued runs remain pending instead of replacing one another.
 
-The `dev` snapshot also owns the shared Fern configuration, components, assets, and CSS on `docs-website`. The `latest` snapshot copies its documentation and navigation but does not replace those shared files. This keeps the site configuration aligned with `main` while preserving the released content.
+The `dev` snapshot also owns the shared Fern configuration, components, assets, and CSS on `docs-website`. The `latest` snapshot copies its documentation, navigation, and redirects but does not replace shared components, assets, or CSS. This keeps the site configuration aligned with `main` while preserving the released content.
 
 A `dev` sync copies the top-level `announcement` from the source `fern/docs.yml`. This announcement is the global fallback, and removing it from the source removes it from `docs-website`. Each snapshot sync copies the source version announcement only to the channel being updated. A version announcement overrides the global announcement for that version, so Release Dev cannot change the `latest` announcement and Release Tag cannot change the `dev` announcement.
 
+Redirects are synchronized with their mutable snapshot. A redirect whose source starts with `/openshell/dev/` or `/openshell/latest/` belongs to that channel. An unversioned alias to a versioned destination belongs to the destination channel; other shared rules belong to `dev`. Each sync replaces that channel's rules, including removing rules absent from the source. A stable release updates `latest` redirects only when it promotes `latest`, so an older maintenance release cannot roll back live routing. Redirects owned by other versions remain unchanged.
+
 ## Manual maintenance and publishing
 
-Maintainers can run `.github/workflows/sync-docs.yml` manually to add, refresh, or remove a historical version snapshot. The workflow preserves snapshots that were not selected. Production publishing is disabled by default for a manual sync.
+Maintainers can run `.github/workflows/sync-docs.yml` manually to add, refresh, or remove a historical version snapshot. To repair stale redirects for a mutable channel without changing its content, sync that channel from its recorded source commit and release version in `fern/.docs-snapshots.yml`, retaining its display name and availability from `fern/docs.yml`. Use the updated automation from `main`; select production publishing only when ready to publish the repair. The workflow preserves snapshots that were not selected. Production publishing is disabled by default for a manual sync.
 
 `.github/workflows/publish-docs-website.yml` validates and publishes the existing `docs-website` branch without syncing content. Its default mode creates a preview. Selecting production mode publishes the live site, so use it only for an intentional production republish.
 

@@ -19,6 +19,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+from urllib.parse import urlsplit
 
 import yaml
 from packaging.version import InvalidVersion, Version
@@ -380,6 +381,55 @@ def sync_global_announcement(source_docs_yml: Path, target_docs_yml: Path) -> No
     write_yaml(target_docs_yml, target_data)
 
 
+def sync_redirects(source_docs_yml: Path, target_docs_yml: Path, slug: str) -> None:
+    """Refresh routing alongside its mutable snapshot, including deleted rules."""
+    source_data = read_yaml(source_docs_yml)
+    target_data = read_yaml(target_docs_yml)
+    version_slugs = {"dev", "latest"} | {
+        entry.slug
+        for data in (source_data, target_data)
+        for entry in parse_versions(data.get("versions"))
+    }
+
+    def redirects(data: YamlMapping) -> list[YamlMapping]:
+        value = data.get("redirects", [])
+        if not isinstance(value, list) or any(
+            not isinstance(rule, dict)
+            or not isinstance(rule.get("source"), str)
+            or not isinstance(rule.get("destination"), str)
+            for rule in value
+        ):
+            raise ValueError(
+                "docs.yml redirects must be a list of source/destination mappings"
+            )
+        return cast("list[YamlMapping]", value)
+
+    def owner(rule: YamlMapping) -> str | None:
+        # A versioned source owns its redirect even when it targets another
+        # version. Unversioned aliases belong to their destination's version.
+        for field in ("source", "destination"):
+            url = urlsplit(cast("str", rule[field]))
+            if not url.netloc and url.path.startswith("/openshell/"):
+                version = url.path.removeprefix("/openshell/").split("/", 1)[0]
+                if version in version_slugs:
+                    return version
+        # Dev owns shared rules such as the legacy .html URL normalization.
+        return None
+
+    def selected(rule: YamlMapping) -> bool:
+        channel = owner(rule)
+        return channel == slug or (channel is None and slug == "dev")
+
+    retained = [rule for rule in redirects(target_data) if not selected(rule)]
+    updated = [rule for rule in redirects(source_data) if selected(rule)]
+    # Keep source ordering (explicit rules before wildcards), and place the
+    # refreshed channel's rules before shared fallback rules.
+    target_data["redirects"] = sorted(
+        updated + retained, key=lambda rule: owner(rule) is None
+    )
+    write_yaml(target_docs_yml, target_data)
+
+
 def source_version_announcement(docs_yml: Path, slug: str) -> YamlMapping | None:
     entries = parse_versions(read_yaml(docs_yml).get("versions"))
     for entry in entries:
@@ -436,6 +486,9 @@ def write_snapshot(
             source_fern / "fern.config.json", target_fern / "fern.config.json"
         )
         sync_global_announcement(source_fern / "docs.yml", target_fern / "docs.yml")
+
+    if entry.slug in {"dev", "latest"}:
+        sync_redirects(source_fern / "docs.yml", target_fern / "docs.yml", entry.slug)
 
     versions_dir = target_fern / "versions"
     versions_dir.mkdir(parents=True, exist_ok=True)

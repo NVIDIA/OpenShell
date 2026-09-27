@@ -1041,3 +1041,131 @@ def test_stable_promotion_replaces_latest_page_components(tmp_path: Path) -> Non
 
     widget = website / "fern" / "pages-latest" / "_components" / "Widget.tsx"
     assert widget.read_text(encoding="utf-8") == "export const Widget = 'new';\n"
+
+
+@pytest.mark.parametrize("channel", ["latest", "stable"])
+def test_sync_replaces_latest_redirects_with_snapshot(
+    tmp_path: Path, channel: str
+) -> None:
+    source = tmp_path / "source"
+    website = tmp_path / "docs-website"
+    _make_source_tree(source)
+    _make_docs_website_tree(website)
+    source_config = source / "fern" / "docs.yml"
+    target_config = website / "fern" / "docs.yml"
+    aliases = [
+        {
+            "source": "/openshell/tutorials",
+            "destination": "/openshell/latest/tutorials",
+        },
+        {
+            "source": "/openshell/tutorials/:path*",
+            "destination": "/openshell/latest/tutorials/:path*",
+        },
+    ]
+    preserved = [
+        # Source ownership wins over the destination channel.
+        {"source": "/openshell/dev/retired", "destination": "/openshell/latest"},
+        {"source": "/openshell/v0.0.116/old", "destination": "/openshell/v0.0.116/new"},
+        {"source": "/openshell/:path*.html", "destination": "/openshell/:path*"},
+    ]
+    old_aliases = [
+        {
+            "source": rule["source"],
+            "destination": rule["destination"].replace(
+                "/latest/tutorials", "/latest/get-started/tutorials"
+            ),
+        }
+        for rule in aliases
+    ]
+    stale = [
+        {
+            "source": rule["source"].replace("/openshell/", "/openshell/latest/", 1),
+            "destination": rule["destination"],
+        }
+        for rule in old_aliases
+    ]
+    sdw.write_yaml(source_config, {"versions": [], "redirects": aliases})
+    sdw.write_yaml(
+        target_config,
+        {
+            "versions": [
+                {
+                    "slug": "v0.0.116",
+                    "display-name": "v0.0.116",
+                    "path": "./versions/v0.0.116.yml",
+                }
+            ],
+            "redirects": stale + old_aliases + preserved,
+        },
+    )
+    args = Namespace(
+        source_root=source,
+        docs_website_root=website,
+        channel=channel,
+        source_ref="v0.1.1",
+        source_sha="release-sha",
+        release_version="0.1.1",
+        version_slug="v0.1.1" if channel == "stable" else "",
+        display_name="",
+        availability="",
+        allow_rollback=False,
+    )
+    # Repeating the same snapshot can repair routing without changing content.
+    for _ in range(2):
+        sdw.sync_docs(args)
+        assert read_yaml(target_config)["redirects"] == aliases + preserved
+        assert (website / "fern" / "pages-latest" / "intro.mdx").is_file()
+
+    # A maintenance release must not restore the stale redirects.
+    sdw.write_yaml(source_config, {"versions": [], "redirects": stale + old_aliases})
+    args.source_ref = "v0.0.117"
+    args.source_sha = "maintenance-sha"
+    args.release_version = "0.0.117"
+    args.version_slug = "v0.0.117" if channel == "stable" else ""
+    sdw.sync_docs(args)
+    assert read_yaml(target_config)["redirects"] == aliases + preserved
+
+
+def test_dev_sync_updates_own_and_shared_redirects_only(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    website = tmp_path / "docs-website"
+    _make_source_tree(source)
+    _make_docs_website_tree(website)
+    source_config = source / "fern" / "docs.yml"
+    target_config = website / "fern" / "docs.yml"
+    latest = {
+        "source": "/openshell/latest/index.html",
+        "destination": "/openshell/latest",
+    }
+    dev = {"source": "/openshell/dev/old", "destination": "/openshell/dev/new#section"}
+    shared = {
+        "source": "/openshell/:path*/index.html",
+        "destination": "/openshell/:path*",
+    }
+    stale = {
+        "source": "/openshell/dev/removed",
+        "destination": "/openshell/dev/deleted",
+    }
+    sdw.write_yaml(target_config, {"versions": [], "redirects": [latest, stale]})
+    sdw.write_yaml(source_config, {"versions": [], "redirects": [dev, shared]})
+    args = Namespace(
+        source_root=source,
+        docs_website_root=website,
+        channel="dev",
+        source_ref="main",
+        source_sha="dev-sha",
+        release_version="0.2.0.dev1",
+        version_slug="",
+        display_name="",
+        availability="",
+        allow_rollback=False,
+    )
+    sdw.sync_docs(args)
+    # Keep the explicit latest/index.html rule ahead of the shared wildcard.
+    assert read_yaml(target_config)["redirects"] == [dev, latest, shared]
+
+    # Removing the entire field removes only dev/shared rules.
+    sdw.write_yaml(source_config, {"versions": []})
+    sdw.sync_docs(args)
+    assert read_yaml(target_config)["redirects"] == [latest]

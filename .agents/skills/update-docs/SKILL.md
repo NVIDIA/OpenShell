@@ -121,6 +121,7 @@ When updating an existing page:
 - Add content in the logical place within the existing structure.
 - Do not reorganize sections unless the change requires it.
 - Update any cross-references or "Next Steps" links if relevant.
+- When moving published URLs, update `fern/docs.yml` redirects and run `mise run test:docs-website`. Redirects reach production through the owning channel's snapshot sync; changing source configuration alone does not republish existing snapshots. See `fern/README.md` for channel ownership and repair instructions.
 
 When creating a new page:
 

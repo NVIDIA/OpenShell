@@ -587,7 +587,11 @@ configuration, components, theme assets, and publish settings live in `fern/`.
 Use `mise run docs` for strict validation and `mise run docs:serve` for local
 preview. PR previews are produced by `.github/workflows/branch-docs.yml` when
 Fern credentials are available. Production docs publish from the release tag
-workflow.
+workflow. Redirect rules follow the mutable snapshot that owns their source URL
+(or destination for unversioned aliases). Syncing replaces that channel's rules,
+including deletions; `dev` owns shared fallback rules. Stable promotion updates
+`latest` routing together with its content, while older maintenance releases
+preserve both.
 
 ## Validation Expectations
 
