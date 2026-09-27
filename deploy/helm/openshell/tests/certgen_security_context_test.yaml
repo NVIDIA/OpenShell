@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: certgen hook securityContext
+templates:
+  - templates/certgen.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: renders a Restricted-compliant pod and container securityContext by default
+    template: templates/certgen.yaml
+    documentIndex: 3
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsNonRoot
+          value: true
+      - equal:
+          path: spec.template.spec.securityContext.seccompProfile.type
+          value: RuntimeDefault
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop[0]
+          value: ALL
+
+  - it: renders an explicitly set pkiInitJob.podSecurityContext
+    template: templates/certgen.yaml
+    documentIndex: 3
+    set:
+      pkiInitJob.podSecurityContext:
+        runAsNonRoot: true
+        runAsUser: 2000
+        seccompProfile:
+          type: RuntimeDefault
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsUser
+          value: 2000
+
+  - it: renders the same securityContext on the cert-manager backend-ca hook
+    template: templates/certgen.yaml
+    set:
+      certManager.enabled: true
+      grpcRoute.backendTLSPolicy.enabled: true
+    documentIndex: 4
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsNonRoot
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop[0]
+          value: ALL
